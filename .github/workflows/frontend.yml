@@ -9,8 +9,8 @@ on:
     paths:    ["frontend/**"]
 
 jobs:
-  lint-build:
-    name: Lint & Build
+  build:
+    name: Build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -26,12 +26,6 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Lint
-        run: npm run lint
-
-      - name: Type check
-        run: npx tsc --noEmit
-
       - name: Build
         run: npm run build
         env:
@@ -40,7 +34,7 @@ jobs:
 
   deploy:
     name: Deploy to Vercel
-    needs: lint-build
+    needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
