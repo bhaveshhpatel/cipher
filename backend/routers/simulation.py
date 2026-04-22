@@ -45,8 +45,8 @@ async def run_simulation(
     body: SimulationRequest,
     _: TokenData = Depends(get_current_user),
 ):
-    if body.n_agents < 1 or body.n_agents > 20:
-        raise HTTPException(status_code=422, detail="n_agents must be 1-20")
+    if body.n_agents < 1 or body.n_agents > 6:
+        raise HTTPException(status_code=422, detail="n_agents must be 1-6")
     if body.n_runs < 1 or body.n_runs > 5:
         raise HTTPException(status_code=422, detail="n_runs must be 1-5")
 

@@ -1,4 +1,16 @@
-// Cipher uses FastAPI JWT auth directly.
-// This file is a placeholder to satisfy NextAuth path conventions if needed.
-export async function GET()  { return new Response("Not used", { status: 404 }); }
-export async function POST() { return new Response("Not used", { status: 404 }); }
+
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  return NextResponse.json(
+    { message: "NextAuth is not configured in this application. Cipher uses custom JWT auth via the FastAPI backend." },
+    { status: 501 }
+  );
+}
+
+export async function POST() {
+  return NextResponse.json(
+    { message: "NextAuth is not configured in this application. Cipher uses custom JWT auth via the FastAPI backend." },
+    { status: 501 }
+  );
+}
