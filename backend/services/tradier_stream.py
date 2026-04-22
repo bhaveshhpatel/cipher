@@ -33,16 +33,18 @@ def get_stats() -> dict:
 
 async def _get_session_token() -> Optional[str]:
     """Obtain a streaming session token from Tradier."""
-    url     = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
-    headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept":        "application/json",
-    }
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, headers=headers, timeout=10)
-            r.raise_for_status()
-            return r.json().get("stream", {}).get("sessionid")
+            resp = await client.post(
+                f"{settings.TRADIER_BASE_URL}/v1/markets/events/session",
+                headers={
+                    "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+                    "Accept": "application/json",
+                },
+                content=b"",
+            )
+            resp.raise_for_status()
+            return resp.json().get("stream", {}).get("sessionid")
     except Exception as e:
         log.error("Failed to get session token: %s", e)
         return None
