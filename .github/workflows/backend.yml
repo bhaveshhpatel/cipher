@@ -35,7 +35,6 @@ jobs:
 
       - name: Test
         run: pytest tests/ -v --tb=short
-        continue-on-error: true   # no tests yet — won't block deploy
 
   deploy:
     name: Deploy to Railway
@@ -52,5 +51,5 @@ jobs:
       - name: Deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service cipher-backend --detach
+        run: railway up --service cipher-backend
         working-directory: backend
