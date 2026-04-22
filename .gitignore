@@ -32,6 +32,8 @@ Thumbs.db
 # Railway / Vercel
 .railway/
 .vercel/
+!frontend/.vercel/
+!frontend/.vercel/project.json
 
 # Logs
 *.log
