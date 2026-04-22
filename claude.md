@@ -1,0 +1,230 @@
+# Cipher — Claude Context File
+
+## Project Overview
+
+**Cipher** is an institutional options flow intelligence platform with the tagline *"Decode the Market."* It detects real-time whale/institutional options flow, scores signals using a composite engine, and runs multi-agent AI swarm simulations to generate BUY/SELL/HOLD verdicts.
+
+---
+
+## Repository
+
+- **GitHub**: `https://github.com/bhaveshhpatel/cipher`
+- **Owner**: Dhruv Patel (full-stack developer, San Francisco)
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 14, TypeScript, Tailwind CSS |
+| Backend | FastAPI (Python 3.11), async WebSockets |
+| Auth | JWT (`python-jose` + `passlib` bcrypt) |
+| Streaming | Tradier WebSocket → async in-process event bus |
+| AI Engine | OpenAI GPT-4o-mini (multi-agent swarm, 6 roles) |
+| Database | Supabase (PostgreSQL) |
+| Deploy (BE) | Railway |
+| Deploy (FE) | Vercel |
+| CI/CD | GitHub Actions |
+
+---
+
+## Repository Structure
+
+```
+cipher/
+├── .github/
+│   ├── workflows/
+│   │   ├── backend.yml        # Railway deploy CI
+│   │   └── frontend.yml       # Vercel deploy CI
+├── backend/
+│   ├── main.py                # FastAPI app entry, lifespan, CORS, router mounts
+│   ├── config.py              # pydantic-settings config (env vars)
+│   ├── requirements.txt
+│   ├── Procfile               # Railway process definition
+│   ├── railway.toml
+│   ├── core/
+│   │   ├── auth.py            # JWT helpers, get_current_user dependency
+│   │   └── async_bus.py       # In-process async pub/sub event bus
+│   ├── parsers/
+│   │   ├── options_flow_parser.py   # Raw Tradier trade → OptionsFlowEvent
+│   │   ├── bid_ask_classifier.py    # ABOVE_ASK / AT_ASK / BELOW_BID etc.
+│   │   └── trade_type_detector.py  # SWEEP / BLOCK / SPLIT / SINGLE
+│   ├── signals/
+│   │   ├── repetition_accumulator.py    # 30-min rolling window accumulator
+│   │   ├── backtest_validator.py         # Historical win-rate scoring
+│   │   ├── midcap_screener.py            # Mid-cap unusual activity detection
+│   │   └── composite_signal_engine.py   # flow_score×0.6 + backtest_score×0.4
+│   ├── simulation/
+│   │   ├── swarm_engine.py      # 6 LLM agents with distinct trading roles
+│   │   └── ensemble_runner.py   # Aggregate agent verdicts into consensus
+│   ├── execution/
+│   │   └── trade_executor.py    # Tradier order placement
+│   ├── services/
+│   │   └── tradier_stream.py    # Live Tradier WS stream processor + demo mode
+│   └── routers/
+│       ├── auth.py              # POST /api/auth/token, /register
+│       ├── flow.py              # GET /api/flow/scan
+│       ├── simulation.py        # POST /api/simulation/run
+│       ├── ws.py                # WS /ws/signals
+│       └── smart_signals.py     # GET /api/signals/composite/{ticker}, /stream/stats
+├── frontend/
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── layout.tsx           # Root layout + fonts
+│   │   │   ├── globals.css          # Global design system CSS
+│   │   │   ├── page.tsx             # Login / landing page
+│   │   │   └── dashboard/
+│   │   │       └── page.tsx         # Main dashboard (FLOW + SWARM tabs)
+│   │   │   └── api/auth/[...nextauth]/route.ts
+│   │   ├── components/
+│   │   │   ├── CipherLogo.tsx
+│   │   │   └── dashboard/
+│   │   │       ├── SignalFeed.tsx       # Real-time WebSocket signal feed
+│   │   │       ├── FlowTable.tsx        # Options flow event table
+│   │   │       ├── SimulationPanel.tsx  # AI swarm controls + results
+│   │   │       ├── CompositeCard.tsx    # Composite signal score display
+│   │   │       └── StreamStatsBar.tsx   # Live stream health stats
+│   │   ├── hooks/
+│   │   │   ├── useAuth.ts
+│   │   │   ├── useSignalStream.ts  # WS connection to /ws/signals
+│   │   │   ├── useFlow.ts          # /api/flow/scan fetcher
+│   │   │   └── useSimulation.ts    # /api/simulation/run caller
+│   │   ├── lib/
+│   │   │   └── api.ts              # Axios/fetch base config
+│   │   └── types/
+│   │       └── index.ts            # Shared TypeScript types
+│   ├── package.json
+│   ├── next.config.ts
+│   ├── tailwind.config.ts
+│   ├── tsconfig.json
+│   └── vercel.json
+```
+
+---
+
+## Environment Variables
+
+### Backend (`.env`)
+
+| Variable | Purpose |
+|---|---|
+| `SECRET_KEY` | JWT signing secret |
+| `ALGORITHM` | JWT algorithm (default: HS256) |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Token TTL (default: 1440) |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase anon key |
+| `SUPABASE_SERVICE_KEY` | Supabase service role key |
+| `TRADIER_API_KEY` | Tradier brokerage API key |
+| `TRADIER_ACCOUNT_ID` | Tradier account ID |
+| `TRADIER_BASE_URL` | Tradier REST base (default: `https://api.tradier.com`) |
+| `TRADIER_STREAM_URL` | Tradier stream base (default: `https://stream.tradier.com`) |
+| `OPENAI_API_KEY` | OpenAI API key for swarm agents |
+| `ANTHROPIC_API_KEY` | Anthropic API key (reserved) |
+| `REDIS_URL` | Redis connection (default: `redis://localhost:6379`) |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins |
+
+### Frontend (`.env.local`)
+
+Refer to `frontend/.env.example` for required variables (Next.js public + server-side).
+
+---
+
+## Key Business Logic
+
+### Signal Pipeline
+
+1. Tradier WebSocket emits raw trade ticks
+2. `options_flow_parser.py` parses ticks → `OptionsFlowEvent`
+3. `bid_ask_classifier.py` classifies fill aggressiveness
+4. `trade_type_detector.py` classifies trade type (SWEEP / BLOCK / SPLIT / SINGLE)
+5. `repetition_accumulator.py` groups trades into `RepetitionEpisode` objects (30-min window, min 3 trades, min $50K premium)
+6. `composite_signal_engine.py` scores: `composite = flow_score × 0.6 + backtest_score × 0.4`
+7. Signal published to `async_bus` → broadcast to all WS subscribers
+
+### Composite Score Formula
+
+```
+flow_score    = min(1.0, (total_premium / 10M) × 0.65 + is_accelerating × 0.15 + min(trade_count/20, 0.20))
+backtest_score = historical win-rate by (ticker, contract_type, DTE bucket, tier)
+composite      = flow_score × 0.6 + backtest_score × 0.4
+
+Recommendation:
+  composite >= 0.65 AND BULLISH → BUY
+  composite >= 0.65 AND BEARISH → SELL
+  else                          → HOLD
+```
+
+### Swarm Simulation
+
+Six LLM agents (GPT-4o-mini) with roles:
+- **Momentum Trader** — follows the tape
+- **Contrarian Analyst** — fades crowded trades
+- **Fundamental Analyst** — weighs flow vs. valuation
+- **Technical Analyst** — IV + chart context
+- **Macro Strategist** — broad market context
+- **Risk Manager** — downside and position sizing
+
+Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. `ensemble_runner.py` aggregates votes into a consensus verdict.
+
+### Alert Levels
+
+| Level | Meaning |
+|---|---|
+| `CONVICTION` | Highest confidence signal |
+| `STRONG_SIGNAL` | High confidence |
+| `ALERT` | Moderate signal |
+| `WATCH` | Low/monitoring signal |
+
+---
+
+## Current State & Known Gaps
+
+| Area | Status |
+|---|---|
+| Flow data | **Mocked** — deterministic `random.Random` seeded by ticker hash; live Tradier wires exist but need valid API key |
+| Supabase | Configured but **not actively queried** — flow scan comments say "in production: query Supabase" |
+| Redis | In `config.py` but **not yet integrated** |
+| Frontend styling | **Inline styles** used throughout dashboard components despite Tailwind being installed |
+| Trade execution | `trade_executor.py` exists but is not wired into the main signal flow |
+| Anthropic key | In config but **not used** |
+
+---
+
+## Coding Conventions
+
+- Backend: Python 3.11, async/await throughout, pydantic models for all I/O
+- Frontend: TypeScript strict mode, functional components, custom hooks pattern
+- Auth guard: all protected routes use `Depends(get_current_user)` (BE) and `useAuth` hook redirect (FE)
+- Monorepo with `backend/` and `frontend/` as siblings
+- No ORM — direct Supabase REST/postgrest calls planned
+
+---
+
+## How to Run Locally
+
+### Backend
+```bash
+cd backend
+pip install -r requirements.txt
+cp .env.example .env   # Fill in secrets
+uvicorn main:app --reload --port 8000
+```
+
+### Frontend
+```bash
+cd frontend
+npm install
+cp .env.example .env.local  # Fill in vars
+npm run dev
+```
+
+---
+
+## Deployment
+
+| Target | Platform | Trigger |
+|---|---|---|
+| Backend | Railway | Push to `main` via `backend.yml` |
+| Frontend | Vercel | Push to `main` via `frontend.yml` |
+
