@@ -113,7 +113,7 @@ export function SignalFeed({ signals, onClear }: Props) {
                 <div style={{ display:"flex", gap:12, alignItems:"center" }}>
                   <div>
                     <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, fontWeight:700,
-                      color:"#e8b84b" }}>{premiumStr(sig.total_premium)}</span>
+                      color:"#e8b84b" }}>{premiumStr(sig.total_premium ?? 0)}</span>
                     <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#304060", marginLeft:5 }}>total prem</span>
                   </div>
                   <div style={{ width:1, height:12, background:"rgba(30,45,74,0.8)" }} />
