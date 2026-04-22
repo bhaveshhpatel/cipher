@@ -3,7 +3,7 @@ In-process async event bus. Signals are published here by the stream processor
 and consumed by WebSocket connections.
 """
 import asyncio
-from typing import Dict, List, Callable, Any
+from typing import Dict, List, Any
 
 class AsyncEventBus:
     def __init__(self):

@@ -2,7 +2,6 @@
 Screens tickers for unusual options activity relative to open interest.
 Flags mid-cap names (market cap $2B–$20B) where whale flow is more significant.
 """
-from typing import List, Dict
 
 # Simplified: in production, pull market cap from Tradier or a data provider
 KNOWN_MIDCAP = {

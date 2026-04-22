@@ -11,9 +11,12 @@ import random
 _CACHE: Dict[Tuple, float] = {}
 
 def _dte_bucket(dte: int) -> str:
-    if dte <= 7:   return "0-7"
-    if dte <= 30:  return "8-30"
-    if dte <= 90:  return "31-90"
+    if dte <= 7:
+        return "0-7"
+    if dte <= 30:
+        return "8-30"
+    if dte <= 90:
+        return "31-90"
     return "90+"
 
 def get_backtest_score(

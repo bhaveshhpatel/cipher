@@ -12,7 +12,6 @@ from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
 from signals.repetition_accumulator import RepetitionAccumulator
-from signals.composite_signal_engine import build_composite
 
 log = logging.getLogger("tradier_stream")
 
@@ -101,7 +100,6 @@ async def _process_trade(raw: dict):
     ep = accumulator.ingest(ev)
     if ep:
         alert_level = accumulator.get_alert_level(ep)
-        composite   = build_composite(ep, accumulator)
         signal      = {
             "type":          "signal",
             "data": {

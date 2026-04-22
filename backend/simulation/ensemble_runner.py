@@ -3,7 +3,7 @@ Aggregates SwarmEngine verdicts into a final ensemble result.
 """
 from dataclasses import dataclass, field
 from typing import List
-from simulation.swarm_engine import AgentVerdict, SwarmEngine
+from simulation.swarm_engine import SwarmEngine
 
 @dataclass
 class EnsembleResult:

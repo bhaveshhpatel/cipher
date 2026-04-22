@@ -10,6 +10,9 @@ from fastapi.responses import JSONResponse
 
 from config import settings
 from routers import auth, flow, simulation, ws, smart_signals
+from routers.smart_signals import stream_stats
+from core.auth import get_current_user
+from fastapi import Depends
 from services.tradier_stream import stream_options_flow
 
 logging.basicConfig(
@@ -63,9 +66,6 @@ app.include_router(smart_signals.router)
 
 # Alias /api/stream/stats → handled inside smart_signals router
 # (already mounted under /api/signals prefix; frontend uses /api/stream/stats)
-from routers.smart_signals import stream_stats
-from core.auth import get_current_user
-from fastapi import Depends
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)

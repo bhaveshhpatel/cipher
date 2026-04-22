@@ -1,8 +1,6 @@
 from fastapi import APIRouter, Depends, Path
 from pydantic import BaseModel
 from core.auth import get_current_user, TokenData
-from signals.composite_signal_engine import CompositeSignal
-from signals.repetition_accumulator import RepetitionAccumulator, RepetitionEpisode
 from signals.backtest_validator import get_backtest_score
 from services.tradier_stream import get_stats
 import random

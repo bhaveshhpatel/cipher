@@ -2,7 +2,6 @@
 Combines flow score + backtest score into a final composite signal.
 """
 from dataclasses import dataclass
-from parsers.options_flow_parser import OptionsFlowEvent
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
 

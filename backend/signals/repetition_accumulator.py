@@ -2,7 +2,6 @@
 Tracks repeated options flow on the same contract over a rolling window.
 Emits a signal when repetition thresholds are met.
 """
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional

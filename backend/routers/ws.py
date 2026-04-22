@@ -2,7 +2,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from jose import JWTError, jwt
 from config import settings
 from core.async_bus import bus
-import asyncio, json, logging
+import asyncio
+import json
+import logging
 
 router = APIRouter(tags=["websocket"])
 log    = logging.getLogger("ws")

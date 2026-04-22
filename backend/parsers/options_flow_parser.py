@@ -1,10 +1,10 @@
 """
 Parses raw Tradier options flow into a structured OptionsFlowEvent.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive, TradeType
+from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
 
 @dataclass

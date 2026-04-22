@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List
 from core.auth import get_current_user, TokenData
 from simulation.ensemble_runner import run_ensemble
 

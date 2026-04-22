@@ -1,10 +1,8 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 from core.auth import get_current_user, TokenData
-from parsers.options_flow_parser import OptionsFlowEvent
-import httpx, random
-from config import settings
+import random
 from datetime import date, timedelta
 
 router = APIRouter(prefix="/api/flow", tags=["flow"])
@@ -52,7 +50,7 @@ def _mock_events(ticker: str, n: int = 20) -> List[FlowEventOut]:
             influence_tier   = tier,
             conviction_score = round(rng.uniform(0.3, 0.95), 2),
             is_golden_sweep  = prem >= 500_000 and rng.random() < 0.15,
-            timestamp        = __import__("datetime").datetime.utcnow().isoformat(),
+            timestamp        = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
         ))
     return sorted(events, key=lambda e: e.premium, reverse=True)
 
