@@ -51,5 +51,5 @@ jobs:
       - name: Deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service cipher-backend
+        run: railway up --detach
         working-directory: backend
