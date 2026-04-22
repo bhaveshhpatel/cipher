@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --cipher-bg:      #060b18;
+  --cipher-surface: #0c1428;
+  --cipher-border:  #1e2d4a;
+  --cipher-cyan:    #00d4ff;
+  --cipher-gold:    #e8b84b;
+  --cipher-purple:  #a855f7;
+  --cipher-text:    #e8edf5;
+  --cipher-muted:   #9baec8;
+  --cipher-faint:   #546882;
+  --cipher-dim:     #304060;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
+
+body {
+  background: var(--cipher-bg);
+  color: var(--cipher-text);
+  font-family: "Inter", sans-serif;
+  min-height: 100dvh;
+}
+
+/* Dot-grid background */
+body::before {
+  content:"";
+  position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image: radial-gradient(circle, rgba(0,212,255,0.06) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Scan-line overlay */
+body::after {
+  content:"";
+  position:fixed; inset:0; pointer-events:none; z-index:1;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent, transparent 2px,
+    rgba(0,0,0,0.04) 2px, rgba(0,0,0,0.04) 4px
+  );
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background: var(--cipher-bg); }
+::-webkit-scrollbar-thumb { background: var(--cipher-border); border-radius:4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--cipher-dim); }
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(30,45,74,0.25) 25%,
+    rgba(30,45,74,0.5)  50%,
+    rgba(30,45,74,0.25) 75%
+  );
+  background-size: 400px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+/* Fade-up for new signals */
+@keyframes fadeUp {
+  from { opacity:0; transform:translateY(10px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+
+/* Pulse dot */
+@keyframes pulseDot {
+  0%,100% { opacity:1; transform:scale(1); }
+  50%     { opacity:0.4; transform:scale(0.75); }
+}
+.pulse-dot { animation: pulseDot 1.8s ease-in-out infinite; }
+
+/* Focus ring */
+:focus-visible { outline:2px solid var(--cipher-gold); outline-offset:3px; border-radius:4px; }
+
+/* Input reset */
+input, button, textarea, select { font:inherit; color:inherit; }
+button { cursor:pointer; background:none; border:none; }
