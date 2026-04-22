@@ -8,6 +8,9 @@ from typing import List, Dict
 from openai import AsyncOpenAI
 from config import settings
 
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
+
 AGENT_ROLES = [
     {"role":"momentum","name":"Momentum Trader","prompt":"You are an aggressive momentum trader. You follow the tape and big money flow. Evaluate options flow and give a BUY, SELL, or HOLD verdict with one sentence of reasoning."},
     {"role":"contrarian","name":"Contrarian Analyst","prompt":"You are a contrarian analyst. You look for overextension and fade crowded trades. Evaluate options flow and give a BUY, SELL, or HOLD verdict with one sentence of reasoning."},
@@ -36,7 +39,7 @@ async def run_agent(client: AsyncOpenAI, agent_def: Dict, ticker: str, flow_summ
     )
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=GROQ_MODEL,
             messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}],
             temperature=0.2,
         )
@@ -61,7 +64,10 @@ async def run_agent(client: AsyncOpenAI, agent_def: Dict, ticker: str, flow_summ
 class SwarmEngine:
     def __init__(self, n_agents: int = 6):
         self.n_agents = max(1, min(n_agents, len(AGENT_ROLES)))
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY) if settings.OPENAI_API_KEY else None
+        self.client = (
+            AsyncOpenAI(api_key=settings.GROQ_API_KEY, base_url=GROQ_BASE_URL)
+            if settings.GROQ_API_KEY else None
+        )
 
     async def run(self, ticker: str, flow_summary: str) -> List[AgentVerdict]:
         if not self.client:

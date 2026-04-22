@@ -16,8 +16,9 @@ class Settings(BaseSettings):
     TRADIER_BASE_URL: str = "https://api.tradier.com"
     TRADIER_STREAM_URL: str = "https://stream.tradier.com"
 
-    OPENAI_API_KEY: str = ""
-    ANTHROPIC_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""      # kept for future use
+    ANTHROPIC_API_KEY: str = ""   # kept for future use
 
     REDIS_URL: str = "redis://localhost:6379"
     ALLOWED_ORIGINS: str = "http://localhost:3000"
