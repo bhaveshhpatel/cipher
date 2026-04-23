@@ -35,14 +35,14 @@
 cipher/
 ├── .github/
 │   ├── workflows/
-│   │   ├── backend.yml        # Railway deploy CI
+│   │   ├── backend.yml        # Railway deploy CI — runs from backend/ dir
 │   │   └── frontend.yml       # Vercel deploy CI
 ├── backend/
 │   ├── main.py                # FastAPI app entry, lifespan, CORS, router mounts
 │   ├── config.py              # pydantic-settings config (env vars)
 │   ├── requirements.txt
 │   ├── Procfile               # Railway process definition
-│   ├── railway.toml
+│   ├── railway.toml           # Backend-local Railway config (rootDirectory = "backend")
 │   ├── core/
 │   │   ├── auth.py            # JWT helpers, get_current_user dependency
 │   │   └── async_bus.py       # In-process async pub/sub event bus
@@ -63,7 +63,7 @@ cipher/
 │   ├── services/
 │   │   └── tradier_stream.py    # Live Tradier WS stream processor + demo mode
 │   └── routers/
-│       ├── auth.py              # POST /api/auth/token, /register — FIXED 2026-04-23
+│       ├── auth.py              # POST /api/auth/token, /register
 │       ├── flow.py              # GET /api/flow/scan
 │       ├── simulation.py        # POST /api/simulation/run
 │       ├── ws.py                # WS /ws/signals
@@ -71,39 +71,41 @@ cipher/
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
-│   │   │   ├── layout.tsx           # Root layout + fonts
-│   │   │   ├── globals.css          # Global design system CSS
-│   │   │   ├── page.tsx             # Login / landing page
+│   │   │   ├── layout.tsx
+│   │   │   ├── globals.css
+│   │   │   ├── page.tsx
 │   │   │   └── dashboard/
-│   │   │       └── page.tsx         # Main dashboard (FLOW + SWARM tabs)
+│   │   │       └── page.tsx
 │   │   │   └── api/auth/[...nextauth]/route.ts
 │   │   ├── components/
 │   │   │   ├── CipherLogo.tsx
 │   │   │   └── dashboard/
-│   │   │       ├── SignalFeed.tsx       # Real-time WebSocket signal feed
-│   │   │       ├── FlowTable.tsx        # Options flow event table
-│   │   │       ├── SimulationPanel.tsx  # AI swarm controls + results
-│   │   │       ├── CompositeCard.tsx    # Composite signal score display
-│   │   │       └── StreamStatsBar.tsx   # Live stream health stats
+│   │   │       ├── SignalFeed.tsx
+│   │   │       ├── FlowTable.tsx
+│   │   │       ├── SimulationPanel.tsx
+│   │   │       ├── CompositeCard.tsx
+│   │   │       └── StreamStatsBar.tsx
 │   │   ├── hooks/
 │   │   │   ├── useAuth.ts
-│   │   │   ├── useSignalStream.ts  # WS connection to /ws/signals
-│   │   │   ├── useFlow.ts          # /api/flow/scan fetcher
-│   │   │   └── useSimulation.ts    # /api/simulation/run caller
+│   │   │   ├── useSignalStream.ts
+│   │   │   ├── useFlow.ts
+│   │   │   └── useSimulation.ts
 │   │   ├── lib/
-│   │   │   └── api.ts              # Axios/fetch base config
+│   │   │   └── api.ts
 │   │   └── types/
-│   │       └── index.ts            # Shared TypeScript types
+│   │       └── index.ts
 │   ├── package.json
 │   ├── next.config.mjs
 │   ├── tailwind.config.ts
 │   ├── tsconfig.json
-│   └── vercel.json                  # buildCommand, outputDirectory, framework ONLY — no env block
+│   └── vercel.json
 ├── docs/
-│   ├── BACKLOG.md             # Product backlog (B-001 to B-007)
+│   ├── BACKLOG.md
 │   ├── features.md
 │   ├── regression-test-plan.md
 │   └── specs.md
+├── railway.toml               # Root-level Railway config (rootDirectory = "backend")
+└── claude.md
 ```
 
 ---
@@ -165,7 +167,7 @@ Recommendation:
   else                          → HOLD
 ```
 
-### Auth Flow (post-fix)
+### Auth Flow
 
 ```
 Register:
@@ -182,18 +184,11 @@ Login:
     → success → JWT created with create_access_token({"sub": email})
 ```
 
-> ⚠️ In-memory `_users` dict resets on every Railway deploy. In production,
-> Supabase must be configured so users persist.
+> ⚠️ In-memory `_users` dict resets on every Railway deploy. Supabase must be configured for production.
 
 ### Swarm Simulation
 
-Six LLM agents (GPT-4o-mini) with roles:
-- **Momentum Trader** — follows the tape
-- **Contrarian Analyst** — fades crowded trades
-- **Fundamental Analyst** — weighs flow vs. valuation
-- **Technical Analyst** — IV + chart context
-- **Macro Strategist** — broad market context
-- **Risk Manager** — downside and position sizing
+Six LLM agents (GPT-4o-mini): Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
 
 ### Alert Levels
 
@@ -212,7 +207,8 @@ Six LLM agents (GPT-4o-mini) with roles:
 |---|---|
 | Frontend deployment | ✅ Live on Vercel |
 | Backend deployment | ✅ Live on Railway |
-| Auth — register + login | ✅ **Fixed 2026-04-23** — Supabase path no longer silently falls through; credential errors surface as 401 |
+| Auth — register + login | ✅ Fixed 2026-04-23 |
+| Railway CLI build | ✅ Fixed 2026-04-23 — rootDirectory + working-directory align |
 | Flow data | **Mocked** — deterministic seed by ticker hash; live Tradier wires exist but need valid API key |
 | Supabase | Auth working; DB not actively queried yet |
 | Redis | In `config.py` but not integrated |
@@ -230,12 +226,25 @@ Six LLM agents (GPT-4o-mini) with roles:
 - All Vercel CLI steps run from **repo root** (not `frontend/`)
 - `vercel.json` has `buildCommand`, `outputDirectory`, `framework` **only — no `env` block**
 - Frontend env vars managed in **Vercel dashboard only**
-- To manually trigger a deploy: bump `frontend/.deploy-trigger`
 
 ### Backend (Railway via GitHub Actions)
 - Workflow: `.github/workflows/backend.yml`
-- Triggers on `push` to `main` when `backend/**` files change
+- Triggers on `push` to `main` when `backend/**` or `railway.toml` files change
+- **`working-directory: backend`** — CLI runs from `backend/` so it picks up `backend/railway.toml`
+- `backend/railway.toml` has `rootDirectory = "backend"` explicitly set
+- Root `railway.toml` also has `rootDirectory = "backend"` as safety net
 - ⚠️ **Disable Railway dashboard auto-deploy** to prevent double-deploys
+
+### Railway Root Directory Fix (2026-04-23)
+
+Previous failure: `Could not find root directory: /backend`
+
+**Root cause:** Two conflicting `railway.toml` files. The GitHub Actions workflow ran `railway up` from the repo root, picking up the root `railway.toml` which had no `rootDirectory`. Railway/nixpacks couldn't locate `requirements.txt` at the repo root.
+
+**Fix applied:**
+1. `railway.toml` (root) — added `rootDirectory = "backend"`, removed `cd backend &&` from startCommand
+2. `backend/railway.toml` — added `rootDirectory = "backend"` explicitly
+3. `.github/workflows/backend.yml` — added `working-directory: backend` to the deploy step
 
 ---
 
@@ -282,7 +291,8 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through to in-memory dict after register; credential errors now return 401; added `_get_supabase_client()` helper; added logging throughout auth router |
+| 2026-04-23 | **Fixed Railway CLI root directory error** — added `rootDirectory = "backend"` to both `railway.toml` files; added `working-directory: backend` to `backend.yml` deploy step |
+| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through; credential errors return 401 |
 | 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
 | 2026-04-22 | Removed `@cipher_api_url` / `@cipher_ws_url` secret refs from `frontend/vercel.json` |
 | 2026-04-22 | Documented Railway auto-deploy issue |

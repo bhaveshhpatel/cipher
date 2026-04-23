@@ -27,5 +27,7 @@ jobs:
       - name: Deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        working-directory: backend
         run: railway up --service "${{ secrets.RAILWAY_SERVICE }}" --detach
-        # Run from repo root so Railway sees the root railway.toml
+        # Run from backend/ so Railway CLI picks up backend/railway.toml
+        # and nixpacks finds requirements.txt at the correct root
