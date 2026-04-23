@@ -20,6 +20,13 @@ NOTE: Neither table receives an `id` field — Postgres generates it
 
 This module is the ONLY place that writes options flow data to the DB.
 The async_bus is purely in-memory fan-out for WebSocket delivery.
+
+IMPORTANT — Key selection:
+  Only SUPABASE_SERVICE_ROLE_KEY is used here. The service role key
+  bypasses Row Level Security (RLS) which is required for server-side
+  inserts. The anon/public key (SUPABASE_KEY) respects RLS and will
+  cause every insert to fail with a 42501 policy violation. Never use
+  the anon key for backend DB writes.
 """
 import asyncio
 import logging
@@ -32,7 +39,11 @@ import httpx
 log = logging.getLogger("flow_store")
 
 _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY: Optional[str] = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")
+
+# IMPORTANT: Use the service role key ONLY — it bypasses RLS.
+# Never fall back to the anon key (SUPABASE_KEY) here; the anon key
+# respects RLS and will produce 401/42501 errors on every insert.
+_SUPABASE_KEY: Optional[str] = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 # Batch insert flow_events every N seconds to avoid per-tick DB hammering
 _FLUSH_INTERVAL = 5  # seconds
@@ -171,8 +182,9 @@ async def start_flow_writer():
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         log.warning(
-            "[flow_store] SUPABASE_URL or SUPABASE_KEY not set — "
-            "flow_events and flow_episodes will NOT be persisted to DB"
+            "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
+            "flow_events and flow_episodes will NOT be persisted to DB. "
+            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
         )
         return
 
