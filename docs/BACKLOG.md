@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-22  
+> Last updated: 2026-04-23  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -17,6 +17,10 @@
 | B-005 | Trading options for customers (real or paper) | 🔲 Todo | Customer-facing paper or live trading — requires brokerage integration + risk disclaimers. |
 | B-006 | Product ideation — PM mode | 🔲 Todo | Explore adjacent product ideas; act as PM to define features, user personas, market fit. |
 | B-007 | Charting on dashboard | 🔲 Todo | Add price/signal charts to the main dashboard (e.g. options flow overlaid on price chart). |
+| B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting), reconnect count, last tick time. |
+| B-009 | Wire `trade_executor.py` into signal flow | 🔲 Todo | `execution/trade_executor.py` exists but is not connected to the composite signal engine output. |
+| B-010 | Supabase DB — active query integration | 🔲 Todo | Auth works via Supabase; DB tables not yet actively queried. Wire signal storage + user prefs. |
+| B-011 | Redis integration | 🔲 Todo | Redis is in config but not used. Candidate for signal caching + WebSocket pub/sub at scale. |
 
 ---
 
@@ -24,7 +28,9 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
-| — | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json, confirmed login page live. |
+| C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json, confirmed login page live. |
+| C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: fixed ReadableStream body bug (Vercel runtime), Next.js 15 async params, TS strict mode. |
+| C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. See `docs/specs.md` § Tradier Stream Architecture. |
 
 ---
 
@@ -41,4 +47,7 @@
 | Date | Change |
 |------|--------|
 | 2026-04-22 | Created backlog with B-001 through B-007 |
-| 2026-04-22 | Added frontend deployment fix to Completed |
+| 2026-04-22 | Added C-001 frontend deployment fix |
+| 2026-04-23 | Added C-002 auth 501 fix |
+| 2026-04-23 | Added C-003 Tradier stream resilience fix (9 failure modes) |
+| 2026-04-23 | Added B-008 stream health endpoint, B-009 trade executor wiring, B-010 Supabase DB, B-011 Redis |
