@@ -1,173 +1,231 @@
 "use client";
 import { useState } from "react";
-import { FlowEvent } from "@/lib/api";
-
-const TIER: Record<string, { color: string; bg: string }> = {
-  WHALE:         { color:"#00d4ff", bg:"rgba(0,212,255,0.1)"   },
-  INSTITUTIONAL: { color:"#a855f7", bg:"rgba(168,85,247,0.1)"  },
-  LARGE:         { color:"#e8b84b", bg:"rgba(232,184,75,0.1)"  },
-  RETAIL:        { color:"#546882", bg:"rgba(84,104,130,0.08)" },
-};
+import type { FlowEvent } from "@/lib/api";
 
 interface Props {
-  events:   FlowEvent[];
-  ticker:   string;
-  loading:  boolean;
-  onSearch: (ticker: string) => void;
+  events:  FlowEvent[];
+  loading: boolean;
+  error:   string | null;
+  ticker:  string;
+  onScan:  (t: string) => void;
 }
 
-export function FlowTable({ events, ticker, loading, onSearch }: Props) {
-  const [input, setInput] = useState(ticker || "");
-  const bull      = events.filter(e => e.sentiment === "BULLISH").length;
-  const bear      = events.filter(e => e.sentiment === "BEARISH").length;
-  const totalPrem = events.reduce((s, e) => s + (e.premium || 0), 0);
-  const premStr   = totalPrem >= 1_000_000
-    ? `$${(totalPrem / 1_000_000).toFixed(1)}M`
-    : `$${(totalPrem / 1000).toFixed(0)}K`;
+const sentimentColor = (s: string) => {
+  if (s === "BULLISH")  return "var(--green)";
+  if (s === "BEARISH")  return "var(--red)";
+  return "var(--muted)";
+};
+const sentimentBadge = (s: string) => {
+  if (s === "BULLISH") return "badge badge-green";
+  if (s === "BEARISH") return "badge badge-red";
+  return "badge badge-muted";
+};
+const tierBadge = (t: string) => {
+  if (t === "WHALE")       return "badge badge-amber";
+  if (t === "INSTITUTIONAL") return "badge badge-teal";
+  if (t === "LARGE")       return "badge badge-blue";
+  return "badge badge-muted";
+};
+const fmt$ = (n: number) =>
+  n >= 1_000_000 ? `$${(n/1_000_000).toFixed(2)}M`
+  : n >= 1_000   ? `$${(n/1_000).toFixed(1)}K`
+  : `$${n.toFixed(0)}`;
+
+function EmptyState({ ticker }: { ticker: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-20 gap-4"
+         style={{ color: "var(--faint)" }}>
+      <span className="text-4xl">⟁</span>
+      <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>No flow events for {ticker}</p>
+      <p className="text-sm">Try scanning a different ticker or check stream connectivity.</p>
+    </div>
+  );
+}
+
+function SkeletonRows() {
+  return (
+    <>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <tr key={i} className="border-b" style={{ borderColor: "var(--border)" }}>
+          {Array.from({ length: 9 }).map((__, j) => (
+            <td key={j} className="px-3 py-3">
+              <div className="skeleton h-4 rounded" style={{ width: j === 0 ? 48 : j === 8 ? 64 : 80 }} />
+            </td>
+          ))}
+        </tr>
+      ))}
+    </>
+  );
+}
+
+export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
+  const [sort,    setSort]   = useState<keyof FlowEvent>("conviction_score");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [filterSentiment, setFilterSentiment] = useState<string>("ALL");
+
+  const sorted = [...events]
+    .filter(e => filterSentiment === "ALL" || e.sentiment === filterSentiment)
+    .sort((a, b) => {
+      const av = a[sort], bv = b[sort];
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+
+  const totalPremium = events.reduce((s, e) => s + e.premium, 0);
+  const bullCount = events.filter(e => e.sentiment === "BULLISH").length;
+  const bearCount = events.filter(e => e.sentiment === "BEARISH").length;
+  const whaleCount = events.filter(e => e.influence_tier === "WHALE").length;
+
+  const toggleSort = (col: keyof FlowEvent) => {
+    if (sort === col) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSort(col); setSortDir("desc"); }
+  };
+
+  const Th = ({ col, label, right }: { col: keyof FlowEvent; label: string; right?: boolean }) => (
+    <th
+      onClick={() => toggleSort(col)}
+      className="px-3 py-3 text-left cursor-pointer select-none whitespace-nowrap"
+      style={{
+        textAlign:    right ? "right" : "left",
+        color:        sort === col ? "var(--amber)" : "var(--faint)",
+        fontSize:     "0.7rem",
+        fontWeight:   700,
+        letterSpacing:"0.07em",
+        textTransform:"uppercase",
+        background:   "var(--surface-2)",
+        borderBottom: "1px solid var(--border)",
+        userSelect:   "none",
+      }}
+    >
+      {label} {sort === col ? (sortDir === "desc" ? "↓" : "↑") : ""}
+    </th>
+  );
 
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"100%" }}>
-      {/* Search bar */}
-      <div style={{
-        display:"flex", alignItems:"center", gap:12, padding:"10px 16px", flexShrink:0,
-        borderBottom:"1px solid rgba(30,45,74,0.6)", background:"rgba(9,14,29,0.4)",
-      }}>
-        <div style={{ display:"flex", gap:8, flex:1 }}>
-          <input
-            value={input}
-            onChange={e => setInput(e.target.value.toUpperCase())}
-            onKeyDown={e => e.key === "Enter" && input && onSearch(input)}
-            placeholder="TICKER" maxLength={8}
-            style={{
-              width:100, padding:"8px 12px", borderRadius:8, textTransform:"uppercase",
-              fontFamily:"'JetBrains Mono',monospace", fontSize:12, fontWeight:700,
-              background:"rgba(6,11,24,0.8)", border:"1px solid rgba(30,45,74,0.8)",
-              color:"#e8edf5", outline:"none", letterSpacing:"0.12em",
-            }}
-            onFocus={e => { (e.target as HTMLInputElement).style.borderColor = "rgba(232,184,75,0.5)"; }}
-            onBlur ={e => { (e.target as HTMLInputElement).style.borderColor = "rgba(30,45,74,0.8)";  }}
-          />
-          <button onClick={() => input && onSearch(input)} style={{
-            padding:"8px 18px", borderRadius:8,
-            fontFamily:"'JetBrains Mono',monospace", fontSize:9, letterSpacing:"0.2em", fontWeight:700,
-            background:"rgba(232,184,75,0.1)", border:"1px solid rgba(232,184,75,0.35)", color:"#e8b84b",
-            cursor:"pointer", transition:"background 0.2s",
-          }}
-          onMouseEnter={e => { e.currentTarget.style.background = "rgba(232,184,75,0.2)"; }}
-          onMouseLeave={e => { e.currentTarget.style.background = "rgba(232,184,75,0.1)"; }}>
-            SCAN FLOW
-          </button>
+    <div className="flex flex-col gap-4">
+
+      {/* Summary row */}
+      {events.length > 0 && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[
+            { label: "Total Premium",  value: fmt$(totalPremium), accent: "var(--amber)" },
+            { label: "Bullish Events", value: bullCount,          accent: "var(--green)" },
+            { label: "Bearish Events", value: bearCount,          accent: "var(--red)" },
+            { label: "Whale Trades",   value: whaleCount,         accent: "var(--amber)" },
+          ].map(({ label, value, accent }) => (
+            <div key={label} className="card px-4 py-3 flex flex-col gap-0.5">
+              <span className="text-2xs font-bold uppercase tracking-widest" style={{ color: "var(--faint)" }}>{label}</span>
+              <span className="text-2xl font-bold font-mono tabular" style={{ color: accent }}>{value}</span>
+            </div>
+          ))}
         </div>
-        {events.length > 0 && (
-          <div style={{ display:"flex", gap:8 }}>
-            {[
-              { label:"BULL", val:bull,    color:"#22c55e" },
-              { label:"BEAR", val:bear,    color:"#ef4444" },
-              { label:"PREM", val:premStr, color:"#e8b84b" },
-            ].map(({ label, val, color }) => (
-              <div key={label} style={{
-                display:"flex", alignItems:"center", gap:5,
-                padding:"4px 10px", borderRadius:6,
-                background:`${color}0d`, border:`1px solid ${color}30`,
-              }}>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, fontWeight:700, color }}>{val}</span>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#304060" }}>{label}</span>
-              </div>
-            ))}
-          </div>
-        )}
+      )}
+
+      {/* Filter + count bar */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          {["ALL", "BULLISH", "BEARISH", "NEUTRAL"].map(s => (
+            <button
+              key={s}
+              onClick={() => setFilterSentiment(s)}
+              className="px-3 py-1.5 rounded-md text-xs font-semibold transition-all"
+              style={{
+                background:  filterSentiment === s ? "var(--amber)" : "var(--surface-2)",
+                color:       filterSentiment === s ? "#1a0f00"       : "var(--muted)",
+                border:      `1px solid ${filterSentiment === s ? "var(--amber)" : "var(--border)"}`,
+              }}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        <span className="text-xs font-mono" style={{ color: "var(--faint)" }}>
+          {sorted.length} of {events.length} events
+        </span>
       </div>
 
       {/* Table */}
-      <div style={{ flex:1, overflowY:"auto" }}>
-        {loading ? (
-          <div style={{ padding:16, display:"flex", flexDirection:"column", gap:8 }}>
-            {Array.from({length:10}).map((_,i) => (
-              <div key={i} className="skeleton" style={{ height:40, borderRadius:8, opacity:Math.max(0.15,1-i*0.08) }} />
-            ))}
-          </div>
-        ) : events.length === 0 ? (
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:12 }}>
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1e2d4a" strokeWidth="1.5">
-              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
-            </svg>
-            <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, letterSpacing:"0.25em", color:"#304060" }}>
-              ENTER TICKER TO SCAN OPTIONS FLOW
-            </span>
-          </div>
-        ) : (
-          <table style={{ width:"100%", borderCollapse:"collapse" }}>
+      <div className="card overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[700px]">
             <thead>
-              <tr style={{ borderBottom:"1px solid rgba(30,45,74,0.6)", background:"rgba(9,14,29,0.7)", position:"sticky", top:0 }}>
-                {["TYPE","STRIKE / EXP","PREMIUM","TIER","SENTIMENT","CONVICTION"].map(h => (
-                  <th key={h} style={{
-                    textAlign:"left", padding:"9px 12px",
-                    fontFamily:"'JetBrains Mono',monospace", fontSize:9,
-                    letterSpacing:"0.15em", color:"#304060", fontWeight:500,
-                  }}>{h}</th>
-                ))}
+              <tr>
+                <Th col="ticker"          label="Ticker" />
+                <Th col="contract_type"   label="Type" />
+                <Th col="strike"          label="Strike"     right />
+                <Th col="expiry"          label="Expiry" />
+                <Th col="premium"         label="Premium"    right />
+                <Th col="sentiment"       label="Sentiment" />
+                <Th col="influence_tier"  label="Tier" />
+                <Th col="conviction_score"label="Conviction" right />
+                <Th col="timestamp"       label="Time" />
               </tr>
             </thead>
             <tbody>
-              {events.map((ev, i) => {
-                const t = TIER[ev.influence_tier] || TIER.RETAIL;
-                const pStr = ev.premium >= 1_000_000
-                  ? `$${(ev.premium/1_000_000).toFixed(1)}M`
-                  : `$${(ev.premium/1000).toFixed(0)}K`;
-                return (
-                  <tr key={i} style={{ borderBottom:"1px solid rgba(30,45,74,0.3)", transition:"background 0.15s" }}
-                      onMouseEnter={e => { e.currentTarget.style.background = "rgba(12,20,40,0.9)"; }}
-                      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}>
-                    <td style={{ padding:"11px 12px" }}>
-                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                        {ev.is_golden_sweep && <span style={{ color:"#e8b84b", fontSize:11 }} title="Golden Sweep">★</span>}
-                        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, fontWeight:700,
-                          color: ev.contract_type==="CALL" ? "#22c55e" : "#ef4444" }}>{ev.contract_type}</span>
-                        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#304060" }}>{ev.trade_type}</span>
-                      </div>
+              {loading ? (
+                <SkeletonRows />
+              ) : error ? (
+                <tr><td colSpan={9} className="px-4 py-10 text-center text-sm" style={{ color: "var(--red)" }}>⚠ {error}</td></tr>
+              ) : sorted.length === 0 ? (
+                <tr><td colSpan={9}><EmptyState ticker={ticker} /></td></tr>
+              ) : (
+                sorted.map((e, i) => (
+                  <tr
+                    key={i}
+                    className="border-b transition-colors hover:bg-[var(--surface-2)] animate-fade-up"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <td className="px-3 py-3 font-mono font-bold text-sm" style={{ color: "var(--amber)" }}>
+                      {e.ticker}
+                      {e.is_golden_sweep && <span className="ml-1 text-xs">★</span>}
                     </td>
-                    <td style={{ padding:"11px 12px" }}>
-                      <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:"#e8edf5", fontWeight:600 }}>${ev.strike}</div>
-                      <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#546882" }}>{ev.expiry}</div>
-                    </td>
-                    <td style={{ padding:"11px 12px" }}>
-                      <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, fontWeight:700,
-                        color: ev.premium >= 1_000_000 ? "#e8b84b" : "#9baec8" }}>{pStr}</span>
-                    </td>
-                    <td style={{ padding:"11px 12px" }}>
-                      <span style={{ padding:"3px 8px", borderRadius:4, background:t.bg, color:t.color,
-                        fontFamily:"'JetBrains Mono',monospace", fontSize:9, fontWeight:700, letterSpacing:"0.08em" }}>
-                        {ev.influence_tier}
+                    <td className="px-3 py-3">
+                      <span className={e.contract_type === "CALL" ? "badge badge-green" : "badge badge-red"}>
+                        {e.contract_type}
                       </span>
                     </td>
-                    <td style={{ padding:"11px 12px" }}>
-                      <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, fontWeight:600,
-                        color: ev.sentiment==="BULLISH"?"#22c55e":ev.sentiment==="BEARISH"?"#ef4444":"#546882" }}>
-                        {ev.sentiment}
-                      </span>
+                    <td className="px-3 py-3 font-mono text-sm tabular text-right" style={{ color: "var(--text)" }}>
+                      ${e.strike.toFixed(0)}
                     </td>
-                    <td style={{ padding:"11px 12px" }}>
-                      <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-                        <div style={{ width:56, height:4, borderRadius:4, overflow:"hidden", background:"rgba(30,45,74,0.6)" }}>
-                          <div style={{
-                            height:"100%", borderRadius:4,
-                            width:`${ev.conviction_score*100}%`,
-                            background: ev.conviction_score>0.75?"#00d4ff":ev.conviction_score>0.5?"#e8b84b":"#304060",
-                            transition:"width 0.7s ease",
-                          }} />
-                        </div>
-                        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#546882" }}>
-                          {(ev.conviction_score*100).toFixed(0)}%
-                        </span>
-                      </div>
+                    <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
+                      {e.expiry}
+                    </td>
+                    <td className="px-3 py-3 font-mono font-semibold text-sm tabular text-right"
+                        style={{ color: "var(--amber)" }}>
+                      {fmt$(e.premium)}
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className={sentimentBadge(e.sentiment)}>{e.sentiment}</span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className={tierBadge(e.influence_tier)}>{e.influence_tier}</span>
+                    </td>
+                    <td className="px-3 py-3 text-right">
+                      <ConvictionBar score={e.conviction_score} />
+                    </td>
+                    <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--faint)" }}>
+                      {new Date(e.timestamp).toLocaleTimeString()}
                     </td>
                   </tr>
-                );
-              })}
+                ))
+              )}
             </tbody>
           </table>
-        )}
+        </div>
       </div>
+    </div>
+  );
+}
+
+function ConvictionBar({ score }: { score: number }) {
+  const pct = Math.min(Math.max(score * 100, 0), 100);
+  const color = pct >= 70 ? "var(--green)" : pct >= 40 ? "var(--amber)" : "var(--red)";
+  return (
+    <div className="flex items-center gap-2 justify-end">
+      <div className="w-16 h-1.5 rounded-full overflow-hidden" style={{ background: "var(--border)" }}>
+        <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />
+      </div>
+      <span className="text-xs font-mono tabular w-8 text-right" style={{ color }}>{pct.toFixed(0)}</span>
     </div>
   );
 }
