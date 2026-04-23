@@ -9,6 +9,7 @@ Design principles:
   - Session token fetch retried up to 3x for transient network failures
   - Clear distinction: 401 on session = bad key (slow retry), 401 on stream = expired token (fast retry)
   - Demo mode is a supervised fallback task, not an infinite blocking trap
+  - Market-hours guard: backs off 60s when US options market is closed
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -16,12 +17,15 @@ Tradier streaming notes:
   - Stream POST uses sessionid + Bearer token in headers
   - Tradier sends bare newlines as keepalives — idle >30s means the connection is dead
   - On market close, Tradier may close the stream normally — reconnect for next open
+  - Tradier closes the stream immediately when the market is closed (no queued data)
 """
 import asyncio
 import json
 import logging
 import random
+from datetime import datetime, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -41,6 +45,11 @@ _BACKOFF_BASE        = 5.0      # initial reconnect delay (seconds)
 _BACKOFF_CAP         = 60.0     # maximum reconnect delay (seconds)
 _IDLE_TIMEOUT        = 30.0     # seconds without any line before declaring connection dead
 _CONNECT_TIMEOUT     = 15.0     # seconds to establish the HTTP connection
+_MARKET_CLOSED_SLEEP = 60.0     # seconds to sleep when market is closed before retrying
+
+_ET = ZoneInfo("America/New_York")
+_MARKET_OPEN  = time(9, 30)
+_MARKET_CLOSE = time(16, 0)
 
 # ---------------------------------------------------------------------------
 # Global stats (read by /health endpoint)
@@ -60,6 +69,21 @@ accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium
 
 def get_stats() -> dict:
     return dict(_stats)
+
+
+# ---------------------------------------------------------------------------
+# Market hours helper
+# ---------------------------------------------------------------------------
+def _is_market_hours() -> bool:
+    """
+    Returns True if the US options market is currently open.
+    Options trade Mon–Fri 9:30–16:00 ET.
+    Does NOT account for market holidays (Tradier will just close the stream on those).
+    """
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return _MARKET_OPEN <= now_et.time() < _MARKET_CLOSE
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +122,11 @@ async def _get_session_token() -> Optional[str]:
                 resp = await client.post(url, headers=headers, data={})
 
             if resp.status_code == 401:
-                # Bad API key — no point retrying immediately, but don't give up forever
                 log.error(
                     "Tradier session 401 — TRADIER_API_KEY rejected. "
                     "Verify the key in Railway env vars. (attempt %d/%d)",
                     attempt + 1, _SESSION_RETRY_MAX,
                 )
-                # Still return None so caller can back off and retry later
                 return None
 
             resp.raise_for_status()
@@ -138,11 +160,16 @@ async def stream_options_flow(symbols: list[str]):
     Resilient main loop. Never exits permanently.
 
     Lifecycle:
-      1. Fetch fresh session token
-      2. Open streaming POST connection
-      3. Read lines with 30s idle watchdog
-      4. On any failure: back off, re-fetch token, reconnect
-      5. If no live key configured: run demo mode in parallel, keep retrying live
+      1. Check market hours — sleep 60s if closed (Tradier closes stream immediately when closed)
+      2. Fetch fresh session token
+      3. Open streaming POST connection
+      4. Read lines with 30s idle watchdog
+      5. On any failure: back off, re-fetch token, reconnect
+      6. If no live key configured: run demo mode in parallel, keep retrying live
+
+    Key design: reconnect_attempt is only reset when we actually receive data (ticks).
+    A clean close with no ticks (market closed) preserves the attempt counter so
+    backoff accumulates properly instead of always restarting from 0.
     """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
@@ -159,13 +186,22 @@ async def stream_options_flow(symbols: list[str]):
         "Accept": "application/json",
     }
 
-    # Track consecutive 401s on the stream endpoint separately
-    # (means the token expired — fast re-fetch, no long backoff)
     consecutive_stream_401s = 0
     reconnect_attempt = 0
     demo_task: Optional[asyncio.Task] = None
 
     while True:
+        # --- 0. Market hours guard ---
+        if not _is_market_hours():
+            now_et = datetime.now(_ET)
+            log.info(
+                "Market closed (ET: %s) — sleeping %ds before next check",
+                now_et.strftime("%H:%M %Z %a"), int(_MARKET_CLOSED_SLEEP),
+            )
+            _stats["mode"] = "market_closed"
+            await asyncio.sleep(_MARKET_CLOSED_SLEEP)
+            continue
+
         # --- 1. Fetch fresh session token on every reconnect ---
         session_token = await _get_session_token()
 
@@ -176,7 +212,6 @@ async def stream_options_flow(symbols: list[str]):
                 "No session token — backing off %.1fs before retry (attempt %d)",
                 backoff, reconnect_attempt + 1,
             )
-            # Start demo mode as background task if not already running
             if demo_task is None or demo_task.done():
                 log.info("Starting demo mode as fallback while waiting for live connection")
                 _stats["mode"] = "demo"
@@ -201,6 +236,9 @@ async def stream_options_flow(symbols: list[str]):
             "linebreak": "true",
         }
 
+        # Track ticks received in this session to detect "connected but no data" (market closed)
+        session_ticks = 0
+
         # --- 2. Open stream and read with idle watchdog ---
         try:
             timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=None, write=10.0, pool=10.0)
@@ -208,8 +246,6 @@ async def stream_options_flow(symbols: list[str]):
                 async with client.stream("POST", url, headers=stream_headers, data=payload) as resp:
 
                     if resp.status_code == 401:
-                        # Session token was rejected — it expired between fetch and use.
-                        # This is normal after a reconnect race. Re-fetch immediately.
                         consecutive_stream_401s += 1
                         log.warning(
                             "Tradier stream 401 (session expired) — re-fetching token "
@@ -217,7 +253,6 @@ async def stream_options_flow(symbols: list[str]):
                         )
                         _stats["errors"] += 1
                         if consecutive_stream_401s >= 5:
-                            # 5 consecutive 401s = likely a bad API key, back off longer
                             backoff = _backoff(min(consecutive_stream_401s, 7))
                             log.error(
                                 "5+ consecutive stream 401s — possible bad API key. "
@@ -225,13 +260,12 @@ async def stream_options_flow(symbols: list[str]):
                             )
                             await asyncio.sleep(backoff)
                         else:
-                            await asyncio.sleep(1.0)  # brief pause, then re-fetch
+                            await asyncio.sleep(1.0)
                         reconnect_attempt += 1
                         continue
 
                     # Successful connection
                     consecutive_stream_401s = 0
-                    reconnect_attempt = 0
                     _stats["mode"] = "live"
                     log.info(
                         "Tradier stream connected — monitoring %d symbols",
@@ -246,9 +280,10 @@ async def stream_options_flow(symbols: list[str]):
                             raw = json.loads(line)
                         except json.JSONDecodeError:
                             continue
+                        session_ticks += 1
                         await _process_trade(raw)
 
-                    # Stream ended cleanly (market close, server restart)
+                    # Stream ended cleanly
                     log.info("Tradier stream closed cleanly — reconnecting")
 
         except asyncio.TimeoutError:
@@ -266,9 +301,17 @@ async def stream_options_flow(symbols: list[str]):
         # --- 4. Back off before reconnect ---
         _stats["reconnects"] += 1
         _stats["mode"] = "reconnecting"
+
+        # Only reset the attempt counter if we actually received data this session.
+        # If session_ticks == 0, the market is likely closed and Tradier closed instantly —
+        # preserve the attempt counter so backoff accumulates (not reset to 0 every cycle).
+        if session_ticks > 0:
+            reconnect_attempt = 0
+        else:
+            reconnect_attempt += 1
+
         backoff = _backoff(min(reconnect_attempt, 7))
         log.info("Reconnecting in %.1fs (attempt %d)", backoff, reconnect_attempt + 1)
-        reconnect_attempt += 1
         await asyncio.sleep(backoff)
 
 
@@ -283,14 +326,11 @@ async def _iter_lines_with_watchdog(resp: httpx.Response):
     """
     async for line in resp.aiter_lines():
         yield line
-        # Reset watchdog: we got a line (even a blank keepalive)
-        # The timeout is applied per-iteration via the outer wait_for wrapper
 
 
 async def _guarded_lines(resp: httpx.Response):
     """
-    Alternative watchdog using asyncio.wait_for per line for older Python compat.
-    We use an async generator that wraps the iterator.
+    Watchdog using asyncio.wait_for per line.
     """
     aiter = resp.aiter_lines().__aiter__()
     while True:
@@ -300,7 +340,7 @@ async def _guarded_lines(resp: httpx.Response):
         except StopAsyncIteration:
             return
         except asyncio.TimeoutError:
-            raise  # propagate to outer handler
+            raise
 
 
 # Override the simple wrapper with the guarded version
