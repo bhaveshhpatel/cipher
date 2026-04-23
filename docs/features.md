@@ -27,6 +27,8 @@
 | **Universe symbols loader** | `services/symbols_loader.py` — CBOE fetch + Tradier validation | 20-concurrent semaphore. Returns `(symbols, source, stream_eligible_set)`. |
 | **Universe background refresh** | 24h asyncio background task in `main.py` | Never blocks stream; passes `stream_eligible_set` to `save_snapshot`. |
 | **Universe screener** | `services/universe_screener.py` — stream-eligible screening | Added 2026-04-23. Priority pool always eligible. Remaining symbols screened via Tradier OI check. Batch throttle via `UNIVERSE_BATCH_DELAY_MS`. Fallback to `UNIVERSE_STREAM_ELIGIBLE_DEFAULT`. |
+| **DB signal persistence — flow_episodes** | Every repetition signal episode persisted to `flow_episodes` via `flow_store.py` | Fixed 2026-04-23: was incorrectly writing to `composite_signals` (wrong schema → 400). Now correctly targets `flow_episodes`. No `id` field sent (Postgres generates bigserial). |
+| **DB signal persistence — flow_events** | Every classified tick buffered and batch-flushed to `flow_events` every 5s | Fixed 2026-04-23: `id` field removed from payload (Postgres generates uuid). f-string logging fixed to prevent crash on None values. |
 
 ---
 
@@ -34,9 +36,9 @@
 
 | Feature | Description | Gap |
 |---------|-------------|-----|
-| **Supabase DB — signal storage** | Universe tables live; signal storage not yet wired | `options_universe_snapshots` + `options_universe_symbols` (with `stream_eligible`) live. Signal storage + user prefs not yet wired. |
 | **Stream health endpoint** | `/health/stream` exposing mode + reconnect count | `get_stats()` exists; not yet exposed as dedicated HTTP endpoint. |
 | **Frontend styling** | Tailwind CSS available | Many components use inline styles; Tailwind underused |
+| **Flow scan endpoint** | `GET /api/flow/scan` | Returns mock data — needs to query `flow_events` table from Supabase |
 
 ---
 
@@ -64,6 +66,16 @@
 
 ---
 
+## DB Write — Bug History
+
+| Date | Symptom | Root Cause | Fix |
+|------|---------|------------|-----|
+| 2026-04-23 | 400 on every signal persist | `flow_store.py` writing to `composite_signals` (wrong table, wrong schema) | Changed target to `flow_episodes`; renamed `persist_composite_signal` → `persist_flow_episode` |
+| 2026-04-23 | 400 on `flow_events` insert | Client sending `id` field; Postgres uuid column rejects client-provided value | Removed `id` from both row builders; Postgres generates all IDs |
+| 2026-04-23 | Log crash on None signal fields | `log.info("... %,.0f", None)` — `%` formatter cannot format None | Switched to f-strings throughout `flow_store.py` |
+
+---
+
 ## Options Universe — Architecture Notes
 
 ### Before (hardcoded seed)
@@ -86,7 +98,7 @@
 ## Known Limitations
 
 - Tradier stream only active during market hours (Mon–Fri 09:30–16:00 ET)
-- No persistent signal storage — signals lost on container restart
 - No user-specific signal filtering or watchlists
 - No rate limiting on API endpoints
 - Frontend auth state uses `localStorage` (no server-side session)
+- `GET /api/flow/scan` returns mock data, not live `flow_events` rows
