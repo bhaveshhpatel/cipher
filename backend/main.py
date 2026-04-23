@@ -16,6 +16,8 @@ from routers.smart_signals import stream_stats
 from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
+from services.symbols_loader import load_universe, SEED_SYMBOLS
+from services import universe_store
 
 
 # ── Structured JSON log formatter ────────────────────────────────────────────
@@ -24,9 +26,6 @@ class _JsonFormatter(logging.Formatter):
     Emit one JSON object per log line so Railway's log collector reads
     `severity` from the structured field instead of regex-guessing it
     from the raw message string.
-
-    Railway maps the `severity` field directly to its log level UI —
-    so INFO stays INFO, WARNING stays WARNING, ERROR stays ERROR.
     """
     SEVERITY_MAP = {
         logging.DEBUG:    "debug",
@@ -49,23 +48,12 @@ class _JsonFormatter(logging.Formatter):
 
 
 def _configure_logging() -> None:
-    """
-    Replace the root handler with a JSON formatter.
-    Suppress httpx's INFO chatter — it logs every HTTP request at INFO
-    which Railway mis-classifies as errors when the line doesn't parse cleanly.
-    We keep WARNING+ from httpx so auth failures and timeouts still surface.
-    """
     root = logging.getLogger()
     root.handlers.clear()
-
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(_JsonFormatter())
     root.addHandler(handler)
     root.setLevel(logging.INFO)
-
-    # httpx logs every successful request at INFO — noisy and mis-classified
-    # by Railway's text scanner.  Raise its floor to WARNING so only real
-    # problems (timeouts, connection errors) come through.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -73,22 +61,95 @@ def _configure_logging() -> None:
 _configure_logging()
 log = logging.getLogger("main")
 
-DEFAULT_SYMBOLS = [
-    "AAPL","TSLA","NVDA","SPY","QQQ","MSFT","AMZN","META",
-    "GOOGL","AMD","PLTR","SOFI","HOOD","RIVN","CRWD","NET",
-]
+
+# ---------------------------------------------------------------------------
+# Universe loader — resolves symbols at startup with full fallback chain
+# ---------------------------------------------------------------------------
+async def _resolve_startup_universe() -> list[str]:
+    """
+    Priority:
+      1. Fresh DB snapshot (< 24h old) — stream starts instantly
+      2. Tradier fetch + validate     — saves to DB, then starts
+      3. Any DB snapshot (stale)      — fallback if Tradier is down
+      4. SEED_SYMBOLS                 — last resort
+    """
+    # Step 1 — try fresh DB snapshot first (fast path)
+    fresh = universe_store.load_fresh_snapshot(max_age_hours=24)
+    if fresh:
+        log.info("Startup: loaded fresh universe from DB (%d symbols)", len(fresh))
+        return fresh
+
+    log.info("Startup: no fresh DB snapshot — fetching from Tradier")
+
+    # Step 2 — fetch from Tradier, with stale DB as fallback arg
+    stale = universe_store.load_any_snapshot()
+    symbols, source = await load_universe(db_snapshot=stale)
+
+    # Persist to DB if we got a live validated universe
+    if source == "tradier_validated":
+        saved = universe_store.save_snapshot(symbols, source)
+        if not saved:
+            log.warning("Startup: failed to persist universe snapshot to DB")
+
+    log.info("Startup: universe resolved — %d symbols (source=%s)", len(symbols), source)
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# Background 24-hour refresh
+# ---------------------------------------------------------------------------
+async def _universe_refresh_loop():
+    """
+    Refreshes the universe every 24 hours in the background.
+    Never cancels the main stream — stream keeps running with current symbols.
+    On failure, logs a warning and keeps the existing snapshot active.
+    """
+    REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours in seconds
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL)
+        log.info("Background universe refresh starting")
+        try:
+            stale = universe_store.load_any_snapshot()
+            symbols, source = await load_universe(db_snapshot=stale)
+            if source == "tradier_validated":
+                saved = universe_store.save_snapshot(symbols, source)
+                log.info(
+                    "Background refresh complete: %d symbols saved=%s",
+                    len(symbols), saved,
+                )
+            else:
+                log.warning(
+                    "Background refresh could not reach Tradier — keeping current snapshot "
+                    "(source=%s)", source,
+                )
+        except Exception as e:
+            log.error("Background universe refresh failed (non-fatal): %s", e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
-    stream_task = asyncio.create_task(stream_options_flow(DEFAULT_SYMBOLS))
+
+    # Resolve universe (DB → Tradier → stale DB → seed)
+    symbols = await _resolve_startup_universe()
+
+    # Start stream with resolved universe
+    stream_task = asyncio.create_task(stream_options_flow(symbols))
+
+    # Start background 24-hour refresh
+    refresh_task = asyncio.create_task(_universe_refresh_loop())
+
     yield
+
+    refresh_task.cancel()
     stream_task.cancel()
-    try:
-        await stream_task
-    except asyncio.CancelledError:
-        pass
+    for task in (stream_task, refresh_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     log.info("Cipher backend stopped.")
+
 
 app = FastAPI(
     title       = "Cipher API",
