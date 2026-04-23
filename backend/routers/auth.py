@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
@@ -6,6 +5,9 @@ from core.auth import hash_password, verify_password, create_access_token, get_c
 from config import settings
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
+import logging
+
+log = logging.getLogger("auth")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 _users: dict[str, str] = {}
@@ -32,6 +34,16 @@ def _get_supabase_admin() -> Client | None:
     )
 
 
+def _get_supabase_client() -> Client | None:
+    if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
+        return None
+    return create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_KEY,
+        options=ClientOptions(auto_refresh_token=False, persist_session=False),
+    )
+
+
 def _get_user_from_supabase(email: str):
     client = _get_supabase_admin()
     if not client:
@@ -44,6 +56,7 @@ def _get_user_from_supabase(email: str):
     except Exception:
         return None
     return None
+
 
 @router.post("/register", response_model=MessageResponse, status_code=201)
 async def register(body: RegisterRequest):
@@ -62,32 +75,57 @@ async def register(body: RegisterRequest):
                 "email_confirm": True,
                 "user_metadata": {"source": "cipher"},
             })
+            log.info("Registered user via Supabase: %s", body.email)
             return {"message": "Account created successfully"}
         except Exception as e:
+            log.error("Supabase register error: %s", e)
             raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
 
+    # In-memory fallback (no Supabase configured)
     if body.email in _users:
         raise HTTPException(status_code=409, detail="Email already registered")
     _users[str(body.email)] = hash_password(body.password)
+    log.info("Registered user in-memory: %s", body.email)
     return {"message": "Account created successfully"}
+
 
 @router.post("/token", response_model=TokenResponse)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
-    client = None
-    try:
-        if settings.SUPABASE_URL and settings.SUPABASE_KEY:
-            client = create_client(
-                settings.SUPABASE_URL,
-                settings.SUPABASE_KEY,
-                options=ClientOptions(auto_refresh_token=False, persist_session=False),
+    # ── Supabase path ──────────────────────────────────────────────────────
+    supabase = _get_supabase_client()
+    if supabase:
+        try:
+            auth_res = supabase.auth.sign_in_with_password(
+                {"email": form.username, "password": form.password}
             )
-            auth_res = client.auth.sign_in_with_password({"email": form.username, "password": form.password})
             if getattr(auth_res, 'user', None):
                 token = create_access_token({"sub": form.username})
+                log.info("Login via Supabase: %s", form.username)
                 return {"access_token": token, "token_type": "bearer"}
-    except Exception:
-        client = None
+            # sign_in_with_password returned but no user — bad credentials
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            err = str(e).lower()
+            # Surface credential errors clearly instead of falling through
+            if "invalid" in err or "credentials" in err or "not found" in err or "email" in err:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid email or password",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            log.error("Supabase login error: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service unavailable. Please try again.",
+            )
 
+    # ── In-memory fallback (no Supabase configured) ────────────────────────
     hashed = _users.get(form.username)
     if not hashed or not verify_password(form.password, hashed):
         raise HTTPException(
@@ -96,7 +134,9 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = create_access_token({"sub": form.username})
+    log.info("Login via in-memory fallback: %s", form.username)
     return {"access_token": token, "token_type": "bearer"}
+
 
 @router.get("/me")
 async def me(current_user: TokenData = Depends(get_current_user)):
