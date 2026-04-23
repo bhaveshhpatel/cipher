@@ -110,7 +110,7 @@ async def _get_session_token() -> Optional[str]:
     IMPORTANT: Uses data={} (not content=b"") so httpx sends Content-Length: 0,
     equivalent to curl -d "", which Tradier requires to issue a sessionid.
     """
-    url = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
+    url = f"{settings.TRADIER_STREAM_URL}/v1/markets/events/session"
     headers = {
         "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
         "Accept": "application/json",
