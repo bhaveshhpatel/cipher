@@ -25,6 +25,12 @@ IMPORTANT: All public functions are async-safe.
   starving the FastAPI event loop (which would cause silent None returns
   and fall-through to seed fallback), every public function runs the
   blocking work inside asyncio.get_event_loop().run_in_executor(None, ...).
+
+ROOT CAUSE FIX (2026-04-23):
+  supabase-py v2 .insert().execute() returns an EMPTY data list by default.
+  You MUST chain .select() after .insert() to get the inserted row back.
+  Without this, snapshot_id was never obtained and save_snapshot always
+  returned False silently, leaving the DB permanently empty.
 """
 import asyncio
 import logging
@@ -156,10 +162,14 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
 
 def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
     """
-    1. Insert new snapshot row (is_active=True)
+    1. Insert new snapshot row (is_active=True) — MUST chain .select() to get id back
     2. Bulk-insert all symbols in batches of 500
     3. Deactivate all other snapshots
     4. Prune snapshots beyond _KEEP_SNAPSHOTS
+
+    KEY FIX: supabase-py v2 returns empty data from .insert().execute() unless
+    you chain .select() after .insert(). Without .select(), snap_result.data is []
+    and snapshot_id can never be obtained, causing every save to silently fail.
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
@@ -169,6 +179,8 @@ def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
         log.info("universe_store: inserting snapshot header (source=%s, symbols=%d)", source, len(symbols))
 
         # 1. Insert snapshot header
+        # CRITICAL: .select() MUST follow .insert() in supabase-py v2 to get the inserted row back.
+        # Without .select(), .execute() returns data=[] and snapshot_id cannot be extracted.
         snap_result = (
             sb.table("options_universe_snapshots")
             .insert({
@@ -176,11 +188,15 @@ def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
                 "source":       source,
                 "is_active":    True,
             })
+            .select()          # ← THE FIX: required in supabase-py v2 to return inserted row
             .execute()
         )
         snap_rows = snap_result.data or []
         if not snap_rows:
-            log.error("universe_store.save_snapshot: insert returned no rows — check RLS/table perms")
+            log.error(
+                "universe_store.save_snapshot: insert returned no rows even with .select() "
+                "— check RLS policies (service key must bypass RLS) and table permissions"
+            )
             return False
         snapshot_id = snap_rows[0]["id"]
         log.info("universe_store: snapshot header inserted id=%s", snapshot_id)
