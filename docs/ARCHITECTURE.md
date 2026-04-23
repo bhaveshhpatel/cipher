@@ -32,7 +32,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │                                                            │
 │    ├── start_flow_writer()        services/flow_store.py        │
 │    │     ├── bus.subscribe("db_writer")                         │
-│    │     ├── persist_flow_episode() → flow_episodes  ← FIXED   │
+│    │     ├── persist_flow_episode() → flow_episodes             │
 │    │     └── _flush_flow_events()  every 5s → flow_events       │
 │    │                                                            │
 │    └── _universe_refresh_loop()   every 24h                     │
@@ -101,11 +101,15 @@ The `AsyncEventBus` (in-memory) delivers each signal to all registered channel s
 
 ### Stage 4 — DB Persistence (`flow_store.py`)
 
+#### Supabase Key — Critical Rule
+
+> `flow_store.py` uses **only** `SUPABASE_SERVICE_ROLE_KEY`. This key bypasses Row Level Security (RLS).
+> The anon key (`SUPABASE_KEY`) respects RLS and will cause **every insert** to fail with `42501`.
+> There is **no fallback** — if the service role key is missing the writer logs a warning and exits.
+> See `docs/FIXES.md` fix C-010 for background.
+
 #### `flow_episodes` table
 Written **immediately** on every signal episode that crosses the repetition threshold.
-
-> ⚠️ Fixed 2026-04-23: Previously incorrectly targeting `composite_signals` (wrong schema → 400).
-> Now correctly targets `flow_episodes`. `id` field is never sent — Postgres generates bigserial.
 
 | Column | Source |
 |--------|--------|
@@ -122,10 +126,10 @@ Written **immediately** on every signal episode that crosses the repetition thre
 | `signal_ts` | timestamp of triggering tick |
 | `created_at` | UTC insert time (Postgres default) |
 
+> `id` is **never sent** — Postgres generates it as `bigserial`.
+
 #### `flow_events` table
 Written in **batches every 5 seconds** (buffered to avoid per-tick DB hammering).
-
-> `id` field is never sent — Postgres generates uuid via `DEFAULT gen_random_uuid()`.
 
 | Column | Source |
 |--------|--------|
@@ -140,6 +144,8 @@ Written in **batches every 5 seconds** (buffered to avoid per-tick DB hammering)
 | `conviction_score` | 0.0–1.0 |
 | `is_golden_sweep` | bool |
 | `created_at` | UTC insert time (Postgres default) |
+
+> `id` is **never sent** — Postgres generates it as `uuid` via `DEFAULT gen_random_uuid()`.
 
 ---
 
@@ -188,15 +194,6 @@ Simulation is triggered via `POST /api/simulate`.
 
 ---
 
-## Known Issues / TODO
-
-- `routers/flow.py` (`GET /api/flow/scan`) returns **mock data** — needs to be wired to `flow_events` table query
-- `flow_events` and `flow_episodes` tables must exist in Supabase with columns matching schemas above
-- RLS policies on both tables must allow service role inserts
-- `flow_store.py` uses `SUPABASE_SERVICE_ROLE_KEY` (preferred) or `SUPABASE_KEY` — ensure env var is set in Railway
-
----
-
 ## Environment Variables Required
 
 | Variable | Used by | Required |
@@ -205,7 +202,15 @@ Simulation is triggered via `POST /api/simulate`.
 | `TRADIER_BASE_URL` | tradier_stream.py | Yes |
 | `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
 | `SUPABASE_URL` | flow_store.py, universe_store.py | Yes |
-| `SUPABASE_SERVICE_ROLE_KEY` | flow_store.py | Yes (for DB writes) |
-| `SUPABASE_KEY` | universe_store.py | Yes |
+| `SUPABASE_SERVICE_ROLE_KEY` | flow_store.py | **Yes — service role key, not anon key** |
+| `SUPABASE_KEY` | universe_store.py | Yes (anon key for reads) |
 | `SECRET_KEY` | auth.py | Yes |
 | `ALGORITHM` | auth.py | Yes (default: HS256) |
+
+---
+
+## Known Issues / TODO
+
+- `routers/flow.py` (`GET /api/flow/scan`) returns **mock data** — needs to be wired to `flow_events` table query
+- `flow_events` and `flow_episodes` tables must exist in Supabase with columns matching schemas above
+- RLS policies on both tables must permit `service_role` inserts (or be disabled for the service role)

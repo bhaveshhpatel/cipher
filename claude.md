@@ -98,6 +98,7 @@ cipher/
 │   │   ├── options_flow_parser.py
 │   │   └── bid_ask_classifier.py
 │   ├── services/
+│   │   ├── flow_store.py          # DB writer: flow_events + flow_episodes — uses SERVICE ROLE KEY only
 │   │   ├── symbols_loader.py      # Steps 1–3: CBOE fetch, validation, batch quotes
 │   │   ├── universe_store.py      # Steps 4–5: DB read/write + upsert_symbol_quotes
 │   │   ├── universe_screener.py   # DEPRECATED — OI-based screener, no longer called
@@ -108,6 +109,13 @@ cipher/
 │       └── test_symbols_loader.py # Steps 1–3 full coverage incl. Step 3 batch quotes
 ├── frontend/
 │   └── (Next.js 14 app)
+├── docs/
+│   ├── ARCHITECTURE.md        # System data flow and DB schema
+│   ├── BACKLOG.md
+│   ├── FIXES.md               # Chronological log of all bug fixes applied
+│   ├── features.md
+│   ├── regression-test-plan.md
+│   └── specs.md
 └── claude.md                  # This file — Claude context for code changes
 ```
 
@@ -122,6 +130,25 @@ cipher/
 | C-007 | `config.py` missing `priority_symbols` property — added `@property` that parses `UNIVERSE_PRIORITY_SYMBOLS` string into `list[str]` |
 | C-008 | `stream_eligible` column missing from DB migration — added in `002_universe_symbols_quotes.sql` along with `last_price` and `volume` |
 | C-009 | `universe_screener.py` OI-based per-symbol screening replaced by `_fetch_batch_quotes()` batch quotes (Step 3) — screener marked deprecated |
+| C-010 | `flow_store.py` was falling back to `SUPABASE_KEY` (anon key) when `SUPABASE_SERVICE_ROLE_KEY` was missing — anon key respects RLS and caused every `flow_episodes` insert to fail with 401/42501. Fixed: removed fallback, `SUPABASE_SERVICE_ROLE_KEY` is now required exclusively. See `docs/FIXES.md` for full details. |
+
+---
+
+## Critical Rules — Supabase Key Usage
+
+> **NEVER use the anon key (`SUPABASE_KEY`) for any server-side DB write.**
+>
+> `flow_store.py` uses **only** `SUPABASE_SERVICE_ROLE_KEY`. This key bypasses Row Level Security (RLS).
+> The anon key respects RLS policies and will cause **every insert** to fail with `42501` (policy violation).
+> There is NO fallback to the anon key — if `SUPABASE_SERVICE_ROLE_KEY` is missing, `flow_store.py` logs
+> a warning and exits cleanly rather than silently using the wrong key.
+
+### Supabase Key Reference
+
+| Key | Env var | Used by | Bypasses RLS? |
+|-----|---------|---------|---------------|
+| Anon / Public | `SUPABASE_KEY` | `universe_store.py` (reads only) | ❌ No |
+| Service Role | `SUPABASE_SERVICE_ROLE_KEY` | `flow_store.py` (writes) | ✅ Yes |
 
 ---
 
@@ -149,6 +176,11 @@ Kept in the repo for reference and backward test compatibility.
 `screen_universe()` emits a deprecation warning log if called.
 Do NOT re-add a call to it from `load_universe()`.
 
+### flow_store.py — Key Selection
+`flow_store.py` is the **only** module that writes options flow data to the DB.
+It **must** use `SUPABASE_SERVICE_ROLE_KEY`. Never introduce a fallback to `SUPABASE_KEY` here.
+See the Critical Rules section above.
+
 ---
 
 ## Environment Variables (Full List)
@@ -161,8 +193,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES=1440
 
 # Supabase
 SUPABASE_URL=
-SUPABASE_KEY=
-SUPABASE_SERVICE_KEY=
+SUPABASE_KEY=                      # anon key — used by universe_store.py (reads)
+SUPABASE_SERVICE_ROLE_KEY=          # service role key — REQUIRED by flow_store.py (writes)
 
 # Tradier
 TRADIER_API_KEY=
