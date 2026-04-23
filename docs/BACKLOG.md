@@ -19,7 +19,7 @@
 | B-007 | Charting on dashboard | 🔲 Todo | Add price/signal charts to the main dashboard (e.g. options flow overlaid on price chart). |
 | B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting), reconnect count, last tick time. |
 | B-009 | Wire `trade_executor.py` into signal flow | 🔲 Todo | `execution/trade_executor.py` exists but is not connected to the composite signal engine output. |
-| B-010 | Supabase DB — active query integration | 🔲 Todo | Auth works via Supabase; DB tables not yet actively queried. Wire signal storage + user prefs. |
+| B-010 | Supabase DB — signal storage | 🔲 Todo | Universe tables live (C-004). Wire signal storage + user prefs into DB. |
 | B-011 | Redis integration | 🔲 Todo | Redis is in config but not used. Candidate for signal caching + WebSocket pub/sub at scale. |
 
 ---
@@ -31,6 +31,7 @@
 | C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json, confirmed login page live. |
 | C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: fixed ReadableStream body bug (Vercel runtime), Next.js 15 async params, TS strict mode. |
 | C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. See `docs/specs.md` § Tradier Stream Architecture. |
+| C-004 | Options universe persistence | 2026-04-23 | ~8,000-symbol tradeable universe persisted in Supabase. DB-first startup (< 1s cold start), 24h background refresh, full fallback chain. `symbols_loader.py` + `universe_store.py` + `001_options_universe.sql` migration (applied). 30 test cases. See `docs/specs.md` § Options Universe Persistence. |
 
 ---
 
@@ -46,6 +47,8 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-23 | Added C-004 options universe persistence — symbols_loader, universe_store, DB migration, 30 tests |
+| 2026-04-23 | Updated B-010 — universe tables live; now specifically about signal storage |
 | 2026-04-22 | Created backlog with B-001 through B-007 |
 | 2026-04-22 | Added C-001 frontend deployment fix |
 | 2026-04-23 | Added C-002 auth 501 fix |

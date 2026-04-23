@@ -11,6 +11,7 @@ Cipher is an institutional options flow intelligence platform. It ingests real-t
 **Live URLs**
 - Frontend: Vercel (bhaveshhpatels-projects/cipher)
 - Backend: Railway (`cipher-production-6cd8.up.railway.app`)
+- Database: Supabase `cipher-database` — project ID `kpajucxqlrteckfuafvq` (us-west-2)
 
 ---
 
@@ -23,24 +24,109 @@ Cipher is an institutional options flow intelligence platform. It ingests real-t
 | Auth | JWT (`python-jose` + `passlib` bcrypt) |
 | Streaming | Tradier WebSocket → async in-process event bus |
 | AI Engine | OpenAI GPT-4o-mini (6-agent swarm) |
-| Database | Supabase (PostgreSQL) |
+| Database | Supabase (PostgreSQL) — universe snapshots + auth |
 | Deploy | Railway (BE) + Vercel (FE) |
 | CI/CD | GitHub Actions |
+
+---
+
+## Options Universe Persistence (Added 2026-04-23)
+
+### Overview
+
+The full universe of tradeable options symbols (~8,000 tickers) is persisted in Supabase. This eliminates cold-start delays, Tradier downtime blind spots, and audit gaps.
+
+### Startup Resolution Order
+
+`main.py` → `_resolve_startup_universe()` runs at app startup:
+
+```
+App startup
+  │
+  ├─ 1. Query DB for latest active snapshot (< 24h old)
+  │       └─ Found & fresh → LOAD from DB → stream starts in < 1s ✅
+  │
+  ├─ 2. No fresh snapshot
+  │       └─ Fetch from Tradier + validate (parallel, semaphore=20)
+  │             ├─ Success → SAVE to DB → mark active → start stream ✅
+  │             └─ Tradier down → load LAST snapshot (any age) from DB
+  │                   └─ None ever in DB → SEED_SYMBOLS (16 tickers) ✅
+  │
+  └─ 3. Background refresh every 24h (_universe_refresh_loop asyncio.Task)
+          └─ Success → SAVE new snapshot → deactivate old one ✅
+          └─ Failure → keep current active snapshot, log warning ✅
+```
+
+### DB Schema
+
+```sql
+-- One row per validated universe snapshot
+CREATE TABLE options_universe_snapshots (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  symbol_count  INT NOT NULL,
+  source        TEXT NOT NULL
+    CHECK (source IN ('tradier_validated', 'seed_fallback', 'cache')),
+  is_active     BOOLEAN NOT NULL DEFAULT true
+);
+
+-- Individual symbols per snapshot (normalized)
+CREATE TABLE options_universe_symbols (
+  snapshot_id  UUID NOT NULL
+    REFERENCES options_universe_snapshots(id) ON DELETE CASCADE,
+  symbol       TEXT NOT NULL,
+  PRIMARY KEY (snapshot_id, symbol)
+);
+
+-- Partial unique index: only 1 active snapshot at a time (DB-level enforcement)
+CREATE UNIQUE INDEX idx_universe_snapshots_single_active
+  ON options_universe_snapshots (is_active)
+  WHERE is_active = true;
+```
+
+**Migration file:** `backend/migrations/001_options_universe.sql` — applied to production 2026-04-23.
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| 24h refresh cadence | Options-active universe changes slowly (IPOs, delistings). Daily is sufficient. |
+| Keep last 7 snapshots | Audit / debugging. ON DELETE CASCADE auto-purges older ones. |
+| Never block stream on refresh | Background asyncio task — stream runs with current universe while refresh is in-flight. |
+| `source` field | Distinguishes `tradier_validated` (full coverage) vs `seed_fallback` (degraded) vs `cache` (loaded from DB). |
+| Partial unique index | DB-level safety net: only one `is_active = true` row can ever exist. |
+| Batch insert (500) | Supabase REST performance — bulk inserts chunked to avoid payload limits. |
+
+### Services
+
+| File | Responsibility |
+|---|---|
+| `services/symbols_loader.py` | `load_universe(settings)` — fetches optionable symbols from Tradier REST, validates each via expiration check (20 concurrent via semaphore), handles 401, network errors, empty results, single-dict Tradier responses, lowercase symbols. Returns `(List[str], source_str)`. |
+| `services/universe_store.py` | `load_fresh_snapshot(max_age_hours=24)`, `load_any_snapshot()`, `save_snapshot(symbols, source)`. Batches symbol inserts in 500s. Prunes to last 7 snapshots. |
+| `migrations/001_options_universe.sql` | DDL for both tables + 3 indexes. Applied to `cipher-database`. |
+
+### Test Coverage
+
+| File | Cases | What's covered |
+|---|---|---|
+| `tests/test_symbols_loader.py` | 20 | Success path, 401, network error, empty results, single-dict Tradier quirk, symbol normalization, exception isolation per symbol, all 6 `load_universe()` fallback scenarios |
+| `tests/test_universe_store.py` | 10 | Fresh snapshot hit, no snapshot, stale fallback, empty symbol guard, insert failure, DB exception, prune-when-over-7, batch-insert for >500 symbols |
 
 ---
 
 ## Signal Pipeline
 
 ```
-Tradier WebSocket
-  └─ options_flow_parser.py       → OptionsFlowEvent
-       └─ bid_ask_classifier.py   → fill aggressiveness
-       └─ trade_type_detector.py  → SWEEP / BLOCK / SPLIT / SINGLE
-  └─ repetition_accumulator.py    → RepetitionEpisode
-       (30-min window, min 3 trades, min $50K premium)
-  └─ composite_signal_engine.py   → composite score
-       (flow_score × 0.6 + backtest_score × 0.4)
-  └─ async_bus                    → broadcast to WebSocket subscribers
+_resolve_startup_universe()   ← loads symbol list from DB (or fallback)
+  └─ Tradier WebSocket (subscribed to universe symbols)
+       └─ options_flow_parser.py       → OptionsFlowEvent
+            └─ bid_ask_classifier.py   → fill aggressiveness
+            └─ trade_type_detector.py  → SWEEP / BLOCK / SPLIT / SINGLE
+       └─ repetition_accumulator.py    → RepetitionEpisode
+            (30-min window, min 3 trades, min $50K premium)
+       └─ composite_signal_engine.py   → composite score
+            (flow_score × 0.6 + backtest_score × 0.4)
+       └─ async_bus                    → broadcast to WebSocket subscribers
 ```
 
 ---
@@ -99,7 +185,7 @@ startup
 
 ### Idle Watchdog
 
-Tradier sends bare `\n` keepalives. If no line (including keepalives) is received within **30 seconds**, `_guarded_lines()` raises `asyncio.TimeoutError`, which triggers an immediate reconnect. This prevents silent TCP hangs from causing indefinite data gaps.
+Tradier sends bare `\n` keepalives. If no line (including keepalives) is received within **30 seconds**, `_guarded_lines()` raises `asyncio.TimeoutError`, which triggers an immediate reconnect.
 
 ```python
 async def _guarded_lines(resp):
@@ -127,7 +213,7 @@ def _backoff(attempt: int) -> float:
 
 ### Demo Mode
 
-Demo mode runs as a cancellable `asyncio.Task` (`_demo_mode_once()`). It emits synthetic signals at random intervals and is immediately cancelled when a live Tradier connection is established. It is **not** a blocking infinite loop — cancellation is clean via `asyncio.CancelledError`.
+Demo mode runs as a cancellable `asyncio.Task` (`_demo_mode_once()`). It emits synthetic signals at random intervals and is immediately cancelled when a live Tradier connection is established.
 
 Demo mode is only entered when:
 1. `TRADIER_API_KEY` is not set (permanent demo until restart)
@@ -138,7 +224,7 @@ Demo mode is only entered when:
 The module exposes `get_stats()` returning:
 ```json
 {
-  "active_symbols": 8,
+  "active_symbols": 8012,
   "ticks": 1420,
   "classified": 893,
   "signals": 47,
@@ -160,12 +246,25 @@ The module exposes `get_stats()` returning:
 
 ---
 
+## Supabase Schema
+
+### Live Tables (`cipher-database` — `kpajucxqlrteckfuafvq`)
+
+| Table | Purpose | Migration |
+|---|---|---|
+| `options_universe_snapshots` | One row per validated ~8,000-symbol universe snapshot | `001_options_universe.sql` |
+| `options_universe_symbols` | Individual symbols per snapshot (normalized, ON DELETE CASCADE) | `001_options_universe.sql` |
+
+> Auth tables are managed by Supabase Auth (built-in `auth.users`).
+
+---
+
 ## Authentication
 
 - JWT-based, issued on login, stored client-side
 - `ACCESS_TOKEN_EXPIRE_MINUTES`: 1440 (24 hours)
 - Protected routes: all `/api/*` except `/api/auth/register` and `/api/auth/login`
-- Supabase used for user persistence; DB tables not yet actively queried beyond auth
+- Supabase used for user persistence; signal storage not yet wired
 
 ---
 
@@ -184,7 +283,7 @@ Next.js App Router catch-all route at `app/api/[...path]/route.ts` proxies all `
 
 ### Backend (Railway)
 - Nixpacks build from `backend/`
-- Entry: `uvicorn main:app --host 0.0.0.0 --port 8080`
+- Entry: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Auto-deploys on push to `main`
 - Env vars set in Railway dashboard
 

@@ -20,6 +20,10 @@
 | **WebSocket broadcast** | Real-time signals to connected clients | Stable via `async_bus` |
 | **Swarm simulation** | 6-agent GPT-4o-mini verdict engine | Stable |
 | **CORS** | Preflight handling | Fixed 2026-04-22 |
+| **Options universe persistence** | ~8,000-symbol tradeable universe stored in Supabase | Shipped 2026-04-23. DB snapshot loaded on startup in < 1s; refreshed every 24h in background. Full fallback chain: DB → Tradier → stale DB → seed. |
+| **Universe snapshot store** | `services/universe_store.py` — Supabase read/write | Snapshots batched in 500s, pruned to last 7, partial unique index enforces single active row. |
+| **Universe symbols loader** | `services/symbols_loader.py` — Tradier fetch + validation | 20-concurrent semaphore, handles 401/network/empty/single-dict/lowercase edge cases. |
+| **Universe background refresh** | 24h asyncio background task in `main.py` | Never blocks stream; keeps active snapshot current without restart. |
 
 ---
 
@@ -27,7 +31,7 @@
 
 | Feature | Description | Gap |
 |---------|-------------|-----|
-| **Supabase DB** | Auth works; PostgreSQL available | Tables not yet actively queried beyond auth. Signal storage + user prefs not wired. |
+| **Supabase DB — signal storage** | Universe tables live; signal storage not yet wired | `options_universe_snapshots` + `options_universe_symbols` live. Signal storage + user prefs not yet wired. |
 | **Stream health endpoint** | `/health/stream` exposing mode + reconnect count | `get_stats()` exists in `tradier_stream.py`; not yet exposed as HTTP endpoint |
 | **Frontend styling** | Tailwind CSS available | Many components use inline styles; Tailwind underused |
 
@@ -53,6 +57,23 @@
 | 2026-04-23 | `401 — session token rejected` after 5 min, permanent demo mode | Token fetched once at startup, reused after stream drop (tokens expire on close) | Re-fetch token on every reconnect |
 | 2026-04-23 | `peer closed connection without sending complete message body` | No idle watchdog; silent TCP hang went undetected | 30s `asyncio.wait_for` per line |
 | 2026-04-23 | Never recovers from 401 — stays in demo mode forever | `_demo_mode()` was blocking infinite loop with `return` after 401 | Demo mode is now cancellable `asyncio.Task`; loop always retries |
+
+---
+
+## Options Universe — Architecture Notes
+
+### Before (hardcoded seed)
+- `DEFAULT_SYMBOLS` — 16 hardcoded tickers
+- Cold start: instant, but near-zero market coverage
+- No persistence, no audit trail, no fallback on Tradier downtime
+
+### After (DB-persisted universe)
+- Up to ~8,000 validated optionable symbols loaded from Supabase snapshot
+- Cold start: < 1 second (DB load) on subsequent deploys
+- Background refresh every 24h, zero stream interruption
+- Full fallback chain: fresh DB → Tradier validate → stale DB → seed
+- `source` field distinguishes `tradier_validated` / `seed_fallback` / `cache`
+- Last 7 snapshots retained for audit; older auto-purged via ON DELETE CASCADE
 
 ---
 
