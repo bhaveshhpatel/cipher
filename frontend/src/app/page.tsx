@@ -2,16 +2,19 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { CipherLogo } from "@/components/CipherLogo";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { useAuth } from "@/hooks/useAuth";
 
 export default function LoginPage() {
   const router = useRouter();
   const { login, register, isAuthenticated, loading, error } = useAuth();
-  const [mode,     setMode]     = useState<"login"|"register">("login");
+  const [mode,     setMode]     = useState<"login" | "register">("login");
   const [email,    setEmail]    = useState("");
   const [password, setPassword] = useState("");
 
-  useEffect(() => { if (isAuthenticated) router.push("/dashboard"); }, [isAuthenticated, router]);
+  useEffect(() => {
+    if (isAuthenticated) router.push("/dashboard");
+  }, [isAuthenticated, router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,97 +22,168 @@ export default function LoginPage() {
     else                  await register(email, password);
   };
 
-  const inp = {
-    background:"rgba(6,11,24,0.8)", border:"1px solid rgba(30,45,74,0.8)",
-    borderRadius:8, padding:"12px 14px", width:"100%", outline:"none",
-    fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:"#e8edf5",
-    transition:"border-color 0.2s",
-  } as React.CSSProperties;
-
   return (
-    <div style={{ minHeight:"100dvh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, position:"relative", zIndex:2 }}>
-      {/* Radial glow */}
-      <div style={{ position:"fixed", top:"35%", left:"50%", transform:"translate(-50%,-50%)", width:600, height:600,
-        background:"radial-gradient(circle, rgba(0,212,255,0.05) 0%, transparent 70%)", pointerEvents:"none" }} />
+    <div className="min-h-dvh flex flex-col items-center justify-center p-6 relative"
+         style={{ background: "var(--bg)" }}>
+
+      {/* Theme toggle — top right */}
+      <div className="fixed top-4 right-4 z-50">
+        <ThemeToggle />
+      </div>
+
+      {/* Subtle radial glow behind card (light: amber, dark: blue) */}
+      <div
+        className="fixed pointer-events-none"
+        style={{
+          top: "40%", left: "50%", transform: "translate(-50%, -50%)",
+          width: 700, height: 700,
+          background: "radial-gradient(circle, rgba(232,160,32,0.07) 0%, transparent 65%)",
+        }}
+      />
+
+      {/* Logo + tagline */}
+      <div className="mb-8 flex flex-col items-center gap-2">
+        <CipherLogo size={72} showTagline />
+      </div>
 
       {/* Card */}
-      <div style={{
-        width:"100%", maxWidth:420,
-        background:"rgba(12,20,40,0.85)", backdropFilter:"blur(12px)",
-        border:"1px solid rgba(30,45,74,0.8)", borderRadius:16,
-        padding:40, display:"flex", flexDirection:"column", alignItems:"center", gap:28,
-        boxShadow:"0 24px 64px rgba(0,0,0,0.5)",
-        position:"relative", overflow:"hidden",
-      }}>
-        {/* Cyan accent line at top */}
-        <div style={{ position:"absolute", top:0, left:"15%", right:"15%", height:1,
-          background:"linear-gradient(90deg,transparent,#00d4ff80,transparent)" }} />
-
-        <CipherLogo size={80} showTagline />
+      <div
+        className="w-full max-w-[420px] rounded-xl p-8 flex flex-col gap-6 animate-fade-up"
+        style={{
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          boxShadow: "0 4px 24px rgba(0,0,0,0.07), 0 1px 4px rgba(0,0,0,0.05)",
+        }}
+      >
+        {/* Amber accent top rule */}
+        <div
+          className="absolute top-0 left-[20%] right-[20%] h-px"
+          style={{ background: "linear-gradient(90deg, transparent, var(--amber), transparent)" }}
+        />
 
         {/* Mode tabs */}
-        <div style={{ display:"flex", gap:0, width:"100%", background:"rgba(6,11,24,0.6)",
-          borderRadius:8, border:"1px solid rgba(30,45,74,0.6)", overflow:"hidden" }}>
-          {(["login","register"] as const).map(m => (
-            <button key={m} onClick={()=>setMode(m)} style={{
-              flex:1, padding:"9px 0",
-              fontFamily:"'JetBrains Mono',monospace", fontSize:9,
-              letterSpacing:"0.2em", fontWeight:700, cursor:"pointer",
-              background: mode===m ? "rgba(0,212,255,0.1)" : "transparent",
-              color: mode===m ? "#00d4ff" : "#304060",
-              borderRight: m==="login" ? "1px solid rgba(30,45,74,0.6)" : "none",
-              transition:"all 0.2s", textTransform:"uppercase",
-            }}>
-              {m === "login" ? "SIGN IN" : "REGISTER"}
+        <div
+          className="flex rounded-lg overflow-hidden"
+          style={{ border: "1px solid var(--border)", background: "var(--surface-2)" }}
+        >
+          {(["login", "register"] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              className="flex-1 py-2.5 text-xs font-bold uppercase tracking-widest transition-all"
+              style={{
+                background:   mode === m ? "var(--amber)" : "transparent",
+                color:        mode === m ? "#1a0f00"      : "var(--faint)",
+                borderRight:  m === "login" ? "1px solid var(--border)" : "none",
+              }}
+            >
+              {m === "login" ? "Sign In" : "Register"}
             </button>
           ))}
         </div>
 
-        <form onSubmit={handleSubmit} style={{ width:"100%", display:"flex", flexDirection:"column", gap:14 }}>
-          <div>
-            <label style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:8, color:"#304060", letterSpacing:"0.15em", display:"block", marginBottom:7 }}>EMAIL</label>
-            <input type="email" value={email} onChange={e=>setEmail(e.target.value)} required
-              placeholder="trader@cipher.io" style={inp}
-              onFocus={e=>{(e.target as HTMLInputElement).style.borderColor="rgba(0,212,255,0.4)";}}
-              onBlur={e=>{(e.target as HTMLInputElement).style.borderColor="rgba(30,45,74,0.8)";}} />
-          </div>
-          <div>
-            <label style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:8, color:"#304060", letterSpacing:"0.15em", display:"block", marginBottom:7 }}>PASSWORD</label>
-            <input type="password" value={password} onChange={e=>setPassword(e.target.value)} required
-              placeholder="••••••••" style={inp}
-              onFocus={e=>{(e.target as HTMLInputElement).style.borderColor="rgba(0,212,255,0.4)";}}
-              onBlur={e=>{(e.target as HTMLInputElement).style.borderColor="rgba(30,45,74,0.8)";}} />
+        {/* Form */}
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          {/* Email */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              className="text-xs font-semibold uppercase tracking-widest"
+              style={{ color: "var(--muted)" }}
+            >
+              Email
+            </label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              placeholder="trader@cipher.io"
+              className="w-full px-3.5 py-3 rounded-lg text-sm font-mono outline-none transition-all"
+              style={{
+                background:   "var(--surface-2)",
+                border:       "1px solid var(--border)",
+                color:        "var(--text)",
+              }}
+              onFocus={(e) => (e.target.style.borderColor = "var(--amber)")}
+              onBlur={(e)  => (e.target.style.borderColor = "var(--border)")}
+            />
           </div>
 
+          {/* Password */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              className="text-xs font-semibold uppercase tracking-widest"
+              style={{ color: "var(--muted)" }}
+            >
+              Password
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              placeholder="••••••••"
+              className="w-full px-3.5 py-3 rounded-lg text-sm font-mono outline-none transition-all"
+              style={{
+                background:   "var(--surface-2)",
+                border:       "1px solid var(--border)",
+                color:        "var(--text)",
+              }}
+              onFocus={(e) => (e.target.style.borderColor = "var(--amber)")}
+              onBlur={(e)  => (e.target.style.borderColor = "var(--border)")}
+            />
+          </div>
+
+          {/* Error */}
           {error && (
-            <div style={{ padding:"9px 12px", borderRadius:7, background:"rgba(239,68,68,0.07)", border:"1px solid rgba(239,68,68,0.25)",
-              fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#ef4444" }}>⚠ {error}</div>
+            <div
+              className="px-3.5 py-2.5 rounded-lg text-sm font-mono"
+              style={{
+                background:   "rgba(220,53,69,0.07)",
+                border:       "1px solid rgba(220,53,69,0.25)",
+                color:        "var(--red)",
+              }}
+            >
+              ⚠ {error}
+            </div>
           )}
 
-          <button type="submit" disabled={loading} style={{
-            padding:"13px 0", borderRadius:8, marginTop:4, cursor: loading?"not-allowed":"pointer",
-            fontFamily:"'JetBrains Mono',monospace", fontSize:10, fontWeight:700, letterSpacing:"0.2em",
-            background: loading ? "rgba(30,45,74,0.3)" : "rgba(0,212,255,0.1)",
-            border:`1px solid ${loading?"rgba(30,45,74,0.4)":"rgba(0,212,255,0.4)"}`,
-            color: loading ? "#304060" : "#00d4ff",
-            transition:"all 0.2s",
-            boxShadow: loading ? "none" : "0 0 16px rgba(0,212,255,0.12)",
-          }}>
-            {loading ? "AUTHENTICATING…" : mode==="login" ? "ACCESS CIPHER" : "CREATE ACCOUNT"}
+          {/* Submit */}
+          <button
+            type="submit"
+            disabled={loading}
+            className="btn btn-primary w-full py-3 text-sm mt-1"
+          >
+            {loading ? (
+              <span className="flex items-center gap-2">
+                <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                </svg>
+                {mode === "login" ? "Signing in…" : "Creating account…"}
+              </span>
+            ) : (
+              mode === "login" ? "Sign In" : "Create Account"
+            )}
           </button>
         </form>
 
-        {/* Feature pills */}
-        <div style={{ display:"flex", gap:8, flexWrap:"wrap", justifyContent:"center" }}>
-          {["LIVE FLOW","WHALE ALERTS","AI SWARM","COMPOSITE SIGNALS"].map(f=>(
-            <span key={f} style={{ padding:"4px 10px", borderRadius:20,
-              fontFamily:"'JetBrains Mono',monospace", fontSize:8, letterSpacing:"0.15em",
-              color:"#304060", background:"rgba(30,45,74,0.2)", border:"1px solid rgba(30,45,74,0.4)" }}>
-              {f}
-            </span>
-          ))}
-        </div>
+        {/* Footer link */}
+        <p className="text-center text-xs" style={{ color: "var(--faint)" }}>
+          {mode === "login" ? "Don't have an account? " : "Already have an account? "}
+          <button
+            onClick={() => setMode(mode === "login" ? "register" : "login")}
+            className="font-semibold transition-colors hover:opacity-80"
+            style={{ color: "var(--amber)" }}
+          >
+            {mode === "login" ? "Register" : "Sign In"}
+          </button>
+        </p>
       </div>
+
+      {/* Footer tagline */}
+      <p className="mt-8 text-xs text-center" style={{ color: "var(--faint)" }}>
+        Institutional options flow intelligence · Real-time whale detection
+      </p>
     </div>
   );
 }
