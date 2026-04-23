@@ -59,11 +59,11 @@ cipher/
 │   │   ├── swarm_engine.py      # 6 LLM agents with distinct trading roles
 │   │   └── ensemble_runner.py   # Aggregate agent verdicts into consensus
 │   ├── execution/
-│   │   └── trade_executor.py    # Tradier order placement
+│   │   └── trade_executor.py    # Tradier order placement (not yet wired in)
 │   ├── services/
 │   │   └── tradier_stream.py    # Live Tradier WS stream processor + demo mode
 │   └── routers/
-│       ├── auth.py              # POST /api/auth/token, /register
+│       ├── auth.py              # POST /api/auth/token, /register — FIXED 2026-04-23
 │       ├── flow.py              # GET /api/flow/scan
 │       ├── simulation.py        # POST /api/simulation/run
 │       ├── ws.py                # WS /ws/signals
@@ -137,8 +137,6 @@ cipher/
 | `NEXT_PUBLIC_WS_URL` | **Vercel dashboard only** | `wss://cipher-production-6cd8.up.railway.app/` |
 
 > ⚠️ Do NOT add these to `vercel.json` or the GitHub Actions workflow.
-> Managing them in the workflow caused the @cipher_api_url secret reference
-> bug that broke every deploy for hours.
 
 ---
 
@@ -167,6 +165,26 @@ Recommendation:
   else                          → HOLD
 ```
 
+### Auth Flow (post-fix)
+
+```
+Register:
+  POST /api/auth/register (email, password)
+    → if SUPABASE_URL + SUPABASE_SERVICE_KEY set: create user via admin API
+    → else: store hash in in-memory _users dict
+
+Login:
+  POST /api/auth/token (username=email, password)
+    → if SUPABASE_URL + SUPABASE_KEY set: sign_in_with_password
+        → credential error → 401 (no silent fallthrough)
+        → service error → 503
+    → else: verify against _users dict
+    → success → JWT created with create_access_token({"sub": email})
+```
+
+> ⚠️ In-memory `_users` dict resets on every Railway deploy. In production,
+> Supabase must be configured so users persist.
+
 ### Swarm Simulation
 
 Six LLM agents (GPT-4o-mini) with roles:
@@ -176,8 +194,6 @@ Six LLM agents (GPT-4o-mini) with roles:
 - **Technical Analyst** — IV + chart context
 - **Macro Strategist** — broad market context
 - **Risk Manager** — downside and position sizing
-
-Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. `ensemble_runner.py` aggregates votes into a consensus verdict.
 
 ### Alert Levels
 
@@ -194,14 +210,15 @@ Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. 
 
 | Area | Status |
 |---|---|
-| Frontend deployment | ✅ **Live on Vercel** — login page confirmed working |
-| Backend deployment | ✅ **Live on Railway** — `https://cipher-production-6cd8.up.railway.app` |
-| Flow data | **Mocked** — deterministic `random.Random` seeded by ticker hash; live Tradier wires exist but need valid API key |
-| Supabase | Configured but **not actively queried** |
-| Redis | In `config.py` but **not yet integrated** |
-| Frontend styling | **Inline styles** used throughout dashboard components despite Tailwind being installed |
-| Trade execution | `trade_executor.py` exists but is not wired into the main signal flow |
-| Anthropic key | In config but **not used** |
+| Frontend deployment | ✅ Live on Vercel |
+| Backend deployment | ✅ Live on Railway |
+| Auth — register + login | ✅ **Fixed 2026-04-23** — Supabase path no longer silently falls through; credential errors surface as 401 |
+| Flow data | **Mocked** — deterministic seed by ticker hash; live Tradier wires exist but need valid API key |
+| Supabase | Auth working; DB not actively queried yet |
+| Redis | In `config.py` but not integrated |
+| Frontend styling | Inline styles throughout dashboard; Tailwind installed but not fully used |
+| Trade execution | `trade_executor.py` exists but not wired into signal flow |
+| Anthropic key | In config but not used |
 
 ---
 
@@ -210,16 +227,15 @@ Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. 
 ### Frontend (Vercel via GitHub Actions)
 - Workflow: `.github/workflows/frontend.yml`
 - Triggers on `push` to `main` when `frontend/**` files change
-- All Vercel CLI steps (`pull`, `build`, `deploy`) run from **repo root** — not `frontend/`
-- The Vercel project has `rootDirectory=frontend` in the dashboard → written into `project.json` by `vercel pull` → CLI uses it automatically
-- `vercel.json` has `buildCommand`, `outputDirectory`, `framework` **only — no `env` block ever**
+- All Vercel CLI steps run from **repo root** (not `frontend/`)
+- `vercel.json` has `buildCommand`, `outputDirectory`, `framework` **only — no `env` block**
 - Frontend env vars managed in **Vercel dashboard only**
 - To manually trigger a deploy: bump `frontend/.deploy-trigger`
 
 ### Backend (Railway via GitHub Actions)
 - Workflow: `.github/workflows/backend.yml`
 - Triggers on `push` to `main` when `backend/**` files change
-- ⚠️ **Disable Railway dashboard auto-deploy** — it triggers on every `main` push regardless of path, causing backend deploys on frontend-only changes
+- ⚠️ **Disable Railway dashboard auto-deploy** to prevent double-deploys
 
 ---
 
@@ -227,8 +243,8 @@ Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. 
 
 - Backend: Python 3.11, async/await throughout, pydantic models for all I/O
 - Frontend: TypeScript strict mode, functional components, custom hooks pattern
-- Auth guard: all protected routes use `Depends(get_current_user)` (BE) and `useAuth` hook redirect (FE)
-- Monorepo with `backend/` and `frontend/` as siblings
+- Auth guard: `Depends(get_current_user)` (BE) and `useAuth` hook redirect (FE)
+- Monorepo: `backend/` and `frontend/` as siblings
 - No ORM — direct Supabase REST/postgrest calls planned
 
 ---
@@ -239,7 +255,7 @@ Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. 
 ```bash
 cd backend
 pip install -r requirements.txt
-cp .env.example .env   # Fill in secrets
+cp .env.example .env
 uvicorn main:app --reload --port 8000
 ```
 
@@ -247,7 +263,7 @@ uvicorn main:app --reload --port 8000
 ```bash
 cd frontend
 npm install
-cp .env.example .env.local  # Fill in vars
+cp .env.example .env.local
 npm run dev
 ```
 
@@ -266,8 +282,9 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug — all CLI steps now run from repo root |
-| 2026-04-22 | **Root cause fixed**: removed `@cipher_api_url` / `@cipher_ws_url` secret refs from `frontend/vercel.json` env block |
-| 2026-04-22 | Documented Railway auto-deploy issue — disable dashboard auto-deploy to prevent unintended backend deploys |
+| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through to in-memory dict after register; credential errors now return 401; added `_get_supabase_client()` helper; added logging throughout auth router |
+| 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
+| 2026-04-22 | Removed `@cipher_api_url` / `@cipher_ws_url` secret refs from `frontend/vercel.json` |
+| 2026-04-22 | Documented Railway auto-deploy issue |
 | 2026-04-22 | Frontend confirmed live — login page visible |
 | 2026-04-22 | Created `docs/BACKLOG.md` with B-001 through B-007 |
