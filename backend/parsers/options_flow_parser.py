@@ -55,7 +55,12 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         bid       = float(raw.get("bid",  0))
         ask       = float(raw.get("ask",  0))
         fill      = float(raw.get("price", (bid+ask)/2))
-        size      = int(raw.get("size", 0))
+        size      = int(raw.get("size") or 0)  # Phase 3: guard missing/null size
+
+        # Skip zero-size events — no valid premium can be derived
+        if size == 0:
+            return None
+
         premium   = fill * size * 100
 
         ctype     = "CALL" if raw.get("option_type","C").upper() in ("C","CALL") else "PUT"
