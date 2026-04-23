@@ -105,12 +105,22 @@ CREATE UNIQUE INDEX idx_universe_snapshots_single_active
 | `services/universe_store.py` | `load_fresh_snapshot(max_age_hours=24)`, `load_any_snapshot()`, `save_snapshot(symbols, source)`. Batches symbol inserts in 500s. Prunes to last 7 snapshots. |
 | `migrations/001_options_universe.sql` | DDL for both tables + 3 indexes. Applied to `cipher-database`. |
 
+### supabase-py v2 — uuid4 snapshot_id Pattern
+
+`supabase==2.15.2` does **not** support chaining `.select()` after `.insert()`. Doing so raises:
+```
+AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
+```
+**Fix:** Generate `snapshot_id = str(uuid4())` in Python before the insert and pass it explicitly in the payload. The ID is known ahead of time — no need to read it back from the response.
+
+> **Rule:** Never chain `.select()` after `.insert()` anywhere in this codebase with `supabase==2.15.2`.
+
 ### Test Coverage
 
 | File | Cases | What's covered |
 |---|---|---|
 | `tests/test_symbols_loader.py` | 20 | Success path, 401, network error, empty results, single-dict Tradier quirk, symbol normalization, exception isolation per symbol, all 6 `load_universe()` fallback scenarios |
-| `tests/test_universe_store.py` | 10 | Fresh snapshot hit, no snapshot, stale fallback, empty symbol guard, insert failure, DB exception, prune-when-over-7, batch-insert for >500 symbols |
+| `tests/test_universe_store.py` | 10 | Fresh snapshot hit, no snapshot, stale fallback, empty symbol guard, insert failure, DB exception, prune-when-over-7, batch-insert for >500 symbols, uuid4 pre-generated id passed in payload, no `.select()` chained after `.insert()` |
 
 ---
 
@@ -137,6 +147,43 @@ _resolve_startup_universe()   ← loads symbol list from DB (or fallback)
 
 The Tradier stream connection is managed by `backend/services/tradier_stream.py`. The module is designed for production resilience — it never exits permanently and always attempts to recover a live connection.
 
+### Market-Hours Guard (Added 2026-04-23 — commit 9a32d4b)
+
+A `_is_market_hours()` helper checks US Eastern Time Mon–Fri 09:30–16:00 using `zoneinfo.ZoneInfo("America/New_York")` (Python stdlib, no extra deps).
+
+**Behaviour at the top of the reconnect loop:**
+- If market is **closed** → log once and sleep 60 seconds before the next check. Zero reconnect spam.
+- If market is **open** → proceed to token fetch and stream connection as normal.
+
+```python
+def _is_market_hours() -> bool:
+    from zoneinfo import ZoneInfo
+    import datetime
+    now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:          # Saturday / Sunday
+        return False
+    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_ <= now < close_
+```
+
+Example log when closed:
+```
+Market closed (ET: 01:28 PDT Wed) — sleeping 60s before next check
+```
+
+`_stats["mode"]` is set to `"market_closed"` while outside market hours — visible on `/health`.
+
+### Reconnect Backoff — session_ticks Fix (commit 9a32d4b)
+
+**Old behaviour:** `reconnect_attempt` was reset to `0` on every successful connection, even when the stream connected but instantly closed with no data (off-hours). This meant backoff always restarted from ~0–5 s, producing rapid reconnect spam.
+
+**New behaviour:**
+- `session_ticks > 0` (real data received) → reset `reconnect_attempt = 0` ✅
+- `session_ticks == 0` (connected, instant close, no data) → `attempt += 1` → backoff grows up to 60 s cap
+
+This ensures off-hours connections degrade gracefully to ~60 s polling.
+
 ### Session Token Lifecycle
 
 Tradier requires a fresh session token for every stream connection. Tokens are obtained via:
@@ -153,6 +200,8 @@ Content-Length: 0   ← required (data={}, equivalent to curl -d "")
 ```
 startup
   └─ while True:
+      ├─ _is_market_hours()            ← NEW: if closed, sleep 60s and continue
+      │
       ├─ _get_session_token()          ← fresh token every iteration
       │    ├─ retry up to 3x on transient network error (2s gap)
       │    └─ return None on 401 (bad key) or exhausted retries
@@ -173,11 +222,14 @@ startup
       │    ├─ if connected:
       │    │    ├─ set mode = "live"
       │    │    ├─ read lines via _guarded_lines() [30s idle watchdog]
+      │    │    ├─ increment session_ticks per data line
       │    │    └─ process each trade → signal pipeline
       │    │
       │    └─ on any error (network, timeout, idle):
       │         ├─ increment reconnect counter
       │         ├─ set mode = "reconnecting"
+      │         ├─ if session_ticks > 0 → reset attempt = 0  ← NEW
+      │         ├─ else → attempt += 1                        ← NEW
       │         └─ exponential backoff → continue
       │
       └─ loop forever
@@ -233,7 +285,7 @@ The module exposes `get_stats()` returning:
   "mode": "live"
 }
 ```
-`mode` values: `starting` | `live` | `demo` | `reconnecting`
+`mode` values: `starting` | `live` | `demo` | `reconnecting` | `market_closed`
 
 ### Environment Variables
 

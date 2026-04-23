@@ -32,6 +32,46 @@
 | F8 | Demo mode emits valid signals | `test_f8_demo_mode_emits_signals` | `tests/test_tradier_stream.py` |
 | F9 | Stats dict has all required keys + mode field | `test_get_stats_returns_dict`, `test_mode_field_exists` | `tests/test_tradier_stream.py` |
 
+### Tradier Stream — Market-Hours Guard & Backoff Fix (commit 9a32d4b)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| MH-1 | `_is_market_hours()` returns False on Saturday | `test_market_hours_saturday_is_false` | `tests/test_tradier_stream.py` |
+| MH-2 | `_is_market_hours()` returns False on Sunday | `test_market_hours_sunday_is_false` | `tests/test_tradier_stream.py` |
+| MH-3 | `_is_market_hours()` returns False before 09:30 ET weekday | `test_market_hours_before_open_is_false` | `tests/test_tradier_stream.py` |
+| MH-4 | `_is_market_hours()` returns False after 16:00 ET weekday | `test_market_hours_after_close_is_false` | `tests/test_tradier_stream.py` |
+| MH-5 | `_is_market_hours()` returns True at 10:00 ET Monday | `test_market_hours_open_weekday_is_true` | `tests/test_tradier_stream.py` |
+| MH-6 | Loop sleeps 60s and logs when market closed | `test_loop_sleeps_when_market_closed` | `tests/test_tradier_stream.py` |
+| MH-7 | Mode set to `market_closed` when outside hours | `test_mode_is_market_closed_outside_hours` | `tests/test_tradier_stream.py` |
+| BF-1 | `reconnect_attempt` resets to 0 when `session_ticks > 0` | `test_backoff_resets_when_ticks_received` | `tests/test_tradier_stream.py` |
+| BF-2 | `reconnect_attempt` increments when `session_ticks == 0` | `test_backoff_increments_when_no_ticks` | `tests/test_tradier_stream.py` |
+| BF-3 | Backoff reaches ~60s cap after 4+ zero-tick connections | `test_backoff_reaches_cap_after_zero_tick_closes` | `tests/test_tradier_stream.py` |
+
+### Options Universe — symbols_loader.py
+| Test ID | Scenario | File |
+|---------|----------|------|
+| SL-1 | Happy path — returns validated symbols list | `tests/test_symbols_loader.py` |
+| SL-2 | Tradier 401 — returns seed fallback | `tests/test_symbols_loader.py` |
+| SL-3 | Network error — returns seed fallback | `tests/test_symbols_loader.py` |
+| SL-4 | Empty results from Tradier — returns seed fallback | `tests/test_symbols_loader.py` |
+| SL-5 | Single-dict Tradier response (not list) — handled correctly | `tests/test_symbols_loader.py` |
+| SL-6 | Lowercase symbols normalized to uppercase | `tests/test_symbols_loader.py` |
+| SL-7 | Exception on single symbol does not abort whole batch | `tests/test_symbols_loader.py` |
+| SL-8–20 | All 6 `load_universe()` fallback scenario branches | `tests/test_symbols_loader.py` |
+
+### Options Universe — universe_store.py
+| Test ID | Scenario | File |
+|---------|----------|------|
+| US-1 | `load_fresh_snapshot` — snapshot < 24h old returned | `tests/test_universe_store.py` |
+| US-2 | `load_fresh_snapshot` — no rows → returns None | `tests/test_universe_store.py` |
+| US-3 | `load_any_snapshot` — stale snapshot returned as fallback | `tests/test_universe_store.py` |
+| US-4 | `save_snapshot` — empty symbol list rejected | `tests/test_universe_store.py` |
+| US-5 | `save_snapshot` — insert failure handled | `tests/test_universe_store.py` |
+| US-6 | DB exception propagates correctly | `tests/test_universe_store.py` |
+| US-7 | Prunes to last 7 snapshots on save | `tests/test_universe_store.py` |
+| US-8 | Batch insert fires for > 500 symbols | `tests/test_universe_store.py` |
+| US-9 | `snapshot_id` generated via `uuid4()` in Python — passed in payload | `tests/test_universe_store.py` |
+| US-10 | No `.select()` chained after `.insert()` (supabase-py v2 guard) | `tests/test_universe_store.py` |
+
 ### Signal Pipeline
 | Test | File | Status |
 |------|------|--------|
@@ -52,6 +92,12 @@ pytest tests/ -v
 
 # Tradier stream failure modes only
 pytest tests/test_tradier_stream.py -v
+
+# Market-hours guard tests only
+pytest tests/test_tradier_stream.py -k "market_hours or backoff" -v
+
+# Universe tests only
+pytest tests/test_symbols_loader.py tests/test_universe_store.py -v
 
 # Live Tradier integration test (requires real key, skip in CI)
 TRADIER_API_KEY=<your_key> pytest tests/test_tradier_stream.py \
@@ -90,6 +136,10 @@ curl -X POST https://api.tradier.com/v1/markets/events/session \
 - [ ] After 5 min: logs show reconnect, NOT `401 — Falling back to demo mode`
 - [ ] Mode in `/health` or stats endpoint shows `live` not `demo`
 - [ ] Simulate network drop: logs show reconnect with backoff, not permanent demo
+- [ ] **Outside market hours:** logs show `Market closed (ET: ...) — sleeping 60s` once per minute, NOT rapid reconnect spam
+- [ ] **Outside market hours:** `/health` mode shows `market_closed`
+- [ ] **Outside market hours:** backoff increases across consecutive zero-tick closes (check reconnect_attempt in logs)
+- [ ] **At market open (09:30 ET):** stream transitions from `market_closed` → `live` automatically
 
 ---
 
