@@ -64,10 +64,10 @@ cipher/
 │   │   └── trade_executor.py
 │   ├── services/
 │   │   ├── tradier_stream.py
-│   │   ├── symbols_loader.py  # ★ NEW — Tradier universe fetch + validation + fallbacks
-│   │   └── universe_store.py  # ★ NEW — Supabase snapshot read/write
+│   │   ├── symbols_loader.py  # CBOE CSV fetch + Tradier validation + fallbacks
+│   │   └── universe_store.py  # Supabase snapshot read/write
 │   ├── migrations/
-│   │   └── 001_options_universe.sql  # ★ NEW — DB schema for universe snapshots
+│   │   └── 001_options_universe.sql  # DB schema for universe snapshots
 │   ├── routers/
 │   │   ├── auth.py
 │   │   ├── flow.py
@@ -80,8 +80,8 @@ cipher/
 │       ├── test_flow_and_stats.py
 │       ├── test_simulation_and_ws.py
 │       ├── test_tradier_stream.py
-│       ├── test_symbols_loader.py   # ★ NEW — 20 edge-case tests
-│       └── test_universe_store.py   # ★ NEW — DB read/write tests
+│       ├── test_symbols_loader.py
+│       └── test_universe_store.py
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
@@ -156,9 +156,9 @@ cipher/
 
 ## Key Business Logic
 
-### Options Universe — Persistence Layer ★ NEW
+### Options Universe — Persistence Layer
 
-The full universe of tradeable options symbols (~8,000 tickers) is now persisted in Supabase.
+The full universe of tradeable options symbols (~8,000 tickers) is persisted in Supabase.
 This eliminates cold-start delays, Tradier downtime blind spots, and audit gaps.
 
 #### Startup Resolution Order (`main.py → _resolve_startup_universe()`)
@@ -170,9 +170,9 @@ App startup
   │       └─ Found & fresh → LOAD from DB → stream starts instantly ✅
   │
   ├─ 2. No fresh snapshot in DB
-  │       └─ Fetch from Tradier + validate in parallel batches (semaphore=20)
+  │       └─ Fetch from CBOE CSV + validate via Tradier in parallel batches (semaphore=20)
   │             ├─ Success → SAVE to DB → mark active → start stream ✅
-  │             └─ Tradier down → load LAST snapshot (any age) from DB
+  │             └─ Tradier/CBOE down → load LAST snapshot (any age) from DB
   │                   └─ None ever in DB → SEED_SYMBOLS fallback (16 symbols) ✅
   │
   └─ 3. Background refresh every 24h (_universe_refresh_loop)
@@ -207,12 +207,13 @@ options_universe_symbols (
 - **Never block stream on refresh** — background asyncio task
 - `source` field distinguishes full coverage vs degraded fallback
 - Partial unique index enforces only ONE active snapshot at the DB level
+- **snapshot_id generated via `uuid4()` in Python** — passed explicitly in the insert payload; never read back from insert response (see Known Issues below)
 
 #### Services
 
 | File | Responsibility |
 |---|---|
-| `services/symbols_loader.py` | Fetches optionable symbols from Tradier REST, validates each via expiration check (20 concurrent), handles all edge cases (401, network error, single-dict response, lowercase symbols) |
+| `services/symbols_loader.py` | Fetches optionable symbols from CBOE CSV (no auth), validates each via Tradier expirations (20 concurrent), handles all edge cases |
 | `services/universe_store.py` | Supabase read/write — `load_fresh_snapshot()`, `load_any_snapshot()`, `save_snapshot()` (batched inserts of 500, prunes to 7 snapshots) |
 | `migrations/001_options_universe.sql` | DDL for both tables + 3 indexes including partial unique index |
 
@@ -220,7 +221,7 @@ options_universe_symbols (
 
 ### Signal Pipeline
 
-1. `_resolve_startup_universe()` loads symbol list from DB (or Tradier/seed fallback)
+1. `_resolve_startup_universe()` loads symbol list from DB (or CBOE/seed fallback)
 2. Tradier WebSocket emits raw trade ticks for those symbols
 3. `options_flow_parser.py` parses ticks → `OptionsFlowEvent`
 4. `bid_ask_classifier.py` classifies fill aggressiveness
@@ -316,13 +317,28 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Tradier stream 401 loop | ✅ Fixed 2026-04-23 |
 | Tradier session token Content-Length | ✅ Fixed 2026-04-23 |
 | Tradier stream | ✅ Live |
-| **Options universe persistence** | ✅ **Live 2026-04-23 — DB + services + tests shipped** |
+| Options universe persistence | ✅ Live 2026-04-23 |
+| **universe_store AttributeError on .select()** | ✅ **Fixed 2026-04-23 — uuid4 snapshot_id** |
 | Flow data | Live Tradier stream running; demo mode fallback if key missing |
 | Supabase | Auth working; universe tables live; signal storage not yet wired |
 | Redis | In config but not integrated |
 | Frontend styling | Inline styles throughout dashboard; Tailwind installed but underused |
 | Trade execution | `trade_executor.py` exists but not wired into signal flow |
 | Anthropic key | In config but not used |
+
+---
+
+## Known Issues / Gotchas
+
+### supabase-py v2 — No `.select()` after `.insert()`
+
+`supabase==2.15.2` returns a `SyncQueryRequestBuilder` from `.insert()` which does **not** expose a `.select()` method. Chaining `.insert().select().execute()` raises:
+```
+AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
+```
+**Fix applied in `universe_store.py`:** Generate `snapshot_id = str(uuid4())` in Python before the insert and pass it explicitly in the payload. The ID is known ahead of time so we never need to read it back from the insert response. This is stable across all supabase-py v2 versions.
+
+**Rule:** Never chain `.select()` after `.insert()` anywhere in this codebase with `supabase==2.15.2`.
 
 ---
 
@@ -363,7 +379,7 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 
 - `requirements.txt` — production deps only (no pytest)
 - `requirements-dev.txt` — dev/test deps: `pytest`, `pytest-asyncio`
-- Key versions: `fastapi==0.115.12`, `pydantic[email]==2.11.4`, `pydantic-settings==2.9.1`, `pandas==2.2.3`, `numpy==2.2.5`
+- Key versions: `fastapi==0.115.12`, `pydantic[email]==2.11.4`, `pydantic-settings==2.9.1`, `pandas==2.2.3`, `numpy==2.2.5`, `supabase==2.15.2`
 - All packages have prebuilt wheels for both cp311 and cp313
 
 ## pydantic-settings v2 Notes
@@ -381,6 +397,7 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 - Auth guard: `Depends(get_current_user)` (BE) / `useAuth` hook redirect (FE)
 - Monorepo: `backend/` and `frontend/` as siblings at repo root
 - No ORM — direct Supabase REST/postgrest calls
+- **Do NOT chain `.select()` after `.insert()` with supabase-py v2** — use `uuid4()` pattern instead
 
 ---
 
@@ -419,6 +436,7 @@ npm run dev
 
 | Date | Change |
 |------|--------|
+| 2026-04-23 | **Fixed universe_store AttributeError** — replaced broken `.insert().select()` chain with `uuid4()` pre-generated snapshot_id; updated regression tests with 4 new cases |
 | 2026-04-23 | **Options universe persistence shipped** — `symbols_loader.py`, `universe_store.py`, `migrations/001_options_universe.sql`, updated `main.py` startup + 24h background refresh loop, 20 + 10 test cases |
 | 2026-04-23 | **Supabase migration applied** — `options_universe_snapshots` + `options_universe_symbols` tables live in `cipher-database` |
 | 2026-04-23 | **Fixed Tradier session token Content-Length** — changed `content=b""` to `data={}` |
