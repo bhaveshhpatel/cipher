@@ -24,7 +24,7 @@ Cipher is an institutional options flow intelligence platform. It ingests real-t
 | Auth | JWT (`python-jose` + `passlib` bcrypt) |
 | Streaming | Tradier WebSocket → async in-process event bus |
 | AI Engine | OpenAI GPT-4o-mini (6-agent swarm) |
-| Database | Supabase (PostgreSQL) — universe snapshots + auth |
+| Database | Supabase (PostgreSQL) — universe + signal persistence + auth |
 | Deploy | Railway (BE) + Vercel (FE) |
 | CI/CD | GitHub Actions |
 
@@ -124,6 +124,107 @@ AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
 
 ---
 
+## Flow Store — DB Signal Persistence (Fixed 2026-04-23)
+
+### Overview
+
+`services/flow_store.py` is the **only** module that writes options flow data to Supabase. It subscribes to the `db_writer` channel on the async event bus and persists:
+
+1. **Signal episodes** → `flow_episodes` table (immediate write on every qualifying signal)
+2. **Raw classified ticks** → `flow_events` table (batched every 5 seconds)
+
+### ID Generation Contract
+
+> **Critical rule:** Neither `flow_events` nor `flow_episodes` rows are ever sent with an `id` field.
+> Postgres generates IDs server-side:
+> - `flow_events.id` → `uuid` via `DEFAULT gen_random_uuid()`
+> - `flow_episodes.id` → `bigserial` (auto-increment)
+>
+> Sending a client-provided `id` will cause a 400 / schema mismatch error. Never add `id` to any row dict in `flow_store.py`.
+
+### flow_episodes Schema
+
+```sql
+CREATE TABLE flow_episodes (
+  id             BIGSERIAL PRIMARY KEY,          -- Postgres-generated, never sent by client
+  ticker         TEXT NOT NULL,
+  direction      TEXT,                           -- REPEAT_BUY / REPEAT_SELL
+  contract_type  TEXT,                           -- CALL / PUT
+  strike         NUMERIC,
+  expiry         TEXT,
+  total_premium  NUMERIC,
+  trade_count    INT,
+  alert_level    TEXT,                           -- WATCH / ALERT / STRONG_SIGNAL / CONVICTION
+  is_accelerating BOOLEAN DEFAULT false,
+  seed_episode   TEXT,
+  signal_ts      TEXT,
+  created_at     TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### flow_events Schema
+
+```sql
+CREATE TABLE flow_events (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- Postgres-generated, never sent
+  ticker          TEXT NOT NULL,
+  contract_type   TEXT,
+  strike          NUMERIC,
+  expiry          TEXT,
+  premium         NUMERIC,
+  trade_type      TEXT DEFAULT 'UNKNOWN',
+  sentiment       TEXT DEFAULT 'UNKNOWN',
+  influence_tier  TEXT DEFAULT 'UNKNOWN',
+  conviction_score NUMERIC DEFAULT 0.0,
+  is_golden_sweep BOOLEAN DEFAULT false,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### Bus Integration
+
+```
+bus.publish_all(signal_dict)
+  └── channel: "db_writer"
+        └── flow_store._bus_signal_listener()
+              └── if signal["type"] == "signal":
+                    → persist_flow_episode(signal["data"])
+                          → _insert_rows("flow_episodes", [row])
+```
+
+### Batching Strategy (flow_events)
+
+- `persist_flow_event(ev_dict)` appends to `_flow_event_buffer` (in-memory list)
+- `_flush_flow_events()` runs every `_FLUSH_INTERVAL = 5` seconds
+- Batch is atomically drained: `batch = buf.copy(); buf.clear()`
+- On flush failure: data is logged as lost (no retry queue — by design for simplicity)
+
+### Logging Contract
+
+All log lines in `flow_store.py` use **f-strings**, never `%`-style formatting.
+
+Reason: `%`-style formatting defers evaluation to the logging framework. If any value is `None` and the format specifier is numeric (e.g. `%,.0f`), the logging call raises `TypeError` at runtime, silently dropping the log line and potentially crashing the writer.
+
+```python
+# CORRECT — f-string evaluated immediately, None renders as "None"
+log.info(f"[flow_store] flow_episode saved: {row['ticker']} prem=${(row['total_premium'] or 0):,.0f}")
+
+# WRONG — crashes if total_premium is None
+log.info("[flow_store] saved prem=$%,.0f", row['total_premium'])
+```
+
+### No-op Behavior
+
+If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_KEY` is not set, `start_flow_writer()` returns immediately with a warning log. No DB writes are attempted and no exceptions are raised.
+
+### Test Coverage
+
+| File | Cases | What's covered |
+|---|---|---|
+| `tests/test_flow_store.py` | 8 | Episode row schema (no old `composite_signals` columns), event row has no `id`, sparse input defaults, f-string log with None, buffer drain, no-op without env vars, `_insert_rows` called with `"flow_episodes"` not `"composite_signals"`, `persist_flow_event` buffers without network call |
+
+---
+
 ## Signal Pipeline
 
 ```
@@ -136,7 +237,9 @@ _resolve_startup_universe()   ← loads symbol list from DB (or fallback)
             (30-min window, min 3 trades, min $50K premium)
        └─ composite_signal_engine.py   → composite score
             (flow_score × 0.6 + backtest_score × 0.4)
-       └─ async_bus                    → broadcast to WebSocket subscribers
+       └─ async_bus                    → fan-out:
+            ├── "signals"   → ws.py → WebSocket clients
+            └── "db_writer" → flow_store.py → Supabase (flow_episodes + flow_events)
 ```
 
 ---
@@ -167,22 +270,15 @@ def _is_market_hours() -> bool:
     return open_ <= now < close_
 ```
 
-Example log when closed:
-```
-Market closed (ET: 01:28 PDT Wed) — sleeping 60s before next check
-```
-
 `_stats["mode"]` is set to `"market_closed"` while outside market hours — visible on `/health`.
 
 ### Reconnect Backoff — session_ticks Fix (commit 9a32d4b)
 
-**Old behaviour:** `reconnect_attempt` was reset to `0` on every successful connection, even when the stream connected but instantly closed with no data (off-hours). This meant backoff always restarted from ~0–5 s, producing rapid reconnect spam.
+**Old behaviour:** `reconnect_attempt` was reset to `0` on every successful connection, even when the stream connected but instantly closed with no data (off-hours). This produced rapid reconnect spam.
 
 **New behaviour:**
 - `session_ticks > 0` (real data received) → reset `reconnect_attempt = 0` ✅
-- `session_ticks == 0` (connected, instant close, no data) → `attempt += 1` → backoff grows up to 60 s cap
-
-This ensures off-hours connections degrade gracefully to ~60 s polling.
+- `session_ticks == 0` (connected, instant close, no data) → `attempt += 1` → backoff grows up to 60s cap
 
 ### Session Token Lifecycle
 
@@ -193,14 +289,14 @@ Authorization: Bearer <TRADIER_API_KEY>
 Content-Length: 0   ← required (data={}, equivalent to curl -d "")
 ```
 
-**Critical:** Session tokens expire when the stream connection closes. The token **must** be re-fetched on every reconnect — reusing a token after any disconnect will produce a 401.
+**Critical:** Session tokens expire when the stream connection closes. The token **must** be re-fetched on every reconnect.
 
 ### Reconnection State Machine
 
 ```
 startup
   └─ while True:
-      ├─ _is_market_hours()            ← NEW: if closed, sleep 60s and continue
+      ├─ _is_market_hours()            ← if closed, sleep 60s and continue
       │
       ├─ _get_session_token()          ← fresh token every iteration
       │    ├─ retry up to 3x on transient network error (2s gap)
@@ -214,37 +310,11 @@ startup
       ├─ if token:
       │    ├─ cancel demo task (if running)
       │    ├─ open httpx streaming POST to Tradier
-      │    │
-      │    ├─ if stream 401 (expired token race):
-      │    │    ├─ fast retry (1s) for first 4 consecutive
-      │    │    └─ slow backoff after 5 consecutive (likely bad key)
-      │    │
-      │    ├─ if connected:
-      │    │    ├─ set mode = "live"
-      │    │    ├─ read lines via _guarded_lines() [30s idle watchdog]
-      │    │    ├─ increment session_ticks per data line
-      │    │    └─ process each trade → signal pipeline
-      │    │
-      │    └─ on any error (network, timeout, idle):
-      │         ├─ increment reconnect counter
-      │         ├─ set mode = "reconnecting"
-      │         ├─ if session_ticks > 0 → reset attempt = 0  ← NEW
-      │         ├─ else → attempt += 1                        ← NEW
-      │         └─ exponential backoff → continue
+      │    ├─ read lines via _guarded_lines() [30s idle watchdog]
+      │    ├─ increment session_ticks per data line
+      │    └─ process each trade → signal pipeline
       │
       └─ loop forever
-```
-
-### Idle Watchdog
-
-Tradier sends bare `\n` keepalives. If no line (including keepalives) is received within **30 seconds**, `_guarded_lines()` raises `asyncio.TimeoutError`, which triggers an immediate reconnect.
-
-```python
-async def _guarded_lines(resp):
-    aiter = resp.aiter_lines().__aiter__()
-    while True:
-        line = await asyncio.wait_for(aiter.__anext__(), timeout=30.0)
-        yield line
 ```
 
 ### Backoff Formula
@@ -263,14 +333,6 @@ def _backoff(attempt: int) -> float:
 | 3 | 40s |
 | 4+ | 60s (cap) |
 
-### Demo Mode
-
-Demo mode runs as a cancellable `asyncio.Task` (`_demo_mode_once()`). It emits synthetic signals at random intervals and is immediately cancelled when a live Tradier connection is established.
-
-Demo mode is only entered when:
-1. `TRADIER_API_KEY` is not set (permanent demo until restart)
-2. Session token cannot be obtained after retries (temporary demo until token recovers)
-
 ### Stats
 
 The module exposes `get_stats()` returning:
@@ -287,15 +349,6 @@ The module exposes `get_stats()` returning:
 ```
 `mode` values: `starting` | `live` | `demo` | `reconnecting` | `market_closed`
 
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TRADIER_API_KEY` | Yes (for live) | Bearer token for Tradier API |
-| `TRADIER_ACCOUNT_ID` | Yes (for trading) | Tradier brokerage account ID |
-| `TRADIER_BASE_URL` | No | Default: `https://api.tradier.com` |
-| `TRADIER_STREAM_URL` | No | Default: `https://stream.tradier.com` |
-
 ---
 
 ## Supabase Schema
@@ -306,6 +359,8 @@ The module exposes `get_stats()` returning:
 |---|---|---|
 | `options_universe_snapshots` | One row per validated ~8,000-symbol universe snapshot | `001_options_universe.sql` |
 | `options_universe_symbols` | Individual symbols per snapshot (normalized, ON DELETE CASCADE) | `001_options_universe.sql` |
+| `flow_episodes` | One row per qualifying repetition signal episode | manual (apply schema above) |
+| `flow_events` | One row per classified options tick (batched writes) | manual (apply schema above) |
 
 > Auth tables are managed by Supabase Auth (built-in `auth.users`).
 
@@ -316,7 +371,6 @@ The module exposes `get_stats()` returning:
 - JWT-based, issued on login, stored client-side
 - `ACCESS_TOKEN_EXPIRE_MINUTES`: 1440 (24 hours)
 - Protected routes: all `/api/*` except `/api/auth/register` and `/api/auth/login`
-- Supabase used for user persistence; signal storage not yet wired
 
 ---
 
@@ -327,7 +381,7 @@ Next.js App Router catch-all route at `app/api/[...path]/route.ts` proxies all `
 **Key implementation notes (updated 2026-04-23):**
 - Body read as `req.text()` before forwarding — avoids `ReadableStream` / `duplex: half` issues on Vercel's Node runtime
 - Next.js 15: `params` must be awaited (`Promise<{ path: string[] }>`)
-- `typescript.ignoreBuildErrors: true` in `next.config.js` — proxy uses intentional casts that TS flags but are runtime-correct
+- `typescript.ignoreBuildErrors: true` in `next.config.js`
 
 ---
 
@@ -337,7 +391,6 @@ Next.js App Router catch-all route at `app/api/[...path]/route.ts` proxies all `
 - Nixpacks build from `backend/`
 - Entry: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Auto-deploys on push to `main`
-- Env vars set in Railway dashboard
 
 ### Frontend (Vercel)
 - Next.js project root: `frontend/`
