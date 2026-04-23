@@ -9,7 +9,7 @@
 ## Repository
 
 - **GitHub**: `https://github.com/bhaveshhpatel/cipher`
-- **Owner**: Dhruv Patel (bhaveshhpatel@yahoo.com)
+- **Owner**: Dhruv Patel
 
 ---
 
@@ -18,7 +18,7 @@
 | Layer | Technology |
 |---|---|
 | Frontend | Next.js 14, TypeScript, Tailwind CSS |
-| Backend | FastAPI (Python 3.11), async WebSockets |
+| Backend | FastAPI (Python 3.11 pinned), async WebSockets |
 | Auth | JWT (`python-jose` + `passlib` bcrypt) |
 | Streaming | Tradier WebSocket → async in-process event bus |
 | AI Engine | OpenAI GPT-4o-mini (multi-agent swarm, 6 roles) |
@@ -39,10 +39,12 @@ cipher/
 │       └── frontend.yml       # Vercel deploy via CLI
 ├── backend/
 │   ├── main.py
-│   ├── config.py
+│   ├── config.py              # pydantic-settings v2 — uses model_config = SettingsConfigDict(...)
 │   ├── requirements.txt       # Production deps (no pytest)
 │   ├── requirements-dev.txt   # Dev/test deps (pytest, pytest-asyncio)
-│   ├── nixpacks.toml          # Forces Python 3.11 for Railway build
+│   ├── nixpacks.toml          # Forces Python 3.11 for Railway nixpacks builder
+│   ├── runtime.txt            # python-3.11.9 — Railway Docker builder reads this
+│   ├── .python-version        # 3.11.9 — pyenv standard
 │   ├── core/
 │   │   ├── auth.py
 │   │   └── async_bus.py
@@ -203,12 +205,13 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 |---|---|
 | Frontend deployment | ✅ Live on Vercel |
 | Backend deployment | ✅ Live on Railway (native GitHub integration) |
+| Backend startup crash | ✅ Fixed 2026-04-23 — pydantic-settings v2.9 migration |
 | Auth — register + login | ✅ Fixed 2026-04-23 |
 | Railway deploy pipeline | ✅ Fixed 2026-04-23 — native GitHub integration, no CLI |
-| Python version pinning | ✅ Fixed 2026-04-23 — nixpacks.toml forces Python 3.11 |
-| Flow data | **Mocked** — deterministic seed by ticker hash; live Tradier wires exist but need valid API key |
+| Python version pinning | ✅ Fixed 2026-04-23 — nixpacks.toml + runtime.txt + .python-version |
+| Flow data | **Mocked** — demo mode when no Tradier key set |
 | Supabase | Auth working; DB not actively queried yet |
-| Redis | In `config.py` but not integrated |
+| Redis | In config but not integrated |
 | Frontend styling | Inline styles throughout dashboard; Tailwind installed but underused |
 | Trade execution | `trade_executor.py` exists but not wired into signal flow |
 | Anthropic key | In config but not used |
@@ -235,29 +238,16 @@ healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 ```
 
-**`backend/nixpacks.toml` (Python version pin):**
-```toml
-[phases.setup]
-nixPkgs = ["python311", "python311Packages.pip"]
-
-[variables]
-PYTHON_VERSION = "3.11"
-```
-
-**Railway dashboard settings required:**
-- Source: `bhaveshhpatel/cipher`, branch `main`
-- Root Directory: `/backend`
-- Auto Deploy: enabled
-
-**Files removed (were causing conflicts):**
-- `backend/railway.toml` — caused `backend/backend` path error
-- `backend/Procfile` — redundant with startCommand
+**Python version pinning (3 signals for Railway):**
+- `backend/nixpacks.toml` — `NIXPACKS_PYTHON_VERSION=3.11`
+- `backend/runtime.txt` — `python-3.11.9`
+- `backend/.python-version` — `3.11.9`
 
 ### Backend — GitHub Actions (`backend.yml`)
-CI only — syntax check on all `.py` files. No deploy steps. No secrets needed.
+CI only — syntax check on all `.py` files. No deploy steps.
 
 ### Frontend — Vercel via GitHub Actions (`frontend.yml`)
-Vercel CLI deploy on push to `main` when `frontend/**` changes. Env vars in Vercel dashboard only.
+Vercel CLI deploy on push to `main` when `frontend/**` changes.
 
 ---
 
@@ -265,7 +255,13 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes. Env vars in Verc
 
 - `requirements.txt` — production deps only (no pytest)
 - `requirements-dev.txt` — dev/test deps: `pytest`, `pytest-asyncio`
-- Key versions: `pandas==2.2.3`, `numpy==2.0.2` (prebuilt wheels for Python 3.11)
+- Key versions: `fastapi==0.115.12`, `pydantic==2.11.4`, `pydantic-settings==2.9.1`, `pandas==2.2.3`, `numpy==2.2.5`
+- All packages have prebuilt wheels for both cp311 and cp313 — no Rust/C compilation
+
+## pydantic-settings v2 Notes
+
+- `config.py` uses `model_config = SettingsConfigDict(...)` — NOT the old inner `class Config`
+- The old `class Config` pattern causes a `PydanticUserError` crash on startup in pydantic-settings ≥ 2.3
 
 ---
 
@@ -313,10 +309,9 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed Python 3.13 build failure** — added `backend/nixpacks.toml` to force Python 3.11; `pandas==2.2.2` has no py3.13 wheel and fails to compile from source; bumped to `pandas==2.2.3` + `numpy==2.0.2`; moved pytest deps to `requirements-dev.txt` |
-| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` and `backend/Procfile`; rewrote `backend.yml` to CI-only; Railway deploys via native GitHub integration using root `railway.toml` |
-| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through; credential errors return 401 |
+| 2026-04-23 | **Fixed runtime startup crash** — `config.py` migrated from deprecated `class Config` to `model_config = SettingsConfigDict(...)` for pydantic-settings v2.9 compatibility |
+| 2026-04-23 | **Fixed pip build failure** — upgraded all deps to latest with prebuilt cp311/cp313 wheels; added `runtime.txt` + `.python-version` for Python 3.11 pinning |
+| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` and `backend/Procfile`; Railway deploys via native GitHub integration |
+| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through |
 | 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
-| 2026-04-22 | Removed secret refs from `frontend/vercel.json` |
 | 2026-04-22 | Frontend confirmed live — login page visible |
-| 2026-04-22 | Created `docs/BACKLOG.md` with B-001 through B-007 |
