@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # Symbols passing BOTH filters get stream_eligible=true and are fed to StreamPoolManager.
     # Override in Railway env vars to tune the eligible pool size (~1,000-2,000 target).
     UNIVERSE_MIN_PRICE: float = 1.0        # exclude sub-penny / illiquid tickers
-    UNIVERSE_MIN_VOLUME: int = 100_000     # exclude very low-activity tickers
+    UNIVERSE_MIN_VOLUME: int = 1_000_000   # min avg daily stock volume (30-day avg) — liquid names only
     UNIVERSE_QUOTES_BATCH_SIZE: int = 200  # symbols per /v1/markets/quotes request
     UNIVERSE_QUOTES_CONCURRENCY: int = 28  # parallel quote batch requests
 
