@@ -24,7 +24,7 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
-| — | — | — | — |
+| — | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json, confirmed login page live. |
 
 ---
 
@@ -41,3 +41,4 @@
 | Date | Change |
 |------|--------|
 | 2026-04-22 | Created backlog with B-001 through B-007 |
+| 2026-04-22 | Added frontend deployment fix to Completed |

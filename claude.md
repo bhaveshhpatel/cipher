@@ -9,7 +9,7 @@
 ## Repository
 
 - **GitHub**: `https://github.com/bhaveshhpatel/cipher`
-- **Owner**: Dhruv Patel (full-stack developer, San Francisco)
+- **Owner**: Dhruv Patel (bhaveshhpatel@yahoo.com)
 
 ---
 
@@ -95,10 +95,15 @@ cipher/
 │   │   └── types/
 │   │       └── index.ts            # Shared TypeScript types
 │   ├── package.json
-│   ├── next.config.ts
+│   ├── next.config.mjs
 │   ├── tailwind.config.ts
 │   ├── tsconfig.json
-│   └── vercel.json
+│   └── vercel.json                  # buildCommand, outputDirectory, framework ONLY — no env block
+├── docs/
+│   ├── BACKLOG.md             # Product backlog (B-001 to B-007)
+│   ├── features.md
+│   ├── regression-test-plan.md
+│   └── specs.md
 ```
 
 ---
@@ -124,9 +129,16 @@ cipher/
 | `REDIS_URL` | Redis connection (default: `redis://localhost:6379`) |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 
-### Frontend (`.env.local`)
+### Frontend
 
-Refer to `frontend/.env.example` for required variables (Next.js public + server-side).
+| Variable | Where managed | Value |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | **Vercel dashboard only** | `https://cipher-production-6cd8.up.railway.app` |
+| `NEXT_PUBLIC_WS_URL` | **Vercel dashboard only** | `wss://cipher-production-6cd8.up.railway.app/` |
+
+> ⚠️ Do NOT add these to `vercel.json` or the GitHub Actions workflow.
+> Managing them in the workflow caused the @cipher_api_url secret reference
+> bug that broke every deploy for hours.
 
 ---
 
@@ -182,12 +194,32 @@ Each agent independently returns `VERDICT: BUY|SELL|HOLD` + one-line reasoning. 
 
 | Area | Status |
 |---|---|
+| Frontend deployment | ✅ **Live on Vercel** — login page confirmed working |
+| Backend deployment | ✅ **Live on Railway** — `https://cipher-production-6cd8.up.railway.app` |
 | Flow data | **Mocked** — deterministic `random.Random` seeded by ticker hash; live Tradier wires exist but need valid API key |
-| Supabase | Configured but **not actively queried** — flow scan comments say "in production: query Supabase" |
+| Supabase | Configured but **not actively queried** |
 | Redis | In `config.py` but **not yet integrated** |
 | Frontend styling | **Inline styles** used throughout dashboard components despite Tailwind being installed |
 | Trade execution | `trade_executor.py` exists but is not wired into the main signal flow |
 | Anthropic key | In config but **not used** |
+
+---
+
+## CI/CD Notes
+
+### Frontend (Vercel via GitHub Actions)
+- Workflow: `.github/workflows/frontend.yml`
+- Triggers on `push` to `main` when `frontend/**` files change
+- All Vercel CLI steps (`pull`, `build`, `deploy`) run from **repo root** — not `frontend/`
+- The Vercel project has `rootDirectory=frontend` in the dashboard → written into `project.json` by `vercel pull` → CLI uses it automatically
+- `vercel.json` has `buildCommand`, `outputDirectory`, `framework` **only — no `env` block ever**
+- Frontend env vars managed in **Vercel dashboard only**
+- To manually trigger a deploy: bump `frontend/.deploy-trigger`
+
+### Backend (Railway via GitHub Actions)
+- Workflow: `.github/workflows/backend.yml`
+- Triggers on `push` to `main` when `backend/**` files change
+- ⚠️ **Disable Railway dashboard auto-deploy** — it triggers on every `main` push regardless of path, causing backend deploys on frontend-only changes
 
 ---
 
@@ -223,8 +255,19 @@ npm run dev
 
 ## Deployment
 
-| Target | Platform | Trigger |
-|---|---|---|
-| Backend | Railway | Push to `main` via `backend.yml` |
-| Frontend | Vercel | Push to `main` via `frontend.yml` |
+| Target | Platform | Trigger | URL |
+|---|---|---|---|
+| Backend | Railway | Push to `main` via `backend.yml` | `https://cipher-production-6cd8.up.railway.app` |
+| Frontend | Vercel | Push to `main` via `frontend.yml` | Vercel project: `bhaveshhpatels-projects/cipher` |
 
+---
+
+## Changelog
+
+| Date | Change |
+|------|--------|
+| 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug — all CLI steps now run from repo root |
+| 2026-04-22 | **Root cause fixed**: removed `@cipher_api_url` / `@cipher_ws_url` secret refs from `frontend/vercel.json` env block |
+| 2026-04-22 | Documented Railway auto-deploy issue — disable dashboard auto-deploy to prevent unintended backend deploys |
+| 2026-04-22 | Frontend confirmed live — login page visible |
+| 2026-04-22 | Created `docs/BACKLOG.md` with B-001 through B-007 |
