@@ -72,7 +72,7 @@ class SymbolQuote:
 async def load_universe(
     *,
     db_snapshot: Optional[list[str]] = None,
-) -> tuple[list[str], str, Optional[set[str]], list[SymbolQuote]]:
+) -> tuple[list[str], str, Optional[set[str]], list["SymbolQuote"]]:
     """
     Return (symbols, source, stream_eligible_set, quotes) where:
       symbols             — full validated universe list
@@ -195,7 +195,7 @@ async def _fetch_cboe_symbols() -> list[str]:
         log.warning("CBOE symbol list network error: %s", e)
         return []
     except Exception as e:
-tml        log.error("CBOE symbol list unexpected error: %s", e)
+        log.error("CBOE symbol list unexpected error: %s", e)
         return []
 
 
@@ -257,11 +257,11 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
     if not symbols:
         return []
 
-    batch_size   = settings.UNIVERSE_QUOTES_BATCH_SIZE
-    concurrency  = settings.UNIVERSE_QUOTES_CONCURRENCY
-    min_price    = settings.UNIVERSE_MIN_PRICE
-    min_volume   = settings.UNIVERSE_MIN_VOLUME
-    headers      = {
+    batch_size  = settings.UNIVERSE_QUOTES_BATCH_SIZE
+    concurrency = settings.UNIVERSE_QUOTES_CONCURRENCY
+    min_price   = settings.UNIVERSE_MIN_PRICE
+    min_volume  = settings.UNIVERSE_MIN_VOLUME
+    headers     = {
         "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
         "Accept":        "application/json",
     }
@@ -297,13 +297,16 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                     )
                     return [SymbolQuote(symbol=s) for s in batch]
 
-                data = resp.json()
+                data       = resp.json()
                 quotes_raw = data.get("quotes", {}).get("quote") or []
 
+                # Tradier returns a dict (not list) when only 1 symbol in the batch
                 if isinstance(quotes_raw, dict):
                     quotes_raw = [quotes_raw]
 
-                quote_map: dict[str, dict] = {q["symbol"]: q for q in quotes_raw if "symbol" in q}
+                quote_map: dict[str, dict] = {
+                    q["symbol"]: q for q in quotes_raw if "symbol" in q
+                }
 
                 results: list[SymbolQuote] = []
                 for symbol in batch:
