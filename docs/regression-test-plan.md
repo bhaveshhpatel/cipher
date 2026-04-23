@@ -101,6 +101,72 @@
 
 ---
 
+## Phase 3 — Smart Signals, WS Heartbeat, Parser Guard, Volume-Weighted Score
+
+### Parser — Size Field Guard (options_flow_parser.py)
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| P3-P-1 | `raw` dict missing `size` key entirely | Returns `None` (no event emitted) |
+| P3-P-2 | `raw["size"]` is `None` | Returns `None` |
+| P3-P-3 | `raw["size"]` is `0` | Returns `None` |
+| P3-P-4 | `raw["size"]` is `"0"` (string zero) | Returns `None` |
+| P3-P-5 | `raw["size"]` is valid positive int | Returns valid `OptionsFlowEvent` |
+| P3-P-6 | `raw["size"]` is valid positive string int | Returns valid `OptionsFlowEvent` |
+
+### Signal Engine — Volume-Weighted Premium Factor
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| P3-S-1 | `open_interest == 0` on latest event | `volume_weighted_premium_factor()` returns `0.5` |
+| P3-S-2 | `open_interest` unavailable (field absent) | Returns `0.5` neutral |
+| P3-S-3 | `total_premium / (OI × 100)` < 1.0 | Returns ratio rounded to 3dp |
+| P3-S-4 | Very high premium vs low OI — ratio > 1.0 | Capped at `1.0` |
+| P3-S-5 | Composite score uses weights `0.55/0.35/0.10` | `comp == flow*0.55 + bt*0.35 + vwp*0.10` |
+| P3-S-6 | `CompositeSignal` includes `volume_premium_factor` field | Field present and 0–1 range |
+| P3-S-7 | Reasoning string includes volume-premium factor | String contains `volume-premium factor` |
+
+### Smart Signals Router — Pagination & Filters
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| P3-R-1 | `GET /api/signals/list` — no params | 200, returns 20 results, page=1 |
+| P3-R-2 | `GET /api/signals/list?page=2&page_size=5` | 200, returns up to 5 results, page=2 |
+| P3-R-3 | `page_size=101` | 422 Unprocessable Entity |
+| P3-R-4 | `page=0` | 422 Unprocessable Entity |
+| P3-R-5 | `direction=bullish` | Returns only signals with `recommendation=="BUY"` |
+| P3-R-6 | `direction=bearish` | Returns only signals with `recommendation=="SELL"` |
+| P3-R-7 | `direction=neutral` | Returns only signals with `recommendation=="HOLD"` |
+| P3-R-8 | `direction=invalid` | 422 with valid values listed |
+| P3-R-9 | `tier=invalid` | 422 with valid values listed |
+| P3-R-10 | `min_conviction=0.65` | Returns only signals where `composite_score >= 0.65` |
+| P3-R-11 | `min_conviction=1.1` | 422 (exceeds max 1.0) |
+| P3-R-12 | `min_conviction=-0.1` | 422 (below min 0.0) |
+| P3-R-13 | Unauthenticated request | 401 |
+| P3-R-14 | `CompositeOut` response includes `volume_premium_factor` | Field present |
+| P3-R-15 | `total` in response reflects filtered count, not full count | Correct filtered total |
+
+### WebSocket Heartbeat (ws.py)
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| P3-W-1 | Client connects, server sends `{"type":"ping"}` within 25s | Ping received |
+| P3-W-2 | Client responds `{"type":"pong"}` within 10s | Connection stays open |
+| P3-W-3 | Client does NOT respond to ping within 10s | Server closes with code 1001 |
+| P3-W-4 | Client sends non-pong message in ping window | Server logs warning, connection may continue |
+| P3-W-5 | `stop_event` set externally | Heartbeat task exits cleanly |
+| P3-W-6 | WebSocket disconnect during heartbeat | `stop_event` set, task cancelled, bus unsubscribed |
+| P3-W-7 | Invalid JWT on connect | Closed with code 4001, no heartbeat started |
+
+### Manual Regression — Phase 3
+- [ ] `GET /api/signals/list` returns paginated JSON with `signals`, `page`, `page_size`, `total`
+- [ ] `?direction=bullish&min_conviction=0.65` filters correctly — all returned signals are BUY ≥ 0.65
+- [ ] `?page=2&page_size=5` returns correct slice of results
+- [ ] `GET /api/signals/composite/AAPL` response includes `volume_premium_factor` field
+- [ ] Composite scores use new `0.55/0.35/0.10` weights (verify via reasoning string)
+- [ ] Browser WS devtools: ping frame arrives every ~25s
+- [ ] Browser WS devtools: pong reply sent by frontend keeps connection alive
+- [ ] Railway logs: `WS pong timeout — closing connection` does NOT appear during normal operation
+- [ ] Parser: flow events with missing/null/zero `size` do not reach accumulator (verify via Railway logs — no `prem=$0` entries)
+
+---
+
 ## Running Tests
 
 ```bash
