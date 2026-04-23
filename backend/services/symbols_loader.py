@@ -1,13 +1,23 @@
 """
 services/symbols_loader.py
 
-Fetches and validates the full options-tradeable universe.
-After validation, runs universe_screener to determine stream eligibility.
+Fetches and validates the full options-tradeable universe, then computes
+stream eligibility via Tradier batch quotes (Step 3).
 
-Universe source priority:
-  1. CBOE public equity+index options symbol list (CSV, no auth required)
-  2. Falls back to last DB snapshot if CBOE fetch fails
-  3. Falls back to SEED_SYMBOLS as last resort
+Universe pipeline:
+  Step 1 — CBOE CSV → ~5,500 raw symbols
+  Step 2 — Tradier /expirations validation → ~5,500 confirmed optionable symbols
+  Step 3 — Tradier /v1/markets/quotes batch fetch (200/request, ~28 parallel)
+             → last_price, volume per symbol
+             → compute stream_eligible flag
+             → upsert all symbols into universe_symbols table
+  Step 4 — Extract stream_eligible=true symbols → StreamPoolManager (~1,000–2,000)
+  Step 5 — Save snapshot to options_universe_snapshots
+
+Fallback priority:
+  1. CBOE + Tradier validated + batch quotes (full pipeline)
+  2. DB snapshot if provided (stream_eligible_set = None)
+  3. SEED_SYMBOLS as last resort (stream_eligible_set = None)
 
 Returns (symbols, source, stream_eligible_set) from load_universe().
 """
@@ -15,6 +25,7 @@ import asyncio
 import csv
 import io
 import logging
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
@@ -33,9 +44,23 @@ _CBOE_URL             = (
     "equity_index_options/?download=csv"
 )
 _CHAIN_URL            = f"{settings.TRADIER_BASE_URL}/v1/markets/options/expirations"
+_QUOTES_URL           = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
 _CONNECT_TIMEOUT      = 20.0
 _VALIDATE_CONCURRENCY = 20
 _VALIDATE_TIMEOUT     = 8.0
+_QUOTES_TIMEOUT       = 12.0
+
+
+# ---------------------------------------------------------------------------
+# Quote result dataclass (Step 3 output per symbol)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SymbolQuote:
+    symbol: str
+    last_price: Optional[float] = None
+    volume: Optional[int] = None
+    stream_eligible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -51,27 +76,44 @@ async def load_universe(
       symbols             — full validated universe list
       source              — 'tradier_validated' | 'cache' | 'seed_fallback'
       stream_eligible_set — set of symbols eligible for streaming,
-                            or None when source is cache/seed (screener not run)
+                            or None when source is cache/seed (pipeline not run)
 
-    Priority:
-      1. CBOE fetch + Tradier validation → then screen for stream eligibility
-      2. db_snapshot if provided (any age) → stream_eligible_set = None
-      3. SEED_SYMBOLS                      → stream_eligible_set = None
+    When the full pipeline succeeds, universe_store.upsert_symbol_quotes() is
+    called to persist last_price, volume, stream_eligible per symbol before
+    save_snapshot() is called by the caller (main.py startup).
     """
     try:
         symbols = await _fetch_and_validate()
         if symbols:
             log.info("Universe loaded: %d symbols (CBOE + Tradier validated)", len(symbols))
-            # Run stream-eligibility screening
-            from services.universe_screener import screen_universe
-            screen_result = await screen_universe(symbols)
+
+            # Step 3 — batch quotes → stream eligibility
+            quotes = await _fetch_batch_quotes(symbols)
+            eligible_set = {q.symbol for q in quotes if q.stream_eligible}
+
+            # Priority symbols are always stream-eligible regardless of price/volume
+            priority = set(settings.priority_symbols)
+            eligible_set |= (priority & set(symbols))
+
             log.info(
-                "Universe screened: %d eligible / %d total (%.1f%%)",
-                len(screen_result.eligible), len(symbols),
-                100 * len(screen_result.eligible) / len(symbols) if symbols else 0,
+                "Step 3 complete: %d / %d symbols stream-eligible (%.1f%%) "
+                "[min_price=%.2f, min_volume=%d]",
+                len(eligible_set), len(symbols),
+                100 * len(eligible_set) / len(symbols) if symbols else 0,
+                settings.UNIVERSE_MIN_PRICE,
+                settings.UNIVERSE_MIN_VOLUME,
             )
-            eligible_set = set(screen_result.eligible)
+
+            # Persist quote data to DB so universe_store.save_snapshot() can
+            # read stream_eligible back per symbol.
+            try:
+                from services.universe_store import upsert_symbol_quotes
+                await upsert_symbol_quotes(quotes)
+            except Exception as e:
+                log.warning("upsert_symbol_quotes failed (non-fatal): %s", e)
+
             return symbols, "tradier_validated", eligible_set
+
         log.warning("CBOE+Tradier universe fetch returned 0 valid symbols — using fallback")
     except Exception as e:
         log.error("Universe fetch failed unexpectedly: %s — using fallback", e)
@@ -89,7 +131,7 @@ def _fallback(db_snapshot: Optional[list[str]]) -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# Fetch from CBOE
+# Step 1: CBOE fetch
 # ---------------------------------------------------------------------------
 
 async def _fetch_and_validate() -> list[str]:
@@ -162,7 +204,7 @@ async def _fetch_cboe_symbols() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Tradier per-symbol validation
+# Step 2: Tradier per-symbol expiration validation
 # ---------------------------------------------------------------------------
 
 async def _validate_symbols(symbols: list[str]) -> list[str]:
@@ -196,3 +238,144 @@ async def _validate_symbols(symbols: list[str]) -> list[str]:
 
     results = await asyncio.gather(*[_check(s) for s in symbols])
     return [s for s in results if s is not None]
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Tradier batch quotes → stream eligibility
+# ---------------------------------------------------------------------------
+
+async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
+    """
+    Fetch last_price and volume for all symbols via Tradier /v1/markets/quotes.
+
+    Batches symbols into groups of UNIVERSE_QUOTES_BATCH_SIZE (default 200),
+    fires up to UNIVERSE_QUOTES_CONCURRENCY (default 28) batches in parallel.
+
+    stream_eligible = last_price >= UNIVERSE_MIN_PRICE
+                      AND volume  >= UNIVERSE_MIN_VOLUME
+
+    Any symbol that errors or returns no quote data gets:
+      last_price=None, volume=None, stream_eligible=False
+    (unless it is in priority_symbols, which is forced eligible by the caller).
+    """
+    if not symbols:
+        return []
+
+    batch_size   = settings.UNIVERSE_QUOTES_BATCH_SIZE
+    concurrency  = settings.UNIVERSE_QUOTES_CONCURRENCY
+    min_price    = settings.UNIVERSE_MIN_PRICE
+    min_volume   = settings.UNIVERSE_MIN_VOLUME
+    headers      = {
+        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+        "Accept":        "application/json",
+    }
+
+    # Build batches
+    batches: list[list[str]] = [
+        symbols[i : i + batch_size]
+        for i in range(0, len(symbols), batch_size)
+    ]
+    log.info(
+        "Step 3: fetching quotes for %d symbols in %d batches (%d symbols/batch, %d concurrent)",
+        len(symbols), len(batches), batch_size, concurrency,
+    )
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _fetch_batch(batch: list[str]) -> list[SymbolQuote]:
+        """Fetch one batch of up to `batch_size` symbols. Returns SymbolQuote per symbol."""
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=_QUOTES_TIMEOUT) as client:
+                    resp = await client.get(
+                        _QUOTES_URL,
+                        headers=headers,
+                        params={
+                            "symbols": ",".join(batch),
+                            "greeks": "false",
+                        },
+                    )
+
+                if resp.status_code != 200:
+                    log.warning(
+                        "Quotes batch HTTP %d for %d symbols (first: %s)",
+                        resp.status_code, len(batch), batch[0],
+                    )
+                    return [SymbolQuote(symbol=s) for s in batch]
+
+                data = resp.json()
+                quotes_raw = data.get("quotes", {}).get("quote") or []
+
+                # Tradier returns a dict (not list) when only 1 symbol is in the batch
+                if isinstance(quotes_raw, dict):
+                    quotes_raw = [quotes_raw]
+
+                # Build lookup by symbol
+                quote_map: dict[str, dict] = {q["symbol"]: q for q in quotes_raw if "symbol" in q}
+
+                results: list[SymbolQuote] = []
+                for symbol in batch:
+                    raw = quote_map.get(symbol)
+                    if raw is None:
+                        results.append(SymbolQuote(symbol=symbol))
+                        continue
+
+                    last_price: Optional[float] = None
+                    volume:     Optional[int]   = None
+
+                    # last / last_price field names vary by Tradier response
+                    for price_key in ("last", "last_price", "close", "prevclose"):
+                        val = raw.get(price_key)
+                        if val is not None:
+                            try:
+                                last_price = float(val)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+
+                    vol_val = raw.get("volume")
+                    if vol_val is not None:
+                        try:
+                            volume = int(vol_val)
+                        except (TypeError, ValueError):
+                            pass
+
+                    eligible = (
+                        last_price is not None
+                        and volume  is not None
+                        and last_price >= min_price
+                        and volume    >= min_volume
+                    )
+
+                    results.append(SymbolQuote(
+                        symbol=symbol,
+                        last_price=last_price,
+                        volume=volume,
+                        stream_eligible=eligible,
+                    ))
+
+                return results
+
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                log.warning("Quotes batch network error (first: %s): %s", batch[0], e)
+                return [SymbolQuote(symbol=s) for s in batch]
+            except Exception as e:
+                log.error("Quotes batch unexpected error (first: %s): %s", batch[0], e)
+                return [SymbolQuote(symbol=s) for s in batch]
+
+    # Fire all batches, gather results
+    batch_results = await asyncio.gather(*[_fetch_batch(b) for b in batches])
+
+    # Flatten
+    all_quotes: list[SymbolQuote] = []
+    for batch_result in batch_results:
+        all_quotes.extend(batch_result)
+
+    eligible_count = sum(1 for q in all_quotes if q.stream_eligible)
+    log.info(
+        "Quotes fetch complete: %d/%d symbols have price+volume data, %d stream-eligible",
+        sum(1 for q in all_quotes if q.last_price is not None),
+        len(all_quotes),
+        eligible_count,
+    )
+    return all_quotes
