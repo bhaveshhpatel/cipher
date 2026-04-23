@@ -3,10 +3,14 @@ name: Backend CI/CD
 on:
   push:
     branches: [main]
-    paths:    ["backend/**"]
+    paths:
+      - "backend/**"
+      - "railway.toml"
   pull_request:
     branches: [main]
-    paths:    ["backend/**"]
+    paths:
+      - "backend/**"
+      - "railway.toml"
 
 jobs:
   deploy:
@@ -24,4 +28,4 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: railway up --service "${{ secrets.RAILWAY_SERVICE }}" --detach
-        working-directory: backend
+        # Run from repo root so Railway sees the root railway.toml
