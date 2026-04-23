@@ -64,12 +64,18 @@ cipher/
 │   │   └── trade_executor.py
 │   ├── services/
 │   │   └── tradier_stream.py
-│   └── routers/
-│       ├── auth.py            # OPTIONS handlers for /register and /token added
-│       ├── flow.py
-│       ├── simulation.py
-│       ├── ws.py
-│       └── smart_signals.py
+│   ├── routers/
+│   │   ├── auth.py            # OPTIONS handlers for /register and /token added
+│   │   ├── flow.py
+│   │   ├── simulation.py
+│   │   ├── ws.py
+│   │   └── smart_signals.py
+│   └── tests/
+│       ├── conftest.py
+│       ├── test_auth_flow.py
+│       ├── test_flow_and_stats.py
+│       ├── test_simulation_and_ws.py
+│       └── test_tradier_stream.py   # Tradier session token + stream 401 regression tests
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
@@ -192,6 +198,13 @@ Login:
 - `routers/auth.py` has explicit `@router.options("/register")` and `@router.options("/token")` handlers returning 200 to guarantee preflight never returns 400
 - `frontend/src/lib/api.ts` strips trailing slash from `NEXT_PUBLIC_API_URL` defensively
 
+### Tradier Stream — Critical Implementation Notes
+
+- **Session token POST requires `data={}` (NOT `content=b""`)** so httpx sends `Content-Length: 0`, matching `curl -d ""`. Using `content=b""` omits `Content-Length` and Tradier silently fails to return a sessionid.
+- Equivalent curl: `curl -X POST https://api.tradier.com/v1/markets/events/session -H "Authorization: Bearer $KEY" -H "Accept: application/json" -d ""`
+- Session tokens are short-lived. On 401 from either the session or stream endpoint, the service falls back to demo mode (no infinite retry loop).
+- Stream POST uses Bearer token in header + sessionid in body payload.
+
 ### Swarm Simulation
 
 Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
@@ -219,7 +232,9 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Auth — register + login | ✅ Fixed 2026-04-23 |
 | Railway deploy pipeline | ✅ Fixed 2026-04-23 |
 | Python version pinning | ✅ Fixed 2026-04-23 |
-| Tradier stream | ✅ Live — confirmed connecting to Tradier API on startup |
+| Tradier stream 401 loop | ✅ Fixed 2026-04-23 — 401 guard added + demo-mode fallback |
+| Tradier session token Content-Length | ✅ Fixed 2026-04-23 — `data={}` instead of `content=b""` to send Content-Length: 0 |
+| Tradier stream | ✅ Live — confirmed key works via curl; now connecting correctly |
 | Flow data | Live Tradier stream running; demo mode fallback if key missing |
 | Supabase | Auth working; DB not actively queried yet |
 | Redis | In config but not integrated |
@@ -321,6 +336,9 @@ npm run dev
 
 | Date | Change |
 |------|--------|
+| 2026-04-23 | **Fixed Tradier session token Content-Length** — changed `content=b""` to `data={}` in `_get_session_token()` so httpx sends `Content-Length: 0`, matching `curl -d ""` which Tradier requires |
+| 2026-04-23 | **Fixed Tradier 401 infinite loop** — added 401 guards on both session token and stream endpoints; stream 401 now falls back to demo mode instead of retrying |
+| 2026-04-23 | **Added Tradier regression tests** — `backend/tests/test_tradier_stream.py` covers session 401, session success, network error, stream 401 fallback, and live integration test |
 | 2026-04-23 | **Fixed CORS preflight 400** — added explicit `OPTIONS` handlers in `routers/auth.py` for `/register` and `/token`; stripped trailing slash from `NEXT_PUBLIC_API_URL` in `frontend/src/lib/api.ts` |
 | 2026-04-23 | **Fixed missing email-validator** — changed `pydantic==2.11.4` to `pydantic[email]==2.11.4` in requirements.txt |
 | 2026-04-23 | **Fixed runtime startup crash** — `config.py` migrated to `model_config = SettingsConfigDict(...)` for pydantic-settings v2.9 |

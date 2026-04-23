@@ -2,6 +2,12 @@
 Tradier WebSocket stream processor.
 Connects to Tradier's streaming API, parses option trades,
 runs them through the signal pipeline, and publishes to the event bus.
+
+Notes:
+- Session token POST must send Content-Length: 0 (use data={} not content=b"")
+  This matches curl -d "" which Tradier requires to issue a sessionid.
+- Stream POST uses the sessionid + TRADIER_API_KEY Bearer token.
+- On any 401 (session or stream), falls back to demo mode gracefully.
 """
 import asyncio
 import json
@@ -32,7 +38,13 @@ def get_stats() -> dict:
 
 
 async def _get_session_token() -> Optional[str]:
-    """Obtain a streaming session token from Tradier."""
+    """
+    Obtain a streaming session token from Tradier.
+
+    IMPORTANT: Must use data={} (not content=b"") so httpx sends
+    Content-Length: 0 in the request, equivalent to curl -d "".
+    Tradier requires this header to issue a sessionid.
+    """
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -41,7 +53,7 @@ async def _get_session_token() -> Optional[str]:
                     "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
                     "Accept": "application/json",
                 },
-                content=b"",
+                data={},  # sends Content-Length: 0 — required by Tradier (matches curl -d "")
             )
             if resp.status_code == 401:
                 log.error(
@@ -137,7 +149,7 @@ async def _process_trade(raw: dict):
 
 
 async def _demo_mode(symbols: list[str]):
-    """Emit synthetic signals when Tradier key is not set."""
+    """Emit synthetic signals when Tradier key is not set or auth fails."""
     import random
     rng      = random.Random(42)
     tickers  = symbols or ["AAPL","TSLA","NVDA","SPY","QQQ","MSFT","AMZN","META"]
