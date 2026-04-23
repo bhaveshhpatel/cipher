@@ -91,7 +91,7 @@ async def _resolve_startup_universe() -> list[str]:
     )
 
     log.info("[universe] Step 2b: calling load_universe (CBOE + Tradier validate + screen)")
-    symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
+    symbols, source, stream_eligible_set, quotes = await load_universe(db_snapshot=stale)
     log.info(
         "[universe] Step 2b: load_universe returned source=%s symbols=%d eligible=%s",
         source, len(symbols),
@@ -104,11 +104,18 @@ async def _resolve_startup_universe() -> list[str]:
             len(symbols),
             len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
         )
+        # save_snapshot FIRST — creates the active snapshot row
         saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
         if saved:
             log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
         else:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
+
+        # upsert_symbol_quotes AFTER — active snapshot now exists to upsert into
+        if quotes:
+            log.info("[universe] Step 3b: upserting %d symbol quotes (last_price, volume)", len(quotes))
+            await universe_store.upsert_symbol_quotes(quotes)
+            log.info("[universe] Step 3b SUCCESS: symbol quotes persisted")
     else:
         log.warning(
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
@@ -138,9 +145,11 @@ async def _universe_refresh_loop():
         log.info("[universe] Background refresh starting")
         try:
             stale = await universe_store.load_any_snapshot()
-            symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
+            symbols, source, stream_eligible_set, quotes = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+                if saved and quotes:
+                    await universe_store.upsert_symbol_quotes(quotes)
                 log.info(
                     "[universe] Background refresh complete: %d symbols eligible=%s saved=%s",
                     len(symbols),
@@ -160,8 +169,8 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    symbols     = await _resolve_startup_universe()
-    stream_task = asyncio.create_task(stream_options_flow(symbols))
+    symbols      = await _resolve_startup_universe()
+    stream_task  = asyncio.create_task(stream_options_flow(symbols))
     refresh_task = asyncio.create_task(_universe_refresh_loop())
 
     yield
