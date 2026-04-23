@@ -22,11 +22,6 @@ from services import universe_store
 
 # ── Structured JSON log formatter ────────────────────────────────────────────
 class _JsonFormatter(logging.Formatter):
-    """
-    Emit one JSON object per log line so Railway's log collector reads
-    `severity` from the structured field instead of regex-guessing it
-    from the raw message string.
-    """
     SEVERITY_MAP = {
         logging.DEBUG:    "debug",
         logging.INFO:     "info",
@@ -72,26 +67,50 @@ async def _resolve_startup_universe() -> list[str]:
       2. Tradier fetch + validate     — saves to DB, then starts
       3. Any DB snapshot (stale)      — fallback if Tradier is down
       4. SEED_SYMBOLS                 — last resort
+
+    Every step is logged explicitly so Railway logs reveal exactly
+    where the fallback chain breaks.
     """
+    log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
+
     # Step 1 — try fresh DB snapshot first (fast path)
-    fresh = universe_store.load_fresh_snapshot(max_age_hours=24)
+    fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
-        log.info("Startup: loaded fresh universe from DB (%d symbols)", len(fresh))
+        log.info("[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting", len(fresh))
         return fresh
 
-    log.info("Startup: no fresh DB snapshot — fetching from Tradier")
+    log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
+    log.info("[universe] Step 2: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
+             bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL))
 
-    # Step 2 — fetch from Tradier, with stale DB as fallback arg
-    stale = universe_store.load_any_snapshot()
+    # Step 2 — load stale snapshot for fallback arg, then hit Tradier
+    log.info("[universe] Step 2a: loading any stale DB snapshot as safety net")
+    stale = await universe_store.load_any_snapshot()
+    log.info("[universe] Step 2a: stale snapshot available=%s (%d symbols)",
+             stale is not None, len(stale) if stale else 0)
+
+    log.info("[universe] Step 2b: calling Tradier to fetch + validate full universe")
     symbols, source = await load_universe(db_snapshot=stale)
+    log.info("[universe] Step 2b: load_universe returned source=%s symbols=%d", source, len(symbols))
 
-    # Persist to DB if we got a live validated universe
+    # Persist to DB only if we got a live validated universe
     if source == "tradier_validated":
-        saved = universe_store.save_snapshot(symbols, source)
-        if not saved:
-            log.warning("Startup: failed to persist universe snapshot to DB")
+        log.info("[universe] Step 3: persisting tradier_validated snapshot (%d symbols) to DB", len(symbols))
+        saved = await universe_store.save_snapshot(symbols, source)
+        if saved:
+            log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
+        else:
+            log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs above")
+    else:
+        log.warning(
+            "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
+            source,
+        )
 
-    log.info("Startup: universe resolved — %d symbols (source=%s)", len(symbols), source)
+    log.info(
+        "[universe] FINAL: stream starting with %d symbols (source=%s)",
+        len(symbols), source,
+    )
     return symbols
 
 
@@ -102,28 +121,27 @@ async def _universe_refresh_loop():
     """
     Refreshes the universe every 24 hours in the background.
     Never cancels the main stream — stream keeps running with current symbols.
-    On failure, logs a warning and keeps the existing snapshot active.
     """
     REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours in seconds
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
-        log.info("Background universe refresh starting")
+        log.info("[universe] Background refresh starting")
         try:
-            stale = universe_store.load_any_snapshot()
+            stale = await universe_store.load_any_snapshot()
             symbols, source = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
-                saved = universe_store.save_snapshot(symbols, source)
+                saved = await universe_store.save_snapshot(symbols, source)
                 log.info(
-                    "Background refresh complete: %d symbols saved=%s",
+                    "[universe] Background refresh complete: %d symbols saved=%s",
                     len(symbols), saved,
                 )
             else:
                 log.warning(
-                    "Background refresh could not reach Tradier — keeping current snapshot "
-                    "(source=%s)", source,
+                    "[universe] Background refresh could not reach Tradier (source=%s) — keeping current snapshot",
+                    source,
                 )
         except Exception as e:
-            log.error("Background universe refresh failed (non-fatal): %s", e)
+            log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
 
 
 @asynccontextmanager
