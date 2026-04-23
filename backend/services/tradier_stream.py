@@ -77,7 +77,7 @@ def get_stats() -> dict:
 def _is_market_hours() -> bool:
     """
     Returns True if the US options market is currently open.
-    Options trade Mon–Fri 9:30–16:00 ET.
+    Options trade Mon-Fri 9:30-16:00 ET.
     Does NOT account for market holidays (Tradier will just close the stream on those).
     """
     now_et = datetime.now(_ET)
@@ -302,9 +302,6 @@ async def stream_options_flow(symbols: list[str]):
         _stats["reconnects"] += 1
         _stats["mode"] = "reconnecting"
 
-        # Only reset the attempt counter if we actually received data this session.
-        # If session_ticks == 0, the market is likely closed and Tradier closed instantly —
-        # preserve the attempt counter so backoff accumulates (not reset to 0 every cycle).
         if session_ticks > 0:
             reconnect_attempt = 0
         else:
@@ -319,19 +316,11 @@ async def stream_options_flow(symbols: list[str]):
 # Idle watchdog wrapper
 # ---------------------------------------------------------------------------
 async def _iter_lines_with_watchdog(resp: httpx.Response):
-    """
-    Wraps resp.aiter_lines() with a per-line timeout.
-    Raises asyncio.TimeoutError if no line is received within _IDLE_TIMEOUT seconds.
-    This catches silent TCP hangs that httpx would otherwise not detect.
-    """
     async for line in resp.aiter_lines():
         yield line
 
 
 async def _guarded_lines(resp: httpx.Response):
-    """
-    Watchdog using asyncio.wait_for per line.
-    """
     aiter = resp.aiter_lines().__aiter__()
     while True:
         try:
@@ -343,7 +332,6 @@ async def _guarded_lines(resp: httpx.Response):
             raise
 
 
-# Override the simple wrapper with the guarded version
 _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
@@ -355,13 +343,44 @@ async def _process_trade(raw: dict):
     ev = parse_tradier_trade(raw)
     if not ev:
         return
+
     _stats["classified"] += 1
+
+    # -----------------------------------------------------------------------
+    # LOG every classified options flow tick (visible in Railway logs)
+    # -----------------------------------------------------------------------
+    log.info(
+        "[flow] %s %s $%.0f x%s | prem=$%,.0f | type=%s | sentiment=%s | tier=%s",
+        ev.ticker,
+        ev.contract_type,
+        ev.strike,
+        ev.expiry,
+        ev.premium,
+        getattr(ev, "trade_type", "UNKNOWN"),
+        getattr(ev, "sentiment", "UNKNOWN"),
+        getattr(ev, "influence_tier", "UNKNOWN"),
+    )
 
     ep = accumulator.ingest(ev)
     if not ep:
         return
 
     alert_level = accumulator.get_alert_level(ep)
+
+    # -----------------------------------------------------------------------
+    # LOG every signal episode that crosses the repetition threshold
+    # -----------------------------------------------------------------------
+    log.info(
+        "[signal] %s | %s | alert=%s | trades=%d | total_prem=$%,.0f | accel=%s | %s",
+        ep.ticker,
+        ep.contract_type,
+        alert_level,
+        ep.trade_count,
+        ep.total_premium,
+        ep.is_accelerating,
+        ep.summary_str(),
+    )
+
     signal = {
         "type": "signal",
         "data": {
@@ -386,10 +405,6 @@ async def _process_trade(raw: dict):
 # Demo mode — supervised fallback, not an infinite trap
 # ---------------------------------------------------------------------------
 async def _demo_mode_once(symbols: list[str]):
-    """
-    Emit synthetic signals as a cancellable background task.
-    Designed to be cancelled when a live connection is established.
-    """
     import datetime
     rng     = random.Random(42)
     tickers = symbols or ["AAPL", "TSLA", "NVDA", "SPY", "QQQ", "MSFT", "AMZN", "META"]

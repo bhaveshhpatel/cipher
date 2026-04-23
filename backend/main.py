@@ -18,6 +18,7 @@ from fastapi import Depends
 from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, SEED_SYMBOLS
 from services import universe_store
+from services.flow_store import start_flow_writer
 
 
 class _JsonFormatter(logging.Formatter):
@@ -104,14 +105,12 @@ async def _resolve_startup_universe() -> list[str]:
             len(symbols),
             len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
         )
-        # save_snapshot FIRST — creates the active snapshot row
         saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
         if saved:
             log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
         else:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
 
-        # upsert_symbol_quotes AFTER — active snapshot now exists to upsert into
         if quotes:
             log.info("[universe] Step 3b: upserting %d symbol quotes (last_price, volume)", len(quotes))
             await universe_store.upsert_symbol_quotes(quotes)
@@ -122,7 +121,6 @@ async def _resolve_startup_universe() -> list[str]:
             source,
         )
 
-    # Stream only eligible symbols when available, else full list
     stream_symbols = (
         [s for s in symbols if s in stream_eligible_set]
         if stream_eligible_set is not None
@@ -169,15 +167,17 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    symbols      = await _resolve_startup_universe()
-    stream_task  = asyncio.create_task(stream_options_flow(symbols))
-    refresh_task = asyncio.create_task(_universe_refresh_loop())
+    symbols        = await _resolve_startup_universe()
+    stream_task    = asyncio.create_task(stream_options_flow(symbols))
+    db_write_task  = asyncio.create_task(start_flow_writer())
+    refresh_task   = asyncio.create_task(_universe_refresh_loop())
 
     yield
 
     refresh_task.cancel()
     stream_task.cancel()
-    for task in (stream_task, refresh_task):
+    db_write_task.cancel()
+    for task in (stream_task, db_write_task, refresh_task):
         try:
             await task
         except asyncio.CancelledError:
