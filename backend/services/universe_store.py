@@ -21,6 +21,12 @@ ROOT CAUSE FIX (2026-04-23) C-005:
 ROOT CAUSE FIX (2026-04-23) C-006:
   options_universe_snapshots.provider is NOT NULL with no default.
   Fix: always pass provider="tradier" explicitly.
+
+ROOT CAUSE FIX (2026-04-23) C-007:
+  _client() was falling back to the anon key (SUPABASE_KEY) when
+  SUPABASE_SERVICE_KEY was not set. The anon key respects RLS and causes
+  42501 policy violations on every server-side INSERT/UPDATE/DELETE.
+  Fix: use SUPABASE_SERVICE_KEY ONLY — raise clearly if it is missing.
 """
 import asyncio
 import logging
@@ -42,10 +48,21 @@ _UPSERT_BATCH    = 500  # rows per upsert batch
 
 
 def _client() -> Client:
-    return create_client(
-        settings.SUPABASE_URL,
-        settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY,
-    )
+    """
+    Always use the service role key — it bypasses RLS, which is required
+    for all server-side INSERT/UPDATE/DELETE operations.
+
+    NEVER fall back to the anon key (settings.SUPABASE_KEY). The anon key
+    respects RLS and will cause 401/42501 errors on every write.
+    """
+    service_key = settings.SUPABASE_SERVICE_KEY
+    if not service_key:
+        raise RuntimeError(
+            "[universe_store] SUPABASE_SERVICE_KEY is not set. "
+            "Set it in Railway env vars to the Supabase service_role key. "
+            "Never use the anon key for backend DB writes."
+        )
+    return create_client(settings.SUPABASE_URL, service_key)
 
 
 # ---------------------------------------------------------------------------
