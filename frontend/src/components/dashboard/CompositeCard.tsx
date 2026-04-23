@@ -1,84 +1,123 @@
 "use client";
-import { useEffect, useState } from "react";
-import { api, CompositeSignal } from "@/lib/api";
+import type { CompositeSignal } from "@/lib/api";
 
-interface Props { ticker: string | null; token: string; }
+interface Props {
+  signal:  CompositeSignal | null;
+  loading: boolean;
+  ticker:  string;
+}
 
-export function CompositeCard({ ticker, token }: Props) {
-  const [data,    setData]    = useState<CompositeSignal | null>(null);
-  const [loading, setLoading] = useState(false);
+function ScoreBar({ label, score, color }: { label: string; score: number; color: string }) {
+  const pct = Math.min(Math.max(score * 100, 0), 100);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
+          {label}
+        </span>
+        <span className="text-sm font-mono font-bold tabular" style={{ color }}>
+          {pct.toFixed(0)}
+        </span>
+      </div>
+      <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--border)" }}>
+        <div className="h-full rounded-full transition-all duration-700" style={{ width: `${pct}%`, background: color }} />
+      </div>
+    </div>
+  );
+}
 
-  useEffect(() => {
-    if (!ticker || !token) return;
-    setLoading(true);
-    api.getComposite(ticker, token)
-      .then(setData).catch(() => {}).finally(() => setLoading(false));
-  }, [ticker, token]);
+const recStyle = (r: string) => {
+  if (r === "BUY")       return { color: "var(--green)",  bg: "rgba(26,158,90,0.08)",  border: "rgba(26,158,90,0.2)"  };
+  if (r === "SELL")      return { color: "var(--red)",    bg: "rgba(220,53,69,0.08)",  border: "rgba(220,53,69,0.2)"  };
+  if (r === "STRONG_BUY")return { color: "var(--teal)",   bg: "rgba(10,155,140,0.08)", border: "rgba(10,155,140,0.2)" };
+  return                          { color: "var(--muted)", bg: "var(--surface-2)",      border: "var(--border)"        };
+};
 
-  const REC_COLORS: Record<string,string> = { BUY:"#22c55e", SELL:"#ef4444", HOLD:"#e8b84b" };
-  const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
+function EmptyState({ ticker }: { ticker: string }) {
+  return (
+    <div className="card flex flex-col items-center justify-center py-20 gap-4">
+      <span className="text-4xl" style={{ color: "var(--faint)" }}>◈</span>
+      <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>
+        No composite signal for {ticker}
+      </p>
+      <p className="text-sm" style={{ color: "var(--faint)" }}>
+        Click "Analyze {ticker}" to run multi-factor scoring.
+      </p>
+    </div>
+  );
+}
+
+export function CompositeCard({ signal, loading, ticker }: Props) {
+  if (loading) {
+    return (
+      <div className="card p-6 flex flex-col gap-4">
+        {[120, 80, 240, 160].map((w, i) => (
+          <div key={i} className="skeleton h-5 rounded" style={{ width: w }} />
+        ))}
+      </div>
+    );
+  }
+
+  if (!signal) return <EmptyState ticker={ticker} />;
+
+  const rs = recStyle(signal.recommendation);
+  const compositeColor = signal.composite_score >= 0.7 ? "var(--green)"
+    : signal.composite_score >= 0.4 ? "var(--amber)" : "var(--red)";
 
   return (
-    <div style={{ padding:16, height:"100%", display:"flex", flexDirection:"column", gap:16 }}>
-      <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, letterSpacing:"0.2em", color:"#304060" }}>
-        COMPOSITE SIGNAL
+    <div className="grid gap-4 sm:grid-cols-2">
+
+      {/* Left: Score gauges */}
+      <div className="card p-5 flex flex-col gap-4">
+        <h3 className="text-sm font-bold uppercase tracking-widest" style={{ color: "var(--faint)" }}>
+          Factor Scores · {signal.ticker}
+        </h3>
+        <ScoreBar label="Composite"    score={signal.composite_score} color={compositeColor} />
+        <ScoreBar label="Flow Score"   score={signal.flow_score}      color="var(--amber)" />
+        <ScoreBar label="Backtest"     score={signal.backtest_score}  color="var(--teal)" />
+
+        {/* Composite dial */}
+        <div className="flex items-center justify-center pt-2">
+          <div className="flex flex-col items-center gap-1">
+            <span
+              className="text-5xl font-black font-mono tabular"
+              style={{ color: compositeColor }}
+            >
+              {(signal.composite_score * 100).toFixed(0)}
+            </span>
+            <span className="text-xs uppercase tracking-widest" style={{ color: "var(--faint)" }}>
+              composite score
+            </span>
+          </div>
+        </div>
       </div>
 
-      {!ticker ? (
-        <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center" }}>
-          <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#1e2d4a", letterSpacing:"0.15em" }}>SCAN A TICKER</span>
-        </div>
-      ) : loading ? (
-        <div style={{ flex:1, display:"flex", flexDirection:"column", gap:10 }}>
-          {Array.from({length:4}).map((_,i) => (
-            <div key={i} className="skeleton" style={{ height:30, borderRadius:8 }} />
-          ))}
-        </div>
-      ) : data ? (
-        <>
-          {/* Recommendation */}
-          <div style={{
-            padding:"18px 20px", borderRadius:12, textAlign:"center",
-            background:`${REC_COLORS[data.recommendation] || "#546882"}10`,
-            border:`1px solid ${REC_COLORS[data.recommendation] || "#546882"}30`,
-          }}>
-            <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:28, fontWeight:700,
-              color: REC_COLORS[data.recommendation] || "#9baec8", letterSpacing:"0.1em",
-              textShadow:`0 0 24px ${REC_COLORS[data.recommendation] || "#9baec8"}60`,
-            }}>{data.recommendation}</div>
-            <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#546882", marginTop:4 }}>
-              {data.ticker} · composite {pct(data.composite_score)}
-            </div>
-          </div>
+      {/* Right: Recommendation + reasoning */}
+      <div className="card p-5 flex flex-col gap-4">
+        <h3 className="text-sm font-bold uppercase tracking-widest" style={{ color: "var(--faint)" }}>
+          Recommendation
+        </h3>
 
-          {/* Score bars */}
-          {[
-            { label:"COMPOSITE", value:data.composite_score, color:"#00d4ff" },
-            { label:"FLOW SCORE", value:data.flow_score, color:"#e8b84b" },
-            { label:"BACKTEST",   value:data.backtest_score, color:"#a855f7" },
-          ].map(({ label, value, color }) => (
-            <div key={label}>
-              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#304060", letterSpacing:"0.12em" }}>{label}</span>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color, fontWeight:700 }}>{pct(value)}</span>
-              </div>
-              <div style={{ height:5, borderRadius:4, background:"rgba(30,45,74,0.6)", overflow:"hidden" }}>
-                <div style={{ height:"100%", width:`${value*100}%`, borderRadius:4, background:color,
-                  boxShadow:`0 0 8px ${color}60`, transition:"width 0.8s cubic-bezier(0.16,1,0.3,1)" }} />
-              </div>
-            </div>
-          ))}
+        {/* Verdict pill */}
+        <div
+          className="rounded-xl px-5 py-4 flex items-center justify-center"
+          style={{ background: rs.bg, border: `1px solid ${rs.border}` }}
+        >
+          <span className="text-4xl font-black font-mono tracking-tight" style={{ color: rs.color }}>
+            {signal.recommendation}
+          </span>
+        </div>
 
-          {/* Reasoning */}
-          <div style={{
-            padding:"10px 12px", borderRadius:8,
-            background:"rgba(9,14,29,0.6)", border:"1px solid rgba(30,45,74,0.4)",
-            fontFamily:"'JetBrains Mono',monospace", fontSize:10, lineHeight:1.65, color:"#9baec8",
-          }}>
-            {data.reasoning}
-          </div>
-        </>
-      ) : null}
+        {/* Reasoning */}
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--faint)" }}>
+            Reasoning
+          </span>
+          <p className="text-sm leading-relaxed" style={{ color: "var(--text)" }}>
+            {signal.reasoning}
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
