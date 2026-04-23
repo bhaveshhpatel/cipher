@@ -27,15 +27,21 @@ IMPORTANT: All public functions are async-safe.
   blocking work inside asyncio.get_event_loop().run_in_executor(None, ...).
 
 ROOT CAUSE FIX (2026-04-23):
-  supabase-py v2 .insert().execute() returns an EMPTY data list by default.
-  You MUST chain .select() after .insert() to get the inserted row back.
-  Without this, snapshot_id was never obtained and save_snapshot always
-  returned False silently, leaving the DB permanently empty.
+  supabase-py v2 SyncQueryRequestBuilder does NOT expose .select() after
+  .insert(). Chaining .insert().select().execute() raises:
+    AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
+
+  Fix: generate snapshot_id = str(uuid4()) in Python BEFORE the insert and
+  pass it explicitly in the payload. The ID is known ahead of time so we
+  never need to read it back from the insert result. This is stable across
+  all supabase-py v2 versions and removes the dependency on insert-return
+  behaviour entirely.
 """
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from uuid import uuid4
 
 from supabase import create_client, Client
 from config import settings
@@ -162,44 +168,40 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
 
 def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
     """
-    1. Insert new snapshot row (is_active=True) — MUST chain .select() to get id back
-    2. Bulk-insert all symbols in batches of 500
-    3. Deactivate all other snapshots
-    4. Prune snapshots beyond _KEEP_SNAPSHOTS
+    1. Generate snapshot_id locally via uuid4() — no need to read it back from insert
+    2. Insert new snapshot row with the pre-generated id (is_active=True)
+    3. Bulk-insert all symbols in batches of 500
+    4. Deactivate all other snapshots
+    5. Prune snapshots beyond _KEEP_SNAPSHOTS
 
-    KEY FIX: supabase-py v2 returns empty data from .insert().execute() unless
-    you chain .select() after .insert(). Without .select(), snap_result.data is []
-    and snapshot_id can never be obtained, causing every save to silently fail.
+    KEY FIX: supabase-py v2 SyncQueryRequestBuilder does not expose .select()
+    after .insert(). Previously chaining .insert().select().execute() raised:
+      AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
+
+    By generating the UUID in Python and passing it in the insert payload,
+    we know the snapshot_id before any DB call and never need it returned.
+    This is version-agnostic and eliminates the crash entirely.
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
         return False
     try:
         sb = _client()
-        log.info("universe_store: inserting snapshot header (source=%s, symbols=%d)", source, len(symbols))
 
-        # 1. Insert snapshot header
-        # CRITICAL: .select() MUST follow .insert() in supabase-py v2 to get the inserted row back.
-        # Without .select(), .execute() returns data=[] and snapshot_id cannot be extracted.
-        snap_result = (
-            sb.table("options_universe_snapshots")
-            .insert({
-                "symbol_count": len(symbols),
-                "source":       source,
-                "is_active":    True,
-            })
-            .select()          # ← THE FIX: required in supabase-py v2 to return inserted row
-            .execute()
+        # Generate ID locally — stable across all supabase-py v2 versions
+        snapshot_id = str(uuid4())
+        log.info(
+            "universe_store: inserting snapshot id=%s source=%s symbols=%d",
+            snapshot_id, source, len(symbols),
         )
-        snap_rows = snap_result.data or []
-        if not snap_rows:
-            log.error(
-                "universe_store.save_snapshot: insert returned no rows even with .select() "
-                "— check RLS policies (service key must bypass RLS) and table permissions"
-            )
-            return False
-        snapshot_id = snap_rows[0]["id"]
-        log.info("universe_store: snapshot header inserted id=%s", snapshot_id)
+
+        # 1. Insert snapshot header with pre-generated id
+        sb.table("options_universe_snapshots").insert({
+            "id":           snapshot_id,
+            "symbol_count": len(symbols),
+            "source":       source,
+            "is_active":    True,
+        }).execute()
 
         # 2. Bulk insert symbols in batches of 500
         batch_size = 500
