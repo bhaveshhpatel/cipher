@@ -20,7 +20,6 @@ from services.symbols_loader import load_universe, SEED_SYMBOLS
 from services import universe_store
 
 
-# ── Structured JSON log formatter ────────────────────────────────────────────
 class _JsonFormatter(logging.Formatter):
     SEVERITY_MAP = {
         logging.DEBUG:    "debug",
@@ -58,82 +57,95 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
-# Universe loader — resolves symbols at startup with full fallback chain
+# Universe loader
 # ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> list[str]:
     """
     Priority:
       1. Fresh DB snapshot (< 24h old) — stream starts instantly
-      2. Tradier fetch + validate     — saves to DB, then starts
-      3. Any DB snapshot (stale)      — fallback if Tradier is down
-      4. SEED_SYMBOLS                 — last resort
-
-    Every step is logged explicitly so Railway logs reveal exactly
-    where the fallback chain breaks.
+      2. Tradier fetch + validate + screen — saves to DB, then starts
+      3. Any DB snapshot (stale)          — fallback if Tradier is down
+      4. SEED_SYMBOLS                     — last resort
     """
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
-    # Step 1 — try fresh DB snapshot first (fast path)
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
-        log.info("[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting", len(fresh))
+        log.info(
+            "[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting",
+            len(fresh),
+        )
         return fresh
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
-    log.info("[universe] Step 2: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
-             bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL))
+    log.info(
+        "[universe] Step 2: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
+        bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL),
+    )
 
-    # Step 2 — load stale snapshot for fallback arg, then hit Tradier
     log.info("[universe] Step 2a: loading any stale DB snapshot as safety net")
     stale = await universe_store.load_any_snapshot()
-    log.info("[universe] Step 2a: stale snapshot available=%s (%d symbols)",
-             stale is not None, len(stale) if stale else 0)
+    log.info(
+        "[universe] Step 2a: stale snapshot available=%s (%d symbols)",
+        stale is not None, len(stale) if stale else 0,
+    )
 
-    log.info("[universe] Step 2b: calling Tradier to fetch + validate full universe")
-    symbols, source = await load_universe(db_snapshot=stale)
-    log.info("[universe] Step 2b: load_universe returned source=%s symbols=%d", source, len(symbols))
+    log.info("[universe] Step 2b: calling load_universe (CBOE + Tradier validate + screen)")
+    symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
+    log.info(
+        "[universe] Step 2b: load_universe returned source=%s symbols=%d eligible=%s",
+        source, len(symbols),
+        len(stream_eligible_set) if stream_eligible_set is not None else "n/a",
+    )
 
-    # Persist to DB only if we got a live validated universe
     if source == "tradier_validated":
-        log.info("[universe] Step 3: persisting tradier_validated snapshot (%d symbols) to DB", len(symbols))
-        saved = await universe_store.save_snapshot(symbols, source)
+        log.info(
+            "[universe] Step 3: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
+            len(symbols),
+            len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
+        )
+        saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
         if saved:
             log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
         else:
-            log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs above")
+            log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
     else:
         log.warning(
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
             source,
         )
 
-    log.info(
-        "[universe] FINAL: stream starting with %d symbols (source=%s)",
-        len(symbols), source,
+    # Stream only eligible symbols when available, else full list
+    stream_symbols = (
+        [s for s in symbols if s in stream_eligible_set]
+        if stream_eligible_set is not None
+        else symbols
     )
-    return symbols
+    log.info(
+        "[universe] FINAL: stream starting with %d symbols (source=%s, from universe of %d)",
+        len(stream_symbols), source, len(symbols),
+    )
+    return stream_symbols
 
 
 # ---------------------------------------------------------------------------
 # Background 24-hour refresh
 # ---------------------------------------------------------------------------
 async def _universe_refresh_loop():
-    """
-    Refreshes the universe every 24 hours in the background.
-    Never cancels the main stream — stream keeps running with current symbols.
-    """
-    REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours in seconds
+    REFRESH_INTERVAL = 24 * 60 * 60
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         log.info("[universe] Background refresh starting")
         try:
             stale = await universe_store.load_any_snapshot()
-            symbols, source = await load_universe(db_snapshot=stale)
+            symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
-                saved = await universe_store.save_snapshot(symbols, source)
+                saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
                 log.info(
-                    "[universe] Background refresh complete: %d symbols saved=%s",
-                    len(symbols), saved,
+                    "[universe] Background refresh complete: %d symbols eligible=%s saved=%s",
+                    len(symbols),
+                    len(stream_eligible_set) if stream_eligible_set is not None else "all",
+                    saved,
                 )
             else:
                 log.warning(
@@ -148,13 +160,8 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    # Resolve universe (DB → Tradier → stale DB → seed)
-    symbols = await _resolve_startup_universe()
-
-    # Start stream with resolved universe
+    symbols     = await _resolve_startup_universe()
     stream_task = asyncio.create_task(stream_options_flow(symbols))
-
-    # Start background 24-hour refresh
     refresh_task = asyncio.create_task(_universe_refresh_loop())
 
     yield
@@ -176,9 +183,8 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────
 _configured_origins = settings.origins
-_use_wildcard = "*" in _configured_origins
+_use_wildcard       = "*" in _configured_origins
 
 if not _use_wildcard:
     _base = [
@@ -201,7 +207,6 @@ app.add_middleware(
     expose_headers    = ["*"],
 )
 
-# ── Routers ───────────────────────────────────────────────────────────────
 app.include_router(auth.router)
 app.include_router(flow.router)
 app.include_router(simulation.router)
