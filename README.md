@@ -17,49 +17,75 @@ AI swarm simulation, and composite signal scoring.
 | Deploy FE  | Vercel                                    |
 | CI/CD      | GitHub Actions                            |
 
+## Architecture
+
+### Options Universe Persistence
+
+The full ~8,000-symbol tradeable options universe is persisted in Supabase.
+On cold start the stream loads in < 1 second from DB instead of re-validating via Tradier API.
+A background task refreshes the universe every 24 hours without interrupting the stream.
+
+```
+Startup Resolution Order:
+  1. Fresh DB snapshot (< 24h)    → load instantly, stream starts in < 1s
+  2. Tradier fetch + validate     → save to DB, then stream
+  3. Stale DB snapshot (any age)  → if Tradier is down
+  4. SEED_SYMBOLS (16 tickers)    → last resort fallback
+```
+
 ## Project Structure
 
 ```
 cipher/
 ├── backend/
-│   ├── main.py                     # FastAPI app entry
-│   ├── config.py                   # Settings (pydantic-settings)
+│   ├── main.py                     # FastAPI app — startup loads universe from DB
+│   ├── config.py                   # Settings (pydantic-settings v2)
 │   ├── requirements.txt
 │   ├── core/
-│   │   ├── auth.py                 # JWT auth helpers
-│   │   └── async_bus.py            # In-process event bus
+│   │   ├── auth.py
+│   │   └── async_bus.py
 │   ├── parsers/
-│   │   ├── options_flow_parser.py  # Raw trade → OptionsFlowEvent
-│   │   ├── bid_ask_classifier.py   # ABOVE_ASK / AT_ASK / etc.
-│   │   └── trade_type_detector.py  # SWEEP / BLOCK / SPLIT
+│   │   ├── options_flow_parser.py
+│   │   ├── bid_ask_classifier.py
+│   │   └── trade_type_detector.py
 │   ├── signals/
-│   │   ├── repetition_accumulator.py   # Rolling window repetition
-│   │   ├── backtest_validator.py        # Historical win-rate score
-│   │   ├── midcap_screener.py           # Mid-cap unusual activity
-│   │   └── composite_signal_engine.py  # Flow + backtest composite
+│   │   ├── repetition_accumulator.py
+│   │   ├── backtest_validator.py
+│   │   ├── midcap_screener.py
+│   │   └── composite_signal_engine.py
 │   ├── simulation/
-│   │   ├── swarm_engine.py         # Multi-agent LLM voting
-│   │   └── ensemble_runner.py      # Aggregate verdicts
+│   │   ├── swarm_engine.py
+│   │   └── ensemble_runner.py
 │   ├── execution/
-│   │   └── trade_executor.py       # Tradier order placement
+│   │   └── trade_executor.py
 │   ├── services/
-│   │   └── tradier_stream.py       # Live stream processor
-│   └── routers/
-│       ├── auth.py                 # POST /api/auth/token, /register
-│       ├── flow.py                 # GET  /api/flow/scan
-│       ├── simulation.py           # POST /api/simulation/run
-│       ├── ws.py                   # WS   /ws/signals
-│       └── smart_signals.py        # GET  /api/signals/composite/{ticker}
+│   │   ├── tradier_stream.py       # Live stream processor
+│   │   ├── symbols_loader.py       # ★ Universe fetch + Tradier validation
+│   │   └── universe_store.py       # ★ Supabase snapshot read/write
+│   ├── migrations/
+│   │   └── 001_options_universe.sql  # ★ DB schema (applied to Supabase)
+│   ├── routers/
+│   │   ├── auth.py
+│   │   ├── flow.py
+│   │   ├── simulation.py
+│   │   ├── ws.py
+│   │   └── smart_signals.py
+│   └── tests/
+│       ├── test_auth_flow.py
+│       ├── test_flow_and_stats.py
+│       ├── test_simulation_and_ws.py
+│       ├── test_tradier_stream.py
+│       ├── test_symbols_loader.py   # ★ 20 edge-case tests
+│       └── test_universe_store.py   # ★ DB read/write tests
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
-│   │   │   ├── layout.tsx          # Root layout + fonts
-│   │   │   ├── globals.css         # Design system CSS
-│   │   │   ├── page.tsx            # Login / landing page
-│   │   │   └── dashboard/
-│   │   │       └── page.tsx        # Main dashboard
+│   │   │   ├── layout.tsx
+│   │   │   ├── globals.css
+│   │   │   ├── page.tsx
+│   │   │   └── dashboard/page.tsx
 │   │   ├── components/
-│   │   │   ├── CipherLogo.tsx      # SVG logo
+│   │   │   ├── CipherLogo.tsx
 │   │   │   └── dashboard/
 │   │   │       ├── SignalFeed.tsx
 │   │   │       ├── FlowTable.tsx
@@ -71,15 +97,9 @@ cipher/
 │   │   │   ├── useSignalStream.ts
 │   │   │   ├── useFlow.ts
 │   │   │   └── useSimulation.ts
-│   │   ├── lib/
-│   │   │   └── api.ts
-│   │   └── types/
-│   │       └── index.ts
-│   ├── package.json
-│   ├── next.config.ts
-│   ├── tailwind.config.ts
-│   ├── tsconfig.json
-│   └── .env.example
+│   │   ├── lib/api.ts
+│   │   └── types/index.ts
+│   └── ...
 └── .github/
     └── workflows/
         ├── backend.yml
@@ -109,11 +129,19 @@ npm run dev
 
 See `backend/.env.example` and `frontend/.env.example`.
 
+## Supabase Tables
+
+| Table | Purpose |
+|---|---|
+| `options_universe_snapshots` | One row per validated ~8,000-symbol universe snapshot |
+| `options_universe_symbols` | Individual symbols per snapshot (normalized) |
+
+Migration file: `backend/migrations/001_options_universe.sql` — already applied to production.
+
 ## GitHub Actions Secrets Required
 
 | Secret                  | Used by    |
 |-------------------------|------------|
-| `RAILWAY_TOKEN`         | BE deploy  |
 | `VERCEL_TOKEN`          | FE deploy  |
 | `VERCEL_ORG_ID`         | FE deploy  |
 | `VERCEL_PROJECT_ID`     | FE deploy  |

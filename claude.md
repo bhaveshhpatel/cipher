@@ -38,7 +38,7 @@ cipher/
 │       ├── backend.yml        # CI only — syntax check; NO deploy steps
 │       └── frontend.yml       # Vercel deploy via CLI
 ├── backend/
-│   ├── main.py
+│   ├── main.py                # FastAPI app — startup loads universe from DB first
 │   ├── config.py              # pydantic-settings v2 — uses model_config = SettingsConfigDict(...)
 │   ├── requirements.txt       # pydantic[email] ensures email-validator is installed
 │   ├── requirements-dev.txt
@@ -63,9 +63,13 @@ cipher/
 │   ├── execution/
 │   │   └── trade_executor.py
 │   ├── services/
-│   │   └── tradier_stream.py
+│   │   ├── tradier_stream.py
+│   │   ├── symbols_loader.py  # ★ NEW — Tradier universe fetch + validation + fallbacks
+│   │   └── universe_store.py  # ★ NEW — Supabase snapshot read/write
+│   ├── migrations/
+│   │   └── 001_options_universe.sql  # ★ NEW — DB schema for universe snapshots
 │   ├── routers/
-│   │   ├── auth.py            # OPTIONS handlers for /register and /token added
+│   │   ├── auth.py
 │   │   ├── flow.py
 │   │   ├── simulation.py
 │   │   ├── ws.py
@@ -75,7 +79,9 @@ cipher/
 │       ├── test_auth_flow.py
 │       ├── test_flow_and_stats.py
 │       ├── test_simulation_and_ws.py
-│       └── test_tradier_stream.py   # Tradier session token + stream 401 regression tests
+│       ├── test_tradier_stream.py
+│       ├── test_symbols_loader.py   # ★ NEW — 20 edge-case tests
+│       └── test_universe_store.py   # ★ NEW — DB read/write tests
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
@@ -96,7 +102,7 @@ cipher/
 │   │   │   ├── useSignalStream.ts
 │   │   │   ├── useFlow.ts
 │   │   │   └── useSimulation.ts
-│   │   ├── lib/api.ts         # Strips trailing slash from NEXT_PUBLIC_API_URL
+│   │   ├── lib/api.ts
 │   │   └── types/index.ts
 │   ├── package.json
 │   ├── next.config.mjs
@@ -150,15 +156,78 @@ cipher/
 
 ## Key Business Logic
 
+### Options Universe — Persistence Layer ★ NEW
+
+The full universe of tradeable options symbols (~8,000 tickers) is now persisted in Supabase.
+This eliminates cold-start delays, Tradier downtime blind spots, and audit gaps.
+
+#### Startup Resolution Order (`main.py → _resolve_startup_universe()`)
+
+```
+App startup
+  │
+  ├─ 1. Query DB for latest active snapshot (< 24h old)
+  │       └─ Found & fresh → LOAD from DB → stream starts instantly ✅
+  │
+  ├─ 2. No fresh snapshot in DB
+  │       └─ Fetch from Tradier + validate in parallel batches (semaphore=20)
+  │             ├─ Success → SAVE to DB → mark active → start stream ✅
+  │             └─ Tradier down → load LAST snapshot (any age) from DB
+  │                   └─ None ever in DB → SEED_SYMBOLS fallback (16 symbols) ✅
+  │
+  └─ 3. Background refresh every 24h (_universe_refresh_loop)
+          └─ Fetch + validate new universe
+                ├─ Success → SAVE new snapshot → deactivate old one ✅
+                └─ Failure → keep current active snapshot, log warning ✅
+```
+
+#### DB Tables
+
+```sql
+-- One row per validated universe snapshot
+options_universe_snapshots (
+  id            UUID PRIMARY KEY,
+  fetched_at    TIMESTAMPTZ,
+  symbol_count  INT,
+  source        TEXT,   -- 'tradier_validated' | 'seed_fallback' | 'cache'
+  is_active     BOOLEAN -- UNIQUE partial index: only 1 active at a time
+)
+
+-- Individual symbols per snapshot (normalized, batch-inserted in 500s)
+options_universe_symbols (
+  snapshot_id  UUID → options_universe_snapshots(id) ON DELETE CASCADE,
+  symbol       TEXT,
+  PRIMARY KEY (snapshot_id, symbol)
+)
+```
+
+#### Key Design Decisions
+- Refresh cadence: **every 24h** — options-active universe changes slowly
+- Keep **last 7 snapshots** — auto-purge older ones via ON DELETE CASCADE
+- **Never block stream on refresh** — background asyncio task
+- `source` field distinguishes full coverage vs degraded fallback
+- Partial unique index enforces only ONE active snapshot at the DB level
+
+#### Services
+
+| File | Responsibility |
+|---|---|
+| `services/symbols_loader.py` | Fetches optionable symbols from Tradier REST, validates each via expiration check (20 concurrent), handles all edge cases (401, network error, single-dict response, lowercase symbols) |
+| `services/universe_store.py` | Supabase read/write — `load_fresh_snapshot()`, `load_any_snapshot()`, `save_snapshot()` (batched inserts of 500, prunes to 7 snapshots) |
+| `migrations/001_options_universe.sql` | DDL for both tables + 3 indexes including partial unique index |
+
+---
+
 ### Signal Pipeline
 
-1. Tradier WebSocket emits raw trade ticks
-2. `options_flow_parser.py` parses ticks → `OptionsFlowEvent`
-3. `bid_ask_classifier.py` classifies fill aggressiveness
-4. `trade_type_detector.py` classifies trade type (SWEEP / BLOCK / SPLIT / SINGLE)
-5. `repetition_accumulator.py` groups trades into `RepetitionEpisode` (30-min window, min 3 trades, min $50K premium)
-6. `composite_signal_engine.py` scores: `composite = flow_score × 0.6 + backtest_score × 0.4`
-7. Signal published to `async_bus` → broadcast to all WS subscribers
+1. `_resolve_startup_universe()` loads symbol list from DB (or Tradier/seed fallback)
+2. Tradier WebSocket emits raw trade ticks for those symbols
+3. `options_flow_parser.py` parses ticks → `OptionsFlowEvent`
+4. `bid_ask_classifier.py` classifies fill aggressiveness
+5. `trade_type_detector.py` classifies trade type (SWEEP / BLOCK / SPLIT / SINGLE)
+6. `repetition_accumulator.py` groups trades into `RepetitionEpisode` (30-min window, min 3 trades, min $50K premium)
+7. `composite_signal_engine.py` scores: `composite = flow_score × 0.6 + backtest_score × 0.4`
+8. Signal published to `async_bus` → broadcast to all WS subscribers
 
 ### Composite Score Formula
 
@@ -201,7 +270,6 @@ Login:
 ### Tradier Stream — Critical Implementation Notes
 
 - **Session token POST requires `data={}` (NOT `content=b""`)** so httpx sends `Content-Length: 0`, matching `curl -d ""`. Using `content=b""` omits `Content-Length` and Tradier silently fails to return a sessionid.
-- Equivalent curl: `curl -X POST https://api.tradier.com/v1/markets/events/session -H "Authorization: Bearer $KEY" -H "Accept: application/json" -d ""`
 - Session tokens are short-lived. On 401 from either the session or stream endpoint, the service falls back to demo mode (no infinite retry loop).
 - Stream POST uses Bearer token in header + sessionid in body payload.
 
@@ -220,6 +288,19 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 
 ---
 
+## Supabase Schema
+
+### Tables Live in Production (`cipher-database` — `kpajucxqlrteckfuafvq`)
+
+| Table | Purpose | Migration |
+|---|---|---|
+| `options_universe_snapshots` | One row per validated universe snapshot | `001_options_universe.sql` |
+| `options_universe_symbols` | Individual symbols per snapshot (normalized) | `001_options_universe.sql` |
+
+> Auth tables are managed by Supabase Auth (built-in `auth.users`).
+
+---
+
 ## Current State & Known Gaps
 
 | Area | Status |
@@ -227,16 +308,17 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Frontend deployment | ✅ Live on Vercel |
 | Backend deployment | ✅ Live on Railway (native GitHub integration) |
 | Backend startup crash (pydantic-settings) | ✅ Fixed 2026-04-23 |
-| email-validator missing | ✅ Fixed 2026-04-23 — `pydantic[email]` in requirements |
-| CORS preflight 400 on /register | ✅ Fixed 2026-04-23 — explicit OPTIONS handlers + trailing slash strip |
+| email-validator missing | ✅ Fixed 2026-04-23 |
+| CORS preflight 400 on /register | ✅ Fixed 2026-04-23 |
 | Auth — register + login | ✅ Fixed 2026-04-23 |
 | Railway deploy pipeline | ✅ Fixed 2026-04-23 |
 | Python version pinning | ✅ Fixed 2026-04-23 |
-| Tradier stream 401 loop | ✅ Fixed 2026-04-23 — 401 guard added + demo-mode fallback |
-| Tradier session token Content-Length | ✅ Fixed 2026-04-23 — `data={}` instead of `content=b""` to send Content-Length: 0 |
-| Tradier stream | ✅ Live — confirmed key works via curl; now connecting correctly |
+| Tradier stream 401 loop | ✅ Fixed 2026-04-23 |
+| Tradier session token Content-Length | ✅ Fixed 2026-04-23 |
+| Tradier stream | ✅ Live |
+| **Options universe persistence** | ✅ **Live 2026-04-23 — DB + services + tests shipped** |
 | Flow data | Live Tradier stream running; demo mode fallback if key missing |
-| Supabase | Auth working; DB not actively queried yet |
+| Supabase | Auth working; universe tables live; signal storage not yet wired |
 | Redis | In config but not integrated |
 | Frontend styling | Inline styles throughout dashboard; Tailwind installed but underused |
 | Trade execution | `trade_executor.py` exists but not wired into signal flow |
@@ -298,7 +380,7 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 - Frontend: TypeScript strict mode, functional components, custom hooks
 - Auth guard: `Depends(get_current_user)` (BE) / `useAuth` hook redirect (FE)
 - Monorepo: `backend/` and `frontend/` as siblings at repo root
-- No ORM — direct Supabase REST/postgrest calls planned
+- No ORM — direct Supabase REST/postgrest calls
 
 ---
 
@@ -329,6 +411,7 @@ npm run dev
 |---|---|---|
 | Backend | Railway | `https://cipher-production-6cd8.up.railway.app` |
 | Frontend | Vercel | Vercel project: `bhaveshhpatels-projects/cipher` |
+| Supabase DB | Supabase | Project ID: `kpajucxqlrteckfuafvq` (cipher-database, us-west-2) |
 
 ---
 
@@ -336,14 +419,16 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed Tradier session token Content-Length** — changed `content=b""` to `data={}` in `_get_session_token()` so httpx sends `Content-Length: 0`, matching `curl -d ""` which Tradier requires |
-| 2026-04-23 | **Fixed Tradier 401 infinite loop** — added 401 guards on both session token and stream endpoints; stream 401 now falls back to demo mode instead of retrying |
-| 2026-04-23 | **Added Tradier regression tests** — `backend/tests/test_tradier_stream.py` covers session 401, session success, network error, stream 401 fallback, and live integration test |
-| 2026-04-23 | **Fixed CORS preflight 400** — added explicit `OPTIONS` handlers in `routers/auth.py` for `/register` and `/token`; stripped trailing slash from `NEXT_PUBLIC_API_URL` in `frontend/src/lib/api.ts` |
-| 2026-04-23 | **Fixed missing email-validator** — changed `pydantic==2.11.4` to `pydantic[email]==2.11.4` in requirements.txt |
-| 2026-04-23 | **Fixed runtime startup crash** — `config.py` migrated to `model_config = SettingsConfigDict(...)` for pydantic-settings v2.9 |
-| 2026-04-23 | **Fixed pip build failure** — upgraded all deps to latest with prebuilt wheels; added `runtime.txt` + `.python-version` |
-| 2026-04-23 | **Fixed Railway deploy pipeline** — native GitHub integration, no CLI |
-| 2026-04-23 | **Fixed auth register bug** — Supabase credential errors now return 401 |
+| 2026-04-23 | **Options universe persistence shipped** — `symbols_loader.py`, `universe_store.py`, `migrations/001_options_universe.sql`, updated `main.py` startup + 24h background refresh loop, 20 + 10 test cases |
+| 2026-04-23 | **Supabase migration applied** — `options_universe_snapshots` + `options_universe_symbols` tables live in `cipher-database` |
+| 2026-04-23 | **Fixed Tradier session token Content-Length** — changed `content=b""` to `data={}` |
+| 2026-04-23 | **Fixed Tradier 401 infinite loop** — 401 guards + demo-mode fallback |
+| 2026-04-23 | **Added Tradier regression tests** — `test_tradier_stream.py` |
+| 2026-04-23 | **Fixed CORS preflight 400** — explicit OPTIONS handlers + trailing slash strip |
+| 2026-04-23 | **Fixed missing email-validator** — `pydantic[email]` |
+| 2026-04-23 | **Fixed runtime startup crash** — pydantic-settings v2 migration |
+| 2026-04-23 | **Fixed pip build failure** — deps upgraded + runtime.txt + .python-version |
+| 2026-04-23 | **Fixed Railway deploy pipeline** — native GitHub integration |
+| 2026-04-23 | **Fixed auth register bug** — Supabase credential errors return 401 |
 | 2026-04-22 | Fixed frontend CI/CD Vercel path bug |
 | 2026-04-22 | Frontend confirmed live — login page visible |
