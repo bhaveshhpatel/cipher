@@ -25,7 +25,7 @@
 | Database | Supabase (PostgreSQL) |
 | Deploy (BE) | Railway |
 | Deploy (FE) | Vercel |
-| CI/CD | GitHub Actions |
+| CI/CD | GitHub Actions (CI only for backend; deploy via Railway native GitHub integration) |
 
 ---
 
@@ -34,49 +34,45 @@
 ```
 cipher/
 ├── .github/
-│   ├── workflows/
-│   │   ├── backend.yml        # Railway deploy CI — runs from backend/ dir
-│   │   └── frontend.yml       # Vercel deploy CI
+│   └── workflows/
+│       ├── backend.yml        # CI only — syntax check; NO deploy steps
+│       └── frontend.yml       # Vercel deploy via CLI
 ├── backend/
-│   ├── main.py                # FastAPI app entry, lifespan, CORS, router mounts
-│   ├── config.py              # pydantic-settings config (env vars)
+│   ├── main.py                # FastAPI entry, lifespan, CORS, router mounts
+│   ├── config.py              # pydantic-settings (env vars)
 │   ├── requirements.txt
-│   ├── Procfile               # Railway process definition
-│   ├── railway.toml           # Backend-local Railway config (rootDirectory = "backend")
 │   ├── core/
-│   │   ├── auth.py            # JWT helpers, get_current_user dependency
-│   │   └── async_bus.py       # In-process async pub/sub event bus
+│   │   ├── auth.py
+│   │   └── async_bus.py
 │   ├── parsers/
-│   │   ├── options_flow_parser.py   # Raw Tradier trade → OptionsFlowEvent
-│   │   ├── bid_ask_classifier.py    # ABOVE_ASK / AT_ASK / BELOW_BID etc.
-│   │   └── trade_type_detector.py  # SWEEP / BLOCK / SPLIT / SINGLE
+│   │   ├── options_flow_parser.py
+│   │   ├── bid_ask_classifier.py
+│   │   └── trade_type_detector.py
 │   ├── signals/
-│   │   ├── repetition_accumulator.py    # 30-min rolling window accumulator
-│   │   ├── backtest_validator.py         # Historical win-rate scoring
-│   │   ├── midcap_screener.py            # Mid-cap unusual activity detection
-│   │   └── composite_signal_engine.py   # flow_score×0.6 + backtest_score×0.4
+│   │   ├── repetition_accumulator.py
+│   │   ├── backtest_validator.py
+│   │   ├── midcap_screener.py
+│   │   └── composite_signal_engine.py
 │   ├── simulation/
-│   │   ├── swarm_engine.py      # 6 LLM agents with distinct trading roles
-│   │   └── ensemble_runner.py   # Aggregate agent verdicts into consensus
+│   │   ├── swarm_engine.py
+│   │   └── ensemble_runner.py
 │   ├── execution/
-│   │   └── trade_executor.py    # Tradier order placement (not yet wired in)
+│   │   └── trade_executor.py
 │   ├── services/
-│   │   └── tradier_stream.py    # Live Tradier WS stream processor + demo mode
+│   │   └── tradier_stream.py
 │   └── routers/
-│       ├── auth.py              # POST /api/auth/token, /register
-│       ├── flow.py              # GET /api/flow/scan
-│       ├── simulation.py        # POST /api/simulation/run
-│       ├── ws.py                # WS /ws/signals
-│       └── smart_signals.py     # GET /api/signals/composite/{ticker}, /stream/stats
+│       ├── auth.py
+│       ├── flow.py
+│       ├── simulation.py
+│       ├── ws.py
+│       └── smart_signals.py
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── layout.tsx
 │   │   │   ├── globals.css
 │   │   │   ├── page.tsx
-│   │   │   └── dashboard/
-│   │   │       └── page.tsx
-│   │   │   └── api/auth/[...nextauth]/route.ts
+│   │   │   └── dashboard/page.tsx
 │   │   ├── components/
 │   │   │   ├── CipherLogo.tsx
 │   │   │   └── dashboard/
@@ -90,10 +86,8 @@ cipher/
 │   │   │   ├── useSignalStream.ts
 │   │   │   ├── useFlow.ts
 │   │   │   └── useSimulation.ts
-│   │   ├── lib/
-│   │   │   └── api.ts
-│   │   └── types/
-│   │       └── index.ts
+│   │   ├── lib/api.ts
+│   │   └── types/index.ts
 │   ├── package.json
 │   ├── next.config.mjs
 │   ├── tailwind.config.ts
@@ -104,7 +98,7 @@ cipher/
 │   ├── features.md
 │   ├── regression-test-plan.md
 │   └── specs.md
-├── railway.toml               # Root-level Railway config (rootDirectory = "backend")
+├── railway.toml               # SINGLE authoritative Railway config (root)
 └── claude.md
 ```
 
@@ -112,7 +106,7 @@ cipher/
 
 ## Environment Variables
 
-### Backend (`.env`)
+### Backend (Railway dashboard env vars)
 
 | Variable | Purpose |
 |---|---|
@@ -131,14 +125,14 @@ cipher/
 | `REDIS_URL` | Redis connection (default: `redis://localhost:6379`) |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 
-### Frontend
+### Frontend (Vercel dashboard env vars)
 
-| Variable | Where managed | Value |
-|---|---|---|
-| `NEXT_PUBLIC_API_URL` | **Vercel dashboard only** | `https://cipher-production-6cd8.up.railway.app` |
-| `NEXT_PUBLIC_WS_URL` | **Vercel dashboard only** | `wss://cipher-production-6cd8.up.railway.app/` |
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | `https://cipher-production-6cd8.up.railway.app` |
+| `NEXT_PUBLIC_WS_URL` | `wss://cipher-production-6cd8.up.railway.app/` |
 
-> ⚠️ Do NOT add these to `vercel.json` or the GitHub Actions workflow.
+> ⚠️ Do NOT add frontend env vars to `vercel.json` or GitHub Actions.
 
 ---
 
@@ -150,14 +144,14 @@ cipher/
 2. `options_flow_parser.py` parses ticks → `OptionsFlowEvent`
 3. `bid_ask_classifier.py` classifies fill aggressiveness
 4. `trade_type_detector.py` classifies trade type (SWEEP / BLOCK / SPLIT / SINGLE)
-5. `repetition_accumulator.py` groups trades into `RepetitionEpisode` objects (30-min window, min 3 trades, min $50K premium)
+5. `repetition_accumulator.py` groups trades into `RepetitionEpisode` (30-min window, min 3 trades, min $50K premium)
 6. `composite_signal_engine.py` scores: `composite = flow_score × 0.6 + backtest_score × 0.4`
 7. Signal published to `async_bus` → broadcast to all WS subscribers
 
 ### Composite Score Formula
 
 ```
-flow_score    = min(1.0, (total_premium / 10M) × 0.65 + is_accelerating × 0.15 + min(trade_count/20, 0.20))
+flow_score     = min(1.0, (total_premium / 10M) × 0.65 + is_accelerating × 0.15 + min(trade_count/20, 0.20))
 backtest_score = historical win-rate by (ticker, contract_type, DTE bucket, tier)
 composite      = flow_score × 0.6 + backtest_score × 0.4
 
@@ -173,31 +167,31 @@ Recommendation:
 Register:
   POST /api/auth/register (email, password)
     → if SUPABASE_URL + SUPABASE_SERVICE_KEY set: create user via admin API
-    → else: store hash in in-memory _users dict
+    → else: store hash in in-memory _users dict (resets on redeploy)
 
 Login:
   POST /api/auth/token (username=email, password)
     → if SUPABASE_URL + SUPABASE_KEY set: sign_in_with_password
-        → credential error → 401 (no silent fallthrough)
+        → credential error → 401
         → service error → 503
     → else: verify against _users dict
-    → success → JWT created with create_access_token({"sub": email})
+    → success → JWT {"sub": email}
 ```
 
-> ⚠️ In-memory `_users` dict resets on every Railway deploy. Supabase must be configured for production.
+> ⚠️ In-memory `_users` resets on every Railway deploy. Supabase must be configured for persistent auth.
 
 ### Swarm Simulation
 
-Six LLM agents (GPT-4o-mini): Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
+Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
 
 ### Alert Levels
 
 | Level | Meaning |
 |---|---|
-| `CONVICTION` | Highest confidence signal |
+| `CONVICTION` | Highest confidence |
 | `STRONG_SIGNAL` | High confidence |
-| `ALERT` | Moderate signal |
-| `WATCH` | Low/monitoring signal |
+| `ALERT` | Moderate |
+| `WATCH` | Low/monitoring |
 
 ---
 
@@ -206,54 +200,76 @@ Six LLM agents (GPT-4o-mini): Momentum Trader, Contrarian Analyst, Fundamental A
 | Area | Status |
 |---|---|
 | Frontend deployment | ✅ Live on Vercel |
-| Backend deployment | ✅ Live on Railway |
+| Backend deployment | ✅ Live on Railway (native GitHub integration) |
 | Auth — register + login | ✅ Fixed 2026-04-23 |
-| Railway CLI build | ✅ Fixed 2026-04-23 — rootDirectory + working-directory align |
+| Railway deploy pipeline | ✅ Fixed 2026-04-23 — native GitHub integration, no CLI |
 | Flow data | **Mocked** — deterministic seed by ticker hash; live Tradier wires exist but need valid API key |
 | Supabase | Auth working; DB not actively queried yet |
 | Redis | In `config.py` but not integrated |
-| Frontend styling | Inline styles throughout dashboard; Tailwind installed but not fully used |
+| Frontend styling | Inline styles throughout dashboard; Tailwind installed but underused |
 | Trade execution | `trade_executor.py` exists but not wired into signal flow |
 | Anthropic key | In config but not used |
 
 ---
 
-## CI/CD Notes
+## CI/CD Architecture
 
-### Frontend (Vercel via GitHub Actions)
-- Workflow: `.github/workflows/frontend.yml`
-- Triggers on `push` to `main` when `frontend/**` files change
-- All Vercel CLI steps run from **repo root** (not `frontend/`)
-- `vercel.json` has `buildCommand`, `outputDirectory`, `framework` **only — no `env` block**
-- Frontend env vars managed in **Vercel dashboard only**
+### Backend — Railway Native GitHub Integration (authoritative)
 
-### Backend (Railway via GitHub Actions)
-- Workflow: `.github/workflows/backend.yml`
-- Triggers on `push` to `main` when `backend/**` or `railway.toml` files change
-- **`working-directory: backend`** — CLI runs from `backend/` so it picks up `backend/railway.toml`
-- `backend/railway.toml` has `rootDirectory = "backend"` explicitly set
-- Root `railway.toml` also has `rootDirectory = "backend"` as safety net
-- ⚠️ **Disable Railway dashboard auto-deploy** to prevent double-deploys
+Railway deploys the backend automatically when changes are pushed to `main`. No CLI, no token, no GitHub Actions deploy step.
 
-### Railway Root Directory Fix (2026-04-23)
+**How it works:**
+- Railway service is connected to `github.com/bhaveshhpatel/cipher`
+- `railway.toml` at repo root is the single source of truth
+- `rootDirectory = "backend"` → nixpacks builds from `backend/`
+- `watchPatterns = ["backend/**"]` → only redeploys when backend files change
+- `startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"`
+- `healthcheckPath = "/health"` → validated after every deploy
 
-Previous failure: `Could not find root directory: /backend`
+**To verify/enable in Railway dashboard:**
+1. Railway dashboard → your service → Settings → Source
+2. Confirm GitHub repo `bhaveshhpatel/cipher` is connected
+3. Confirm branch is `main`
+4. Confirm root directory is left blank (railway.toml handles it)
+5. Disable any manual deploy triggers to avoid double-deploys
 
-**Root cause:** Two conflicting `railway.toml` files. The GitHub Actions workflow ran `railway up` from the repo root, picking up the root `railway.toml` which had no `rootDirectory`. Railway/nixpacks couldn't locate `requirements.txt` at the repo root.
+**Root `railway.toml` (single authoritative config):**
+```toml
+[build]
+builder = "nixpacks"
+rootDirectory = "backend"
+watchPatterns = ["backend/**"]
 
-**Fix applied:**
-1. `railway.toml` (root) — added `rootDirectory = "backend"`, removed `cd backend &&` from startCommand
-2. `backend/railway.toml` — added `rootDirectory = "backend"` explicitly
-3. `.github/workflows/backend.yml` — added `working-directory: backend` to the deploy step
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+```
+
+**Files removed (were causing conflicts):**
+- `backend/railway.toml` — deleted; caused `backend/backend` path resolution error
+- `backend/Procfile` — deleted; redundant with `startCommand` in railway.toml
+
+### Backend — GitHub Actions (`backend.yml`)
+
+CI only — runs syntax check on all `.py` files. Does NOT deploy.
+- Triggers on push/PR to `main` when `backend/**` or `railway.toml` changes
+- No `RAILWAY_TOKEN` secret needed
+- Railway deploy happens independently via native integration
+
+### Frontend — Vercel via GitHub Actions (`frontend.yml`)
+- Vercel CLI deploy triggered by push to `main` when `frontend/**` changes
+- All env vars managed in Vercel dashboard only
 
 ---
 
 ## Coding Conventions
 
 - Backend: Python 3.11, async/await throughout, pydantic models for all I/O
-- Frontend: TypeScript strict mode, functional components, custom hooks pattern
-- Auth guard: `Depends(get_current_user)` (BE) and `useAuth` hook redirect (FE)
-- Monorepo: `backend/` and `frontend/` as siblings
+- Frontend: TypeScript strict mode, functional components, custom hooks
+- Auth guard: `Depends(get_current_user)` (BE) / `useAuth` hook redirect (FE)
+- Monorepo: `backend/` and `frontend/` as siblings at repo root
 - No ORM — direct Supabase REST/postgrest calls planned
 
 ---
@@ -278,12 +294,12 @@ npm run dev
 
 ---
 
-## Deployment
+## Deployment URLs
 
-| Target | Platform | Trigger | URL |
-|---|---|---|---|
-| Backend | Railway | Push to `main` via `backend.yml` | `https://cipher-production-6cd8.up.railway.app` |
-| Frontend | Vercel | Push to `main` via `frontend.yml` | Vercel project: `bhaveshhpatels-projects/cipher` |
+| Target | Platform | URL |
+|---|---|---|
+| Backend | Railway | `https://cipher-production-6cd8.up.railway.app` |
+| Frontend | Vercel | Vercel project: `bhaveshhpatels-projects/cipher` |
 
 ---
 
@@ -291,10 +307,9 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed Railway CLI root directory error** — added `rootDirectory = "backend"` to both `railway.toml` files; added `working-directory: backend` to `backend.yml` deploy step |
+| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` (caused `backend/backend` path error) and `backend/Procfile` (redundant); rewrote `backend.yml` to CI-only (syntax check, no deploy); Railway now deploys via native GitHub integration using root `railway.toml` exclusively |
 | 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through; credential errors return 401 |
 | 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
-| 2026-04-22 | Removed `@cipher_api_url` / `@cipher_ws_url` secret refs from `frontend/vercel.json` |
-| 2026-04-22 | Documented Railway auto-deploy issue |
+| 2026-04-22 | Removed secret refs from `frontend/vercel.json` |
 | 2026-04-22 | Frontend confirmed live — login page visible |
 | 2026-04-22 | Created `docs/BACKLOG.md` with B-001 through B-007 |

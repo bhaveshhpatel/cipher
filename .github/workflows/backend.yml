@@ -1,4 +1,4 @@
-name: Backend CI/CD
+name: Backend CI
 
 on:
   push:
@@ -13,21 +13,29 @@ on:
       - "railway.toml"
 
 jobs:
-  deploy:
-    name: Deploy to Railway
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  lint:
+    name: Syntax Check
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Railway CLI
-        run: npm i -g @railway/cli
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Deploy
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Install dependencies
         working-directory: backend
-        run: railway up --service "${{ secrets.RAILWAY_SERVICE }}" --detach
-        # Run from backend/ so Railway CLI picks up backend/railway.toml
-        # and nixpacks finds requirements.txt at the correct root
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        working-directory: backend
+        run: |
+          find . -name "*.py" -exec python -m py_compile {} \;
+          echo "All Python files OK"
+
+# Deploy is handled automatically by Railway's native GitHub integration.
+# Railway watches this repo, detects changes to backend/** via watchPatterns
+# in the root railway.toml, and redeploys without any CLI or token needed.
+# To configure: Railway dashboard -> service -> Settings -> Source -> connect GitHub repo
