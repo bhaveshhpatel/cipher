@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from core.auth import hash_password, verify_password, create_access_token, get_current_user, TokenData
@@ -58,6 +59,16 @@ def _get_user_from_supabase(email: str):
     return None
 
 
+# ── Explicit OPTIONS handlers so CORS preflight never gets a 400 ──────────
+@router.options("/register")
+async def options_register():
+    return Response(status_code=200)
+
+@router.options("/token")
+async def options_token():
+    return Response(status_code=200)
+
+
 @router.post("/register", response_model=MessageResponse, status_code=201)
 async def register(body: RegisterRequest):
     if len(body.password) < 8:
@@ -91,7 +102,6 @@ async def register(body: RegisterRequest):
 
 @router.post("/token", response_model=TokenResponse)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
-    # ── Supabase path ──────────────────────────────────────────────────────
     supabase = _get_supabase_client()
     if supabase:
         try:
@@ -102,7 +112,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
                 token = create_access_token({"sub": form.username})
                 log.info("Login via Supabase: %s", form.username)
                 return {"access_token": token, "token_type": "bearer"}
-            # sign_in_with_password returned but no user — bad credentials
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password",
@@ -112,7 +121,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
             raise
         except Exception as e:
             err = str(e).lower()
-            # Surface credential errors clearly instead of falling through
             if "invalid" in err or "credentials" in err or "not found" in err or "email" in err:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -125,7 +133,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
                 detail="Authentication service unavailable. Please try again.",
             )
 
-    # ── In-memory fallback (no Supabase configured) ────────────────────────
     hashed = _users.get(form.username)
     if not hashed or not verify_password(form.password, hashed):
         raise HTTPException(

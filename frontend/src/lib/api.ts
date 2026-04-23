@@ -1,4 +1,5 @@
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Strip any trailing slash so paths like /api/auth/register never become //api/auth/register
+const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
 export interface FlowEvent {
   ticker: string; contract_type: string; strike: number; expiry: string;

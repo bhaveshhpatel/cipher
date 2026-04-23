@@ -40,11 +40,11 @@ cipher/
 ├── backend/
 │   ├── main.py
 │   ├── config.py              # pydantic-settings v2 — uses model_config = SettingsConfigDict(...)
-│   ├── requirements.txt       # Production deps (no pytest)
-│   ├── requirements-dev.txt   # Dev/test deps (pytest, pytest-asyncio)
-│   ├── nixpacks.toml          # Forces Python 3.11 for Railway nixpacks builder
-│   ├── runtime.txt            # python-3.11.9 — Railway Docker builder reads this
-│   ├── .python-version        # 3.11.9 — pyenv standard
+│   ├── requirements.txt       # pydantic[email] ensures email-validator is installed
+│   ├── requirements-dev.txt
+│   ├── nixpacks.toml
+│   ├── runtime.txt            # python-3.11.9
+│   ├── .python-version        # 3.11.9
 │   ├── core/
 │   │   ├── auth.py
 │   │   └── async_bus.py
@@ -65,7 +65,7 @@ cipher/
 │   ├── services/
 │   │   └── tradier_stream.py
 │   └── routers/
-│       ├── auth.py
+│       ├── auth.py            # OPTIONS handlers for /register and /token added
 │       ├── flow.py
 │       ├── simulation.py
 │       ├── ws.py
@@ -90,7 +90,7 @@ cipher/
 │   │   │   ├── useSignalStream.ts
 │   │   │   ├── useFlow.ts
 │   │   │   └── useSimulation.ts
-│   │   ├── lib/api.ts
+│   │   ├── lib/api.ts         # Strips trailing slash from NEXT_PUBLIC_API_URL
 │   │   └── types/index.ts
 │   ├── package.json
 │   ├── next.config.mjs
@@ -135,6 +135,8 @@ cipher/
 |---|---|
 | `NEXT_PUBLIC_API_URL` | `https://cipher-production-6cd8.up.railway.app` |
 | `NEXT_PUBLIC_WS_URL` | `wss://cipher-production-6cd8.up.railway.app/` |
+
+> ⚠️ `NEXT_PUBLIC_API_URL` must NOT have a trailing slash. `api.ts` strips it defensively but the env var should be clean.
 
 > ⚠️ Do NOT add frontend env vars to `vercel.json` or GitHub Actions.
 
@@ -184,6 +186,12 @@ Login:
 
 > ⚠️ In-memory `_users` resets on every Railway deploy. Supabase must be configured for persistent auth.
 
+### CORS / Preflight Notes
+
+- `main.py` uses FastAPI `CORSMiddleware` with `allow_methods=["*"]`
+- `routers/auth.py` has explicit `@router.options("/register")` and `@router.options("/token")` handlers returning 200 to guarantee preflight never returns 400
+- `frontend/src/lib/api.ts` strips trailing slash from `NEXT_PUBLIC_API_URL` defensively
+
 ### Swarm Simulation
 
 Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
@@ -205,11 +213,14 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 |---|---|
 | Frontend deployment | ✅ Live on Vercel |
 | Backend deployment | ✅ Live on Railway (native GitHub integration) |
-| Backend startup crash | ✅ Fixed 2026-04-23 — pydantic-settings v2.9 migration |
+| Backend startup crash (pydantic-settings) | ✅ Fixed 2026-04-23 |
+| email-validator missing | ✅ Fixed 2026-04-23 — `pydantic[email]` in requirements |
+| CORS preflight 400 on /register | ✅ Fixed 2026-04-23 — explicit OPTIONS handlers + trailing slash strip |
 | Auth — register + login | ✅ Fixed 2026-04-23 |
-| Railway deploy pipeline | ✅ Fixed 2026-04-23 — native GitHub integration, no CLI |
-| Python version pinning | ✅ Fixed 2026-04-23 — nixpacks.toml + runtime.txt + .python-version |
-| Flow data | **Mocked** — demo mode when no Tradier key set |
+| Railway deploy pipeline | ✅ Fixed 2026-04-23 |
+| Python version pinning | ✅ Fixed 2026-04-23 |
+| Tradier stream | ✅ Live — confirmed connecting to Tradier API on startup |
+| Flow data | Live Tradier stream running; demo mode fallback if key missing |
 | Supabase | Auth working; DB not actively queried yet |
 | Redis | In config but not integrated |
 | Frontend styling | Inline styles throughout dashboard; Tailwind installed but underused |
@@ -255,13 +266,14 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 
 - `requirements.txt` — production deps only (no pytest)
 - `requirements-dev.txt` — dev/test deps: `pytest`, `pytest-asyncio`
-- Key versions: `fastapi==0.115.12`, `pydantic==2.11.4`, `pydantic-settings==2.9.1`, `pandas==2.2.3`, `numpy==2.2.5`
-- All packages have prebuilt wheels for both cp311 and cp313 — no Rust/C compilation
+- Key versions: `fastapi==0.115.12`, `pydantic[email]==2.11.4`, `pydantic-settings==2.9.1`, `pandas==2.2.3`, `numpy==2.2.5`
+- All packages have prebuilt wheels for both cp311 and cp313
 
 ## pydantic-settings v2 Notes
 
 - `config.py` uses `model_config = SettingsConfigDict(...)` — NOT the old inner `class Config`
 - The old `class Config` pattern causes a `PydanticUserError` crash on startup in pydantic-settings ≥ 2.3
+- `pydantic[email]` extra required for `EmailStr` fields in request models
 
 ---
 
@@ -309,9 +321,11 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed runtime startup crash** — `config.py` migrated from deprecated `class Config` to `model_config = SettingsConfigDict(...)` for pydantic-settings v2.9 compatibility |
-| 2026-04-23 | **Fixed pip build failure** — upgraded all deps to latest with prebuilt cp311/cp313 wheels; added `runtime.txt` + `.python-version` for Python 3.11 pinning |
-| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` and `backend/Procfile`; Railway deploys via native GitHub integration |
-| 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through |
-| 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
+| 2026-04-23 | **Fixed CORS preflight 400** — added explicit `OPTIONS` handlers in `routers/auth.py` for `/register` and `/token`; stripped trailing slash from `NEXT_PUBLIC_API_URL` in `frontend/src/lib/api.ts` |
+| 2026-04-23 | **Fixed missing email-validator** — changed `pydantic==2.11.4` to `pydantic[email]==2.11.4` in requirements.txt |
+| 2026-04-23 | **Fixed runtime startup crash** — `config.py` migrated to `model_config = SettingsConfigDict(...)` for pydantic-settings v2.9 |
+| 2026-04-23 | **Fixed pip build failure** — upgraded all deps to latest with prebuilt wheels; added `runtime.txt` + `.python-version` |
+| 2026-04-23 | **Fixed Railway deploy pipeline** — native GitHub integration, no CLI |
+| 2026-04-23 | **Fixed auth register bug** — Supabase credential errors now return 401 |
+| 2026-04-22 | Fixed frontend CI/CD Vercel path bug |
 | 2026-04-22 | Frontend confirmed live — login page visible |
