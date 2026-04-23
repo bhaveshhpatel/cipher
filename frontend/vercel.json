@@ -1,9 +1,5 @@
 {
-  "buildCommand":   "npm run build",
+  "buildCommand":    "npm run build",
   "outputDirectory": ".next",
-  "framework":      "nextjs",
-  "env": {
-    "NEXT_PUBLIC_API_URL": "@cipher_api_url",
-    "NEXT_PUBLIC_WS_URL":  "@cipher_ws_url"
-  }
+  "framework":       "nextjs"
 }
