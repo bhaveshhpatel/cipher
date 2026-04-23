@@ -413,3 +413,46 @@ class TestStats:
     def test_mode_field_exists(self):
         from services.tradier_stream import get_stats
         assert get_stats()["mode"] in ("starting", "live", "demo", "reconnecting")
+
+# ---------------------------------------------------------------------------
+# URL regression — session token must use TRADIER_BASE_URL not TRADIER_STREAM_URL
+# ---------------------------------------------------------------------------
+class TestSessionTokenURL:
+    @pytest.mark.asyncio
+    async def test_session_post_uses_base_url_not_stream_url(self):
+        """
+        Regression: _get_session_token must POST to TRADIER_BASE_URL/v1/markets/events/session
+        NOT to TRADIER_STREAM_URL. stream.tradier.com only accepts the streaming connection,
+        not the REST session-creation call.
+        """
+        from services.tradier_stream import _get_session_token
+
+        posted_urls = []
+
+        class _C:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def post(self, url, *a, **kw):
+                posted_urls.append(url)
+                r = MagicMock()
+                r.status_code = 200
+                r.json.return_value = {"stream": {"sessionid": "tok_url_test"}}
+                r.raise_for_status = MagicMock()
+                return r
+
+        with patch("services.tradier_stream.httpx.AsyncClient", return_value=_C()):
+            with patch("services.tradier_stream.settings") as mock_settings:
+                mock_settings.TRADIER_API_KEY  = "fake_key"
+                mock_settings.TRADIER_BASE_URL = "https://api.tradier.com"
+                mock_settings.TRADIER_STREAM_URL = "https://stream.tradier.com"
+                result = await _get_session_token()
+
+        assert result == "tok_url_test"
+        assert len(posted_urls) == 1
+        assert "api.tradier.com" in posted_urls[0], (
+            f"Session token POST went to wrong URL: {posted_urls[0]}. "
+            "Must use TRADIER_BASE_URL (api.tradier.com), not TRADIER_STREAM_URL (stream.tradier.com)."
+        )
+        assert "stream.tradier.com" not in posted_urls[0], (
+            f"Session POST incorrectly used TRADIER_STREAM_URL: {posted_urls[0]}"
+        )
