@@ -43,6 +43,12 @@ async def _get_session_token() -> Optional[str]:
                 },
                 content=b"",
             )
+            if resp.status_code == 401:
+                log.error(
+                    "Tradier session token request returned 401 — "
+                    "check TRADIER_API_KEY in Railway env vars"
+                )
+                return None
             resp.raise_for_status()
             return resp.json().get("stream", {}).get("sessionid")
     except Exception as e:
@@ -78,6 +84,14 @@ async def stream_options_flow(symbols: list[str]):
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("POST", url, headers=headers, data=payload) as resp:
+                    if resp.status_code == 401:
+                        log.error(
+                            "Tradier stream returned 401 — session token rejected. "
+                            "Falling back to demo mode."
+                        )
+                        _stats["errors"] += 1
+                        await _demo_mode(symbols)
+                        return
                     async for line in resp.aiter_lines():
                         if not line.strip():
                             continue
