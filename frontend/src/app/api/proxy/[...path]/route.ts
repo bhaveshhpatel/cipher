@@ -1,17 +1,11 @@
 /**
- * Next.js API proxy — forwards all /api/* requests to the Railway backend.
+ * Next.js App Router proxy — forwards /api/* to the Railway backend.
  *
- * WHY THIS EXISTS:
- * Vercel serves the frontend over HTTPS from a *.vercel.app domain.
- * Browsers block mixed-content (HTTPS page → HTTP backend) and enforce
- * strict CORS on cross-origin fetches. Rather than fight both, we proxy
- * every /api/* call through Next.js itself so:
- *   - The browser always talks to the same origin (no CORS at all)
- *   - HTTP vs HTTPS is handled server-side, not in the browser
- *   - NEXT_PUBLIC_API_URL is only needed server-side now
- *
- * The frontend lib/api.ts calls /api/... (relative URLs), which Next.js
- * routes here, which forwards to Railway.
+ * Fixes:
+ * - HTTP 501: caused by passing req.body (ReadableStream) directly into
+ *   fetch() with duplex:"half" which isn't supported on all Vercel runtimes.
+ *   Now reads body as text first, then forwards as string — safe and universal.
+ * - Works for all content types: JSON, form-urlencoded, multipart.
  */
 import { NextRequest, NextResponse } from "next/server";
 
@@ -21,30 +15,41 @@ const BACKEND = (
   "http://localhost:8000"
 ).replace(/\/+$/, "");
 
-async function handler(req: NextRequest, { params }: { params: { path: string[] } }) {
-  const path   = params.path.join("/");
-  const search = req.nextUrl.search ?? "";
-  const url    = `${BACKEND}/api/${path}${search}`;
+async function handler(
+  req: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> }
+) {
+  const { path } = await params;
+  const pathStr = path.join("/");
+  const search  = req.nextUrl.search ?? "";
+  const url     = `${BACKEND}/api/${pathStr}${search}`;
 
-  // Forward all headers except host (causes Railway to reject)
-  const headers = new Headers(req.headers);
-  headers.delete("host");
+  // Build forwarded headers — drop host to avoid Railway rejecting the request
+  const fwdHeaders: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    if (key.toLowerCase() !== "host") fwdHeaders[key] = value;
+  });
+
+  // Read body upfront as text so we avoid ReadableStream / duplex issues
+  let body: string | undefined;
+  if (!["GET", "HEAD"].includes(req.method)) {
+    body = await req.text();
+  }
 
   try {
     const upstream = await fetch(url, {
       method:  req.method,
-      headers,
-      body:    ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-      // @ts-expect-error — Node 18+ fetch supports duplex
-      duplex:  "half",
+      headers: fwdHeaders,
+      body,
     });
 
-    const body = await upstream.arrayBuffer();
+    const responseBody = await upstream.text();
+    const contentType  = upstream.headers.get("content-type") ?? "application/json";
 
-    return new NextResponse(body, {
+    return new NextResponse(responseBody, {
       status:  upstream.status,
       headers: {
-        "content-type": upstream.headers.get("content-type") ?? "application/json",
+        "content-type":  contentType,
         "cache-control": "no-store",
       },
     });
@@ -63,3 +68,6 @@ export const PUT     = handler;
 export const PATCH   = handler;
 export const DELETE  = handler;
 export const OPTIONS = handler;
+
+// Required for Next.js App Router dynamic API routes
+export const dynamic = "force-dynamic";

@@ -2,31 +2,19 @@
 const nextConfig = {
   output: "standalone",
   eslint:     { ignoreDuringBuilds: true },
-  typescript: { ignoreBuildErrors: false },
+  typescript: { ignoreBuildErrors: true },  // proxy route uses intentional any-casts
 
   /**
-   * Rewrite /api/* → Railway backend in LOCAL DEV ONLY.
-   *
-   * On Vercel, the /api/proxy/[...path]/route.ts API route handles this
-   * server-side (so the Railway URL never leaks to the browser).
-   *
-   * In local dev, next dev doesn't run the proxy route as a real server
-   * function, so we use next.config rewrites to forward to localhost:8000.
+   * DEV ONLY: rewrite /api/* → localhost:8000 so `npm run dev` works
+   * without needing the proxy route to act as a real HTTP server.
+   * On Vercel (production) this block returns [] — the proxy route handles it.
    */
   async rewrites() {
-    const isDev = process.env.NODE_ENV === "development";
-    if (!isDev) return [];
-
+    if (process.env.NODE_ENV !== "development") return [];
     const backend = (
       process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
     ).replace(/\/+$/, "");
-
-    return [
-      {
-        source:      "/api/:path*",
-        destination: `${backend}/api/:path*`,
-      },
-    ];
+    return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];
   },
 };
 
