@@ -327,20 +327,20 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                             except (TypeError, ValueError):
                                 pass
 
-                    # Always use average_volume (30-day avg daily stock volume) for eligibility.
-                    # Today's intraday "volume" is 0 pre-market and irrelevant for universe filtering.
-                    avg_vol_val = raw.get("average_volume")
-                    if avg_vol_val is not None:
-                        try:
-                            volume = int(float(avg_vol_val))
-                        except (TypeError, ValueError):
-                            pass
-                    # If today's volume is 0 (pre-market) fall back to 30-day average volume
-                    if not volume and avg_vol_val is not None:
-                        try:
-                            volume = int(float(avg_vol_val))
-                        except (TypeError, ValueError):
-                            pass
+                    # Use max(average_volume, today_volume) so symbols like HOOD that
+                    # report average_volume=0 but have real intraday volume still qualify.
+                    avg_vol: int = 0
+                    today_vol: int = 0
+                    try:
+                        avg_vol = int(float(raw.get("average_volume") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        today_vol = int(float(raw.get("volume") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    effective_vol = max(avg_vol, today_vol)
+                    volume = effective_vol if effective_vol > 0 else None
 
                     eligible = (
                         last_price is not None
