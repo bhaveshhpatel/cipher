@@ -21,13 +21,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# Default symbols to stream (expand via env or DB in production)
 DEFAULT_SYMBOLS = [
     "AAPL","TSLA","NVDA","SPY","QQQ","MSFT","AMZN","META",
     "GOOGL","AMD","PLTR","SOFI","HOOD","RIVN","CRWD","NET",
 ]
 
-# ── Lifespan: start stream on startup ─────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
@@ -40,7 +38,6 @@ async def lifespan(app: FastAPI):
         pass
     log.info("Cipher backend stopped.")
 
-# ── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(
     title       = "Cipher API",
     description = "Institutional options flow intelligence platform.",
@@ -49,12 +46,31 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────
+# Build allowed origins: always include localhost, plus whatever is in
+# ALLOWED_ORIGINS env var.  If the env var contains "*" we go full wildcard.
+_configured_origins = settings.origins
+_use_wildcard = "*" in _configured_origins
+
+if not _use_wildcard:
+    # Always ensure local dev origins are present
+    _base = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+    ]
+    _allow_origins = list(dict.fromkeys(_base + _configured_origins))  # deduplicated
+else:
+    _allow_origins = ["*"]
+
+log.info("CORS allowed origins: %s", _allow_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = settings.origins,
-    allow_credentials = True,
+    allow_origins     = _allow_origins,
+    allow_credentials = not _use_wildcard,   # credentials incompatible with wildcard
     allow_methods     = ["*"],
     allow_headers     = ["*"],
+    expose_headers    = ["*"],
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────
@@ -64,13 +80,10 @@ app.include_router(simulation.router)
 app.include_router(ws.router)
 app.include_router(smart_signals.router)
 
-# Alias /api/stream/stats → handled inside smart_signals router
-# (already mounted under /api/signals prefix; frontend uses /api/stream/stats)
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
 
-# ── Health ────────────────────────────────────────────────────────────────
 @app.get("/health", tags=["health"])
 async def health():
     return JSONResponse({"status": "ok", "service": "cipher-api"})

@@ -1,5 +1,8 @@
-// Strip any trailing slash so paths like /api/auth/register never become //api/auth/register
+// Strip trailing slash so paths never become //api/...
 const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+
+// Default request timeout (ms). Cold Railway starts can take ~8-10s.
+const TIMEOUT_MS = 15_000;
 
 export interface FlowEvent {
   ticker: string; contract_type: string; strike: number; expiry: string;
@@ -22,37 +25,63 @@ export interface StreamStats {
 }
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
-  const res = await fetch(`${API}${path}`, opts);
-  if (!res.ok) { const b = await res.json().catch(()=>({})); throw new Error(b.detail||`HTTP ${res.status}`); }
-  return res.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const res = await fetch(`${API}${path}`, {
+      ...opts,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Request timed out — server may be starting up, please retry.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export const api = {
   login: (email: string, password: string) =>
     req<{ access_token: string }>("/api/auth/token", {
-      method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ username: email, password }),
     }),
+
   register: (email: string, password: string) =>
     req<{ message: string }>("/api/auth/register", {
-      method:"POST", headers:{"Content-Type":"application/json"},
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
     }),
+
   getFlow: (ticker: string, token: string) =>
     req<{ events: FlowEvent[] }>(`/api/flow/scan?ticker=${ticker}`, {
-      headers:{ Authorization:`Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}` },
     }),
+
   runSimulation: (ticker: string, events: FlowEvent[], nAgents: number, nRuns: number, token: string) =>
     req<SimulationResult>("/api/simulation/run", {
-      method:"POST", headers:{"Content-Type":"application/json", Authorization:`Bearer ${token}`},
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ ticker, flow_events: events, n_agents: nAgents, n_runs: nRuns }),
     }),
+
   getComposite: (ticker: string, token: string) =>
     req<CompositeSignal>(`/api/signals/composite/${ticker}`, {
-      headers:{ Authorization:`Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}` },
     }),
+
   getStats: (token: string) =>
     req<{ stats: StreamStats }>("/api/stream/stats", {
-      headers:{ Authorization:`Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}` },
     }),
 };
