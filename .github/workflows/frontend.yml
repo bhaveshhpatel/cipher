@@ -39,10 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     # All Vercel CLI steps run from the REPO ROOT (no working-directory).
     # The Vercel project has rootDirectory=frontend configured in the
-    # Vercel dashboard. `vercel pull` writes that into project.json, and
-    # the CLI uses it to locate the correct source directory automatically.
-    # Running from frontend/ caused the CLI to resolve
-    # frontend/frontend/package.json (double-nesting ENOENT).
+    # Vercel dashboard. vercel pull writes that into project.json and
+    # the CLI uses it to locate source automatically.
 
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +59,7 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: vercel pull --yes --environment=production --token=$VERCEL_TOKEN
 
-      - name: Inject environment variables into Vercel
+      - name: Fix env vars (remove broken secret refs, set correct literals)
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
@@ -69,8 +67,12 @@ jobs:
           NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
           NEXT_PUBLIC_WS_URL:  ${{ secrets.NEXT_PUBLIC_WS_URL }}
         run: |
-          echo "$NEXT_PUBLIC_API_URL" | vercel env add NEXT_PUBLIC_API_URL production --token=$VERCEL_TOKEN --force
-          echo "$NEXT_PUBLIC_WS_URL"  | vercel env add NEXT_PUBLIC_WS_URL  production --token=$VERCEL_TOKEN --force
+          # Remove existing entries (ignore errors if they don't exist)
+          vercel env rm NEXT_PUBLIC_API_URL production --yes --token=$VERCEL_TOKEN || true
+          vercel env rm NEXT_PUBLIC_WS_URL  production --yes --token=$VERCEL_TOKEN || true
+          # Re-add with correct literal values from GitHub Secrets
+          echo "$NEXT_PUBLIC_API_URL" | vercel env add NEXT_PUBLIC_API_URL production --token=$VERCEL_TOKEN
+          echo "$NEXT_PUBLIC_WS_URL"  | vercel env add NEXT_PUBLIC_WS_URL  production --token=$VERCEL_TOKEN
 
       - name: Build (Vercel)
         env:
