@@ -2,7 +2,9 @@
 Cipher Backend — FastAPI entry point
 """
 import asyncio
+import json
 import logging
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +17,60 @@ from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
+
+# ── Structured JSON log formatter ────────────────────────────────────────────
+class _JsonFormatter(logging.Formatter):
+    """
+    Emit one JSON object per log line so Railway's log collector reads
+    `severity` from the structured field instead of regex-guessing it
+    from the raw message string.
+
+    Railway maps the `severity` field directly to its log level UI —
+    so INFO stays INFO, WARNING stays WARNING, ERROR stays ERROR.
+    """
+    SEVERITY_MAP = {
+        logging.DEBUG:    "debug",
+        logging.INFO:     "info",
+        logging.WARNING:  "warning",
+        logging.ERROR:    "error",
+        logging.CRITICAL: "critical",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "severity":  self.SEVERITY_MAP.get(record.levelno, "info"),
+            "logger":    record.name,
+            "message":   record.getMessage(),
+            "timestamp": self.formatTime(record, self.datefmt),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def _configure_logging() -> None:
+    """
+    Replace the root handler with a JSON formatter.
+    Suppress httpx's INFO chatter — it logs every HTTP request at INFO
+    which Railway mis-classifies as errors when the line doesn't parse cleanly.
+    We keep WARNING+ from httpx so auth failures and timeouts still surface.
+    """
+    root = logging.getLogger()
+    root.handlers.clear()
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+    # httpx logs every successful request at INFO — noisy and mis-classified
+    # by Railway's text scanner.  Raise its floor to WARNING so only real
+    # problems (timeouts, connection errors) come through.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+_configure_logging()
 log = logging.getLogger("main")
 
 DEFAULT_SYMBOLS = [
@@ -46,19 +98,16 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────
-# Build allowed origins: always include localhost, plus whatever is in
-# ALLOWED_ORIGINS env var.  If the env var contains "*" we go full wildcard.
 _configured_origins = settings.origins
 _use_wildcard = "*" in _configured_origins
 
 if not _use_wildcard:
-    # Always ensure local dev origins are present
     _base = [
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
     ]
-    _allow_origins = list(dict.fromkeys(_base + _configured_origins))  # deduplicated
+    _allow_origins = list(dict.fromkeys(_base + _configured_origins))
 else:
     _allow_origins = ["*"]
 
@@ -67,7 +116,7 @@ log.info("CORS allowed origins: %s", _allow_origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = _allow_origins,
-    allow_credentials = not _use_wildcard,   # credentials incompatible with wildcard
+    allow_credentials = not _use_wildcard,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
     expose_headers    = ["*"],
