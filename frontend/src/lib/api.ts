@@ -1,8 +1,17 @@
-// Strip trailing slash so paths never become //api/...
-const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+/**
+ * All fetch calls use RELATIVE paths (/api/...).
+ *
+ * In development  → Next.js dev server proxies to localhost:8000
+ * On Vercel       → Next.js API route at /api/proxy/[...path] forwards to Railway
+ *
+ * This eliminates:
+ *  - Mixed-content errors (HTTPS page fetching HTTP Railway URL)
+ *  - CORS preflight failures (same-origin requests have no CORS)
+ *  - "Failed to fetch" when NEXT_PUBLIC_API_URL is missing/wrong in Vercel
+ */
 
-// Default request timeout (ms). Cold Railway starts can take ~8-10s.
-const TIMEOUT_MS = 15_000;
+// Default request timeout (ms). Cold Railway starts can take ~10-12s.
+const TIMEOUT_MS = 20_000;
 
 export interface FlowEvent {
   ticker: string; contract_type: string; strike: number; expiry: string;
@@ -28,16 +37,17 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
+  // Always use relative /api/... so the Next.js proxy handles routing.
+  // Never call the Railway URL directly from the browser.
+  const url = path.startsWith("/") ? path : `/${path}`;
+
   try {
-    const res = await fetch(`${API}${path}`, {
-      ...opts,
-      signal: controller.signal,
-    });
+    const res = await fetch(url, { ...opts, signal: controller.signal });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      throw new Error(b.detail || `HTTP ${res.status}`);
+      throw new Error((b as { detail?: string }).detail || `HTTP ${res.status}`);
     }
-    return res.json();
+    return res.json() as Promise<T>;
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error("Request timed out — server may be starting up, please retry.");
