@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     ALLOWED_ORIGINS: str = "http://localhost:3000"
 
+    # Universe screener settings
+    UNIVERSE_PRIORITY_SYMBOLS: str = "SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD"
+    UNIVERSE_BATCH_DELAY_MS: int = 0          # ms delay between validation batches (0 = no throttle)
+    UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True  # flag for symbols with no screening data yet
+
     @property
     def origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
