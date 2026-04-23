@@ -37,9 +37,12 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
+    # NOTE: No job-level defaults.run.working-directory here.
+    # Vercel CLI resolves project paths internally from the repo root
+    # using project.json it downloads via `vercel pull`. Setting the
+    # job-level working-directory to `frontend` caused the CLI to look
+    # for frontend/frontend/package.json (ENOENT double-nesting bug).
+    # Per-step working-directory: frontend is used instead.
 
     steps:
       - uses: actions/checkout@v4
@@ -50,16 +53,17 @@ jobs:
 
       - name: Install Vercel CLI
         run: npm i -g vercel
-        working-directory: .
 
       - name: Pull Vercel environment & settings
+        working-directory: frontend
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: vercel pull --yes --environment=production --token=$VERCEL_TOKEN
 
-      - name: Build
+      - name: Build (Vercel)
+        working-directory: frontend
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
@@ -67,6 +71,7 @@ jobs:
         run: vercel build --prod --token=$VERCEL_TOKEN
 
       - name: Deploy prebuilt
+        working-directory: frontend
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
