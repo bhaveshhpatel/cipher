@@ -6,47 +6,20 @@ Supabase read/write for options universe snapshots.
 Tables (must be migrated first):
   options_universe_snapshots  — one row per snapshot, only ONE is_active=true at a time
   options_universe_symbols    — normalized symbol rows per snapshot_id
+                                (includes stream_eligible column — migration 002)
 
 Public API:
   load_fresh_snapshot()  → list[str] | None
-      Returns symbols from the most recent active snapshot younger than max_age_hours.
-      Returns None if no fresh snapshot exists.
-
-  load_any_snapshot()  → list[str] | None
-      Returns symbols from the most recent snapshot regardless of age.
-      Used as stale fallback when Tradier is down.
-
-  save_snapshot(symbols, source)  → bool
-      Persists a new snapshot, deactivates the old one, prunes snapshots older than 7.
-      Returns True on success.
-
-IMPORTANT: All public functions are async-safe.
-  The underlying Supabase client is synchronous (blocking I/O). To avoid
-  starving the FastAPI event loop (which would cause silent None returns
-  and fall-through to seed fallback), every public function runs the
-  blocking work inside asyncio.get_event_loop().run_in_executor(None, ...).
+  load_any_snapshot()    → list[str] | None
+  save_snapshot(symbols, source, stream_eligible_set)  → bool
 
 ROOT CAUSE FIX (2026-04-23) C-005:
-  supabase-py v2 SyncQueryRequestBuilder does NOT expose .select() after
-  .insert(). Chaining .insert().select().execute() raises:
-    AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
-
-  Fix: generate snapshot_id = str(uuid4()) in Python BEFORE the insert and
-  pass it explicitly in the payload. The ID is known ahead of time so we
-  never need to read it back from the insert result. This is stable across
-  all supabase-py v2 versions and removes the dependency on insert-return
-  behaviour entirely.
+  supabase-py v2 does NOT expose .select() after .insert().
+  Fix: generate snapshot_id = str(uuid4()) in Python before insert.
 
 ROOT CAUSE FIX (2026-04-23) C-006:
-  The options_universe_snapshots table has a NOT NULL column `provider` with
-  no default value. The insert payload in _sync_save_snapshot never included
-  it, causing every save_snapshot call to fail with:
-    null value in column "provider" of relation "options_universe_snapshots"
-    violates not-null constraint
-
-  Fix: pass provider="tradier" explicitly in the insert dict.
-  Other columns (refresh_reason, meta, created_at) have DB-level defaults
-  and do not need to be sent.
+  options_universe_snapshots.provider is NOT NULL with no default.
+  Fix: always pass provider="tradier" explicitly.
 """
 import asyncio
 import logging
@@ -59,8 +32,8 @@ from config import settings
 
 log = logging.getLogger("universe_store")
 
-_KEEP_SNAPSHOTS  = 7    # number of most-recent snapshots to retain
-_DEFAULT_MAX_AGE = 24   # hours — snapshot freshness window
+_KEEP_SNAPSHOTS  = 7
+_DEFAULT_MAX_AGE = 24   # hours
 
 
 def _client() -> Client:
@@ -71,43 +44,37 @@ def _client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# Async wrappers — run blocking Supabase I/O off the event loop
+# Async wrappers
 # ---------------------------------------------------------------------------
 
 async def load_fresh_snapshot(max_age_hours: int = _DEFAULT_MAX_AGE) -> Optional[list[str]]:
-    """
-    Return symbols from the active snapshot if it is younger than max_age_hours.
-    Returns None if no fresh active snapshot exists.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_load_fresh_snapshot, max_age_hours)
 
 
 async def load_any_snapshot() -> Optional[list[str]]:
-    """
-    Return symbols from the most recent snapshot regardless of age.
-    Stale fallback when Tradier is unavailable.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_load_any_snapshot)
 
 
-async def save_snapshot(symbols: list[str], source: str) -> bool:
-    """
-    Persist a new snapshot, deactivate the old one, prune old snapshots.
-    Returns True on success.
-    """
+async def save_snapshot(
+    symbols: list[str],
+    source: str,
+    stream_eligible_set: Optional[set[str]] = None,
+) -> bool:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_save_snapshot, symbols, source)
+    return await loop.run_in_executor(
+        None, _sync_save_snapshot, symbols, source, stream_eligible_set
+    )
 
 
 # ---------------------------------------------------------------------------
-# Synchronous implementations (called via run_in_executor)
+# Sync implementations
 # ---------------------------------------------------------------------------
 
 def _sync_load_fresh_snapshot(max_age_hours: int) -> Optional[list[str]]:
     try:
-        sb = _client()
+        sb     = _client()
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         log.info("universe_store: querying fresh snapshot (cutoff=%s)", cutoff)
         result = (
@@ -168,7 +135,7 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
             .eq("snapshot_id", snapshot_id)
             .execute()
         )
-        rows = result.data or []
+        rows    = result.data or []
         symbols = [r["symbol"] for r in rows if r.get("symbol")]
         log.info("universe_store: loaded %d symbols from snapshot %s", len(symbols), snapshot_id)
         return symbols if symbols else None
@@ -177,40 +144,32 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
         return None
 
 
-def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
+def _sync_save_snapshot(
+    symbols: list[str],
+    source: str,
+    stream_eligible_set: Optional[set[str]] = None,
+) -> bool:
     """
-    1. Generate snapshot_id locally via uuid4() — no need to read it back from insert
-    2. Insert new snapshot row with the pre-generated id (is_active=True)
-    3. Bulk-insert all symbols in batches of 500
+    1. Generate snapshot_id locally via uuid4()
+    2. Insert snapshot header
+    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag
     4. Deactivate all other snapshots
-    5. Prune snapshots beyond _KEEP_SNAPSHOTS
-
-    KEY FIX (C-005): supabase-py v2 SyncQueryRequestBuilder does not expose
-    .select() after .insert(). By generating the UUID in Python and passing
-    it in the insert payload, we know the snapshot_id before any DB call
-    and never need it returned. This is version-agnostic.
-
-    KEY FIX (C-006): the options_universe_snapshots table has a NOT NULL
-    column `provider` with no default. Must be included in every insert.
-    Value is always 'tradier' — the only data provider currently integrated.
-    Other columns (refresh_reason, meta, created_at) have DB-level defaults.
+    5. Prune beyond _KEEP_SNAPSHOTS
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
         return False
     try:
-        sb = _client()
-
-        # Generate ID locally — stable across all supabase-py v2 versions
+        sb          = _client()
         snapshot_id = str(uuid4())
+
         log.info(
-            "universe_store: inserting snapshot id=%s source=%s symbols=%d",
+            "universe_store: inserting snapshot id=%s source=%s symbols=%d stream_eligible=%s",
             snapshot_id, source, len(symbols),
+            len(stream_eligible_set) if stream_eligible_set is not None else "all",
         )
 
         # 1. Insert snapshot header
-        # provider is NOT NULL with no default — must always be sent explicitly.
-        # refresh_reason, meta, created_at all have DB-level defaults.
         sb.table("options_universe_snapshots").insert({
             "id":           snapshot_id,
             "symbol_count": len(symbols),
@@ -219,16 +178,24 @@ def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
             "is_active":    True,
         }).execute()
 
-        # 2. Bulk insert symbols in batches of 500
-        batch_size = 500
-        rows = [{"snapshot_id": snapshot_id, "symbol": s} for s in symbols]
+        # 2. Bulk insert symbols with stream_eligible flag
+        batch_size    = 500
+        eligible_set  = stream_eligible_set if stream_eligible_set is not None else set(symbols)
+        rows          = [
+            {
+                "snapshot_id":    snapshot_id,
+                "symbol":         s,
+                "stream_eligible": s in eligible_set,
+            }
+            for s in symbols
+        ]
         total_batches = (len(rows) + batch_size - 1) // batch_size
         for i in range(0, len(rows), batch_size):
             batch_num = i // batch_size + 1
-            sb.table("options_universe_symbols").insert(rows[i:i + batch_size]).execute()
+            sb.table("options_universe_symbols").insert(rows[i : i + batch_size]).execute()
             log.info(
                 "universe_store: inserted symbol batch %d/%d (%d symbols)",
-                batch_num, total_batches, len(rows[i:i + batch_size]),
+                batch_num, total_batches, len(rows[i : i + batch_size]),
             )
 
         # 3. Deactivate all other snapshots
