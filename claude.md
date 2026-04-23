@@ -1,8 +1,20 @@
 # Cipher — Claude Context File
 
-## Project Overview
+> Last updated: 2026-04-23 (Phase 3)
+> This file is the authoritative AI-assistant context document for the Cipher codebase.
+> Keep it updated after every phase so future sessions have full project context.
+
+---
+
+## What Is Cipher?
 
 **Cipher** is an institutional options flow intelligence platform with the tagline *"Decode the Market."* It detects real-time whale/institutional options flow, scores signals using a composite engine, and runs multi-agent AI swarm simulations to generate BUY/SELL/HOLD verdicts.
+
+Built with:
+- **Backend:** FastAPI (Python 3.11) on Railway
+- **Frontend:** Next.js 14, TypeScript, Tailwind CSS on Vercel
+- **Database:** Supabase (PostgreSQL)
+- **Data source:** Tradier WebSocket SSE stream (~2,600+ symbols)
 
 ---
 
@@ -26,6 +38,47 @@
 | Deploy (BE) | Railway |
 | Deploy (FE) | Vercel |
 | CI/CD | GitHub Actions (CI only for backend; deploy via Railway native GitHub integration) |
+
+---
+
+## Phase History
+
+### Phase 1 — Foundation
+- FastAPI backend scaffolded on Railway
+- Tradier SSE stream integration (`services/tradier_stream.py`)
+- `RepetitionAccumulator` — groups flow by (ticker, strike, expiry, type), emits episodes at ≥3 trades / ≥$50K premium
+- `AsyncEventBus` in-memory fan-out (`core/async_bus.py`)
+- Supabase persistence: `flow_episodes` + `flow_events` tables
+- Auth: JWT-based (`/api/auth/register`, `/api/auth/login`, `/api/auth/me`)
+- WebSocket delivery: `/ws/signals`
+- Market-hours guard (no streaming outside 09:30–16:00 ET Mon–Fri)
+- Railway deployment with nixpacks, environment variable management
+
+### Phase 2 — Signal Engine + Hardening
+- `composite_signal_engine.py` — combined flow score + backtest score
+  - Weights: `flow × 0.60 + backtest × 0.40`
+  - Recommendation: BUY / SELL / HOLD at ≥0.65 composite threshold
+- `backtest_validator.py` — historical win-rate lookup by ticker/type/DTE/tier
+- `smart_signals.py` router — `/api/signals/composite/{ticker}` endpoint
+- Multiple stream failure mode fixes (F1–F9): token refresh, 401 handling, watchdog, backoff with jitter
+- Flow store fixes (REG-FS-1 through REG-FS-3): correct table targeting, removed client-sent IDs, f-string logging
+- Comprehensive test suite: `test_tradier_stream.py`, `test_flow_store.py`, `test_universe_store.py`, `test_symbols_loader.py`
+
+### Phase 3 — Volume-Weighted Scoring, Filters, Heartbeat (current)
+- **`options_flow_parser.py`**: Size field guard — `size == 0` or missing → `return None`, preventing zero-premium events from entering accumulator
+- **`composite_signal_engine.py`**: New 3-component scoring
+  - Added `volume_weighted_premium_factor()` — measures premium conviction relative to open interest
+  - New weights: `flow × 0.55 + backtest × 0.35 + volume_premium × 0.10`
+  - `CompositeSignal` dataclass now includes `volume_premium_factor` field
+- **`smart_signals.py`**: Hardened and expanded
+  - New `GET /api/signals/list` endpoint with pagination (`page`, `page_size`) and filters (`direction`, `tier`, `min_conviction`)
+  - Input validation via FastAPI `Query()` constraints + enum checks
+  - `CompositeOut` response model includes `volume_premium_factor`
+- **`ws.py`**: Full ping/pong heartbeat
+  - Server pings every 25s (`{"type":"ping"}`)
+  - Expects `{"type":"pong"}` within 10s
+  - Closes with code 1001 on pong timeout
+  - Prevents Railway idle TCP timeout disconnections
 
 ---
 
@@ -72,6 +125,55 @@ Step 5: Save snapshot to options_universe_snapshots
 
 ---
 
+## Signal Pipeline (Phase 3)
+
+```
+Tradier SSE tick
+  → parse_tradier_trade()
+       └── size == 0 / missing → return None (skip)
+  → RepetitionAccumulator.ingest()
+       threshold: ≥3 trades, ≥$50K premium, 30-min rolling window
+       → RepetitionEpisode
+  → build_composite(ep, accumulator)
+       flow_score          × 0.55
+       backtest_score      × 0.35
+       volume_premium_factor × 0.10
+       → CompositeSignal { BUY | SELL | HOLD, 0–1 score }
+  → bus.publish_all()
+       → ws.py         → connected WebSocket clients
+       → flow_store.py → Supabase flow_episodes + flow_events
+```
+
+---
+
+## Composite Score Weights
+
+| Phase | Formula |
+|-------|---------|
+| Phase 2 | `flow × 0.60 + backtest × 0.40` |
+| Phase 3 | `flow × 0.55 + backtest × 0.35 + volume_premium × 0.10` |
+
+**Recommendation threshold:** composite ≥ 0.65 → BUY (bullish) or SELL (bearish)
+
+`volume_weighted_premium_factor` = `total_premium / (open_interest × 100)`, capped 0–1.
+Falls back to `0.5` neutral when OI is unavailable from Tradier.
+
+---
+
+## WebSocket Protocol
+
+| Message | Direction | Meaning |
+|---------|-----------|---------|
+| Signal JSON | Server → Client | Live signal episode |
+| `{"type":"ping"}` | Server → Client | Heartbeat probe (every 25s) |
+| `{"type":"pong"}` | Client → Server | Heartbeat reply (within 10s) |
+
+Connection close codes:
+- `4001` — invalid/expired JWT on connect
+- `1001` — pong timeout (Railway idle disconnect prevention)
+
+---
+
 ## Repository Structure
 
 ```
@@ -95,8 +197,9 @@ cipher/
 │   │   ├── auth.py
 │   │   └── async_bus.py
 │   ├── parsers/
-│   │   ├── options_flow_parser.py
-│   │   └── bid_ask_classifier.py
+│   │   ├── options_flow_parser.py     # [Phase 3] size==0 guard
+│   │   ├── bid_ask_classifier.py
+│   │   └── trade_type_detector.py
 │   ├── services/
 │   │   ├── flow_store.py          # DB writer: flow_events + flow_episodes — uses SERVICE ROLE KEY only
 │   │   ├── symbols_loader.py      # Steps 1–3: CBOE fetch, validation, batch quotes
@@ -104,20 +207,83 @@ cipher/
 │   │   ├── universe_screener.py   # DEPRECATED — OI-based screener, no longer called
 │   │   └── tradier_stream.py      # Resilient WebSocket stream processor
 │   ├── signals/
-│   │   └── repetition_accumulator.py
+│   │   ├── repetition_accumulator.py
+│   │   ├── composite_signal_engine.py  # [Phase 3] 3-component scoring + volume_premium_factor
+│   │   └── backtest_validator.py
+│   ├── routers/
+│   │   ├── ws.py              # [Phase 3] WebSocket + ping/pong heartbeat
+│   │   ├── smart_signals.py   # [Phase 3] /composite/{ticker} + /list endpoint
+│   │   ├── flow.py            # /api/flow/scan — currently mocked
+│   │   ├── auth.py
+│   │   └── simulation.py
 │   └── tests/
-│       └── test_symbols_loader.py # Steps 1–3 full coverage incl. Step 3 batch quotes
+│       ├── test_symbols_loader.py
+│       ├── test_tradier_stream.py
+│       ├── test_flow_store.py
+│       └── test_universe_store.py
 ├── frontend/
 │   └── (Next.js 14 app)
 ├── docs/
 │   ├── ARCHITECTURE.md        # System data flow and DB schema
 │   ├── BACKLOG.md
 │   ├── FIXES.md               # Chronological log of all bug fixes applied
+│   ├── SIGNAL_ENGINE.md
 │   ├── features.md
 │   ├── regression-test-plan.md
 │   └── specs.md
 └── claude.md                  # This file — Claude context for code changes
 ```
+
+---
+
+## Key File Map
+
+| File | Purpose |
+|------|---------|
+| `backend/main.py` | FastAPI app, lifespan startup, router registration |
+| `backend/config.py` | Pydantic settings — env vars |
+| `backend/services/tradier_stream.py` | SSE stream loop, market-hours guard, demo mode, stats |
+| `backend/parsers/options_flow_parser.py` | Tradier tick → `OptionsFlowEvent` |
+| `backend/parsers/bid_ask_classifier.py` | ABOVE_ASK / AT_ASK / MID / AT_BID / BELOW_BID |
+| `backend/parsers/trade_type_detector.py` | SWEEP / BLOCK / SPLIT / SINGLE |
+| `backend/signals/repetition_accumulator.py` | Groups events into `RepetitionEpisode`, emits at threshold |
+| `backend/signals/composite_signal_engine.py` | `build_composite()` — 3-component scoring → BUY/SELL/HOLD |
+| `backend/signals/backtest_validator.py` | Historical win-rate lookup |
+| `backend/routers/ws.py` | WebSocket `/ws/signals` with ping/pong heartbeat |
+| `backend/routers/smart_signals.py` | `/api/signals/composite/{ticker}` + `/api/signals/list` |
+| `backend/routers/flow.py` | `/api/flow/scan` — **currently mocked** |
+| `backend/routers/auth.py` | JWT auth endpoints |
+| `backend/routers/simulation.py` | Paper trading simulation |
+| `backend/core/async_bus.py` | In-memory async event bus |
+| `backend/core/auth.py` | JWT decode, `get_current_user` dependency |
+| `backend/services/flow_store.py` | Supabase DB writer — `flow_episodes` + `flow_events` |
+| `backend/services/universe_store.py` | Options universe snapshot persistence |
+
+---
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/auth/register` | No | Register user |
+| POST | `/api/auth/login` | No | Login, returns JWT |
+| GET | `/api/auth/me` | JWT | Current user info |
+| GET | `/api/signals/composite/{ticker}` | JWT | Single-ticker composite signal |
+| GET | `/api/signals/list` | JWT | Paginated signal list with filters |
+| GET | `/api/signals/stream/stats` | JWT | Stream stats (ticks, signals, mode) |
+| GET | `/api/flow/scan` | JWT | Flow scan (mocked — Phase 4 TODO) |
+| POST | `/api/simulate` | JWT | Run paper trading simulation |
+| WS | `/ws/signals?token=<jwt>` | JWT (query) | Live signal stream |
+
+### `/api/signals/list` Query Params
+
+| Param | Type | Default | Constraints |
+|-------|------|---------|-------------|
+| `page` | int | 1 | ≥1 |
+| `page_size` | int | 20 | 1–100 |
+| `direction` | string | — | `bullish` / `bearish` / `neutral` |
+| `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
+| `min_conviction` | float | 0.0 | 0.0–1.0 |
 
 ---
 
@@ -134,14 +300,11 @@ cipher/
 
 ---
 
-## Critical Rules — Supabase Key Usage
+## Supabase Critical Rules
 
-> **NEVER use the anon key (`SUPABASE_KEY`) for any server-side DB write.**
->
-> `flow_store.py` uses **only** `SUPABASE_SERVICE_ROLE_KEY`. This key bypasses Row Level Security (RLS).
-> The anon key respects RLS policies and will cause **every insert** to fail with `42501` (policy violation).
-> There is NO fallback to the anon key — if `SUPABASE_SERVICE_ROLE_KEY` is missing, `flow_store.py` logs
-> a warning and exits cleanly rather than silently using the wrong key.
+1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for `flow_store.py` inserts — the anon key fails with `42501` due to RLS
+2. **Never send `id` fields** for `flow_events` (uuid) or `flow_episodes` (bigserial) — Postgres generates them
+3. **No `.select()` chained after `.insert()`** in supabase-py v2 (breaks batch inserts)
 
 ### Supabase Key Reference
 
@@ -179,7 +342,12 @@ Do NOT re-add a call to it from `load_universe()`.
 ### flow_store.py — Key Selection
 `flow_store.py` is the **only** module that writes options flow data to the DB.
 It **must** use `SUPABASE_SERVICE_ROLE_KEY`. Never introduce a fallback to `SUPABASE_KEY` here.
-See the Critical Rules section above.
+See the Supabase Critical Rules section above.
+
+### volume_premium_factor — OI Fallback
+`volume_weighted_premium_factor()` = `total_premium / (open_interest × 100)`, capped 0–1.
+Falls back to `0.5` neutral when OI is unavailable from Tradier.
+Do not treat 0.5 as a signal — it means OI data was absent.
 
 ---
 
@@ -220,3 +388,14 @@ UNIVERSE_MIN_VOLUME=100000
 UNIVERSE_QUOTES_BATCH_SIZE=200
 UNIVERSE_QUOTES_CONCURRENCY=28
 ```
+
+---
+
+## Known Issues / Phase 4 TODO
+
+- `GET /api/flow/scan` returns mock data — wire to live `flow_events` Supabase query
+- `/api/signals/list` tier filter is pass-through in mock mode — wire to live accumulator in Phase 4
+- `volume_premium_factor` falls back to `0.5` when OI is unavailable from Tradier — investigate OI field availability per symbol
+- Frontend needs to implement WS pong response (`{"type":"pong"}`) to survive Phase 3 heartbeat
+- Load test `/api/signals/list` with 50 concurrent authenticated users
+- WebSocket fan-out benchmark with 50+ subscribers
