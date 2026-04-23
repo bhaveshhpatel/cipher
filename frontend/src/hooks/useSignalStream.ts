@@ -8,30 +8,38 @@ export interface WsSignal {
 }
 
 /**
- * Derives the WebSocket URL from the current page origin so it always
- * points at the right host regardless of environment:
+ * Derives the WebSocket URL from env vars or current page origin.
  *
- *   localhost:3000 (dev)  → ws://localhost:8000/ws/signals
- *   cipher.vercel.app     → wss://cipher-production-xxxx.up.railway.app/ws/signals
+ * Priority:
+ *   1. NEXT_PUBLIC_WS_URL env var (set in Vercel to wss://...railway.app)
+ *   2. Derive from window.location (works for local dev)
  *
- * NEXT_PUBLIC_WS_URL must be set in Vercel env vars to the Railway wss:// URL.
- * Falls back gracefully to localhost for local dev.
+ * Returns null if a valid URL cannot be determined — the hook will
+ * skip connecting rather than crash the page.
  */
-function getWsBase(): string {
-  // Server-side render guard
-  if (typeof window === "undefined") return "ws://localhost:8000";
+function getWsUrl(token: string): string | null {
+  // SSR guard — never run on the server
+  if (typeof window === "undefined") return null;
 
-  const explicit = process.env.NEXT_PUBLIC_WS_URL;
-  if (explicit) return explicit.replace(/\/+$/, "");
+  try {
+    const explicit = process.env.NEXT_PUBLIC_WS_URL;
+    if (explicit && explicit.trim() !== "") {
+      const base = explicit.replace(/\/+$/, "");
+      return `${base}/ws/signals?token=${token}`;
+    }
 
-  // Derive from current page: http→ws, https→wss, same host
-  const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  const host  = window.location.host;
-  // In local dev the Next.js dev server is on 3000 but backend is on 8000
-  const wsHost = host.includes("localhost") || host.includes("127.0.0.1")
-    ? host.replace(/:.*/, ":8000")
-    : host;
-  return `${proto}://${wsHost}`;
+    // Fallback: derive from current page origin
+    const proto  = window.location.protocol === "https:" ? "wss" : "ws";
+    const host   = window.location.host;
+    // In local dev Next.js is on :3000 but the backend is on :8000
+    const wsHost = (host.includes("localhost") || host.includes("127.0.0.1"))
+      ? host.replace(/:.*/, ":8000")
+      : host;
+
+    return `${proto}://${wsHost}/ws/signals?token=${token}`;
+  } catch {
+    return null;
+  }
 }
 
 export function useSignalStream(token: string | null) {
@@ -42,31 +50,40 @@ export function useSignalStream(token: string | null) {
 
   useEffect(() => {
     if (!token) return;
+
+    const wsUrl = getWsUrl(token);
+    if (!wsUrl) {
+      console.warn("[useSignalStream] Could not determine WebSocket URL — NEXT_PUBLIC_WS_URL may not be set.");
+      return;
+    }
+
     let active = true;
-    const base  = getWsBase();
-    const wsUrl = `${base}/ws/signals?token=${token}`;
 
     const connect = () => {
       if (!active) return;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      try {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-      ws.onopen  = () => setConnected(true);
-      ws.onclose = () => {
-        setConnected(false);
-        if (active) reconnectRef.current = setTimeout(connect, 3000);
-      };
-      ws.onerror = () => setConnected(false);
-      ws.onmessage = (e) => {
-        try {
-          const m = JSON.parse(e.data as string);
-          if (m.type === "ping") return;
-          const payload = m.type === "signal" && m.data ? m.data : m;
-          if (payload?.ticker && payload?.alert_level) {
-            setSignals(p => [payload, ...p].slice(0, 200));
-          }
-        } catch { /* ignore malformed frames */ }
-      };
+        ws.onopen  = () => { if (active) setConnected(true); };
+        ws.onclose = () => {
+          setConnected(false);
+          if (active) reconnectRef.current = setTimeout(connect, 3000);
+        };
+        ws.onerror = () => setConnected(false);
+        ws.onmessage = (e) => {
+          try {
+            const m = JSON.parse(e.data as string);
+            if (m.type === "ping") return;
+            const payload = m.type === "signal" && m.data ? m.data : m;
+            if (payload?.ticker && payload?.alert_level) {
+              setSignals(p => [payload, ...p].slice(0, 200));
+            }
+          } catch { /* ignore malformed frames */ }
+        };
+      } catch (err) {
+        console.error("[useSignalStream] WebSocket construction failed:", err);
+      }
     };
 
     connect();
