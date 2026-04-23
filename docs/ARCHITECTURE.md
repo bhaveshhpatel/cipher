@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-23
+> Last updated: 2026-04-23 (Phase 3)
 
 ---
 
@@ -21,6 +21,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │     ├── _get_session_token() Tradier REST                  │
 │    │     ├── httpx SSE stream     Tradier Stream API            │
 │    │     ├── parse_tradier_trade() parsers/options_flow_parser  │
+│    │     │     └── [Phase 3] size==0 guard → returns None       │
 │    │     ├── [LOG] every tick     Railway logs                  │
 │    │     ├── RepetitionAccumulator signals/repetition_accumulator│
 │    │     ├── [LOG] every signal   Railway logs                  │
@@ -39,10 +40,11 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │                                                                 │
 │  FastAPI Routers                                                │
 │    ├── /api/auth        auth.py                                 │
-│    ├── /api/flow/scan   flow.py   (currently mocked — TODO)     │
+│    ├── /api/flow/scan   flow.py   (currently mocked)            │
 │    ├── /api/simulate    simulation.py                           │
-│    ├── /ws/signals      ws.py     WebSocket                     │
-│    └── /api/signals     smart_signals.py                        │
+│    ├── /ws/signals      ws.py     WebSocket + heartbeat         │
+│    ├── /api/signals/composite  smart_signals.py                 │
+│    └── /api/signals/list       smart_signals.py  [Phase 3]     │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -52,6 +54,75 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │   options_universe_symbols · auth.users                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Backend Signal Pipeline — Phase 3
+
+```
+Tradier SSE tick
+  → parse_tradier_trade()
+       └── [Phase 3] size guard: if size == 0 → return None (skip event)
+  → RepetitionAccumulator.ingest()
+       └── RepetitionEpisode produced when trades ≥ 3 AND premium ≥ $50K
+  → build_composite(ep, accumulator)
+       ├── compute_flow_score()              × 0.55 weight
+       │     premium (capped $10M) + acceleration bonus + trade count
+       ├── get_backtest_score()              × 0.35 weight
+       │     historical win-rate by ticker/type/DTE/tier
+       └── volume_weighted_premium_factor()  × 0.10 weight  [Phase 3]
+             total_premium / (open_interest × 100), capped 0–1
+             falls back to 0.5 neutral when OI unavailable
+  → CompositeSignal { recommendation, composite_score, flow_score,
+                      backtest_score, volume_premium_factor, reasoning }
+  → bus.publish_all() → WebSocket clients + Supabase
+```
+
+### Composite Score Weights (Phase 3)
+
+| Component | Weight | Source |
+|-----------|--------|--------|
+| `flow_score` | 0.55 | Premium size, acceleration, trade count |
+| `backtest_score` | 0.35 | Historical win-rate (ticker/type/DTE/tier) |
+| `volume_premium_factor` | 0.10 | Premium relative to open interest |
+
+> **Phase 2 weights were** `flow × 0.60 + backtest × 0.40`. Phase 3 adds the OI-relative conviction filter.
+
+---
+
+## WebSocket Heartbeat (Phase 3)
+
+Railway terminates idle TCP connections. The WS router now runs a full ping/pong loop:
+
+| Event | Details |
+|-------|---------|
+| Server → client ping | `{"type":"ping"}` every **25 seconds** |
+| Client → server pong | `{"type":"pong"}` expected within **10 seconds** |
+| Pong timeout | Server closes with code `1001`, logs warning |
+
+Frontend must handle `{"type":"ping"}` messages and respond with `{"type":"pong"}`.
+
+---
+
+## Smart Signals Endpoint — Phase 3
+
+### `GET /api/signals/list`
+
+New paginated, filterable endpoint:
+
+| Query Param | Type | Default | Description |
+|-------------|------|---------|-------------|
+| `page` | int | 1 | Page number (1-indexed) |
+| `page_size` | int | 20 | Results per page (max 100) |
+| `direction` | string | — | `bullish` / `bearish` / `neutral` |
+| `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
+| `min_conviction` | float | 0.0 | Minimum `composite_score` (0.0–1.0) |
+
+Response includes `signals[]`, `page`, `page_size`, `total`.
+
+### `GET /api/signals/composite/{ticker}`
+
+Unchanged single-ticker endpoint. Response now includes `volume_premium_factor` field.
 
 ---
 
@@ -76,6 +147,7 @@ Refreshes every **24 hours** in background.
 ```
 Tradier SSE tick
   → parse_tradier_trade()          parse raw JSON into OptionsFlowEvent
+       └── size == 0 → return None   [Phase 3 guard]
   → [LOG] tradier_stream logger    "[flow] AAPL CALL $180 2024-06-21 | prem=$250,000 ..."
   → RepetitionAccumulator.ingest() group by (ticker, strike, expiry, contract_type)
        └── if trades >= 3 AND premium >= $50,000:
@@ -182,6 +254,7 @@ Simulation is triggered via `POST /api/simulate`.
 | All raw ticks (persisted) | Supabase `flow_events` table |
 | Simulation results | Supabase `simulation_results` table |
 | WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
+| Paginated signals list | `GET /api/signals/list?page=1&min_conviction=0.65` |
 
 ---
 
@@ -214,3 +287,4 @@ Simulation is triggered via `POST /api/simulate`.
 - `routers/flow.py` (`GET /api/flow/scan`) returns **mock data** — needs to be wired to `flow_events` table query
 - `flow_events` and `flow_episodes` tables must exist in Supabase with columns matching schemas above
 - RLS policies on both tables must permit `service_role` inserts (or be disabled for the service role)
+- `/api/signals/list` tier filter is pass-through (mock data) — wire to live accumulator query in Phase 4
