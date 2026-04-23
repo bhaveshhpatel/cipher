@@ -61,6 +61,17 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: vercel pull --yes --environment=production --token=$VERCEL_TOKEN
 
+      - name: Inject environment variables into Vercel
+        env:
+          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+          NEXT_PUBLIC_WS_URL:  ${{ secrets.NEXT_PUBLIC_WS_URL }}
+        run: |
+          echo "$NEXT_PUBLIC_API_URL" | vercel env add NEXT_PUBLIC_API_URL production --token=$VERCEL_TOKEN --force
+          echo "$NEXT_PUBLIC_WS_URL"  | vercel env add NEXT_PUBLIC_WS_URL  production --token=$VERCEL_TOKEN --force
+
       - name: Build (Vercel)
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
