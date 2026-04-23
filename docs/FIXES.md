@@ -100,3 +100,13 @@ Do **not** use the `anon` key — it will always fail for server-side writes wit
 **Date:** 2026-04-17  
 **Severity:** High — snapshot ID could not be read back after insert  
 **Fix:** Generate `snapshot_id` via `uuid4()` in Python before the insert, use it directly rather than reading back from the DB response.
+
+## C-011 — Design System Overhaul (Phase 1)
+**Date:** 2026-04-23  
+**Files:** `frontend/src/app/globals.css`, `layout.tsx`, `page.tsx`, all dashboard components  
+**Changes:** Full dark terminal design system. CSS variables for color, surface, typography. Redesigned FlowTable, SignalFeed, SimulationPanel, CompositeCard, StreamStatsBar with skeleton loaders, empty states, conviction bars, confidence rings, vote bars, agent grids. Sidebar navigation.
+
+## C-012 — Tailwind + Auth + SmartSignals (Phase 2)
+**Date:** 2026-04-23  
+**Files:** `tailwind.config.ts`, `login/page.tsx`, `register/page.tsx`, `SmartSignals.tsx`  
+**Changes:** Tailwind wired to CSS vars. Login/register pages matching dark design. SmartSignals leaderboard tab added.
