@@ -32,6 +32,7 @@ import httpx
 from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
+from services.flow_store import persist_flow_event
 from signals.repetition_accumulator import RepetitionAccumulator
 
 log = logging.getLogger("tradier_stream")
@@ -292,8 +293,15 @@ _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
-# Trade processor — ALL log.info use f-strings (no % args) to prevent
-# logging formatter crash when fields are None or non-numeric
+# Trade processor
+#
+# FIX 1: persist_flow_event() is now called for every classified tick so
+#         that flow_events rows are actually written to Supabase.
+#         Previously this call was missing — the buffer was never filled.
+#
+# FIX 2: [flow] per-tick log downgraded to DEBUG to stop Railway rate-limit
+#         drops (400+ msgs/sec at INFO was exceeding Railway's log budget).
+#         [signal] stays at INFO — low frequency, high importance.
 # ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     _stats["ticks"] += 1
@@ -303,8 +311,8 @@ async def _process_trade(raw: dict):
 
     _stats["classified"] += 1
 
-    # Safe f-string log — evaluates immediately, never deferred by logging formatter
-    log.info(
+    # DEBUG — high-frequency per-tick log (avoids Railway rate-limit drops)
+    log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
         f"${ev.strike:.0f} {ev.expiry} "
         f"| prem=${ev.premium:,.0f} "
@@ -313,13 +321,27 @@ async def _process_trade(raw: dict):
         f"| tier={ev.influence_tier or 'UNKNOWN'}"
     )
 
+    # FIX 1: buffer this tick for batch insert into flow_events (every 5s flush)
+    await persist_flow_event({
+        "ticker":           ev.ticker,
+        "contract_type":    ev.contract_type,
+        "strike":           ev.strike,
+        "expiry":           ev.expiry,
+        "premium":          ev.premium,
+        "trade_type":       ev.trade_type,
+        "sentiment":        ev.sentiment,
+        "influence_tier":   ev.influence_tier,
+        "conviction_score": ev.conviction_score,
+        "is_golden_sweep":  ev.is_golden_sweep,
+    })
+
     ep = accumulator.ingest(ev)
     if not ep:
         return
 
     alert_level = accumulator.get_alert_level(ep)
 
-    # Safe f-string log for signal episodes
+    # INFO — low-frequency signal log, keep visible
     log.info(
         f"[signal] {ep.ticker} {ep.contract_type} "
         f"| alert={alert_level} "
