@@ -327,12 +327,12 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                             except (TypeError, ValueError):
                                 pass
 
-                    # Use today's volume; fall back to average_volume when market hasn't opened yet
-                    vol_val = raw.get("volume")
+                    # Always use average_volume (30-day avg daily stock volume) for eligibility.
+                    # Today's intraday "volume" is 0 pre-market and irrelevant for universe filtering.
                     avg_vol_val = raw.get("average_volume")
-                    if vol_val is not None:
+                    if avg_vol_val is not None:
                         try:
-                            volume = int(vol_val)
+                            volume = int(float(avg_vol_val))
                         except (TypeError, ValueError):
                             pass
                     # If today's volume is 0 (pre-market) fall back to 30-day average volume
