@@ -63,7 +63,7 @@ cipher/
 │   ├── execution/
 │   │   └── trade_executor.py
 │   ├── services/
-│   │   ├── tradier_stream.py
+│   │   ├── tradier_stream.py  # Market-hours guard + session_ticks backoff (commit 9a32d4b)
 │   │   ├── symbols_loader.py  # CBOE CSV fetch + Tradier validation + fallbacks
 │   │   └── universe_store.py  # Supabase snapshot read/write
 │   ├── migrations/
@@ -79,7 +79,7 @@ cipher/
 │       ├── test_auth_flow.py
 │       ├── test_flow_and_stats.py
 │       ├── test_simulation_and_ws.py
-│       ├── test_tradier_stream.py
+│       ├── test_tradier_stream.py  # F1–F9 + MH-1–7 + BF-1–3
 │       ├── test_symbols_loader.py
 │       └── test_universe_store.py
 ├── frontend/
@@ -155,6 +155,93 @@ cipher/
 ---
 
 ## Key Business Logic
+
+### Tradier Stream — Market-Hours Guard & Backoff Fix (C-005, commit 9a32d4b)
+
+#### `_is_market_hours()` helper
+
+Checks US Eastern Time Mon–Fri 09:30–16:00 using `zoneinfo.ZoneInfo("America/New_York")` (Python stdlib — no extra deps).
+
+```python
+def _is_market_hours() -> bool:
+    from zoneinfo import ZoneInfo
+    import datetime
+    now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:          # Saturday / Sunday
+        return False
+    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_ <= now < close_
+```
+
+**Behaviour:**
+- Market **closed** → log once + sleep 60s before next check. Zero reconnect spam. `mode = "market_closed"`.
+- Market **open** → proceed to token fetch and stream connection as normal.
+
+Example log when closed:
+```
+Market closed (ET: 01:28 PDT Wed) — sleeping 60s before next check
+```
+
+#### session_ticks-aware backoff reset
+
+**Old:** `reconnect_attempt` reset to `0` on every successful connection, even instant closes with no data → backoff always restarted from ~0–5s → overnight reconnect spam.
+
+**New:**
+- `session_ticks > 0` (real data received) → reset `reconnect_attempt = 0` ✅
+- `session_ticks == 0` (connected, instant close, no data) → `attempt += 1` → backoff grows up to 60s cap
+
+#### Reconnect State Machine (current)
+
+```
+startup
+  └─ while True:
+      ├─ _is_market_hours()            ← if closed: log + sleep 60s + continue
+      │
+      ├─ _get_session_token()          ← fresh token every iteration
+      │    ├─ retry up to 3x on transient network error (2s gap)
+      │    └─ return None on 401 (bad key) or exhausted retries
+      │
+      ├─ if no token:
+      │    ├─ start _demo_mode_once() as background asyncio.Task
+      │    ├─ exponential backoff (5s base, 60s cap, jitter)
+      │    └─ continue → retry token fetch
+      │
+      ├─ if token:
+      │    ├─ cancel demo task (if running)
+      │    ├─ open httpx streaming POST to Tradier
+      │    │
+      │    ├─ if stream 401 (expired token race):
+      │    │    ├─ fast retry (1s) for first 4 consecutive
+      │    │    └─ slow backoff after 5 consecutive (likely bad key)
+      │    │
+      │    ├─ if connected:
+      │    │    ├─ set mode = "live"
+      │    │    ├─ read lines via _guarded_lines() [30s idle watchdog]
+      │    │    ├─ increment session_ticks per data line
+      │    │    └─ process each trade → signal pipeline
+      │    │
+      │    └─ on any error (network, timeout, idle):
+      │         ├─ increment reconnect counter
+      │         ├─ set mode = "reconnecting"
+      │         ├─ if session_ticks > 0 → reset attempt = 0
+      │         ├─ else → attempt += 1
+      │         └─ exponential backoff → continue
+      │
+      └─ loop forever
+```
+
+#### Stats — mode values
+
+`mode` field in `get_stats()`: `starting` | `live` | `demo` | `reconnecting` | `market_closed`
+
+#### Critical implementation notes
+
+- **Session token POST requires `data={}` (NOT `content=b""`)** — httpx must send `Content-Length: 0` matching `curl -d ""`. Using `content=b""` omits `Content-Length` and Tradier silently fails.
+- Session tokens expire on stream close — **must re-fetch on every reconnect**.
+- Demo mode is a cancellable `asyncio.Task` — cancelled immediately when live connection established.
+
+---
 
 ### Options Universe — Persistence Layer
 
@@ -268,12 +355,6 @@ Login:
 - `routers/auth.py` has explicit `@router.options("/register")` and `@router.options("/token")` handlers returning 200 to guarantee preflight never returns 400
 - `frontend/src/lib/api.ts` strips trailing slash from `NEXT_PUBLIC_API_URL` defensively
 
-### Tradier Stream — Critical Implementation Notes
-
-- **Session token POST requires `data={}` (NOT `content=b""`)** so httpx sends `Content-Length: 0`, matching `curl -d ""`. Using `content=b""` omits `Content-Length` and Tradier silently fails to return a sessionid.
-- Session tokens are short-lived. On 401 from either the session or stream endpoint, the service falls back to demo mode (no infinite retry loop).
-- Stream POST uses Bearer token in header + sessionid in body payload.
-
 ### Swarm Simulation
 
 Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst, Technical Analyst, Macro Strategist, Risk Manager.
@@ -318,7 +399,8 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Tradier session token Content-Length | ✅ Fixed 2026-04-23 |
 | Tradier stream | ✅ Live |
 | Options universe persistence | ✅ Live 2026-04-23 |
-| **universe_store AttributeError on .select()** | ✅ **Fixed 2026-04-23 — uuid4 snapshot_id** |
+| universe_store AttributeError on .select() | ✅ Fixed 2026-04-23 — uuid4 snapshot_id |
+| **Tradier overnight reconnect spam** | ✅ **Fixed 2026-04-23 — market-hours guard + session_ticks backoff (commit 9a32d4b)** |
 | Flow data | Live Tradier stream running; demo mode fallback if key missing |
 | Supabase | Auth working; universe tables live; signal storage not yet wired |
 | Redis | In config but not integrated |
@@ -339,6 +421,14 @@ AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
 **Fix applied in `universe_store.py`:** Generate `snapshot_id = str(uuid4())` in Python before the insert and pass it explicitly in the payload. The ID is known ahead of time so we never need to read it back from the insert response. This is stable across all supabase-py v2 versions.
 
 **Rule:** Never chain `.select()` after `.insert()` anywhere in this codebase with `supabase==2.15.2`.
+
+### Tradier Stream — Off-Hours Behaviour
+
+Outside market hours (Mon–Fri 09:30–16:00 ET, weekends), the stream loop:
+- Logs `Market closed (ET: ...) — sleeping 60s before next check` once per minute
+- Sets `mode = "market_closed"` in stats / `/health`
+- Does NOT attempt token fetch or stream connection
+- Reconnect backoff only resets when `session_ticks > 0` (real data received), so off-hours polling stays at the 60s cap rather than spamming rapid retries
 
 ---
 
@@ -398,6 +488,7 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 - Monorepo: `backend/` and `frontend/` as siblings at repo root
 - No ORM — direct Supabase REST/postgrest calls
 - **Do NOT chain `.select()` after `.insert()` with supabase-py v2** — use `uuid4()` pattern instead
+- **Do NOT add market-hours logic using third-party libs** — use `zoneinfo` (stdlib) only
 
 ---
 
@@ -436,12 +527,13 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed universe_store AttributeError** — replaced broken `.insert().select()` chain with `uuid4()` pre-generated snapshot_id; updated regression tests with 4 new cases |
-| 2026-04-23 | **Options universe persistence shipped** — `symbols_loader.py`, `universe_store.py`, `migrations/001_options_universe.sql`, updated `main.py` startup + 24h background refresh loop, 20 + 10 test cases |
-| 2026-04-23 | **Supabase migration applied** — `options_universe_snapshots` + `options_universe_symbols` tables live in `cipher-database` |
+| 2026-04-23 | **C-005: Tradier market-hours guard + session_ticks backoff fix** — `_is_market_hours()` helper (ET timezone, stdlib), market-closed guard at top of reconnect loop (60s sleep, one log/min), `session_ticks`-aware backoff reset, `mode = market_closed` in stats. Eliminates overnight reconnect spam. 10 new test cases (MH-1–7, BF-1–3). |
+| 2026-04-23 | **Fixed universe_store AttributeError** — replaced broken `.insert().select()` chain with `uuid4()` pre-generated snapshot_id |
+| 2026-04-23 | **Options universe persistence shipped** — `symbols_loader.py`, `universe_store.py`, `migrations/001_options_universe.sql`, updated `main.py` startup + 24h background refresh loop, 30 test cases |
+| 2026-04-23 | **Supabase migration applied** — `options_universe_snapshots` + `options_universe_symbols` tables live |
 | 2026-04-23 | **Fixed Tradier session token Content-Length** — changed `content=b""` to `data={}` |
 | 2026-04-23 | **Fixed Tradier 401 infinite loop** — 401 guards + demo-mode fallback |
-| 2026-04-23 | **Added Tradier regression tests** — `test_tradier_stream.py` |
+| 2026-04-23 | **Added Tradier regression tests** — `test_tradier_stream.py` (F1–F9) |
 | 2026-04-23 | **Fixed CORS preflight 400** — explicit OPTIONS handlers + trailing slash strip |
 | 2026-04-23 | **Fixed missing email-validator** — `pydantic[email]` |
 | 2026-04-23 | **Fixed runtime startup crash** — pydantic-settings v2 migration |
