@@ -360,3 +360,53 @@ class TestLoadUniverse:
 
         assert source == "seed_fallback"
         assert eligible_set is None
+
+    @pytest.mark.asyncio
+    async def test_average_volume_zero_falls_back_to_today_volume(self):
+        """HOOD-case: average_volume=0 but today volume=24M → stream_eligible=True."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "quotes": {
+                "quote": [{
+                    "symbol": "HOOD",
+                    "last": 83.4,
+                    "volume": 24_549_554,
+                    "average_volume": 0,
+                }]
+            }
+        }
+        with patch("services.symbols_loader.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_resp)
+            result = await _fetch_batch_quotes(["HOOD"])
+        assert result[0].stream_eligible is True
+        assert result[0].volume == 24_549_554
+
+    @pytest.mark.asyncio
+    async def test_effective_volume_uses_max_of_avg_and_today(self):
+        """Takes the higher of average_volume vs today volume for eligibility."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "quotes": {
+                "quote": [
+                    # avg_vol > today_vol → use avg_vol
+                    {"symbol": "RIVN", "last": 16.99, "volume": 5_000_000,  "average_volume": 28_622_140},
+                    # today_vol > avg_vol (avg=0) → use today_vol
+                    {"symbol": "HOOD", "last": 83.40, "volume": 24_549_554, "average_volume": 0},
+                    # both below threshold → not eligible
+                    {"symbol": "ILLQ", "last": 5.00,  "volume": 100,        "average_volume": 50},
+                ]
+            }
+        }
+        with patch("services.symbols_loader.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_resp)
+            result = await _fetch_batch_quotes(["RIVN", "HOOD", "ILLQ"])
+
+        rivn = next(q for q in result if q.symbol == "RIVN")
+        hood = next(q for q in result if q.symbol == "HOOD")
+        illq = next(q for q in result if q.symbol == "ILLQ")
+
+        assert rivn.stream_eligible is True
+        assert hood.stream_eligible is True
+        assert illq.stream_eligible is False
