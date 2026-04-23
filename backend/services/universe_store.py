@@ -26,7 +26,7 @@ IMPORTANT: All public functions are async-safe.
   and fall-through to seed fallback), every public function runs the
   blocking work inside asyncio.get_event_loop().run_in_executor(None, ...).
 
-ROOT CAUSE FIX (2026-04-23):
+ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 SyncQueryRequestBuilder does NOT expose .select() after
   .insert(). Chaining .insert().select().execute() raises:
     AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
@@ -36,6 +36,17 @@ ROOT CAUSE FIX (2026-04-23):
   never need to read it back from the insert result. This is stable across
   all supabase-py v2 versions and removes the dependency on insert-return
   behaviour entirely.
+
+ROOT CAUSE FIX (2026-04-23) C-006:
+  The options_universe_snapshots table has a NOT NULL column `provider` with
+  no default value. The insert payload in _sync_save_snapshot never included
+  it, causing every save_snapshot call to fail with:
+    null value in column "provider" of relation "options_universe_snapshots"
+    violates not-null constraint
+
+  Fix: pass provider="tradier" explicitly in the insert dict.
+  Other columns (refresh_reason, meta, created_at) have DB-level defaults
+  and do not need to be sent.
 """
 import asyncio
 import logging
@@ -174,13 +185,15 @@ def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
     4. Deactivate all other snapshots
     5. Prune snapshots beyond _KEEP_SNAPSHOTS
 
-    KEY FIX: supabase-py v2 SyncQueryRequestBuilder does not expose .select()
-    after .insert(). Previously chaining .insert().select().execute() raised:
-      AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
+    KEY FIX (C-005): supabase-py v2 SyncQueryRequestBuilder does not expose
+    .select() after .insert(). By generating the UUID in Python and passing
+    it in the insert payload, we know the snapshot_id before any DB call
+    and never need it returned. This is version-agnostic.
 
-    By generating the UUID in Python and passing it in the insert payload,
-    we know the snapshot_id before any DB call and never need it returned.
-    This is version-agnostic and eliminates the crash entirely.
+    KEY FIX (C-006): the options_universe_snapshots table has a NOT NULL
+    column `provider` with no default. Must be included in every insert.
+    Value is always 'tradier' — the only data provider currently integrated.
+    Other columns (refresh_reason, meta, created_at) have DB-level defaults.
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
@@ -195,10 +208,13 @@ def _sync_save_snapshot(symbols: list[str], source: str) -> bool:
             snapshot_id, source, len(symbols),
         )
 
-        # 1. Insert snapshot header with pre-generated id
+        # 1. Insert snapshot header
+        # provider is NOT NULL with no default — must always be sent explicitly.
+        # refresh_reason, meta, created_at all have DB-level defaults.
         sb.table("options_universe_snapshots").insert({
             "id":           snapshot_id,
             "symbol_count": len(symbols),
+            "provider":     "tradier",
             "source":       source,
             "is_active":    True,
         }).execute()

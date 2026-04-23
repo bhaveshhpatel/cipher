@@ -4,14 +4,21 @@
 --
 -- options_universe_snapshots  — one row per validated snapshot
 -- options_universe_symbols    — normalized symbol membership per snapshot
+--
+-- Schema reflects actual production columns (updated 2026-04-23, C-006).
+-- Columns added vs original: provider (NOT NULL), refresh_reason, meta, created_at.
 
 CREATE TABLE IF NOT EXISTS options_universe_snapshots (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  symbol_count  INT NOT NULL,
-  source        TEXT NOT NULL
+  id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  fetched_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  symbol_count   INT         NOT NULL DEFAULT 0,
+  provider       TEXT        NOT NULL,
+  source         TEXT        NOT NULL
     CHECK (source IN ('tradier_validated', 'seed_fallback', 'cache')),
-  is_active     BOOLEAN NOT NULL DEFAULT true
+  is_active      BOOLEAN     NOT NULL DEFAULT false,
+  refresh_reason TEXT        NOT NULL DEFAULT 'startup',
+  meta           JSONB       NOT NULL DEFAULT '{}',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS options_universe_symbols (

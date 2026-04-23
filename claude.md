@@ -268,16 +268,20 @@ App startup
                 └─ Failure → keep current active snapshot, log warning ✅
 ```
 
-#### DB Tables
+#### DB Tables — Real Production Schema
 
 ```sql
 -- One row per validated universe snapshot
 options_universe_snapshots (
-  id            UUID PRIMARY KEY,
-  fetched_at    TIMESTAMPTZ,
-  symbol_count  INT,
-  source        TEXT,   -- 'tradier_validated' | 'seed_fallback' | 'cache'
-  is_active     BOOLEAN -- UNIQUE partial index: only 1 active at a time
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  fetched_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  symbol_count   INT NOT NULL DEFAULT 0,
+  provider       TEXT NOT NULL,                        -- e.g. 'tradier'
+  source         TEXT NOT NULL,                        -- 'tradier_validated' | 'seed_fallback' | 'cache'
+  is_active      BOOLEAN NOT NULL DEFAULT false,
+  refresh_reason TEXT NOT NULL DEFAULT 'startup',
+  meta           JSONB NOT NULL DEFAULT '{}',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 )
 
 -- Individual symbols per snapshot (normalized, batch-inserted in 500s)
@@ -293,6 +297,7 @@ options_universe_symbols (
 - Keep **last 7 snapshots** — auto-purge older ones via ON DELETE CASCADE
 - **Never block stream on refresh** — background asyncio task
 - `source` field distinguishes full coverage vs degraded fallback
+- `provider` field is always `"tradier"` — the only data provider currently integrated. **NOT NULL, no default — must always be sent explicitly in insert.**
 - Partial unique index enforces only ONE active snapshot at the DB level
 - **snapshot_id generated via `uuid4()` in Python** — passed explicitly in the insert payload; never read back from insert response (see Known Issues below)
 
@@ -379,6 +384,20 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | `options_universe_snapshots` | One row per validated universe snapshot | `001_options_universe.sql` |
 | `options_universe_symbols` | Individual symbols per snapshot (normalized) | `001_options_universe.sql` |
 
+**`options_universe_snapshots` columns (production):**
+
+| Column | Type | Nullable | Default |
+|---|---|---|---|
+| `id` | UUID | NO | `gen_random_uuid()` |
+| `fetched_at` | TIMESTAMPTZ | NO | `now()` |
+| `symbol_count` | INT | NO | `0` |
+| `provider` | TEXT | **NO** | **none — must send explicitly** |
+| `source` | TEXT | NO | none — must send explicitly |
+| `is_active` | BOOLEAN | NO | `false` |
+| `refresh_reason` | TEXT | NO | `'startup'` |
+| `meta` | JSONB | NO | `'{}'` |
+| `created_at` | TIMESTAMPTZ | NO | `now()` |
+
 > Auth tables are managed by Supabase Auth (built-in `auth.users`).
 
 ---
@@ -400,7 +419,8 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Tradier stream | ✅ Live |
 | Options universe persistence | ✅ Live 2026-04-23 |
 | universe_store AttributeError on .select() | ✅ Fixed 2026-04-23 — uuid4 snapshot_id |
-| **Tradier overnight reconnect spam** | ✅ **Fixed 2026-04-23 — market-hours guard + session_ticks backoff (commit 9a32d4b)** |
+| Tradier overnight reconnect spam | ✅ Fixed 2026-04-23 — market-hours guard + session_ticks backoff (C-005) |
+| **universe_store provider NOT NULL crash** | ✅ **Fixed 2026-04-23 — send provider="tradier" in insert (C-006)** |
 | Flow data | Live Tradier stream running; demo mode fallback if key missing |
 | Supabase | Auth working; universe tables live; signal storage not yet wired |
 | Redis | In config but not integrated |
@@ -421,6 +441,16 @@ AttributeError: 'SyncQueryRequestBuilder' object has no attribute 'select'
 **Fix applied in `universe_store.py`:** Generate `snapshot_id = str(uuid4())` in Python before the insert and pass it explicitly in the payload. The ID is known ahead of time so we never need to read it back from the insert response. This is stable across all supabase-py v2 versions.
 
 **Rule:** Never chain `.select()` after `.insert()` anywhere in this codebase with `supabase==2.15.2`.
+
+### options_universe_snapshots — `provider` column is NOT NULL with no default
+
+The `provider` column was added to the production table outside the original migration and has **no default value**. Every insert into `options_universe_snapshots` **must** include `"provider": "tradier"` explicitly or the DB will reject with:
+```
+null value in column "provider" of relation "options_universe_snapshots" violates not-null constraint
+```
+**Fix applied in `universe_store.py` (`_sync_save_snapshot`):** `"provider": "tradier"` is now always included in the insert dict. The migration SQL (`001_options_universe.sql`) has also been updated to reflect the full production schema.
+
+**Rule:** Any future insert into `options_universe_snapshots` must include `provider`.
 
 ### Tradier Stream — Off-Hours Behaviour
 
@@ -489,6 +519,7 @@ Vercel CLI deploy on push to `main` when `frontend/**` changes.
 - No ORM — direct Supabase REST/postgrest calls
 - **Do NOT chain `.select()` after `.insert()` with supabase-py v2** — use `uuid4()` pattern instead
 - **Do NOT add market-hours logic using third-party libs** — use `zoneinfo` (stdlib) only
+- **Always include `provider` in any insert to `options_universe_snapshots`** — NOT NULL, no default
 
 ---
 
@@ -527,6 +558,7 @@ npm run dev
 
 | Date | Change |
 |------|--------|
+| 2026-04-23 | **C-006: universe_store provider NOT NULL fix** — added `"provider": "tradier"` to `_sync_save_snapshot` insert payload; updated `001_options_universe.sql` to match full production schema (provider, refresh_reason, meta, created_at columns); updated claude.md schema table and Known Issues. |
 | 2026-04-23 | **C-005: Tradier market-hours guard + session_ticks backoff fix** — `_is_market_hours()` helper (ET timezone, stdlib), market-closed guard at top of reconnect loop (60s sleep, one log/min), `session_ticks`-aware backoff reset, `mode = market_closed` in stats. Eliminates overnight reconnect spam. 10 new test cases (MH-1–7, BF-1–3). |
 | 2026-04-23 | **Fixed universe_store AttributeError** — replaced broken `.insert().select()` chain with `uuid4()` pre-generated snapshot_id |
 | 2026-04-23 | **Options universe persistence shipped** — `symbols_loader.py`, `universe_store.py`, `migrations/001_options_universe.sql`, updated `main.py` startup + 24h background refresh loop, 30 test cases |
