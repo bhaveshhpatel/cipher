@@ -38,9 +38,11 @@ cipher/
 │       ├── backend.yml        # CI only — syntax check; NO deploy steps
 │       └── frontend.yml       # Vercel deploy via CLI
 ├── backend/
-│   ├── main.py                # FastAPI entry, lifespan, CORS, router mounts
-│   ├── config.py              # pydantic-settings (env vars)
-│   ├── requirements.txt
+│   ├── main.py
+│   ├── config.py
+│   ├── requirements.txt       # Production deps (no pytest)
+│   ├── requirements-dev.txt   # Dev/test deps (pytest, pytest-asyncio)
+│   ├── nixpacks.toml          # Forces Python 3.11 for Railway build
 │   ├── core/
 │   │   ├── auth.py
 │   │   └── async_bus.py
@@ -98,7 +100,7 @@ cipher/
 │   ├── features.md
 │   ├── regression-test-plan.md
 │   └── specs.md
-├── railway.toml               # SINGLE authoritative Railway config (root)
+├── railway.toml
 └── claude.md
 ```
 
@@ -203,6 +205,7 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 | Backend deployment | ✅ Live on Railway (native GitHub integration) |
 | Auth — register + login | ✅ Fixed 2026-04-23 |
 | Railway deploy pipeline | ✅ Fixed 2026-04-23 — native GitHub integration, no CLI |
+| Python version pinning | ✅ Fixed 2026-04-23 — nixpacks.toml forces Python 3.11 |
 | Flow data | **Mocked** — deterministic seed by ticker hash; live Tradier wires exist but need valid API key |
 | Supabase | Auth working; DB not actively queried yet |
 | Redis | In `config.py` but not integrated |
@@ -214,26 +217,11 @@ Six GPT-4o-mini agents: Momentum Trader, Contrarian Analyst, Fundamental Analyst
 
 ## CI/CD Architecture
 
-### Backend — Railway Native GitHub Integration (authoritative)
+### Backend — Railway Native GitHub Integration
 
-Railway deploys the backend automatically when changes are pushed to `main`. No CLI, no token, no GitHub Actions deploy step.
+Railway deploys automatically on push to `main`. No CLI, no token, no GitHub Actions deploy step.
 
-**How it works:**
-- Railway service is connected to `github.com/bhaveshhpatel/cipher`
-- `railway.toml` at repo root is the single source of truth
-- `rootDirectory = "backend"` → nixpacks builds from `backend/`
-- `watchPatterns = ["backend/**"]` → only redeploys when backend files change
-- `startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"`
-- `healthcheckPath = "/health"` → validated after every deploy
-
-**To verify/enable in Railway dashboard:**
-1. Railway dashboard → your service → Settings → Source
-2. Confirm GitHub repo `bhaveshhpatel/cipher` is connected
-3. Confirm branch is `main`
-4. Confirm root directory is left blank (railway.toml handles it)
-5. Disable any manual deploy triggers to avoid double-deploys
-
-**Root `railway.toml` (single authoritative config):**
+**Root `railway.toml`:**
 ```toml
 [build]
 builder = "nixpacks"
@@ -247,20 +235,37 @@ healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 ```
 
+**`backend/nixpacks.toml` (Python version pin):**
+```toml
+[phases.setup]
+nixPkgs = ["python311", "python311Packages.pip"]
+
+[variables]
+PYTHON_VERSION = "3.11"
+```
+
+**Railway dashboard settings required:**
+- Source: `bhaveshhpatel/cipher`, branch `main`
+- Root Directory: `/backend`
+- Auto Deploy: enabled
+
 **Files removed (were causing conflicts):**
-- `backend/railway.toml` — deleted; caused `backend/backend` path resolution error
-- `backend/Procfile` — deleted; redundant with `startCommand` in railway.toml
+- `backend/railway.toml` — caused `backend/backend` path error
+- `backend/Procfile` — redundant with startCommand
 
 ### Backend — GitHub Actions (`backend.yml`)
-
-CI only — runs syntax check on all `.py` files. Does NOT deploy.
-- Triggers on push/PR to `main` when `backend/**` or `railway.toml` changes
-- No `RAILWAY_TOKEN` secret needed
-- Railway deploy happens independently via native integration
+CI only — syntax check on all `.py` files. No deploy steps. No secrets needed.
 
 ### Frontend — Vercel via GitHub Actions (`frontend.yml`)
-- Vercel CLI deploy triggered by push to `main` when `frontend/**` changes
-- All env vars managed in Vercel dashboard only
+Vercel CLI deploy on push to `main` when `frontend/**` changes. Env vars in Vercel dashboard only.
+
+---
+
+## Python Dependencies
+
+- `requirements.txt` — production deps only (no pytest)
+- `requirements-dev.txt` — dev/test deps: `pytest`, `pytest-asyncio`
+- Key versions: `pandas==2.2.3`, `numpy==2.0.2` (prebuilt wheels for Python 3.11)
 
 ---
 
@@ -280,6 +285,7 @@ CI only — runs syntax check on all `.py` files. Does NOT deploy.
 ```bash
 cd backend
 pip install -r requirements.txt
+pip install -r requirements-dev.txt  # for tests
 cp .env.example .env
 uvicorn main:app --reload --port 8000
 ```
@@ -307,7 +313,8 @@ npm run dev
 
 | Date | Change |
 |------|--------|
-| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` (caused `backend/backend` path error) and `backend/Procfile` (redundant); rewrote `backend.yml` to CI-only (syntax check, no deploy); Railway now deploys via native GitHub integration using root `railway.toml` exclusively |
+| 2026-04-23 | **Fixed Python 3.13 build failure** — added `backend/nixpacks.toml` to force Python 3.11; `pandas==2.2.2` has no py3.13 wheel and fails to compile from source; bumped to `pandas==2.2.3` + `numpy==2.0.2`; moved pytest deps to `requirements-dev.txt` |
+| 2026-04-23 | **Fixed Railway deploy pipeline** — deleted `backend/railway.toml` and `backend/Procfile`; rewrote `backend.yml` to CI-only; Railway deploys via native GitHub integration using root `railway.toml` |
 | 2026-04-23 | **Fixed auth register bug** — Supabase login no longer silently falls through; credential errors return 401 |
 | 2026-04-22 | Fixed frontend CI/CD: Vercel CLI double-nested path bug |
 | 2026-04-22 | Removed secret refs from `frontend/vercel.json` |
