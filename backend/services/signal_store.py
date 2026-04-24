@@ -6,6 +6,11 @@ Phase 5A changes:
     swarm_direction, swarm_confidence, swarm_agents (JSONB),
     swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
 
+Bug fix (2026-04-24):
+  - _build_row() was omitting NOT NULL columns—alert_level, sentiment,
+    premium, trade_type, is_golden_sweep—causing Postgres error 23502.
+    Now derives sensible defaults from the episode/signal data.
+
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
 
@@ -59,8 +64,35 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     plus optional RepetitionEpisode metadata.
 
     Phase 5A: includes swarm verdict fields.
+    Fix: ensures all NOT NULL columns are populated so Postgres 23502 never fires.
     """
     episode = ep or {}
+
+    # ── Derive alert_level from composite_score when not explicit ───────────
+    score = sig.get("composite_score") or 0.0
+    if sig.get("alert_level"):
+        alert_level = sig["alert_level"]
+    elif score >= 0.85:
+        alert_level = "CONVICTION"
+    elif score >= 0.70:
+        alert_level = "STRONG_SIGNAL"
+    elif score >= 0.55:
+        alert_level = "ALERT"
+    else:
+        alert_level = "WATCH"
+
+    # ── Derive sentiment from contract_type / direction ──────────────────────
+    ctype     = episode.get("contract_type") or sig.get("contract_type", "")
+    direction = episode.get("direction", sig.get("direction", ""))
+    if sig.get("sentiment"):
+        sentiment = sig["sentiment"]
+    elif "BUY" in direction.upper() or ctype.upper() == "CALL":
+        sentiment = "BULLISH"
+    elif "SELL" in direction.upper() or ctype.upper() == "PUT":
+        sentiment = "BEARISH"
+    else:
+        sentiment = "NEUTRAL"
+
     return {
         # ── Composite signal fields ─────────────────────────────────────────
         "ticker":                sig.get("ticker"),
@@ -70,9 +102,17 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "backtest_score":        sig.get("backtest_score"),
         "volume_premium_factor": sig.get("volume_premium_factor", 0.5),
         "reasoning":             sig.get("reasoning"),
+        # ── Previously missing NOT NULL columns (fix for error 23502) ───────
+        "alert_level":           alert_level,
+        "sentiment":             sentiment,
+        "premium":               episode.get("total_premium") or sig.get("total_premium") or 0,
+        "trade_type":            episode.get("trade_type") or sig.get("trade_type") or "UNKNOWN",
+        "is_golden_sweep":       bool(
+            episode.get("is_golden_sweep") or sig.get("is_golden_sweep", False)
+        ),
         # ── Episode metadata (denormalized) ────────────────────────────────
-        "contract_type":         episode.get("contract_type"),
-        "direction":             episode.get("direction"),
+        "contract_type":         ctype or None,
+        "direction":             direction or None,
         "influence_tier":        episode.get("influence_tier"),
         "total_premium":         episode.get("total_premium"),
         "trade_count":           episode.get("trade_count"),
