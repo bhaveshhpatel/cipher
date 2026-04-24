@@ -1,8 +1,9 @@
 """
 Parses raw Tradier options flow into a structured OptionsFlowEvent.
 """
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
@@ -46,6 +47,37 @@ class OptionsFlowEvent:
     underlying_price: float = 0.0
 
 
+# OCC symbol pattern: AAPL  240119C00150000
+# Ticker (up to 6 chars, left-padded with spaces), 6-digit date YYMMDD,
+# C or P, 8-digit strike (price * 1000, zero-padded)
+_OCC_RE = re.compile(
+    r"^([A-Z]{1,6})\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$"
+)
+
+
+def _parse_occ_symbol(symbol: str):
+    """
+    Parse OCC option symbol into (strike: float, expiry: str, contract_type: str).
+    Returns (None, None, None) if the symbol does not match OCC format.
+
+    Example: 'AAPL  260117C00180000'
+      → strike=180.0, expiry='2026-01-17', contract_type='CALL'
+    """
+    m = _OCC_RE.match(symbol.strip())
+    if not m:
+        return None, None, None
+    _, yy, mm, dd, cp, strike_raw = m.groups()
+    try:
+        expiry = f"20{yy}-{mm}-{dd}"
+        # Validate it's a real date
+        date.fromisoformat(expiry)
+        strike = int(strike_raw) / 1000.0
+        contract_type = "CALL" if cp == "C" else "PUT"
+        return strike, expiry, contract_type
+    except (ValueError, OverflowError):
+        return None, None, None
+
+
 def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
     """Parse a single Tradier stream trade dict into OptionsFlowEvent."""
     try:
@@ -63,10 +95,25 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
 
         premium   = fill * size * 100
 
-        ctype     = "CALL" if raw.get("option_type","C").upper() in ("C","CALL") else "PUT"
+        # -- Primary: use top-level fields from Tradier payload
+        ctype_raw = raw.get("option_type", "")
         strike    = float(raw.get("strike", 0))
         expiry    = raw.get("expiration_date", "")
-        dte       = int(raw.get("dte", 0))
+
+        # -- Fallback: parse from OCC symbol when fields are absent/zero
+        # Tradier streaming trade events often omit strike/expiration_date
+        # at the top level — they are embedded in the OCC symbol string.
+        if (not ctype_raw or strike == 0 or not expiry) and symbol:
+            occ_strike, occ_expiry, occ_ctype = _parse_occ_symbol(symbol)
+            if strike == 0 and occ_strike is not None:
+                strike = occ_strike
+            if not expiry and occ_expiry is not None:
+                expiry = occ_expiry
+            if not ctype_raw and occ_ctype is not None:
+                ctype_raw = occ_ctype
+
+        ctype  = "CALL" if ctype_raw.upper() in ("C", "CALL") else "PUT"
+        dte    = int(raw.get("dte", 0))
 
         exc_cnt   = int(raw.get("exchange_count", 1))
         fill_cnt  = int(raw.get("fill_count", 1))
