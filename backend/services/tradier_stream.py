@@ -25,13 +25,20 @@ Fix (C-011):
   - persist_flow_event() call confirmed to include all parsed fields from OptionsFlowEvent.
 
 Fix (C-013):
-  - Tradier streaming sends events wrapped in an envelope:
-      {"type":"trade","trade":{"symbol":"AAPL  ...", "price":3.45, ...}}
-    _process_trade() was passing the outer envelope to parse_tradier_trade() which
-    then found no "symbol"/"price"/"size" keys → every tick returned None → complete
-    ingestion freeze even with a healthy stream connection.
-  - Fix: unwrap the inner payload by checking raw["type"] and extracting raw[raw["type"]].
-  - Also logs the first raw line on each new connection for future diagnostics.
+  - Tradier streaming sends events wrapped in an envelope.
+  - Fix: unwrap the inner payload by checking raw["type"].
+  - Also logs the first raw line on each new connection for diagnostics.
+
+Fix (C-015):
+  - CRITICAL: switched stream filter from "trade" to "timesale".
+    filter=trade delivers equity trade events where symbol=underlying ticker,
+    price=stock last price, bid/ask=stock NBBO — completely wrong for options.
+    filter=timesale delivers option contract events where:
+      symbol = full OCC string (e.g. "ACGL  260516P00095000")
+      price  = option fill price
+      bid/ask = real option bid/ask
+    This was the root cause of strike=0, expiry=null, bid=0, ask=0 in DB.
+  - _process_trade now accepts both "timesale" and "trade" envelope types.
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -40,6 +47,8 @@ Tradier streaming notes:
   - Tradier sends bare newlines as keepalives — idle >30s means the connection is dead
   - On market close, Tradier may close the stream normally — reconnect for next open
   - Tradier closes the stream immediately when the market is closed (no queued data)
+  - filter=timesale: symbol field = full OCC option string, price = option fill
+  - filter=trade:    symbol field = underlying ticker, price = stock last — DO NOT USE
 """
 import asyncio
 import json
@@ -74,6 +83,10 @@ _MARKET_CLOSED_SLEEP = 60.0
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
+
+# Event types we process — timesale carries option OCC symbol + real bid/ask/price
+# trade carries equity events with stock price — do NOT process as options flow
+_PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
 # Global stats (read by /health endpoint)
@@ -217,10 +230,12 @@ async def stream_options_flow(symbols: list[str]):
                 pass
             demo_task = None
 
+        # CRITICAL: filter=timesale sends full OCC option symbol + real option
+        # bid/ask/price. filter=trade sends equity events with stock prices — wrong.
         payload = {
             "sessionid": session_token,
             "symbols":   ",".join(symbols),
-            "filter":    "trade",
+            "filter":    "timesale",
             "linebreak": "true",
         }
 
@@ -254,7 +269,7 @@ async def stream_options_flow(symbols: list[str]):
 
                     consecutive_stream_401s = 0
                     _stats["mode"] = "live"
-                    log.info(f"Tradier stream connected — monitoring {len(symbols)} symbols")
+                    log.info(f"Tradier stream connected — monitoring {len(symbols)} symbols (filter=timesale)")
 
                     async for line in _iter_lines_with_watchdog(resp):
                         stripped = line.strip()
@@ -265,10 +280,10 @@ async def stream_options_flow(symbols: list[str]):
                         except json.JSONDecodeError:
                             continue
 
-                        # Log the first non-empty JSON line on each new connection
-                        # so we can see the exact envelope format Tradier is sending.
+                        # Log first raw line each connection so we can verify
+                        # the exact envelope and field names Tradier sends.
                         if not first_line_logged:
-                            log.info(f"[stream] first raw tick sample: {stripped[:300]}")
+                            log.info(f"[stream] first raw tick sample: {stripped[:400]}")
                             first_line_logged = True
 
                         session_ticks += 1
@@ -326,32 +341,36 @@ _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 async def _process_trade(raw: dict):
     """
-    Process a raw Tradier stream event.
+    Process a raw Tradier stream event (filter=timesale).
 
-    Tradier wraps every event in an envelope:
-      {"type": "trade", "trade": { ...actual trade fields... }}
+    Tradier wraps every timesale event in an envelope:
+      {"type": "timesale", "timesale": { ...option fields... }}
 
-    We must unwrap the inner payload before passing to parse_tradier_trade(),
-    which expects the flat dict with keys like symbol, price, size, bid, ask, etc.
+    The inner payload has:
+      symbol = full OCC string e.g. "ACGL  260516P00095000"
+      price  = option fill price
+      bid    = option bid
+      ask    = option ask
+      size   = contract count
+      date   = epoch ms timestamp
 
-    Other event types (e.g. "summary", "quote", "timesale") are filtered by
-    the stream's filter=trade param but may still occasionally appear — they
-    are silently ignored here.
+    We unwrap the envelope and pass the inner dict to parse_tradier_trade().
+    Both "timesale" and "trade" envelope types are handled for compatibility.
     """
     _stats["ticks"] += 1
 
     # Unwrap Tradier event envelope
     event_type = raw.get("type", "")
-    if event_type and event_type in raw:
+
+    if event_type in _PROCESSABLE_TYPES and event_type in raw:
         trade_payload = raw[event_type]
         if not isinstance(trade_payload, dict):
             return
-    else:
-        # Flat dict — pass through directly (future-proofing / alternate formats)
+    elif event_type in _PROCESSABLE_TYPES:
+        # Flat format — pass through directly
         trade_payload = raw
-
-    # Only process trade events
-    if event_type and event_type != "trade":
+    else:
+        # Ignore summary, quote, trade (equity) and any other non-timesale events
         return
 
     ev = parse_tradier_trade(trade_payload)
@@ -370,7 +389,6 @@ async def _process_trade(raw: dict):
         f"| conviction={ev.conviction_score}"
     )
 
-    # Persist raw individual tick — ALL columns populated (C-010 + C-011 + C-012 + C-013 fix)
     await persist_flow_event({
         "ticker":           ev.ticker,
         "contract_type":    ev.contract_type,
@@ -411,15 +429,12 @@ async def _process_trade(raw: dict):
         f"| {ep.summary_str()}"
     )
 
-    # Build composite signal (Phase 3 scoring)
     try:
         composite = build_composite(ep, accumulator)
     except Exception as e:
         log.error(f"[signal] build_composite failed for {ep.ticker}: {e}")
         composite = None
 
-    # Direction derived from episode contract_type.
-    # CALL = REPEAT_BUY, PUT = REPEAT_SELL.
     if ep.contract_type == "CALL":
         direction = "REPEAT_BUY"
     elif ep.contract_type == "PUT":
@@ -446,7 +461,6 @@ async def _process_trade(raw: dict):
     _stats["signals"] += 1
     await bus.publish_all(signal)
 
-    # Phase 4: publish composite_signal for signal_store.py to persist
     if composite is not None:
         composite_msg = {
             "type": "composite_signal",
@@ -482,23 +496,16 @@ async def _demo_mode_once(symbols: list[str]):
     rng     = random.Random(42)
     tickers = symbols or ["AAPL", "TSLA", "NVDA", "SPY", "QQQ", "MSFT", "AMZN", "META"]
     levels  = ["CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"]
-
-    # Use a valid future expiry date
     demo_expiry = "2026-06-20"
 
     log.info("Demo mode active — emitting synthetic signals")
     try:
         while True:
             await asyncio.sleep(rng.uniform(2, 6))
-            ticker = rng.choice(tickers)
-            prem   = rng.randint(100_000, 8_000_000)
-
-            # Contract type and direction are consistent:
-            # CALL → REPEAT_BUY, PUT → REPEAT_SELL
+            ticker    = rng.choice(tickers)
+            prem      = rng.randint(100_000, 8_000_000)
             ctype     = rng.choice(["CALL", "PUT"])
             direction = "REPEAT_BUY" if ctype == "CALL" else "REPEAT_SELL"
-            sentiment = "BULLISH" if ctype == "CALL" else "BEARISH"
-
             strike    = round(rng.uniform(100, 500), 0)
             fill      = round(rng.uniform(1.0, 15.0), 2)
             bid       = round(fill * 0.99, 2)
@@ -527,10 +534,9 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["signals"]    += 1
             await bus.publish_all(signal)
 
-            # Emit composite_signal so signal_store.py populates signal_history
             composite_score = round(rng.uniform(0.40, 0.95), 3)
-            rec = "BUY" if composite_score >= 0.65 and ctype == "CALL" else \
-                  "SELL" if composite_score >= 0.65 and ctype == "PUT" else "HOLD"
+            rec = "BUY"  if composite_score >= 0.65 and ctype == "CALL" else \
+                  "SELL" if composite_score >= 0.65 and ctype == "PUT"  else "HOLD"
 
             composite_msg = {
                 "type": "composite_signal",
