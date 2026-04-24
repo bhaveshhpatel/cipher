@@ -316,9 +316,6 @@ export default function DashboardPage() {
 }
 
 // ── TickerSearchBar ───────────────────────────────────────────────────────────
-// Replaces the old TickerInput that lived in the header.
-// Lives inside each tab's header area so it's contextual.
-
 function TickerSearchBar({
   placeholder = "Ticker…",
   onScan,
