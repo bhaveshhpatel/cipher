@@ -15,8 +15,11 @@ Bug fix (2026-04-24 #2):
   - direction column check constraint only allows BUY | SELL | HOLD.
     REPEAT_BUY → BUY, REPEAT_SELL → SELL. (Postgres error 23514)
   - trade_type check constraint only allows SWEEP | BLOCK | SPLIT | SINGLE.
-    UNKNOWN and any unrecognised value are dropped (set to NULL) since the
-    column is nullable — avoids the constraint while preserving data.
+    Unrecognised values now fall back to 'SINGLE' (NOT NULL column).
+
+Bug fix (2026-04-24 #3):
+  - trade_type is NOT NULL — None caused 23502 again. Falls back to 'SINGLE'.
+  - influence_tier is NOT NULL with no default — falls back to 'RETAIL'.
 
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
@@ -40,8 +43,9 @@ _SUPABASE_KEY: Optional[str] = os.environ.get("SUPABASE_SERVICE_KEY")
 _TABLE = "signal_history"
 
 # Valid values enforced by DB check constraints
-_VALID_DIRECTIONS  = {"BUY", "SELL", "HOLD"}
-_VALID_TRADE_TYPES = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
+_VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
+_VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
+_VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
 
 
 def _headers() -> dict:
@@ -69,17 +73,14 @@ async def _insert_signal(row: dict) -> bool:
         return False
 
 
-def _normalise_direction(raw: str) -> Optional[str]:
+def _normalise_direction(raw: str) -> str:
     """
     Map raw direction values to the DB-allowed set: BUY | SELL | HOLD.
-
-    REPEAT_BUY  → BUY
-    REPEAT_SELL → SELL
-    Anything already valid passes through.
-    Anything unrecognised returns None (nullable column).
+    REPEAT_BUY → BUY, REPEAT_SELL → SELL.
+    Falls back to 'HOLD' for anything unrecognised (column is NOT NULL).
     """
     if not raw:
-        return None
+        return "HOLD"
     upper = raw.upper()
     if upper in _VALID_DIRECTIONS:
         return upper
@@ -87,21 +88,30 @@ def _normalise_direction(raw: str) -> Optional[str]:
         return "BUY"
     if "SELL" in upper:
         return "SELL"
-    if "HOLD" in upper:
-        return "HOLD"
-    return None
+    return "HOLD"
 
 
-def _normalise_trade_type(raw: str) -> Optional[str]:
+def _normalise_trade_type(raw: str) -> str:
     """
     Map raw trade_type to the DB-allowed set: SWEEP | BLOCK | SPLIT | SINGLE.
-    Any unrecognised value (including UNKNOWN) returns None so the nullable
-    column is left empty rather than triggering a check constraint violation.
+    Column is NOT NULL — falls back to 'SINGLE' for UNKNOWN or anything
+    unrecognised so the check constraint is never violated.
     """
     if not raw:
-        return None
+        return "SINGLE"
     upper = raw.upper()
-    return upper if upper in _VALID_TRADE_TYPES else None
+    return upper if upper in _VALID_TRADE_TYPES else "SINGLE"
+
+
+def _normalise_influence_tier(raw: str) -> str:
+    """
+    Map raw influence_tier to the DB-allowed set: WHALE | INSTITUTIONAL | LARGE | RETAIL.
+    Column is NOT NULL — falls back to 'RETAIL'.
+    """
+    if not raw:
+        return "RETAIL"
+    upper = raw.upper()
+    return upper if upper in _VALID_TIERS else "RETAIL"
 
 
 def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
@@ -111,7 +121,8 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
 
     Phase 5A: includes swarm verdict fields.
     Fix #1: ensures all NOT NULL columns are populated (Postgres 23502).
-    Fix #2: maps direction and trade_type to DB check-constraint-safe values (Postgres 23514).
+    Fix #2: maps direction/trade_type to DB check-constraint-safe values (Postgres 23514).
+    Fix #3: trade_type and influence_tier always non-null with valid fallbacks.
     """
     episode = ep or {}
 
@@ -129,8 +140,8 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         alert_level = "WATCH"
 
     # ── Derive sentiment from contract_type / direction ──────────────────────
-    ctype     = episode.get("contract_type") or sig.get("contract_type", "")
-    raw_dir   = episode.get("direction", sig.get("direction", ""))
+    ctype   = episode.get("contract_type") or sig.get("contract_type", "")
+    raw_dir = episode.get("direction", sig.get("direction", ""))
     if sig.get("sentiment"):
         sentiment = sig["sentiment"]
     elif "BUY" in raw_dir.upper() or ctype.upper() == "CALL":
@@ -140,10 +151,13 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     else:
         sentiment = "NEUTRAL"
 
-    # ── Normalise constrained enum columns ───────────────────────────────────
-    direction  = _normalise_direction(raw_dir)
-    trade_type = _normalise_trade_type(
+    # ── Normalise constrained enum columns (all NOT NULL) ────────────────────
+    direction      = _normalise_direction(raw_dir)
+    trade_type     = _normalise_trade_type(
         episode.get("trade_type") or sig.get("trade_type", "")
+    )
+    influence_tier = _normalise_influence_tier(
+        episode.get("influence_tier") or sig.get("influence_tier", "")
     )
 
     return {
@@ -157,16 +171,16 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "reasoning":             sig.get("reasoning"),
         # ── NOT NULL columns ────────────────────────────────────────────────
         "alert_level":           alert_level,
+        "direction":             direction,        # BUY | SELL | HOLD
         "sentiment":             sentiment,
         "premium":               episode.get("total_premium") or sig.get("total_premium") or 0,
-        "trade_type":            trade_type,           # None when unrecognised (nullable)
+        "trade_type":            trade_type,       # SWEEP | BLOCK | SPLIT | SINGLE
+        "influence_tier":        influence_tier,   # WHALE | INSTITUTIONAL | LARGE | RETAIL
         "is_golden_sweep":       bool(
             episode.get("is_golden_sweep") or sig.get("is_golden_sweep", False)
         ),
-        # ── Episode metadata (denormalized) ────────────────────────────────
+        # ── Episode metadata (denormalized, nullable) ───────────────────────
         "contract_type":         ctype or None,
-        "direction":             direction,            # BUY | SELL | HOLD | None
-        "influence_tier":        episode.get("influence_tier"),
         "total_premium":         episode.get("total_premium"),
         "trade_count":           episode.get("trade_count"),
         "is_accelerating":       episode.get("is_accelerating", False),
