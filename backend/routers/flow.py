@@ -4,10 +4,15 @@ flow.py — Live options flow scan endpoint.
 Phase 4: Unmocked. Queries flow_events from Supabase with pagination
 and optional ticker filter. Falls back to empty list if DB is unavailable.
 
+Fix (2026-04-24): switched from anon key to SUPABASE_SERVICE_KEY for reads.
+  The anon key was silently blocked by RLS (returning [] with HTTP 200),
+  making the Flow Scanner tab appear permanently blank on the frontend.
+  The service key bypasses RLS and can always read flow_events.
+
 Endpoints:
   GET /api/flow/scan?ticker=AAPL&limit=50&offset=0
 """
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from core.auth import get_current_user, TokenData
@@ -20,7 +25,12 @@ log = logging.getLogger("routers.flow")
 router = APIRouter(prefix="/api/flow", tags=["flow"])
 
 _SUPABASE_URL = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # anon key — read-only, no RLS issue for SELECT
+# Use service key so RLS does not silently block SELECT on flow_events.
+# The anon key respects RLS — without an explicit SELECT policy the anon
+# key returns [] (HTTP 200) with no error, making the tab look blank.
+# Migration 006 adds the anon SELECT policy, but using the service key
+# here is a belt-and-suspenders fix that works even before the migration runs.
+_SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
 
 
 class FlowEventOut(BaseModel):
@@ -61,10 +71,10 @@ async def _query_flow_events(
     """
     Query flow_events from Supabase REST API.
     Returns (rows, total_count).
-    Uses anon key — SELECT is safe under RLS (public read policy or service role not needed).
+    Uses service key to bypass RLS (anon key silently returns [] if no SELECT policy).
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
-        log.warning("[flow] SUPABASE_URL or SUPABASE_KEY not set — returning empty flow scan")
+        log.warning("[flow] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — returning empty flow scan")
         return [], 0
 
     url = f"{_SUPABASE_URL}/rest/v1/flow_events"
@@ -83,11 +93,18 @@ async def _query_flow_events(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers, params=params)
 
+        log.debug(f"[flow] Supabase response: status={resp.status_code} content-range={resp.headers.get('content-range','—')} body_preview={resp.text[:200]}")
+
         if resp.status_code not in (200, 206):
             log.error(f"[flow] Supabase query failed: {resp.status_code} — {resp.text[:300]}")
             return [], 0
 
         rows = resp.json()
+
+        if not isinstance(rows, list):
+            log.error(f"[flow] Unexpected Supabase response type: {type(rows)} — {str(rows)[:200]}")
+            return [], 0
+
         # Parse Content-Range header for total count: "0-49/1234"
         content_range = resp.headers.get("content-range", "")
         total = 0
@@ -99,6 +116,7 @@ async def _query_flow_events(
         else:
             total = len(rows)
 
+        log.info(f"[flow] queried flow_events: ticker={ticker!r} rows={len(rows)} total={total}")
         return rows, total
 
     except Exception as e:
@@ -142,9 +160,9 @@ async def scan_flow(
             continue
 
     return FlowResponse(
-        ticker = ticker_clean,
-        events = events,
-        total  = total,
-        limit  = limit,
-        offset = offset,
+        ticker=ticker_clean,
+        events=events,
+        total=total,
+        limit=limit,
+        offset=offset,
     )
