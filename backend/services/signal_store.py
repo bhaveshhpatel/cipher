@@ -1,29 +1,17 @@
 """
 signal_store.py — Supabase DB writer for composite signals.
 
+Phase 5A changes:
+  - _build_row() now persists swarm fields:
+    swarm_direction, swarm_confidence, swarm_agents (JSONB),
+    swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
+
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
 
-Usage — call once at startup from main.py lifespan:
-
-    from services.signal_store import start_signal_writer
-    asyncio.create_task(start_signal_writer())
-
-Table written:
-  - signal_history : one row per CompositeSignal emitted by
-                     composite_signal_engine.build_composite()
-
-NOTE: id is BIGSERIAL — never send it. Postgres generates it.
-
 IMPORTANT — Key selection:
-  Uses SUPABASE_SERVICE_ROLE_KEY exclusively. The anon key (SUPABASE_KEY)
-  respects RLS and will cause every insert to fail with 42501.
-  Same rule as flow_store.py — never introduce an anon-key fallback here.
-
-Bus channel: 'signal_writer'
-  The tradier_stream / composite_signal_engine publishes signals on the bus
-  with type='composite_signal' and data=CompositeSignal.__dict__.
-  This module subscribes on the 'signal_writer' channel.
+  Uses SUPABASE_SERVICE_ROLE_KEY exclusively. The anon key respects RLS
+  and will cause every insert to fail with 42501.
 """
 import asyncio
 import logging
@@ -50,7 +38,6 @@ def _headers() -> dict:
 
 
 async def _insert_signal(row: dict) -> bool:
-    """POST a single composite signal row to signal_history."""
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
     url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}"
@@ -59,9 +46,7 @@ async def _insert_signal(row: dict) -> bool:
             resp = await client.post(url, headers=_headers(), json=[row])
         if resp.status_code in (200, 201):
             return True
-        log.error(
-            f"[signal_store] insert failed: {resp.status_code} — {resp.text[:300]}"
-        )
+        log.error(f"[signal_store] insert failed: {resp.status_code} — {resp.text[:300]}")
         return False
     except Exception as e:
         log.error(f"[signal_store] insert exception: {e}")
@@ -73,17 +58,11 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     Build a signal_history DB row from a CompositeSignal dict
     plus optional RepetitionEpisode metadata.
 
-    The bus publishes composite signals as:
-      {
-        "type": "composite_signal",
-        "data": {
-          "signal":  CompositeSignal.__dict__,
-          "episode": RepetitionEpisode summary dict
-        }
-      }
+    Phase 5A: includes swarm verdict fields.
     """
     episode = ep or {}
     return {
+        # ── Composite signal fields ─────────────────────────────────────────
         "ticker":                sig.get("ticker"),
         "recommendation":        sig.get("recommendation"),
         "composite_score":       sig.get("composite_score"),
@@ -91,7 +70,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "backtest_score":        sig.get("backtest_score"),
         "volume_premium_factor": sig.get("volume_premium_factor", 0.5),
         "reasoning":             sig.get("reasoning"),
-        # Episode metadata (denormalized)
+        # ── Episode metadata (denormalized) ────────────────────────────────
         "contract_type":         episode.get("contract_type"),
         "direction":             episode.get("direction"),
         "influence_tier":        episode.get("influence_tier"),
@@ -99,40 +78,34 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "trade_count":           episode.get("trade_count"),
         "is_accelerating":       episode.get("is_accelerating", False),
         "signal_ts":             episode.get("timestamp"),
-        # created_at: let Postgres default (now())
+        # ── Phase 5A: swarm verdict fields ─────────────────────────────────
+        "swarm_direction":       sig.get("swarm_direction"),
+        "swarm_confidence":      sig.get("swarm_confidence"),
+        "swarm_bull_votes":      sig.get("swarm_bull_votes"),
+        "swarm_bear_votes":      sig.get("swarm_bear_votes"),
+        "swarm_hold_votes":      sig.get("swarm_hold_votes"),
+        "swarm_agents":          sig.get("swarm_agents"),  # JSONB — list of agent dicts
     }
 
 
 async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
-    """Insert one CompositeSignal to signal_history immediately."""
     row = _build_row(sig, ep)
-    ok = await _insert_signal(row)
+    ok  = await _insert_signal(row)
     if ok:
+        swarm = sig.get("swarm_direction", "—")
         log.info(
-            f"[signal_store] signal saved: {row['ticker']} "
-            f"{row['recommendation']} score={row['composite_score']}"
+            f"[signal_store] saved: {row['ticker']} "
+            f"{row['recommendation']} score={row['composite_score']} "
+            f"swarm={swarm}"
         )
     else:
-        log.warning(
-            f"[signal_store] failed to save signal for {row.get('ticker')} — data lost"
-        )
+        log.warning(f"[signal_store] failed to save signal for {row.get('ticker')} — data lost")
 
 
 async def _bus_signal_listener() -> None:
-    """
-    Subscribe to the bus on the 'signal_writer' channel.
-    Expects messages with type='composite_signal':
-      {
-        "type": "composite_signal",
-        "data": {
-          "signal":  { ...CompositeSignal fields... },
-          "episode": { ...episode metadata... }
-        }
-      }
-    """
     from core.async_bus import bus
     q = bus.subscribe("signal_writer")
-    log.info("[signal_store] signal writer subscribed to bus — composite signals will be persisted")
+    log.info("[signal_store] signal writer subscribed to bus")
     try:
         while True:
             msg = await q.get()
@@ -149,19 +122,11 @@ async def _bus_signal_listener() -> None:
 
 
 async def start_signal_writer() -> None:
-    """
-    Entry point — start the bus listener for composite signals.
-    Call once from main.py lifespan as an asyncio task:
-
-        signal_write_task = asyncio.create_task(start_signal_writer())
-    """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         log.warning(
             "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — "
-            "composite signals will NOT be persisted to signal_history. "
-            "Ensure SUPABASE_SERVICE_KEY (not the anon key) is set in Railway env vars."
+            "composite signals will NOT be persisted."
         )
         return
-
     log.info("[signal_store] Starting composite signal DB writer")
     await _bus_signal_listener()

@@ -29,18 +29,20 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     ALLOWED_ORIGINS: str = "http://localhost:3000"
 
+    # Phase 5A — AI Swarm configuration
+    # Number of agents to use: snapped to nearest of [3, 6, 9, 12]. Default: 6.
+    # Override via Railway env var SWARM_N_AGENTS.
+    SWARM_N_AGENTS: int = 6
+
     # Universe pipeline settings
     UNIVERSE_PRIORITY_SYMBOLS: str = "SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD"
-    UNIVERSE_BATCH_DELAY_MS: int = 0          # ms delay between validation batches (0 = no throttle)
-    UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True  # flag for symbols with no screening data yet
+    UNIVERSE_BATCH_DELAY_MS: int = 0
+    UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True
 
-    # Step 3: Tradier batch quotes — stream eligibility thresholds
-    # Symbols passing BOTH filters get stream_eligible=true and are fed to StreamPoolManager.
-    # Override in Railway env vars to tune the eligible pool size (~1,000-2,000 target).
-    UNIVERSE_MIN_PRICE: float = 1.0        # exclude sub-penny / illiquid tickers
-    UNIVERSE_MIN_VOLUME: int = 500_000    # min effective volume (max of avg_volume, today_volume) — liquid names only
-    UNIVERSE_QUOTES_BATCH_SIZE: int = 200  # symbols per /v1/markets/quotes request
-    UNIVERSE_QUOTES_CONCURRENCY: int = 28  # parallel quote batch requests
+    UNIVERSE_MIN_PRICE: float = 1.0
+    UNIVERSE_MIN_VOLUME: int = 500_000
+    UNIVERSE_QUOTES_BATCH_SIZE: int = 200
+    UNIVERSE_QUOTES_CONCURRENCY: int = 28
 
     @property
     def origins(self) -> List[str]:
@@ -48,7 +50,6 @@ class Settings(BaseSettings):
 
     @property
     def priority_symbols(self) -> List[str]:
-        """Parsed list of high-priority symbols always included in the stream pool."""
         return [s.strip() for s in self.UNIVERSE_PRIORITY_SYMBOLS.split(",") if s.strip()]
 
 
