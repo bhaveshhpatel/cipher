@@ -44,6 +44,21 @@ class Settings(BaseSettings):
     UNIVERSE_QUOTES_BATCH_SIZE: int = 200
     UNIVERSE_QUOTES_CONCURRENCY: int = 28
 
+    # OCC Symbol Registry settings (Layer 1 of options flow architecture)
+    # Controls how the SymbolRegistry builds and refreshes the OCC contract map.
+    # Override any of these via Railway env vars.
+    #
+    # REGISTRY_MAX_DTE        : only include contracts expiring within N days (default 90)
+    # REGISTRY_ATM_RANGE_PCT  : ±N% of stock price for strike filter (default 0.15 = ±15%)
+    # REGISTRY_REFRESH_MINS   : how often to rebuild the full registry (default 30 min)
+    # REGISTRY_MIN_OI         : minimum open interest to include a contract (default 0 = all)
+    # REGISTRY_EXPIRY_DAY_REFRESH_MINS : faster refresh interval on days with expirations
+    REGISTRY_MAX_DTE: int = 90
+    REGISTRY_ATM_RANGE_PCT: float = 0.15
+    REGISTRY_REFRESH_MINS: int = 30
+    REGISTRY_MIN_OI: int = 0
+    REGISTRY_EXPIRY_DAY_REFRESH_MINS: int = 15
+
     @property
     def origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
