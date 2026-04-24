@@ -87,7 +87,7 @@ function HistoryRow({ item }: { item: SignalHistoryItem }) {
   );
 }
 
-export interface SignalHistoryProps { token: string; }
+export interface SignalHistoryProps { token: string | null; }
 
 export function SignalHistory({ token }: SignalHistoryProps) {
   const { items, total, loading, error, page, pageSize, fetch, setPage } = useSignalHistory(token);
