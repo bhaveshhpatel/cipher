@@ -10,8 +10,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND = (
-  process.env.NEXT_PUBLIC_API_URL ||
-  process.env.BACKEND_URL ||
+  process.env.BACKEND_URL ||           // server-only var — set in Vercel env vars
+  process.env.NEXT_PUBLIC_API_URL ||   // fallback for local dev
   "http://localhost:8000"
 ).replace(/\/+$/, "");
 
