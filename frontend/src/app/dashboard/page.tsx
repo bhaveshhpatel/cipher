@@ -28,8 +28,8 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
 ];
 
 // Auto-refresh intervals (ms)
-const FLOW_REFRESH_MS   = 30_000;
-const STATS_REFRESH_MS  = 15_000;
+const FLOW_REFRESH_MS  = 30_000;
+const STATS_REFRESH_MS = 15_000;
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -42,14 +42,13 @@ export default function DashboardPage() {
   const [flowTicker,      setFlowTicker]      = useState("");
   const [compositeTicker, setCompositeTicker] = useState("");
 
-  const [tab,       setTab]       = useState<Tab>("flow");
-  const [stats,     setStats]     = useState<StreamStats | null>(null);
-  const [composite, setComposite] = useState<CompositeSignal | null>(null);
+  const [tab,              setTab]              = useState<Tab>("flow");
+  const [stats,            setStats]            = useState<StreamStats | null>(null);
+  const [composite,        setComposite]        = useState<CompositeSignal | null>(null);
   const [compositeLoading, setCompositeLoading] = useState(false);
 
   // flow auto-refresh countdown
   const [flowCountdown, setFlowCountdown] = useState(FLOW_REFRESH_MS / 1000);
-  const flowTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Auth guard
   useEffect(() => {
@@ -62,15 +61,18 @@ export default function DashboardPage() {
     setFlowCountdown(FLOW_REFRESH_MS / 1000);
   }, [fetchFlow]);
 
-  // Auto-load all flow on mount
+  // Auto-load all flow on mount — FIX: doFetchFlow added to deps (it is
+  // stable via useCallback so this does NOT cause an infinite loop).
+  // Previously the eslint-disable masked the missing dep which caused
+  // the initial fetch to run with a stale null-token closure and silently
+  // bail out, leaving the Flow Scanner permanently blank.
   useEffect(() => {
     if (token) doFetchFlow("");
-  }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [token, doFetchFlow]);
 
   // Auto-refresh flow every 30s
   useEffect(() => {
     if (!token) return;
-    // countdown tick
     const countIv = setInterval(() => {
       setFlowCountdown(c => {
         if (c <= 1) { doFetchFlow(flowTicker); return FLOW_REFRESH_MS / 1000; }
@@ -97,8 +99,9 @@ export default function DashboardPage() {
   };
 
   const handleSimulate = () => {
-    if (!events.length) return;
-    runSim(flowTicker || "MARKET", events, 6, 3);
+    if (!token || !events.length) return;
+    const ticker = flowTicker || events[0]?.ticker || "UNKNOWN";
+    runSim(ticker, events, 6, 3);
     setTab("simulation");
   };
 
@@ -106,87 +109,81 @@ export default function DashboardPage() {
     if (!token || !t) return;
     setCompositeTicker(t);
     setCompositeLoading(true);
-    try { const d = await api.getComposite(t, token); setComposite(d); }
-    catch {}
-    finally { setCompositeLoading(false); }
+    try {
+      const c = await api.getComposite(t, token);
+      setComposite(c);
+    } catch (e: unknown) {
+      setComposite(null);
+    } finally {
+      setCompositeLoading(false);
+    }
   };
 
   if (!isAuthenticated) return null;
 
   return (
-    <div className="min-h-dvh flex flex-col" style={{ background: "var(--bg)" }}>
+    <div className="min-h-screen flex flex-col" style={{ background: "var(--bg)" }}>
 
-      {/* ── Top Nav ─────────────────────────────────────── */}
+      {/* ── Header ── */}
       <header
-        className="sticky top-0 z-40 flex items-center justify-between px-5 py-3 gap-4"
-        style={{
-          background:     "var(--surface)",
-          borderBottom:   "1px solid var(--border)",
-          backdropFilter: "blur(8px)",
-        }}
+        className="sticky top-0 z-40 flex items-center justify-between px-4 md:px-6 h-14"
+        style={{ background: "var(--surface)", borderBottom: "1px solid var(--border)" }}
       >
-        {/* Left: logo + live status */}
-        <div className="flex items-center gap-4 min-w-0">
-          <CipherLogo size={32} />
-          <div className="hidden sm:flex items-center gap-2">
-            <span
-              className="pulse-dot inline-block w-2 h-2 rounded-full"
-              style={{ background: connected ? "var(--green)" : "var(--faint)" }}
-            />
-            <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>
-              {connected ? "LIVE" : "OFFLINE"}
-            </span>
-            {stats && (
-              <span className="text-xs font-mono tabular" style={{ color: "var(--faint)" }}>
-                · {stats.active_symbols.toLocaleString()} symbols · {stats.signals.toLocaleString()} signals
-              </span>
-            )}
-          </div>
+        <div className="flex items-center gap-3">
+          <CipherLogo size={28} />
+          <span className="font-bold text-base tracking-tight" style={{ color: "var(--text)" }}>
+            CIPHER
+          </span>
         </div>
 
-        {/* Right: user + controls */}
-        <div className="flex items-center gap-2 shrink-0">
-          <span className="hidden md:block text-xs font-mono truncate max-w-[160px]"
-                style={{ color: "var(--muted)" }}>
+        <div className="flex items-center gap-3">
+          {stats && <StreamStatsBar stats={stats} />}
+          <span className="text-xs font-mono hidden sm:block" style={{ color: "var(--faint)" }}>
             {email}
           </span>
           <ThemeToggle />
-          <button onClick={logout} className="btn btn-ghost text-xs px-3 py-1.5">
+          <button
+            onClick={logout}
+            className="text-xs px-3 py-1.5 rounded-md transition-all font-mono"
+            style={{
+              background: "var(--surface-2)",
+              border:     "1px solid var(--border)",
+              color:      "var(--muted)",
+            }}
+          >
             Sign out
           </button>
         </div>
       </header>
 
-      {/* ── Stream stats bar ─────────────────────────────── */}
-      {stats && (
-        <div style={{ borderBottom: "1px solid var(--border)", background: "var(--surface-2)" }}>
-          <StreamStatsBar stats={stats} />
-        </div>
-      )}
-
-      {/* ── Tab bar ──────────────────────────────────────── */}
+      {/* ── Tab Nav ── */}
       <nav
-        className="flex items-center gap-1 px-4 py-2 overflow-x-auto"
-        style={{ borderBottom: "1px solid var(--border)", background: "var(--surface)" }}
+        className="flex items-center gap-1 px-4 md:px-6 overflow-x-auto"
+        style={{
+          background:   "var(--surface)",
+          borderBottom: "1px solid var(--border)",
+          paddingTop:   "0.5rem",
+        }}
       >
-        {TABS.map((t) => (
+        {TABS.map(t => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-all"
+            className="relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium whitespace-nowrap transition-all rounded-t-md"
             style={{
-              background:   tab === t.id ? "rgba(232,160,32,0.1)" : "transparent",
-              color:        tab === t.id ? "var(--amber)"          : "var(--muted)",
-              borderBottom: tab === t.id ? "2px solid var(--amber)": "2px solid transparent",
-              borderRadius: "6px 6px 0 0",
+              color:      tab === t.id ? "var(--amber)" : "var(--muted)",
+              background: tab === t.id ? "var(--surface-2)" : "transparent",
+              borderBottom: tab === t.id
+                ? "2px solid var(--amber)"
+                : "2px solid transparent",
             }}
           >
-            <span className="text-base leading-none">{t.icon}</span>
-            {t.label}
+            <span>{t.icon}</span>
+            <span>{t.label}</span>
             {t.id === "signals" && signals.length > 0 && (
               <span
-                className="inline-flex items-center justify-center w-5 h-5 rounded-full text-2xs font-bold"
-                style={{ background: "var(--amber)", color: "#1a0f00" }}
+                className="ml-1 px-1.5 py-0.5 rounded-full text-xs font-bold font-mono"
+                style={{ background: "var(--amber)", color: "#1a0f00", minWidth: 20, textAlign: "center" }}
               >
                 {signals.length > 99 ? "99+" : signals.length}
               </span>
@@ -195,7 +192,7 @@ export default function DashboardPage() {
         ))}
       </nav>
 
-      {/* ── Main content ─────────────────────────────────── */}
+      {/* ── Main content ── */}
       <main className="flex-1 p-4 md:p-6" style={{ maxWidth: 1400, width: "100%", margin: "0 auto" }}>
 
         {/* ── Flow Scanner ── */}
@@ -333,7 +330,6 @@ function TickerSearchBar({
 }) {
   const [local, setLocal] = useState(activeTicker);
 
-  // keep local in sync if parent clears
   useEffect(() => { setLocal(activeTicker); }, [activeTicker]);
 
   const submit = (e: React.FormEvent) => {
