@@ -15,14 +15,16 @@ import { FlowTable } from "@/components/dashboard/FlowTable";
 import { SignalFeed } from "@/components/dashboard/SignalFeed";
 import { SimulationPanel } from "@/components/dashboard/SimulationPanel";
 import { CompositeCard } from "@/components/dashboard/CompositeCard";
+import { SignalHistory } from "@/components/dashboard/SignalHistory";
 
-type Tab = "flow" | "signals" | "simulation" | "composite";
+type Tab = "flow" | "signals" | "simulation" | "composite" | "history";
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "flow",       label: "Flow Scanner", icon: "⟁" },
-  { id: "signals",    label: "Live Signals", icon: "◉" },
-  { id: "simulation", label: "AI Simulation", icon: "⬡" },
-  { id: "composite",  label: "Composite",    icon: "◈" },
+  { id: "flow",       label: "Flow Scanner",    icon: "⟁"  },
+  { id: "signals",    label: "Live Signals",     icon: "◉"  },
+  { id: "simulation", label: "AI Simulation",    icon: "⬡"  },
+  { id: "composite",  label: "Composite",        icon: "◈"  },
+  { id: "history",    label: "Signal History",   icon: "🕐" },
 ];
 
 const DEFAULT_TICKER = "SPY";
@@ -94,7 +96,6 @@ export default function DashboardPage() {
           backdropFilter:"blur(8px)",
         }}
       >
-        {/* Left: Logo + ticker input */}
         <div className="flex items-center gap-4 min-w-0">
           <CipherLogo size={32} />
           <TickerInput
@@ -105,7 +106,6 @@ export default function DashboardPage() {
           />
         </div>
 
-        {/* Center: Stream health pill */}
         <div className="hidden sm:flex items-center gap-2">
           <span
             className="pulse-dot inline-block w-2 h-2 rounded-full"
@@ -121,7 +121,6 @@ export default function DashboardPage() {
           )}
         </div>
 
-        {/* Right: User + theme */}
         <div className="flex items-center gap-2 shrink-0">
           <span className="hidden md:block text-xs font-mono truncate max-w-[160px]"
                 style={{ color: "var(--muted)" }}>
@@ -256,6 +255,17 @@ export default function DashboardPage() {
             />
           </div>
         )}
+
+        {tab === "history" && token && (
+          <div className="flex flex-col gap-4">
+            <SectionHeader
+              title="Signal History"
+              subtitle="Persisted composite signals · flow × 0.55 + backtest × 0.35 + volume-premium × 0.10"
+            />
+            <SignalHistory token={token} />
+          </div>
+        )}
+
       </main>
     </div>
   );

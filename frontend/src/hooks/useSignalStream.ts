@@ -18,24 +18,18 @@ export interface WsSignal {
  * skip connecting rather than crash the page.
  */
 function getWsUrl(token: string): string | null {
-  // SSR guard — never run on the server
   if (typeof window === "undefined") return null;
-
   try {
     const explicit = process.env.NEXT_PUBLIC_WS_URL;
     if (explicit && explicit.trim() !== "") {
       const base = explicit.replace(/\/+$/, "");
       return `${base}/ws/signals?token=${token}`;
     }
-
-    // Fallback: derive from current page origin
     const proto  = window.location.protocol === "https:" ? "wss" : "ws";
     const host   = window.location.host;
-    // In local dev Next.js is on :3000 but the backend is on :8000
     const wsHost = (host.includes("localhost") || host.includes("127.0.0.1"))
       ? host.replace(/:.*/, ":8000")
       : host;
-
     return `${proto}://${wsHost}/ws/signals?token=${token}`;
   } catch {
     return null;
@@ -74,7 +68,15 @@ export function useSignalStream(token: string | null) {
         ws.onmessage = (e) => {
           try {
             const m = JSON.parse(e.data as string);
-            if (m.type === "ping") return;
+
+            // Phase 4: respond to server keepalive pings
+            if (m.type === "ping") {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "pong" }));
+              }
+              return;
+            }
+
             const payload = m.type === "signal" && m.data ? m.data : m;
             if (payload?.ticker && payload?.alert_level) {
               setSignals(p => [payload, ...p].slice(0, 200));

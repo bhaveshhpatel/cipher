@@ -7,10 +7,9 @@
  * This eliminates:
  *  - Mixed-content errors (HTTPS page fetching HTTP Railway URL)
  *  - CORS preflight failures (same-origin requests have no CORS)
- *  - "Failed to fetch" when NEXT_PUBLIC_API_URL is missing/wrong in Vercel
+ *  - “Failed to fetch” when NEXT_PUBLIC_API_URL is missing/wrong in Vercel
  */
 
-// Default request timeout (ms). Cold Railway starts can take ~10-12s.
 const TIMEOUT_MS = 20_000;
 
 export interface FlowEvent {
@@ -27,20 +26,41 @@ export interface SimulationResult {
 export interface CompositeSignal {
   ticker: string; recommendation: string; composite_score: number;
   flow_score: number; backtest_score: number; reasoning: string;
+  volume_premium_factor?: number;
 }
 export interface StreamStats {
   active_symbols: number; ticks: number; classified: number;
   signals: number; errors: number;
 }
+export interface SignalHistoryItem {
+  id: number;
+  ticker: string;
+  recommendation: string;          // BUY | SELL | HOLD
+  composite_score: number;
+  flow_score: number;
+  backtest_score: number;
+  volume_premium_factor: number;
+  reasoning: string | null;
+  contract_type: string | null;
+  direction: string | null;
+  influence_tier: string | null;
+  total_premium: number | null;
+  trade_count: number | null;
+  is_accelerating: boolean;
+  signal_ts: string | null;
+  created_at: string;
+}
+export interface SignalHistoryResponse {
+  signals: SignalHistoryItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-  // Always use relative /api/... so the Next.js proxy handles routing.
-  // Never call the Railway URL directly from the browser.
   const url = path.startsWith("/") ? path : `/${path}`;
-
   try {
     const res = await fetch(url, { ...opts, signal: controller.signal });
     if (!res.ok) {
@@ -73,10 +93,11 @@ export const api = {
       body: JSON.stringify({ email, password }),
     }),
 
-  getFlow: (ticker: string, token: string) =>
-    req<{ events: FlowEvent[] }>(`/api/flow/scan?ticker=${ticker}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }),
+  getFlow: (ticker: string, token: string, limit = 50, offset = 0) =>
+    req<{ ticker: string | null; events: FlowEvent[]; total: number; limit: number; offset: number }>(
+      `/api/flow/scan?ticker=${ticker}&limit=${limit}&offset=${offset}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    ),
 
   runSimulation: (ticker: string, events: FlowEvent[], nAgents: number, nRuns: number, token: string) =>
     req<SimulationResult>("/api/simulation/run", {
@@ -94,4 +115,27 @@ export const api = {
     req<{ stats: StreamStats }>("/api/stream/stats", {
       headers: { Authorization: `Bearer ${token}` },
     }),
+
+  getSignalHistory: (
+    token: string,
+    params: {
+      ticker?:         string;
+      direction?:      string;   // bullish | bearish | neutral
+      tier?:           string;   // whale | institutional | large | retail
+      min_conviction?: number;
+      limit?:          number;
+      offset?:         number;
+    } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.ticker)                        qs.set("ticker",         params.ticker);
+    if (params.direction)                     qs.set("direction",      params.direction);
+    if (params.tier)                          qs.set("tier",           params.tier);
+    if (params.min_conviction !== undefined)  qs.set("min_conviction", String(params.min_conviction));
+    if (params.limit          !== undefined)  qs.set("limit",          String(params.limit));
+    if (params.offset         !== undefined)  qs.set("offset",         String(params.offset));
+    return req<SignalHistoryResponse>(`/api/signals/history?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  },
 };
