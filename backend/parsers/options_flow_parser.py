@@ -162,7 +162,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         bid  = float(raw.get("bid",  0) or 0)
         ask  = float(raw.get("ask",  0) or 0)
         # Derive fill from mid if price field absent or 0 — do NOT return None
-        fill = float(raw.get("price", (bid + ask) / 2 if (bid + ask) > 0 else 0))
+        fill = float(raw.get("last") or raw.get("price") or ((bid + ask) / 2 if (bid + ask) > 0 else 0))
         size = int(raw.get("size") or 0)
 
         # Only skip genuinely zero-size events
@@ -268,6 +268,23 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             ),
             3,
         )
+
+        # Registry enrichment — override parsed fields with pre-validated metadata
+        try:
+            from services.symbol_registry import get_registry
+            reg = get_registry()
+            if reg:
+                meta = reg.lookup(symbol)
+                if meta:
+                    ev.ticker        = meta.ticker
+                    ev.strike        = meta.strike
+                    ev.expiry        = meta.expiry
+                    ev.contract_type = meta.contract_type
+                    ev.dte           = meta.dte
+                    ev.open_interest = meta.open_interest
+                    ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
+        except Exception:
+            pass  # registry not yet built — fallback to OCC regex parse (already done)
 
         return ev
     except Exception:
