@@ -35,6 +35,14 @@ Fix (C-010):
     exchange_count, fill_count, open_interest, iv, underlying_price.
   - expiry sent as None (not "") when empty so Postgres DATE/TEXT column
     does not receive an empty string that triggers a cast error.
+
+Fix (C-011):
+  - strike=0 sent as 0.0 (not None) — parser now skips zero-strike trades
+    so any trade reaching here has a valid strike.
+  - _bus_signal_listener now handles both 'signal' and 'composite_signal'
+    event types — previously composite_signal events were silently dropped.
+  - persist_flow_event logs a warning when strike or expiry is missing
+    so parsing quality can be monitored in Railway logs.
 """
 import asyncio
 import logging
@@ -112,15 +120,31 @@ async def persist_flow_event(ev_dict: dict):
 
     ev_dict is built from a full OptionsFlowEvent in tradier_stream._process_trade().
     All columns of the flow_events table are populated here.
+
     expiry is coerced to None when empty string so Postgres does not
     receive '' for a TEXT/DATE column.
+
+    strike is sent as-is (0.0 is a valid float for Postgres NUMERIC) — the
+    parser now skips trades where strike could not be parsed so 0.0 here
+    means a genuinely zero-strike edge case, not a parsing failure.
     """
-    expiry = ev_dict.get("expiry") or None  # "" → None, avoids DB cast error
+    expiry = ev_dict.get("expiry") or None   # "" → None, avoids DB cast error
+    strike = ev_dict.get("strike")           # Keep 0.0 as-is (valid numeric)
+    if strike is None:
+        strike = None
+    # else send as float — do NOT coerce 0.0 to None (that hides data)
+
+    # Log a warning if key fields are missing — helps monitor parsing quality
+    ticker = ev_dict.get("ticker", "UNKNOWN")
+    if not expiry:
+        log.warning(f"[flow_store] {ticker}: expiry is empty — OCC parse may have failed")
+    if strike == 0.0:
+        log.warning(f"[flow_store] {ticker}: strike=0.0 — verify OCC parse for this symbol")
 
     row = {
-        "ticker":            ev_dict.get("ticker"),
+        "ticker":            ticker,
         "contract_type":     ev_dict.get("contract_type"),
-        "strike":            ev_dict.get("strike") or None,
+        "strike":            strike,
         "expiry":            expiry,
         "dte":               ev_dict.get("dte", 0),
         "fill_price":        ev_dict.get("fill_price", 0.0),
@@ -162,7 +186,7 @@ async def persist_flow_episode(signal_data: dict):
         "ticker":          signal_data.get("ticker"),
         "direction":       signal_data.get("direction"),
         "contract_type":   signal_data.get("contract_type"),
-        "strike":          signal_data.get("strike") or None,
+        "strike":          signal_data.get("strike"),
         "expiry":          expiry,
         "total_premium":   signal_data.get("total_premium"),
         "trade_count":     signal_data.get("trade_count"),
@@ -183,16 +207,40 @@ async def persist_flow_episode(signal_data: dict):
 async def _bus_signal_listener():
     """
     Subscribe to the async bus on the 'db_writer' channel.
-    On every signal published by tradier_stream, persist the flow episode.
+    Handles both 'signal' (flow episode) and 'composite_signal' events.
+
+    Previously only 'signal' type was handled — composite_signal events
+    were silently dropped and never persisted to flow_episodes.
     """
     from core.async_bus import bus
     q = bus.subscribe("db_writer")
     log.info("[flow_store] DB writer subscribed to bus — flow_episodes will be persisted")
     try:
         while True:
-            signal = await q.get()
-            if isinstance(signal, dict) and signal.get("type") == "signal":
-                await persist_flow_episode(signal.get("data", {}))
+            msg = await q.get()
+            if not isinstance(msg, dict):
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "signal":
+                await persist_flow_episode(msg.get("data", {}))
+            elif msg_type == "composite_signal":
+                # composite_signal carries nested dicts — flatten for episode persist
+                data = msg.get("data", {})
+                sig  = data.get("signal", {})
+                ep   = data.get("episode", {})
+                await persist_flow_episode({
+                    "ticker":          sig.get("ticker"),
+                    "direction":       ep.get("direction"),
+                    "contract_type":   ep.get("contract_type"),
+                    "strike":          None,   # not in composite_signal payload
+                    "expiry":          None,   # not in composite_signal payload
+                    "total_premium":   ep.get("total_premium"),
+                    "trade_count":     ep.get("trade_count"),
+                    "alert_level":     sig.get("recommendation"),
+                    "is_accelerating": ep.get("is_accelerating", False),
+                    "seed_episode":    sig.get("reasoning"),
+                    "timestamp":       ep.get("timestamp"),
+                })
     except asyncio.CancelledError:
         bus.unsubscribe("db_writer", q)
         log.info("[flow_store] DB writer unsubscribed from bus")
