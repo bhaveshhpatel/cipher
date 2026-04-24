@@ -301,17 +301,6 @@ async def _guarded_lines(resp: httpx.Response):
 _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# Trade processor
-#
-# Phase 4 addition:
-#   After build_composite() is called on a qualifying episode, publish
-#   a 'composite_signal' bus message so signal_store.py can persist it
-#   to the signal_history table.
-#
-# FIX 1: persist_flow_event() is called for every classified tick.
-# FIX 2: per-tick log downgraded to DEBUG to avoid Railway rate-limit drops.
-# ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     _stats["ticks"] += 1
     ev = parse_tradier_trade(raw)
@@ -322,24 +311,37 @@ async def _process_trade(raw: dict):
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
-        f"${ev.strike:.0f} {ev.expiry} "
+        f"${ev.strike:.2f} {ev.expiry} "
+        f"| fill={ev.fill_price} bid={ev.bid} ask={ev.ask} size={ev.size} "
         f"| prem=${ev.premium:,.0f} "
-        f"| type={ev.trade_type or 'UNKNOWN'} "
-        f"| sentiment={ev.sentiment or 'UNKNOWN'} "
-        f"| tier={ev.influence_tier or 'UNKNOWN'}"
+        f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
+        f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier}"
     )
 
+    # Persist raw individual tick — ALL columns now populated (C-010 fix)
     await persist_flow_event({
         "ticker":           ev.ticker,
         "contract_type":    ev.contract_type,
         "strike":           ev.strike,
         "expiry":           ev.expiry,
+        "dte":              ev.dte,
+        "fill_price":       ev.fill_price,
+        "bid":              ev.bid,
+        "ask":              ev.ask,
+        "size":             ev.size,
         "premium":          ev.premium,
         "trade_type":       ev.trade_type,
+        "bid_ask_class":    ev.bid_ask_class,
+        "is_aggressive":    ev.is_aggressive,
+        "is_golden_sweep":  ev.is_golden_sweep,
         "sentiment":        ev.sentiment,
         "influence_tier":   ev.influence_tier,
         "conviction_score": ev.conviction_score,
-        "is_golden_sweep":  ev.is_golden_sweep,
+        "exchange_count":   ev.exchange_count,
+        "fill_count":       ev.fill_count,
+        "open_interest":    ev.open_interest,
+        "iv":               ev.iv,
+        "underlying_price": ev.underlying_price,
     })
 
     ep = accumulator.ingest(ev)
@@ -364,7 +366,16 @@ async def _process_trade(raw: dict):
         log.error(f"[signal] build_composite failed for {ep.ticker}: {e}")
         composite = None
 
-    direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+    # Direction derived from episode contract_type + last-event sentiment.
+    # Previously used ev.sentiment only — which was always NEUTRAL when
+    # strike=0 caused bid/ask classifier to return MID (non-aggressive).
+    # Now: episode contract_type is the primary signal; sentiment is tiebreak.
+    if ep.contract_type == "CALL":
+        direction = "REPEAT_BUY"
+    elif ep.contract_type == "PUT":
+        direction = "REPEAT_SELL"
+    else:
+        direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
 
     signal = {
         "type": "signal",
