@@ -461,32 +461,26 @@ async def _demo_mode_once(symbols: list[str]):
             is_accel        = rng.random() < 0.2
             rec = "BUY" if composite_score >= 0.65 and direction == "REPEAT_BUY" else \
                   "SELL" if composite_score >= 0.65 else "HOLD"
+            # After await bus.publish_all(signal) in demo loop, add:
             composite_msg = {
                 "type": "composite_signal",
                 "data": {
                     "signal": {
                         "ticker":                ticker,
-                        "recommendation":        rec,
-                        "composite_score":       composite_score,
-                        "flow_score":            flow_score,
-                        "backtest_score":        backtest_score,
-                        "volume_premium_factor": vwp_factor,
-                        "reasoning": (
-                            f"{trade_count} {ctype} trades on {ticker} "
-                            f"(${prem:,} total premium). "
-                            f"Flow score {flow_score:.0%}, backtest win-rate {backtest_score:.0%}, "
-                            f"volume-premium factor {vwp_factor:.0%}. "
-                            f"{'Accelerating flow detected. ' if is_accel else ''}"
-                            f"Composite: {composite_score:.0%} \u2192 {rec}. [DEMO]"
-                        ),
+                        "recommendation":        rng.choice(["BUY", "SELL", "HOLD"]),
+                        "composite_score":       round(rng.uniform(0.4, 0.95), 3),
+                        "flow_score":            round(rng.uniform(0.4, 0.9), 3),
+                        "backtest_score":        round(rng.uniform(0.4, 0.85), 3),
+                        "volume_premium_factor": round(rng.uniform(0.3, 0.8), 3),
+                        "reasoning":             f"Demo synthetic signal for {ticker}",
                     },
                     "episode": {
-                        "contract_type":   ctype,
-                        "direction":       direction,
-                        "influence_tier":  rng.choice(["INSTITUTIONAL", "RETAIL", "WHALE"]),
+                        "contract_type":   rng.choice(["CALL", "PUT"]),
+                        "direction":       rng.choice(["REPEAT_BUY", "REPEAT_SELL"]),
+                        "influence_tier":  rng.choice(["INSTITUTIONAL", "RETAIL"]),
                         "total_premium":   prem,
-                        "trade_count":     trade_count,
-                        "is_accelerating": is_accel,
+                        "trade_count":     rng.randint(3, 25),
+                        "is_accelerating": rng.random() < 0.2,
                         "timestamp":       datetime.datetime.utcnow().isoformat(),
                     },
                 },
