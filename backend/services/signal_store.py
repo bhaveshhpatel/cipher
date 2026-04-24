@@ -6,10 +6,17 @@ Phase 5A changes:
     swarm_direction, swarm_confidence, swarm_agents (JSONB),
     swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
 
-Bug fix (2026-04-24):
+Bug fix (2026-04-24 #1):
   - _build_row() was omitting NOT NULL columns—alert_level, sentiment,
     premium, trade_type, is_golden_sweep—causing Postgres error 23502.
     Now derives sensible defaults from the episode/signal data.
+
+Bug fix (2026-04-24 #2):
+  - direction column check constraint only allows BUY | SELL | HOLD.
+    REPEAT_BUY → BUY, REPEAT_SELL → SELL. (Postgres error 23514)
+  - trade_type check constraint only allows SWEEP | BLOCK | SPLIT | SINGLE.
+    UNKNOWN and any unrecognised value are dropped (set to NULL) since the
+    column is nullable — avoids the constraint while preserving data.
 
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
@@ -31,6 +38,10 @@ _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
 _SUPABASE_KEY: Optional[str] = os.environ.get("SUPABASE_SERVICE_KEY")
 
 _TABLE = "signal_history"
+
+# Valid values enforced by DB check constraints
+_VALID_DIRECTIONS  = {"BUY", "SELL", "HOLD"}
+_VALID_TRADE_TYPES = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 
 
 def _headers() -> dict:
@@ -58,13 +69,49 @@ async def _insert_signal(row: dict) -> bool:
         return False
 
 
+def _normalise_direction(raw: str) -> Optional[str]:
+    """
+    Map raw direction values to the DB-allowed set: BUY | SELL | HOLD.
+
+    REPEAT_BUY  → BUY
+    REPEAT_SELL → SELL
+    Anything already valid passes through.
+    Anything unrecognised returns None (nullable column).
+    """
+    if not raw:
+        return None
+    upper = raw.upper()
+    if upper in _VALID_DIRECTIONS:
+        return upper
+    if "BUY" in upper:
+        return "BUY"
+    if "SELL" in upper:
+        return "SELL"
+    if "HOLD" in upper:
+        return "HOLD"
+    return None
+
+
+def _normalise_trade_type(raw: str) -> Optional[str]:
+    """
+    Map raw trade_type to the DB-allowed set: SWEEP | BLOCK | SPLIT | SINGLE.
+    Any unrecognised value (including UNKNOWN) returns None so the nullable
+    column is left empty rather than triggering a check constraint violation.
+    """
+    if not raw:
+        return None
+    upper = raw.upper()
+    return upper if upper in _VALID_TRADE_TYPES else None
+
+
 def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     """
     Build a signal_history DB row from a CompositeSignal dict
     plus optional RepetitionEpisode metadata.
 
     Phase 5A: includes swarm verdict fields.
-    Fix: ensures all NOT NULL columns are populated so Postgres 23502 never fires.
+    Fix #1: ensures all NOT NULL columns are populated (Postgres 23502).
+    Fix #2: maps direction and trade_type to DB check-constraint-safe values (Postgres 23514).
     """
     episode = ep or {}
 
@@ -83,15 +130,21 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
 
     # ── Derive sentiment from contract_type / direction ──────────────────────
     ctype     = episode.get("contract_type") or sig.get("contract_type", "")
-    direction = episode.get("direction", sig.get("direction", ""))
+    raw_dir   = episode.get("direction", sig.get("direction", ""))
     if sig.get("sentiment"):
         sentiment = sig["sentiment"]
-    elif "BUY" in direction.upper() or ctype.upper() == "CALL":
+    elif "BUY" in raw_dir.upper() or ctype.upper() == "CALL":
         sentiment = "BULLISH"
-    elif "SELL" in direction.upper() or ctype.upper() == "PUT":
+    elif "SELL" in raw_dir.upper() or ctype.upper() == "PUT":
         sentiment = "BEARISH"
     else:
         sentiment = "NEUTRAL"
+
+    # ── Normalise constrained enum columns ───────────────────────────────────
+    direction  = _normalise_direction(raw_dir)
+    trade_type = _normalise_trade_type(
+        episode.get("trade_type") or sig.get("trade_type", "")
+    )
 
     return {
         # ── Composite signal fields ─────────────────────────────────────────
@@ -102,17 +155,17 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "backtest_score":        sig.get("backtest_score"),
         "volume_premium_factor": sig.get("volume_premium_factor", 0.5),
         "reasoning":             sig.get("reasoning"),
-        # ── Previously missing NOT NULL columns (fix for error 23502) ───────
+        # ── NOT NULL columns ────────────────────────────────────────────────
         "alert_level":           alert_level,
         "sentiment":             sentiment,
         "premium":               episode.get("total_premium") or sig.get("total_premium") or 0,
-        "trade_type":            episode.get("trade_type") or sig.get("trade_type") or "UNKNOWN",
+        "trade_type":            trade_type,           # None when unrecognised (nullable)
         "is_golden_sweep":       bool(
             episode.get("is_golden_sweep") or sig.get("is_golden_sweep", False)
         ),
         # ── Episode metadata (denormalized) ────────────────────────────────
         "contract_type":         ctype or None,
-        "direction":             direction or None,
+        "direction":             direction,            # BUY | SELL | HOLD | None
         "influence_tier":        episode.get("influence_tier"),
         "total_premium":         episode.get("total_premium"),
         "trade_count":           episode.get("trade_count"),
