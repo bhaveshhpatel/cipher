@@ -9,10 +9,10 @@ const nextConfig = {
    *
    * DEV  → /api/:path*  proxied directly to localhost:8000 by Next.js dev server
    * PROD → /api/:path*  rewritten to /api/proxy/:path* so the App Router
-   *         proxy route at /api/proxy/[...path]/route.ts forwards to Railway.
+   *         proxy route at /api/proxy/[...path] forwards to Railway.
    *
-   * This keeps api.ts using clean /api/auth/register style URLs everywhere
-   * while correctly routing through the proxy on Vercel.
+   * The source regex explicitly excludes /api/proxy/* to prevent an infinite
+   * rewrite loop where /api/proxy/foo re-matches /api/:path* and loops forever.
    */
   async rewrites() {
     if (process.env.NODE_ENV === "development") {
@@ -23,10 +23,10 @@ const nextConfig = {
     }
 
     // Production: rewrite /api/:path* → /api/proxy/:path*
-    // Excludes /api/proxy itself to avoid infinite loop
+    // Excludes /api/proxy/* to avoid infinite rewrite loop
     return [
       {
-        source: "/api/:path*",
+        source: "/api/:path((?!proxy/).*)",
         destination: "/api/proxy/:path*",
       },
     ];
