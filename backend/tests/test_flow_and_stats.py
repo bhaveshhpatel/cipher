@@ -128,6 +128,54 @@ class TestFlowScan:
         r = client.get("/api/flow/scan", headers={"Authorization": "Bearer fakefakefake"})
         assert r.status_code == 401
 
+    @patch("routers.flow._query_flow_events", new_callable=AsyncMock)
+    def test_empty_string_ticker_treated_as_all(self, mock_query):
+        """
+        Regression: frontend sends no ticker param on initial load (all-tickers).
+        Previously the useEffect stale-closure bug meant this call never fired.
+        Now that it fires, ensure the backend returns all events (no filter).
+        Passing ticker="" in the URL should behave identically to omitting ticker.
+        """
+        mock_query.return_value = (MOCK_ROWS, 2)
+        # Simulate what the frontend does: omits ticker param entirely
+        r = client.get("/api/flow/scan?limit=100&offset=0", headers=self._headers())
+        assert r.status_code == 200
+        body = r.json()
+        # No filter applied — ticker field in response should be null
+        assert body["ticker"] is None
+        assert len(body["events"]) == 2
+        # Both AAPL and TSLA returned
+        tickers = {e["ticker"] for e in body["events"]}
+        assert "AAPL" in tickers
+        assert "TSLA" in tickers
+        # Backend called with ticker=None (no WHERE clause)
+        mock_query.assert_called_once_with(None, 100, 0)
+    
+    @patch("routers.flow._query_flow_events", new_callable=AsyncMock)
+    def test_scan_then_filter_flow(self, mock_query):
+        """
+        Regression: after initial all-tickers load, user types AAPL and clicks Scan.
+        Backend should be called with ticker='AAPL' and return only AAPL rows.
+        Validates the full user journey: load all → filter by ticker.
+        """
+        # Step 1: initial all-tickers load
+        mock_query.return_value = (MOCK_ROWS, 2)
+        r1 = client.get("/api/flow/scan", headers=self._headers())
+        assert r1.status_code == 200
+        assert r1.json()["ticker"] is None
+        assert len(r1.json()["events"]) == 2
+    
+        # Step 2: user scans AAPL
+        mock_query.reset_mock()
+        mock_query.return_value = ([MOCK_ROWS[0]], 1)
+        r2 = client.get("/api/flow/scan?ticker=AAPL", headers=self._headers())
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["ticker"] == "AAPL"
+        assert len(body2["events"]) == 1
+        assert body2["events"][0]["ticker"] == "AAPL"
+        mock_query.assert_called_once_with("AAPL", 50, 0)
+
 
 # ── stream/stats tests ────────────────────────────────────────────────────────
 
