@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cipher — Full Roadmap Phase 1–8</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root, [data-theme="light"] {
+  --color-bg: #f7f6f2;
+  --color-surface: #f9f8f5;
+  --color-surface-2: #fbfbf9;
+  --color-surface-offset: #f3f0ec;
+  --color-divider: #dcd9d5;
+  --color-border: #d4d1ca;
+  --color-text: #28251d;
+  --color-text-muted: #7a7974;
+  --color-text-faint: #bab9b4;
+  --color-primary: #01696f;
+  --color-primary-hover: #0c4e54;
+  --color-primary-highlight: #cedcd8;
+  --color-success: #437a22;
+  --color-success-highlight: #d4dfcc;
+  --color-gold: #d19900;
+  --color-gold-highlight: #e9e0c6;
+  --color-blue: #006494;
+  --color-blue-highlight: #c6d8e4;
+  --color-purple: #7a39bb;
+  --color-purple-highlight: #dacfde;
+  --color-orange: #da7101;
+  --color-orange-highlight: #e7d7c4;
+  --color-error: #a12c7b;
+  --color-error-highlight: #e0ced7;
+  --shadow-sm: 0 1px 2px oklch(0.2 0.01 80 / 0.06);
+  --shadow-md: 0 4px 12px oklch(0.2 0.01 80 / 0.08);
+  --shadow-lg: 0 12px 32px oklch(0.2 0.01 80 / 0.12);
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --text-xs: clamp(0.75rem, 0.7rem + 0.25vw, 0.875rem);
+  --text-sm: clamp(0.875rem, 0.8rem + 0.35vw, 1rem);
+  --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
+  --text-lg: clamp(1.125rem, 1rem + 0.75vw, 1.5rem);
+  --text-xl: clamp(1.5rem, 1.2rem + 1.25vw, 2.25rem);
+  --text-2xl: clamp(2rem, 1.2rem + 2.5vw, 3.5rem);
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-theme="dark"] {
+  --color-bg: #0e0d0c;
+  --color-surface: #131211;
+  --color-surface-2: #181715;
+  --color-surface-offset: #1d1c1a;
+  --color-divider: #262523;
+  --color-border: #2e2d2b;
+  --color-text: #cdccca;
+  --color-text-muted: #797876;
+  --color-text-faint: #5a5957;
+  --color-primary: #4f98a3;
+  --color-primary-hover: #227f8b;
+  --color-primary-highlight: #1a3335;
+  --color-success: #6daa45;
+  --color-success-highlight: #1e3318;
+  --color-gold: #e8af34;
+  --color-gold-highlight: #2e2510;
+  --color-blue: #5591c7;
+  --color-blue-highlight: #192435;
+  --color-purple: #a86fdf;
+  --color-purple-highlight: #231a35;
+  --color-orange: #fdab43;
+  --color-orange-highlight: #2a1c0a;
+  --color-error: #d163a7;
+  --color-error-highlight: #2d1222;
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.3);
+  --shadow-md: 0 4px 12px oklch(0 0 0 / 0.4);
+  --shadow-lg: 0 12px 32px oklch(0 0 0 / 0.5);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--color-text);
+  background: var(--color-bg);
+  min-height: 100dvh;
+  line-height: 1.6;
+}
+button { cursor: pointer; background: none; border: none; font: inherit; color: inherit; }
+a { color: inherit; text-decoration: none; }
+
+/* Layout */
+.app { display: flex; min-height: 100dvh; }
+.sidebar {
+  width: 260px;
+  flex-shrink: 0;
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+  padding: 1.5rem 1rem;
+  position: sticky;
+  top: 0;
+  height: 100dvh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+.main { flex: 1; overflow: hidden; }
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: color-mix(in oklch, var(--color-bg) 85%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.75rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.content { padding: 2.5rem 2rem 4rem; max-width: 900px; }
+
+/* Logo */
+.logo-wrap { display: flex; align-items: center; gap: 0.625rem; padding: 0.25rem 0; }
+.logo-mark {
+  width: 32px; height: 32px; flex-shrink: 0;
+}
+.logo-text { font-size: var(--text-sm); font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--color-text); }
+
+/* Sidebar nav */
+.nav-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-faint);
+  padding: 0 0.5rem;
+}
+.nav-list { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.nav-item a {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.5rem 0.625rem;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  transition: background var(--transition), color var(--transition);
+}
+.nav-item a:hover { background: var(--color-surface-offset); color: var(--color-text); }
+.nav-item a.active { background: var(--color-primary-highlight); color: var(--color-primary); font-weight: 600; }
+.nav-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.dot-done { background: var(--color-success); }
+.dot-active { background: var(--color-gold); }
+.dot-todo { background: var(--color-border); }
+
+/* Theme toggle */
+.theme-btn {
+  width: 32px; height: 32px;
+  border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-text-muted);
+  transition: background var(--transition), color var(--transition);
+}
+.theme-btn:hover { background: var(--color-surface-offset); color: var(--color-text); }
+
+/* Page header */
+.page-header { margin-bottom: 2.5rem; }
+.page-eyebrow {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-primary);
+  margin-bottom: 0.5rem;
+}
+.page-title {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  color: var(--color-text);
+  line-height: 1.15;
+  margin-bottom: 0.625rem;
+}
+.page-desc { font-size: var(--text-sm); color: var(--color-text-muted); max-width: 60ch; }
+
+/* Progress bar */
+.progress-bar-wrap {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 2.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+.progress-stats { display: flex; gap: 1.5rem; flex-shrink: 0; }
+.stat { text-align: center; }
+.stat-num { font-size: var(--text-lg); font-weight: 700; font-family: var(--font-mono); }
+.stat-label { font-size: var(--text-xs); color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.stat-num.done { color: var(--color-success); }
+.stat-num.active { color: var(--color-gold); }
+.stat-num.todo { color: var(--color-text-faint); }
+.progress-track-wrap { flex: 1; }
+.progress-label { font-size: var(--text-xs); color: var(--color-text-muted); margin-bottom: 0.5rem; display: flex; justify-content: space-between; }
+.progress-track {
+  height: 6px;
+  background: var(--color-surface-offset);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  position: relative;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--color-success), var(--color-primary));
+  border-radius: var(--radius-full);
+  width: 37.5%;
+  transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Phase card */
+.phase-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  margin-bottom: 1.25rem;
+  overflow: hidden;
+  transition: box-shadow var(--transition);
+}
+.phase-card:hover { box-shadow: var(--shadow-md); }
+.phase-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+  cursor: pointer;
+  user-select: none;
+}
+.phase-num {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--color-text-faint);
+  background: var(--color-surface-offset);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.125rem 0.5rem;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.phase-title-wrap { flex: 1; }
+.phase-title {
+  font-size: var(--text-base);
+  font-weight: 700;
+  color: var(--color-text);
+  margin-bottom: 0.25rem;
+}
+.phase-subtitle { font-size: var(--text-xs); color: var(--color-text-muted); }
+.phase-badge {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  padding: 0.25rem 0.625rem;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.badge-done { background: var(--color-success-highlight); color: var(--color-success); }
+.badge-active { background: var(--color-gold-highlight); color: var(--color-gold); }
+.badge-next { background: var(--color-blue-highlight); color: var(--color-blue); }
+.badge-todo { background: var(--color-surface-offset); color: var(--color-text-muted); }
+
+.chevron {
+  width: 16px; height: 16px;
+  flex-shrink: 0;
+  color: var(--color-text-faint);
+  transition: transform var(--transition);
+  margin-top: 4px;
+}
+.phase-card.open .chevron { transform: rotate(90deg); }
+
+/* Phase body */
+.phase-body {
+  display: none;
+  padding: 0 1.5rem 1.5rem;
+  border-top: 1px solid var(--color-divider);
+}
+.phase-card.open .phase-body { display: block; }
+.phase-body-inner { padding-top: 1.25rem; }
+
+/* Deliverables grid */
+.section-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-faint);
+  margin-bottom: 0.75rem;
+  margin-top: 1.25rem;
+}
+.section-label:first-child { margin-top: 0; }
+
+.deliverables { display: flex; flex-direction: column; gap: 6px; }
+.deliv-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.625rem 0.75rem;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+.deliv-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+.deliv-text { flex: 1; }
+.deliv-file {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-faint);
+  background: var(--color-surface-offset);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.125rem 0.375rem;
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Goal row */
+.goal-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  padding: 0.25rem 0.625rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-offset);
+  color: var(--color-text-muted);
+  margin: 0.25rem 0.25rem 0.25rem 0;
+}
+.goal-chips { display: flex; flex-wrap: wrap; margin-bottom: 0.5rem; }
+
+/* Timeline connector */
+.timeline { position: relative; }
+.timeline::before {
+  content: "";
+  position: absolute;
+  left: 15px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-border);
+}
+
+/* Mobile */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .content { padding: 1.5rem 1rem 3rem; }
+  .progress-bar-wrap { flex-direction: column; gap: 1rem; }
+  .progress-stats { justify-content: space-around; width: 100%; }
+  .progress-track-wrap { width: 100%; }
+  .deliv-file { display: none; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="logo-wrap">
+      <svg class="logo-mark" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Cipher logo">
+        <rect width="32" height="32" rx="8" fill="var(--color-primary)" opacity="0.15"/>
+        <path d="M16 6 L26 11 L26 21 L16 26 L6 21 L6 11 Z" stroke="var(--color-primary)" stroke-width="1.5" fill="none"/>
+        <path d="M16 11 L21 13.5 L21 18.5 L16 21 L11 18.5 L11 13.5 Z" stroke="var(--color-primary)" stroke-width="1.5" fill="none" opacity="0.6"/>
+        <circle cx="16" cy="16" r="2" fill="var(--color-primary)"/>
+      </svg>
+      <span class="logo-text">Cipher</span>
+    </div>
+
+    <div>
+      <div class="nav-label" style="margin-bottom:0.5rem;">Phases</div>
+      <ul class="nav-list" id="sidebarNav">
+        <li class="nav-item"><a href="#p1" class="active"><span class="nav-dot dot-done"></span>Phase 1 — Design System</a></li>
+        <li class="nav-item"><a href="#p2"><span class="nav-dot dot-done"></span>Phase 2 — Auth & SmartSignals</a></li>
+        <li class="nav-item"><a href="#p3"><span class="nav-dot dot-done"></span>Phase 3 — Backend Hardening</a></li>
+        <li class="nav-item"><a href="#p4"><span class="nav-dot dot-active"></span>Phase 4 — Data Persistence</a></li>
+        <li class="nav-item"><a href="#p5"><span class="nav-dot dot-todo"></span>Phase 5 — AI Intelligence</a></li>
+        <li class="nav-item"><a href="#p6"><span class="nav-dot dot-todo"></span>Phase 6 — Portfolio & Alerts</a></li>
+        <li class="nav-item"><a href="#p7"><span class="nav-dot dot-todo"></span>Phase 7 — Monetisation</a></li>
+        <li class="nav-item"><a href="#p8"><span class="nav-dot dot-todo"></span>Phase 8 — Scale & Ops</a></li>
+      </ul>
+    </div>
+
+    <div style="margin-top:auto;">
+      <div style="font-size:var(--text-xs);color:var(--color-text-faint);padding:0 0.5rem;">
+        Last updated<br>
+        <span style="color:var(--color-text-muted);font-family:var(--font-mono);">2026-04-23</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <span style="font-size:var(--text-sm);color:var(--color-text-muted);">Product Roadmap <span style="color:var(--color-text-faint);">·</span> Phase 1–8</span>
+      <div style="display:flex;align-items:center;gap:0.5rem;">
+        <span style="font-size:var(--text-xs);background:var(--color-success-highlight);color:var(--color-success);padding:0.2rem 0.6rem;border-radius:9999px;font-weight:600;">3 of 8 done</span>
+        <button class="theme-btn" data-theme-toggle aria-label="Toggle theme">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="content">
+      <!-- Page header -->
+      <div class="page-header">
+        <div class="page-eyebrow">Cipher — Institutional Options Flow Intelligence</div>
+        <h1 class="page-title">Full Product Roadmap</h1>
+        <p class="page-desc">Eight phases from design foundation to enterprise-grade scale. Phases 1–3 are complete. Phase 4 is in progress.</p>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-bar-wrap">
+        <div class="progress-stats">
+          <div class="stat"><div class="stat-num done">3</div><div class="stat-label">Done</div></div>
+          <div class="stat"><div class="stat-num active">1</div><div class="stat-label">Active</div></div>
+          <div class="stat"><div class="stat-num todo">4</div><div class="stat-label">Queued</div></div>
+        </div>
+        <div class="progress-track-wrap">
+          <div class="progress-label"><span>Overall progress</span><span style="font-family:var(--font-mono);">37.5%</span></div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+        </div>
+      </div>
+
+      <!-- Phase cards -->
+      <div class="timeline">
+
+        <!-- PHASE 1 -->
+        <div class="phase-card open" id="p1">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P1</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Design System Overhaul</div>
+              <div class="phase-subtitle">globals.css · layout · all dashboard components</div>
+            </div>
+            <span class="phase-badge badge-done">✓ Complete</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">🎨 Design tokens</span>
+                <span class="goal-chip">🌗 Dark/light mode</span>
+                <span class="goal-chip">📐 Layout system</span>
+                <span class="goal-chip">🧩 Component library</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Full design token system — OKLCH colors, fluid type scale, 4px spacing grid</span><span class="deliv-file">globals.css</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">App shell layout — sidebar, topbar, content area, sticky nav</span><span class="deliv-file">layout.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Dashboard components — KPI cards, signal rows, chart wrappers</span><span class="deliv-file">components/</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Dark mode with system-preference detection and manual toggle</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Responsive mobile layout with collapsible sidebar</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 2 -->
+        <div class="phase-card" id="p2">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P2</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Auth, Tailwind & SmartSignals Tab</div>
+              <div class="phase-subtitle">Tailwind config · login/register pages · SmartSignals UI</div>
+            </div>
+            <span class="phase-badge badge-done">✓ Complete</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">🔐 Authentication</span>
+                <span class="goal-chip">🎛️ Tailwind v4</span>
+                <span class="goal-chip">📊 SmartSignals</span>
+                <span class="goal-chip">🔑 Supabase Auth</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Tailwind v4 config — custom theme bridged to CSS variables</span><span class="deliv-file">tailwind.config.ts</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Login page — email/password, Supabase Auth integration, error states</span><span class="deliv-file">app/login/page.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Register page — progressive form, email confirmation flow</span><span class="deliv-file">app/register/page.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">SmartSignals tab — real-time signal table, confidence scores, flow type badges</span><span class="deliv-file">components/SmartSignalsTab.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Route protection — middleware redirects for unauthenticated users</span><span class="deliv-file">middleware.ts</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 3 -->
+        <div class="phase-card" id="p3">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P3</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Backend Hardening</div>
+              <div class="phase-subtitle">Signal engine · smart signals endpoint · flow parser · WS heartbeat · docs</div>
+            </div>
+            <span class="phase-badge badge-done">✓ Complete</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">⚙️ Signal engine</span>
+                <span class="goal-chip">🔌 WebSocket heartbeat</span>
+                <span class="goal-chip">🌊 Flow parser</span>
+                <span class="goal-chip">📄 API docs</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Composite signal scoring engine — multi-factor weighting, threshold calibration</span><span class="deliv-file">signal_engine.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Smart signals REST endpoint — /api/signals/smart with pagination and filtering</span><span class="deliv-file">routers/signals.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Options flow parser — unusual activity detection, whale/institutional classification</span><span class="deliv-file">flow_parser.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">WebSocket heartbeat — ping/pong keep-alive, reconnect logic, market-hours guard</span><span class="deliv-file">ws_manager.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Market hours guard with _is_market_hours() — market_closed mode, session tick backoff fix</span><span class="deliv-file">tradier_stream.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">API documentation — specs.md, BACKLOG.md, regression-test-plan.md updated</span><span class="deliv-file">docs/</span></div>
+                <div class="deliv-item"><span class="deliv-icon">✅</span><span class="deliv-text">Groq LLaMA 3.3-70B swarm engine replacing OpenAI dependency</span><span class="deliv-file">swarm_engine.py</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 4 -->
+        <div class="phase-card" id="p4">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P4</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Data Persistence & History</div>
+              <div class="phase-subtitle">Supabase schema · history store · History tab UI · rate tracker</div>
+            </div>
+            <span class="phase-badge badge-active">⚡ In Progress</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">🗄️ Supabase DB</span>
+                <span class="goal-chip">📜 Signal history</span>
+                <span class="goal-chip">📈 History tab</span>
+                <span class="goal-chip">🚦 Rate tracker</span>
+              </div>
+              <div class="section-label">Batch 4A — Database Migration</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">signal_history table — ticker, signal_type, confidence, premium, timestamp, metadata JSONB</span><span class="deliv-file">001_signal_history.sql</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">Row-Level Security (RLS) policies — service role write, anon read with filters</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">Performance indexes — ticker, created_at DESC, signal_type composite index</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">TypeScript type export for Supabase client</span><span class="deliv-file">types/supabase.ts</span></div>
+              </div>
+              <div class="section-label">Batch 4B — Backend Persistence Layer</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">history_store.py — async upsert signals to Supabase after scoring</span><span class="deliv-file">app/history_store.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">History REST router — GET /api/signals/history with date range, ticker, type filters</span><span class="deliv-file">routers/history.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">main.py update — wire history_store into signal pipeline post-score hook</span><span class="deliv-file">app/main.py</span></div>
+              </div>
+              <div class="section-label">Batch 4C — Frontend History Tab</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">HistoryTab component — date picker, filter bar, paginated signal table, CSV export</span><span class="deliv-file">components/HistoryTab.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">History dashboard page — route /dashboard/history wired to backend</span><span class="deliv-file">app/dashboard/history/page.tsx</span></div>
+              </div>
+              <div class="section-label">Batch 4D — Rate Tracker & Docs</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">rate_tracker.py — Tradier API call counter, daily limit guard, alert on 80% usage</span><span class="deliv-file">app/rate_tracker.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">⏳</span><span class="deliv-text">claude.md updated — Phase 4 complete, TODOs carried forward</span><span class="deliv-file">claude.md</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 5 -->
+        <div class="phase-card" id="p5">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P5</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">AI Intelligence Layer</div>
+              <div class="phase-subtitle">Groq swarm · pattern recognition · backtesting engine · AI verdict UI</div>
+            </div>
+            <span class="phase-badge badge-next">Next</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">🤖 Groq LLaMA 3.3</span>
+                <span class="goal-chip">🧠 Swarm AI</span>
+                <span class="goal-chip">📊 Backtesting</span>
+                <span class="goal-chip">🔍 Pattern engine</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Swarm simulation full wiring — multi-agent BUY/SELL/HOLD debate, confidence aggregation</span><span class="deliv-file">swarm_engine.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Pattern recognition engine — historical flow clustering, repeat-pattern alerts</span><span class="deliv-file">pattern_engine.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Backtesting module — replay historical signals, P&amp;L simulation, win rate stats</span><span class="deliv-file">backtester.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">AI verdict UI component — swarm debate transcript, agent votes, confidence ring chart</span><span class="deliv-file">components/AIVerdict.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Trade executor wiring — trade_executor.py integrated into signal flow for live simulated execution</span><span class="deliv-file">trade_executor.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Anthropic Claude fallback — secondary model for complex analysis, prompt routing</span><span class="deliv-file">config.py</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 6 -->
+        <div class="phase-card" id="p6">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P6</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Portfolio Tracking & Alerts</div>
+              <div class="phase-subtitle">Virtual portfolio · P&amp;L dashboard · real-time alerts · notification system</div>
+            </div>
+            <span class="phase-badge badge-todo">Queued</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">💼 Portfolio</span>
+                <span class="goal-chip">📉 P&amp;L tracking</span>
+                <span class="goal-chip">🔔 Alerts</span>
+                <span class="goal-chip">📧 Notifications</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Virtual portfolio DB schema — positions table, trades table, user_portfolios</span><span class="deliv-file">002_portfolio.sql</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Portfolio API — CRUD positions, P&amp;L calculation, open/closed trade history</span><span class="deliv-file">routers/portfolio.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">P&amp;L dashboard tab — equity curve chart, per-trade breakdown, win/loss ratio</span><span class="deliv-file">components/PortfolioTab.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Alert engine — user-defined signal thresholds, ticker watchlists, confidence triggers</span><span class="deliv-file">alert_engine.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Real-time alert delivery — WebSocket push to frontend, toast + sound notification</span><span class="deliv-file">components/AlertToast.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Email/SMS notifications — Resend (email) + Twilio (SMS) for high-confidence signals</span><span class="deliv-file">notifier.py</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 7 -->
+        <div class="phase-card" id="p7">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P7</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Monetisation & User Tiers</div>
+              <div class="phase-subtitle">Stripe billing · feature gating · usage metering · subscription tiers</div>
+            </div>
+            <span class="phase-badge badge-todo">Queued</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">💳 Stripe</span>
+                <span class="goal-chip">🔒 Feature gates</span>
+                <span class="goal-chip">📏 Usage limits</span>
+                <span class="goal-chip">👑 Pro/Elite tiers</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Tier schema — user_subscriptions table, tier enum (free/pro/elite), billing_period</span><span class="deliv-file">003_subscriptions.sql</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Stripe Checkout integration — subscription plans, payment link generation, webhook handler</span><span class="deliv-file">routers/billing.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Feature gate middleware — enforce limits per tier (signal count, AI verdicts, alerts)</span><span class="deliv-file">middleware/gates.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Usage metering — Supabase daily counters, over-limit UI with upgrade prompt</span><span class="deliv-file">usage_meter.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Pricing page — tier comparison table, CTA to Stripe checkout, feature checklist</span><span class="deliv-file">app/pricing/page.tsx</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Billing settings — current plan, next billing date, cancel/upgrade flow, invoice history</span><span class="deliv-file">app/settings/billing/page.tsx</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PHASE 8 -->
+        <div class="phase-card" id="p8">
+          <div class="phase-header" onclick="togglePhase(this)">
+            <span class="phase-num">P8</span>
+            <div class="phase-title-wrap">
+              <div class="phase-title">Scale, Observability & Enterprise</div>
+              <div class="phase-subtitle">Load testing · monitoring · multi-tenant · RBAC · enterprise features</div>
+            </div>
+            <span class="phase-badge badge-todo">Queued</span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg>
+          </div>
+          <div class="phase-body">
+            <div class="phase-body-inner">
+              <div class="goal-chips">
+                <span class="goal-chip">🚀 Scale</span>
+                <span class="goal-chip">📡 Observability</span>
+                <span class="goal-chip">🏢 Multi-tenant</span>
+                <span class="goal-chip">🛡️ RBAC</span>
+              </div>
+              <div class="section-label">Deliverables</div>
+              <div class="deliverables">
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">WebSocket fan-out benchmarking — target 500+ concurrent connections, Railway scaling config</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">/api/signals/list load testing — Locust scripts, p95 latency target &lt;200ms under load</span><span class="deliv-file">tests/load/</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Observability stack — Sentry error tracking, structured logging, Railway metrics dashboard</span><span class="deliv-file">logging_config.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Multi-tenant architecture — org_id isolation, team workspaces, shared signal feeds</span><span class="deliv-file">004_orgs.sql</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">RBAC — admin/analyst/viewer roles, permission checks on all API routes</span><span class="deliv-file">middleware/rbac.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Tradier OI availability investigation — resolve open interest data gap (BACKLOG B-009)</span><span class="deliv-file">tradier_stream.py</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">Frontend WS pong implementation — client-side heartbeat response to reduce server disconnects</span><span class="deliv-file">lib/websocket.ts</span></div>
+                <div class="deliv-item"><span class="deliv-icon">🔲</span><span class="deliv-text">CI/CD hardening — full e2e test suite in GitHub Actions, staging environment on Railway</span><span class="deliv-file">.github/workflows/</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /timeline -->
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script>
+function togglePhase(header) {
+  const card = header.closest(".phase-card");
+  card.classList.toggle("open");
+}
+
+// Sidebar active link on scroll
+const sections = document.querySelectorAll("[id^='p']");
+const navLinks = document.querySelectorAll(".nav-item a");
+window.addEventListener("scroll", () => {
+  let current = "";
+  sections.forEach(s => { if (window.scrollY >= s.offsetTop - 120) current = s.id; });
+  navLinks.forEach(a => {
+    a.classList.toggle("active", a.getAttribute("href") === "#" + current);
+  });
+}, { passive: true });
+
+// Theme toggle
+(function(){
+  const btn = document.querySelector("[data-theme-toggle]");
+  const html = document.documentElement;
+  let dark = true;
+  function setTheme(isDark) {
+    dark = isDark;
+    html.setAttribute("data-theme", isDark ? "dark" : "light");
+    btn.innerHTML = isDark
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>';
+  }
+  setTheme(true);
+  btn.addEventListener("click", () => setTheme(!dark));
+})();
+</script>
+</body>
+</html>
