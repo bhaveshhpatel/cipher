@@ -11,6 +11,10 @@ Design principles:
   - Demo mode is a supervised fallback task, not an infinite blocking trap
   - Market-hours guard: backs off 60s when US options market is closed
 
+Phase 4 change:
+  - _process_trade() now calls build_composite() after accumulator threshold is crossed
+    and publishes a 'composite_signal' bus message for signal_store.py to persist.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -34,6 +38,7 @@ from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
 from services.flow_store import persist_flow_event
 from signals.repetition_accumulator import RepetitionAccumulator
+from signals.composite_signal_engine import build_composite
 
 log = logging.getLogger("tradier_stream")
 
@@ -295,13 +300,13 @@ _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 # ---------------------------------------------------------------------------
 # Trade processor
 #
-# FIX 1: persist_flow_event() is now called for every classified tick so
-#         that flow_events rows are actually written to Supabase.
-#         Previously this call was missing — the buffer was never filled.
+# Phase 4 addition:
+#   After build_composite() is called on a qualifying episode, publish
+#   a 'composite_signal' bus message so signal_store.py can persist it
+#   to the signal_history table.
 #
-# FIX 2: [flow] per-tick log downgraded to DEBUG to stop Railway rate-limit
-#         drops (400+ msgs/sec at INFO was exceeding Railway's log budget).
-#         [signal] stays at INFO — low frequency, high importance.
+# FIX 1: persist_flow_event() is called for every classified tick.
+# FIX 2: per-tick log downgraded to DEBUG to avoid Railway rate-limit drops.
 # ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     _stats["ticks"] += 1
@@ -311,7 +316,6 @@ async def _process_trade(raw: dict):
 
     _stats["classified"] += 1
 
-    # DEBUG — high-frequency per-tick log (avoids Railway rate-limit drops)
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
         f"${ev.strike:.0f} {ev.expiry} "
@@ -321,7 +325,6 @@ async def _process_trade(raw: dict):
         f"| tier={ev.influence_tier or 'UNKNOWN'}"
     )
 
-    # FIX 1: buffer this tick for batch insert into flow_events (every 5s flush)
     await persist_flow_event({
         "ticker":           ev.ticker,
         "contract_type":    ev.contract_type,
@@ -341,7 +344,6 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(ep)
 
-    # INFO — low-frequency signal log, keep visible
     log.info(
         f"[signal] {ep.ticker} {ep.contract_type} "
         f"| alert={alert_level} "
@@ -351,11 +353,20 @@ async def _process_trade(raw: dict):
         f"| {ep.summary_str()}"
     )
 
+    # Build composite signal (Phase 3 scoring)
+    try:
+        composite = build_composite(ep, accumulator)
+    except Exception as e:
+        log.error(f"[signal] build_composite failed for {ep.ticker}: {e}")
+        composite = None
+
+    direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+
     signal = {
         "type": "signal",
         "data": {
             "ticker":          ep.ticker,
-            "direction":       "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL",
+            "direction":       direction,
             "contract_type":   ep.contract_type,
             "strike":          ep.strike,
             "expiry":          ep.expiry,
@@ -369,6 +380,33 @@ async def _process_trade(raw: dict):
     }
     _stats["signals"] += 1
     await bus.publish_all(signal)
+
+    # Phase 4: publish composite_signal for signal_store.py to persist
+    if composite is not None:
+        composite_msg = {
+            "type": "composite_signal",
+            "data": {
+                "signal": {
+                    "ticker":                composite.ticker,
+                    "recommendation":        composite.recommendation,
+                    "composite_score":       composite.composite_score,
+                    "flow_score":            composite.flow_score,
+                    "backtest_score":        composite.backtest_score,
+                    "volume_premium_factor": composite.volume_premium_factor,
+                    "reasoning":             composite.reasoning,
+                },
+                "episode": {
+                    "contract_type":   ep.contract_type,
+                    "direction":       direction,
+                    "influence_tier":  ev.influence_tier,
+                    "total_premium":   ep.total_premium,
+                    "trade_count":     ep.trade_count,
+                    "is_accelerating": ep.is_accelerating,
+                    "timestamp":       ev.timestamp.isoformat(),
+                },
+            },
+        }
+        await bus.publish_all(composite_msg)
 
 
 # ---------------------------------------------------------------------------

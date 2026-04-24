@@ -13,12 +13,14 @@ from fastapi.responses import JSONResponse
 from config import settings
 from routers import auth, flow, simulation, ws, smart_signals
 from routers.smart_signals import stream_stats
+from routers import history
 from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, SEED_SYMBOLS
 from services import universe_store
 from services.flow_store import start_flow_writer
+from services.signal_store import start_signal_writer
 
 
 class _JsonFormatter(logging.Formatter):
@@ -167,17 +169,19 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    symbols        = await _resolve_startup_universe()
-    stream_task    = asyncio.create_task(stream_options_flow(symbols))
-    db_write_task  = asyncio.create_task(start_flow_writer())
-    refresh_task   = asyncio.create_task(_universe_refresh_loop())
+    symbols             = await _resolve_startup_universe()
+    stream_task         = asyncio.create_task(stream_options_flow(symbols))
+    db_write_task       = asyncio.create_task(start_flow_writer())
+    signal_write_task   = asyncio.create_task(start_signal_writer())   # Phase 4
+    refresh_task        = asyncio.create_task(_universe_refresh_loop())
 
     yield
 
     refresh_task.cancel()
     stream_task.cancel()
     db_write_task.cancel()
-    for task in (stream_task, db_write_task, refresh_task):
+    signal_write_task.cancel()
+    for task in (stream_task, db_write_task, signal_write_task, refresh_task):
         try:
             await task
         except asyncio.CancelledError:
@@ -221,6 +225,7 @@ app.include_router(flow.router)
 app.include_router(simulation.router)
 app.include_router(ws.router)
 app.include_router(smart_signals.router)
+app.include_router(history.router)       # Phase 4: signal history endpoint
 
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
