@@ -19,6 +19,11 @@ Fix (signal_history empty):
   - _demo_mode_once() now also emits composite_signal messages so signal_store.py
     populates signal_history during demo/fallback mode.
 
+Fix (C-011):
+  - Demo mode expiry updated to valid future date (2026-06-20).
+  - Demo mode contract_type now consistent with direction (CALL=BUY, PUT=SELL).
+  - persist_flow_event() call confirmed to include all parsed fields from OptionsFlowEvent.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -311,14 +316,15 @@ async def _process_trade(raw: dict):
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
-        f"${ev.strike:.2f} {ev.expiry} "
+        f"${ev.strike:.2f} {ev.expiry} dte={ev.dte} "
         f"| fill={ev.fill_price} bid={ev.bid} ask={ev.ask} size={ev.size} "
         f"| prem=${ev.premium:,.0f} "
         f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
-        f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier}"
+        f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier} "
+        f"| conviction={ev.conviction_score}"
     )
 
-    # Persist raw individual tick — ALL columns now populated (C-010 fix)
+    # Persist raw individual tick — ALL columns populated (C-010 + C-011 fix)
     await persist_flow_event({
         "ticker":           ev.ticker,
         "contract_type":    ev.contract_type,
@@ -366,10 +372,8 @@ async def _process_trade(raw: dict):
         log.error(f"[signal] build_composite failed for {ep.ticker}: {e}")
         composite = None
 
-    # Direction derived from episode contract_type + last-event sentiment.
-    # Previously used ev.sentiment only — which was always NEUTRAL when
-    # strike=0 caused bid/ask classifier to return MID (non-aggressive).
-    # Now: episode contract_type is the primary signal; sentiment is tiebreak.
+    # Direction derived from episode contract_type.
+    # CALL = REPEAT_BUY, PUT = REPEAT_SELL.
     if ep.contract_type == "CALL":
         direction = "REPEAT_BUY"
     elif ep.contract_type == "PUT":
@@ -428,34 +432,48 @@ async def _process_trade(raw: dict):
 # Demo mode
 # ---------------------------------------------------------------------------
 async def _demo_mode_once(symbols: list[str]):
-    import datetime
+    import datetime as dt
     rng     = random.Random(42)
     tickers = symbols or ["AAPL", "TSLA", "NVDA", "SPY", "QQQ", "MSFT", "AMZN", "META"]
-    ctypes  = ["CALL", "PUT"]
     levels  = ["CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"]
+
+    # Use a valid future expiry date
+    demo_expiry = "2026-06-20"
 
     log.info("Demo mode active — emitting synthetic signals")
     try:
         while True:
             await asyncio.sleep(rng.uniform(2, 6))
-            ticker    = rng.choice(tickers)
-            prem      = rng.randint(100_000, 8_000_000)
-            ctype     = rng.choice(ctypes)
-            direction = rng.choice(["REPEAT_BUY", "REPEAT_SELL"])
+            ticker = rng.choice(tickers)
+            prem   = rng.randint(100_000, 8_000_000)
+
+            # Contract type and direction are consistent:
+            # CALL → REPEAT_BUY, PUT → REPEAT_SELL
+            ctype     = rng.choice(["CALL", "PUT"])
+            direction = "REPEAT_BUY" if ctype == "CALL" else "REPEAT_SELL"
+            sentiment = "BULLISH" if ctype == "CALL" else "BEARISH"
+
+            strike    = round(rng.uniform(100, 500), 0)
+            fill      = round(rng.uniform(1.0, 15.0), 2)
+            bid       = round(fill * 0.99, 2)
+            ask       = round(fill * 1.01, 2)
+            size      = rng.randint(10, 500)
+            dte       = rng.randint(1, 60)
+
             signal = {
                 "type": "signal",
                 "data": {
                     "ticker":          ticker,
                     "direction":       direction,
                     "contract_type":   ctype,
-                    "strike":          round(rng.uniform(100, 500), 0),
-                    "expiry":          "2025-01-17",
+                    "strike":          strike,
+                    "expiry":          demo_expiry,
                     "total_premium":   prem,
                     "trade_count":     rng.randint(3, 25),
                     "alert_level":     rng.choices(levels, weights=[5, 15, 30, 50])[0],
                     "is_accelerating": rng.random() < 0.2,
                     "seed_episode":    f"Demo: {ticker} synthetic flow",
-                    "timestamp":       datetime.datetime.utcnow().isoformat(),
+                    "timestamp":       dt.datetime.utcnow().isoformat(),
                 },
             }
             _stats["ticks"]      += 1
@@ -465,34 +483,29 @@ async def _demo_mode_once(symbols: list[str]):
 
             # Emit composite_signal so signal_store.py populates signal_history
             composite_score = round(rng.uniform(0.40, 0.95), 3)
-            flow_score      = round(rng.uniform(0.40, 0.90), 3)
-            backtest_score  = round(rng.uniform(0.40, 0.85), 3)
-            vwp_factor      = round(rng.uniform(0.30, 0.80), 3)
-            trade_count     = rng.randint(3, 25)
-            is_accel        = rng.random() < 0.2
-            rec = "BUY" if composite_score >= 0.65 and direction == "REPEAT_BUY" else \
-                  "SELL" if composite_score >= 0.65 else "HOLD"
-            # After await bus.publish_all(signal) in demo loop, add:
+            rec = "BUY" if composite_score >= 0.65 and ctype == "CALL" else \
+                  "SELL" if composite_score >= 0.65 and ctype == "PUT" else "HOLD"
+
             composite_msg = {
                 "type": "composite_signal",
                 "data": {
                     "signal": {
                         "ticker":                ticker,
-                        "recommendation":        rng.choice(["BUY", "SELL", "HOLD"]),
-                        "composite_score":       round(rng.uniform(0.4, 0.95), 3),
+                        "recommendation":        rec,
+                        "composite_score":       composite_score,
                         "flow_score":            round(rng.uniform(0.4, 0.9), 3),
                         "backtest_score":        round(rng.uniform(0.4, 0.85), 3),
                         "volume_premium_factor": round(rng.uniform(0.3, 0.8), 3),
                         "reasoning":             f"Demo synthetic signal for {ticker}",
                     },
                     "episode": {
-                        "contract_type":   rng.choice(["CALL", "PUT"]),
-                        "direction":       rng.choice(["REPEAT_BUY", "REPEAT_SELL"]),
-                        "influence_tier":  rng.choice(["INSTITUTIONAL", "RETAIL"]),
+                        "contract_type":   ctype,
+                        "direction":       direction,
+                        "influence_tier":  rng.choice(["WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"]),
                         "total_premium":   prem,
                         "trade_count":     rng.randint(3, 25),
                         "is_accelerating": rng.random() < 0.2,
-                        "timestamp":       datetime.datetime.utcnow().isoformat(),
+                        "timestamp":       dt.datetime.utcnow().isoformat(),
                     },
                 },
             }
