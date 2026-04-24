@@ -21,9 +21,9 @@ const sentimentBadge = (s: string) => {
   return "badge badge-muted";
 };
 const tierBadge = (t: string) => {
-  if (t === "WHALE")       return "badge badge-amber";
+  if (t === "WHALE")         return "badge badge-amber";
   if (t === "INSTITUTIONAL") return "badge badge-teal";
-  if (t === "LARGE")       return "badge badge-blue";
+  if (t === "LARGE")         return "badge badge-blue";
   return "badge badge-muted";
 };
 const fmt$ = (n: number) =>
@@ -31,13 +31,22 @@ const fmt$ = (n: number) =>
   : n >= 1_000   ? `$${(n/1_000).toFixed(1)}K`
   : `$${n.toFixed(0)}`;
 
+// FIX: differentiate "no ticker filter" (initial all-tickers load) from
+// "ticker filtered but no results". Previously showed "No flow events for "
+// (blank) which looked broken.
 function EmptyState({ ticker }: { ticker: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-20 gap-4"
          style={{ color: "var(--faint)" }}>
       <span className="text-4xl">⟁</span>
-      <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>No flow events for {ticker}</p>
-      <p className="text-sm">Try scanning a different ticker or check stream connectivity.</p>
+      <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>
+        {ticker ? `No flow events for ${ticker}` : "No flow data yet"}
+      </p>
+      <p className="text-sm">
+        {ticker
+          ? "Try a different ticker or check stream connectivity."
+          : "Flow events will appear here once the stream ingests options trades."}
+      </p>
     </div>
   );
 }
@@ -59,7 +68,7 @@ function SkeletonRows() {
 }
 
 export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
-  const [sort,    setSort]   = useState<keyof FlowEvent>("conviction_score");
+  const [sort,    setSort]    = useState<keyof FlowEvent>("conviction_score");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [filterSentiment, setFilterSentiment] = useState<string>("ALL");
 
@@ -72,8 +81,8 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
     });
 
   const totalPremium = events.reduce((s, e) => s + e.premium, 0);
-  const bullCount = events.filter(e => e.sentiment === "BULLISH").length;
-  const bearCount = events.filter(e => e.sentiment === "BEARISH").length;
+  const bullCount  = events.filter(e => e.sentiment === "BULLISH").length;
+  const bearCount  = events.filter(e => e.sentiment === "BEARISH").length;
   const whaleCount = events.filter(e => e.influence_tier === "WHALE").length;
 
   const toggleSort = (col: keyof FlowEvent) => {
@@ -86,15 +95,15 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
       onClick={() => toggleSort(col)}
       className="px-3 py-3 text-left cursor-pointer select-none whitespace-nowrap"
       style={{
-        textAlign:    right ? "right" : "left",
-        color:        sort === col ? "var(--amber)" : "var(--faint)",
-        fontSize:     "0.7rem",
-        fontWeight:   700,
-        letterSpacing:"0.07em",
-        textTransform:"uppercase",
-        background:   "var(--surface-2)",
-        borderBottom: "1px solid var(--border)",
-        userSelect:   "none",
+        textAlign:     right ? "right" : "left",
+        color:         sort === col ? "var(--amber)" : "var(--faint)",
+        fontSize:      "0.7rem",
+        fontWeight:    700,
+        letterSpacing: "0.07em",
+        textTransform: "uppercase",
+        background:    "var(--surface-2)",
+        borderBottom:  "1px solid var(--border)",
+        userSelect:    "none",
       }}
     >
       {label} {sort === col ? (sortDir === "desc" ? "↓" : "↑") : ""}
@@ -110,7 +119,7 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
           {[
             { label: "Total Premium",  value: fmt$(totalPremium), accent: "var(--amber)" },
             { label: "Bullish Events", value: bullCount,          accent: "var(--green)" },
-            { label: "Bearish Events", value: bearCount,          accent: "var(--red)" },
+            { label: "Bearish Events", value: bearCount,          accent: "var(--red)"   },
             { label: "Whale Trades",   value: whaleCount,         accent: "var(--amber)" },
           ].map(({ label, value, accent }) => (
             <div key={label} className="card px-4 py-3 flex flex-col gap-0.5">
@@ -130,9 +139,9 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
               onClick={() => setFilterSentiment(s)}
               className="px-3 py-1.5 rounded-md text-xs font-semibold transition-all"
               style={{
-                background:  filterSentiment === s ? "var(--amber)" : "var(--surface-2)",
-                color:       filterSentiment === s ? "#1a0f00"       : "var(--muted)",
-                border:      `1px solid ${filterSentiment === s ? "var(--amber)" : "var(--border)"}`,
+                background: filterSentiment === s ? "var(--amber)" : "var(--surface-2)",
+                color:      filterSentiment === s ? "#1a0f00"       : "var(--muted)",
+                border:     `1px solid ${filterSentiment === s ? "var(--amber)" : "var(--border)"}`,
               }}
             >
               {s}
@@ -150,15 +159,15 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
           <table className="w-full min-w-[700px]">
             <thead>
               <tr>
-                <Th col="ticker"          label="Ticker" />
-                <Th col="contract_type"   label="Type" />
-                <Th col="strike"          label="Strike"     right />
-                <Th col="expiry"          label="Expiry" />
-                <Th col="premium"         label="Premium"    right />
-                <Th col="sentiment"       label="Sentiment" />
-                <Th col="influence_tier"  label="Tier" />
-                <Th col="conviction_score"label="Conviction" right />
-                <Th col="timestamp"       label="Time" />
+                <Th col="ticker"           label="Ticker" />
+                <Th col="contract_type"    label="Type" />
+                <Th col="strike"           label="Strike"     right />
+                <Th col="expiry"           label="Expiry" />
+                <Th col="premium"          label="Premium"    right />
+                <Th col="sentiment"        label="Sentiment" />
+                <Th col="influence_tier"   label="Tier" />
+                <Th col="conviction_score" label="Conviction" right />
+                <Th col="timestamp"        label="Time" />
               </tr>
             </thead>
             <tbody>
@@ -218,7 +227,7 @@ export function FlowTable({ events, loading, error, ticker, onScan }: Props) {
 }
 
 function ConvictionBar({ score }: { score: number }) {
-  const pct = Math.min(Math.max(score * 100, 0), 100);
+  const pct   = Math.min(Math.max(score * 100, 0), 100);
   const color = pct >= 70 ? "var(--green)" : pct >= 40 ? "var(--amber)" : "var(--red)";
   return (
     <div className="flex items-center gap-2 justify-end">
