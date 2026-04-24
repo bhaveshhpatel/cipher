@@ -199,14 +199,26 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     row = _build_row(sig, ep)
     ok  = await _insert_signal(row)
     if ok:
-        swarm = sig.get("swarm_direction", "—")
+        premium_fmt = f"${row['premium']:,.0f}" if row['premium'] else "$0"
+        golden      = " ⚡ GOLDEN SWEEP" if row["is_golden_sweep"] else ""
         log.info(
-            f"[signal_store] saved: {row['ticker']} "
-            f"{row['recommendation']} score={row['composite_score']} "
-            f"swarm={swarm}"
+            f"[signal_store] ✅ DB INSERT OK | "
+            f"{row['ticker']} | "
+            f"{row['recommendation']} | "
+            f"dir={row['direction']} | "
+            f"score={row['composite_score']:.3f} | "
+            f"flow={row['flow_score']:.3f} | "
+            f"alert={row['alert_level']} | "
+            f"sentiment={row['sentiment']} | "
+            f"tier={row['influence_tier']} | "
+            f"type={row['trade_type']} | "
+            f"premium={premium_fmt} | "
+            f"swarm={row['swarm_direction'] or '—'} "
+            f"({row['swarm_bull_votes']}B/{row['swarm_bear_votes']}Be/{row['swarm_hold_votes']}H)"
+            f"{golden}"
         )
     else:
-        log.warning(f"[signal_store] failed to save signal for {row.get('ticker')} — data lost")
+        log.warning(f"[signal_store] ❌ INSERT FAILED — signal for {row.get('ticker')} was NOT saved to DB")
 
 
 async def _bus_signal_listener() -> None:
