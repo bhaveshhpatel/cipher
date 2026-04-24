@@ -15,6 +15,10 @@ Phase 4 change:
   - _process_trade() now calls build_composite() after accumulator threshold is crossed
     and publishes a 'composite_signal' bus message for signal_store.py to persist.
 
+Fix (signal_history empty):
+  - _demo_mode_once() now also emits composite_signal messages so signal_store.py
+    populates signal_history during demo/fallback mode.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -423,14 +427,16 @@ async def _demo_mode_once(symbols: list[str]):
     try:
         while True:
             await asyncio.sleep(rng.uniform(2, 6))
-            ticker = rng.choice(tickers)
-            prem   = rng.randint(100_000, 8_000_000)
+            ticker    = rng.choice(tickers)
+            prem      = rng.randint(100_000, 8_000_000)
+            ctype     = rng.choice(ctypes)
+            direction = rng.choice(["REPEAT_BUY", "REPEAT_SELL"])
             signal = {
                 "type": "signal",
                 "data": {
                     "ticker":          ticker,
-                    "direction":       rng.choice(["REPEAT_BUY", "REPEAT_SELL"]),
-                    "contract_type":   rng.choice(ctypes),
+                    "direction":       direction,
+                    "contract_type":   ctype,
                     "strike":          round(rng.uniform(100, 500), 0),
                     "expiry":          "2025-01-17",
                     "total_premium":   prem,
@@ -445,6 +451,47 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["classified"] += 1
             _stats["signals"]    += 1
             await bus.publish_all(signal)
+
+            # Emit composite_signal so signal_store.py populates signal_history
+            composite_score = round(rng.uniform(0.40, 0.95), 3)
+            flow_score      = round(rng.uniform(0.40, 0.90), 3)
+            backtest_score  = round(rng.uniform(0.40, 0.85), 3)
+            vwp_factor      = round(rng.uniform(0.30, 0.80), 3)
+            trade_count     = rng.randint(3, 25)
+            is_accel        = rng.random() < 0.2
+            rec = "BUY" if composite_score >= 0.65 and direction == "REPEAT_BUY" else \
+                  "SELL" if composite_score >= 0.65 else "HOLD"
+            composite_msg = {
+                "type": "composite_signal",
+                "data": {
+                    "signal": {
+                        "ticker":                ticker,
+                        "recommendation":        rec,
+                        "composite_score":       composite_score,
+                        "flow_score":            flow_score,
+                        "backtest_score":        backtest_score,
+                        "volume_premium_factor": vwp_factor,
+                        "reasoning": (
+                            f"{trade_count} {ctype} trades on {ticker} "
+                            f"(${prem:,} total premium). "
+                            f"Flow score {flow_score:.0%}, backtest win-rate {backtest_score:.0%}, "
+                            f"volume-premium factor {vwp_factor:.0%}. "
+                            f"{'Accelerating flow detected. ' if is_accel else ''}"
+                            f"Composite: {composite_score:.0%} \u2192 {rec}. [DEMO]"
+                        ),
+                    },
+                    "episode": {
+                        "contract_type":   ctype,
+                        "direction":       direction,
+                        "influence_tier":  rng.choice(["INSTITUTIONAL", "RETAIL", "WHALE"]),
+                        "total_premium":   prem,
+                        "trade_count":     trade_count,
+                        "is_accelerating": is_accel,
+                        "timestamp":       datetime.datetime.utcnow().isoformat(),
+                    },
+                },
+            }
+            await bus.publish_all(composite_msg)
     except asyncio.CancelledError:
         log.info("Demo mode cancelled — live stream connection established")
         raise
