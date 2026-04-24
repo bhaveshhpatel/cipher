@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-23  
+> Last updated: 2026-04-23 (Phase 4)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -20,7 +20,8 @@
 | B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting/market_closed), reconnect count, last tick time. |
 | B-009 | Wire `trade_executor.py` into signal flow | 🔲 Todo | `execution/trade_executor.py` exists but is not connected to the composite signal engine output. |
 | B-011 | Redis integration | 🔲 Todo | Redis is in config but not used. Candidate for signal caching + WebSocket pub/sub at scale. |
-| B-012 | Wire `GET /api/flow/scan` to `flow_events` table | 🔲 Todo | `routers/flow.py` currently returns mock data. Needs Supabase query against live `flow_events` rows with filtering (ticker, date range, alert_level). |
+| B-012 | Wire `GET /api/flow/scan` to `flow_events` table | 🔲 Todo | `routers/flow.py` currently returns mock data. Needs Supabase query against live `flow_events` rows. |
+| B-013 | Wire `/api/signals/list` tier filter to live accumulator | 🔲 Todo | Tier filter currently pass-through (mock). Needs real query against live signal data. |
 
 ---
 
@@ -28,12 +29,14 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
-| C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json, confirmed login page live. |
-| C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: fixed ReadableStream body bug (Vercel runtime), Next.js 15 async params, TS strict mode. |
-| C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. See `docs/specs.md` § Tradier Stream Architecture. |
-| C-004 | Options universe persistence | 2026-04-23 | ~8,000-symbol tradeable universe persisted in Supabase. DB-first startup (< 1s cold start), 24h background refresh, full fallback chain. `symbols_loader.py` + `universe_store.py` + `001_options_universe.sql` migration (applied). 30 test cases. See `docs/specs.md` § Options Universe Persistence. |
-| C-005 | Tradier stream — market-hours guard + backoff fix | 2026-04-23 | Commit 9a32d4b. `_is_market_hours()` helper (ET timezone, stdlib only). Market-closed guard at top of reconnect loop — sleeps 60s, logs once per minute. `session_ticks`-aware backoff: attempt resets only when real data was received. `mode = market_closed` exposed in stats. Eliminates overnight reconnect spam. |
-| C-006 | flow_store.py — fix wrong table + id field + log crash | 2026-04-23 | Commit 701aaf6. `persist_composite_signal()` renamed `persist_flow_episode()` and retargeted from `composite_signals` → `flow_episodes`. Removed `id` from both row builders (Postgres generates uuid/bigserial). Switched all `log.info` calls to f-strings to prevent crash when signal fields are None. 8 unit tests added in `tests/test_flow_store.py`. |
+| C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json. |
+| C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: ReadableStream body bug, Next.js 15 async params, TS strict mode. |
+| C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. |
+| C-004 | Options universe persistence | 2026-04-23 | ~8,000-symbol universe in Supabase. DB-first startup, 24h refresh, full fallback chain. 30 tests. |
+| C-005 | Tradier stream — market-hours guard + backoff fix | 2026-04-23 | `_is_market_hours()`, session_ticks-aware backoff, `market_closed` mode. |
+| C-006 | flow_store.py — fix wrong table + id field + log crash | 2026-04-23 | `persist_flow_episode()` targets `flow_episodes`. No `id` in row builders. f-string logs. 8 tests. |
+| C-007 | Phase 3 — composite score v2 + signals list | 2026-04-23 | `volume_premium_factor` (×0.10), weights 0.55/0.35/0.10, `/api/signals/list` endpoint, size==0 guard. |
+| C-008 | Phase 4 — signal history | 2026-04-23 | `signal_history` table (`003_signal_history.sql`), `signal_store.py`, `GET /api/signals/history`, `useSignalHistory` hook, `SignalHistory` component, dashboard History tab. WS ping/pong TODO resolved in `useSignalStream.ts`. |
 
 ---
 
@@ -41,7 +44,7 @@
 
 | # | Item | Dropped | Reason |
 |---|------|---------|--------|
-| B-010 | Supabase DB — signal storage | 2026-04-23 | Completed as C-006. `flow_episodes` and `flow_events` tables now live and receiving writes. |
+| B-010 | Supabase DB — signal storage | 2026-04-23 | Completed as C-006 + C-008. All three signal tables live. |
 
 ---
 
@@ -49,15 +52,15 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-23 | Added C-008 — Phase 4 signal history (signal_store, history endpoint, frontend tab, ping/pong resolved) |
+| 2026-04-23 | Added B-013 — wire signals/list tier filter to live data |
+| 2026-04-23 | Added C-007 — Phase 3 composite score v2 + signals list endpoint |
 | 2026-04-23 | Added C-006 — flow_store fix: wrong table, id field, f-string logs, 8 tests |
-| 2026-04-23 | Closed B-010 → moved to Dropped (superseded by C-006) |
+| 2026-04-23 | Closed B-010 → moved to Dropped (superseded by C-006 + C-008) |
 | 2026-04-23 | Added B-012 — wire flow scan endpoint to live flow_events table |
 | 2026-04-23 | Added C-005 — Tradier market-hours guard + session_ticks backoff fix |
-| 2026-04-23 | Updated B-008 — mode enum now includes `market_closed` |
-| 2026-04-23 | Added C-004 options universe persistence — symbols_loader, universe_store, DB migration, 30 tests |
-| 2026-04-23 | Updated B-010 — universe tables live; now specifically about signal storage |
+| 2026-04-23 | Added C-004 options universe persistence — 30 tests |
 | 2026-04-22 | Created backlog with B-001 through B-007 |
 | 2026-04-22 | Added C-001 frontend deployment fix |
 | 2026-04-23 | Added C-002 auth 501 fix |
-| 2026-04-23 | Added C-003 Tradier stream resilience fix (9 failure modes) |
-| 2026-04-23 | Added B-008 stream health endpoint, B-009 trade executor wiring, B-010 Supabase DB, B-011 Redis |
+| 2026-04-23 | Added C-003 Tradier stream resilience fix |
