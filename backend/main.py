@@ -69,13 +69,10 @@ async def _resolve_startup_universe() -> list[str]:
       2. Tradier fetch + validate + screen — saves to DB, then starts
       3. Any DB snapshot (stale)          — fallback if Tradier is down
       4. SEED_SYMBOLS                     — last resort
-
-    NOTE: max_age_hours=0 forces a full rebuild on this deploy.
-    Revert to max_age_hours=24 after one successful deploy.
     """
-    log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=0 — FORCED REBUILD)")
+    log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
-    fresh = await universe_store.load_fresh_snapshot(max_age_hours=0)
+    fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
         log.info(
             "[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting",
