@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { useFlow } from "@/hooks/useFlow";
@@ -20,14 +20,16 @@ import { SignalHistory } from "@/components/dashboard/SignalHistory";
 type Tab = "flow" | "signals" | "simulation" | "composite" | "history";
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "flow",       label: "Flow Scanner",    icon: "⟁"  },
-  { id: "signals",    label: "Live Signals",     icon: "◉"  },
-  { id: "simulation", label: "AI Simulation",    icon: "⬡"  },
-  { id: "composite",  label: "Composite",        icon: "◈"  },
-  { id: "history",    label: "Signal History",   icon: "🕐" },
+  { id: "flow",       label: "Flow Scanner",  icon: "⟁" },
+  { id: "signals",    label: "Live Signals",   icon: "◉" },
+  { id: "simulation", label: "AI Simulation",  icon: "⬡" },
+  { id: "composite",  label: "Composite",      icon: "◈" },
+  { id: "history",    label: "Signal History", icon: "🕐" },
 ];
 
-const DEFAULT_TICKER = "SPY";
+// Auto-refresh intervals (ms)
+const FLOW_REFRESH_MS   = 30_000;
+const STATS_REFRESH_MS  = 15_000;
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -36,16 +38,47 @@ export default function DashboardPage() {
   const { result: simResult, loading: simLoading, error: simError, progress, run: runSim } = useSimulation(token);
   const { signals, connected } = useSignalStream(token);
 
-  const [ticker,    setTicker]    = useState(DEFAULT_TICKER);
+  // ticker state — empty string means "all tickers"
+  const [flowTicker,      setFlowTicker]      = useState("");
+  const [compositeTicker, setCompositeTicker] = useState("");
+
   const [tab,       setTab]       = useState<Tab>("flow");
   const [stats,     setStats]     = useState<StreamStats | null>(null);
   const [composite, setComposite] = useState<CompositeSignal | null>(null);
   const [compositeLoading, setCompositeLoading] = useState(false);
 
+  // flow auto-refresh countdown
+  const [flowCountdown, setFlowCountdown] = useState(FLOW_REFRESH_MS / 1000);
+  const flowTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Auth guard
   useEffect(() => {
     if (!isAuthenticated) router.push("/");
   }, [isAuthenticated, router]);
+
+  // ── Fetch flow (no ticker = all) ──────────────────────
+  const doFetchFlow = useCallback((ticker: string) => {
+    fetchFlow(ticker); // empty string → backend returns all
+    setFlowCountdown(FLOW_REFRESH_MS / 1000);
+  }, [fetchFlow]);
+
+  // Auto-load all flow on mount
+  useEffect(() => {
+    if (token) doFetchFlow("");
+  }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-refresh flow every 30s
+  useEffect(() => {
+    if (!token) return;
+    // countdown tick
+    const countIv = setInterval(() => {
+      setFlowCountdown(c => {
+        if (c <= 1) { doFetchFlow(flowTicker); return FLOW_REFRESH_MS / 1000; }
+        return c - 1;
+      });
+    }, 1000);
+    return () => clearInterval(countIv);
+  }, [token, flowTicker, doFetchFlow]);
 
   // Poll stream stats every 15s
   useEffect(() => {
@@ -54,28 +87,24 @@ export default function DashboardPage() {
       try { const d = await api.getStats(token); setStats(d.stats); } catch {}
     };
     load();
-    const iv = setInterval(load, 15_000);
+    const iv = setInterval(load, STATS_REFRESH_MS);
     return () => clearInterval(iv);
   }, [token]);
 
-  // Auto-load flow on mount
-  useEffect(() => {
-    if (token) fetchFlow(DEFAULT_TICKER);
-  }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const handleFlowScan = (t: string) => {
-    setTicker(t);
-    fetchFlow(t);
+    setFlowTicker(t);
+    doFetchFlow(t);
   };
 
   const handleSimulate = () => {
     if (!events.length) return;
-    runSim(ticker, events, 6, 3);
+    runSim(flowTicker || "MARKET", events, 6, 3);
     setTab("simulation");
   };
 
   const handleComposite = async (t: string) => {
-    if (!token) return;
+    if (!token || !t) return;
+    setCompositeTicker(t);
     setCompositeLoading(true);
     try { const d = await api.getComposite(t, token); setComposite(d); }
     catch {}
@@ -91,46 +120,38 @@ export default function DashboardPage() {
       <header
         className="sticky top-0 z-40 flex items-center justify-between px-5 py-3 gap-4"
         style={{
-          background:    "var(--surface)",
-          borderBottom:  "1px solid var(--border)",
-          backdropFilter:"blur(8px)",
+          background:     "var(--surface)",
+          borderBottom:   "1px solid var(--border)",
+          backdropFilter: "blur(8px)",
         }}
       >
+        {/* Left: logo + live status */}
         <div className="flex items-center gap-4 min-w-0">
           <CipherLogo size={32} />
-          <TickerInput
-            value={ticker}
-            onScan={handleFlowScan}
-            onComposite={handleComposite}
-            loading={flowLoading}
-          />
-        </div>
-
-        <div className="hidden sm:flex items-center gap-2">
-          <span
-            className="pulse-dot inline-block w-2 h-2 rounded-full"
-            style={{ background: connected ? "var(--green)" : "var(--faint)" }}
-          />
-          <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>
-            {connected ? "LIVE" : "OFFLINE"}
-          </span>
-          {stats && (
-            <span className="text-xs font-mono tabular" style={{ color: "var(--faint)" }}>
-              · {stats.active_symbols.toLocaleString()} symbols · {stats.signals.toLocaleString()} signals
+          <div className="hidden sm:flex items-center gap-2">
+            <span
+              className="pulse-dot inline-block w-2 h-2 rounded-full"
+              style={{ background: connected ? "var(--green)" : "var(--faint)" }}
+            />
+            <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>
+              {connected ? "LIVE" : "OFFLINE"}
             </span>
-          )}
+            {stats && (
+              <span className="text-xs font-mono tabular" style={{ color: "var(--faint)" }}>
+                · {stats.active_symbols.toLocaleString()} symbols · {stats.signals.toLocaleString()} signals
+              </span>
+            )}
+          </div>
         </div>
 
+        {/* Right: user + controls */}
         <div className="flex items-center gap-2 shrink-0">
           <span className="hidden md:block text-xs font-mono truncate max-w-[160px]"
                 style={{ color: "var(--muted)" }}>
             {email}
           </span>
           <ThemeToggle />
-          <button
-            onClick={logout}
-            className="btn btn-ghost text-xs px-3 py-1.5"
-          >
+          <button onClick={logout} className="btn btn-ghost text-xs px-3 py-1.5">
             Sign out
           </button>
         </div>
@@ -177,91 +198,114 @@ export default function DashboardPage() {
       {/* ── Main content ─────────────────────────────────── */}
       <main className="flex-1 p-4 md:p-6" style={{ maxWidth: 1400, width: "100%", margin: "0 auto" }}>
 
+        {/* ── Flow Scanner ── */}
         {tab === "flow" && (
           <div className="flex flex-col gap-4">
-            <SectionHeader
-              title="Options Flow Scanner"
-              subtitle={`Scanning ${ticker} · ${events.length} events loaded`}
-            >
-              {events.length > 0 && (
-                <button onClick={handleSimulate} className="btn btn-primary text-sm px-4">
-                  ⬡ Run AI Simulation
-                </button>
-              )}
-            </SectionHeader>
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Options Flow Scanner</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                  {flowTicker ? `Filtered: ${flowTicker}` : "Showing all tickers"}
+                  {" · "}{events.length} events
+                  {" · "}
+                  <span style={{ color: "var(--faint)" }}>auto-refresh in {flowCountdown}s</span>
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <TickerSearchBar
+                  placeholder="Filter by ticker…"
+                  onScan={handleFlowScan}
+                  onClear={() => handleFlowScan("")}
+                  loading={flowLoading}
+                  activeTicker={flowTicker}
+                />
+                {events.length > 0 && (
+                  <button onClick={handleSimulate} className="btn btn-primary text-sm px-4">
+                    ⬡ Run AI Simulation
+                  </button>
+                )}
+              </div>
+            </div>
             <FlowTable
               events={events}
               loading={flowLoading}
               error={flowError}
-              ticker={ticker}
+              ticker={flowTicker}
               onScan={handleFlowScan}
             />
           </div>
         )}
 
+        {/* ── Live Signals ── */}
         {tab === "signals" && (
           <div className="flex flex-col gap-4">
-            <SectionHeader
-              title="Live Signal Feed"
-              subtitle={connected ? "WebSocket connected · streaming real-time signals" : "Connecting to stream…"}
-            />
-            <SignalFeed signals={signals} connected={connected} />
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Live Signal Feed</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                  {connected ? "WebSocket connected · streaming real-time signals" : "Connecting to stream…"}
+                </p>
+              </div>
+            </div>
+            <SignalFeed signals={signals} connected={connected} token={token} />
           </div>
         )}
 
+        {/* ── AI Simulation ── */}
         {tab === "simulation" && (
           <div className="flex flex-col gap-4">
-            <SectionHeader
-              title="AI Swarm Simulation"
-              subtitle="6-agent consensus engine · BUY / SELL / HOLD verdict"
-            >
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>AI Swarm Simulation</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>6-agent consensus engine · BUY / SELL / HOLD verdict</p>
+              </div>
               {events.length > 0 && (
-                <button
-                  onClick={handleSimulate}
-                  disabled={simLoading}
-                  className="btn btn-primary text-sm px-4"
-                >
+                <button onClick={handleSimulate} disabled={simLoading} className="btn btn-primary text-sm px-4">
                   {simLoading ? `Running… ${progress}%` : "Re-run Simulation"}
                 </button>
               )}
-            </SectionHeader>
-            <SimulationPanel
-              result={simResult}
-              loading={simLoading}
-              error={simError}
-              progress={progress}
-            />
+            </div>
+            <SimulationPanel result={simResult} loading={simLoading} error={simError} progress={progress} />
           </div>
         )}
 
+        {/* ── Composite ── */}
         {tab === "composite" && (
           <div className="flex flex-col gap-4">
-            <SectionHeader
-              title="Composite Signal"
-              subtitle="Multi-factor scoring: flow + backtest + swarm consensus"
-            >
-              <button
-                onClick={() => handleComposite(ticker)}
-                disabled={compositeLoading}
-                className="btn btn-primary text-sm px-4"
-              >
-                {compositeLoading ? "Analyzing…" : `Analyze ${ticker}`}
-              </button>
-            </SectionHeader>
-            <CompositeCard
-              signal={composite}
-              loading={compositeLoading}
-              ticker={ticker}
-            />
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Composite Signal</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>Multi-factor scoring: flow + backtest + swarm consensus</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <TickerSearchBar
+                  placeholder="Enter ticker…"
+                  onScan={handleComposite}
+                  onClear={() => { setComposite(null); setCompositeTicker(""); }}
+                  loading={compositeLoading}
+                  activeTicker={compositeTicker}
+                  scanLabel="Analyze"
+                />
+              </div>
+            </div>
+            {!compositeTicker && !composite && (
+              <div className="card flex flex-col items-center justify-center py-20 gap-3">
+                <span className="text-4xl" style={{ color: "var(--faint)" }}>◈</span>
+                <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>Enter a ticker above and click Analyze</p>
+                <p className="text-sm" style={{ color: "var(--faint)" }}>Composite scores are computed on-demand from live flow + backtest data.</p>
+              </div>
+            )}
+            <CompositeCard signal={composite} loading={compositeLoading} ticker={compositeTicker} />
           </div>
         )}
 
+        {/* ── Signal History ── */}
         {tab === "history" && token && (
           <div className="flex flex-col gap-4">
-            <SectionHeader
-              title="Signal History"
-              subtitle="Persisted composite signals · flow × 0.55 + backtest × 0.35 + volume-premium × 0.10"
-            />
+            <div>
+              <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Signal History</h1>
+              <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>Persisted composite signals · flow × 0.55 + backtest × 0.35 + volume-premium × 0.10</p>
+            </div>
             <SignalHistory token={token} />
           </div>
         )}
@@ -271,38 +315,34 @@ export default function DashboardPage() {
   );
 }
 
-// ── Sub-components ────────────────────────────────────────────────────────────
+// ── TickerSearchBar ───────────────────────────────────────────────────────────
+// Replaces the old TickerInput that lived in the header.
+// Lives inside each tab's header area so it's contextual.
 
-function SectionHeader({
-  title, subtitle, children
-}: { title: string; subtitle?: string; children?: React.ReactNode }) {
-  return (
-    <div className="flex items-start justify-between gap-4 flex-wrap">
-      <div>
-        <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>{title}</h1>
-        {subtitle && (
-          <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>{subtitle}</p>
-        )}
-      </div>
-      {children && <div className="flex items-center gap-2">{children}</div>}
-    </div>
-  );
-}
-
-function TickerInput({
-  value, onScan, onComposite, loading
+function TickerSearchBar({
+  placeholder = "Ticker…",
+  onScan,
+  onClear,
+  loading,
+  activeTicker,
+  scanLabel = "Scan",
 }: {
-  value: string;
+  placeholder?: string;
   onScan: (t: string) => void;
-  onComposite: (t: string) => void;
+  onClear: () => void;
   loading: boolean;
+  activeTicker: string;
+  scanLabel?: string;
 }) {
-  const [local, setLocal] = useState(value);
+  const [local, setLocal] = useState(activeTicker);
+
+  // keep local in sync if parent clears
+  useEffect(() => { setLocal(activeTicker); }, [activeTicker]);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     const t = local.trim().toUpperCase();
-    if (t) { onScan(t); onComposite(t); }
+    if (t) onScan(t);
   };
 
   return (
@@ -310,13 +350,13 @@ function TickerInput({
       <input
         value={local}
         onChange={(e) => setLocal(e.target.value.toUpperCase())}
-        placeholder="Ticker…"
+        placeholder={placeholder}
         maxLength={6}
-        className="w-24 px-3 py-1.5 rounded-lg text-sm font-mono font-semibold uppercase outline-none transition-all"
+        className="w-28 px-3 py-1.5 rounded-lg text-sm font-mono font-semibold uppercase outline-none transition-all"
         style={{
-          background:  "var(--surface-2)",
-          border:      "1px solid var(--border)",
-          color:       "var(--text)",
+          background: "var(--surface-2)",
+          border:     "1px solid var(--border)",
+          color:      "var(--text)",
         }}
         onFocus={(e) => (e.target.style.borderColor = "var(--amber)")}
         onBlur={(e)  => (e.target.style.borderColor = "var(--border)")}
@@ -330,8 +370,23 @@ function TickerInput({
           <svg className="animate-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-        ) : "Scan"}
+        ) : scanLabel}
       </button>
+      {activeTicker && (
+        <button
+          type="button"
+          onClick={() => { setLocal(""); onClear(); }}
+          className="text-xs px-2 py-1.5 rounded-md transition-all"
+          style={{
+            color:      "var(--muted)",
+            background: "var(--surface-2)",
+            border:     "1px solid var(--border)",
+          }}
+          title="Clear filter — show all"
+        >
+          ✕ All
+        </button>
+      )}
     </form>
   );
 }

@@ -3,11 +3,6 @@
  *
  * In development  → Next.js dev server proxies to localhost:8000
  * On Vercel       → Next.js API route at /api/proxy/[...path] forwards to Railway
- *
- * This eliminates:
- *  - Mixed-content errors (HTTPS page fetching HTTP Railway URL)
- *  - CORS preflight failures (same-origin requests have no CORS)
- *  - “Failed to fetch” when NEXT_PUBLIC_API_URL is missing/wrong in Vercel
  */
 
 const TIMEOUT_MS = 20_000;
@@ -35,7 +30,7 @@ export interface StreamStats {
 export interface SignalHistoryItem {
   id: number;
   ticker: string;
-  recommendation: string;          // BUY | SELL | HOLD
+  recommendation: string;
   composite_score: number;
   flow_score: number;
   backtest_score: number;
@@ -93,11 +88,17 @@ export const api = {
       body: JSON.stringify({ email, password }),
     }),
 
-  getFlow: (ticker: string, token: string, limit = 50, offset = 0) =>
-    req<{ ticker: string | null; events: FlowEvent[]; total: number; limit: number; offset: number }>(
-      `/api/flow/scan?ticker=${ticker}&limit=${limit}&offset=${offset}`,
+  // ticker = "" → backend returns all (no WHERE ticker = ... clause)
+  getFlow: (ticker: string, token: string, limit = 100, offset = 0) => {
+    const qs = new URLSearchParams();
+    if (ticker) qs.set("ticker", ticker);
+    qs.set("limit",  String(limit));
+    qs.set("offset", String(offset));
+    return req<{ ticker: string | null; events: FlowEvent[]; total: number; limit: number; offset: number }>(
+      `/api/flow/scan?${qs.toString()}`,
       { headers: { Authorization: `Bearer ${token}` } },
-    ),
+    );
+  },
 
   runSimulation: (ticker: string, events: FlowEvent[], nAgents: number, nRuns: number, token: string) =>
     req<SimulationResult>("/api/simulation/run", {
@@ -120,8 +121,8 @@ export const api = {
     token: string,
     params: {
       ticker?:         string;
-      direction?:      string;   // bullish | bearish | neutral
-      tier?:           string;   // whale | institutional | large | retail
+      direction?:      string;
+      tier?:           string;
       min_conviction?: number;
       limit?:          number;
       offset?:         number;
