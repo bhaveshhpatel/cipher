@@ -22,6 +22,12 @@ Fix (C-011):
     bid_ask_classifier never gets 0/0 and always returns MID.
   - Conviction score revised: includes DTE urgency factor (short-dated
     contracts score higher) and caps cleanly at 1.0.
+
+Fix (C-012):
+  - _parse_timestamp() added to safely handle Tradier's epoch-ms integer
+    timestamp format. Previously datetime.fromisoformat() was called on an
+    int → TypeError → bare except returned None → every tick silently
+    discarded → complete ingestion freeze.
 """
 import re
 from dataclasses import dataclass
@@ -119,6 +125,32 @@ def _calc_dte(expiry: str) -> int:
         return 0
 
 
+def _parse_timestamp(ts) -> datetime:
+    """
+    Safely parse a Tradier stream timestamp into a datetime.
+
+    Tradier sends `timestamp` in two formats depending on the endpoint:
+      - int/float : Unix epoch milliseconds  e.g. 1745521391000
+      - str       : ISO 8601                 e.g. '2026-04-24T18:03:30'
+
+    Previously datetime.fromisoformat() was called directly on the raw value.
+    When Tradier sends an integer, this raises TypeError which was caught by
+    the bare `except Exception: return None` in parse_tradier_trade() —
+    causing EVERY tick to be silently discarded and ingestion to freeze.
+
+    Falls back to utcnow() if the value is absent or unparseable.
+    """
+    if ts is None:
+        return datetime.utcnow()
+    try:
+        if isinstance(ts, (int, float)):
+            # Tradier epoch timestamps are in milliseconds
+            return datetime.utcfromtimestamp(ts / 1000.0)
+        return datetime.fromisoformat(str(ts))
+    except (ValueError, OSError, OverflowError, TypeError):
+        return datetime.utcnow()
+
+
 def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
     """Parse a single Tradier stream trade dict into OptionsFlowEvent.
 
@@ -131,6 +163,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
       - `option_type`     : 'call' | 'put'  (often absent in stream)
       - `strike`          : float            (often absent in stream)
       - `expiration_date` : YYYY-MM-DD       (often absent in stream)
+      - `timestamp`       : int (epoch ms) or ISO str (may be absent)
 
     When option_type / strike / expiration_date are absent the OCC symbol
     is the only reliable source — parse it directly.
@@ -224,9 +257,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         ev = OptionsFlowEvent(
             id              = raw.get("id", f"{ticker}_{expiry}_{strike}_{ctype}"),
             ticker          = ticker,
-            timestamp       = datetime.fromisoformat(
-                                raw.get("timestamp", datetime.utcnow().isoformat())
-                              ),
+            timestamp       = _parse_timestamp(raw.get("timestamp")),
             contract_type   = ctype,
             strike          = strike,
             expiry          = expiry,
