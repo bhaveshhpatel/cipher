@@ -48,7 +48,7 @@ _CBOE_URL             = (
 _CHAIN_URL            = f"{settings.TRADIER_BASE_URL}/v1/markets/options/expirations"
 _QUOTES_URL           = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
 _CONNECT_TIMEOUT      = 20.0
-_VALIDATE_CONCURRENCY = 20
+_VALIDATE_CONCURRENCY = 50   # raised from 20 — reduces symbol dropout from timeouts
 _VALIDATE_TIMEOUT     = 8.0
 _QUOTES_TIMEOUT       = 12.0
 
