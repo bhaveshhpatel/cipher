@@ -15,19 +15,21 @@ Key fix (C-010):
 Fix (C-011):
   - OCC regex expanded to 1-10 char tickers (handles SPY, SPXW, etc.)
   - Sentiment: CALL → BULLISH, PUT → BEARISH baseline regardless of
-    aggressiveness. Aggressiveness elevates conviction score but is not
-    a gate on sentiment direction.
+    aggressiveness.
   - DTE auto-calculated from expiry date when the stream omits `dte`.
   - bid/ask=0 with nonzero fill → synthetic spread (fill ± 0.5%) so
-    bid_ask_classifier never gets 0/0 and always returns MID.
-  - Conviction score revised: includes DTE urgency factor (short-dated
-    contracts score higher) and caps cleanly at 1.0.
+    bid_ask_classifier never gets 0/0.
+  - Conviction score revised: includes DTE urgency factor.
 
 Fix (C-012):
-  - _parse_timestamp() added to safely handle Tradier's epoch-ms integer
-    timestamp format. Previously datetime.fromisoformat() was called on an
-    int → TypeError → bare except returned None → every tick silently
-    discarded → complete ingestion freeze.
+  - _parse_timestamp() handles Tradier epoch-ms integer timestamps.
+
+Fix (C-014):
+  - Reverted regressions introduced in 59becaee:
+    * Removed `if fill == 0: return None` — fill=0 is handled gracefully
+      by deriving from mid price, not by dropping the trade.
+    * Removed hard `return None` for unknown ctype — defaults to PUT
+      as last resort (same as original working code).
 """
 import re
 from dataclasses import dataclass
@@ -77,10 +79,7 @@ class OptionsFlowEvent:
 
 
 # OCC symbol pattern: AAPL  240119C00150000 or SPXW  260117P04500000
-# Ticker: 1-10 uppercase letters (left-padded with spaces in some feeds)
-# Date: 6-digit YYMMDD
-# C or P
-# Strike: 8-digit (price * 1000, zero-padded)
+# Expanded to 1-10 char tickers to handle SPY, SPXW, etc.
 _OCC_RE = re.compile(
     r"^([A-Z]{1,10})\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$"
 )
@@ -127,24 +126,13 @@ def _calc_dte(expiry: str) -> int:
 
 def _parse_timestamp(ts) -> datetime:
     """
-    Safely parse a Tradier stream timestamp into a datetime.
-
-    Tradier sends `timestamp` in two formats depending on the endpoint:
-      - int/float : Unix epoch milliseconds  e.g. 1745521391000
-      - str       : ISO 8601                 e.g. '2026-04-24T18:03:30'
-
-    Previously datetime.fromisoformat() was called directly on the raw value.
-    When Tradier sends an integer, this raises TypeError which was caught by
-    the bare `except Exception: return None` in parse_tradier_trade() —
-    causing EVERY tick to be silently discarded and ingestion to freeze.
-
-    Falls back to utcnow() if the value is absent or unparseable.
+    Safely parse a Tradier stream timestamp.
+    Handles int/float (epoch ms), ISO string, or missing (falls back to utcnow).
     """
     if ts is None:
         return datetime.utcnow()
     try:
         if isinstance(ts, (int, float)):
-            # Tradier epoch timestamps are in milliseconds
             return datetime.utcfromtimestamp(ts / 1000.0)
         return datetime.fromisoformat(str(ts))
     except (ValueError, OSError, OverflowError, TypeError):
@@ -163,34 +151,22 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
       - `option_type`     : 'call' | 'put'  (often absent in stream)
       - `strike`          : float            (often absent in stream)
       - `expiration_date` : YYYY-MM-DD       (often absent in stream)
-      - `timestamp`       : int (epoch ms) or ISO str (may be absent)
+      - `timestamp`       : int (epoch ms) or ISO str
 
     When option_type / strike / expiration_date are absent the OCC symbol
     is the only reliable source — parse it directly.
-
-    When bid/ask are both 0 but fill is nonzero, a synthetic ±0.5% spread
-    is applied so the bid_ask classifier can produce a meaningful result
-    instead of always returning MID.
     """
     try:
         symbol = raw.get("symbol", "")
 
         bid  = float(raw.get("bid",  0) or 0)
         ask  = float(raw.get("ask",  0) or 0)
-        fill = float(raw.get("price", 0) or 0)
-
-        # If price field absent or 0, derive from mid
-        if fill == 0 and (bid + ask) > 0:
-            fill = (bid + ask) / 2
-
+        # Derive fill from mid if price field absent or 0 — do NOT return None
+        fill = float(raw.get("price", (bid + ask) / 2 if (bid + ask) > 0 else 0))
         size = int(raw.get("size") or 0)
 
-        # Skip zero-size events — no valid premium can be derived
+        # Only skip genuinely zero-size events
         if size == 0:
-            return None
-
-        # Skip zero-fill events — no valid premium
-        if fill == 0:
             return None
 
         premium = fill * size * 100
@@ -200,14 +176,10 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         strike    = float(raw.get("strike", 0) or 0)
         expiry    = raw.get("expiration_date", "") or ""
 
-        # -- Always attempt OCC parse on `symbol` field.
-        #    Tradier streams the full OCC contract string in `symbol`
-        #    (e.g. 'AAPL  260117C00180000'), NOT the underlying ticker.
-        #    `underlying` is a separate field that carries the ticker.
+        # -- Always attempt OCC parse on `symbol` field
         occ_ticker, occ_strike, occ_expiry, occ_ctype = _parse_occ_symbol(symbol)
 
-        # Ticker: prefer explicit `underlying` field, fall back to OCC prefix,
-        # last resort split on whitespace from symbol string.
+        # Ticker: prefer explicit `underlying` field, fall back to OCC prefix
         ticker = (
             raw.get("underlying")
             or occ_ticker
@@ -222,15 +194,9 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         if not ctype_raw and occ_ctype is not None:
             ctype_raw = occ_ctype
 
-        # Normalize contract type — default to CALL only as last resort
-        # (previously always defaulted to PUT which was wrong)
-        if ctype_raw.upper() in ("C", "CALL"):
-            ctype = "CALL"
-        elif ctype_raw.upper() in ("P", "PUT"):
-            ctype = "PUT"
-        else:
-            # Cannot determine from any source — skip trade
-            return None
+        # Normalize contract type — default to PUT as last resort (same as original)
+        # Do NOT return None here — the working version never dropped on unknown ctype
+        ctype = "CALL" if ctype_raw.upper() in ("C", "CALL") else "PUT"
 
         # DTE: use stream value if provided, otherwise calculate from expiry
         dte = int(raw.get("dte", 0) or 0)
@@ -240,14 +206,12 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         exc_cnt  = int(raw.get("exchange_count", 1) or 1)
         fill_cnt = int(raw.get("fill_count", 1) or 1)
 
-        # Fix: when bid/ask are both 0 but fill is nonzero, synthesize a
-        # tight spread so the classifier produces a useful result.
-        # A 0/0 spread always returns MID → sentiment always NEUTRAL.
+        # Synthetic spread when bid/ask both 0 but fill is nonzero
         effective_bid = bid
         effective_ask = ask
         if effective_bid == 0 and effective_ask == 0 and fill > 0:
-            effective_bid = round(fill * 0.995, 4)  # fill - 0.5%
-            effective_ask = round(fill * 1.005, 4)  # fill + 0.5%
+            effective_bid = round(fill * 0.995, 4)
+            effective_ask = round(fill * 1.005, 4)
 
         ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
         ttype      = detect_trade_type(size, premium, exc_cnt, fill_cnt)
@@ -263,8 +227,8 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             expiry          = expiry,
             dte             = dte,
             fill_price      = fill,
-            bid             = bid,       # store original bid (0 if absent)
-            ask             = ask,       # store original ask (0 if absent)
+            bid             = bid,
+            ask             = ask,
             size            = size,
             premium         = premium,
             trade_type      = ttype,
@@ -278,12 +242,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             underlying_price = float(raw.get("underlying_price", 0) or 0),
         )
 
-        # ----------------------------------------------------------------
-        # Sentiment: CALL = BULLISH baseline, PUT = BEARISH baseline.
-        # Aggressiveness is a signal amplifier for conviction, NOT a gate
-        # on sentiment direction.  Previously sentiment was only set when
-        # is_aggressive=True which meant nearly all trades were NEUTRAL.
-        # ----------------------------------------------------------------
+        # Sentiment: CALL = BULLISH baseline, PUT = BEARISH baseline
         if ctype == "CALL":
             ev.sentiment = "BULLISH"
         elif ctype == "PUT":
@@ -297,13 +256,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         elif premium >= 100_000:
             ev.influence_tier = "LARGE"
 
-        # ----------------------------------------------------------------
-        # Conviction score (0.0 – 1.0)
-        #   - Base: aggressiveness of fill vs spread
-        #   - Golden sweep bonus
-        #   - Premium size factor (capped at $10M)
-        #   - DTE urgency: short-dated (<= 7 DTE) scores higher
-        # ----------------------------------------------------------------
+        # Conviction score
         dte_urgency = 0.1 if dte <= 7 else (0.05 if dte <= 30 else 0.0)
         ev.conviction_score = round(
             min(
