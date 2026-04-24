@@ -29,7 +29,6 @@ class MessageResponse(BaseModel):
 
 
 def _supabase_admin() -> Client | None:
-    """Return a Supabase admin client or None — never raises."""
     if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
         log.warning("Supabase admin creds not configured — falling back to in-memory store")
         return None
@@ -45,7 +44,6 @@ def _supabase_admin() -> Client | None:
 
 
 def _supabase_client() -> Client | None:
-    """Return a Supabase anon client or None — never raises."""
     if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
         log.warning("Supabase anon creds not configured — falling back to in-memory store")
         return None
@@ -61,7 +59,6 @@ def _supabase_client() -> Client | None:
 
 
 def _find_user_by_email(email: str):
-    """Lookup a Supabase auth user by email. Returns user object or None."""
     client = _supabase_admin()
     if not client:
         return None
@@ -75,7 +72,6 @@ def _find_user_by_email(email: str):
     return None
 
 
-# ── Explicit OPTIONS handlers so CORS preflight never gets a 400 ──────────
 @router.options("/register")
 async def options_register():
     return Response(status_code=200)
@@ -86,19 +82,14 @@ async def options_token():
     return Response(status_code=200)
 
 
-# ── Register ──────────────────────────────────────────────────────────────
 @router.post("/register", response_model=MessageResponse, status_code=201)
 async def register(body: RegisterRequest):
     if len(body.password) < 8:
-        raise HTTPException(
-            status_code=422,
-            detail="Password must be at least 8 characters",
-        )
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
 
     client = _supabase_admin()
 
     if client:
-        # Check duplicate
         if _find_user_by_email(str(body.email)):
             raise HTTPException(status_code=409, detail="Email already registered")
         try:
@@ -109,22 +100,15 @@ async def register(body: RegisterRequest):
                 "user_metadata": {"source": "cipher"},
             })
             if not getattr(result, "user", None):
-                raise HTTPException(
-                    status_code=500,
-                    detail="Registration failed: Supabase did not return a user",
-                )
+                raise HTTPException(status_code=500, detail="Registration failed: Supabase did not return a user")
             log.info("Registered via Supabase: %s", body.email)
             return {"message": "Account created successfully"}
         except HTTPException:
             raise
         except Exception as exc:
             log.error("Supabase register error: %s", exc)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Registration failed: {exc}",
-            )
+            raise HTTPException(status_code=500, detail=f"Registration failed: {exc}")
 
-    # ── In-memory fallback (local dev / no Supabase) ──────────────────────
     if str(body.email) in _users:
         raise HTTPException(status_code=409, detail="Email already registered")
     _users[str(body.email)] = hash_password(body.password)
@@ -132,7 +116,6 @@ async def register(body: RegisterRequest):
     return {"message": "Account created successfully"}
 
 
-# ── Login ─────────────────────────────────────────────────────────────────
 @router.post("/token", response_model=TokenResponse)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
     supabase = _supabase_client()
@@ -151,28 +134,22 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
             token = create_access_token({"sub": form.username})
             log.info("Login via Supabase: %s", form.username)
             return {"access_token": token, "token_type": "bearer"}
-
         except HTTPException:
             raise
         except Exception as exc:
             err_lower = str(exc).lower()
-            # Credentials errors → 401 (don't leak internals)
-            if any(k in err_lower for k in (
-                "invalid", "credentials", "not found", "email", "password", "user"
-            )):
+            if any(k in err_lower for k in ("invalid", "credentials", "not found", "email", "password", "user")):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid email or password",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-            # Genuine service error → 503 with a clear message
             log.error("Supabase login error: %s", exc)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Authentication service temporarily unavailable. Please try again in a moment.",
             )
 
-    # ── In-memory fallback ────────────────────────────────────────────────
     hashed = _users.get(form.username)
     if not hashed or not verify_password(form.password, hashed):
         raise HTTPException(
@@ -185,7 +162,7 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": token, "token_type": "bearer"}
 
 
-# ── Me ────────────────────────────────────────────────────────────────────
 @router.get("/me")
 async def me(current_user: TokenData = Depends(get_current_user)):
-    return {"email": current_user.email}
+    """Returns email + role. Frontend uses this to gate admin UI."""
+    return {"email": current_user.email, "role": current_user.role}

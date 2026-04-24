@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { authAPI } from "@/lib/api";
 
+const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+
 export default function LoginPage() {
   const router = useRouter();
   const [form,    setForm]    = useState({ username: "", password: "" });
@@ -16,10 +18,24 @@ export default function LoginPage() {
     setError(null);
     try {
       const data = await authAPI.login(form.username, form.password);
-      localStorage.setItem("cipher_token", data.access_token);
+      const token = data.access_token;
+      localStorage.setItem("cipher_token", token);
+
+      // Fetch email + role from /me immediately after login
+      try {
+        const me = await fetch(`${API}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (me.ok) {
+          const { email, role } = await me.json();
+          if (email) localStorage.setItem("cipher_email", email);
+          if (role)  localStorage.setItem("cipher_role",  role);
+        }
+      } catch { /* non-fatal — useAuth will retry */ }
+
       router.push("/dashboard");
-    } catch (err: any) {
-      setError(err.message ?? "Login failed");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setLoading(false);
     }
@@ -30,17 +46,14 @@ export default function LoginPage() {
          style={{ background: "var(--bg)" }}>
       <div className="w-full max-w-sm flex flex-col gap-6">
 
-        {/* Logo */}
         <div className="flex flex-col items-center gap-2">
           <span className="text-4xl font-black font-mono tracking-tight"
-                style={{ color: "var(--amber)" }}>⬡ CIPHER</span>
+                style={{ color: "var(--amber)" }}>&#x2B61; CIPHER</span>
           <span className="text-xs uppercase tracking-widest"
                 style={{ color: "var(--faint)" }}>Institutional Options Intelligence</span>
         </div>
 
-        {/* Card */}
-        <form onSubmit={handleSubmit}
-              className="card p-6 flex flex-col gap-4">
+        <form onSubmit={handleSubmit} className="card p-6 flex flex-col gap-4">
           <h1 className="text-lg font-bold" style={{ color: "var(--text)" }}>Sign in</h1>
 
           {error && (
@@ -52,17 +65,13 @@ export default function LoginPage() {
 
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-semibold uppercase tracking-wider"
-                   style={{ color: "var(--faint)" }}>Username</label>
+                   style={{ color: "var(--faint)" }}>Email</label>
             <input
               type="text" required autoComplete="username"
               value={form.username}
               onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
               className="rounded-md px-3 py-2.5 text-sm font-mono outline-none transition-all"
-              style={{
-                background:   "var(--surface-2)",
-                border:       "1px solid var(--border)",
-                color:        "var(--text)",
-              }}
+              style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text)" }}
               onFocus={e => e.target.style.borderColor = "var(--amber)"}
               onBlur={e  => e.target.style.borderColor = "var(--border)"}
             />
@@ -76,11 +85,7 @@ export default function LoginPage() {
               value={form.password}
               onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
               className="rounded-md px-3 py-2.5 text-sm font-mono outline-none transition-all"
-              style={{
-                background: "var(--surface-2)",
-                border:     "1px solid var(--border)",
-                color:      "var(--text)",
-              }}
+              style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text)" }}
               onFocus={e => e.target.style.borderColor = "var(--amber)"}
               onBlur={e  => e.target.style.borderColor = "var(--border)"}
             />
@@ -89,10 +94,7 @@ export default function LoginPage() {
           <button
             type="submit" disabled={loading}
             className="rounded-md py-2.5 text-sm font-bold uppercase tracking-wider transition-all"
-            style={{
-              background: loading ? "var(--border)" : "var(--amber)",
-              color:      loading ? "var(--muted)"  : "#1a0f00",
-            }}
+            style={{ background: loading ? "var(--border)" : "var(--amber)", color: loading ? "var(--muted)" : "#1a0f00" }}
           >
             {loading ? "Signing in…" : "Sign in"}
           </button>

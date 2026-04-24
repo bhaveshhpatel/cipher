@@ -1,118 +1,124 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/hooks/useAuth";
 import { useAdminDemo } from "@/hooks/useAdminDemo";
-
-const ADMIN_EMAIL = "bhaveshhpatel@yahoo.com";
 
 export default function AdminPage() {
   const router = useRouter();
-  const [token, setToken] = useState<string | null>(null);
-  const [email, setEmail] = useState<string | null>(null);
+  const { token, email, isAdmin, isAuthenticated, ready } = useAuth();
   const { status, loading, error, toggle } = useAdminDemo(token);
 
   useEffect(() => {
-    const t = localStorage.getItem("cipher_token");
-    const e = localStorage.getItem("cipher_email");
-    if (!t || e !== ADMIN_EMAIL) {
-      router.replace("/dashboard");
-      return;
-    }
-    setToken(t);
-    setEmail(e);
-  }, [router]);
+    if (!ready) return;
+    if (!isAuthenticated) { router.replace("/"); return; }
+    if (!isAdmin)         { router.replace("/dashboard"); return; }
+  }, [ready, isAuthenticated, isAdmin, router]);
 
   const isRunning = status?.demo?.running ?? false;
 
+  // Don't render until auth is confirmed
+  if (!ready || !isAdmin) return null;
+
   return (
-    <div className="min-h-screen bg-[var(--surface-0)] text-[var(--text-primary)] p-8">
+    <div className="min-h-screen p-8" style={{ background: "var(--bg)", color: "var(--text)" }}>
+
       {/* Header */}
       <div className="mb-8 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight font-mono">⚙️ Admin Panel</h1>
-          <p className="text-[var(--text-muted)] text-sm mt-1">{email}</p>
+          <p className="text-sm mt-1 font-mono" style={{ color: "var(--muted)" }}>{email}</p>
         </div>
         <button
           onClick={() => router.push("/dashboard")}
-          className="text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+          className="text-sm transition-colors font-mono"
+          style={{ color: "var(--muted)" }}
         >
           ← Back to Dashboard
         </button>
       </div>
 
       {/* Demo Engine Card */}
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-1)] p-6 max-w-xl">
+      <div className="rounded-xl p-6 max-w-xl mb-6"
+           style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
         <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-lg font-semibold font-mono">Demo Engine</h2>
-            <p className="text-xs text-[var(--text-muted)] mt-1">
+            <p className="text-xs mt-1 font-mono" style={{ color: "var(--muted)" }}>
               Emits realistic Tradier timesale events through the full 6-layer pipeline
             </p>
           </div>
-          {/* Status badge */}
-          <span
-            className={`text-xs font-mono px-3 py-1 rounded-full border ${
-              isRunning
-                ? "border-green-500/40 bg-green-500/10 text-green-400"
-                : "border-[var(--border)] bg-[var(--surface-0)] text-[var(--text-muted)]"
-            }`}
-          >
+          <span className="text-xs font-mono px-3 py-1 rounded-full"
+                style={{
+                  border:     isRunning ? "1px solid rgba(74,222,128,0.4)"  : "1px solid var(--border)",
+                  background: isRunning ? "rgba(74,222,128,0.1)"            : "var(--surface-2)",
+                  color:      isRunning ? "rgb(74,222,128)"                 : "var(--muted)",
+                }}>
             {isRunning ? "● RUNNING" : "○ STOPPED"}
           </span>
         </div>
 
-        {/* Toggle */}
+        {/* Toggle buttons */}
         <div className="flex items-center gap-4 mb-6">
           <button
             disabled={loading || isRunning}
             onClick={() => toggle(true)}
-            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold 
-                       bg-green-600 hover:bg-green-500 disabled:opacity-40 
-                       disabled:cursor-not-allowed transition-colors"
+            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
+            style={{
+              background: loading || isRunning ? "var(--border)" : "#16a34a",
+              color:      loading || isRunning ? "var(--muted)"  : "#fff",
+              cursor:     loading || isRunning ? "not-allowed"   : "pointer",
+            }}
           >
             {loading && !isRunning ? "Starting…" : "▶ Start Demo"}
           </button>
           <button
             disabled={loading || !isRunning}
             onClick={() => toggle(false)}
-            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold 
-                       bg-red-700 hover:bg-red-600 disabled:opacity-40 
-                       disabled:cursor-not-allowed transition-colors"
+            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
+            style={{
+              background: loading || !isRunning ? "var(--border)" : "#b91c1c",
+              color:      loading || !isRunning ? "var(--muted)"  : "#fff",
+              cursor:     loading || !isRunning ? "not-allowed"   : "pointer",
+            }}
           >
             {loading && isRunning ? "Stopping…" : "■ Stop Demo"}
           </button>
         </div>
 
-        {/* Stats */}
+        {/* Stats grid */}
         {status?.demo && (
           <div className="grid grid-cols-2 gap-3">
-            <Stat label="Ticks Emitted"    value={status.demo.ticks_emitted} />
+            <Stat label="Ticks Emitted"     value={status.demo.ticks_emitted} />
             <Stat label="Signals Generated" value={status.demo.signals_generated} />
-            <Stat label="Last Ticker"      value={status.demo.last_ticker ?? "—"} />
-            <Stat label="Stream Mode"      value={String(status.stream?.mode ?? "—")} />
+            <Stat label="Last Ticker"       value={status.demo.last_ticker ?? "—"} />
+            <Stat label="Started At"        value={
+              status.demo.started_at
+                ? new Date(status.demo.started_at).toLocaleTimeString()
+                : "—"
+            } />
           </div>
         )}
 
-        {/* Error */}
         {error && (
-          <p className="mt-4 text-xs text-red-400 font-mono bg-red-500/10 
-                        border border-red-500/20 rounded p-3">
+          <p className="mt-4 text-xs font-mono p-3 rounded"
+             style={{ color: "var(--red)", background: "rgba(220,53,69,0.1)", border: "1px solid rgba(220,53,69,0.2)" }}>
             {error}
           </p>
         )}
       </div>
 
-      {/* What demo mode does */}
-      <div className="mt-6 max-w-xl rounded-xl border border-[var(--border)] 
-                      bg-[var(--surface-1)] p-6">
-        <h3 className="text-sm font-semibold font-mono mb-3 text-[var(--text-muted)]">How It Works</h3>
-        <ul className="text-xs text-[var(--text-muted)] space-y-2 font-mono">
+      {/* How it works */}
+      <div className="rounded-xl p-6 max-w-xl"
+           style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
+        <h3 className="text-sm font-semibold font-mono mb-3" style={{ color: "var(--muted)" }}>How It Works</h3>
+        <ul className="text-xs space-y-2 font-mono" style={{ color: "var(--muted)" }}>
           <li>① Generates OCC symbol strings (e.g. TSLA  260620C00245000)</li>
           <li>② Emits timesale envelopes — exact Tradier format ("last" field for fill)</li>
           <li>③ Multi-exchange: same trade on 2-4 exchanges (N/C/M/Q) within 200ms</li>
-          <li>④ Goes through Layer 3 parser → Layer 4 dedup → accumulator → composite</li>
+          <li>④ Layer 3 parser → Layer 4 dedup → accumulator → composite signal</li>
           <li>⑤ Writes to flow_events + flow_episodes + signal_history in Supabase</li>
-          <li>⑥ Broadcasts to WebSocket clients via Supabase Realtime</li>
+          <li>⑥ Broadcasts to WebSocket clients — appears live in dashboard</li>
         </ul>
       </div>
     </div>
@@ -121,9 +127,10 @@ export default function AdminPage() {
 
 function Stat({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="rounded-lg bg-[var(--surface-0)] border border-[var(--border)] p-3">
-      <p className="text-xs text-[var(--text-muted)] font-mono mb-1">{label}</p>
-      <p className="text-sm font-semibold font-mono text-[var(--text-primary)]">
+    <div className="rounded-lg p-3"
+         style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+      <p className="text-xs font-mono mb-1" style={{ color: "var(--muted)" }}>{label}</p>
+      <p className="text-sm font-semibold font-mono" style={{ color: "var(--text)" }}>
         {typeof value === "number" ? value.toLocaleString() : value}
       </p>
     </div>
