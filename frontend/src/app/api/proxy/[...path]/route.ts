@@ -1,17 +1,18 @@
 /**
  * Next.js App Router proxy — forwards /api/* to the Railway backend.
  *
- * Fixes:
- * - HTTP 501: caused by passing req.body (ReadableStream) directly into
- *   fetch() with duplex:"half" which isn't supported on all Vercel runtimes.
- *   Now reads body as text first, then forwards as string — safe and universal.
- * - Works for all content types: JSON, form-urlencoded, multipart.
+ * Env var priority (both are checked so either works):
+ *   BACKEND_URL          — server-only var, recommended for production (Vercel)
+ *   NEXT_PUBLIC_API_URL  — also works; used by local dev and as fallback
+ *
+ * IMPORTANT: On Vercel, set BACKEND_URL = https://your-app.up.railway.app
+ * in the Vercel dashboard under Settings → Environment Variables.
  */
 import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND = (
-  process.env.BACKEND_URL ||           // server-only var — set in Vercel env vars
-  process.env.NEXT_PUBLIC_API_URL ||   // fallback for local dev
+  process.env.BACKEND_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
   "http://localhost:8000"
 ).replace(/\/+$/, "");
 
@@ -24,13 +25,19 @@ async function handler(
   const search  = req.nextUrl.search ?? "";
   const url     = `${BACKEND}/api/${pathStr}${search}`;
 
-  // Build forwarded headers — drop host to avoid Railway rejecting the request
+  if (!BACKEND || BACKEND === "http://localhost:8000" && process.env.NODE_ENV === "production") {
+    console.error("[proxy] No BACKEND_URL or NEXT_PUBLIC_API_URL configured for production");
+    return NextResponse.json(
+      { detail: "Backend not configured — set BACKEND_URL in Vercel environment variables." },
+      { status: 503 }
+    );
+  }
+
   const fwdHeaders: Record<string, string> = {};
   req.headers.forEach((value, key) => {
     if (key.toLowerCase() !== "host") fwdHeaders[key] = value;
   });
 
-  // Read body upfront as text so we avoid ReadableStream / duplex issues
   let body: string | undefined;
   if (!["GET", "HEAD"].includes(req.method)) {
     body = await req.text();
@@ -69,5 +76,4 @@ export const PATCH   = handler;
 export const DELETE  = handler;
 export const OPTIONS = handler;
 
-// Required for Next.js App Router dynamic API routes
 export const dynamic = "force-dynamic";
