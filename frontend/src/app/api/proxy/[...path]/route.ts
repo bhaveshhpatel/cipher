@@ -1,79 +1,73 @@
 /**
- * Next.js App Router proxy — forwards /api/* to the Railway backend.
+ * Next.js App Router catch-all proxy.
  *
- * Env var priority (both are checked so either works):
- *   BACKEND_URL          — server-only var, recommended for production (Vercel)
- *   NEXT_PUBLIC_API_URL  — also works; used by local dev and as fallback
+ * In production (Vercel), next.config.mjs rewrites:
+ *   /api/:path*  →  /api/proxy/:path*
  *
- * IMPORTANT: On Vercel, set BACKEND_URL = https://your-app.up.railway.app
- * in the Vercel dashboard under Settings → Environment Variables.
+ * This route then forwards the request to the Railway backend.
+ * Without this file the entire dashboard is broken — every API call
+ * hits a 404 because /api/proxy/[...path] had no route handler.
  */
 import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND = (
-  process.env.BACKEND_URL ||
-  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.BACKEND_URL ??
+  process.env.NEXT_PUBLIC_API_URL ??
   "http://localhost:8000"
 ).replace(/\/+$/, "");
 
 async function handler(
   req: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> }
+  context: { params: Promise<{ path: string[] }> }
 ) {
-  const { path } = await params;
+  const { path } = await context.params;
   const pathStr = path.join("/");
-  const search  = req.nextUrl.search ?? "";
+  const search  = req.nextUrl.search;
   const url     = `${BACKEND}/api/${pathStr}${search}`;
 
-  if (!BACKEND || BACKEND === "http://localhost:8000" && process.env.NODE_ENV === "production") {
-    console.error("[proxy] No BACKEND_URL or NEXT_PUBLIC_API_URL configured for production");
-    return NextResponse.json(
-      { detail: "Backend not configured — set BACKEND_URL in Vercel environment variables." },
-      { status: 503 }
-    );
-  }
-
-  const fwdHeaders: Record<string, string> = {};
+  // Forward all headers except ones that would confuse the upstream
+  const headers = new Headers();
   req.headers.forEach((value, key) => {
-    if (key.toLowerCase() !== "host") fwdHeaders[key] = value;
+    if (!["host", "connection", "transfer-encoding"].includes(key.toLowerCase())) {
+      headers.set(key, value);
+    }
   });
 
-  let body: string | undefined;
-  if (!["GET", "HEAD"].includes(req.method)) {
-    body = await req.text();
-  }
+  const isBodyMethod = !["GET", "HEAD"].includes(req.method.toUpperCase());
+  const body = isBodyMethod ? await req.arrayBuffer() : undefined;
 
+  let upstream: Response;
   try {
-    const upstream = await fetch(url, {
+    upstream = await fetch(url, {
       method:  req.method,
-      headers: fwdHeaders,
-      body,
-    });
-
-    const responseBody = await upstream.text();
-    const contentType  = upstream.headers.get("content-type") ?? "application/json";
-
-    return new NextResponse(responseBody, {
-      status:  upstream.status,
-      headers: {
-        "content-type":  contentType,
-        "cache-control": "no-store",
-      },
+      headers,
+      body:    body ? Buffer.from(body) : undefined,
     });
   } catch (err) {
-    console.error(`[proxy] ${req.method} ${url} →`, err);
+    console.error("[proxy] upstream fetch failed:", err);
     return NextResponse.json(
-      { detail: "Backend unreachable — server may be starting up, please retry in a few seconds." },
-      { status: 503 }
+      { detail: "Backend unreachable. Please try again." },
+      { status: 502 }
     );
   }
+
+  const resHeaders = new Headers();
+  upstream.headers.forEach((value, key) => {
+    // Don't forward encoding headers — Next.js handles this
+    if (!["content-encoding", "transfer-encoding"].includes(key.toLowerCase())) {
+      resHeaders.set(key, value);
+    }
+  });
+
+  return new NextResponse(upstream.body, {
+    status:  upstream.status,
+    headers: resHeaders,
+  });
 }
 
 export const GET     = handler;
 export const POST    = handler;
 export const PUT     = handler;
-export const PATCH   = handler;
 export const DELETE  = handler;
+export const PATCH   = handler;
 export const OPTIONS = handler;
-
-export const dynamic = "force-dynamic";
