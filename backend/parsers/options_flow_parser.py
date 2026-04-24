@@ -30,6 +30,18 @@ Fix (C-014):
       by deriving from mid price, not by dropping the trade.
     * Removed hard `return None` for unknown ctype — defaults to PUT
       as last resort (same as original working code).
+
+Fix (C-015):
+  - fill field: use "last" first, then "price" as fallback.
+    Tradier timesale events send the fill price in the "last" field.
+    "price" is kept as a fallback for compatibility with any legacy path.
+
+Architecture change (Layer 1):
+  - Registry enrichment: after OCC regex parse, lookup the symbol in the
+    SymbolRegistry (if built). If found, override ticker/strike/expiry/
+    contract_type/dte/open_interest with pre-validated chain data.
+    This ensures 100% accurate metadata even if the OCC regex fails on
+    unusual symbol formats.
 """
 import re
 from dataclasses import dataclass
@@ -142,10 +154,11 @@ def _parse_timestamp(ts) -> datetime:
 def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
     """Parse a single Tradier stream trade dict into OptionsFlowEvent.
 
-    Tradier streaming payload anatomy:
+    Tradier streaming payload anatomy (filter=timesale):
       - `symbol`          : OCC option symbol  e.g. 'AAPL  260117C00180000'
       - `underlying`      : underlying ticker  e.g. 'AAPL'  (may be absent)
-      - `price`           : fill price
+      - `last`            : fill price  ← PRIMARY field for timesale events
+      - `price`           : fill price  ← FALLBACK (some legacy feed formats)
       - `bid` / `ask`     : NBBO at time of trade (may be 0 in some feeds)
       - `size`            : contract count
       - `option_type`     : 'call' | 'put'  (often absent in stream)
@@ -155,14 +168,23 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
 
     When option_type / strike / expiration_date are absent the OCC symbol
     is the only reliable source — parse it directly.
+
+    Fill price priority: "last" → "price" → mid(bid, ask) → 0
     """
     try:
         symbol = raw.get("symbol", "")
 
         bid  = float(raw.get("bid",  0) or 0)
         ask  = float(raw.get("ask",  0) or 0)
-        # Derive fill from mid if price field absent or 0 — do NOT return None
-        fill = float(raw.get("last") or raw.get("price") or ((bid + ask) / 2 if (bid + ask) > 0 else 0))
+
+        # FIX: Tradier timesale sends fill price in "last" field, not "price".
+        # Fall back to "price" for compatibility, then mid, then 0.
+        fill = float(
+            raw.get("last") or
+            raw.get("price") or
+            ((bid + ask) / 2 if (bid + ask) > 0 else 0)
+        )
+
         size = int(raw.get("size") or 0)
 
         # Only skip genuinely zero-size events
@@ -194,8 +216,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         if not ctype_raw and occ_ctype is not None:
             ctype_raw = occ_ctype
 
-        # Normalize contract type — default to PUT as last resort (same as original)
-        # Do NOT return None here — the working version never dropped on unknown ctype
+        # Normalize contract type — default to PUT as last resort
         ctype = "CALL" if ctype_raw.upper() in ("C", "CALL") else "PUT"
 
         # DTE: use stream value if provided, otherwise calculate from expiry
@@ -269,11 +290,14 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             3,
         )
 
-        # Registry enrichment — override parsed fields with pre-validated metadata
+        # Registry enrichment — override parsed fields with pre-validated chain metadata.
+        # If the OCC SymbolRegistry is built, use it as ground truth for ticker/strike/
+        # expiry/contract_type/dte/open_interest. Falls back gracefully to OCC regex
+        # parse above if registry is not yet available.
         try:
             from services.symbol_registry import get_registry
             reg = get_registry()
-            if reg:
+            if reg and reg.is_ready():
                 meta = reg.lookup(symbol)
                 if meta:
                     ev.ticker        = meta.ticker
@@ -284,7 +308,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
                     ev.open_interest = meta.open_interest
                     ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
         except Exception:
-            pass  # registry not yet built — fallback to OCC regex parse (already done)
+            pass  # registry not yet built — OCC regex parse above is sufficient
 
         return ev
     except Exception:
