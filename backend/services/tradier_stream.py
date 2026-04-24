@@ -24,6 +24,15 @@ Fix (C-011):
   - Demo mode contract_type now consistent with direction (CALL=BUY, PUT=SELL).
   - persist_flow_event() call confirmed to include all parsed fields from OptionsFlowEvent.
 
+Fix (C-013):
+  - Tradier streaming sends events wrapped in an envelope:
+      {"type":"trade","trade":{"symbol":"AAPL  ...", "price":3.45, ...}}
+    _process_trade() was passing the outer envelope to parse_tradier_trade() which
+    then found no "symbol"/"price"/"size" keys → every tick returned None → complete
+    ingestion freeze even with a healthy stream connection.
+  - Fix: unwrap the inner payload by checking raw["type"] and extracting raw[raw["type"]].
+  - Also logs the first raw line on each new connection for future diagnostics.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -216,6 +225,7 @@ async def stream_options_flow(symbols: list[str]):
         }
 
         session_ticks = 0
+        first_line_logged = False
 
         # --- 2. Open stream ---
         try:
@@ -247,12 +257,20 @@ async def stream_options_flow(symbols: list[str]):
                     log.info(f"Tradier stream connected — monitoring {len(symbols)} symbols")
 
                     async for line in _iter_lines_with_watchdog(resp):
-                        if not line.strip():
+                        stripped = line.strip()
+                        if not stripped:
                             continue
                         try:
-                            raw = json.loads(line)
+                            raw = json.loads(stripped)
                         except json.JSONDecodeError:
                             continue
+
+                        # Log the first non-empty JSON line on each new connection
+                        # so we can see the exact envelope format Tradier is sending.
+                        if not first_line_logged:
+                            log.info(f"[stream] first raw tick sample: {stripped[:300]}")
+                            first_line_logged = True
+
                         session_ticks += 1
                         await _process_trade(raw)
 
@@ -307,8 +325,36 @@ _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
 async def _process_trade(raw: dict):
+    """
+    Process a raw Tradier stream event.
+
+    Tradier wraps every event in an envelope:
+      {"type": "trade", "trade": { ...actual trade fields... }}
+
+    We must unwrap the inner payload before passing to parse_tradier_trade(),
+    which expects the flat dict with keys like symbol, price, size, bid, ask, etc.
+
+    Other event types (e.g. "summary", "quote", "timesale") are filtered by
+    the stream's filter=trade param but may still occasionally appear — they
+    are silently ignored here.
+    """
     _stats["ticks"] += 1
-    ev = parse_tradier_trade(raw)
+
+    # Unwrap Tradier event envelope
+    event_type = raw.get("type", "")
+    if event_type and event_type in raw:
+        trade_payload = raw[event_type]
+        if not isinstance(trade_payload, dict):
+            return
+    else:
+        # Flat dict — pass through directly (future-proofing / alternate formats)
+        trade_payload = raw
+
+    # Only process trade events
+    if event_type and event_type != "trade":
+        return
+
+    ev = parse_tradier_trade(trade_payload)
     if not ev:
         return
 
@@ -324,7 +370,7 @@ async def _process_trade(raw: dict):
         f"| conviction={ev.conviction_score}"
     )
 
-    # Persist raw individual tick — ALL columns populated (C-010 + C-011 fix)
+    # Persist raw individual tick — ALL columns populated (C-010 + C-011 + C-012 + C-013 fix)
     await persist_flow_event({
         "ticker":           ev.ticker,
         "contract_type":    ev.contract_type,
