@@ -40,6 +40,14 @@ Fix (C-015):
     This was the root cause of strike=0, expiry=null, bid=0, ask=0 in DB.
   - _process_trade now accepts both "timesale" and "trade" envelope types.
 
+Architecture change (Layer 1+2):
+  - stream_options_flow() now builds the OCC SymbolRegistry first, then
+    delegates to StreamManager which spawns parallel StreamWorker instances
+    (500 OCC symbols per connection). This ensures Tradier receives full OCC
+    contract strings (e.g. "AAPL  260117C00180000") instead of ticker symbols,
+    which was the root cause of receiving equity events instead of option events.
+  - occ_symbol field now passed through to persist_flow_event() and stored in DB.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -171,9 +179,23 @@ async def _get_session_token() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Main streaming loop
+# Main streaming entry point — now delegates to StreamManager + SymbolRegistry
 # ---------------------------------------------------------------------------
 async def stream_options_flow(symbols: list[str]):
+    """
+    Entry point called from main.py lifespan.
+    `symbols` is the underlying ticker list (e.g. ["AAPL", "TSLA", ...]).
+
+    Architecture change: instead of streaming underlying ticker symbols,
+    we now:
+      1. Build the OCC SymbolRegistry (fetches chains for each ticker)
+      2. Pass all OCC contract symbols to StreamManager
+      3. StreamManager spawns parallel StreamWorker instances (500 OCC/conn)
+      4. Each worker pushes raw events to shared queue → _process_trade()
+
+    This ensures Tradier receives full OCC contract strings and returns
+    real option trade events instead of equity events.
+    """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
@@ -183,147 +205,43 @@ async def stream_options_flow(symbols: list[str]):
         await _demo_mode(symbols)
         return
 
-    url = f"{settings.TRADIER_STREAM_URL}/v1/markets/events"
-    stream_headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept": "application/json",
-    }
+    # Build OCC symbol registry from ticker watchlist
+    from services.symbol_registry import init_registry
+    from services.stream_manager import StreamManager
 
-    consecutive_stream_401s = 0
-    reconnect_attempt = 0
-    demo_task: Optional[asyncio.Task] = None
+    log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
+    registry = init_registry(watchlist=symbols)
 
-    while True:
-        # --- 0. Market hours guard ---
-        if not _is_market_hours():
-            now_et = datetime.now(_ET)
-            log.info(
-                f"Market closed (ET: {now_et.strftime('%H:%M %Z %a')}) "
-                f"— sleeping {int(_MARKET_CLOSED_SLEEP)}s before next check"
-            )
-            _stats["mode"] = "market_closed"
-            await asyncio.sleep(_MARKET_CLOSED_SLEEP)
-            continue
+    try:
+        occ_count = await registry.build()
+    except Exception as e:
+        log.error(f"[stream] OCC registry build failed: {e} — falling back to demo mode")
+        _stats["mode"] = "demo"
+        await _demo_mode(symbols)
+        return
 
-        # --- 1. Fetch fresh session token ---
-        session_token = await _get_session_token()
+    _stats["active_symbols"] = occ_count
 
-        if not session_token:
-            _stats["errors"] += 1
-            backoff = _backoff(min(reconnect_attempt, 7))
-            log.warning(
-                f"No session token — backing off {backoff:.1f}s before retry (attempt {reconnect_attempt + 1})"
-            )
-            if demo_task is None or demo_task.done():
-                log.info("Starting demo mode as fallback while waiting for live connection")
-                _stats["mode"] = "demo"
-                demo_task = asyncio.create_task(_demo_mode_once(symbols))
-            reconnect_attempt += 1
-            await asyncio.sleep(backoff)
-            continue
+    if occ_count == 0:
+        log.warning("[stream] OCC registry is empty — no contracts found. Falling back to demo mode")
+        _stats["mode"] = "demo"
+        await _demo_mode(symbols)
+        return
 
-        if demo_task and not demo_task.done():
-            demo_task.cancel()
-            try:
-                await demo_task
-            except asyncio.CancelledError:
-                pass
-            demo_task = None
+    log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
+    _stats["mode"] = "live"
 
-        # CRITICAL: filter=timesale sends full OCC option symbol + real option
-        # bid/ask/price. filter=trade sends equity events with stock prices — wrong.
-        payload = {
-            "sessionid": session_token,
-            "symbols":   ",".join(symbols),
-            "filter":    "timesale",
-            "linebreak": "true",
-        }
+    # Start background 30-min registry refresh
+    asyncio.create_task(registry.refresh_loop())
 
-        session_ticks = 0
-        first_line_logged = False
-
-        # --- 2. Open stream ---
-        try:
-            timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=None, write=10.0, pool=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, headers=stream_headers, data=payload) as resp:
-
-                    if resp.status_code == 401:
-                        consecutive_stream_401s += 1
-                        log.warning(
-                            f"Tradier stream 401 (session expired) — re-fetching token "
-                            f"(consecutive: {consecutive_stream_401s})"
-                        )
-                        _stats["errors"] += 1
-                        if consecutive_stream_401s >= 5:
-                            backoff = _backoff(min(consecutive_stream_401s, 7))
-                            log.error(
-                                f"5+ consecutive stream 401s — possible bad API key. "
-                                f"Backing off {backoff:.1f}s"
-                            )
-                            await asyncio.sleep(backoff)
-                        else:
-                            await asyncio.sleep(1.0)
-                        reconnect_attempt += 1
-                        continue
-
-                    consecutive_stream_401s = 0
-                    _stats["mode"] = "live"
-                    log.info(f"Tradier stream connected — monitoring {len(symbols)} symbols (filter=timesale)")
-
-                    async for line in _iter_lines_with_watchdog(resp):
-                        stripped = line.strip()
-                        if not stripped:
-                            continue
-                        try:
-                            raw = json.loads(stripped)
-                        except json.JSONDecodeError:
-                            continue
-
-                        # Log first raw line each connection so we can verify
-                        # the exact envelope and field names Tradier sends.
-                        if not first_line_logged:
-                            log.info(f"[stream] first raw tick sample: {stripped[:400]}")
-                            first_line_logged = True
-
-                        session_ticks += 1
-                        await _process_trade(raw)
-
-                    log.info("Tradier stream closed cleanly — reconnecting")
-
-        except asyncio.TimeoutError:
-            _stats["errors"] += 1
-            log.warning(f"Tradier stream idle for {int(_IDLE_TIMEOUT)}s — reconnecting")
-
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
-            _stats["errors"] += 1
-            log.warning(f"Tradier stream network error: {e} — reconnecting")
-
-        except Exception as e:
-            _stats["errors"] += 1
-            log.error(f"Tradier stream unexpected error: {e} — reconnecting")
-
-        _stats["reconnects"] += 1
-        _stats["mode"] = "reconnecting"
-
-        if session_ticks > 0:
-            reconnect_attempt = 0
-        else:
-            reconnect_attempt += 1
-
-        backoff = _backoff(min(reconnect_attempt, 7))
-        log.info(f"Reconnecting in {backoff:.1f}s (attempt {reconnect_attempt + 1})")
-        await asyncio.sleep(backoff)
+    # StreamManager handles all parallel workers + queue consumer
+    manager = StreamManager(registry=registry, process_fn=_process_trade)
+    await manager.run()
 
 
 # ---------------------------------------------------------------------------
 # Idle watchdog
 # ---------------------------------------------------------------------------
-async def _iter_lines_with_watchdog(resp: httpx.Response):
-    async for line in resp.aiter_lines():
-        yield line
-
-
 async def _guarded_lines(resp: httpx.Response):
     aiter = resp.aiter_lines().__aiter__()
     while True:
@@ -339,6 +257,9 @@ async def _guarded_lines(resp: httpx.Response):
 _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# Trade processor — shared by StreamManager workers and legacy path
+# ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
@@ -348,7 +269,7 @@ async def _process_trade(raw: dict):
 
     The inner payload has:
       symbol = full OCC string e.g. "ACGL  260516P00095000"
-      price  = option fill price
+      last   = option fill price  (NOTE: field is "last" not "price")
       bid    = option bid
       ask    = option ask
       size   = contract count
@@ -356,6 +277,7 @@ async def _process_trade(raw: dict):
 
     We unwrap the envelope and pass the inner dict to parse_tradier_trade().
     Both "timesale" and "trade" envelope types are handled for compatibility.
+    occ_symbol is passed through to persist_flow_event() and stored in DB.
     """
     _stats["ticks"] += 1
 
@@ -379,6 +301,9 @@ async def _process_trade(raw: dict):
 
     _stats["classified"] += 1
 
+    # Capture the raw OCC symbol for DB storage
+    occ_symbol = trade_payload.get("symbol", "")
+
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
         f"${ev.strike:.2f} {ev.expiry} dte={ev.dte} "
@@ -386,7 +311,7 @@ async def _process_trade(raw: dict):
         f"| prem=${ev.premium:,.0f} "
         f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
         f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier} "
-        f"| conviction={ev.conviction_score}"
+        f"| conviction={ev.conviction_score} occ={occ_symbol}"
     )
 
     await persist_flow_event({
@@ -412,6 +337,7 @@ async def _process_trade(raw: dict):
         "open_interest":    ev.open_interest,
         "iv":               ev.iv,
         "underlying_price": ev.underlying_price,
+        "occ_symbol":       occ_symbol,   # NEW: stored in flow_events.occ_symbol
     })
 
     ep = accumulator.ingest(ev)
