@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { useAdminDemo } from "@/hooks/useAdminDemo";
 
+/* ─── Types ──────────────────────────────────────────────── */
+
 interface ConfigRow {
   key:         string;
   value:       string;
@@ -41,6 +43,194 @@ interface CacheMeta {
   ttl_seconds: number;
 }
 
+/* ─── Admin palette (slate/navy override, independent of dark mode) ── */
+const A = {
+  bg:        "#080c14",
+  surface:   "#0e1422",
+  surface2:  "#131927",
+  border:    "#1e2d45",
+  border2:   "#263754",
+  text:      "#dce6f5",
+  muted:     "#6b83a6",
+  faint:     "#364d6b",
+  cyan:      "#22d3ee",
+  cyanDim:   "rgba(34,211,238,0.12)",
+  cyanBorder:"rgba(34,211,238,0.25)",
+  indigo:    "#818cf8",
+  indigoDim: "rgba(129,140,248,0.12)",
+  indigoBorder:"rgba(129,140,248,0.25)",
+  amber:     "#fbbf24",
+  amberDim:  "rgba(251,191,36,0.10)",
+  amberBorder:"rgba(251,191,36,0.25)",
+  green:     "rgb(74,222,128)",
+  greenDim:  "rgba(74,222,128,0.10)",
+  greenBorder:"rgba(74,222,128,0.25)",
+  red:       "#f87171",
+  redDim:    "rgba(248,113,113,0.10)",
+  redBorder: "rgba(248,113,113,0.25)",
+};
+
+/* ─── Shared sub-components ──────────────────────────────── */
+
+function AdminCard({
+  children,
+  className = "",
+  style = {},
+}: {
+  children: React.ReactNode;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <div
+      className={`rounded-xl p-6 ${className}`}
+      style={{
+        background: A.surface,
+        border: `1px solid ${A.border}`,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function CardHeader({
+  title,
+  subtitle,
+  action,
+}: {
+  title: string;
+  subtitle?: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between mb-5 gap-3">
+      <div>
+        <h2
+          className="text-base font-semibold font-mono tracking-tight"
+          style={{ color: A.text }}
+        >
+          {title}
+        </h2>
+        {subtitle && (
+          <p className="text-xs mt-1 font-mono leading-relaxed" style={{ color: A.muted }}>
+            {subtitle}
+          </p>
+        )}
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function StatusPill({
+  on,
+  onLabel = "● RUNNING",
+  offLabel = "○ STOPPED",
+  loading = false,
+}: {
+  on: boolean;
+  onLabel?: string;
+  offLabel?: string;
+  loading?: boolean;
+}) {
+  return (
+    <span
+      className="text-xs font-mono px-3 py-1 rounded-full shrink-0"
+      style={{
+        border:     on ? `1px solid ${A.greenBorder}` : `1px solid ${A.border}`,
+        background: on ? A.greenDim : A.surface2,
+        color:      on ? A.green    : A.muted,
+      }}
+    >
+      {loading ? "LOADING…" : on ? onLabel : offLabel}
+    </span>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: A.surface2, border: `1px solid ${A.border}` }}
+    >
+      <p className="text-xs font-mono mb-1" style={{ color: A.muted }}>{label}</p>
+      <p className="text-sm font-semibold font-mono tabular" style={{ color: A.text }}>
+        {typeof value === "number" ? value.toLocaleString() : value}
+      </p>
+    </div>
+  );
+}
+
+function FieldInput({
+  value,
+  onChange,
+  onEnter,
+  dirty,
+  error,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onEnter: () => void;
+  dirty: boolean;
+  error: string;
+}) {
+  return (
+    <input
+      type="text"
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      onKeyDown={e => { if (e.key === "Enter") onEnter(); }}
+      className="flex-1 px-3 py-1.5 rounded text-sm font-mono"
+      style={{
+        background: A.bg,
+        border: `1px solid ${error ? A.redBorder : dirty ? A.amberBorder : A.border}`,
+        color: A.text,
+        outline: "none",
+      }}
+    />
+  );
+}
+
+function SaveBtn({
+  onClick,
+  saving,
+  saved,
+  dirty,
+}: {
+  onClick: () => void;
+  saving: boolean;
+  saved: boolean;
+  dirty: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={saving || !dirty}
+      className="px-4 py-1.5 rounded text-xs font-mono font-semibold transition-colors"
+      style={{
+        minWidth: "64px",
+        background: saved    ? A.greenDim
+                  : saving   ? A.surface2
+                  : !dirty   ? A.surface2
+                  : A.indigoDim,
+        color:  saved    ? A.green
+              : !dirty   ? A.muted
+              : A.indigo,
+        border: saved  ? `1px solid ${A.greenBorder}`
+              : !dirty ? `1px solid ${A.border}`
+              : `1px solid ${A.indigoBorder}`,
+        cursor: saving || !dirty ? "not-allowed" : "pointer",
+      }}
+    >
+      {saved ? "✓ Saved" : saving ? "Saving…" : "Save"}
+    </button>
+  );
+}
+
+/* ─── Page ───────────────────────────────────────────────── */
+
 export default function AdminPage() {
   const router = useRouter();
   const { token, email, isAdmin, isAuthenticated, ready } = useAuth();
@@ -55,146 +245,240 @@ export default function AdminPage() {
   if (!ready || !isAdmin) return null;
 
   return (
-    <div className="min-h-screen p-8" style={{ background: "var(--bg)", color: "var(--text)" }}>
+    <div className="min-h-screen" style={{ background: A.bg, color: A.text }}>
 
-      {/* Header */}
-      <div className="mb-8 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight font-mono">⚙️ Admin Panel</h1>
-          <p className="text-sm mt-1 font-mono" style={{ color: "var(--muted)" }}>{email}</p>
-        </div>
-        <button
-          onClick={() => router.push("/dashboard")}
-          className="text-sm transition-colors font-mono"
-          style={{ color: "var(--muted)" }}
-        >
-          ← Back to Dashboard
-        </button>
-      </div>
-
-      {/* Demo Engine Card */}
-      <div className="rounded-xl p-6 max-w-xl mb-6"
-           style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h2 className="text-lg font-semibold font-mono">Demo Engine</h2>
-            <p className="text-xs mt-1 font-mono" style={{ color: "var(--muted)" }}>
-              Emits realistic Tradier timesale events through the full 6-layer pipeline
-            </p>
-          </div>
+      {/* ── Top bar ────────────────────────────────────────── */}
+      <div
+        className="sticky top-0 z-10 flex items-center justify-between px-8 py-4"
+        style={{
+          background: `${A.surface}cc`,
+          borderBottom: `1px solid ${A.border}`,
+          backdropFilter: "blur(12px)",
+        }}
+      >
+        <div className="flex items-center gap-3">
           <span
-            className="text-xs font-mono px-3 py-1 rounded-full"
-            style={{
-              border:     isRunning ? "1px solid rgba(74,222,128,0.4)"  : "1px solid var(--border)",
-              background: isRunning ? "rgba(74,222,128,0.1)"            : "var(--surface-2)",
-              color:      isRunning ? "rgb(74,222,128)"                 : "var(--muted)",
-            }}
+            className="text-xs font-mono px-2 py-0.5 rounded"
+            style={{ background: A.cyanDim, color: A.cyan, border: `1px solid ${A.cyanBorder}` }}
           >
-            {status === null ? "LOADING…" : isRunning ? "● RUNNING" : "○ STOPPED"}
+            ADMIN
           </span>
+          <h1 className="text-sm font-semibold font-mono tracking-wide" style={{ color: A.text }}>
+            Cipher Control Panel
+          </h1>
         </div>
-
-        <div className="flex items-center gap-4 mb-6">
+        <div className="flex items-center gap-4">
+          <span className="text-xs font-mono" style={{ color: A.muted }}>{email}</span>
           <button
-            disabled={loading || isRunning || status === null}
-            onClick={() => toggle(true)}
-            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
+            onClick={() => router.push("/dashboard")}
+            className="text-xs font-mono transition-colors px-3 py-1.5 rounded"
             style={{
-              background: loading || isRunning || status === null ? "var(--border)" : "#16a34a",
-              color:      loading || isRunning || status === null ? "var(--muted)"  : "#fff",
-              cursor:     loading || isRunning || status === null ? "not-allowed"   : "pointer",
+              color: A.muted,
+              border: `1px solid ${A.border}`,
+              background: A.surface2,
             }}
           >
-            {loading && !isRunning ? "Starting…" : "▶ Start Demo"}
-          </button>
-          <button
-            disabled={loading || !isRunning || status === null}
-            onClick={() => toggle(false)}
-            className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
-            style={{
-              background: loading || !isRunning || status === null ? "var(--border)" : "#b91c1c",
-              color:      loading || !isRunning || status === null ? "var(--muted)"  : "#fff",
-              cursor:     loading || !isRunning || status === null ? "not-allowed"   : "pointer",
-            }}
-          >
-            {loading && isRunning ? "Stopping…" : "■ Stop Demo"}
+            ← Dashboard
           </button>
         </div>
-
-        {status?.demo && (
-          <div className="grid grid-cols-2 gap-3">
-            <Stat label="Ticks Emitted"     value={status.demo.ticks_emitted} />
-            <Stat label="Signals Generated" value={status.demo.signals_generated} />
-            <Stat label="Last Ticker"       value={status.demo.last_ticker ?? "—"} />
-            <Stat label="Started At"        value={
-              status.demo.started_at
-                ? new Date(status.demo.started_at + "Z").toLocaleTimeString()
-                : "—"
-            } />
-          </div>
-        )}
-
-        {error && (
-          <p className="mt-4 text-xs font-mono p-3 rounded"
-             style={{ color: "var(--red)", background: "rgba(220,53,69,0.1)", border: "1px solid rgba(220,53,69,0.2)" }}>
-            {error}
-          </p>
-        )}
       </div>
 
-      {/* How it works */}
-      <div className="rounded-xl p-6 max-w-xl mb-6"
-           style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
-        <h3 className="text-sm font-semibold font-mono mb-3" style={{ color: "var(--muted)" }}>How It Works</h3>
-        <ul className="text-xs space-y-2 font-mono" style={{ color: "var(--muted)" }}>
-          <li>① Generates OCC symbol strings (e.g. TSLA  260620C00245000)</li>
-          <li>② Emits timesale envelopes — exact Tradier format ("last" field for fill)</li>
-          <li>③ Multi-exchange: same trade on 2-4 exchanges (N/C/M/Q) within 200ms</li>
-          <li>④ Layer 3 parser → Layer 4 dedup → accumulator → composite signal</li>
-          <li>⑤ Writes to flow_events + flow_episodes + signal_history in Supabase</li>
-          <li>⑥ Broadcasts to WebSocket clients — appears live in dashboard</li>
-        </ul>
+      {/* ── Body ───────────────────────────────────────────── */}
+      <div className="p-8">
+
+        {/* Row 1: Demo Engine (left) + How It Works (right) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+          <DemoEngineCard
+            status={status}
+            isRunning={isRunning}
+            loading={loading}
+            error={error}
+            toggle={toggle}
+          />
+          <HowItWorksCard />
+        </div>
+
+        {/* Row 2: Tier Thresholds (left) + Ingestion Config (right) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <TierThresholdsCard token={token} />
+          <IngestionConfigCard token={token} />
+        </div>
       </div>
-
-      {/* Tier Thresholds Card — B-019 */}
-      <TierThresholdsCard token={token} />
-
-      {/* Ingestion Config Card */}
-      <IngestionConfigCard token={token} />
-
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// B-019: Tier Thresholds Card
-// ---------------------------------------------------------------------------
+/* ─── Demo Engine card ───────────────────────────────────── */
 
-const TIER_FIELDS: { key: keyof TierThresholdsRow; label: string; tier: 1 | 2 | 3; hint: string }[] = [
-  // Tier 1
-  { key: "t1_min_volume",     label: "Min Volume",     tier: 1, hint: "Avg daily vol (e.g. 20000000)" },
-  { key: "t1_min_last_price", label: "Min Price ($)",  tier: 1, hint: "Min last price" },
-  { key: "t1_min_oi",         label: "Min OI",         tier: 1, hint: "Open interest at ATM strike" },
-  { key: "t1_atm_pct",        label: "ATM % Range",    tier: 1, hint: "±% strike range (e.g. 0.20)" },
-  { key: "t1_max_dte",        label: "Max DTE",        tier: 1, hint: "Max days to expiry" },
-  // Tier 2
-  { key: "t2_min_volume",     label: "Min Volume",     tier: 2, hint: "Avg daily vol (e.g. 2000000)" },
-  { key: "t2_min_last_price", label: "Min Price ($)",  tier: 2, hint: "Min last price" },
-  { key: "t2_min_oi",         label: "Min OI",         tier: 2, hint: "Open interest at ATM strike" },
-  { key: "t2_atm_pct",        label: "ATM % Range",    tier: 2, hint: "±% strike range (e.g. 0.15)" },
-  { key: "t2_max_dte",        label: "Max DTE",        tier: 2, hint: "Max days to expiry" },
-  // Tier 3
-  { key: "t3_min_volume",     label: "Min Volume",     tier: 3, hint: "Avg daily vol (e.g. 500000)" },
-  { key: "t3_min_last_price", label: "Min Price ($)",  tier: 3, hint: "Min last price" },
-  { key: "t3_min_oi",         label: "Min OI",         tier: 3, hint: "Open interest at ATM strike" },
-  { key: "t3_atm_pct",        label: "ATM % Range",    tier: 3, hint: "±% strike range (e.g. 0.10)" },
-  { key: "t3_max_dte",        label: "Max DTE",        tier: 3, hint: "Max days to expiry" },
+function DemoEngineCard({
+  status,
+  isRunning,
+  loading,
+  error,
+  toggle,
+}: {
+  status: ReturnType<typeof useAdminDemo>["status"];
+  isRunning: boolean;
+  loading: boolean;
+  error: string | null;
+  toggle: (on: boolean) => void;
+}) {
+  return (
+    <AdminCard>
+      <div className="flex items-start justify-between mb-5">
+        <div>
+          <h2 className="text-base font-semibold font-mono tracking-tight" style={{ color: A.text }}>
+            Demo Engine
+          </h2>
+          <p className="text-xs mt-1 font-mono" style={{ color: A.muted }}>
+            Emits realistic Tradier timesale events through the full 6-layer pipeline
+          </p>
+        </div>
+        <StatusPill on={isRunning} loading={status === null} />
+      </div>
+
+      <div className="flex items-center gap-3 mb-5">
+        <button
+          disabled={loading || isRunning || status === null}
+          onClick={() => toggle(true)}
+          className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
+          style={{
+            background: loading || isRunning || status === null
+              ? A.surface2 : "rgba(34,197,94,0.15)",
+            color:      loading || isRunning || status === null
+              ? A.muted : A.green,
+            border: `1px solid ${loading || isRunning || status === null ? A.border : A.greenBorder}`,
+            cursor: loading || isRunning || status === null ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading && !isRunning ? "Starting…" : "▶ Start Demo"}
+        </button>
+        <button
+          disabled={loading || !isRunning || status === null}
+          onClick={() => toggle(false)}
+          className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
+          style={{
+            background: loading || !isRunning || status === null
+              ? A.surface2 : A.redDim,
+            color:      loading || !isRunning || status === null
+              ? A.muted : A.red,
+            border: `1px solid ${loading || !isRunning || status === null ? A.border : A.redBorder}`,
+            cursor: loading || !isRunning || status === null ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading && isRunning ? "Stopping…" : "■ Stop Demo"}
+        </button>
+      </div>
+
+      {status?.demo && (
+        <div className="grid grid-cols-2 gap-3">
+          <Stat label="Ticks Emitted"     value={status.demo.ticks_emitted} />
+          <Stat label="Signals Generated" value={status.demo.signals_generated} />
+          <Stat label="Last Ticker"       value={status.demo.last_ticker ?? "—"} />
+          <Stat label="Started At"        value={
+            status.demo.started_at
+              ? new Date(status.demo.started_at + "Z").toLocaleTimeString()
+              : "—"
+          } />
+        </div>
+      )}
+
+      {error && (
+        <p
+          className="mt-4 text-xs font-mono p-3 rounded"
+          style={{ color: A.red, background: A.redDim, border: `1px solid ${A.redBorder}` }}
+        >
+          {error}
+        </p>
+      )}
+    </AdminCard>
+  );
+}
+
+/* ─── How It Works card ──────────────────────────────────── */
+
+function HowItWorksCard() {
+  const steps = [
+    { n: "①", text: "Generates OCC symbol strings (e.g. TSLA  260620C00245000)" },
+    { n: "②", text: "Emits timesale envelopes — exact Tradier format (\"last\" field for fill)" },
+    { n: "③", text: "Multi-exchange: same trade on 2–4 exchanges (N/C/M/Q) within 200 ms" },
+    { n: "④", text: "Layer 3 parser → Layer 4 dedup → accumulator → composite signal" },
+    { n: "⑤", text: "Writes to flow_events + flow_episodes + signal_history in Supabase" },
+    { n: "⑥", text: "Broadcasts to WebSocket clients — appears live in dashboard" },
+  ];
+
+  return (
+    <AdminCard>
+      <CardHeader
+        title="Pipeline Overview"
+        subtitle="How the 6-layer demo pipeline flows end-to-end"
+      />
+      <div className="space-y-3">
+        {steps.map(s => (
+          <div key={s.n} className="flex items-start gap-3">
+            <span
+              className="text-xs font-mono font-semibold shrink-0 mt-0.5"
+              style={{ color: A.cyan }}
+            >
+              {s.n}
+            </span>
+            <p className="text-xs font-mono leading-relaxed" style={{ color: A.muted }}>
+              {s.text}
+            </p>
+          </div>
+        ))}
+      </div>
+    </AdminCard>
+  );
+}
+
+/* ─── Tier Thresholds card (B-019) ───────────────────────── */
+
+const TIER_FIELDS: {
+  key: keyof TierThresholdsRow;
+  label: string;
+  tier: 1 | 2 | 3;
+  hint: string;
+}[] = [
+  { key: "t1_min_volume",     label: "Min Volume",    tier: 1, hint: "e.g. 20000000" },
+  { key: "t1_min_last_price", label: "Min Price ($)", tier: 1, hint: "min last price" },
+  { key: "t1_min_oi",         label: "Min OI",        tier: 1, hint: "ATM open interest" },
+  { key: "t1_atm_pct",        label: "ATM % Range",   tier: 1, hint: "±% e.g. 0.20" },
+  { key: "t1_max_dte",        label: "Max DTE",       tier: 1, hint: "days to expiry" },
+  { key: "t2_min_volume",     label: "Min Volume",    tier: 2, hint: "e.g. 2000000" },
+  { key: "t2_min_last_price", label: "Min Price ($)", tier: 2, hint: "min last price" },
+  { key: "t2_min_oi",         label: "Min OI",        tier: 2, hint: "ATM open interest" },
+  { key: "t2_atm_pct",        label: "ATM % Range",   tier: 2, hint: "±% e.g. 0.15" },
+  { key: "t2_max_dte",        label: "Max DTE",       tier: 2, hint: "days to expiry" },
+  { key: "t3_min_volume",     label: "Min Volume",    tier: 3, hint: "e.g. 500000" },
+  { key: "t3_min_last_price", label: "Min Price ($)", tier: 3, hint: "min last price" },
+  { key: "t3_min_oi",         label: "Min OI",        tier: 3, hint: "ATM open interest" },
+  { key: "t3_atm_pct",        label: "ATM % Range",   tier: 3, hint: "±% e.g. 0.10" },
+  { key: "t3_max_dte",        label: "Max DTE",       tier: 3, hint: "days to expiry" },
 ];
 
-const TIER_COLORS: Record<1 | 2 | 3, { border: string; bg: string; label: string; text: string }> = {
-  1: { border: "rgba(250,204,21,0.35)",  bg: "rgba(250,204,21,0.07)",  label: "T1 — Liquid Large-Cap",  text: "rgb(250,204,21)"  },
-  2: { border: "rgba(99,102,241,0.35)",  bg: "rgba(99,102,241,0.07)",  label: "T2 — Mid-Cap",           text: "rgb(147,151,255)" },
-  3: { border: "rgba(156,163,175,0.35)", bg: "rgba(156,163,175,0.07)", label: "T3 — Standard",          text: "var(--muted)"     },
+const TIER_COLORS: Record<
+  1 | 2 | 3,
+  { border: string; bg: string; label: string; accent: string }
+> = {
+  1: {
+    border: "rgba(251,191,36,0.3)",
+    bg:     "rgba(251,191,36,0.05)",
+    label:  "T1 — Liquid Large-Cap",
+    accent: "#fbbf24",
+  },
+  2: {
+    border: "rgba(129,140,248,0.3)",
+    bg:     "rgba(129,140,248,0.05)",
+    label:  "T2 — Mid-Cap",
+    accent: "#818cf8",
+  },
+  3: {
+    border: "rgba(107,131,166,0.25)",
+    bg:     "rgba(107,131,166,0.04)",
+    label:  "T3 — Standard",
+    accent: A.muted,
+  },
 };
 
 function TierThresholdsCard({ token }: { token: string | null }) {
@@ -219,7 +503,6 @@ function TierThresholdsCard({ token }: { token: string | null }) {
       const data = await res.json();
       setRow(data.row);
       setCache(data.cache);
-      // Seed edits with current DB values (stringified for inputs)
       const initial: Record<string, string> = {};
       for (const f of TIER_FIELDS) initial[f.key] = String(data.row[f.key] ?? "");
       setEdits(initial);
@@ -234,8 +517,7 @@ function TierThresholdsCard({ token }: { token: string | null }) {
 
   const handleSave = async (key: string) => {
     if (!token || !row) return;
-    const rawVal = edits[key];
-    const numVal = Number(rawVal);
+    const numVal = Number(edits[key]);
     if (isNaN(numVal)) {
       setFieldErr(e => ({ ...e, [key]: "Must be a number" }));
       return;
@@ -264,130 +546,113 @@ function TierThresholdsCard({ token }: { token: string | null }) {
   };
 
   const isDirty = (key: string) =>
-    row !== null && edits[key] !== undefined && edits[key] !== String((row as Record<string, unknown>)[key] ?? "");
+    row !== null &&
+    edits[key] !== undefined &&
+    edits[key] !== String((row as Record<string, unknown>)[key] ?? "");
 
-  const tierGroups: Array<{ tier: 1 | 2 | 3; fields: typeof TIER_FIELDS }> = [
+  const tierGroups: { tier: 1 | 2 | 3; fields: typeof TIER_FIELDS }[] = [
     { tier: 1, fields: TIER_FIELDS.filter(f => f.tier === 1) },
     { tier: 2, fields: TIER_FIELDS.filter(f => f.tier === 2) },
     { tier: 3, fields: TIER_FIELDS.filter(f => f.tier === 3) },
   ];
 
   return (
-    <div className="rounded-xl p-6 max-w-xl mb-6"
-         style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
-
-      <div className="flex items-center justify-between mb-1">
+    <AdminCard>
+      <div className="flex items-start justify-between mb-2">
         <div>
-          <h2 className="text-lg font-semibold font-mono">Tier Thresholds</h2>
-          <p className="text-xs mt-1 font-mono" style={{ color: "var(--muted)" }}>
-            T1/T2/T3 classification rules for the OCC symbol universe.
-            Changes apply on next universe refresh — no restart needed.
+          <h2 className="text-base font-semibold font-mono tracking-tight" style={{ color: A.text }}>
+            Tier Thresholds
+          </h2>
+          <p className="text-xs mt-1 font-mono" style={{ color: A.muted }}>
+            T1/T2/T3 classification rules. Changes apply on next universe refresh.
           </p>
         </div>
         <button
           onClick={fetchThresholds}
-          className="text-xs font-mono ml-4 transition-colors"
-          style={{ color: "var(--muted)" }}
+          className="text-xs font-mono shrink-0 px-2 py-1 rounded transition-colors"
+          style={{ color: A.muted, border: `1px solid ${A.border}`, background: A.surface2 }}
         >
           ↻ Refresh
         </button>
       </div>
 
-      {/* Cache state badge */}
+      {/* Cache badge */}
       {cache && !loading && (
-        <div className="mt-3 mb-4 flex items-center gap-2">
+        <div className="mb-4">
           <span
             className="text-xs font-mono px-2 py-0.5 rounded-full"
             style={{
-              border:     cache.warm ? "1px solid rgba(74,222,128,0.3)"  : "1px solid var(--border)",
-              background: cache.warm ? "rgba(74,222,128,0.08)"           : "var(--surface-2)",
-              color:      cache.warm ? "rgb(74,222,128)"                 : "var(--muted)",
+              border:     cache.warm ? `1px solid ${A.greenBorder}` : `1px solid ${A.border}`,
+              background: cache.warm ? A.greenDim : A.surface2,
+              color:      cache.warm ? A.green    : A.muted,
             }}
           >
             {cache.warm
               ? `● cache warm — ${cache.age_seconds}s ago (TTL ${cache.ttl_seconds}s)`
-              : `○ cache cold — fetches from DB on next assign_tiers()`
-            }
+              : `○ cache cold`}
           </span>
         </div>
       )}
 
       {loading && (
-        <p className="text-xs font-mono mt-4" style={{ color: "var(--muted)" }}>Loading…</p>
+        <p className="text-xs font-mono mt-4" style={{ color: A.muted }}>Loading…</p>
       )}
       {fetchErr && (
-        <p className="text-xs font-mono p-3 rounded mt-4"
-           style={{ color: "var(--red)", background: "rgba(220,53,69,0.1)", border: "1px solid rgba(220,53,69,0.2)" }}>
+        <p
+          className="text-xs font-mono p-3 rounded mt-4"
+          style={{ color: A.red, background: A.redDim, border: `1px solid ${A.redBorder}` }}
+        >
           {fetchErr}
         </p>
       )}
 
       {!loading && row && (
-        <div className="space-y-4 mt-2">
+        <div className="space-y-3 mt-1">
           {tierGroups.map(({ tier, fields }) => {
-            const colors = TIER_COLORS[tier];
+            const c = TIER_COLORS[tier];
             return (
-              <div key={tier}
-                   className="rounded-lg p-4"
-                   style={{ border: `1px solid ${colors.border}`, background: colors.bg }}>
-
-                <p className="text-xs font-mono font-semibold mb-3" style={{ color: colors.text }}>
-                  {colors.label}
+              <div
+                key={tier}
+                className="rounded-lg p-4"
+                style={{ border: `1px solid ${c.border}`, background: c.bg }}
+              >
+                <p
+                  className="text-xs font-mono font-semibold mb-3"
+                  style={{ color: c.accent }}
+                >
+                  {c.label}
                 </p>
-
                 <div className="space-y-2">
                   {fields.map(f => (
                     <div key={f.key}>
-                      <div className="flex items-center justify-between gap-1 mb-0.5">
-                        <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>
+                      <div className="flex items-center justify-between mb-0.5">
+                        <span className="text-xs font-mono" style={{ color: A.muted }}>
                           {f.label}
                         </span>
-                        <span className="text-xs font-mono" style={{ color: "var(--muted)", opacity: 0.5 }}>
+                        <span
+                          className="text-xs font-mono"
+                          style={{ color: A.faint }}
+                        >
                           {f.hint}
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <input
-                          type="text"
+                        <FieldInput
                           value={edits[f.key] ?? ""}
-                          onChange={e => setEdits(prev => ({ ...prev, [f.key]: e.target.value }))}
-                          onKeyDown={e => { if (e.key === "Enter") handleSave(f.key); }}
-                          className="flex-1 px-3 py-1.5 rounded text-sm font-mono"
-                          style={{
-                            background: "var(--bg)",
-                            border: `1px solid ${
-                              fieldErr[f.key]  ? "rgba(220,53,69,0.6)" :
-                              isDirty(f.key)   ? "rgba(250,204,21,0.5)" :
-                              "var(--border)"
-                            }`,
-                            color:   "var(--text)",
-                            outline: "none",
-                          }}
+                          onChange={v => setEdits(p => ({ ...p, [f.key]: v }))}
+                          onEnter={() => handleSave(f.key)}
+                          dirty={isDirty(f.key)}
+                          error={fieldErr[f.key] ?? ""}
                         />
-                        <button
+                        <SaveBtn
                           onClick={() => handleSave(f.key)}
-                          disabled={saving[f.key] || !isDirty(f.key)}
-                          className="px-4 py-1.5 rounded text-xs font-mono font-semibold transition-colors"
-                          style={{
-                            minWidth:   "62px",
-                            background:
-                              saved[f.key]    ? "rgba(74,222,128,0.15)" :
-                              saving[f.key]   ? "var(--border)" :
-                              !isDirty(f.key) ? "var(--border)" :
-                              "rgba(99,102,241,0.8)",
-                            color:
-                              saved[f.key]    ? "rgb(74,222,128)" :
-                              !isDirty(f.key) ? "var(--muted)" :
-                              "#fff",
-                            cursor:  saving[f.key] || !isDirty(f.key) ? "not-allowed" : "pointer",
-                            border:  saved[f.key] ? "1px solid rgba(74,222,128,0.3)" : "1px solid transparent",
-                          }}
-                        >
-                          {saved[f.key] ? "✓ Saved" : saving[f.key] ? "Saving…" : "Save"}
-                        </button>
+                          saving={!!saving[f.key]}
+                          saved={!!saved[f.key]}
+                          dirty={isDirty(f.key)}
+                        />
                       </div>
                       {fieldErr[f.key] && (
-                        <p className="text-xs font-mono mt-0.5" style={{ color: "var(--red)" }}>
+                        <p className="text-xs font-mono mt-0.5" style={{ color: A.red }}>
                           {fieldErr[f.key]}
                         </p>
                       )}
@@ -401,20 +666,19 @@ function TierThresholdsCard({ token }: { token: string | null }) {
       )}
 
       {row && (
-        <p className="text-xs font-mono mt-4" style={{ color: "var(--muted)", opacity: 0.45 }}>
+        <p className="text-xs font-mono mt-4" style={{ color: A.faint }}>
           Last updated {new Date(row.updated_at).toLocaleString()}
-          {row.updated_by ? ` by ${row.updated_by}` : ""}
-          {" · "} row #{row.id}
+          {row.updated_by ? ` by ${row.updated_by}` : ""} · row #{row.id}
         </p>
       )}
-
-      <p className="text-xs font-mono mt-2" style={{ color: "var(--muted)", opacity: 0.45 }}>
-        ⚡ Saves immediately bust the in-process cache (no restart required).
-        New thresholds apply on the next universe refresh cycle.
+      <p className="text-xs font-mono mt-1" style={{ color: A.faint }}>
+        ⚡ Saves bust the in-process cache immediately. No restart required.
       </p>
-    </div>
+    </AdminCard>
   );
 }
+
+/* ─── Ingestion Config card ──────────────────────────────── */
 
 function IngestionConfigCard({ token }: { token: string | null }) {
   const [rows,     setRows]     = useState<ConfigRow[]>([]);
@@ -477,133 +741,109 @@ function IngestionConfigCard({ token }: { token: string | null }) {
     edits[key] !== undefined && edits[key] !== currentValue;
 
   return (
-    <div className="rounded-xl p-6 max-w-xl"
-         style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
-
-      <div className="flex items-center justify-between mb-1">
+    <AdminCard>
+      <div className="flex items-start justify-between mb-5">
         <div>
-          <h2 className="text-lg font-semibold font-mono">Ingestion Config</h2>
-          <p className="text-xs mt-1 font-mono" style={{ color: "var(--muted)" }}>
-            Layer 1 OCC registry + universe pipeline knobs. Changes take effect on next registry
-            refresh — no restart needed.
+          <h2 className="text-base font-semibold font-mono tracking-tight" style={{ color: A.text }}>
+            Ingestion Config
+          </h2>
+          <p className="text-xs mt-1 font-mono" style={{ color: A.muted }}>
+            Layer 1 OCC registry + universe pipeline knobs.
+            Takes effect on next registry refresh — no restart needed.
           </p>
         </div>
         <button
           onClick={fetchConfig}
-          className="text-xs font-mono ml-4 transition-colors"
-          style={{ color: "var(--muted)" }}
+          className="text-xs font-mono shrink-0 px-2 py-1 rounded transition-colors"
+          style={{ color: A.muted, border: `1px solid ${A.border}`, background: A.surface2 }}
         >
           ↻ Refresh
         </button>
       </div>
 
-      <div className="mt-5">
-        {loading && (
-          <p className="text-xs font-mono" style={{ color: "var(--muted)" }}>Loading…</p>
-        )}
-        {fetchErr && (
-          <p className="text-xs font-mono p-3 rounded"
-             style={{ color: "var(--red)", background: "rgba(220,53,69,0.1)", border: "1px solid rgba(220,53,69,0.2)" }}>
-            {fetchErr}
-          </p>
-        )}
+      {loading && (
+        <p className="text-xs font-mono" style={{ color: A.muted }}>Loading…</p>
+      )}
+      {fetchErr && (
+        <p
+          className="text-xs font-mono p-3 rounded"
+          style={{ color: A.red, background: A.redDim, border: `1px solid ${A.redBorder}` }}
+        >
+          {fetchErr}
+        </p>
+      )}
 
-        {!loading && rows.length > 0 && (
-          <div className="space-y-3">
-            {rows.map(row => (
-              <div key={row.key}
-                   className="rounded-lg p-4"
-                   style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div>
-                    <p className="text-xs font-mono font-semibold" style={{ color: "var(--text)" }}>
-                      {row.key}
-                    </p>
-                    {row.description && (
-                      <p className="text-xs font-mono mt-0.5" style={{ color: "var(--muted)" }}>
-                        {row.description}
-                      </p>
-                    )}
-                  </div>
-                  <span className="text-xs font-mono px-2 py-0.5 rounded shrink-0"
-                        style={{ background: "var(--surface)", color: "var(--muted)", border: "1px solid var(--border)" }}>
-                    {row.value_type}
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={edits[row.key] ?? row.value}
-                    onChange={e => setEdits(prev => ({ ...prev, [row.key]: e.target.value }))}
-                    onKeyDown={e => { if (e.key === "Enter") handleSave(row.key); }}
-                    className="flex-1 px-3 py-1.5 rounded text-sm font-mono"
-                    style={{
-                      background: "var(--bg)",
-                      border: `1px solid ${
-                        errors[row.key]              ? "rgba(220,53,69,0.6)" :
-                        isDirty(row.key, row.value)  ? "rgba(250,204,21,0.5)" :
-                        "var(--border)"
-                      }`,
-                      color:   "var(--text)",
-                      outline: "none",
-                    }}
-                  />
-                  <button
-                    onClick={() => handleSave(row.key)}
-                    disabled={saving[row.key] || !isDirty(row.key, row.value)}
-                    className="px-4 py-1.5 rounded text-xs font-mono font-semibold transition-colors"
-                    style={{
-                      minWidth:   "62px",
-                      background:
-                        saved[row.key]               ? "rgba(74,222,128,0.15)" :
-                        saving[row.key]              ? "var(--border)" :
-                        !isDirty(row.key, row.value) ? "var(--border)" :
-                        "rgba(99,102,241,0.8)",
-                      color:
-                        saved[row.key]               ? "rgb(74,222,128)" :
-                        !isDirty(row.key, row.value) ? "var(--muted)" :
-                        "#fff",
-                      cursor:  saving[row.key] || !isDirty(row.key, row.value) ? "not-allowed" : "pointer",
-                      border:  saved[row.key] ? "1px solid rgba(74,222,128,0.3)" : "1px solid transparent",
-                    }}
-                  >
-                    {saved[row.key] ? "✓ Saved" : saving[row.key] ? "Saving…" : "Save"}
-                  </button>
-                </div>
-
-                {errors[row.key] && (
-                  <p className="text-xs font-mono mt-1.5" style={{ color: "var(--red)" }}>
-                    {errors[row.key]}
+      {!loading && rows.length > 0 && (
+        <div className="space-y-3">
+          {rows.map(row => (
+            <div
+              key={row.key}
+              className="rounded-lg p-4"
+              style={{ background: A.surface2, border: `1px solid ${A.border}` }}
+            >
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <div>
+                  <p className="text-xs font-mono font-semibold" style={{ color: A.text }}>
+                    {row.key}
                   </p>
-                )}
-
-                <p className="text-xs font-mono mt-2" style={{ color: "var(--muted)", opacity: 0.55 }}>
-                  Updated {new Date(row.updated_at).toLocaleString()}
-                  {row.updated_by ? ` by ${row.updated_by}` : ""}
-                </p>
+                  {row.description && (
+                    <p className="text-xs font-mono mt-0.5" style={{ color: A.muted }}>
+                      {row.description}
+                    </p>
+                  )}
+                </div>
+                <span
+                  className="text-xs font-mono px-2 py-0.5 rounded shrink-0"
+                  style={{
+                    background: A.surface,
+                    color: A.cyan,
+                    border: `1px solid ${A.cyanBorder}`,
+                  }}
+                >
+                  {row.value_type}
+                </span>
               </div>
-            ))}
-          </div>
-        )}
-      </div>
 
-      <p className="text-xs font-mono mt-5" style={{ color: "var(--muted)", opacity: 0.45 }}>
-        ⚡ Changes propagate to the OCC registry within REGISTRY_REFRESH_MINS minutes (next scheduled rebuild).
-      </p>
-    </div>
-  );
-}
+              <div className="flex items-center gap-2">
+                <FieldInput
+                  value={edits[row.key] ?? row.value}
+                  onChange={v => setEdits(p => ({ ...p, [row.key]: v }))}
+                  onEnter={() => handleSave(row.key)}
+                  dirty={isDirty(row.key, row.value)}
+                  error={errors[row.key] ?? ""}
+                />
+                <SaveBtn
+                  onClick={() => handleSave(row.key)}
+                  saving={!!saving[row.key]}
+                  saved={!!saved[row.key]}
+                  dirty={isDirty(row.key, row.value)}
+                />
+              </div>
 
-function Stat({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-lg p-3"
-         style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-      <p className="text-xs font-mono mb-1" style={{ color: "var(--muted)" }}>{label}</p>
-      <p className="text-sm font-semibold font-mono" style={{ color: "var(--text)" }}>
-        {typeof value === "number" ? value.toLocaleString() : value}
+              {errors[row.key] && (
+                <p className="text-xs font-mono mt-1" style={{ color: A.red }}>
+                  {errors[row.key]}
+                </p>
+              )}
+
+              <p className="text-xs font-mono mt-2" style={{ color: A.faint }}>
+                Updated {new Date(row.updated_at).toLocaleString()}
+                {row.updated_by ? ` by ${row.updated_by}` : ""}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!loading && rows.length === 0 && !fetchErr && (
+        <p className="text-xs font-mono" style={{ color: A.muted }}>
+          No config rows found.
+        </p>
+      )}
+
+      <p className="text-xs font-mono mt-4" style={{ color: A.faint }}>
+        ⚡ Changes propagate within REGISTRY_REFRESH_MINS minutes (next scheduled rebuild).
       </p>
-    </div>
+    </AdminCard>
   );
 }
