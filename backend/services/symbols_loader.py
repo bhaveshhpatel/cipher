@@ -8,7 +8,7 @@ Universe pipeline:
   Step 1 — CBOE CSV → ~5,500 raw symbols
   Step 2 — Tradier /expirations validation → ~5,500 confirmed optionable symbols
   Step 3 — Tradier /v1/markets/quotes batch fetch (200/request, ~28 parallel)
-             → last_price, volume per symbol
+             → last_price, volume, average_volume, open_interest per symbol
              → compute stream_eligible flag
   Step 4 — Extract stream_eligible=true symbols → StreamPoolManager (~1,000–2,000)
   Step 5 — Save snapshot to options_universe_snapshots
@@ -59,10 +59,12 @@ _QUOTES_TIMEOUT       = 12.0
 
 @dataclass
 class SymbolQuote:
-    symbol: str
-    last_price: Optional[float] = None
-    volume: Optional[int] = None
-    stream_eligible: bool = False
+    symbol:         str
+    last_price:     Optional[float] = None
+    volume:         Optional[int]   = None
+    average_volume: Optional[int]   = None
+    open_interest:  Optional[int]   = None
+    stream_eligible: bool           = False
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +96,6 @@ async def load_universe(
             # Step 3 — batch quotes → stream eligibility
             quotes = await _fetch_batch_quotes(symbols)
             eligible_set = {q.symbol for q in quotes if q.stream_eligible}
-
-            # Priority symbols are always stream-eligible regardless of price/volume
-            priority = set(settings.priority_symbols)
-            eligible_set |= (priority & set(symbols))
 
             log.info(
                 "Step 3 complete: %d / %d symbols stream-eligible (%.1f%%) "
@@ -242,7 +240,7 @@ async def _validate_symbols(symbols: list[str]) -> list[str]:
 
 async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
     """
-    Fetch last_price and volume for all symbols via Tradier /v1/markets/quotes.
+    Fetch last_price, volume, average_volume for all symbols via Tradier /v1/markets/quotes.
 
     Batches symbols into groups of UNIVERSE_QUOTES_BATCH_SIZE (default 200),
     fires up to UNIVERSE_QUOTES_CONCURRENCY (default 28) batches in parallel.
@@ -251,8 +249,7 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                       AND volume  >= UNIVERSE_MIN_VOLUME
 
     Any symbol that errors or returns no quote data gets:
-      last_price=None, volume=None, stream_eligible=False
-    (unless it is in priority_symbols, which is forced eligible by the caller).
+      last_price=None, volume=None, average_volume=None, stream_eligible=False
     """
     if not symbols:
         return []
@@ -317,6 +314,7 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
 
                     last_price: Optional[float] = None
                     volume:     Optional[int]   = None
+                    average_volume: Optional[int] = None
 
                     for price_key in ("last", "last_price", "close", "prevclose"):
                         val = raw.get(price_key)
@@ -327,8 +325,7 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                             except (TypeError, ValueError):
                                 pass
 
-                    # Use max(average_volume, today_volume) so symbols like HOOD that
-                    # report average_volume=0 but have real intraday volume still qualify.
+                    # Capture average_volume separately (used for tier assignment)
                     avg_vol: int = 0
                     today_vol: int = 0
                     try:
@@ -339,6 +336,12 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                         today_vol = int(float(raw.get("volume") or 0))
                     except (TypeError, ValueError):
                         pass
+
+                    if avg_vol > 0:
+                        average_volume = avg_vol
+
+                    # Use max(average_volume, today_volume) so symbols like HOOD that
+                    # report average_volume=0 but have real intraday volume still qualify.
                     effective_vol = max(avg_vol, today_vol)
                     volume = effective_vol if effective_vol > 0 else None
 
@@ -353,6 +356,7 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                         symbol=symbol,
                         last_price=last_price,
                         volume=volume,
+                        average_volume=average_volume,
                         stream_eligible=eligible,
                     ))
 

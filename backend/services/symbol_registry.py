@@ -44,7 +44,9 @@ class SymbolRegistry:
     """
 
     def __init__(self, watchlist: Optional[list[str]] = None):
-        self._watchlist: list[str] = watchlist or list(settings.priority_symbols)
+        # 4A: watchlist is now always passed explicitly by the caller.
+        # No longer falls back to the removed priority_symbols config.
+        self._watchlist: list[str] = watchlist or []
         self._registry: dict[str, ContractMeta] = {}
         self._stock_prices: dict[str, float] = {}
         self._last_build: Optional[datetime] = None

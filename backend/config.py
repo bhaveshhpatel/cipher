@@ -35,7 +35,6 @@ class Settings(BaseSettings):
     SWARM_N_AGENTS: int = 6
 
     # Universe pipeline settings
-    UNIVERSE_PRIORITY_SYMBOLS: str = "SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD"
     UNIVERSE_BATCH_DELAY_MS: int = 0
     UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True
 
@@ -62,10 +61,6 @@ class Settings(BaseSettings):
     @property
     def origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
-
-    @property
-    def priority_symbols(self) -> List[str]:
-        return [s.strip() for s in self.UNIVERSE_PRIORITY_SYMBOLS.split(",") if s.strip()]
 
 
 settings = Settings()
