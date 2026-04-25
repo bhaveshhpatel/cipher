@@ -68,6 +68,13 @@ Fix (C-017):
     message always follows immediately and contains richer data (composite score,
     reasoning, recommendation). The raw 'signal' event is still broadcast on the
     WebSocket bus for real-time frontend delivery — it just no longer writes to DB.
+
+Fix (C-018) — Synthetic Quote Tagging:
+  - is_synthetic_quote field now written to flow_events.is_synthetic_quote column.
+    Rows where bid=ask=0 and spread was synthesized from fill price are tagged.
+    Exclude these rows from backtesting aggression and net-premium calculations.
+    Requires DB migration: ALTER TABLE flow_events ADD COLUMN
+      is_synthetic_quote boolean NOT NULL DEFAULT false;
 """
 import asyncio
 import logging
@@ -163,29 +170,31 @@ async def persist_flow_event(ev_dict: dict):
         log.warning(f"[flow_store] {ticker}: strike=0.0 — verify OCC parse for this symbol")
 
     row = {
-        "ticker":            ticker,
-        "contract_type":     ev_dict.get("contract_type"),
-        "strike":            strike,
-        "expiry":            expiry,
-        "dte":               ev_dict.get("dte", 0),
-        "fill_price":        ev_dict.get("fill_price", 0.0),
-        "bid":               ev_dict.get("bid", 0.0),
-        "ask":               ev_dict.get("ask", 0.0),
-        "size":              ev_dict.get("size", 0),
-        "premium":           ev_dict.get("premium", 0.0),
-        "trade_type":        ev_dict.get("trade_type", "UNKNOWN"),
-        "bid_ask_class":     ev_dict.get("bid_ask_class", "MID"),
-        "is_aggressive":     ev_dict.get("is_aggressive", False),
-        "is_golden_sweep":   ev_dict.get("is_golden_sweep", False),
-        "sentiment":         ev_dict.get("sentiment", "NEUTRAL"),
-        "influence_tier":    ev_dict.get("influence_tier", "RETAIL"),
-        "conviction_score":  ev_dict.get("conviction_score", 0.0),
-        "exchange_count":    ev_dict.get("exchange_count", 1),
-        "fill_count":        ev_dict.get("fill_count", 1),
-        "open_interest":     ev_dict.get("open_interest", 0),
-        "iv":                ev_dict.get("iv", 0.0),
-        "underlying_price":  ev_dict.get("underlying_price", 0.0),
-        "occ_symbol":        ev_dict.get("occ_symbol"),
+        "ticker":               ticker,
+        "contract_type":        ev_dict.get("contract_type"),
+        "strike":               strike,
+        "expiry":               expiry,
+        "dte":                  ev_dict.get("dte", 0),
+        "fill_price":           ev_dict.get("fill_price", 0.0),
+        "bid":                  ev_dict.get("bid", 0.0),
+        "ask":                  ev_dict.get("ask", 0.0),
+        "size":                 ev_dict.get("size", 0),
+        "premium":              ev_dict.get("premium", 0.0),
+        "trade_type":           ev_dict.get("trade_type", "UNKNOWN"),
+        "bid_ask_class":        ev_dict.get("bid_ask_class", "MID"),
+        "is_aggressive":        ev_dict.get("is_aggressive", False),
+        "is_golden_sweep":      ev_dict.get("is_golden_sweep", False),
+        "sentiment":            ev_dict.get("sentiment", "NEUTRAL"),
+        "influence_tier":       ev_dict.get("influence_tier", "RETAIL"),
+        "conviction_score":     ev_dict.get("conviction_score", 0.0),
+        "exchange_count":       ev_dict.get("exchange_count", 1),
+        "fill_count":           ev_dict.get("fill_count", 1),
+        "open_interest":        ev_dict.get("open_interest", 0),
+        "iv":                   ev_dict.get("iv", 0.0),
+        "underlying_price":     ev_dict.get("underlying_price", 0.0),
+        "occ_symbol":           ev_dict.get("occ_symbol"),
+        # C-018: tag rows where bid/ask were synthesised — unreliable for backtesting
+        "is_synthetic_quote":   ev_dict.get("is_synthetic_quote", False),
     }
     _flow_event_buffer.append(row)
 

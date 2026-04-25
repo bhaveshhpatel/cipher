@@ -48,6 +48,11 @@ Architecture change (Layer 1+2):
     which was the root cause of receiving equity events instead of option events.
   - occ_symbol field now passed through to persist_flow_event() and stored in DB.
 
+Fix (C-018) — Synthetic Quote Tagging:
+  - is_synthetic_quote is now forwarded from OptionsFlowEvent through
+    _process_trade() into the persist_flow_event() dict.
+  - Rows where bid=ask=0 and spread was synthesised are tagged in the DB.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -316,32 +321,34 @@ async def _process_trade(raw: dict):
         f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
         f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier} "
         f"| conviction={ev.conviction_score} occ={occ_symbol}"
+        f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
     await persist_flow_event({
-        "ticker":           ev.ticker,
-        "contract_type":    ev.contract_type,
-        "strike":           ev.strike,
-        "expiry":           ev.expiry,
-        "dte":              ev.dte,
-        "fill_price":       ev.fill_price,
-        "bid":              ev.bid,
-        "ask":              ev.ask,
-        "size":             ev.size,
-        "premium":          ev.premium,
-        "trade_type":       ev.trade_type,
-        "bid_ask_class":    ev.bid_ask_class,
-        "is_aggressive":    ev.is_aggressive,
-        "is_golden_sweep":  ev.is_golden_sweep,
-        "sentiment":        ev.sentiment,
-        "influence_tier":   ev.influence_tier,
-        "conviction_score": ev.conviction_score,
-        "exchange_count":   ev.exchange_count,
-        "fill_count":       ev.fill_count,
-        "open_interest":    ev.open_interest,
-        "iv":               ev.iv,
-        "underlying_price": ev.underlying_price,
-        "occ_symbol":       occ_symbol,
+        "ticker":               ev.ticker,
+        "contract_type":        ev.contract_type,
+        "strike":               ev.strike,
+        "expiry":               ev.expiry,
+        "dte":                  ev.dte,
+        "fill_price":           ev.fill_price,
+        "bid":                  ev.bid,
+        "ask":                  ev.ask,
+        "size":                 ev.size,
+        "premium":              ev.premium,
+        "trade_type":           ev.trade_type,
+        "bid_ask_class":        ev.bid_ask_class,
+        "is_aggressive":        ev.is_aggressive,
+        "is_golden_sweep":      ev.is_golden_sweep,
+        "sentiment":            ev.sentiment,
+        "influence_tier":       ev.influence_tier,
+        "conviction_score":     ev.conviction_score,
+        "exchange_count":       ev.exchange_count,
+        "fill_count":           ev.fill_count,
+        "open_interest":        ev.open_interest,
+        "iv":                   ev.iv,
+        "underlying_price":     ev.underlying_price,
+        "occ_symbol":           occ_symbol,
+        "is_synthetic_quote":   ev.is_synthetic_quote,   # C-018
     })
 
     ep = accumulator.ingest(ev)

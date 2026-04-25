@@ -42,9 +42,16 @@ Architecture change (Layer 1):
     contract_type/dte/open_interest with pre-validated chain data.
     This ensures 100% accurate metadata even if the OCC regex fails on
     unusual symbol formats.
+
+Fix (C-018) — Synthetic Quote Tagging:
+  - Added `is_synthetic_quote: bool` field to OptionsFlowEvent dataclass.
+  - Set to True when bid=ask=0 and fill > 0 (synthetic spread was applied).
+  - Passed through to flow_store → flow_events.is_synthetic_quote column.
+  - Rows with is_synthetic_quote=True have unreliable bid_ask_class and
+    is_aggressive values — exclude them from backtesting aggression metrics.
 """
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Optional
 from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
@@ -83,11 +90,16 @@ class OptionsFlowEvent:
     conviction_score: float = 0.0
 
     # Metadata
-    exchange_count: int = 1
-    fill_count:     int = 1
-    open_interest:  int = 0
-    iv:             float = 0.0
-    underlying_price: float = 0.0
+    exchange_count:    int = 1
+    fill_count:        int = 1
+    open_interest:     int = 0
+    iv:                float = 0.0
+    underlying_price:  float = 0.0
+
+    # Data quality flag — True when bid=ask=0 and spread was synthesized from fill.
+    # Rows with this flag set have unreliable bid_ask_class / is_aggressive values.
+    # Exclude from backtesting aggression and net-premium calculations.
+    is_synthetic_quote: bool = False
 
 
 # OCC symbol pattern: AAPL  240119C00150000 or SPXW  260117P04500000
@@ -227,12 +239,16 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         exc_cnt  = int(raw.get("exchange_count", 1) or 1)
         fill_cnt = int(raw.get("fill_count", 1) or 1)
 
-        # Synthetic spread when bid/ask both 0 but fill is nonzero
+        # Synthetic spread when bid/ask both 0 but fill is nonzero.
+        # Tag the event so downstream backtesting can exclude these rows
+        # from aggression and net-premium calculations.
+        is_synthetic_quote = False
         effective_bid = bid
         effective_ask = ask
         if effective_bid == 0 and effective_ask == 0 and fill > 0:
             effective_bid = round(fill * 0.995, 4)
             effective_ask = round(fill * 1.005, 4)
+            is_synthetic_quote = True
 
         ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
         ttype      = detect_trade_type(size, premium, exc_cnt, fill_cnt)
@@ -261,6 +277,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             open_interest   = int(raw.get("open_interest", 0) or 0),
             iv              = float((raw.get("greeks") or {}).get("mid_iv", 0) or 0),
             underlying_price = float(raw.get("underlying_price", 0) or 0),
+            is_synthetic_quote = is_synthetic_quote,
         )
 
         # Sentiment: CALL = BULLISH baseline, PUT = BEARISH baseline
