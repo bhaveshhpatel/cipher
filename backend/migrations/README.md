@@ -54,23 +54,34 @@ The script:
 4. Apply via the runner or directly in the Supabase dashboard.
 5. Commit both the `.sql` file and any corresponding model changes together.
 
-## Schema state (as of 2026-04-24)
+## Schema state (as of 2026-04-25, post Feature 4A-OI)
 
 ### `options_universe_symbols` (key columns)
-| Column | Type | Default | Added in |
-|--------|------|---------|----------|
-| `tier` | `SMALLINT` | `3` | 010 |
-| `open_interest` | `INT` | `NULL` | 010 |
-| `average_volume` | `INT` | `NULL` | 010 |
+| Column | Type | Default | Added in | Notes |
+|--------|------|---------|----------|-------|
+| `tier` | `SMALLINT` | `3` | 010 | OI-informed classification since 4A-OI (2026-04-25) |
+| `open_interest` | `INT` | `NULL` | 010 | Avg chain OI from `symbol_registry.build()` since 4A-OI |
+| `average_volume` | `INT` | `NULL` | 010 | From Tradier quote at cold-start |
+
+> **Backfill note (4A-OI, 2026-04-25):** The `open_interest` column was added in migration 010
+> but was not populated until Feature 4A-OI shipped (2026-04-25). Any rows written before
+> that date will have `open_interest = NULL`. The column will be populated on the next
+> cold-start (tradier_validated path) or background 24h refresh. No manual backfill is
+> required — the two-pass pipeline handles it automatically on the next startup.
 
 ### `tier_thresholds`
 | Column | Description |
 |--------|-------------|
-| `t1_*` | Tier 1 (liquid large-caps): vol ≥ 20M, ATM ±20%, DTE ≤ 90 |
-| `t2_*` | Tier 2 (mid-cap): vol ≥ 2M, ATM ±15%, DTE ≤ 60 |
-| `t3_*` | Tier 3 (standard): vol ≥ 500K, ATM ±10%, DTE ≤ 30 |
+| `t1_*` | Tier 1 (liquid large-caps): vol ≥ 20M, price ≥ $10, OI ≥ 1 000, ATM ±20%, DTE ≤ 90 |
+| `t2_*` | Tier 2 (mid-cap): vol ≥ 2M, price ≥ $10, OI ≥ 500, ATM ±15%, DTE ≤ 60 |
+| `t3_*` | Tier 3 (standard): vol ≥ 500K, price ≥ $1, OI ≥ 100, ATM ±10%, DTE ≤ 30 |
 | `is_active` | Only the `true` row is read by the backend |
 | `updated_at` | Auto-updated by trigger (migration 012) |
+
+> **OI grace path removed (4A-OI):** Prior to 2026-04-25, `tier_engine._classify()` would
+> promote symbols to T1/T2 based on vol+price alone when `open_interest == 0` (grace path).
+> This path is permanently removed. All three conditions (vol + price + OI) must be satisfied
+> for T1 or T2 classification. Symbols with `oi=0` always fall to T3.
 
 RLS: service role has full access (Supabase default); `authenticated` users have SELECT (migration 012).
 
@@ -78,3 +89,18 @@ Admin endpoints:
 - `GET  /api/admin/tier-thresholds` — read active row + cache metadata (B-019)
 - `PATCH /api/admin/tier-thresholds` — update threshold columns, busts cache (Feature 4A)
 - `GET  /api/admin/tier-distribution` — tier counts + samples for active snapshot (B-020)
+
+## Feature 4A-OI implementation summary (2026-04-25)
+
+No new migration was required for Feature 4A-OI. Migration 010 already created the
+`open_interest` column. The feature work was entirely in application code:
+
+| Chunk | File | Change |
+|-------|------|--------|
+| 1A | `services/symbol_registry.py` | `_oi_by_ticker` dict + `get_oi_map()` public method |
+| 1B | `services/tier_engine.py` | Removed OI grace path from `_classify()` |
+| 1C | `services/universe_store.py` | `open_interest` field in `_sync_upsert_symbol_quotes()` |
+| 1D | `backend/main.py` | `_stamp_oi()` helper + two-pass OI re-tiering in `lifespan()` |
+| 2A | `tests/test_4a_oi_pipeline.py` | 20 new tests: registry, classify, stamp, integration |
+| 2B | `tests/test_4a_tier_engine.py` | TE-23–26: grace-path removal regression tests |
+| 2C | `tests/test_universe_store.py` | US-OI-01–04: open_interest upsert assertion tests |
