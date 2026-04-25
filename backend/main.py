@@ -23,6 +23,7 @@ from services import universe_store
 from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
+from services.symbol_registry import init_registry, get_registry
 
 
 class _JsonFormatter(logging.Formatter):
@@ -62,15 +63,18 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
-# Universe loader
+# Universe loader — returns (stream_symbols, tier_map)
 # ---------------------------------------------------------------------------
-async def _resolve_startup_universe() -> list[str]:
+async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
     """
     Priority:
       1. Fresh DB snapshot (< 24h old) — stream starts instantly
       2. Tradier fetch + validate + screen — saves to DB, then starts
       3. Any DB snapshot (stale)          — fallback if Tradier is down
       4. SEED_SYMBOLS                     — last resort
+
+    Returns (stream_symbols, tier_map) so the registry can be
+    initialised with accurate per-symbol tiers from the first build.
     """
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
@@ -80,7 +84,16 @@ async def _resolve_startup_universe() -> list[str]:
             "[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting",
             len(fresh),
         )
-        return fresh
+        # Load tier_map from DB so the registry isn't built tier-blind on warm starts
+        tier_map = await universe_store.load_tier_map()
+        log.info(
+            "[universe] Step 1: tier_map loaded (%d symbols mapped, T1=%d T2=%d T3=%d)",
+            len(tier_map),
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+        return fresh, tier_map
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
     log.info(
@@ -102,6 +115,8 @@ async def _resolve_startup_universe() -> list[str]:
         source, len(symbols),
         len(stream_eligible_set) if stream_eligible_set is not None else "n/a",
     )
+
+    tier_map: dict[str, int] = {}
 
     if source == "tradier_validated":
         log.info(
@@ -142,7 +157,7 @@ async def _resolve_startup_universe() -> list[str]:
         "[universe] FINAL: stream starting with %d symbols (source=%s, from universe of %d)",
         len(stream_symbols), source, len(symbols),
     )
-    return stream_symbols
+    return stream_symbols, tier_map
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +173,22 @@ async def _universe_refresh_loop():
             symbols, source, stream_eligible_set, quotes = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+                tier_map: dict[str, int] = {}
                 if saved and quotes:
                     tier_map = await assign_tiers(quotes)
                     await universe_store.upsert_symbol_quotes(quotes, tier_map)
+
+                # Hot-swap tier_map on the running registry so next rebuild uses fresh tiers
+                registry = get_registry()
+                if registry and tier_map:
+                    registry.set_tier_map(tier_map)
+                    log.info(
+                        "[universe] Background refresh: registry tier_map updated (T1=%d T2=%d T3=%d)",
+                        sum(1 for t in tier_map.values() if t == 1),
+                        sum(1 for t in tier_map.values() if t == 2),
+                        sum(1 for t in tier_map.values() if t == 3),
+                    )
+
                 log.info(
                     "[universe] Background refresh complete: %d symbols eligible=%s saved=%s",
                     len(symbols),
@@ -180,19 +208,30 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    symbols             = await _resolve_startup_universe()
-    stream_task         = asyncio.create_task(stream_options_flow(symbols))
-    db_write_task       = asyncio.create_task(start_flow_writer())
-    signal_write_task   = asyncio.create_task(start_signal_writer())   # Phase 4
-    refresh_task        = asyncio.create_task(_universe_refresh_loop())
+    stream_symbols, tier_map = await _resolve_startup_universe()
+
+    # Initialise the OCC symbol registry with tier-aware watchlist
+    registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
+    log.info(
+        "[registry] Initialised with %d stream symbols, %d tiers mapped",
+        len(stream_symbols), len(tier_map),
+    )
+    asyncio.create_task(registry.build())          # first build fires immediately in background
+    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
+
+    stream_task       = asyncio.create_task(stream_options_flow(stream_symbols))
+    db_write_task     = asyncio.create_task(start_flow_writer())
+    signal_write_task = asyncio.create_task(start_signal_writer())
+    refresh_task      = asyncio.create_task(_universe_refresh_loop())
 
     yield
 
     refresh_task.cancel()
+    registry_refresh_task.cancel()
     stream_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    for task in (stream_task, db_write_task, signal_write_task, refresh_task):
+    for task in (stream_task, db_write_task, signal_write_task, refresh_task, registry_refresh_task):
         try:
             await task
         except asyncio.CancelledError:
