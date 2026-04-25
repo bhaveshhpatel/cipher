@@ -16,13 +16,25 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 ┌──────────────────────────────────────────────────────────────────┐
 │  Layer 1 — Symbol Registry  (services/symbol_registry.py)        │
 │                                                                   │
-│  Pre-loads all ~16,000 OCC contract metadata at startup into a   │
-│  dict. On each stream tick: O(1) lookup                          │
+│  Pre-loads OCC contract metadata at startup into a dict.         │
+│  On each stream tick: O(1) lookup                                │
 │    registry["TSLA260424C00375000"]                               │
-│      → { ticker, strike, expiry, contract_type, DTE }            │
+│      → { ticker, strike, expiry, contract_type, DTE, tier }      │
 │  No regex, no API call, no per-tick latency.                     │
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).            │
 │  On expiry days: refreshes every 15 min.                         │
+│                                                                   │
+│  Feature 4A — Per-tier contract filtering:                       │
+│  Contract universe is shaped by the symbol's tier at build time. │
+│  Tier params loaded from tier_thresholds DB row (cached 300s).   │
+│    Tier 1 (liquid): ATM ±20%  max DTE 90  (e.g. AAPL, TSLA)    │
+│    Tier 2 (mid-cap): ATM ±15%  max DTE 60                       │
+│    Tier 3 (default): ATM ±10%  max DTE 30                       │
+│  Unknown-tier symbols fall back to T3 params.                    │
+│  ContractMeta gains a .tier field — carried through pipeline     │
+│  into backtest_score (historical win-rate by ticker/type/DTE/    │
+│  tier). Tier map seeded from universe_store.load_tier_map() on   │
+│  warm start; updated via registry.set_tier_map() on refresh.    │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
