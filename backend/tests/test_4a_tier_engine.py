@@ -7,6 +7,7 @@ Covers:
   TE-13 … TE-16  Admin endpoint column whitelist / PATCH guard
   TE-17 … TE-20  _TierParams dataclass + ContractMeta.tier field (symbol_registry.py)
   TE-21 … TE-22  tier_map round-trip: upsert_symbol_quotes stores tier column
+  TE-23 … TE-26  OI grace-path removal regression (Feature 4A-OI)
 
 All tests are pure-Python / asyncio — no Supabase, no network.
 """
@@ -309,3 +310,99 @@ class TestTierMapRoundTrip:
             )
         else:
             assert rows.get("tier") == 1
+
+
+# ===========================================================================
+# TE-23 … TE-26  OI grace-path removal regression (Feature 4A-OI)
+# ===========================================================================
+
+class TestOiGracePathRemoved:
+    """
+    Regression guard: ensures the OI grace path (promoting oi=0 symbols to
+    T1/T2 based on vol+price alone) is permanently gone from _classify().
+
+    If Chunk 1B is ever reverted, TE-23 and TE-24 will fail immediately.
+    These tests use _classify() directly so they are independent of the
+    async assign_tiers() machinery.
+    """
+
+    def _thresh(self):
+        return {
+            "t1_min_volume":     20_000_000,
+            "t1_min_last_price": 10.0,
+            "t1_min_oi":         1_000,
+            "t1_atm_pct":        0.20,
+            "t1_max_dte":        90,
+            "t2_min_volume":     2_000_000,
+            "t2_min_last_price": 10.0,
+            "t2_min_oi":         500,
+            "t2_atm_pct":        0.15,
+            "t2_max_dte":        60,
+            "t3_min_volume":     500_000,
+            "t3_min_last_price": 1.0,
+            "t3_min_oi":         100,
+            "t3_atm_pct":        0.10,
+            "t3_max_dte":        30,
+        }
+
+    def _make_quote(self, symbol, vol, price, oi):
+        """Minimal SymbolQuote-compatible object for _classify()."""
+        q = MagicMock()
+        q.symbol         = symbol
+        q.average_volume = vol
+        q.volume         = vol
+        q.last_price     = price
+        q.open_interest  = oi
+        return q
+
+    # TE-23
+    def test_oi_zero_t1_vol_price_yields_t3_not_t1(self):
+        """
+        REGRESSION: symbol with T1-qualifying vol+price but oi=0 must be T3.
+        Old grace path returned 1; correct behaviour is 3.
+        """
+        from services.tier_engine import _classify
+        q    = self._make_quote("AAPL", vol=25_000_000, price=150.0, oi=0)
+        tier = _classify(q, self._thresh())
+        assert tier == 3, (
+            f"Grace path regression: oi=0 AAPL should be T3 but _classify() returned T{tier}. "
+            "Chunk 1B (OI grace removal) may have been reverted."
+        )
+
+    # TE-24
+    def test_oi_zero_t2_vol_price_yields_t3_not_t2(self):
+        """
+        REGRESSION: symbol with T2-qualifying vol+price but oi=0 must be T3.
+        Old grace path returned 2; correct behaviour is 3.
+        """
+        from services.tier_engine import _classify
+        q    = self._make_quote("HOOD", vol=3_000_000, price=15.0, oi=0)
+        tier = _classify(q, self._thresh())
+        assert tier == 3, (
+            f"Grace path regression: oi=0 HOOD should be T3 but _classify() returned T{tier}. "
+            "Chunk 1B (OI grace removal) may have been reverted."
+        )
+
+    # TE-25
+    def test_real_oi_at_t1_threshold_promotes_to_t1(self):
+        """oi exactly at t1_min_oi=1000 with T1 vol+price must yield T1."""
+        from services.tier_engine import _classify
+        q    = self._make_quote("NVDA", vol=25_000_000, price=900.0, oi=1_000)
+        tier = _classify(q, self._thresh())
+        assert tier == 1, (
+            f"NVDA with oi=1000 (== t1_min_oi) should be T1 but got T{tier}."
+        )
+
+    # TE-26
+    def test_real_oi_one_below_t1_threshold_stays_t2(self):
+        """
+        Off-by-one boundary: oi=999 (< t1_min_oi=1000) with T1 vol+price
+        must fall to T2, not T1, because the check is >=.
+        """
+        from services.tier_engine import _classify
+        q    = self._make_quote("NVDA", vol=25_000_000, price=900.0, oi=999)
+        tier = _classify(q, self._thresh())
+        assert tier == 2, (
+            f"NVDA with oi=999 (one below t1_min_oi=1000) should be T2 but got T{tier}. "
+            "Check that T1 condition uses >= not >."
+        )

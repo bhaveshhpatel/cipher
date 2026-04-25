@@ -4,6 +4,7 @@ tests/test_universe_store.py
 DB read/write tests for services/universe_store.py with mocked Supabase.
 Updated to cover stream_eligible_set parameter in save_snapshot.
 Updated 2026-04-24: add TR-01…TR-05 for load_tier_map (Feature 4A).
+Updated 2026-04-25: add US-OI-01…US-OI-04 for open_interest upsert (Feature 4A-OI).
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -25,9 +26,23 @@ def _make_sb_mock():
     query.insert.return_value  = query
     query.update.return_value  = query
     query.delete.return_value  = query
+    query.upsert.return_value  = query
     query.execute.return_value = MagicMock(data=[])
     sb.table.return_value      = query
     return sb, query
+
+
+def _make_quote(symbol, last_price=100.0, volume=1_000_000, average_volume=5_000_000,
+                open_interest=750, stream_eligible=True):
+    """Build a minimal SymbolQuote-compatible MagicMock."""
+    q = MagicMock()
+    q.symbol         = symbol
+    q.last_price     = last_price
+    q.volume         = volume
+    q.average_volume = average_volume
+    q.open_interest  = open_interest
+    q.stream_eligible = stream_eligible
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +306,92 @@ class TestLoadTierMap:
                 pytest.skip("load_tier_map not implemented yet")
             result = fn()
         assert result.get("LEGACY") == 3
+
+
+# ---------------------------------------------------------------------------
+# upsert_symbol_quotes — open_interest (Feature 4A-OI) — US-OI-01 … US-OI-04
+# ---------------------------------------------------------------------------
+class TestUpsertSymbolQuotesOi:
+    """
+    Feature 4A-OI: _sync_upsert_symbol_quotes() must include open_interest
+    in every upsert row, sourced from quote.open_interest.
+    """
+
+    def _run_upsert(self, quotes, tier_map=None):
+        """Run _sync_upsert_symbol_quotes with a mocked active snapshot."""
+        sb, query = _make_sb_mock()
+        snapshot_id = "snap-oi-test-001"
+        # First execute() call returns the active snapshot id;
+        # subsequent upsert batch execute() calls return empty.
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": snapshot_id}]),
+        ] + [MagicMock(data=[]) for _ in range(10)]
+
+        with patch("services.universe_store._client", return_value=sb):
+            universe_store._sync_upsert_symbol_quotes(quotes, tier_map or {})
+
+        return query
+
+    # US-OI-01
+    def test_open_interest_key_present_in_upsert_row(self):
+        """
+        Every row sent to .upsert() must contain the 'open_interest' key.
+        Regression: before Chunk 1C this key was absent.
+        """
+        quotes = [_make_quote("AAPL", open_interest=2000)]
+        query  = self._run_upsert(quotes)
+
+        upsert_calls = query.upsert.call_args_list
+        assert upsert_calls, "upsert() was never called — snapshot lookup may have failed"
+        rows = upsert_calls[0].args[0]
+        assert isinstance(rows, list) and len(rows) > 0
+        assert "open_interest" in rows[0], (
+            "'open_interest' key missing from upsert row. "
+            "Chunk 1C (universe_store) may have been reverted."
+        )
+
+    # US-OI-02
+    def test_open_interest_value_sourced_from_quote(self):
+        """The upserted open_interest value must match quote.open_interest exactly."""
+        quotes = [
+            _make_quote("SPY",  open_interest=5_000),
+            _make_quote("HOOD", open_interest=600),
+        ]
+        query = self._run_upsert(quotes)
+
+        rows      = query.upsert.call_args_list[0].args[0]
+        by_symbol = {r["symbol"]: r for r in rows}
+
+        assert by_symbol["SPY"]["open_interest"]  == 5_000
+        assert by_symbol["HOOD"]["open_interest"] == 600
+
+    # US-OI-03
+    def test_open_interest_none_written_as_none(self):
+        """
+        If quote.open_interest is None (e.g. symbol had no registry entry),
+        None must be written to DB rather than silently omitted or defaulted.
+        """
+        quotes = [_make_quote("SPCE", open_interest=None)]
+        query  = self._run_upsert(quotes)
+
+        rows = query.upsert.call_args_list[0].args[0]
+        assert rows[0]["open_interest"] is None, (
+            "open_interest=None should be written as NULL, not omitted."
+        )
+
+    # US-OI-04
+    def test_open_interest_and_tier_both_present_in_same_row(self):
+        """
+        Both open_interest (4A-OI) and tier (4A) must coexist in the same
+        upsert row — neither should overwrite or displace the other.
+        """
+        quotes   = [_make_quote("TSLA", open_interest=1_500)]
+        tier_map = {"TSLA": 1}
+        query    = self._run_upsert(quotes, tier_map)
+
+        rows = query.upsert.call_args_list[0].args[0]
+        row  = rows[0]
+        assert "open_interest" in row, "open_interest missing from upsert row"
+        assert "tier"           in row, "tier missing from upsert row"
+        assert row["open_interest"] == 1_500
+        assert row["tier"]          == 1
