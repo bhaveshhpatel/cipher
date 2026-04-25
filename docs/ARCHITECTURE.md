@@ -24,7 +24,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).            │
 │  On expiry days: refreshes every 15 min.                         │
 │                                                                   │
-│  Feature 4A — Per-tier contract filtering:                       │
+│  Per-tier contract filtering:                       │
 │  Contract universe is shaped by the symbol's tier at build time. │
 │  Tier params loaded from tier_thresholds DB row (cached 300s).   │
 │    Tier 1 (liquid): ATM ±20%  max DTE 90  (e.g. AAPL, TSLA)    │
