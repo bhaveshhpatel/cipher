@@ -7,12 +7,19 @@ Gap fixes audited 2026-04-24 (commit 309192f):
   C-018  Layer 5: _FLUSH_INTERVAL was 5s instead of 500ms; no 100-row early flush
          Layer 3: is_synthetic_quote flag added for bid=ask=0 rows (migration 009)
 
+Feature 4A gap fixes audited 2026-04-24:
+  4A-01  Layer 1 registry must expose set_tier_map() for runtime tier updates
+  4A-02  _build_ticker() must use per-tier _TierParams (atm_pct, max_dte)
+  4A-03  Startup flow must call load_tier_map() and pass to init_registry()
+  4A-04  _universe_refresh_loop must call registry.set_tier_map() before next build
+
 Test groups:
   L4-01 … L4-10  DedupCache unit tests (utils/dedup.py)
   L5-01 … L5-08  flow_store flush interval + early-flush tests
   L2-01 … L2-06  StreamManager.refresh() wiring (import-level + mock)
   INT-01 … INT-03 Integration: dedup gate visible in tradier_stream._process_trade
   SQ-01 … SQ-08  is_synthetic_quote flag (C-018 Layer 3 / migration 009)
+  4A-01 … 4A-08  Feature 4A: tier-aware registry wiring regression tests
 
 All tests are pure-Python / asyncio — no Supabase, no Tradier, no network.
 """
@@ -73,7 +80,6 @@ class TestDedupCacheL4:
     def test_different_fill_price_not_duplicate(self):
         cache = DedupCache(ttl_seconds=2.0)
         cache.is_duplicate("NVDA  260117C00700000", 5, 1.00, "N")
-        # fill rounded to 2dp — 1.009 still rounds to 1.01, so genuinely different
         assert cache.is_duplicate("NVDA  260117C00700000", 5, 1.01, "N") is False
 
     # L4-06
@@ -89,7 +95,6 @@ class TestDedupCacheL4:
         cache.is_duplicate(sym, size, fill, "N")
         cache.is_duplicate(sym, size, fill, "C")
         cache.is_duplicate(sym, size, fill, "M")
-        # After 3 unique exchanges the canonical print is a sweep
         assert cache.is_sweep(sym, size, fill) is True
 
     # L4-08
@@ -102,16 +107,14 @@ class TestDedupCacheL4:
 
     # L4-09
     def test_ttl_expiry_allows_reuse(self):
-        cache = DedupCache(ttl_seconds=0.05)   # 50ms TTL for test speed
+        cache = DedupCache(ttl_seconds=0.05)
         sym, size, fill, exch = "QQQ   260117P00450000", 20, 2.10, "N"
         cache.is_duplicate(sym, size, fill, exch)
-        time.sleep(0.12)  # wait > TTL
-        # New 2s bucket — should NOT be a duplicate
+        time.sleep(0.12)
         assert cache.is_duplicate(sym, size, fill, exch) is False
 
     # L4-10
     def test_module_singleton_exists(self):
-        """flow_dedup singleton must be importable and be a DedupCache."""
         assert isinstance(flow_dedup, DedupCache)
 
 
@@ -139,7 +142,6 @@ class TestFlowStoreFlushL5:
 
     # L5-03
     def test_early_flush_triggers_at_100_rows(self):
-        """persist_flow_event() must flush when buffer reaches 100 rows."""
         import services.flow_store as fs
 
         flushed_batches = []
@@ -166,7 +168,6 @@ class TestFlowStoreFlushL5:
                         "underlying_price": 182.0, "occ_symbol": f"AAPL260117C00180000",
                         "is_synthetic_quote": False,
                     })
-            # After 100 rows, early flush should have fired once
             assert len(flushed_batches) >= 1
             assert flushed_batches[0] == 100
 
@@ -197,7 +198,6 @@ class TestFlowStoreFlushL5:
                         "underlying_price": 205.0, "occ_symbol": f"TSLA260620P00200000",
                         "is_synthetic_quote": False,
                     })
-                # Buffer should be empty after the 100-row early flush
                 assert len(fs._flow_event_buffer) == 0
 
         run(run_test())
@@ -215,7 +215,7 @@ class TestFlowStoreFlushL5:
         async def run_test():
             fs._flow_event_buffer.clear()
             with patch.object(fs, '_insert_rows', side_effect=mock_insert):
-                for i in range(50):  # only 50 rows — no early flush
+                for i in range(50):
                     await fs.persist_flow_event({
                         "ticker": "SPY", "contract_type": "CALL",
                         "strike": 500.0, "expiry": "2026-03-21",
@@ -230,14 +230,13 @@ class TestFlowStoreFlushL5:
                         "underlying_price": 502.0, "occ_symbol": f"SPY260321C00500000",
                         "is_synthetic_quote": False,
                     })
-                assert len(flushed) == 0, "Should NOT flush until 100 rows or timer fires"
+                assert len(flushed) == 0
                 assert len(fs._flow_event_buffer) == 50
 
         run(run_test())
 
     # L5-06
     def test_flush_interval_not_5_seconds(self):
-        """Explicit regression: previous wrong value was 5."""
         import services.flow_store as fs
         assert fs._FLUSH_INTERVAL != 5, (
             "REGRESSION: _FLUSH_INTERVAL reverted to 5s. Must be 0.5s."
@@ -245,7 +244,6 @@ class TestFlowStoreFlushL5:
 
     # L5-07
     def test_row_contains_occ_symbol_field(self):
-        """occ_symbol must be included in every buffered row."""
         import services.flow_store as fs
 
         async def run_test():
@@ -274,14 +272,13 @@ class TestFlowStoreFlushL5:
 
     # L5-08
     def test_expiry_empty_string_coerced_to_none(self):
-        """Empty expiry string must be stored as None — Postgres DATE cast protection."""
         import services.flow_store as fs
 
         async def run_test():
             fs._flow_event_buffer.clear()
             await fs.persist_flow_event({
                 "ticker": "AAPL", "contract_type": "CALL",
-                "strike": 180.0, "expiry": "",   # empty string
+                "strike": 180.0, "expiry": "",
                 "dte": 0, "fill_price": 1.0,
                 "bid": 0.9, "ask": 1.1, "size": 1,
                 "premium": 100.0, "trade_type": "SINGLE",
@@ -294,9 +291,7 @@ class TestFlowStoreFlushL5:
                 "is_synthetic_quote": False,
             })
             row = fs._flow_event_buffer[-1]
-            assert row["expiry"] is None, (
-                f"Empty expiry should be None in DB row, got: {row['expiry']!r}"
-            )
+            assert row["expiry"] is None
 
         run(run_test())
 
@@ -311,43 +306,34 @@ class TestStreamManagerRefreshL2:
     # L2-01
     def test_stream_manager_has_refresh_method(self):
         from services.stream_manager import StreamManager
-        assert hasattr(StreamManager, 'refresh'), \
-            "StreamManager must have a refresh() method for post-rebuild worker restart."
+        assert hasattr(StreamManager, 'refresh')
 
     # L2-02
     def test_stream_manager_refresh_is_coroutine(self):
         import inspect
         from services.stream_manager import StreamManager
-        assert inspect.iscoroutinefunction(StreamManager.refresh), \
-            "StreamManager.refresh must be async (coroutine function)."
+        assert inspect.iscoroutinefunction(StreamManager.refresh)
 
     # L2-03
     def test_tradier_stream_imports_stream_manager(self):
-        """tradier_stream.py must reference StreamManager (not run without it)."""
-        import ast, pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "StreamManager" in text, \
-            "tradier_stream.py must import/use StreamManager for Layer 2."
-
-    # L2-04
-    def test_registry_refresh_notifies_manager(self):
-        """tradier_stream.py must contain the manager.refresh() call."""
         import pathlib
         src = pathlib.Path("backend/services/tradier_stream.py")
         if not src.exists():
             src = pathlib.Path("services/tradier_stream.py")
         text = src.read_text()
-        assert "manager.refresh()" in text, (
-            "REGRESSION C-017: tradier_stream.py does not call manager.refresh() "
-            "after registry rebuild. Workers will stream stale OCC symbols."
-        )
+        assert "StreamManager" in text
+
+    # L2-04
+    def test_registry_refresh_notifies_manager(self):
+        import pathlib
+        src = pathlib.Path("backend/services/tradier_stream.py")
+        if not src.exists():
+            src = pathlib.Path("services/tradier_stream.py")
+        text = src.read_text()
+        assert "manager.refresh()" in text
 
     # L2-05
     def test_stream_manager_refresh_noop_on_no_change(self):
-        """refresh() with identical symbol sets must not restart any workers."""
         from services.stream_manager import StreamManager
         from services.symbol_registry import SymbolRegistry
 
@@ -355,64 +341,47 @@ class TestStreamManagerRefreshL2:
             registry = MagicMock(spec=SymbolRegistry)
             registry.all_symbols.return_value = ["AAPL  260117C00180000"]
             registry.size.return_value = 1
-
             manager = StreamManager(registry=registry, process_fn=AsyncMock())
-            # Pre-populate _workers with one mock worker covering that symbol
             mock_worker = MagicMock()
             mock_worker.symbols = ["AAPL  260117C00180000"]
             manager._workers = [mock_worker]
-
             stop_called = []
-            original_stop = manager.stop
             async def mock_stop():
                 stop_called.append(True)
             manager.stop = mock_stop
-
             await manager.refresh()
-            assert len(stop_called) == 0, \
-                "refresh() must NOT restart workers when symbol set is unchanged."
+            assert len(stop_called) == 0
 
         run(run_test())
 
     # L2-06
     def test_stream_manager_refresh_restarts_on_symbol_change(self):
-        """refresh() with changed symbol set must trigger a worker restart."""
         from services.stream_manager import StreamManager
         from services.symbol_registry import SymbolRegistry
 
         async def run_test():
             registry = MagicMock(spec=SymbolRegistry)
-            # New symbol set has a different contract
             registry.all_symbols.return_value = ["TSLA  260424C00375000"]
             registry.size.return_value = 1
-
             manager = StreamManager(registry=registry, process_fn=AsyncMock())
-            # Pre-populate with old worker covering a DIFFERENT symbol
             mock_worker = MagicMock()
             mock_worker.symbols = ["AAPL  260117C00180000"]
             manager._workers = [mock_worker]
             manager._tasks = []
             manager._consumer = None
-
-            stop_called = []
+            stop_called  = []
             spawn_called = []
-
             async def mock_stop():
                 stop_called.append(True)
                 manager._workers = []
-                manager._tasks = []
-
+                manager._tasks   = []
             async def mock_spawn():
                 spawn_called.append(True)
-
             manager.stop = mock_stop
             manager._spawn_workers = mock_spawn
-
             await manager.refresh()
-            assert len(stop_called) == 1, \
-                "refresh() must stop workers when symbol set changes."
-            assert len(spawn_called) == 1, \
-                "refresh() must respawn workers after symbol set changes."
+            assert len(stop_called)  == 1
+            assert len(spawn_called) == 1
 
         run(run_test())
 
@@ -426,36 +395,24 @@ class TestDedupIntegrationINT:
 
     # INT-01
     def test_process_trade_module_imports_dedup(self):
-        """tradier_stream.py must import flow_dedup."""
         import pathlib
         src = pathlib.Path("backend/services/tradier_stream.py")
         if not src.exists():
             src = pathlib.Path("services/tradier_stream.py")
         text = src.read_text()
-        assert "flow_dedup" in text, (
-            "REGRESSION C-016: tradier_stream.py does not import/use flow_dedup. "
-            "DedupCache is built but not wired — 4× duplicate DB rows per trade."
-        )
+        assert "flow_dedup" in text
 
     # INT-02
     def test_process_trade_calls_is_duplicate(self):
-        """_process_trade() source must contain flow_dedup.is_duplicate call."""
         import pathlib
         src = pathlib.Path("backend/services/tradier_stream.py")
         if not src.exists():
             src = pathlib.Path("services/tradier_stream.py")
         text = src.read_text()
-        assert "flow_dedup.is_duplicate(" in text, (
-            "REGRESSION C-016: _process_trade() does not call flow_dedup.is_duplicate(). "
-            "Every exchange copy of a trade will be persisted to the DB."
-        )
+        assert "flow_dedup.is_duplicate(" in text
 
     # INT-03
     def test_process_trade_drops_duplicate_exchange_tick(self):
-        """
-        End-to-end: when the same trade arrives on a second exchange,
-        persist_flow_event should NOT be called a second time.
-        """
         import services.flow_store as fs
         from utils.dedup import DedupCache
 
@@ -465,14 +422,10 @@ class TestDedupIntegrationINT:
             test_dedup = DedupCache(ttl_seconds=2.0)
 
             async def fake_process(raw: dict):
-                """
-                Minimal replica of _process_trade() dedup gate logic
-                so we can test the gate without the full tradier_stream import.
-                """
                 event_type = raw.get("type", "")
                 if event_type != "timesale":
                     return
-                payload = raw.get("timesale", raw)
+                payload  = raw.get("timesale", raw)
                 symbol   = payload.get("symbol", "")
                 exchange = payload.get("exch", "UNK")
                 size     = int(payload.get("size", 0) or 0)
@@ -480,35 +433,15 @@ class TestDedupIntegrationINT:
                 if size == 0:
                     return
                 if test_dedup.is_duplicate(symbol, size, fill, exchange):
-                    return   # ← dedup gate
+                    return
                 persisted.append(payload)
 
-            tick_n = {"type": "timesale", "timesale": {
-                "symbol": "AAPL  260117C00180000", "last": 1.50,
-                "size": 10, "exch": "N", "bid": 1.45, "ask": 1.55,
-            }}
-            tick_c = {"type": "timesale", "timesale": {
-                "symbol": "AAPL  260117C00180000", "last": 1.50,
-                "size": 10, "exch": "C", "bid": 1.45, "ask": 1.55,
-            }}
-            tick_m = {"type": "timesale", "timesale": {
-                "symbol": "AAPL  260117C00180000", "last": 1.50,
-                "size": 10, "exch": "M", "bid": 1.45, "ask": 1.55,
-            }}
-            tick_q = {"type": "timesale", "timesale": {
-                "symbol": "AAPL  260117C00180000", "last": 1.50,
-                "size": 10, "exch": "Q", "bid": 1.45, "ask": 1.55,
-            }}
-
-            await fake_process(tick_n)  # canonical — persisted
-            await fake_process(tick_c)  # duplicate — dropped
-            await fake_process(tick_m)  # duplicate — dropped
-            await fake_process(tick_q)  # duplicate — dropped
-
-            assert len(persisted) == 1, (
-                f"Expected 1 persisted row (canonical), got {len(persisted)}. "
-                "REGRESSION C-016: dedup gate not reducing 4× exchange duplicates."
-            )
+            for exch in ["N", "C", "M", "Q"]:
+                await fake_process({"type": "timesale", "timesale": {
+                    "symbol": "AAPL  260117C00180000", "last": 1.50,
+                    "size": 10, "exch": exch, "bid": 1.45, "ask": 1.55,
+                }})
+            assert len(persisted) == 1
 
         run(run_test())
 
@@ -518,167 +451,203 @@ class TestDedupIntegrationINT:
 # ===========================================================================
 
 class TestSyntheticQuoteSQ:
-    """
-    C-018 regression: is_synthetic_quote flag — parser sets it correctly,
-    flow_store persists it, and backtest queries must filter it out.
-    """
-
-    # SQ-01: OptionsFlowEvent must have is_synthetic_quote attribute
+    # SQ-01
     def test_flow_event_has_is_synthetic_quote_field(self):
         from parsers.options_flow_parser import OptionsFlowEvent
-        import inspect
         fields = {f.name for f in OptionsFlowEvent.__dataclass_fields__.values()} \
                  if hasattr(OptionsFlowEvent, '__dataclass_fields__') \
                  else set(vars(OptionsFlowEvent()).keys())
-        assert "is_synthetic_quote" in fields, (
-            "REGRESSION C-018: OptionsFlowEvent missing is_synthetic_quote field. "
-            "migration 009 added the column — the dataclass must match."
-        )
+        assert "is_synthetic_quote" in fields
 
-    # SQ-02: Parser sets is_synthetic_quote=True when bid=ask=0
+    # SQ-02
     def test_parser_sets_synthetic_flag_when_bid_ask_zero(self):
         from parsers.options_flow_parser import parse_tradier_trade
-
-        tick = {
-            "type": "timesale",
-            "symbol": "AAPL  260117C00180000",
-            "last": 1.50, "price": 1.50, "size": 10,
-            "bid": 0, "ask": 0,
-            "exch": "N",
-        }
-        event = parse_tradier_trade(tick)
+        event = parse_tradier_trade({
+            "type": "timesale", "symbol": "AAPL  260117C00180000",
+            "last": 1.50, "price": 1.50, "size": 10, "bid": 0, "ask": 0, "exch": "N",
+        })
         assert event is not None
-        assert event.is_synthetic_quote is True, (
-            "Parser must set is_synthetic_quote=True when bid=ask=0. "
-            "bid/ask were synthesised ±0.5% from fill price."
-        )
+        assert event.is_synthetic_quote is True
 
-    # SQ-03: Parser sets is_synthetic_quote=False when real NBBO present
+    # SQ-03
     def test_parser_clears_synthetic_flag_with_real_nbbo(self):
         from parsers.options_flow_parser import parse_tradier_trade
-
-        tick = {
-            "type": "timesale",
-            "symbol": "AAPL  260117C00180000",
-            "last": 1.50, "price": 1.50, "size": 10,
-            "bid": 1.45, "ask": 1.55,
-            "exch": "N",
-        }
-        event = parse_tradier_trade(tick)
+        event = parse_tradier_trade({
+            "type": "timesale", "symbol": "AAPL  260117C00180000",
+            "last": 1.50, "price": 1.50, "size": 10, "bid": 1.45, "ask": 1.55, "exch": "N",
+        })
         assert event is not None
-        assert event.is_synthetic_quote is False, (
-            "Parser must set is_synthetic_quote=False when real bid/ask are present."
-        )
+        assert event.is_synthetic_quote is False
 
-    # SQ-04: Synthetic bid/ask are ±0.5% of fill price
+    # SQ-04
     def test_synthetic_spread_is_half_percent_of_fill(self):
         from parsers.options_flow_parser import parse_tradier_trade
-
-        fill = 2.00
-        tick = {
-            "type": "timesale",
-            "symbol": "TSLA  260424C00375000",
-            "last": fill, "size": 5,
-            "bid": 0, "ask": 0,
-            "exch": "C",
-        }
-        event = parse_tradier_trade(tick)
+        fill  = 2.00
+        event = parse_tradier_trade({
+            "type": "timesale", "symbol": "TSLA  260424C00375000",
+            "last": fill, "size": 5, "bid": 0, "ask": 0, "exch": "C",
+        })
         assert event is not None
-        expected_bid = round(fill * 0.995, 2)
-        expected_ask = round(fill * 1.005, 2)
-        assert abs(event.bid - expected_bid) < 0.005, f"bid={event.bid} expected ~{expected_bid}"
-        assert abs(event.ask - expected_ask) < 0.005, f"ask={event.ask} expected ~{expected_ask}"
+        assert abs(event.bid - round(fill * 0.995, 2)) < 0.005
+        assert abs(event.ask - round(fill * 1.005, 2)) < 0.005
 
-    # SQ-05: flow_store persists is_synthetic_quote field to DB row
+    # SQ-05
     def test_flow_store_persists_is_synthetic_quote_true(self):
         import services.flow_store as fs
-
         async def run_test():
             fs._flow_event_buffer.clear()
             await fs.persist_flow_event({
-                "ticker": "TSLA", "contract_type": "CALL",
-                "strike": 375.0, "expiry": "2026-04-24",
-                "dte": 0, "fill_price": 3.0,
-                "bid": 2.985, "ask": 3.015, "size": 5,
-                "premium": 1500.0, "trade_type": "SINGLE",
-                "bid_ask_class": "AT_ASK", "is_aggressive": True,
+                "ticker": "TSLA", "contract_type": "CALL", "strike": 375.0,
+                "expiry": "2026-04-24", "dte": 0, "fill_price": 3.0,
+                "bid": 2.985, "ask": 3.015, "size": 5, "premium": 1500.0,
+                "trade_type": "SINGLE", "bid_ask_class": "AT_ASK", "is_aggressive": True,
                 "is_golden_sweep": False, "sentiment": "BULLISH",
                 "influence_tier": "RETAIL", "conviction_score": 0.3,
-                "exchange_count": 1, "fill_count": 1,
-                "open_interest": 1000, "iv": 0.50,
-                "underlying_price": 370.0,
-                "occ_symbol": "TSLA  260424C00375000",
+                "exchange_count": 1, "fill_count": 1, "open_interest": 1000, "iv": 0.50,
+                "underlying_price": 370.0, "occ_symbol": "TSLA  260424C00375000",
                 "is_synthetic_quote": True,
             })
             row = fs._flow_event_buffer[-1]
-            assert "is_synthetic_quote" in row, (
-                "REGRESSION C-018: flow_store must persist is_synthetic_quote column."
-            )
+            assert "is_synthetic_quote" in row
             assert row["is_synthetic_quote"] is True
-
         run(run_test())
 
-    # SQ-06: flow_store persists is_synthetic_quote=False for real NBBO rows
+    # SQ-06
     def test_flow_store_persists_is_synthetic_quote_false(self):
         import services.flow_store as fs
-
         async def run_test():
             fs._flow_event_buffer.clear()
             await fs.persist_flow_event({
-                "ticker": "SPY", "contract_type": "PUT",
-                "strike": 450.0, "expiry": "2026-01-17",
-                "dte": 30, "fill_price": 2.00,
-                "bid": 1.95, "ask": 2.05, "size": 20,
-                "premium": 4000.0, "trade_type": "BLOCK",
-                "bid_ask_class": "MID", "is_aggressive": False,
+                "ticker": "SPY", "contract_type": "PUT", "strike": 450.0,
+                "expiry": "2026-01-17", "dte": 30, "fill_price": 2.00,
+                "bid": 1.95, "ask": 2.05, "size": 20, "premium": 4000.0,
+                "trade_type": "BLOCK", "bid_ask_class": "MID", "is_aggressive": False,
                 "is_golden_sweep": False, "sentiment": "BEARISH",
                 "influence_tier": "WHALE", "conviction_score": 0.7,
-                "exchange_count": 1, "fill_count": 1,
-                "open_interest": 30000, "iv": 0.18,
-                "underlying_price": 452.0,
-                "occ_symbol": "SPY   260117P00450000",
+                "exchange_count": 1, "fill_count": 1, "open_interest": 30000, "iv": 0.18,
+                "underlying_price": 452.0, "occ_symbol": "SPY   260117P00450000",
                 "is_synthetic_quote": False,
             })
-            row = fs._flow_event_buffer[-1]
-            assert row["is_synthetic_quote"] is False
-
+            assert fs._flow_event_buffer[-1]["is_synthetic_quote"] is False
         run(run_test())
 
-    # SQ-07: tradier_stream.py must reference is_synthetic_quote
+    # SQ-07
     def test_tradier_stream_sets_is_synthetic_quote(self):
         import pathlib
         src = pathlib.Path("backend/services/tradier_stream.py")
         if not src.exists():
             src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "is_synthetic_quote" in text, (
-            "REGRESSION C-018: tradier_stream.py does not pass is_synthetic_quote "
-            "to persist_flow_event(). Synthetic rows will have NULL in DB column."
-        )
+        assert "is_synthetic_quote" in src.read_text()
 
-    # SQ-08: backtest_score helper must filter is_synthetic_quote=false rows
+    # SQ-08
     def test_backtest_score_query_filters_synthetic_quotes(self):
-        """
-        Verify the backtest score SQL or query builder excludes synthetic rows.
-        Checks source-level: backtesting module must contain the filter.
-        """
         import pathlib
-        # Check wherever backtest_score / historical win-rate is computed
         candidates = [
             pathlib.Path("backend/services/backtest_store.py"),
             pathlib.Path("services/backtest_store.py"),
             pathlib.Path("backend/signals/backtest_scorer.py"),
             pathlib.Path("signals/backtest_scorer.py"),
         ]
-        found_file = None
-        for p in candidates:
-            if p.exists():
-                found_file = p
-                break
-        if found_file is None:
-            pytest.skip("backtest_store.py / backtest_scorer.py not found — skip SQ-08")
-        text = found_file.read_text()
-        assert "is_synthetic_quote" in text, (
-            "REGRESSION C-018: backtest query file does not filter is_synthetic_quote=false. "
-            "Aggression ratios will be skewed by synthesised NBBO rows."
+        found = next((p for p in candidates if p.exists()), None)
+        if found is None:
+            pytest.skip("backtest file not found")
+        assert "is_synthetic_quote" in found.read_text()
+
+
+# ===========================================================================
+# 4A — Feature 4A: tier-aware registry wiring regression tests
+# ===========================================================================
+
+class TestFeature4ATierWiring:
+    """
+    Feature 4A regression: verify tier-aware wiring is present at the source level.
+    These tests guard against accidental reversion of the tier plumbing.
+    """
+
+    # 4A-01: SymbolRegistry must expose set_tier_map()
+    def test_registry_has_set_tier_map(self):
+        from services.symbol_registry import SymbolRegistry
+        assert hasattr(SymbolRegistry, 'set_tier_map'), (
+            "REGRESSION 4A-01: SymbolRegistry must expose set_tier_map() so the "
+            "background refresh loop can push a fresh tier_map without restart."
+        )
+
+    # 4A-02: set_tier_map must be callable (sync or async)
+    def test_set_tier_map_is_callable(self):
+        from services.symbol_registry import SymbolRegistry
+        assert callable(SymbolRegistry.set_tier_map), (
+            "REGRESSION 4A-02: SymbolRegistry.set_tier_map must be callable."
+        )
+
+    # 4A-03: init_registry / lifespan in main.py must reference tier_map
+    def test_main_passes_tier_map_to_registry(self):
+        import pathlib
+        src = pathlib.Path("backend/main.py")
+        if not src.exists():
+            src = pathlib.Path("main.py")
+        text = src.read_text()
+        assert "tier_map" in text, (
+            "REGRESSION 4A-03: main.py must pass tier_map to init_registry() at startup. "
+            "Without this, all contracts default to T3 params on every cold start."
+        )
+
+    # 4A-04: universe_store.load_tier_map must exist
+    def test_load_tier_map_function_exists(self):
+        from services import universe_store
+        assert hasattr(universe_store, 'load_tier_map') or \
+               hasattr(universe_store, '_sync_load_tier_map'), (
+            "REGRESSION 4A-04: universe_store must expose load_tier_map() for "
+            "warm-start tier recovery at boot."
+        )
+
+    # 4A-05: universe_refresh_loop must call set_tier_map
+    def test_universe_refresh_loop_calls_set_tier_map(self):
+        import pathlib
+        src = pathlib.Path("backend/main.py")
+        if not src.exists():
+            src = pathlib.Path("main.py")
+        text = src.read_text()
+        assert "set_tier_map" in text, (
+            "REGRESSION 4A-05: _universe_refresh_loop in main.py must call "
+            "registry.set_tier_map(tier_map) so tier assignments stay current "
+            "across 24h refresh cycles without a restart."
+        )
+
+    # 4A-06: _TierParams must be used inside _build_ticker (source-level check)
+    def test_symbol_registry_uses_tier_params_in_build(self):
+        import pathlib
+        src = pathlib.Path("backend/services/symbol_registry.py")
+        if not src.exists():
+            src = pathlib.Path("services/symbol_registry.py")
+        text = src.read_text()
+        assert "_TierParams" in text, (
+            "REGRESSION 4A-06: symbol_registry.py must define/use _TierParams "
+            "to drive per-tier ATM window and DTE horizon."
+        )
+
+    # 4A-07: tier_engine.py must exist and export assign_tiers
+    def test_tier_engine_module_exists(self):
+        import pathlib
+        candidates = [
+            pathlib.Path("backend/services/tier_engine.py"),
+            pathlib.Path("services/tier_engine.py"),
+        ]
+        found = next((p for p in candidates if p.exists()), None)
+        assert found is not None, (
+            "REGRESSION 4A-07: services/tier_engine.py must exist (Feature 4A)."
+        )
+        assert "assign_tiers" in found.read_text(), (
+            "tier_engine.py must export assign_tiers() function."
+        )
+
+    # 4A-08: upsert_symbol_quotes in universe_store must reference tier
+    def test_upsert_symbol_quotes_references_tier(self):
+        import pathlib
+        src = pathlib.Path("backend/services/universe_store.py")
+        if not src.exists():
+            src = pathlib.Path("services/universe_store.py")
+        text = src.read_text()
+        assert "tier" in text, (
+            "REGRESSION 4A-08: universe_store.upsert_symbol_quotes() must write "
+            "the tier column to options_universe_symbols."
         )

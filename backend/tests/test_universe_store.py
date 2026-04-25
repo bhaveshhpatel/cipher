@@ -3,6 +3,7 @@ tests/test_universe_store.py
 
 DB read/write tests for services/universe_store.py with mocked Supabase.
 Updated to cover stream_eligible_set parameter in save_snapshot.
+Updated 2026-04-24: add TR-01…TR-05 for load_tier_map (Feature 4A).
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -105,10 +106,10 @@ class TestSaveSnapshot:
     def test_returns_true_on_success(self):
         sb, query = _make_sb_mock()
         query.execute.side_effect = [
-            MagicMock(data=[]),  # snapshot insert
-            MagicMock(data=[]),  # symbols batch insert
-            MagicMock(data=[]),  # deactivate
-            MagicMock(data=[{"id": "snap-uuid-new"}]),  # prune select
+            MagicMock(data=[]),
+            MagicMock(data=[]),
+            MagicMock(data=[]),
+            MagicMock(data=[{"id": "snap-uuid-new"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", None)
@@ -124,25 +125,21 @@ class TestSaveSnapshot:
         assert result is False
 
     def test_stream_eligible_true_when_in_eligible_set(self):
-        """Symbols in eligible_set must have stream_eligible=True in insert payload."""
         sb, query = _make_sb_mock()
         query.execute.return_value = MagicMock(data=[])
         eligible_set = {"AAPL"}
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", eligible_set)
-
         symbol_batch = query.insert.call_args_list[1].args[0]
         by_symbol = {r["symbol"]: r for r in symbol_batch}
         assert by_symbol["AAPL"]["stream_eligible"] is True
         assert by_symbol["TSLA"]["stream_eligible"] is False
 
     def test_stream_eligible_all_true_when_no_eligible_set(self):
-        """When eligible_set is None, all symbols default to stream_eligible=True."""
         sb, query = _make_sb_mock()
         query.execute.return_value = MagicMock(data=[])
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["SPY", "QQQ"], "tradier_validated", None)
-
         symbol_batch = query.insert.call_args_list[1].args[0]
         for row in symbol_batch:
             assert row["stream_eligible"] is True
@@ -162,12 +159,10 @@ class TestSaveSnapshot:
         query.execute.return_value = MagicMock(data=[])
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", None)
-
         snapshot_id  = query.insert.call_args_list[0].args[0]["id"]
         symbol_batch = query.insert.call_args_list[1].args[0]
         for row in symbol_batch:
             assert row["snapshot_id"] == snapshot_id
-
         neq_calls = [c for c in query.method_calls if c[0] == "neq"]
         assert any(c.args == ("id", snapshot_id) for c in neq_calls)
 
@@ -214,3 +209,85 @@ class TestSaveSnapshot:
         assert result is True
         delete_calls = [c for c in query.method_calls if c[0] == "delete"]
         assert len(delete_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# load_tier_map (Feature 4A) — TR-01 … TR-05
+# ---------------------------------------------------------------------------
+class TestLoadTierMap:
+    """Feature 4A: load_tier_map() reads tier column from options_universe_symbols."""
+
+    # TR-01
+    def test_returns_dict_of_symbol_to_tier(self):
+        sb, query = _make_sb_mock()
+        snapshot_id = "snap-uuid-tier-001"
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            MagicMock(data=[{"symbol": "SPY", "tier": 1}, {"symbol": "HOOD", "tier": 2}]),
+        ]
+        with patch("services.universe_store._client", return_value=sb):
+            fn = getattr(universe_store, '_sync_load_tier_map',
+                         getattr(universe_store, 'load_tier_map', None))
+            if fn is None:
+                pytest.skip("load_tier_map not implemented yet")
+            result = fn()
+        assert isinstance(result, dict)
+        assert result.get("SPY")  == 1
+        assert result.get("HOOD") == 2
+
+    # TR-02
+    def test_returns_empty_dict_when_no_snapshot(self):
+        sb, query = _make_sb_mock()
+        query.execute.return_value = MagicMock(data=[])
+        with patch("services.universe_store._client", return_value=sb):
+            fn = getattr(universe_store, '_sync_load_tier_map',
+                         getattr(universe_store, 'load_tier_map', None))
+            if fn is None:
+                pytest.skip("load_tier_map not implemented yet")
+            result = fn()
+        assert result == {}
+
+    # TR-03
+    def test_returns_empty_dict_on_db_exception(self):
+        with patch("services.universe_store._client", side_effect=Exception("DB down")):
+            fn = getattr(universe_store, '_sync_load_tier_map',
+                         getattr(universe_store, 'load_tier_map', None))
+            if fn is None:
+                pytest.skip("load_tier_map not implemented yet")
+            result = fn()
+        assert result == {}
+
+    # TR-04
+    def test_tier_column_value_preserved(self):
+        """tier=3 must be stored as int 3, not string '3'."""
+        sb, query = _make_sb_mock()
+        snapshot_id = "snap-uuid-tier-002"
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            MagicMock(data=[{"symbol": "XYZ", "tier": 3}]),
+        ]
+        with patch("services.universe_store._client", return_value=sb):
+            fn = getattr(universe_store, '_sync_load_tier_map',
+                         getattr(universe_store, 'load_tier_map', None))
+            if fn is None:
+                pytest.skip("load_tier_map not implemented yet")
+            result = fn()
+        assert result.get("XYZ") == 3
+        assert isinstance(result.get("XYZ"), int)
+
+    # TR-05
+    def test_missing_tier_column_defaults_to_3(self):
+        """Rows with no tier key (pre-010 data) must default to tier 3."""
+        sb, query = _make_sb_mock()
+        snapshot_id = "snap-uuid-tier-003"
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            MagicMock(data=[{"symbol": "LEGACY"}]),  # no tier key
+        ]
+        with patch("services.universe_store._client", return_value=sb):
+            fn = getattr(universe_store, '_sync_load_tier_map',
+                         getattr(universe_store, 'load_tier_map', None))
+            if fn is None:
+                pytest.skip("load_tier_map not implemented yet")
+            result = fn()
+        assert result.get("LEGACY") == 3
