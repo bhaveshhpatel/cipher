@@ -30,7 +30,8 @@ Fix (C-019) — 2026-04-24:
   5. exchange field is now properly used in sweep detection. Previously
      is_duplicate() accepted exchange but _process_trade() never passed it,
      so sweep detection always saw one unique exchange and never fired.
-     Now tradier_stream.py passes trade_payload.get("exch", "") through.
+     Now tradier_stream.py passes trade_payload.get("exch") or
+     trade_payload.get("exchange", "") through.
   6. Added dedup_stats() for observability — exposes total_seen,
      total_duplicates, total_sweeps counters via the /health endpoint.
 
@@ -61,16 +62,16 @@ class DedupCache:
         the same trade. Set to 5s to cover worst-case PHLX/MIAX lag.
     sweep_window : float
         Window in which 3+ exchange reports on the same contract are
-        classified as a sweep. Should be ≥ ttl_seconds.
+        classified as a sweep. Should be >= ttl_seconds.
     sweep_min_exchanges : int
         Minimum unique exchange count to declare a sweep.
     """
 
     def __init__(
         self,
-        ttl_seconds:        float = 5.0,
-        sweep_window:       float = 8.0,
-        sweep_min_exchanges: int  = 3,
+        ttl_seconds:         float = 5.0,
+        sweep_window:        float = 8.0,
+        sweep_min_exchanges: int   = 3,
     ):
         self._ttl        = ttl_seconds
         self._sweep_win  = sweep_window
@@ -98,7 +99,6 @@ class DedupCache:
         now = time.monotonic()
         if now - self._last_cleanup < 10.0:
             return
-        # Keep entries that are still within TTL + sweep window
         cutoff = now - max(self._ttl, self._sweep_win)
         self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._exchange_hits = defaultdict(list, {
@@ -184,8 +184,8 @@ class DedupCache:
         Returns the number of unique exchanges that have reported this trade
         within sweep_window. Call after is_duplicate() returns False.
         """
-        ckey  = self._contract_key(occ_symbol, size, fill)
-        now   = time.monotonic()
+        ckey   = self._contract_key(occ_symbol, size, fill)
+        now    = time.monotonic()
         cutoff = now - self._sweep_win
         recent_exchanges = [
             e for t, e in self._exchange_hits.get(ckey, []) if t > cutoff
