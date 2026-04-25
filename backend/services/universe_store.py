@@ -10,10 +10,11 @@ Tables (must be migrated first):
                                 (includes open_interest, average_volume, tier — migration 010)
 
 Public API:
-  load_fresh_snapshot()  → list[str] | None
-  load_any_snapshot()    → list[str] | None
-  save_snapshot(symbols, source, stream_eligible_set, quotes)  → bool
-  upsert_symbol_quotes(quotes, tier_map)  → None
+  load_fresh_snapshot()         → list[str] | None
+  load_any_snapshot()           → list[str] | None
+  load_tier_map()               → dict[str, int]        [4A]
+  save_snapshot(...)            → bool
+  upsert_symbol_quotes(...)     → None
 
 ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 does NOT expose .select() after .insert().
@@ -78,6 +79,17 @@ async def load_fresh_snapshot(max_age_hours: int = _DEFAULT_MAX_AGE) -> Optional
 async def load_any_snapshot() -> Optional[list[str]]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_load_any_snapshot)
+
+
+async def load_tier_map() -> dict[str, int]:
+    """
+    Return dict[symbol -> tier] from the current active snapshot.
+    Used by main.py on warm starts (Step 1 HIT) to seed init_registry()
+    with accurate per-symbol tiers without re-running the full pipeline.
+    Returns empty dict on error or if no active snapshot exists.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync_load_tier_map)
 
 
 async def save_snapshot(
@@ -170,6 +182,54 @@ def _sync_load_any_snapshot() -> Optional[list[str]]:
     except Exception as e:
         log.error("universe_store.load_any_snapshot error: %s", e, exc_info=True)
         return None
+
+
+def _sync_load_tier_map() -> dict[str, int]:
+    """
+    Load symbol -> tier mapping from the current active snapshot.
+    Queries options_universe_symbols for the active snapshot_id.
+    Symbols with NULL tier default to 3.
+    Returns {} on error or missing snapshot.
+    """
+    try:
+        sb = _client()
+
+        snap = (
+            sb.table("options_universe_snapshots")
+            .select("id")
+            .eq("is_active", True)
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = snap.data or []
+        if not rows:
+            log.info("universe_store.load_tier_map: no active snapshot")
+            return {}
+
+        snapshot_id = rows[0]["id"]
+        result = (
+            sb.table("options_universe_symbols")
+            .select("symbol, tier")
+            .eq("snapshot_id", snapshot_id)
+            .execute()
+        )
+        tier_map = {
+            r["symbol"]: int(r["tier"] or 3)
+            for r in (result.data or [])
+            if r.get("symbol")
+        }
+        log.info(
+            "universe_store.load_tier_map: loaded %d tiers from snapshot %s (T1=%d T2=%d T3=%d)",
+            len(tier_map), snapshot_id,
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+        return tier_map
+    except Exception as e:
+        log.warning("universe_store.load_tier_map error (non-fatal): %s", e, exc_info=True)
+        return {}
 
 
 def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
