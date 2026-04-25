@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-24 (Phase 5A)  
+> Last updated: 2026-04-24 (Phase 5A — post gap-fix audit)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -17,13 +17,11 @@
 | B-005 | Trading options for customers (real or paper) | 🔲 Todo | Customer-facing paper or live trading — requires brokerage integration + risk disclaimers. |
 | B-006 | Product ideation — PM mode | 🔲 Todo | Explore adjacent product ideas; act as PM to define features, user personas, market fit. |
 | B-007 | Charting on dashboard | 🔲 Todo | Add price/signal charts to the main dashboard (e.g. options flow overlaid on price chart). |
-| B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting/market_closed), reconnect count, last tick time. |
+| B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting/market_closed), reconnect count, last tick time, deduped count. |
 | B-009 | Wire `trade_executor.py` into signal flow | 🔲 Todo | `execution/trade_executor.py` exists but is not connected to the composite signal engine output. |
 | B-011 | Redis integration | 🔲 Todo | Redis is in config but not used. Candidate for signal caching + WebSocket pub/sub at scale. |
 | B-012 | Wire `GET /api/flow/scan` to `flow_episodes` table | 🔲 Todo | `routers/flow.py` queries `flow_episodes` (fixed in Phase 4) but full pagination + filters needed. |
 | B-013 | Wire `/api/signals/list` tier filter to live data | 🔲 Todo | Tier filter currently pass-through. Needs real query against live signal data. |
-| B-014 | Confirm Layer 1 (SymbolRegistry) wired into stream pipeline | 🔲 Todo | `symbol_registry.py` exists but integration into main flow loop unconfirmed. |
-| B-015 | Confirm Layer 2 (StreamManager + StreamWorker) wired into main | 🔲 Todo | `stream_manager.py` / `stream_worker.py` exist but main.py integration unconfirmed. |
 | B-016 | Wire midcap screener into signal pipeline | 🔲 Todo | `signals/midcap_screener.py` exists but not confirmed in signal path. |
 | B-017 | Load test signals endpoints (50 concurrent users) | 🔲 Todo | Benchmark `/api/signals/list` and `/api/signals/history` under load. |
 | B-018 | WebSocket fan-out benchmark (50+ subscribers) | 🔲 Todo | Test `ws.py` throughput with many simultaneous clients. |
@@ -49,6 +47,9 @@
 | C-013 | Phase 5A — Trade Executor | 2026-04-24 | `execution/trade_executor.py` — Tradier REST order placement, paper + live mode. |
 | C-014 | Phase 5A — Migration 004 (swarm fields) | 2026-04-24 | `004_swarm_fields.sql` — adds swarm_direction, swarm_confidence, swarm_agents JSONB, vote counts. |
 | C-015 | fill_price bug fix — Layer 3 parser | 2026-04-24 | Stream sends `last` as fill price, not `price`. Fixed: `tick["last"] or tick.get("price") or 0`. |
+| C-016 | Layer 4 dedup not wired into hot path | 2026-04-24 | `DedupCache` was built (C-010) but `flow_dedup.is_duplicate()` was never called in `_process_trade()`. Fixed: added dedup gate + sweep upgrade in `tradier_stream.py`. Added `deduped` stat counter. Regression tests: `test_6layer_regression.py` tests L4-01 through L4-10. |
+| C-017 | Layer 2 manager.refresh() not hooked to registry loop | 2026-04-24 | `registry.refresh_loop()` rebuilt symbols every 30min but never notified `StreamManager`. Workers streamed stale OCC symbols. Fixed: `_registry_refresh_with_manager_notify()` calls `await manager.refresh()` after every rebuild. Regression tests: L2-01 through L2-06. |
+| C-018 | Layer 5 flush interval 5s → 500ms + 100-row early flush | 2026-04-24 | `_FLUSH_INTERVAL` was 5s (spec: 500ms). At 62K rows/day: ~430 rows per flush window. Fixed: `_FLUSH_INTERVAL=0.5`, `_FLUSH_MAX_ROWS=100`, early-flush in `persist_flow_event()`. Regression tests: L5-01 through L5-08. |
 
 ---
 
@@ -57,6 +58,8 @@
 | # | Item | Dropped | Reason |
 |---|------|---------|--------|
 | B-010 | Supabase DB — signal storage | 2026-04-23 | Completed as C-006 + C-008. All three signal tables live. |
+| B-014 | Confirm Layer 1 (SymbolRegistry) wired into stream pipeline | 2026-04-24 | Confirmed wired — registry enrichment in parser + registry built in stream_options_flow(). |
+| B-015 | Confirm Layer 2 (StreamManager + StreamWorker) wired into main | 2026-04-24 | Confirmed wired — StreamManager spawned in stream_options_flow() with process_fn=_process_trade. |
 
 ---
 
@@ -64,6 +67,8 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-24 | Added C-016, C-017, C-018 — 6-layer gap-fix audit. Layer 4 dedup wired, Layer 2 refresh notify hooked, Layer 5 flush corrected to 500ms/100-row. |
+| 2026-04-24 | Closed B-014 and B-015 — Layer 1 and Layer 2 integration confirmed and verified. |
 | 2026-04-24 | Added C-009 through C-015 — Phase 5A completions (swarm, dedup, registry, stream manager, trade executor, fill_price fix) |
 | 2026-04-24 | Added B-014 through B-018 — Phase 6 TODOs (Layer 1/2 integration confirm, midcap screener, load tests) |
 | 2026-04-23 | Added C-008 — Phase 4 signal history |

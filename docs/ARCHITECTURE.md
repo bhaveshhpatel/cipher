@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-24 (Phase 5A)
+> Last updated: 2026-04-24 (Phase 5A — post gap-fix audit)
 
 ---
 
@@ -22,7 +22,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │      → { ticker, strike, expiry, contract_type, DTE }            │
 │  No regex, no API call, no per-tick latency.                     │
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).            │
-│  On expiry days: refreshes every REGISTRY_EXPIRY_DAY_REFRESH_MINS│
+│  On expiry days: refreshes every 15 min.                         │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -33,16 +33,22 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │  its own session token (stream_worker.py per connection).        │
 │  Auto-reconnects on drop. When symbol list refreshes, only       │
 │  affected workers restart — not all 32.                          │
+│                                                                   │
+│  FIX (2026-04-24): registry refresh loop now calls               │
+│  manager.refresh() after every rebuild. Previously the refresh   │
+│  loop ran but never notified the manager — workers streamed       │
+│  stale OCC symbols indefinitely after a 30-min rebuild.          │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 3 — Parser  (parsers/options_flow_parser.py)              │
 │                                                                   │
-│  CRITICAL FIX: stream sends "last" as fill price, not "price".  │
-│  fill_price = float(tick["last"] or tick.get("price") or 0)     │
+│  CRITICAL FIX (C-015): stream sends "last" as fill price,        │
+│  not "price".                                                    │
+│  fill_price = float(tick["last"] or tick.get("price") or mid)   │
 │  Also: size==0 guard, OCC regex expanded to {1,10} chars,        │
-│  synthetic bid/ask spread when bid=ask=0 to prevent NEUTRAL mis- │
-│  classification. Unknown contract type → return None (skip).     │
+│  synthetic bid/ask spread when bid=ask=0, registry enrichment    │
+│  overrides OCC-parsed fields with pre-validated chain metadata.  │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -52,8 +58,14 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │  (N, C, M, Q) within 200ms. Without dedup: 4 DB rows per trade. │
 │  2-second TTL cache keyed on:                                    │
 │    (occ_symbol, size, fill_price_2dp, time_bucket_2s)            │
-│  Sweep detection: 3+ exchanges within 5s window.                 │
+│  Sweep detection: 3+ exchanges within 5s window → SWEEP.        │
 │  Module-level singleton: flow_dedup                              │
+│                                                                   │
+│  FIX (2026-04-24): DedupCache was fully implemented but was      │
+│  never imported or called in _process_trade(). Every exchange    │
+│  copy of a trade was being written to the DB. Fixed by adding    │
+│  flow_dedup.is_duplicate() gate before persist_flow_event().     │
+│  Also wired is_sweep() upgrade: 3+ exchanges → trade_type=SWEEP.│
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -61,8 +73,13 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │                                                                   │
 │  Never write one row at a time. Buffer events and flush to       │
 │  Supabase every 500ms OR 100 rows, whichever comes first.        │
-│  Estimated: ~62K filtered rows/day.                              │
-│  Uses SUPABASE_SERVICE_KEY (bypasses RLS).                       │
+│  Estimated: ~62K filtered rows/day → ~744 batched flushes.       │
+│  Uses SUPABASE_SERVICE_ROLE_KEY (bypasses RLS).                  │
+│                                                                   │
+│  FIX (2026-04-24): _FLUSH_INTERVAL was set to 5s instead of     │
+│  500ms. At 62K rows/day that's ~430 rows buffered per flush.     │
+│  Fixed: _FLUSH_INTERVAL=0.5s + _FLUSH_MAX_ROWS=100 early-flush  │
+│  in persist_flow_event() so 100-row batches fire immediately.    │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -73,6 +90,18 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │  flow_episodes and signal_history channels.                      │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 6-Layer Gap Fixes (2026-04-24 Audit)
+
+> Three gaps were discovered during a post-implementation audit. All fixed in commit `309192f`.
+
+| Layer | File | What Was Wrong | Fix |
+|-------|------|----------------|-----|
+| **L2** | `tradier_stream.py` | `registry.refresh_loop()` rebuilt the registry every 30 min but never called `manager.refresh()`. Workers kept streaming stale OCC symbols. | Replaced with `_registry_refresh_with_manager_notify()` which calls `await manager.refresh()` after every rebuild. |
+| **L4** | `tradier_stream.py` | `DedupCache` (`utils/dedup.py`) was fully built and unit-tested, but **never imported or called** in `_process_trade()`. Every exchange copy of a trade wrote a DB row. 4 exchanges → 4× row count. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. Also wired `is_sweep()` upgrade. |
+| **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. At 62K rows/day: ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()` itself. |
 
 ---
 
@@ -91,13 +120,14 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │           │     ├── fill_price: tick["last"] (not "price")│
 │    │           │     ├── size==0 guard → skip                  │
 │    │           │     └── OCC regex {1,10} + synthetic spread   │
-│    │           ├── DedupCache.is_duplicate()  Layer 4           │
-│    │           │     └── 2s TTL (symbol,size,price,bucket)     │
+│    │           ├── DedupCache.is_duplicate()  Layer 4  ← FIXED │
+│    │           │     ├── 2s TTL (symbol,size,price,bucket)     │
+│    │           │     └── is_sweep() → trade_type=SWEEP upgrade │
 │    │           ├── RepetitionAccumulator                        │
 │    │           │     └── episode when ≥3 trades / ≥$50K prem  │
 │    │           ├── build_composite()                            │
 │    │           │     └── flow×0.55 + backtest×0.35 + vol×0.10  │
-│    │           ├── SwarmEngine  (12 Groq agents)  Layer 5A     │
+│    │           ├── SwarmEngine  (12 Groq agents)  Phase 5A     │
 │    │           └── bus.publish_all()  core/async_bus.py        │
 │    │                      │                                    │
 │    │              AsyncEventBus (in-memory fan-out)            │
@@ -105,8 +135,11 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │                ├── "db_writer"     → flow_store.py (L5)  │
 │    │                └── "signal_writer" → signal_store.py     │
 │    │                                                           │
+│    ├── _registry_refresh_with_manager_notify()  ← FIXED (L2)  │
+│    │     └── registry.build() → manager.refresh() every 30min │
+│    │                                                           │
 │    ├── start_flow_writer()    services/flow_store.py  (L5)    │
-│    │     ├── buffer events, flush every 500ms or 100 rows      │
+│    │     ├── flush every 500ms OR 100 rows  ← FIXED (L5)      │
 │    │     ├── persist_flow_episode() → flow_episodes            │
 │    │     └── _flush_flow_events()   → flow_events              │
 │    │                                                           │
@@ -148,13 +181,15 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 ```
 Tradier SSE tick (Layer 2 — StreamManager)
   → parse_tradier_trade()                              Layer 3
-       ├── fill_price = tick["last"] or tick.get("price") or 0
+       ├── fill_price = tick["last"] or tick.get("price") or mid
        ├── size==0 guard → return None (skip)
        ├── OCC regex {1,10} — ticker/strike/expiry/type
-       └── synthetic spread when bid=ask=0
-  → DedupCache.is_duplicate()                          Layer 4
-       ├── duplicate (same exchange tick) → drop
-       └── canonical → check is_sweep()
+       ├── synthetic spread when bid=ask=0
+       └── registry enrichment → override with chain metadata
+  → DedupCache.is_duplicate()                          Layer 4  ← WIRED
+       ├── duplicate (same trade, different exchange) → DROP
+       ├── canonical → check is_sweep()
+       └── 3+ exchanges → trade_type = SWEEP
   → RepetitionAccumulator.ingest()
        └── RepetitionEpisode when trades ≥ 3 AND premium ≥ $50K
   → build_composite(ep, accumulator)
@@ -285,19 +320,19 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 
 | Table | Writer | Key Used | Notes |
 |-------|--------|----------|-------|
-| `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
-| `flow_events` | `flow_store.py` | SERVICE_KEY | Batched writes; `expiry` nullable |
-| `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields (Phase 5A) |
+| `flow_episodes` | `flow_store.py` | SERVICE_ROLE_KEY | 82k+ rows, primary flow data |
+| `flow_events` | `flow_store.py` | SERVICE_ROLE_KEY | Batched writes (500ms/100 rows); `expiry` nullable |
+| `signal_history` | `signal_store.py` | SERVICE_ROLE_KEY | Composite signals + swarm fields (Phase 5A) |
 | `options_universe_symbols` | `universe_store.py` | ANON_KEY | Symbol quotes, stream_eligible |
 | `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
 
 ### Supabase Critical Rules
 
-1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history` — anon key fails with `42501` (RLS)
+1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history` — anon key fails with `42501` (RLS)
 2. **Never send `id` fields** — Postgres generates them server-side
 3. **No `.select()` after `.insert()`** in supabase-py v2
 4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
-5. **Env var is `SUPABASE_SERVICE_KEY`** (NOT `SUPABASE_SERVICE_ROLE_KEY`)
+5. **Env var is `SUPABASE_SERVICE_ROLE_KEY`** (Railway config var name)
 
 ---
 
@@ -341,7 +376,7 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
 | `TRADIER_ACCOUNT_ID` | trade_executor.py | Yes (paper/live trading) |
 | `SUPABASE_URL` | flow_store, signal_store, universe_store | Yes |
-| `SUPABASE_SERVICE_KEY` | flow_store, signal_store | **Yes — service role key** |
+| `SUPABASE_SERVICE_ROLE_KEY` | flow_store, signal_store | **Yes — service role key** |
 | `SUPABASE_KEY` | universe_store, smart_signals (reads) | Yes (anon key) |
 | `SECRET_KEY` | auth.py | Yes |
 | `ALGORITHM` | auth.py | Yes (default: HS256) |
@@ -363,13 +398,12 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | Paginated signals list | `GET /api/signals/list?page=1&min_conviction=0.65` |
 | WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
 | Swarm agent reasoning | `signal_history.swarm_agents` JSONB column |
+| Dedup stats (live) | `_stats["deduped"]` via `/health` or Railway logs |
 
 ---
 
 ## Known Issues / Phase 6 TODO
 
-- `stream_manager.py` + `stream_worker.py` — confirm wired into main stream loop
-- `symbol_registry.py` — confirm integrated into flow pipeline (Layer 1 hookup)
 - `signals/midcap_screener.py` — confirm integrated into signal pipeline
 - Wire `TradeExecutor` into simulation router for live paper trade execution
 - Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
