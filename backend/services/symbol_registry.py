@@ -4,29 +4,12 @@ services/symbol_registry.py — Layer 1: OCC Symbol Registry
 Builds and maintains a mapping of ALL active OCC option contract symbols
 to their metadata (ticker, strike, expiry, contract_type, DTE).
 
-This is the key architectural component that enables correct options flow
-streaming. Instead of streaming underlying ticker symbols (which returns
-equity trade events), we stream the full OCC contract symbols
-(e.g. "AAPL  260117C00180000") which returns actual option trade events.
-
-HOW IT WORKS:
-  1. For each ticker in watchlist → fetch current stock price
-  2. Fetch all active expiration dates (DTE ≤ MAX_DTE)
-  3. For each expiry → fetch full option chain
-  4. Filter contracts where strike is within ATM_RANGE of stock price
-  5. Build OCC symbol → metadata dict (O(1) lookup at parse time)
-  6. Refresh every 30 minutes — diff new vs old, update stream workers
-
-USAGE:
-  registry = SymbolRegistry()
-  await registry.build()
-  meta = registry.lookup("AAPL  260117C00180000")
-  # → {"ticker": "AAPL", "strike": 180.0, "expiry": "2026-01-17",
-  #    "contract_type": "CALL", "dte": 30, "open_interest": 5000}
-  occ_symbols = registry.all_symbols()  # → list of OCC strings for streaming
-
-REFRESH:
-  asyncio.create_task(registry.refresh_loop())
+Config (C-019):
+  All filter constants are now read from the `ingestion_config` Supabase
+  table via services.ingestion_config.get_config() on every build/refresh.
+  Knobs (MAX_DTE, ATM_RANGE_PCT, MIN_OI, REFRESH_MINS, etc.) can be changed
+  from the admin UI without restarting the service.
+  A 60-second TTL cache in ingestion_config.py prevents DB hammering.
 """
 import asyncio
 import logging
@@ -38,15 +21,6 @@ from config import settings
 from utils.tradier_client import get_expirations, get_option_chain, get_quotes_batch
 
 log = logging.getLogger("symbol_registry")
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-MAX_DTE        = 90     # only include contracts expiring within 90 days
-ATM_RANGE_PCT  = 0.15   # ±15% of current stock price
-MIN_OI         = 0      # minimum open interest (0 = include all)
-REFRESH_MINS   = 30     # rebuild registry every 30 minutes
-EXPIRY_DAY_REFRESH_MINS = 15  # faster refresh on expiry day
 
 
 @dataclass
@@ -64,6 +38,9 @@ class SymbolRegistry:
     Thread-safe in-memory OCC symbol registry.
     Rebuilt on a schedule; safe for concurrent reads during rebuild
     (atomic swap of the internal dict on completion).
+
+    All filter thresholds are read from ingestion_config DB table on
+    every build so admin UI changes take effect without restart.
     """
 
     def __init__(self, watchlist: Optional[list[str]] = None):
@@ -73,16 +50,10 @@ class SymbolRegistry:
         self._last_build: Optional[datetime] = None
         self._build_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
-        """O(1) lookup of OCC symbol metadata. Returns None if not in registry."""
         return self._registry.get(occ_symbol.strip())
 
     def all_symbols(self) -> list[str]:
-        """Return all OCC symbols currently in the registry."""
         return list(self._registry.keys())
 
     def size(self) -> int:
@@ -94,28 +65,29 @@ class SymbolRegistry:
     def is_ready(self) -> bool:
         return len(self._registry) > 0
 
-    # ------------------------------------------------------------------
-    # Build / Refresh
-    # ------------------------------------------------------------------
-
     async def build(self) -> int:
         """
-        Full registry build. Fetches stock prices → expirations → chains.
+        Full registry build. Reads live config from DB, then:
+        fetches stock prices -> expirations -> chains.
         Returns count of OCC symbols loaded.
         """
+        from services.ingestion_config import get_config
+        cfg = await get_config()
+
         async with self._build_lock:
-            log.info(f"[symbol_registry] Building OCC registry for {len(self._watchlist)} tickers...")
+            log.info(
+                f"[symbol_registry] Building OCC registry for {len(self._watchlist)} tickers "
+                f"[max_dte={cfg['REGISTRY_MAX_DTE']}, atm_range=+/-{cfg['REGISTRY_ATM_RANGE_PCT']:.0%}, "
+                f"min_oi={cfg['REGISTRY_MIN_OI']}]"
+            )
             new_registry: dict[str, ContractMeta] = {}
 
-            # Step 1: Batch fetch stock prices for all watchlist tickers
-            # Split into 200-symbol batches
             prices = await self._fetch_stock_prices()
             self._stock_prices = prices
             log.info(f"[symbol_registry] Stock prices fetched: {len(prices)} tickers")
 
-            # Step 2 + 3: For each ticker, fetch expirations then chains
             tasks = [
-                self._build_ticker(ticker, prices.get(ticker, 0.0), new_registry)
+                self._build_ticker(ticker, prices.get(ticker, 0.0), new_registry, cfg)
                 for ticker in self._watchlist
                 if ticker in prices and prices[ticker] > 0
             ]
@@ -125,7 +97,7 @@ class SymbolRegistry:
             self._registry = new_registry
             self._last_build = datetime.utcnow()
 
-            added   = len(new_registry) - old_count
+            added = len(new_registry) - old_count
             log.info(
                 f"[symbol_registry] Build complete: {len(new_registry):,} OCC symbols "
                 f"(was {old_count:,}, delta={added:+,})"
@@ -135,17 +107,23 @@ class SymbolRegistry:
     async def refresh_loop(self):
         """
         Background task — rebuilds registry on schedule.
-        Run as: asyncio.create_task(registry.refresh_loop())
+        Refresh interval is read from DB config on every cycle so changes
+        to REGISTRY_REFRESH_MINS take effect without restart.
         """
         while True:
-            # Determine refresh interval — faster on expiry days
+            from services.ingestion_config import get_config
+            cfg = await get_config()
+
             today = date.today()
-            # Check if any tracked expiry matches today
             has_expiry_today = any(
                 meta.expiry == today.isoformat()
                 for meta in self._registry.values()
             )
-            interval_mins = EXPIRY_DAY_REFRESH_MINS if has_expiry_today else REFRESH_MINS
+            interval_mins = (
+                cfg["REGISTRY_EXPIRY_DAY_REFRESH_MINS"]
+                if has_expiry_today
+                else cfg["REGISTRY_REFRESH_MINS"]
+            )
             await asyncio.sleep(interval_mins * 60)
 
             log.info(f"[symbol_registry] Scheduled refresh (interval={interval_mins}min)")
@@ -154,12 +132,7 @@ class SymbolRegistry:
             except Exception as e:
                 log.error(f"[symbol_registry] Refresh failed (non-fatal): {e}")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     async def _fetch_stock_prices(self) -> dict[str, float]:
-        """Batch fetch current stock prices for all watchlist tickers."""
         prices: dict[str, float] = {}
         batch_size = 200
         batches = [
@@ -184,14 +157,20 @@ class SymbolRegistry:
         ticker: str,
         stock_price: float,
         registry: dict[str, ContractMeta],
+        cfg: dict,
     ):
         """
         Fetch expirations + chains for one ticker and populate registry.
-        Runs with rate-limit semaphore inside get_option_chain.
+        Uses config snapshot passed in from build() so all tickers in one
+        build cycle use the same consistent config values.
         """
         if stock_price <= 0:
             log.warning(f"[symbol_registry] {ticker}: no stock price — skipping")
             return
+
+        max_dte       = cfg["REGISTRY_MAX_DTE"]
+        atm_range_pct = cfg["REGISTRY_ATM_RANGE_PCT"]
+        min_oi        = cfg["REGISTRY_MIN_OI"]
 
         try:
             expirations = await get_expirations(ticker)
@@ -199,9 +178,9 @@ class SymbolRegistry:
             log.warning(f"[symbol_registry] {ticker}: expirations fetch failed: {e}")
             return
 
-        today = date.today()
-        atm_low  = stock_price * (1 - ATM_RANGE_PCT)
-        atm_high = stock_price * (1 + ATM_RANGE_PCT)
+        today    = date.today()
+        atm_low  = stock_price * (1 - atm_range_pct)
+        atm_high = stock_price * (1 + atm_range_pct)
 
         for expiry_str in expirations:
             try:
@@ -209,7 +188,7 @@ class SymbolRegistry:
             except ValueError:
                 continue
             dte = (exp_date - today).days
-            if dte < 0 or dte > MAX_DTE:
+            if dte < 0 or dte > max_dte:
                 continue
 
             try:
@@ -223,12 +202,10 @@ class SymbolRegistry:
                     strike = float(contract.get("strike", 0) or 0)
                     if strike <= 0:
                         continue
-                    # ATM filter
                     if not (atm_low <= strike <= atm_high):
                         continue
-                    # Open interest filter
                     oi = int(contract.get("open_interest", 0) or 0)
-                    if oi < MIN_OI:
+                    if oi < min_oi:
                         continue
 
                     occ_symbol = contract.get("symbol", "").strip()
@@ -253,9 +230,6 @@ class SymbolRegistry:
         log.debug(f"[symbol_registry] {ticker}: {ticker_count} contracts loaded (price=${stock_price:.2f})")
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
 _registry: Optional[SymbolRegistry] = None
 
 
