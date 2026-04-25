@@ -53,6 +53,19 @@ Fix (C-018) — Synthetic Quote Tagging:
     _process_trade() into the persist_flow_event() dict.
   - Rows where bid=ask=0 and spread was synthesised are tagged in the DB.
 
+Fix (C-019) — Dedup TTL & Sweep Overhaul (Layer 4):
+  - flow_dedup (DedupCache) is now actively called in _process_trade().
+    Previously the singleton was instantiated in utils/dedup.py but never
+    imported here — dedup was completely inert in production.
+  - exchange code from trade_payload.get("exch", "") now passed to
+    is_duplicate() and drives real sweep detection.
+  - If flow_dedup.is_duplicate() returns True → event dropped, _stats["deduped"]
+    incremented. No DB write, no accumulator ingest.
+  - If is_sweep() returns True after canonical pass → ev.trade_type upgraded to
+    "SWEEP" and ev.exchange_count set to the real unique-exchange count.
+  - _stats now includes "deduped" counter exposed via /health endpoint.
+  - DedupCache.dedup_stats() merged into get_stats() for full observability.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -62,6 +75,8 @@ Tradier streaming notes:
   - Tradier closes the stream immediately when the market is closed (no queued data)
   - filter=timesale: symbol field = full OCC option string, price = option fill
   - filter=trade:    symbol field = underlying ticker, price = stock last — DO NOT USE
+  - exch field in timesale payload: single char exchange code (C=CBOE, M=MIAX,
+    Q=NASDAQ, N=NYSE, X=PHLX, B=BATO). Used for sweep detection in DedupCache.
 
 NOTE (2026-04-25):
   - Automatic _demo_mode fallback in stream_options_flow() is DISABLED.
@@ -72,6 +87,7 @@ NOTE (2026-04-25):
 import asyncio
 import logging
 import random
+import time as _time
 from datetime import datetime, time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -84,6 +100,7 @@ from parsers.options_flow_parser import parse_tradier_trade
 from services.flow_store import persist_flow_event
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
+from utils.dedup import flow_dedup   # C-019: Layer 4 dedup now active
 
 log = logging.getLogger("tradier_stream")
 
@@ -113,6 +130,7 @@ _stats = {
     "active_symbols": 0,
     "ticks":          0,
     "classified":     0,
+    "deduped":        0,   # C-019: events dropped by dedup cache
     "signals":        0,
     "errors":         0,
     "reconnects":     0,
@@ -123,7 +141,9 @@ accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium
 
 
 def get_stats() -> dict:
-    return dict(_stats)
+    stats = dict(_stats)
+    stats.update(flow_dedup.dedup_stats())  # C-019: merge dedup counters
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +302,16 @@ async def _process_trade(raw: dict):
       bid    = option bid
       ask    = option ask
       size   = contract count
+      exch   = exchange code e.g. 'C' (CBOE), 'M' (MIAX), 'Q' (NASDAQ),
+               'X' (PHLX), 'N' (NYSE), 'B' (BATO)
       date   = epoch ms timestamp
 
-    We unwrap the envelope and pass the inner dict to parse_tradier_trade().
-    Both "timesale" and "trade" envelope types are handled for compatibility.
-    occ_symbol is passed through to persist_flow_event() and stored in DB.
+    Layer 4 dedup (C-019):
+      flow_dedup.is_duplicate() is called before any DB write or accumulator
+      ingest. Events arriving from slower exchanges (MIAX, PHLX) within 5s of
+      the canonical CBOE print are silently dropped. If 3+ distinct exchanges
+      report the same trade within 8s, trade_type is upgraded to SWEEP and
+      exchange_count is set to the real unique-exchange count.
     """
     _stats["ticks"] += 1
 
@@ -308,10 +333,43 @@ async def _process_trade(raw: dict):
     if not ev:
         return
 
-    _stats["classified"] += 1
-
-    # Capture the raw OCC symbol for DB storage
+    # ------------------------------------------------------------------
+    # Layer 4: Deduplication (C-019)
+    # Drop events that are duplicates of a trade already seen within 5s.
+    # Use monotonic arrival time so Tradier late-delivery batches are
+    # correctly identified as duplicates even if their timestamps differ.
+    # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
+    exchange   = trade_payload.get("exch", "")   # e.g. 'C', 'M', 'Q', 'X'
+    arrival_ts = _time.monotonic()
+
+    if flow_dedup.is_duplicate(
+        occ_symbol=occ_symbol,
+        size=ev.size,
+        fill=ev.fill_price,
+        exchange=exchange,
+        ts=arrival_ts,
+    ):
+        _stats["deduped"] += 1
+        log.debug(
+            f"[dedup] dropped duplicate: {occ_symbol} size={ev.size} "
+            f"fill={ev.fill_price} exch={exchange}"
+        )
+        return
+
+    # Canonical print — check for sweep upgrade
+    if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
+        real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
+        if ev.trade_type != "SWEEP":
+            log.debug(
+                f"[dedup] sweep upgrade: {occ_symbol} "
+                f"{real_exch_count} exchanges — {ev.trade_type} → SWEEP"
+            )
+            ev.trade_type     = "SWEEP"
+        ev.exchange_count = real_exch_count
+    # ------------------------------------------------------------------
+
+    _stats["classified"] += 1
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
@@ -319,8 +377,9 @@ async def _process_trade(raw: dict):
         f"| fill={ev.fill_price} bid={ev.bid} ask={ev.ask} size={ev.size} "
         f"| prem=${ev.premium:,.0f} "
         f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
-        f"| type={ev.trade_type} sentiment={ev.sentiment} tier={ev.influence_tier} "
-        f"| conviction={ev.conviction_score} occ={occ_symbol}"
+        f"| type={ev.trade_type} exch={exchange} exch_count={ev.exchange_count} "
+        f"| sentiment={ev.sentiment} tier={ev.influence_tier} "
+        f"| conviction={ev.conviction_score} occ={occ_symbol} "
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
@@ -348,7 +407,7 @@ async def _process_trade(raw: dict):
         "iv":                   ev.iv,
         "underlying_price":     ev.underlying_price,
         "occ_symbol":           occ_symbol,
-        "is_synthetic_quote":   ev.is_synthetic_quote,   # C-018
+        "is_synthetic_quote":   ev.is_synthetic_quote,
     })
 
     ep = accumulator.ingest(ev)
