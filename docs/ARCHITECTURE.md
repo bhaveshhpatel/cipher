@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-24 (C-019 — Layer 4 dedup TTL overhaul + sweep wiring)
+> Last updated: 2026-04-25 (Feature 4A — TierEngine: dynamic tier assignment, admin thresholds, OI/vol enrichment)
 
 ---
 
@@ -95,11 +95,20 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
-│  Layer 6 — Supabase Realtime                                     │
+│  Layer 6 — Supabase Realtime + TierEngine          Feature 4A    │
 │                                                                   │
-│  Zero extra work. Supabase auto-broadcasts every INSERT to       │
-│  subscribed frontend clients. Frontend subscribes to             │
+│  Realtime: Zero extra work. Supabase auto-broadcasts every       │
+│  INSERT to subscribed frontend clients. Frontend subscribes to   │
 │  flow_episodes and signal_history channels.                      │
+│                                                                   │
+│  TierEngine (services/tier_engine.py):                           │
+│    assign_tiers(symbols) → upserts tier (1/2/3) + open_interest │
+│    + average_volume onto options_universe_symbols.               │
+│    Thresholds loaded from tier_thresholds (is_active=true row)  │
+│    and cached for TIER_THRESHOLD_CACHE_TTL_S (default 300s).    │
+│    Admin whitelist (TIER_ADMIN_WHITELIST env) forces symbols to  │
+│    Tier 1 regardless of metrics.                                 │
+│    Called by universe_store.upsert() after every symbol refresh. │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -116,6 +125,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 | **L4 (orig)** | `tradier_stream.py` | `DedupCache` (`utils/dedup.py`) was fully built and unit-tested, but **never imported or called** in `_process_trade()`. Every exchange copy of a trade wrote a DB row. 4 exchanges → 4× row count. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. Also wired `is_sweep()` upgrade. |
 | **L4 (C-019)** | `utils/dedup.py` + `tradier_stream.py` | TTL=2s too tight for PHLX/MIAX lag (2–5s). `int(ts//2)` bucket boundary let MIAX duplicate at t=2.01s slip past CBOE canonical at t=1.99s. Fill key at 2dp conflated ±$0.01 feed rounding. `exchange` field never passed to `is_duplicate()` so sweep detection always saw one exchange and never fired. | TTL→5s, sweep window→8s. Pure first-seen TTL (no buckets). Fill key 1dp. `"exch"/"exchange"` fallback in `_process_trade()`. `get_exchange_count()` + `dedup_stats()` added. |
 | **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. At 62K rows/day: ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()` itself. |
+| **L6 (4A)** | `services/tier_engine.py` | `options_universe_symbols` had no tier column — every symbol defaulted to Tier 3 regardless of liquidity. Tier used in `backtest_score` was always 3, degrading signal quality for large-cap / liquid symbols. | Added `tier_engine.py` with dynamic threshold-driven assignment. `tier_thresholds` admin table (migration 011). `universe_store.upsert()` now calls `assign_tiers()` post-refresh. |
 
 ---
 
@@ -159,9 +169,18 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │     ├── persist_flow_episode() → flow_episodes            │
 │    │     └── _flush_flow_events()   → flow_events              │
 │    │                                                           │
-│    └── start_signal_writer()  services/signal_store.py        │
-│          ├── persists CompositeSignal + swarm fields           │
-│          └── → signal_history (Supabase Realtime L6)          │
+│    ├── start_signal_writer()  services/signal_store.py        │
+│    │     ├── persists CompositeSignal + swarm fields           │
+│    │     └── → signal_history (Supabase Realtime L6)          │
+│    │                                                           │
+│    └── TierEngine  services/tier_engine.py  Feature 4A        │
+│          ├── assign_tiers(symbols) — called by universe_store  │
+│          │     upsert() after every symbol refresh             │
+│          ├── _load_thresholds() — queries tier_thresholds      │
+│          │     WHERE is_active=true; cached 300s               │
+│          ├── Admin whitelist (TIER_ADMIN_WHITELIST) → Tier 1   │
+│          └── upserts tier + open_interest + average_volume     │
+│                onto options_universe_symbols                    │
 │                                                                 │
 │  FastAPI Routers                                                │
 │    ├── /api/auth                  auth.py                      │
@@ -170,7 +189,9 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    ├── /ws/signals                ws.py (ping/pong heartbeat)  │
 │    ├── /api/signals/composite     smart_signals.py             │
 │    ├── /api/signals/list          smart_signals.py             │
-│    └── /api/signals/history       history.py                   │
+│    ├── /api/signals/history       history.py                   │
+│    ├── /admin/tier-thresholds     admin.py  (PATCH/GET)        │
+│    └── /admin/tier-distribution   admin.py  (GET)              │
 └─────────────────────────────────────────────────────────────────┘
                               │
                 Supabase Realtime (Layer 6)
@@ -180,6 +201,7 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │                    Supabase (PostgreSQL)                        │
 │   flow_episodes · flow_events · options_universe_snapshots      │
 │   options_universe_symbols · signal_history · auth.users        │
+│   tier_thresholds  ← Feature 4A                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -238,6 +260,55 @@ Tradier SSE tick (Layer 2 — StreamManager)
 | `volume_premium_factor` | 0.10 | Premium relative to open interest |
 
 **Recommendation threshold:** composite ≥ 0.65 → BUY (bullish) or SELL (bearish)
+
+---
+
+## TierEngine — Feature 4A
+
+### Tier Definitions
+
+| Tier | Label | Min Avg Volume | ATM Strike Range | Max DTE |
+|------|-------|---------------|-----------------|---------|
+| 1 | Liquid large-cap | ≥ 20M | ±20% | 90 |
+| 2 | Mid-cap | ≥ 2M | ±15% | 60 |
+| 3 | Standard (default) | ≥ 500K | ±10% | 30 |
+
+Thresholds are stored in `tier_thresholds` (the `is_active = true` row) and cached for 300 seconds. Admins can update them live via `PATCH /admin/tier-thresholds` without redeployment.
+
+### `options_universe_symbols` — Feature 4A columns
+
+| Column | Type | Default | Notes |
+|--------|------|---------|-------|
+| `tier` | `SMALLINT` | `3` | 1 = liquid, 2 = mid-cap, 3 = standard |
+| `open_interest` | `INT` | `NULL` | Populated by TierEngine from Tradier quotes |
+| `average_volume` | `INT` | `NULL` | Populated by TierEngine from Tradier quotes |
+
+### Admin endpoints
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/admin/tier-thresholds` | `GET` | Admin JWT | Read active threshold row |
+| `/admin/tier-thresholds` | `PATCH` | Admin JWT | Update thresholds live (no redeploy) |
+| `/admin/tier-distribution` | `GET` | Admin JWT | Count of symbols per tier |
+
+### `tier_thresholds` Table
+
+```sql
+CREATE TABLE tier_thresholds (
+  id                    BIGSERIAL PRIMARY KEY,
+  t1_min_avg_volume     INT NOT NULL DEFAULT 20000000,
+  t1_atm_range_pct      NUMERIC NOT NULL DEFAULT 20.0,
+  t1_max_dte            INT NOT NULL DEFAULT 90,
+  t2_min_avg_volume     INT NOT NULL DEFAULT 2000000,
+  t2_atm_range_pct      NUMERIC NOT NULL DEFAULT 15.0,
+  t2_max_dte            INT NOT NULL DEFAULT 60,
+  t3_min_avg_volume     INT NOT NULL DEFAULT 500000,
+  t3_atm_range_pct      NUMERIC NOT NULL DEFAULT 10.0,
+  t3_max_dte            INT NOT NULL DEFAULT 30,
+  is_active             BOOLEAN NOT NULL DEFAULT false,
+  created_at            TIMESTAMPTZ DEFAULT now()
+);
+```
 
 ---
 
@@ -341,12 +412,13 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | `flow_episodes` | `flow_store.py` | SERVICE_ROLE_KEY | 82k+ rows, primary flow data |
 | `flow_events` | `flow_store.py` | SERVICE_ROLE_KEY | Batched writes (500ms/100 rows); `expiry` nullable |
 | `signal_history` | `signal_store.py` | SERVICE_ROLE_KEY | Composite signals + swarm fields (Phase 5A) |
-| `options_universe_symbols` | `universe_store.py` | ANON_KEY | Symbol quotes, stream_eligible |
+| `options_universe_symbols` | `universe_store.py` + `tier_engine.py` | ANON_KEY / SERVICE_ROLE_KEY | Symbol quotes, stream_eligible, **tier/OI/avg_vol (4A)** |
 | `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
+| `tier_thresholds` | admin endpoint | SERVICE_ROLE_KEY | Single active row; cached 300s by TierEngine |
 
 ### Supabase Critical Rules
 
-1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history` — anon key fails with `42501` (RLS)
+1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
 2. **Never send `id` fields** — Postgres generates them server-side
 3. **No `.select()` after `.insert()`** in supabase-py v2
 4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
@@ -372,8 +444,9 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | 1 | CBOE CSV → ~5,500 raw symbols | — |
 | 2 | Tradier `/expirations` validation → ~5,500 confirmed optionable | — |
 | 3 | Tradier batch quotes (200/batch, 28 parallel) → `stream_eligible` flag | `options_universe_symbols` |
-| 4 | Extract `stream_eligible=true` → StreamManager (~1,000–2,000 symbols) | — |
-| 5 | Save snapshot | `options_universe_snapshots` |
+| 4 | **TierEngine.assign_tiers()** → upserts `tier`, `open_interest`, `average_volume` | `options_universe_symbols` |
+| 5 | Extract `stream_eligible=true` → StreamManager (~1,000–2,000 symbols) | — |
+| 6 | Save snapshot | `options_universe_snapshots` |
 
 **Startup priority:** fresh DB snapshot (< 24h) → Tradier fetch → stale snapshot → `SEED_SYMBOLS`.
 
@@ -394,7 +467,7 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
 | `TRADIER_ACCOUNT_ID` | trade_executor.py | Yes (paper/live trading) |
 | `SUPABASE_URL` | flow_store, signal_store, universe_store | Yes |
-| `SUPABASE_SERVICE_ROLE_KEY` | flow_store, signal_store | **Yes — service role key** |
+| `SUPABASE_SERVICE_ROLE_KEY` | flow_store, signal_store, tier_engine | **Yes — service role key** |
 | `SUPABASE_KEY` | universe_store, smart_signals (reads) | Yes (anon key) |
 | `SECRET_KEY` | auth.py | Yes |
 | `ALGORITHM` | auth.py | Yes (default: HS256) |
@@ -402,6 +475,8 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | `SWARM_N_AGENTS` | swarm_engine.py | No (default: 6) |
 | `REGISTRY_MAX_DTE` | symbol_registry.py | No (default: 90) |
 | `REGISTRY_REFRESH_MINS` | symbol_registry.py | No (default: 30) |
+| `TIER_ADMIN_WHITELIST` | tier_engine.py | No — comma-separated tickers forced to Tier 1 |
+| `TIER_THRESHOLD_CACHE_TTL_S` | tier_engine.py | No (default: 300) |
 
 ---
 
@@ -417,13 +492,17 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
 | Swarm agent reasoning | `signal_history.swarm_agents` JSONB column |
 | Dedup stats (live) | `GET /health` → `dedup_duplicates`, `dedup_sweeps`, `dedup_cache_size` |
+| Tier distribution | `GET /admin/tier-distribution` |
+| Active tier thresholds | `GET /admin/tier-thresholds` |
 
 ---
 
 ## Known Issues / Phase 6 TODO
 
+- ✅ **Feature 4A complete** — TierEngine, tier_thresholds table, migrations 010+011, admin endpoints, 35 tests
 - `signals/midcap_screener.py` — confirm integrated into signal pipeline
 - Wire `TradeExecutor` into simulation router for live paper trade execution
 - Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
 - WebSocket fan-out benchmark with 50+ subscribers
 - Redis integration (`REDIS_URL` in config but unused — candidate for WS pub/sub at scale)
+- Wire `/api/signals/list` tier filter to live `tier` column on `options_universe_symbols`
