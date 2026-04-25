@@ -1,16 +1,18 @@
 """
-test_6layer_regression.py — Regression tests for the three 6-layer gap fixes.
+test_6layer_regression.py — Regression tests for the 6-layer gap fixes.
 
 Gap fixes audited 2026-04-24 (commit 309192f):
   C-016  Layer 4: DedupCache was implemented but never called in _process_trade()
   C-017  Layer 2: registry.refresh_loop() never called manager.refresh() after rebuild
   C-018  Layer 5: _FLUSH_INTERVAL was 5s instead of 500ms; no 100-row early flush
+         Layer 3: is_synthetic_quote flag added for bid=ask=0 rows (migration 009)
 
 Test groups:
   L4-01 … L4-10  DedupCache unit tests (utils/dedup.py)
   L5-01 … L5-08  flow_store flush interval + early-flush tests
   L2-01 … L2-06  StreamManager.refresh() wiring (import-level + mock)
   INT-01 … INT-03 Integration: dedup gate visible in tradier_stream._process_trade
+  SQ-01 … SQ-08  is_synthetic_quote flag (C-018 Layer 3 / migration 009)
 
 All tests are pure-Python / asyncio — no Supabase, no Tradier, no network.
 """
@@ -162,6 +164,7 @@ class TestFlowStoreFlushL5:
                         "exchange_count": 1, "fill_count": 1,
                         "open_interest": 5000, "iv": 0.35,
                         "underlying_price": 182.0, "occ_symbol": f"AAPL260117C00180000",
+                        "is_synthetic_quote": False,
                     })
             # After 100 rows, early flush should have fired once
             assert len(flushed_batches) >= 1
@@ -192,6 +195,7 @@ class TestFlowStoreFlushL5:
                         "exchange_count": 1, "fill_count": 1,
                         "open_interest": 0, "iv": 0.0,
                         "underlying_price": 205.0, "occ_symbol": f"TSLA260620P00200000",
+                        "is_synthetic_quote": False,
                     })
                 # Buffer should be empty after the 100-row early flush
                 assert len(fs._flow_event_buffer) == 0
@@ -224,6 +228,7 @@ class TestFlowStoreFlushL5:
                         "exchange_count": 4, "fill_count": 1,
                         "open_interest": 20000, "iv": 0.22,
                         "underlying_price": 502.0, "occ_symbol": f"SPY260321C00500000",
+                        "is_synthetic_quote": False,
                     })
                 assert len(flushed) == 0, "Should NOT flush until 100 rows or timer fires"
                 assert len(fs._flow_event_buffer) == 50
@@ -258,6 +263,7 @@ class TestFlowStoreFlushL5:
                 "open_interest": 8000, "iv": 0.45,
                 "underlying_price": 701.0,
                 "occ_symbol": "NVDA  260117C00700000",
+                "is_synthetic_quote": False,
             })
             assert len(fs._flow_event_buffer) == 1
             row = fs._flow_event_buffer[0]
@@ -285,6 +291,7 @@ class TestFlowStoreFlushL5:
                 "exchange_count": 1, "fill_count": 1,
                 "open_interest": 0, "iv": 0.0,
                 "underlying_price": 182.0, "occ_symbol": None,
+                "is_synthetic_quote": False,
             })
             row = fs._flow_event_buffer[-1]
             assert row["expiry"] is None, (
@@ -504,3 +511,174 @@ class TestDedupIntegrationINT:
             )
 
         run(run_test())
+
+
+# ===========================================================================
+# SQ — is_synthetic_quote (C-018 Layer 3 / migration 009)
+# ===========================================================================
+
+class TestSyntheticQuoteSQ:
+    """
+    C-018 regression: is_synthetic_quote flag — parser sets it correctly,
+    flow_store persists it, and backtest queries must filter it out.
+    """
+
+    # SQ-01: OptionsFlowEvent must have is_synthetic_quote attribute
+    def test_flow_event_has_is_synthetic_quote_field(self):
+        from parsers.options_flow_parser import OptionsFlowEvent
+        import inspect
+        fields = {f.name for f in OptionsFlowEvent.__dataclass_fields__.values()} \
+                 if hasattr(OptionsFlowEvent, '__dataclass_fields__') \
+                 else set(vars(OptionsFlowEvent()).keys())
+        assert "is_synthetic_quote" in fields, (
+            "REGRESSION C-018: OptionsFlowEvent missing is_synthetic_quote field. "
+            "migration 009 added the column — the dataclass must match."
+        )
+
+    # SQ-02: Parser sets is_synthetic_quote=True when bid=ask=0
+    def test_parser_sets_synthetic_flag_when_bid_ask_zero(self):
+        from parsers.options_flow_parser import parse_tradier_trade
+
+        tick = {
+            "type": "timesale",
+            "symbol": "AAPL  260117C00180000",
+            "last": 1.50, "price": 1.50, "size": 10,
+            "bid": 0, "ask": 0,
+            "exch": "N",
+        }
+        event = parse_tradier_trade(tick)
+        assert event is not None
+        assert event.is_synthetic_quote is True, (
+            "Parser must set is_synthetic_quote=True when bid=ask=0. "
+            "bid/ask were synthesised ±0.5% from fill price."
+        )
+
+    # SQ-03: Parser sets is_synthetic_quote=False when real NBBO present
+    def test_parser_clears_synthetic_flag_with_real_nbbo(self):
+        from parsers.options_flow_parser import parse_tradier_trade
+
+        tick = {
+            "type": "timesale",
+            "symbol": "AAPL  260117C00180000",
+            "last": 1.50, "price": 1.50, "size": 10,
+            "bid": 1.45, "ask": 1.55,
+            "exch": "N",
+        }
+        event = parse_tradier_trade(tick)
+        assert event is not None
+        assert event.is_synthetic_quote is False, (
+            "Parser must set is_synthetic_quote=False when real bid/ask are present."
+        )
+
+    # SQ-04: Synthetic bid/ask are ±0.5% of fill price
+    def test_synthetic_spread_is_half_percent_of_fill(self):
+        from parsers.options_flow_parser import parse_tradier_trade
+
+        fill = 2.00
+        tick = {
+            "type": "timesale",
+            "symbol": "TSLA  260424C00375000",
+            "last": fill, "size": 5,
+            "bid": 0, "ask": 0,
+            "exch": "C",
+        }
+        event = parse_tradier_trade(tick)
+        assert event is not None
+        expected_bid = round(fill * 0.995, 2)
+        expected_ask = round(fill * 1.005, 2)
+        assert abs(event.bid - expected_bid) < 0.005, f"bid={event.bid} expected ~{expected_bid}"
+        assert abs(event.ask - expected_ask) < 0.005, f"ask={event.ask} expected ~{expected_ask}"
+
+    # SQ-05: flow_store persists is_synthetic_quote field to DB row
+    def test_flow_store_persists_is_synthetic_quote_true(self):
+        import services.flow_store as fs
+
+        async def run_test():
+            fs._flow_event_buffer.clear()
+            await fs.persist_flow_event({
+                "ticker": "TSLA", "contract_type": "CALL",
+                "strike": 375.0, "expiry": "2026-04-24",
+                "dte": 0, "fill_price": 3.0,
+                "bid": 2.985, "ask": 3.015, "size": 5,
+                "premium": 1500.0, "trade_type": "SINGLE",
+                "bid_ask_class": "AT_ASK", "is_aggressive": True,
+                "is_golden_sweep": False, "sentiment": "BULLISH",
+                "influence_tier": "RETAIL", "conviction_score": 0.3,
+                "exchange_count": 1, "fill_count": 1,
+                "open_interest": 1000, "iv": 0.50,
+                "underlying_price": 370.0,
+                "occ_symbol": "TSLA  260424C00375000",
+                "is_synthetic_quote": True,
+            })
+            row = fs._flow_event_buffer[-1]
+            assert "is_synthetic_quote" in row, (
+                "REGRESSION C-018: flow_store must persist is_synthetic_quote column."
+            )
+            assert row["is_synthetic_quote"] is True
+
+        run(run_test())
+
+    # SQ-06: flow_store persists is_synthetic_quote=False for real NBBO rows
+    def test_flow_store_persists_is_synthetic_quote_false(self):
+        import services.flow_store as fs
+
+        async def run_test():
+            fs._flow_event_buffer.clear()
+            await fs.persist_flow_event({
+                "ticker": "SPY", "contract_type": "PUT",
+                "strike": 450.0, "expiry": "2026-01-17",
+                "dte": 30, "fill_price": 2.00,
+                "bid": 1.95, "ask": 2.05, "size": 20,
+                "premium": 4000.0, "trade_type": "BLOCK",
+                "bid_ask_class": "MID", "is_aggressive": False,
+                "is_golden_sweep": False, "sentiment": "BEARISH",
+                "influence_tier": "WHALE", "conviction_score": 0.7,
+                "exchange_count": 1, "fill_count": 1,
+                "open_interest": 30000, "iv": 0.18,
+                "underlying_price": 452.0,
+                "occ_symbol": "SPY   260117P00450000",
+                "is_synthetic_quote": False,
+            })
+            row = fs._flow_event_buffer[-1]
+            assert row["is_synthetic_quote"] is False
+
+        run(run_test())
+
+    # SQ-07: tradier_stream.py must reference is_synthetic_quote
+    def test_tradier_stream_sets_is_synthetic_quote(self):
+        import pathlib
+        src = pathlib.Path("backend/services/tradier_stream.py")
+        if not src.exists():
+            src = pathlib.Path("services/tradier_stream.py")
+        text = src.read_text()
+        assert "is_synthetic_quote" in text, (
+            "REGRESSION C-018: tradier_stream.py does not pass is_synthetic_quote "
+            "to persist_flow_event(). Synthetic rows will have NULL in DB column."
+        )
+
+    # SQ-08: backtest_score helper must filter is_synthetic_quote=false rows
+    def test_backtest_score_query_filters_synthetic_quotes(self):
+        """
+        Verify the backtest score SQL or query builder excludes synthetic rows.
+        Checks source-level: backtesting module must contain the filter.
+        """
+        import pathlib
+        # Check wherever backtest_score / historical win-rate is computed
+        candidates = [
+            pathlib.Path("backend/services/backtest_store.py"),
+            pathlib.Path("services/backtest_store.py"),
+            pathlib.Path("backend/signals/backtest_scorer.py"),
+            pathlib.Path("signals/backtest_scorer.py"),
+        ]
+        found_file = None
+        for p in candidates:
+            if p.exists():
+                found_file = p
+                break
+        if found_file is None:
+            pytest.skip("backtest_store.py / backtest_scorer.py not found — skip SQ-08")
+        text = found_file.read_text()
+        assert "is_synthetic_quote" in text, (
+            "REGRESSION C-018: backtest query file does not filter is_synthetic_quote=false. "
+            "Aggression ratios will be skewed by synthesised NBBO rows."
+        )
