@@ -40,11 +40,13 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 2 — Stream Manager  (services/stream_manager.py)          │
 │                                                                   │
-│  ~16,000 OCC symbols — Tradier caps each connection at ~500.     │
-│  StreamManager splits into 32 parallel connections, each with    │
-│  its own session token (stream_worker.py per connection).        │
-│  Auto-reconnects on drop. When symbol list refreshes, only       │
-│  affected workers restart — not all 32.                          │
+│  Streams the tier-filtered OCC symbol set produced by Layer 1.   │
+│  Symbol count is dynamic (tier ATM/DTE params drive registry     │
+│  size). Tradier caps each connection at ~500 symbols; workers     │
+│  are spawned as ceil(registry.size() / 500) — typically 20–40.  │
+│  Each worker has its own session token (stream_worker.py).        │
+│  Auto-reconnects on drop. On refresh: diffs old vs new symbol    │
+│  set, restarts only affected workers — not all of them.          │
 │                                                                   │
 │  FIX (2026-04-24): registry refresh loop now calls               │
 │  manager.refresh() after every rebuild. Previously the refresh   │
@@ -149,9 +151,11 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │                                                                 │
 │  main.py (FastAPI lifespan)                                     │
 │    ├── SymbolRegistry (Layer 1)  services/symbol_registry.py   │
-│    │     └── pre-loads ~16,000 OCC contracts at startup        │
+│    │     ├── builds tier-filtered OCC registry at startup      │
+│    │     ├── tier_map seeded from universe_store.load_tier_map │
+│    │     └── per-tier ATM/DTE params from tier_thresholds DB   │
 │    ├── StreamManager (Layer 2)   services/stream_manager.py    │
-│    │     └── 32 parallel Tradier connections via stream_worker  │
+│    │     └── ceil(registry.size()/500) workers — dynamic count │
 │    │           ├── parse_tradier_trade()  Layer 3               │
 │    │           │     ├── fill_price: tick["last"] (not "price") │
 │    │           │     ├── size==0 guard → skip                  │
@@ -174,7 +178,8 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    │                └── "signal_writer" → signal_store.py     │
 │    │                                                           │
 │    ├── _registry_refresh_with_manager_notify()  ← FIXED (L2)  │
-│    │     └── registry.build() → manager.refresh() every 30min │
+│    │     ├── registry.build() → set_tier_map() → manager.refresh │
+│    │     └── runs every REGISTRY_REFRESH_MINS (default 30min)  │
 │    │                                                           │
 │    ├── start_flow_writer()    services/flow_store.py  (L5)    │
 │    │     ├── flush every 500ms OR 100 rows  ← FIXED (L5)      │
