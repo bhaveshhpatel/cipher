@@ -7,12 +7,13 @@ Tables (must be migrated first):
   options_universe_snapshots  — one row per snapshot, only ONE is_active=true at a time
   options_universe_symbols    — normalized symbol rows per snapshot_id
                                 (includes stream_eligible, last_price, volume — migration 002)
+                                (includes open_interest, average_volume, tier — migration 010)
 
 Public API:
   load_fresh_snapshot()  → list[str] | None
   load_any_snapshot()    → list[str] | None
-  save_snapshot(symbols, source, stream_eligible_set)  → bool
-  upsert_symbol_quotes(quotes)  → None   ← NEW (Step 3)
+  save_snapshot(symbols, source, stream_eligible_set, quotes)  → bool
+  upsert_symbol_quotes(quotes, tier_map)  → None
 
 ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 does NOT expose .select() after .insert().
@@ -90,10 +91,16 @@ async def save_snapshot(
     )
 
 
-async def upsert_symbol_quotes(quotes: list["SymbolQuote"]) -> None:
+async def upsert_symbol_quotes(
+    quotes: list["SymbolQuote"],
+    tier_map: Optional[dict[str, int]] = None,
+) -> None:
     """
-    Persist Step 3 quote data (last_price, volume, stream_eligible) for each symbol
-    into the most recent active snapshot row for that symbol.
+    Persist Step 3 quote data (last_price, volume, average_volume, tier,
+    stream_eligible) for each symbol into the most recent active snapshot.
+
+    tier_map: dict[symbol -> tier] from tier_engine.assign_tiers().
+    If not provided, all symbols default to tier=3.
 
     Uses ON CONFLICT (snapshot_id, symbol) DO UPDATE so it is safe to call
     before or after save_snapshot() — whichever order, the data will be consistent.
@@ -103,7 +110,7 @@ async def upsert_symbol_quotes(quotes: list["SymbolQuote"]) -> None:
     if not quotes:
         return
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _sync_upsert_symbol_quotes, quotes)
+    await loop.run_in_executor(None, _sync_upsert_symbol_quotes, quotes, tier_map or {})
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +197,7 @@ def _sync_save_snapshot(
     """
     1. Generate snapshot_id locally via uuid4()
     2. Insert snapshot header
-    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag
+    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag, tier=3 default
     4. Deactivate all other snapshots
     5. Prune beyond _KEEP_SNAPSHOTS
     """
@@ -216,17 +223,17 @@ def _sync_save_snapshot(
             "is_active":    True,
         }).execute()
 
-        # 2. Bulk insert symbols with stream_eligible flag
-        # NOTE: last_price and volume will be null at insert time;
-        # they are populated by upsert_symbol_quotes() called from load_universe().
-        # The stream_eligible flag here uses the set computed by _fetch_batch_quotes().
-        batch_size    = 500
-        eligible_set  = stream_eligible_set if stream_eligible_set is not None else set(symbols)
-        rows          = [
+        # 2. Bulk insert symbols
+        # last_price, volume, average_volume are null at insert time—populated by upsert_symbol_quotes().
+        # tier defaults to 3 here; upsert_symbol_quotes() will overwrite with the computed tier.
+        batch_size   = 500
+        eligible_set = stream_eligible_set if stream_eligible_set is not None else set(symbols)
+        rows = [
             {
                 "snapshot_id":     snapshot_id,
                 "symbol":          s,
                 "stream_eligible": s in eligible_set,
+                "tier":            3,
             }
             for s in symbols
         ]
@@ -259,18 +266,20 @@ def _sync_save_snapshot(
         return False
 
 
-def _sync_upsert_symbol_quotes(quotes: list) -> None:
+def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
     """
-    Upsert last_price, volume, stream_eligible for every symbol in the active snapshot.
+    Upsert last_price, volume, average_volume, tier, stream_eligible
+    for every symbol in the active snapshot.
 
-    Looks up the active snapshot_id first, then upserts in batches.
-    Safe to call multiple times — uses ON CONFLICT DO UPDATE semantics via
-    supabase-py's .upsert() with on_conflict='snapshot_id,symbol'.
+    tier_map: dict[symbol -> int] from tier_engine.assign_tiers().
+    Symbols absent from tier_map default to tier=3.
+
+    Uses ON CONFLICT DO UPDATE semantics via supabase-py .upsert()
+    with on_conflict='snapshot_id,symbol'.
     """
     try:
         sb = _client()
 
-        # Find the current active snapshot
         result = (
             sb.table("options_universe_snapshots")
             .select("id")
@@ -293,14 +302,15 @@ def _sync_upsert_symbol_quotes(quotes: list) -> None:
             len(quotes), snapshot_id,
         )
 
-        # Build upsert rows
         upsert_rows = [
             {
                 "snapshot_id":     snapshot_id,
                 "symbol":          q.symbol,
                 "last_price":      q.last_price,
                 "volume":          q.volume,
+                "average_volume":  q.average_volume,
                 "stream_eligible": q.stream_eligible,
+                "tier":            tier_map.get(q.symbol, 3),
             }
             for q in quotes
         ]

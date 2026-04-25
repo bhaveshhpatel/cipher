@@ -22,6 +22,7 @@ from services.symbols_loader import load_universe, SEED_SYMBOLS
 from services import universe_store
 from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
+from services.tier_engine import assign_tiers
 
 
 class _JsonFormatter(logging.Formatter):
@@ -115,9 +116,17 @@ async def _resolve_startup_universe() -> list[str]:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
 
         if quotes:
-            log.info("[universe] Step 3b: upserting %d symbol quotes (last_price, volume)", len(quotes))
-            await universe_store.upsert_symbol_quotes(quotes)
-            log.info("[universe] Step 3b SUCCESS: symbol quotes persisted")
+            log.info("[universe] Step 3b: computing tiers for %d symbols", len(quotes))
+            tier_map = await assign_tiers(quotes)
+            log.info(
+                "[universe] Step 3b: tier assignment done — T1=%d T2=%d T3=%d",
+                sum(1 for t in tier_map.values() if t == 1),
+                sum(1 for t in tier_map.values() if t == 2),
+                sum(1 for t in tier_map.values() if t == 3),
+            )
+            log.info("[universe] Step 3c: upserting %d symbol quotes (price, volume, avg_vol, tier)", len(quotes))
+            await universe_store.upsert_symbol_quotes(quotes, tier_map)
+            log.info("[universe] Step 3c SUCCESS: symbol quotes + tiers persisted")
     else:
         log.warning(
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
@@ -150,7 +159,8 @@ async def _universe_refresh_loop():
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
                 if saved and quotes:
-                    await universe_store.upsert_symbol_quotes(quotes)
+                    tier_map = await assign_tiers(quotes)
+                    await universe_store.upsert_symbol_quotes(quotes, tier_map)
                 log.info(
                     "[universe] Background refresh complete: %d symbols eligible=%s saved=%s",
                     len(symbols),
