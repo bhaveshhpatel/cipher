@@ -4,6 +4,87 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## C-020 — Feature 4A: Tier Engine + Universe Tier Assignment
+
+**Date:** 2026-04-25
+**Severity:** Enhancement — universe symbols had no tier classification; `backtest_score` OI factor defaulted to 0.5 for all symbols
+**Files:** `backend/services/tier_engine.py` *(new)*, `backend/services/universe_store.py`, `backend/main.py`
+**Migrations:** `010_add_tier_and_oi_to_universe.sql`, `011_add_tier_thresholds.sql`
+
+### Root Cause
+
+All `options_universe_symbols` rows carried no tier metadata. The `volume_premium_factor` in the composite score used `open_interest` when available and fell back to 0.5 — but OI was never being written to the universe table. The `backtest_score` tier dimension was always `None`. `signal_history.influence_tier` was hard-coded downstream from a simple premium threshold rather than a real tier classification.
+
+### Fix Applied
+
+**New: `backend/services/tier_engine.py`**
+- `_TierParams` dataclass — holds `min_volume`, `max_atm_pct`, `max_dte` per tier row
+- `TierEngine` class:
+  - `load_thresholds()` — reads active row from `tier_thresholds` table; caches in `_params`
+  - `assign_tiers(symbols)` — classifies each symbol dict into tier 1/2/3 using `average_volume` and a 90-day ATM heuristic
+  - `upsert_tiers(symbols)` — batch-upserts `tier` + `open_interest` + `average_volume` back to `options_universe_symbols`
+  - Admin whitelist: symbols in `TIER_1_ADMIN_WHITELIST` (SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, AMD, PLTR, COIN) are always Tier 1 regardless of thresholds
+- `set_tier_map(symbols)` — module-level helper called by `main.py` after universe load; builds an in-memory `{ticker: tier}` lookup for the signal pipeline
+- `get_tier(ticker)` — O(1) lookup; returns 3 if ticker not in map
+
+**`backend/services/universe_store.py`**
+- `load_tier_map()` — new function; reads `(ticker, tier)` from latest active snapshot's symbols; returns `dict[str, int]`; returns `{}` on DB error or missing column
+
+**`backend/main.py`**
+- After universe load at startup, calls `tier_engine.load_thresholds()` then `set_tier_map(symbols)` so all downstream signal scoring has real tier data from first tick
+
+### DB Migrations (applied 2026-04-25 to cipher-database)
+
+**`010_add_tier_and_oi_to_universe.sql`**
+```sql
+ALTER TABLE options_universe_symbols
+  ADD COLUMN IF NOT EXISTS tier         SMALLINT NOT NULL DEFAULT 3,
+  ADD COLUMN IF NOT EXISTS open_interest INT,
+  ADD COLUMN IF NOT EXISTS average_volume INT;
+CREATE INDEX IF NOT EXISTS idx_universe_symbols_tier ON options_universe_symbols (tier);
+```
+
+**`011_add_tier_thresholds.sql`**
+```sql
+CREATE TABLE IF NOT EXISTS tier_thresholds (
+  id               BIGSERIAL PRIMARY KEY,
+  t1_min_volume    BIGINT  NOT NULL DEFAULT 20000000,
+  t1_max_atm_pct   NUMERIC NOT NULL DEFAULT 20.0,
+  t1_max_dte       INT     NOT NULL DEFAULT 90,
+  t2_min_volume    BIGINT  NOT NULL DEFAULT 2000000,
+  t2_max_atm_pct   NUMERIC NOT NULL DEFAULT 15.0,
+  t2_max_dte       INT     NOT NULL DEFAULT 60,
+  t3_min_volume    BIGINT  NOT NULL DEFAULT 500000,
+  t3_max_atm_pct   NUMERIC NOT NULL DEFAULT 10.0,
+  t3_max_dte       INT     NOT NULL DEFAULT 30,
+  is_active        BOOLEAN NOT NULL DEFAULT false,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO tier_thresholds (t1_min_volume, t2_min_volume, t3_min_volume, is_active)
+VALUES (20000000, 2000000, 500000, true)
+ON CONFLICT DO NOTHING;
+```
+
+### Tier Classification Rules
+
+| Tier | Label | Min Avg Volume | Admin Whitelist |
+|------|-------|---------------|-----------------|
+| 1 | Liquid large-cap | ≥ 20M | SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, AMD, PLTR, COIN |
+| 2 | Mid-cap | ≥ 2M | — |
+| 3 | Standard (default) | ≥ 500K | — |
+
+### Expected Impact
+
+| Metric | Before C-020 | After C-020 |
+|--------|-------------|-------------|
+| `tier` on universe symbols | Always `NULL` / 3 | Real 1/2/3 per thresholds |
+| `open_interest` written | Never | Populated on each universe refresh |
+| `volume_premium_factor` OI fallback | Always 0.5 | Real OI used when available |
+| `influence_tier` in signal_history | Premium threshold only | Derived from real tier classification |
+| Admin tier override | None | `TIER_1_ADMIN_WHITELIST` always forces Tier 1 |
+
+---
+
 ## C-019 — Layer 4 dedup TTL too tight / sweep detection inert
 
 **Date:** 2026-04-24
@@ -178,7 +259,7 @@ WHERE is_synthetic_quote = false
 **Severity:** Critical — no flow episodes were ever persisted to DB
 **Symptom in logs:**
 ```
-[flow_store] insert into flow_episodes failed: 401 — {"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \\"flow_episodes\\""}
+[flow_store] insert into flow_episodes failed: 401 — {"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"flow_episodes\""}
 ```
 
 ### Root Cause
