@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { useFlow } from "@/hooks/useFlow";
@@ -27,50 +27,39 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "history",    label: "Signal History", icon: "🕐" },
 ];
 
-// Auto-refresh intervals (ms)
 const FLOW_REFRESH_MS  = 30_000;
 const STATS_REFRESH_MS = 15_000;
 
 export default function DashboardPage() {
   const router = useRouter();
-  const { token, email, isAuthenticated, logout } = useAuth();
+  const { token, email, isAuthenticated, ready, logout } = useAuth();
   const { events, loading: flowLoading, error: flowError, fetch: fetchFlow } = useFlow(token);
   const { result: simResult, loading: simLoading, error: simError, progress, run: runSim } = useSimulation(token);
   const { signals, connected } = useSignalStream(token);
 
-  // ticker state — empty string means "all tickers"
   const [flowTicker,      setFlowTicker]      = useState("");
   const [compositeTicker, setCompositeTicker] = useState("");
-
   const [tab,              setTab]              = useState<Tab>("flow");
   const [stats,            setStats]            = useState<StreamStats | null>(null);
   const [composite,        setComposite]        = useState<CompositeSignal | null>(null);
   const [compositeLoading, setCompositeLoading] = useState(false);
+  const [flowCountdown,    setFlowCountdown]    = useState(FLOW_REFRESH_MS / 1000);
 
-  // flow auto-refresh countdown
-  const [flowCountdown, setFlowCountdown] = useState(FLOW_REFRESH_MS / 1000);
-
-  // Auth guard
+  // Auth guard — wait for ready before redirecting to avoid flicker loop
   useEffect(() => {
-    if (!isAuthenticated) router.push("/");
-  }, [isAuthenticated, router]);
+    if (!ready) return;
+    if (!isAuthenticated) router.replace("/");
+  }, [ready, isAuthenticated, router]);
 
-  // ── Fetch flow (no ticker = all) ──────────────────────
   const doFetchFlow = useCallback((ticker: string) => {
-    fetchFlow(ticker); // empty string → backend returns all
+    fetchFlow(ticker);
     setFlowCountdown(FLOW_REFRESH_MS / 1000);
   }, [fetchFlow]);
 
-  // Auto-load all flow on mount — FIX: doFetchFlow added to deps (it is
-  // stable via useCallback so this does NOT cause an infinite loop).
-  // Previously the eslint-disable masked the missing dep which caused
-  // the initial fetch to run with a stale null-token closure and silently
-  // bail out, leaving the Flow Scanner permanently blank.
   useEffect(() => {
     if (token) doFetchFlow("");
   }, [token, doFetchFlow]);
 
-  // Auto-refresh flow every 30s
   useEffect(() => {
     if (!token) return;
     const countIv = setInterval(() => {
@@ -82,7 +71,6 @@ export default function DashboardPage() {
     return () => clearInterval(countIv);
   }, [token, flowTicker, doFetchFlow]);
 
-  // Poll stream stats every 15s
   useEffect(() => {
     if (!token) return;
     const load = async () => {
@@ -112,14 +100,15 @@ export default function DashboardPage() {
     try {
       const c = await api.getComposite(t, token);
       setComposite(c);
-    } catch (e: unknown) {
+    } catch {
       setComposite(null);
     } finally {
       setCompositeLoading(false);
     }
   };
 
-  if (!isAuthenticated) return null;
+  // Don't render until auth is resolved
+  if (!ready || !isAuthenticated) return null;
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "var(--bg)" }}>
@@ -195,7 +184,6 @@ export default function DashboardPage() {
       {/* ── Main content ── */}
       <main className="flex-1 p-4 md:p-6" style={{ maxWidth: 1400, width: "100%", margin: "0 auto" }}>
 
-        {/* ── Flow Scanner ── */}
         {tab === "flow" && (
           <div className="flex flex-col gap-4">
             <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -233,7 +221,6 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* ── Live Signals ── */}
         {tab === "signals" && (
           <div className="flex flex-col gap-4">
             <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -248,7 +235,6 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* ── AI Simulation ── */}
         {tab === "simulation" && (
           <div className="flex flex-col gap-4">
             <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -266,7 +252,6 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* ── Composite ── */}
         {tab === "composite" && (
           <div className="flex flex-col gap-4">
             <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -296,7 +281,6 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* ── Signal History ── */}
         {tab === "history" && token && (
           <div className="flex flex-col gap-4">
             <div>
@@ -312,7 +296,6 @@ export default function DashboardPage() {
   );
 }
 
-// ── TickerSearchBar ───────────────────────────────────────────────────────────
 function TickerSearchBar({
   placeholder = "Ticker…",
   onScan,
@@ -329,7 +312,6 @@ function TickerSearchBar({
   scanLabel?: string;
 }) {
   const [local, setLocal] = useState(activeTicker);
-
   useEffect(() => { setLocal(activeTicker); }, [activeTicker]);
 
   const submit = (e: React.FormEvent) => {
@@ -354,11 +336,7 @@ function TickerSearchBar({
         onFocus={(e) => (e.target.style.borderColor = "var(--amber)")}
         onBlur={(e)  => (e.target.style.borderColor = "var(--border)")}
       />
-      <button
-        type="submit"
-        disabled={loading}
-        className="btn btn-primary text-xs px-3 py-1.5"
-      >
+      <button type="submit" disabled={loading} className="btn btn-primary text-xs px-3 py-1.5">
         {loading ? (
           <svg className="animate-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
@@ -370,11 +348,7 @@ function TickerSearchBar({
           type="button"
           onClick={() => { setLocal(""); onClear(); }}
           className="text-xs px-2 py-1.5 rounded-md transition-all"
-          style={{
-            color:      "var(--muted)",
-            background: "var(--surface-2)",
-            border:     "1px solid var(--border)",
-          }}
+          style={{ color: "var(--muted)", background: "var(--surface-2)", border: "1px solid var(--border)" }}
           title="Clear filter — show all"
         >
           ✕ All
