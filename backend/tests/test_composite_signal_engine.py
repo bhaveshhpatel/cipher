@@ -1,0 +1,494 @@
+"""
+Unit tests for composite_signal_engine.py (Phase 3 + 5A),
+backtest_validator.py, and RepetitionEpisode/RepetitionAccumulator.
+
+Covers:
+  compute_flow_score
+  1.  Zero premium yields 0 (no acceleration, no trades above threshold)
+  2.  $10M premium clamps prem component to 1.0
+  3.  is_accelerating adds 0.15 bonus
+  4.  trade_count contributes up to 0.20
+  5.  Score never exceeds 1.0
+
+  volume_weighted_premium_factor
+  6.  open_interest=0 returns 0.5 (safe default)
+  7.  Low premium vs OI returns low factor
+  8.  Factor clamps to 1.0 at high premium/OI ratio
+
+  build_composite — recommendation logic
+  9.  composite >= 0.65 + BULLISH  => BUY
+  10. composite >= 0.65 + BEARISH  => SELL
+  11. composite < 0.65             => HOLD
+
+  build_composite — field correctness
+  12. Returns CompositeSignal dataclass
+  13. ticker propagated correctly
+  14. flow_score, backtest_score, volume_premium_factor all in [0, 1]
+  15. composite_score in [0, 1]
+  16. reasoning string non-empty and contains ticker
+  17. Accelerating flag appears in reasoning when is_accelerating=True
+  18. swarm fields are None on sync build_composite()
+
+  backtest_validator
+  19. get_backtest_score returns float in [0.2, 0.95]
+  20. Same inputs return same score (deterministic cache)
+  21. WHALE tier yields higher score than RETAIL on average
+  22. _dte_bucket buckets DTE values correctly
+
+  RepetitionAccumulator
+  23. ingest returns None below threshold
+  24. ingest returns episode at threshold
+  25. get_alert_level CONVICTION at >= $5M
+  26. get_alert_level STRONG_SIGNAL at >= $1M
+  27. get_alert_level ALERT at >= $250k
+  28. get_alert_level WATCH below $250k
+  29. is_accelerating True when 3 events within 60s
+  30. is_accelerating False when 3 events span > 60s
+
+  build_composite_async
+  31. Returns CompositeSignal with swarm fields populated on success
+  32. Swarm failure is non-fatal — signal still returned
+"""
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import List, Optional
+from unittest.mock import MagicMock, patch, AsyncMock
+
+import pytest
+
+from signals.composite_signal_engine import (
+    CompositeSignal,
+    build_composite,
+    build_composite_async,
+    compute_flow_score,
+    volume_weighted_premium_factor,
+)
+from signals.backtest_validator import get_backtest_score, _dte_bucket
+from signals.repetition_accumulator import RepetitionAccumulator, RepetitionEpisode
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+def _fake_event(
+    ticker="AAPL",
+    contract_type="CALL",
+    strike=180.0,
+    expiry="2026-06-20",
+    premium=500_000.0,
+    dte=30,
+    sentiment="BULLISH",
+    influence_tier="WHALE",
+    open_interest=5000,
+    is_golden_sweep=False,
+    timestamp=None,
+):
+    ev = MagicMock()
+    ev.ticker          = ticker
+    ev.contract_type   = contract_type
+    ev.strike          = strike
+    ev.expiry          = expiry
+    ev.premium         = premium
+    ev.dte             = dte
+    ev.sentiment       = sentiment
+    ev.influence_tier  = influence_tier
+    ev.open_interest   = open_interest
+    ev.is_golden_sweep = is_golden_sweep
+    ev.timestamp       = timestamp or datetime(2026, 4, 25, 10, 0, 0)
+    return ev
+
+
+def _fake_episode(
+    ticker="AAPL",
+    contract_type="CALL",
+    n_events=5,
+    premium_each=1_000_000.0,
+    sentiment="BULLISH",
+    influence_tier="WHALE",
+    dte=30,
+    open_interest=5000,
+    accelerating=False,
+) -> RepetitionEpisode:
+    ep = RepetitionEpisode(
+        ticker=ticker,
+        contract_type=contract_type,
+        strike=180.0,
+        expiry="2026-06-20",
+    )
+    base_ts = datetime(2026, 4, 25, 10, 0, 0)
+    for i in range(n_events):
+        if accelerating and i >= n_events - 3:
+            # Last 3 events within 60s
+            ts = base_ts + timedelta(seconds=3600 + i * 15)
+        else:
+            ts = base_ts + timedelta(minutes=i * 5)
+        ev = _fake_event(
+            ticker=ticker,
+            contract_type=contract_type,
+            premium=premium_each,
+            sentiment=sentiment,
+            influence_tier=influence_tier,
+            dte=dte,
+            open_interest=open_interest,
+            timestamp=ts,
+        )
+        ep.events.append(ev)
+    ep.first_seen = ep.events[0].timestamp
+    ep.last_seen  = ep.events[-1].timestamp
+    return ep
+
+
+def _accum() -> RepetitionAccumulator:
+    return RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# compute_flow_score
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 1
+def test_flow_score_zero_premium():
+    ep = _fake_episode(n_events=1, premium_each=0.0, accelerating=False)
+    score = compute_flow_score(ep)
+    # 0 premium * 0.65 + 0 accel + 1/20*0.20 = 0.01
+    assert score >= 0.0
+    assert score <= 0.05
+
+
+# 2
+def test_flow_score_clamps_premium_at_10M():
+    ep = _fake_episode(n_events=1, premium_each=10_000_000.0, accelerating=False)
+    score = compute_flow_score(ep)
+    # max prem component = 1.0 * 0.65 = 0.65; accel=0; trades=0.05 => 0.70
+    assert score <= 1.0
+    assert score >= 0.65
+
+
+# 3
+def test_flow_score_accelerating_adds_bonus():
+    ep_no  = _fake_episode(n_events=5, premium_each=1_000_000.0, accelerating=False)
+    ep_yes = _fake_episode(n_events=5, premium_each=1_000_000.0, accelerating=True)
+    assert compute_flow_score(ep_yes) > compute_flow_score(ep_no)
+
+
+# 4
+def test_flow_score_trades_contribute():
+    ep_few  = _fake_episode(n_events=1,  premium_each=500_000.0, accelerating=False)
+    ep_many = _fake_episode(n_events=20, premium_each=500_000.0, accelerating=False)
+    assert compute_flow_score(ep_many) >= compute_flow_score(ep_few)
+
+
+# 5
+def test_flow_score_never_exceeds_1():
+    ep = _fake_episode(n_events=50, premium_each=10_000_000.0, accelerating=True)
+    assert compute_flow_score(ep) <= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# volume_weighted_premium_factor
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 6
+def test_vwpf_zero_open_interest_returns_half():
+    ep = _fake_episode(n_events=3, open_interest=0)
+    assert volume_weighted_premium_factor(ep) == 0.5
+
+
+# 7
+def test_vwpf_low_premium_vs_oi():
+    # 10 contracts OI = notional $100k; premium $1k => ratio = 0.01
+    ep = _fake_episode(n_events=1, premium_each=1_000.0, open_interest=10)
+    factor = volume_weighted_premium_factor(ep)
+    assert factor < 0.5
+
+
+# 8
+def test_vwpf_clamps_to_1():
+    # Massive premium relative to tiny OI
+    ep = _fake_episode(n_events=1, premium_each=50_000_000.0, open_interest=1)
+    assert volume_weighted_premium_factor(ep) == 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# build_composite — recommendation logic
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 9
+def test_build_composite_buy_on_high_score_bullish():
+    # Force composite >= 0.65 by providing huge premium + WHALE + accelerating
+    ep   = _fake_episode(n_events=10, premium_each=2_000_000.0,
+                         sentiment="BULLISH", influence_tier="WHALE",
+                         accelerating=True)
+    acc  = _accum()
+    sig  = build_composite(ep, acc)
+    # composite should be high enough with WHALE backtest + strong flow
+    # Accept BUY or HOLD depending on exact backtest seed
+    assert sig.recommendation in ("BUY", "HOLD")
+    if sig.composite_score >= 0.65:
+        assert sig.recommendation == "BUY"
+
+
+# 10
+def test_build_composite_sell_on_high_score_bearish():
+    ep  = _fake_episode(n_events=10, premium_each=2_000_000.0,
+                        contract_type="PUT", sentiment="BEARISH",
+                        influence_tier="WHALE", accelerating=True)
+    acc = _accum()
+    sig = build_composite(ep, acc)
+    if sig.composite_score >= 0.65:
+        assert sig.recommendation == "SELL"
+
+
+# 11
+def test_build_composite_hold_on_low_score():
+    # Tiny premium, RETAIL tier => low composite
+    ep  = _fake_episode(n_events=3, premium_each=10_000.0,
+                        sentiment="BULLISH", influence_tier="RETAIL",
+                        accelerating=False)
+    acc = _accum()
+    sig = build_composite(ep, acc)
+    if sig.composite_score < 0.65:
+        assert sig.recommendation == "HOLD"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# build_composite — field correctness
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _standard_ep():
+    return _fake_episode(n_events=5, premium_each=500_000.0,
+                         sentiment="BULLISH", influence_tier="INSTITUTIONAL")
+
+
+# 12
+def test_build_composite_returns_composite_signal():
+    sig = build_composite(_standard_ep(), _accum())
+    assert isinstance(sig, CompositeSignal)
+
+
+# 13
+def test_build_composite_ticker_propagated():
+    ep  = _fake_episode(ticker="NVDA", n_events=5, premium_each=500_000.0)
+    sig = build_composite(ep, _accum())
+    assert sig.ticker == "NVDA"
+
+
+# 14
+def test_build_composite_sub_scores_in_range():
+    sig = build_composite(_standard_ep(), _accum())
+    assert 0.0 <= sig.flow_score            <= 1.0
+    assert 0.0 <= sig.backtest_score        <= 1.0
+    assert 0.0 <= sig.volume_premium_factor <= 1.0
+
+
+# 15
+def test_build_composite_composite_score_in_range():
+    sig = build_composite(_standard_ep(), _accum())
+    assert 0.0 <= sig.composite_score <= 1.0
+
+
+# 16
+def test_build_composite_reasoning_non_empty_and_has_ticker():
+    ep  = _fake_episode(ticker="TSLA", n_events=5, premium_each=500_000.0)
+    sig = build_composite(ep, _accum())
+    assert len(sig.reasoning) > 0
+    assert "TSLA" in sig.reasoning
+
+
+# 17
+def test_build_composite_reasoning_mentions_accelerating():
+    ep  = _fake_episode(n_events=5, premium_each=500_000.0, accelerating=True)
+    sig = build_composite(ep, _accum())
+    assert "Accelerating" in sig.reasoning or "accelerat" in sig.reasoning.lower()
+
+
+# 18
+def test_build_composite_sync_swarm_fields_are_none():
+    sig = build_composite(_standard_ep(), _accum())
+    assert sig.swarm_direction  is None
+    assert sig.swarm_confidence is None
+    assert sig.swarm_bull_votes is None
+    assert sig.swarm_bear_votes is None
+    assert sig.swarm_hold_votes is None
+    assert sig.swarm_agents     == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# backtest_validator
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 19
+def test_backtest_score_in_valid_range():
+    score = get_backtest_score("AAPL", "CALL", 14, "WHALE")
+    assert 0.2 <= score <= 0.95
+
+
+# 20
+def test_backtest_score_deterministic():
+    s1 = get_backtest_score("TSLA", "PUT", 5, "INSTITUTIONAL")
+    s2 = get_backtest_score("TSLA", "PUT", 5, "INSTITUTIONAL")
+    assert s1 == s2
+
+
+# 21
+def test_backtest_score_whale_above_retail():
+    # Over many tickers, WHALE base (0.72) should beat RETAIL base (0.44)
+    tickers = ["AAPL", "TSLA", "NVDA", "SPY", "QQQ",
+               "MSFT", "AMZN", "META", "GOOGL", "AMD"]
+    whale_scores  = [get_backtest_score(t, "CALL", 14, "WHALE")  for t in tickers]
+    retail_scores = [get_backtest_score(t, "CALL", 14, "RETAIL") for t in tickers]
+    assert sum(whale_scores) > sum(retail_scores)
+
+
+# 22
+def test_dte_bucket_values():
+    assert _dte_bucket(0)  == "0-7"
+    assert _dte_bucket(7)  == "0-7"
+    assert _dte_bucket(8)  == "8-30"
+    assert _dte_bucket(30) == "8-30"
+    assert _dte_bucket(31) == "31-90"
+    assert _dte_bucket(90) == "31-90"
+    assert _dte_bucket(91) == "90+"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RepetitionAccumulator
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ev(ticker="AAPL", premium=100_000.0, ts_offset_secs=0):
+    """Create a minimal real-ish OptionsFlowEvent mock for the accumulator."""
+    ev = MagicMock()
+    ev.ticker        = ticker
+    ev.contract_type = "CALL"
+    ev.strike        = 180.0
+    ev.expiry        = "2026-06-20"
+    ev.premium       = premium
+    ev.timestamp     = datetime(2026, 4, 25, 10, 0, 0) + timedelta(seconds=ts_offset_secs)
+    return ev
+
+
+# 23
+def test_accumulator_returns_none_below_threshold():
+    acc = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+    ev  = _ev(premium=10_000.0)
+    result = acc.ingest(ev)
+    assert result is None
+
+
+# 24
+def test_accumulator_returns_episode_at_threshold():
+    acc = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+    for i in range(3):
+        result = acc.ingest(_ev(premium=20_000.0, ts_offset_secs=i * 60))
+    assert result is not None
+    assert isinstance(result, RepetitionEpisode)
+    assert result.trade_count == 3
+    assert result.total_premium == pytest.approx(60_000.0)
+
+
+# 25
+def test_alert_level_conviction():
+    ep = _fake_episode(n_events=3, premium_each=2_000_000.0, accelerating=False)
+    acc = _accum()
+    assert acc.get_alert_level(ep) == "CONVICTION"
+
+
+# 26
+def test_alert_level_strong_signal():
+    ep = _fake_episode(n_events=3, premium_each=400_000.0, accelerating=False)
+    assert _accum().get_alert_level(ep) == "STRONG_SIGNAL"
+
+
+# 27
+def test_alert_level_alert():
+    ep = _fake_episode(n_events=3, premium_each=90_000.0, accelerating=False)
+    assert _accum().get_alert_level(ep) == "ALERT"
+
+
+# 28
+def test_alert_level_watch():
+    ep = _fake_episode(n_events=3, premium_each=30_000.0, accelerating=False)
+    assert _accum().get_alert_level(ep) == "WATCH"
+
+
+# 29
+def test_is_accelerating_true_within_60s():
+    ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=True)
+    assert ep.is_accelerating is True
+
+
+# 30
+def test_is_accelerating_false_span_over_60s():
+    ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=False)
+    # Events spaced 5 minutes apart — span = 20 min > 60s
+    assert ep.is_accelerating is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# build_composite_async (Phase 5A)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _swarm_result(direction="BUY", confidence=0.82,
+                  bull=6, bear=2, hold=2):
+    r = MagicMock()
+    r.direction   = direction
+    r.confidence  = confidence
+    r.bull_votes  = bull
+    r.bear_votes  = bear
+    r.hold_votes  = hold
+    r.agents      = [{"agent": f"a{i}", "vote": direction} for i in range(bull)]
+    return r
+
+
+# 31
+def test_build_composite_async_populates_swarm_fields():
+    ep  = _standard_ep()
+    acc = _accum()
+
+    async def _test():
+        with patch(
+            "signals.composite_signal_engine.build_composite_async.__wrapped__"
+            if hasattr(build_composite_async, "__wrapped__") else
+            "simulation.ensemble_runner.run_ensemble",
+            new_callable=AsyncMock,
+            return_value=_swarm_result(),
+        ):
+            # Patch run_ensemble inside the engine module's namespace
+            import signals.composite_signal_engine as cse
+            with patch.object(
+                cse, "build_composite_async",
+                wraps=build_composite_async,
+            ):
+                with patch("simulation.ensemble_runner.run_ensemble",
+                           new_callable=AsyncMock,
+                           return_value=_swarm_result()) as mock_swarm:
+                    sig = await build_composite_async(ep, acc)
+        return sig
+
+    sig = asyncio.get_event_loop().run_until_complete(_test())
+    assert isinstance(sig, CompositeSignal)
+    # Swarm fields populated
+    assert sig.swarm_direction  == "BUY"
+    assert sig.swarm_confidence == pytest.approx(0.82)
+    assert sig.swarm_bull_votes == 6
+    assert sig.swarm_bear_votes == 2
+    assert sig.swarm_hold_votes == 2
+    assert len(sig.swarm_agents) == 6
+
+
+# 32
+def test_build_composite_async_swarm_failure_is_nonfatal():
+    ep  = _standard_ep()
+    acc = _accum()
+
+    async def _test():
+        with patch("simulation.ensemble_runner.run_ensemble",
+                   new_callable=AsyncMock,
+                   side_effect=RuntimeError("swarm down")):
+            sig = await build_composite_async(ep, acc)
+        return sig
+
+    sig = asyncio.get_event_loop().run_until_complete(_test())
+    assert isinstance(sig, CompositeSignal)
+    # Swarm fields remain None — composite score still valid
+    assert sig.swarm_direction is None
+    assert 0.0 <= sig.composite_score <= 1.0
