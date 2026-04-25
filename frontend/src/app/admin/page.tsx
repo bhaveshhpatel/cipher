@@ -57,6 +57,27 @@ interface StreamHealth {
   uptime_seconds:    number;
 }
 
+/* 4A-OI: tier-distribution response types */
+interface TierDistributionSample {
+  symbol:         string;
+  open_interest:  number | null;
+}
+
+interface TierDistributionTier {
+  count:   number;
+  samples: TierDistributionSample[];
+}
+
+interface TierDistribution {
+  snapshot_id: string;
+  total:       number;
+  tiers: {
+    "1": TierDistributionTier;
+    "2": TierDistributionTier;
+    "3": TierDistributionTier;
+  };
+}
+
 /* ─── Admin palette ──────────────────────────────────────── */
 const A = {
   bg:          "#080c14",
@@ -320,6 +341,11 @@ export default function AdminPage() {
 
         {/* Row 3: Pipeline Overview (full width) */}
         <HowItWorksCard />
+
+        {/* Row 4: Tier Distribution — avg chain OI per symbol (4A-OI) */}
+        <div className="mt-6">
+          <TierDistributionCard token={token} />
+        </div>
       </div>
     </div>
   );
@@ -1026,6 +1052,193 @@ function IngestionConfigCard({ token }: { token: string | null }) {
       <p className="text-xs font-mono mt-4" style={{ color: A.faint }}>
         ⚡ Changes propagate within REGISTRY_REFRESH_MINS minutes (next scheduled rebuild).
       </p>
+    </AdminCard>
+  );
+}
+
+/* ─── Tier Distribution card (4A-OI / B-020) ────────────── */
+
+function TierDistributionCard({ token }: { token: string | null }) {
+  const [dist,     setDist]     = useState<TierDistribution | null>(null);
+  const [loading,  setLoading]  = useState(true);
+  const [fetchErr, setFetchErr] = useState<string | null>(null);
+
+  const fetchDist = useCallback(async () => {
+    if (!token) return;
+    setLoading(true);
+    setFetchErr(null);
+    try {
+      const res = await fetch("/api/admin/tier-distribution", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setDist(await res.json());
+    } catch (e: unknown) {
+      setFetchErr(e instanceof Error ? e.message : "Failed to fetch tier distribution");
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  useEffect(() => { fetchDist(); }, [fetchDist]);
+
+  const tierKeys: Array<"1" | "2" | "3"> = ["1", "2", "3"];
+  const tierNum = (k: "1" | "2" | "3") => parseInt(k, 10) as 1 | 2 | 3;
+
+  return (
+    <AdminCard>
+      <div className="flex items-start justify-between mb-5">
+        <div>
+          <h2 className="text-base font-semibold font-mono tracking-tight" style={{ color: A.text }}>
+            Tier Distribution
+          </h2>
+          <p className="text-xs mt-1 font-mono" style={{ color: A.muted }}>
+            Active snapshot — up to 10 sample symbols per tier with avg chain OI
+          </p>
+        </div>
+        <button
+          onClick={fetchDist}
+          className="text-xs font-mono shrink-0 px-2 py-1 rounded transition-colors"
+          style={{ color: A.muted, border: `1px solid ${A.border}`, background: A.surface2 }}
+        >
+          ↻ Refresh
+        </button>
+      </div>
+
+      {loading && (
+        <p className="text-xs font-mono" style={{ color: A.muted }}>Loading…</p>
+      )}
+      {fetchErr && (
+        <p
+          className="text-xs font-mono p-3 rounded"
+          style={{ color: A.red, background: A.redDim, border: `1px solid ${A.redBorder}` }}
+        >
+          {fetchErr}
+        </p>
+      )}
+
+      {dist && !loading && (
+        <>
+          {/* Summary stats row */}
+          <div className="grid grid-cols-4 gap-3 mb-5">
+            <Stat label="Total Symbols" value={dist.total} />
+            <Stat label="T1 Count"      value={dist.tiers["1"].count} />
+            <Stat label="T2 Count"      value={dist.tiers["2"].count} />
+            <Stat label="T3 Count"      value={dist.tiers["3"].count} />
+          </div>
+
+          {/* Per-tier sample tables */}
+          <div className="space-y-4">
+            {tierKeys.map(tk => {
+              const tier   = dist.tiers[tk];
+              const c      = TIER_COLORS[tierNum(tk)];
+              const noData = tier.samples.length === 0;
+              return (
+                <div
+                  key={tk}
+                  className="rounded-lg overflow-hidden"
+                  style={{ border: `1px solid ${c.border}` }}
+                >
+                  {/* Tier header */}
+                  <div
+                    className="px-4 py-2 flex items-center justify-between"
+                    style={{ background: c.bg }}
+                  >
+                    <span className="text-xs font-mono font-semibold" style={{ color: c.accent }}>
+                      {c.label}
+                    </span>
+                    <span className="text-xs font-mono" style={{ color: A.muted }}>
+                      {tier.count.toLocaleString()} symbol{tier.count !== 1 ? "s" : ""}
+                    </span>
+                  </div>
+
+                  {noData ? (
+                    <div className="px-4 py-3" style={{ background: A.surface2 }}>
+                      <p className="text-xs font-mono" style={{ color: A.faint }}>No symbols</p>
+                    </div>
+                  ) : (
+                    <table className="w-full text-xs font-mono" style={{ background: A.surface2 }}>
+                      <thead>
+                        <tr style={{ borderBottom: `1px solid ${A.border}` }}>
+                          <th
+                            className="text-left px-4 py-2"
+                            style={{ color: A.muted, fontWeight: 500 }}
+                          >
+                            Symbol
+                          </th>
+                          <th
+                            className="text-center px-4 py-2"
+                            style={{ color: A.muted, fontWeight: 500 }}
+                          >
+                            Tier
+                          </th>
+                          <th
+                            className="text-right px-4 py-2"
+                            style={{ color: A.muted, fontWeight: 500 }}
+                            title="Average open interest across loaded option contracts for this symbol"
+                          >
+                            Avg Chain OI ℹ
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tier.samples.map((s, i) => (
+                          <tr
+                            key={s.symbol}
+                            style={{
+                              borderBottom: i < tier.samples.length - 1
+                                ? `1px solid ${A.border}`
+                                : undefined,
+                            }}
+                          >
+                            {/* Symbol */}
+                            <td className="px-4 py-2" style={{ color: A.text }}>
+                              {s.symbol}
+                            </td>
+
+                            {/* Tier badge */}
+                            <td className="px-4 py-2 text-center">
+                              <span
+                                className="px-2 py-0.5 rounded-full text-xs font-mono font-semibold"
+                                style={{
+                                  background: c.bg,
+                                  color:      c.accent,
+                                  border:     `1px solid ${c.border}`,
+                                }}
+                              >
+                                T{tk}
+                              </span>
+                            </td>
+
+                            {/* Avg Chain OI */}
+                            <td
+                              className="px-4 py-2 text-right tabular-nums"
+                              title="Average open interest across loaded option contracts for this symbol"
+                              style={{
+                                color: s.open_interest != null ? A.text : A.faint,
+                              }}
+                            >
+                              {s.open_interest != null
+                                ? s.open_interest.toLocaleString()
+                                : "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <p className="text-xs font-mono mt-3" style={{ color: A.faint }}>
+            Snapshot {dist.snapshot_id.slice(0, 8)}…
+            &nbsp;·&nbsp;
+            OI populated by 4A-OI two-pass pipeline on cold start / 24h refresh
+          </p>
+        </>
+      )}
     </AdminCard>
   );
 }

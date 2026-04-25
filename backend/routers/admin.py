@@ -261,16 +261,23 @@ async def update_tier_thresholds(
 async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
     """
     Return tier counts and up to 10 sample symbols per tier from the
-    current active snapshot.
+    current active snapshot, including avg chain OI (Feature 4A-OI).
 
     Response shape:
     {
       "snapshot_id": "...",
       "total":       5432,
       "tiers": {
-        "1": {"count": 87,  "samples": ["SPY", "AAPL", ...]},
-        "2": {"count": 312, "samples": ["HOOD", "SOFI", ...]},
-        "3": {"count": 5033, "samples": [...]}
+        "1": {
+          "count": 87,
+          "samples": [
+            {"symbol": "SPY",  "open_interest": 142300},
+            {"symbol": "AAPL", "open_interest": 98500},
+            ...
+          ]
+        },
+        "2": { ... },
+        "3": { ... }
       }
     }
     """
@@ -300,10 +307,11 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
 
         snapshot_id = rows[0]["id"]
 
-        # Fetch all symbols + their tier for this snapshot
+        # Fetch all symbols + tier + open_interest for this snapshot
+        # open_interest is the avg chain OI written by the 4A-OI two-pass pipeline
         result = (
             sb.table("options_universe_symbols")
-            .select("symbol, tier")
+            .select("symbol, tier, open_interest")
             .eq("snapshot_id", snapshot_id)
             .execute()
         )
@@ -315,13 +323,16 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
     if snapshot_id is None:
         raise HTTPException(status_code=404, detail="No active snapshot found.")
 
-    # Aggregate
-    tiers: dict[int, list[str]] = {1: [], 2: [], 3: []}
+    # Aggregate — keep symbol + open_interest together for sample objects
+    tiers: dict[int, list[dict]] = {1: [], 2: [], 3: []}
     for row in sym_rows:
         t = int(row.get("tier") or 3)
         if t not in tiers:
             t = 3
-        tiers[t].append(row["symbol"])
+        tiers[t].append({
+            "symbol":         row["symbol"],
+            "open_interest":  row.get("open_interest"),  # None when not yet populated
+        })
 
     return {
         "snapshot_id": snapshot_id,
