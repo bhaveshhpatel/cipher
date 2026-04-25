@@ -7,17 +7,14 @@ import { useAdminDemo } from "@/hooks/useAdminDemo";
 export default function AdminPage() {
   const router = useRouter();
   const { token, email, isAdmin, isAuthenticated, ready } = useAuth();
-  const { status, loading, error, toggle } = useAdminDemo(token);
+  const { status, isRunning, loading, error, toggle } = useAdminDemo(token);
 
   useEffect(() => {
     if (!ready) return;
-    if (!isAuthenticated) { router.replace("/"); return; }
+    if (!isAuthenticated) { router.replace("/");         return; }
     if (!isAdmin)         { router.replace("/dashboard"); return; }
   }, [ready, isAuthenticated, isAdmin, router]);
 
-  const isRunning = status?.demo?.running ?? false;
-
-  // Don't render until auth is confirmed
   if (!ready || !isAdmin) return null;
 
   return (
@@ -41,6 +38,7 @@ export default function AdminPage() {
       {/* Demo Engine Card */}
       <div className="rounded-xl p-6 max-w-xl mb-6"
            style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
+
         <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-lg font-semibold font-mono">Demo Engine</h2>
@@ -48,45 +46,48 @@ export default function AdminPage() {
               Emits realistic Tradier timesale events through the full 6-layer pipeline
             </p>
           </div>
-          <span className="text-xs font-mono px-3 py-1 rounded-full"
-                style={{
-                  border:     isRunning ? "1px solid rgba(74,222,128,0.4)"  : "1px solid var(--border)",
-                  background: isRunning ? "rgba(74,222,128,0.1)"            : "var(--surface-2)",
-                  color:      isRunning ? "rgb(74,222,128)"                 : "var(--muted)",
-                }}>
-            {isRunning ? "● RUNNING" : "○ STOPPED"}
+          <span
+            className="text-xs font-mono px-3 py-1 rounded-full"
+            style={{
+              border:     isRunning ? "1px solid rgba(74,222,128,0.4)"  : "1px solid var(--border)",
+              background: isRunning ? "rgba(74,222,128,0.1)"            : "var(--surface-2)",
+              color:      isRunning ? "rgb(74,222,128)"                 : "var(--muted)",
+            }}
+          >
+            {status === null ? "LOADING…" : isRunning ? "● RUNNING" : "○ STOPPED"}
           </span>
         </div>
 
         {/* Toggle buttons */}
         <div className="flex items-center gap-4 mb-6">
           <button
-            disabled={loading || isRunning}
+            disabled={loading || isRunning || status === null}
             onClick={() => toggle(true)}
             className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
             style={{
-              background: loading || isRunning ? "var(--border)" : "#16a34a",
-              color:      loading || isRunning ? "var(--muted)"  : "#fff",
-              cursor:     loading || isRunning ? "not-allowed"   : "pointer",
+              background: loading || isRunning || status === null ? "var(--border)" : "#16a34a",
+              color:      loading || isRunning || status === null ? "var(--muted)"  : "#fff",
+              cursor:     loading || isRunning || status === null ? "not-allowed"   : "pointer",
             }}
           >
             {loading && !isRunning ? "Starting…" : "▶ Start Demo"}
           </button>
+
           <button
-            disabled={loading || !isRunning}
+            disabled={loading || !isRunning || status === null}
             onClick={() => toggle(false)}
             className="px-5 py-2 rounded-lg text-sm font-mono font-semibold transition-colors"
             style={{
-              background: loading || !isRunning ? "var(--border)" : "#b91c1c",
-              color:      loading || !isRunning ? "var(--muted)"  : "#fff",
-              cursor:     loading || !isRunning ? "not-allowed"   : "pointer",
+              background: loading || !isRunning || status === null ? "var(--border)" : "#b91c1c",
+              color:      loading || !isRunning || status === null ? "var(--muted)"  : "#fff",
+              cursor:     loading || !isRunning || status === null ? "not-allowed"   : "pointer",
             }}
           >
             {loading && isRunning ? "Stopping…" : "■ Stop Demo"}
           </button>
         </div>
 
-        {/* Stats grid */}
+        {/* Stats */}
         {status?.demo && (
           <div className="grid grid-cols-2 gap-3">
             <Stat label="Ticks Emitted"     value={status.demo.ticks_emitted} />
@@ -94,7 +95,7 @@ export default function AdminPage() {
             <Stat label="Last Ticker"       value={status.demo.last_ticker ?? "—"} />
             <Stat label="Started At"        value={
               status.demo.started_at
-                ? new Date(status.demo.started_at).toLocaleTimeString()
+                ? new Date(status.demo.started_at + "Z").toLocaleTimeString()
                 : "—"
             } />
           </div>
