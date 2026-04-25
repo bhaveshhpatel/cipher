@@ -11,8 +11,9 @@ Endpoints:
   POST  /api/admin/demo/off              — stop the demo engine
   GET   /api/admin/ingestion/config      — get all ingestion config knobs
   PATCH /api/admin/ingestion/config      — update one ingestion config knob
-  PATCH /api/admin/tier-thresholds       — update T1/T2/T3 threshold columns  [4A]
-  GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A]
+  GET   /api/admin/tier-thresholds       — read the active tier_thresholds row + cache state  [B-019]
+  PATCH /api/admin/tier-thresholds       — update T1/T2/T3 threshold columns  [4A / B-019]
+  GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A / B-020]
 """
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -108,8 +109,71 @@ async def update_ingestion_config(
 
 
 # ---------------------------------------------------------------------------
-# 4A: Tier thresholds
+# B-019: Tier thresholds — GET (read) + PATCH (update)
 # ---------------------------------------------------------------------------
+
+@router.get("/tier-thresholds")
+async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
+    """
+    Return the active tier_thresholds row plus cache metadata.
+
+    Response shape:
+    {
+      "row": { <all 15 threshold columns> + id/updated_at/updated_by/is_active },
+      "cache": {
+        "warm":       true | false,
+        "age_seconds": <seconds since last DB fetch, or null if cold>
+      }
+    }
+
+    Use this to pre-populate the admin UI form and show staleness.
+    """
+    import asyncio, time
+    from supabase import create_client
+    from config import settings
+    import services.tier_engine as te
+
+    service_key = settings.SUPABASE_SERVICE_KEY
+    if not service_key:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
+
+    def _fetch():
+        sb = create_client(settings.SUPABASE_URL, service_key)
+        result = (
+            sb.table("tier_thresholds")
+            .select("*")
+            .eq("is_active", True)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data or []
+
+    loop = asyncio.get_event_loop()
+    rows = await loop.run_in_executor(None, _fetch)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
+        )
+
+    # Cache metadata — lets the UI show "cache warm (42 s ago)" or "cache cold"
+    now       = time.monotonic()
+    cache_ts  = getattr(te, "_cache_ts", 0.0)
+    cache_age = now - cache_ts if cache_ts > 0.0 else None
+    cache_warm = cache_age is not None and cache_age < te.CACHE_TTL
+
+    log.info("[admin] tier_thresholds fetched by %s", admin.email)
+    return {
+        "row":   rows[0],
+        "cache": {
+            "warm":        cache_warm,
+            "age_seconds": round(cache_age, 1) if cache_age is not None else None,
+            "ttl_seconds": te.CACHE_TTL,
+        },
+    }
+
 
 class TierThresholdUpdate(BaseModel):
     """
@@ -190,7 +254,7 @@ async def update_tier_thresholds(
 
 
 # ---------------------------------------------------------------------------
-# 4A: Tier distribution
+# B-020: Tier distribution
 # ---------------------------------------------------------------------------
 
 @router.get("/tier-distribution")

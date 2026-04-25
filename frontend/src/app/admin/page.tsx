@@ -13,6 +13,34 @@ interface ConfigRow {
   updated_by:  string | null;
 }
 
+interface TierThresholdsRow {
+  id:                 number;
+  updated_at:         string;
+  updated_by:         string | null;
+  is_active:          boolean;
+  t1_min_volume:      number;
+  t1_min_last_price:  number;
+  t1_min_oi:          number;
+  t1_atm_pct:         number;
+  t1_max_dte:         number;
+  t2_min_volume:      number;
+  t2_min_last_price:  number;
+  t2_min_oi:          number;
+  t2_atm_pct:         number;
+  t2_max_dte:         number;
+  t3_min_volume:      number;
+  t3_min_last_price:  number;
+  t3_min_oi:          number;
+  t3_atm_pct:         number;
+  t3_max_dte:         number;
+}
+
+interface CacheMeta {
+  warm:        boolean;
+  age_seconds: number | null;
+  ttl_seconds: number;
+}
+
 export default function AdminPage() {
   const router = useRouter();
   const { token, email, isAdmin, isAuthenticated, ready } = useAuth();
@@ -128,9 +156,262 @@ export default function AdminPage() {
         </ul>
       </div>
 
+      {/* Tier Thresholds Card — B-019 */}
+      <TierThresholdsCard token={token} />
+
       {/* Ingestion Config Card */}
       <IngestionConfigCard token={token} />
 
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B-019: Tier Thresholds Card
+// ---------------------------------------------------------------------------
+
+const TIER_FIELDS: { key: keyof TierThresholdsRow; label: string; tier: 1 | 2 | 3; hint: string }[] = [
+  // Tier 1
+  { key: "t1_min_volume",     label: "Min Volume",     tier: 1, hint: "Avg daily vol (e.g. 20000000)" },
+  { key: "t1_min_last_price", label: "Min Price ($)",  tier: 1, hint: "Min last price" },
+  { key: "t1_min_oi",         label: "Min OI",         tier: 1, hint: "Open interest at ATM strike" },
+  { key: "t1_atm_pct",        label: "ATM % Range",    tier: 1, hint: "±% strike range (e.g. 0.20)" },
+  { key: "t1_max_dte",        label: "Max DTE",        tier: 1, hint: "Max days to expiry" },
+  // Tier 2
+  { key: "t2_min_volume",     label: "Min Volume",     tier: 2, hint: "Avg daily vol (e.g. 2000000)" },
+  { key: "t2_min_last_price", label: "Min Price ($)",  tier: 2, hint: "Min last price" },
+  { key: "t2_min_oi",         label: "Min OI",         tier: 2, hint: "Open interest at ATM strike" },
+  { key: "t2_atm_pct",        label: "ATM % Range",    tier: 2, hint: "±% strike range (e.g. 0.15)" },
+  { key: "t2_max_dte",        label: "Max DTE",        tier: 2, hint: "Max days to expiry" },
+  // Tier 3
+  { key: "t3_min_volume",     label: "Min Volume",     tier: 3, hint: "Avg daily vol (e.g. 500000)" },
+  { key: "t3_min_last_price", label: "Min Price ($)",  tier: 3, hint: "Min last price" },
+  { key: "t3_min_oi",         label: "Min OI",         tier: 3, hint: "Open interest at ATM strike" },
+  { key: "t3_atm_pct",        label: "ATM % Range",    tier: 3, hint: "±% strike range (e.g. 0.10)" },
+  { key: "t3_max_dte",        label: "Max DTE",        tier: 3, hint: "Max days to expiry" },
+];
+
+const TIER_COLORS: Record<1 | 2 | 3, { border: string; bg: string; label: string; text: string }> = {
+  1: { border: "rgba(250,204,21,0.35)",  bg: "rgba(250,204,21,0.07)",  label: "T1 — Liquid Large-Cap",  text: "rgb(250,204,21)"  },
+  2: { border: "rgba(99,102,241,0.35)",  bg: "rgba(99,102,241,0.07)",  label: "T2 — Mid-Cap",           text: "rgb(147,151,255)" },
+  3: { border: "rgba(156,163,175,0.35)", bg: "rgba(156,163,175,0.07)", label: "T3 — Standard",          text: "var(--muted)"     },
+};
+
+function TierThresholdsCard({ token }: { token: string | null }) {
+  const [row,      setRow]      = useState<TierThresholdsRow | null>(null);
+  const [cache,    setCache]    = useState<CacheMeta | null>(null);
+  const [edits,    setEdits]    = useState<Record<string, string>>({});
+  const [saving,   setSaving]   = useState<Record<string, boolean>>({});
+  const [saved,    setSaved]    = useState<Record<string, boolean>>({});
+  const [fieldErr, setFieldErr] = useState<Record<string, string>>({});
+  const [loading,  setLoading]  = useState(true);
+  const [fetchErr, setFetchErr] = useState<string | null>(null);
+
+  const fetchThresholds = useCallback(async () => {
+    if (!token) return;
+    setLoading(true);
+    setFetchErr(null);
+    try {
+      const res = await fetch("/api/admin/tier-thresholds", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setRow(data.row);
+      setCache(data.cache);
+      // Seed edits with current DB values (stringified for inputs)
+      const initial: Record<string, string> = {};
+      for (const f of TIER_FIELDS) initial[f.key] = String(data.row[f.key] ?? "");
+      setEdits(initial);
+    } catch (e: unknown) {
+      setFetchErr(e instanceof Error ? e.message : "Failed to load thresholds");
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  useEffect(() => { fetchThresholds(); }, [fetchThresholds]);
+
+  const handleSave = async (key: string) => {
+    if (!token || !row) return;
+    const rawVal = edits[key];
+    const numVal = Number(rawVal);
+    if (isNaN(numVal)) {
+      setFieldErr(e => ({ ...e, [key]: "Must be a number" }));
+      return;
+    }
+    setSaving(s => ({ ...s, [key]: true }));
+    setFieldErr(e => ({ ...e, [key]: "" }));
+    setSaved(s => ({ ...s, [key]: false }));
+    try {
+      const res = await fetch("/api/admin/tier-thresholds", {
+        method:  "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body:    JSON.stringify({ updates: { [key]: numVal } }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as { detail?: string }).detail ?? `HTTP ${res.status}`);
+      }
+      setSaved(s => ({ ...s, [key]: true }));
+      await fetchThresholds();
+      setTimeout(() => setSaved(s => ({ ...s, [key]: false })), 2500);
+    } catch (e: unknown) {
+      setFieldErr(er => ({ ...er, [key]: e instanceof Error ? e.message : "Save failed" }));
+    } finally {
+      setSaving(s => ({ ...s, [key]: false }));
+    }
+  };
+
+  const isDirty = (key: string) =>
+    row !== null && edits[key] !== undefined && edits[key] !== String((row as Record<string, unknown>)[key] ?? "");
+
+  const tierGroups: Array<{ tier: 1 | 2 | 3; fields: typeof TIER_FIELDS }> = [
+    { tier: 1, fields: TIER_FIELDS.filter(f => f.tier === 1) },
+    { tier: 2, fields: TIER_FIELDS.filter(f => f.tier === 2) },
+    { tier: 3, fields: TIER_FIELDS.filter(f => f.tier === 3) },
+  ];
+
+  return (
+    <div className="rounded-xl p-6 max-w-xl mb-6"
+         style={{ border: "1px solid var(--border)", background: "var(--surface)" }}>
+
+      <div className="flex items-center justify-between mb-1">
+        <div>
+          <h2 className="text-lg font-semibold font-mono">Tier Thresholds</h2>
+          <p className="text-xs mt-1 font-mono" style={{ color: "var(--muted)" }}>
+            T1/T2/T3 classification rules for the OCC symbol universe.
+            Changes apply on next universe refresh — no restart needed.
+          </p>
+        </div>
+        <button
+          onClick={fetchThresholds}
+          className="text-xs font-mono ml-4 transition-colors"
+          style={{ color: "var(--muted)" }}
+        >
+          ↻ Refresh
+        </button>
+      </div>
+
+      {/* Cache state badge */}
+      {cache && !loading && (
+        <div className="mt-3 mb-4 flex items-center gap-2">
+          <span
+            className="text-xs font-mono px-2 py-0.5 rounded-full"
+            style={{
+              border:     cache.warm ? "1px solid rgba(74,222,128,0.3)"  : "1px solid var(--border)",
+              background: cache.warm ? "rgba(74,222,128,0.08)"           : "var(--surface-2)",
+              color:      cache.warm ? "rgb(74,222,128)"                 : "var(--muted)",
+            }}
+          >
+            {cache.warm
+              ? `● cache warm — ${cache.age_seconds}s ago (TTL ${cache.ttl_seconds}s)`
+              : `○ cache cold — fetches from DB on next assign_tiers()`
+            }
+          </span>
+        </div>
+      )}
+
+      {loading && (
+        <p className="text-xs font-mono mt-4" style={{ color: "var(--muted)" }}>Loading…</p>
+      )}
+      {fetchErr && (
+        <p className="text-xs font-mono p-3 rounded mt-4"
+           style={{ color: "var(--red)", background: "rgba(220,53,69,0.1)", border: "1px solid rgba(220,53,69,0.2)" }}>
+          {fetchErr}
+        </p>
+      )}
+
+      {!loading && row && (
+        <div className="space-y-4 mt-2">
+          {tierGroups.map(({ tier, fields }) => {
+            const colors = TIER_COLORS[tier];
+            return (
+              <div key={tier}
+                   className="rounded-lg p-4"
+                   style={{ border: `1px solid ${colors.border}`, background: colors.bg }}>
+
+                <p className="text-xs font-mono font-semibold mb-3" style={{ color: colors.text }}>
+                  {colors.label}
+                </p>
+
+                <div className="space-y-2">
+                  {fields.map(f => (
+                    <div key={f.key}>
+                      <div className="flex items-center justify-between gap-1 mb-0.5">
+                        <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>
+                          {f.label}
+                        </span>
+                        <span className="text-xs font-mono" style={{ color: "var(--muted)", opacity: 0.5 }}>
+                          {f.hint}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={edits[f.key] ?? ""}
+                          onChange={e => setEdits(prev => ({ ...prev, [f.key]: e.target.value }))}
+                          onKeyDown={e => { if (e.key === "Enter") handleSave(f.key); }}
+                          className="flex-1 px-3 py-1.5 rounded text-sm font-mono"
+                          style={{
+                            background: "var(--bg)",
+                            border: `1px solid ${
+                              fieldErr[f.key]  ? "rgba(220,53,69,0.6)" :
+                              isDirty(f.key)   ? "rgba(250,204,21,0.5)" :
+                              "var(--border)"
+                            }`,
+                            color:   "var(--text)",
+                            outline: "none",
+                          }}
+                        />
+                        <button
+                          onClick={() => handleSave(f.key)}
+                          disabled={saving[f.key] || !isDirty(f.key)}
+                          className="px-4 py-1.5 rounded text-xs font-mono font-semibold transition-colors"
+                          style={{
+                            minWidth:   "62px",
+                            background:
+                              saved[f.key]    ? "rgba(74,222,128,0.15)" :
+                              saving[f.key]   ? "var(--border)" :
+                              !isDirty(f.key) ? "var(--border)" :
+                              "rgba(99,102,241,0.8)",
+                            color:
+                              saved[f.key]    ? "rgb(74,222,128)" :
+                              !isDirty(f.key) ? "var(--muted)" :
+                              "#fff",
+                            cursor:  saving[f.key] || !isDirty(f.key) ? "not-allowed" : "pointer",
+                            border:  saved[f.key] ? "1px solid rgba(74,222,128,0.3)" : "1px solid transparent",
+                          }}
+                        >
+                          {saved[f.key] ? "✓ Saved" : saving[f.key] ? "Saving…" : "Save"}
+                        </button>
+                      </div>
+                      {fieldErr[f.key] && (
+                        <p className="text-xs font-mono mt-0.5" style={{ color: "var(--red)" }}>
+                          {fieldErr[f.key]}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {row && (
+        <p className="text-xs font-mono mt-4" style={{ color: "var(--muted)", opacity: 0.45 }}>
+          Last updated {new Date(row.updated_at).toLocaleString()}
+          {row.updated_by ? ` by ${row.updated_by}` : ""}
+          {" · "} row #{row.id}
+        </p>
+      )}
+
+      <p className="text-xs font-mono mt-2" style={{ color: "var(--muted)", opacity: 0.45 }}>
+        ⚡ Saves immediately bust the in-process cache (no restart required).
+        New thresholds apply on the next universe refresh cycle.
+      </p>
     </div>
   );
 }

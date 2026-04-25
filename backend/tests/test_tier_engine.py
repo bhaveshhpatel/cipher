@@ -5,7 +5,7 @@ Covers:
   TE-01 … TE-08   tier_engine.assign_tiers() classification logic
   TR-01 … TR-06   symbol_registry per-tier params (_build_tier_params, ContractMeta.tier)
   US-01 … US-03   universe_store.load_tier_map() (mocked Supabase)
-  ADM-01 … ADM-04 Admin endpoints: PATCH /tier-thresholds, GET /tier-distribution
+  ADM-01 … ADM-06 Admin endpoints: PATCH/GET /tier-thresholds, GET /tier-distribution
 
 All tests are pure-Python / asyncio — no live Supabase, no Tradier, no network.
 """
@@ -285,7 +285,7 @@ class TestUniverseStoreTierMapUS:
 # ===========================================================================
 
 class TestAdminTierEndpointsADM:
-    """Feature 4A: admin router exposes PATCH /tier-thresholds + GET /tier-distribution."""
+    """Feature 4A / B-019: admin router PATCH + GET /tier-thresholds + GET /tier-distribution."""
 
     # ADM-01: Admin router must export tier-thresholds PATCH route
     def test_admin_router_has_patch_tier_thresholds(self):
@@ -330,4 +330,60 @@ class TestAdminTierEndpointsADM:
         text = src.read_text()
         assert "_TIER_THRESHOLD_COLUMNS" in text or "ALLOWED_COLUMNS" in text or "whitelist" in text.lower() or "TIER_THRESHOLD_KEYS" in text, (
             "PATCH /tier-thresholds must use a column whitelist to reject unknown keys."
+        )
+
+    # ADM-05: Admin router must also export GET /tier-thresholds (B-019 read endpoint)
+    def test_admin_router_has_get_tier_thresholds(self):
+        """B-019: GET /api/admin/tier-thresholds must exist to pre-populate the admin UI form."""
+        import pathlib
+        src = pathlib.Path("backend/routers/admin.py")
+        if not src.exists():
+            src = pathlib.Path("routers/admin.py")
+        text = src.read_text()
+        # Must have both @router.get AND tier-thresholds in the same file
+        assert "@router.get" in text and "tier-thresholds" in text, (
+            "admin.py must have GET /tier-thresholds so the UI can pre-populate the form."
+        )
+        # Must return cache metadata (warm/age_seconds/ttl_seconds)
+        assert "cache" in text and "age_seconds" in text, (
+            "GET /tier-thresholds must return cache metadata (warm, age_seconds, ttl_seconds)."
+        )
+
+    # ADM-06: PATCH must bust cache immediately — invalidate_cache() called before returning
+    def test_patch_invalidate_cache_is_synchronous_not_deferred(self):
+        """
+        B-019: invalidate_cache() must be called inside the PATCH handler body,
+        not deferred to a background task. This guarantees zero-latency cache bust
+        so the very next assign_tiers() call (triggered by the next universe refresh)
+        picks up the new thresholds without waiting up to CACHE_TTL seconds.
+        """
+        import pathlib, ast
+        src = pathlib.Path("backend/routers/admin.py")
+        if not src.exists():
+            src = pathlib.Path("routers/admin.py")
+        text = src.read_text()
+
+        # Parse the AST and find the update_tier_thresholds function
+        tree = ast.parse(text)
+        patch_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "update_tier_thresholds":
+                patch_fn = node
+                break
+
+        assert patch_fn is not None, "update_tier_thresholds() async function not found in admin.py"
+
+        # Confirm invalidate_cache() is called as a direct statement inside the function
+        calls = [
+            n for n in ast.walk(patch_fn)
+            if isinstance(n, ast.Call)
+            and getattr(getattr(n.func, "attr", None), "__class__", None) is str
+            or (
+                isinstance(n.func, ast.Name) and n.func.id == "invalidate_cache"
+            )
+        ]
+        fn_source = ast.get_source_segment(text, patch_fn) or ""
+        assert "invalidate_cache()" in fn_source, (
+            "invalidate_cache() must be called directly inside update_tier_thresholds(), "
+            "not in a background task or deferred callback."
         )
