@@ -17,11 +17,12 @@ All schema changes live here as numbered SQL files. They are applied in numeric 
 | 009 | `009_flow_events_synthetic_quote.sql` | `is_synthetic_quote` column (C-018 fix) |
 | 010 | `010_add_tier_and_oi_to_universe.sql` | `tier`, `open_interest`, `average_volume` on `options_universe_symbols` (Feature 4A) |
 | 011 | `011_add_tier_thresholds.sql` | `tier_thresholds` admin table with default active row (Feature 4A) |
+| 012 | `012_tier_thresholds_rls.sql` | RLS enable + `authenticated` SELECT policy + `updated_at` trigger on `tier_thresholds` (B-019) |
 
 ## Running migrations
 
 ### Via Supabase MCP / dashboard (recommended for production)
-Migrations 010 and 011 are already applied to `cipher-database` (verified 2026-04-24).
+Migrations 010–012 are already applied to `cipher-database` (verified 2026-04-24).
 The Supabase dashboard → Database → Migrations shows the full applied history.
 
 ### Via the migration runner script (local / CI)
@@ -47,7 +48,7 @@ The script:
 
 ### Adding a new migration
 
-1. Create `NNN_description.sql` where `NNN` is the next number (e.g. `012_...`).
+1. Create `NNN_description.sql` where `NNN` is the next number (e.g. `013_...`).
 2. Use `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` to keep it idempotent.
 3. Test locally with `--dry-run` first.
 4. Apply via the runner or directly in the Supabase dashboard.
@@ -69,5 +70,11 @@ The script:
 | `t2_*` | Tier 2 (mid-cap): vol ≥ 2M, ATM ±15%, DTE ≤ 60 |
 | `t3_*` | Tier 3 (standard): vol ≥ 500K, ATM ±10%, DTE ≤ 30 |
 | `is_active` | Only the `true` row is read by the backend |
+| `updated_at` | Auto-updated by trigger (migration 012) |
 
-Admin endpoints: `PATCH /admin/tier-thresholds`, `GET /admin/tier-distribution`
+RLS: service role has full access (Supabase default); `authenticated` users have SELECT (migration 012).
+
+Admin endpoints:
+- `GET  /api/admin/tier-thresholds` — read active row + cache metadata (B-019)
+- `PATCH /api/admin/tier-thresholds` — update threshold columns, busts cache (Feature 4A)
+- `GET  /api/admin/tier-distribution` — tier counts + samples for active snapshot (B-020)
