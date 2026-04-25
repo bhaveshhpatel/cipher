@@ -7,8 +7,12 @@ timesale streaming produces, feeding them through the full pipeline:
   Layer 1: OCC SymbolRegistry lookup (real OCC symbol strings generated)
   Layer 2: StreamManager queue format (timesale envelope)
   Layer 3: parse_tradier_trade() — same parser as live data
-  Layer 4: Deduplication — same (symbol, size, fill, bucket) multi-exchange
-           simulation: each trade prints on 2-4 exchanges within 200ms
+  Layer 4: Deduplication (C-019) — 5s TTL, 8s sweep window, no bucket
+           boundary bug. Each trade burst prints on 2-4 exchanges within
+           a 50-300ms window (widened from 20-80ms to cover TTL boundary
+           testing). Exchange code passed as "exch" in inner timesale
+           dict — matching real Tradier field name — so sweep detection
+           in DedupCache correctly counts unique exchanges.
   Layer 5: Batched DB writes via persist_flow_event() — same path
   Layer 6: Supabase Realtime broadcast — same bus.publish_all()
 
@@ -23,6 +27,14 @@ the repetition accumulator threshold (min_trades=3, min_premium=$50K),
 then lets the full signal engine produce a composite signal.
 
 Admin API: routers/admin.py exposes POST /api/admin/demo/on|off
+
+C-019 changes:
+  - _build_timesale_envelope() now uses "exch" as the primary exchange key
+    in the inner timesale dict (matching real Tradier field name). "exchange"
+    kept as an alias for human readability / backward compat.
+  - Inter-exchange delay widened from 20-80ms to 50-300ms to properly
+    exercise the 5s TTL window and simulate MIAX/PHLX lag realistically.
+  - get_stats() now includes dedup_stats() from flow_dedup for observability.
 """
 import asyncio
 import logging
@@ -30,6 +42,8 @@ import random
 import time
 from datetime import datetime, date, timedelta
 from typing import Optional
+
+from utils.dedup import flow_dedup  # C-019: dedup stats in demo reporting
 
 log = logging.getLogger("demo_engine")
 
@@ -123,23 +137,26 @@ def _build_timesale_envelope(occ_symbol: str, ticker: str, fill: float,
       {
         "type": "timesale",
         "timesale": {
-          "symbol": "TSLA  260620C00375000",
-          "last":   3.45,          <- fill price (NOT "price")
-          "bid":    3.40,
-          "ask":    3.50,
-          "size":   50,
-          "date":   1745529600000, <- epoch ms
-          "open":   3.20,
-          "high":   3.55,
-          "low":    3.15,
-          "close":  3.45,
-          "exchange": "C",
-          "vwap":   3.42
+          "symbol":   "TSLA  260620C00375000",
+          "last":     3.45,          <- fill price (NOT "price")
+          "bid":      3.40,
+          "ask":      3.50,
+          "size":     50,
+          "date":     1745529600000, <- epoch ms
+          "open":     3.20,
+          "high":     3.55,
+          "low":      3.15,
+          "close":    3.45,
+          "exch":     "C",           <- PRIMARY: matches real Tradier field (C-019)
+          "exchange": "C",           <- ALIAS: human-readable backward compat
+          "vwap":     3.42
         }
       }
 
-    This is the exact format _process_trade() in tradier_stream.py unwraps.
-    The parser reads raw["timesale"] and then looks for "last" as fill price.
+    C-019: "exch" is now the primary exchange field, matching the real Tradier
+    timesale payload. _process_trade() reads trade_payload.get("exch") first,
+    then falls back to trade_payload.get("exchange", ""). Both are set here
+    so the envelope works with any consumer.
     """
     return {
         "type": "timesale",
@@ -154,7 +171,8 @@ def _build_timesale_envelope(occ_symbol: str, ticker: str, fill: float,
             "high":     round(fill * random.uniform(1.0, 1.03), 2),
             "low":      round(fill * random.uniform(0.94, 1.0), 2),
             "close":    fill,
-            "exchange": exchange,
+            "exch":     exchange,      # C-019: primary — matches real Tradier field
+            "exchange": exchange,      # alias — backward compat / human readable
             "vwap":     round(fill * random.uniform(0.995, 1.005), 2),
         },
     }
@@ -165,15 +183,25 @@ async def _run_demo_loop():
     Core demo loop. For each scenario:
     1. Pick a ticker, expiry, strike, contract type
     2. Emit 3-8 ticks on different exchanges (same symbol, size, fill)
-       within a 200ms window — replicating multi-exchange reporting
+       within a 50-300ms window — replicating multi-exchange reporting
+       with realistic MIAX/PHLX lag (C-019: widened from 20-80ms)
     3. Wait 2-6s before next scenario
 
     All ticks go through _process_trade() exactly like live data:
       → parse_tradier_trade()
+      → flow_dedup.is_duplicate()   ← C-019: dedup now active
       → persist_flow_event()
       → RepetitionAccumulator.ingest()
       → build_composite() if threshold crossed
       → bus.publish_all()
+
+    Dedup behaviour in demo:
+      - First exchange tick for a burst → canonical, passes through
+      - 2nd-4th exchange ticks (same occ+size+fill within 5s) → dropped
+      - If 3+ unique exchanges report → trade_type upgraded to SWEEP
+      - burst_fill uses ±0.5% variation per burst; with fill:.1f key
+        rounding, fills like $3.45 and $3.46 both round to $3.5 and
+        are correctly deduplicated as the same trade.
     """
     global _demo_running, _demo_stats
     from services.tradier_stream import _process_trade
@@ -198,7 +226,6 @@ async def _run_demo_loop():
             occ_symbol = _build_occ_symbol(ticker, expiry, ctype, strike)
 
             # Realistic fill price around mid of synthetic spread
-            # Calls ATM: fill ≈ 2-15% of stock price
             fill_pct = rng.uniform(0.01, 0.08)
             fill     = round(price * fill_pct, 2)
             if fill < 0.05:
@@ -207,20 +234,18 @@ async def _run_demo_loop():
             bid      = round(fill - spread, 2)
             ask      = round(fill + spread, 2)
 
-            # Size: WHALE tiers need premium > $50K
-            # premium = fill * size * 100
-            # Target $100K-$5M premium
+            # Size: target $100K-$5M premium
             target_prem = rng.randint(100_000, 5_000_000)
             size = max(1, int(target_prem / (fill * 100)))
             size = min(size, 5000)  # cap at 5000 contracts
 
             # Number of exchanges this trade prints on (dedup scenario)
-            # Layer 4: 2-4 exchanges report same trade within 200ms
+            # C-019: 2-4 exchanges report same trade within 50-300ms window
             num_exchanges = rng.randint(2, 4)
             exchanges = rng.sample(_EXCHANGES, num_exchanges)
 
-            # Number of tick bursts (3-8 ticks total to cross accumulator threshold)
-            num_bursts = rng.randint(1, 3)  # each burst = num_exchanges ticks
+            # Number of tick bursts (1-3 bursts per scenario)
+            num_bursts = rng.randint(1, 3)
 
             _demo_stats["last_ticker"] = f"{ticker} {ctype} ${strike}"
 
@@ -230,10 +255,11 @@ async def _run_demo_loop():
                 burst_bid  = round(burst_fill - spread, 2)
                 burst_ask  = round(burst_fill + spread, 2)
 
-                # Emit one tick per exchange within a 200ms window
+                # Emit one tick per exchange
+                # C-019: widened to 50-300ms to simulate real MIAX/PHLX lag
                 base_ts_ms = int(time.time() * 1000)
                 for ex_idx, exchange in enumerate(exchanges):
-                    ts_ms = base_ts_ms + (ex_idx * rng.randint(20, 80))
+                    ts_ms = base_ts_ms + (ex_idx * rng.randint(50, 300))
 
                     envelope = _build_timesale_envelope(
                         occ_symbol=occ_symbol,
@@ -252,8 +278,8 @@ async def _run_demo_loop():
                     except Exception as e:
                         log.warning(f"[demo_engine] _process_trade error: {e}")
 
-                    # Tiny delay between exchange reports (20-80ms)
-                    await asyncio.sleep(rng.uniform(0.02, 0.08))
+                    # C-019: delay 50-300ms between exchange reports
+                    await asyncio.sleep(rng.uniform(0.05, 0.30))
 
                 # Delay between bursts within same scenario (0.5-2s)
                 if burst_idx < num_bursts - 1:
@@ -286,13 +312,15 @@ def is_running() -> bool:
 
 
 def get_stats() -> dict:
-    return {
+    stats = {
         "running":           is_running(),
         "ticks_emitted":     _demo_stats["ticks_emitted"],
         "signals_generated": _demo_stats["signals_generated"],
         "last_ticker":       _demo_stats["last_ticker"],
         "started_at":        _demo_stats["started_at"],
     }
+    stats.update(flow_dedup.dedup_stats())  # C-019: live dedup counters
+    return stats
 
 
 async def start_demo() -> dict:
@@ -302,7 +330,6 @@ async def start_demo() -> dict:
     if is_running():
         return {"ok": False, "message": "Demo engine already running", "stats": get_stats()}
 
-    # Reset stats
     _demo_stats = {
         "ticks_emitted":    0,
         "signals_generated": 0,
