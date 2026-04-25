@@ -64,9 +64,9 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
-# Universe loader — returns (stream_symbols, tier_map)
+# Universe loader — returns (stream_symbols, tier_map, quotes)
 # ---------------------------------------------------------------------------
-async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
+async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
     """
     Priority:
       1. Fresh DB snapshot (< 24h old) — stream starts instantly
@@ -74,8 +74,15 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
       3. Any DB snapshot (stale)          — fallback if Tradier is down
       4. SEED_SYMBOLS                     — last resort
 
-    Returns (stream_symbols, tier_map) so the registry can be
+    Returns (stream_symbols, tier_map, quotes) so the registry can be
     initialised with accurate per-symbol tiers from the first build.
+
+    On the tradier_validated path, tier_map and quotes are preliminary
+    (OI=0). lifespan() re-runs assign_tiers() with real OI after the
+    first registry.build() completes (Feature 4A-OI).
+    On the DB snapshot path (warm start), quotes is [] and OI re-tiering
+    is skipped — the stored tier_map already reflects the last cold-start
+    OI-aware classification.
     """
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
@@ -94,7 +101,8 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        return fresh, tier_map
+        # Warm start: no quotes available, OI re-tiering skipped
+        return fresh, tier_map, []
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
     log.info(
@@ -132,22 +140,22 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
 
         if quotes:
-            log.info("[universe] Step 3b: computing tiers for %d symbols", len(quotes))
+            # Preliminary tier assignment (OI=0 at this point; real OI comes after
+            # registry.build() in lifespan() — see Feature 4A-OI step there)
+            log.info("[universe] Step 3b: preliminary tier assignment for %d symbols (OI not yet available)", len(quotes))
             tier_map = await assign_tiers(quotes)
             log.info(
-                "[universe] Step 3b: tier assignment done — T1=%d T2=%d T3=%d",
+                "[universe] Step 3b: preliminary tiers — T1=%d T2=%d T3=%d",
                 sum(1 for t in tier_map.values() if t == 1),
                 sum(1 for t in tier_map.values() if t == 2),
                 sum(1 for t in tier_map.values() if t == 3),
             )
-            log.info("[universe] Step 3c: upserting %d symbol quotes (price, volume, avg_vol, tier)", len(quotes))
-            await universe_store.upsert_symbol_quotes(quotes, tier_map)
-            log.info("[universe] Step 3c SUCCESS: symbol quotes + tiers persisted")
     else:
         log.warning(
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
             source,
         )
+        quotes = []
 
     stream_symbols = (
         [s for s in symbols if s in stream_eligible_set]
@@ -158,7 +166,19 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int]]:
         "[universe] FINAL: stream starting with %d symbols (source=%s, from universe of %d)",
         len(stream_symbols), source, len(symbols),
     )
-    return stream_symbols, tier_map
+    return stream_symbols, tier_map, quotes
+
+
+# ---------------------------------------------------------------------------
+# OI stamp helper
+# ---------------------------------------------------------------------------
+def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
+    """
+    4A-OI: Set quote.open_interest to avg chain OI for each symbol.
+    Mutates quotes in-place. Symbols absent from oi_map get 0.
+    """
+    for q in quotes:
+        q.open_interest = oi_map.get(q.symbol, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -175,16 +195,32 @@ async def _universe_refresh_loop():
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
                 tier_map: dict[str, int] = {}
+
                 if saved and quotes:
+                    # 4A-OI: build registry first to get real OI, then re-classify
+                    registry = get_registry()
+                    if registry:
+                        log.info("[universe] Background refresh: rebuilding registry for OI roll-up")
+                        await registry.build()
+                        oi_map = registry.get_oi_map()
+                        _stamp_oi(quotes, oi_map)
+                        log.info(
+                            "[universe] Background refresh: OI stamped on %d quotes "
+                            "(%d tickers with oi>0)",
+                            len(quotes),
+                            sum(1 for v in oi_map.values() if v > 0),
+                        )
+
                     tier_map = await assign_tiers(quotes)
                     await universe_store.upsert_symbol_quotes(quotes, tier_map)
 
-                # Hot-swap tier_map on the running registry so next rebuild uses fresh tiers
+                # Hot-swap OI-informed tier_map on the running registry
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
                     log.info(
-                        "[universe] Background refresh: registry tier_map updated (T1=%d T2=%d T3=%d)",
+                        "[universe] Background refresh: registry tier_map updated "
+                        "(T1=%d T2=%d T3=%d)",
                         sum(1 for t in tier_map.values() if t == 1),
                         sum(1 for t in tier_map.values() if t == 2),
                         sum(1 for t in tier_map.values() if t == 3),
@@ -209,15 +245,48 @@ async def _universe_refresh_loop():
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    stream_symbols, tier_map = await _resolve_startup_universe()
+    stream_symbols, tier_map, quotes = await _resolve_startup_universe()
 
-    # Initialise the OCC symbol registry with tier-aware watchlist
+    # Initialise the OCC symbol registry with preliminary tier-aware watchlist
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
     log.info(
         "[registry] Initialised with %d stream symbols, %d tiers mapped",
         len(stream_symbols), len(tier_map),
     )
-    asyncio.create_task(registry.build())          # first build fires immediately in background
+
+    # 4A-OI: await the first build so OI data is ready before tier re-classification.
+    # Only block startup on cold starts (tradier_validated path) where quotes exist.
+    # Warm starts (DB snapshot path) have no quotes so we skip OI re-tiering.
+    log.info("[registry] Running first build (blocking startup until OI available)")
+    await registry.build()
+    log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
+
+    if quotes:
+        # 4A-OI: stamp real avg chain OI onto each quote, then re-classify tiers
+        oi_map = registry.get_oi_map()
+        _stamp_oi(quotes, oi_map)
+        log.info(
+            "[registry] OI stamped on %d quotes (%d tickers with oi>0)",
+            len(quotes),
+            sum(1 for v in oi_map.values() if v > 0),
+        )
+
+        tier_map = await assign_tiers(quotes)
+        log.info(
+            "[registry] OI-informed tier assignment — T1=%d T2=%d T3=%d",
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+
+        # Hot-swap the OI-informed tier map back into the registry
+        registry.set_tier_map(tier_map)
+
+        # Persist OI + final tiers to DB
+        log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
+        await universe_store.upsert_symbol_quotes(quotes, tier_map)
+        log.info("[registry] Upsert complete — open_interest column now populated in DB")
+
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
 
     stream_task       = asyncio.create_task(stream_options_flow(stream_symbols))
