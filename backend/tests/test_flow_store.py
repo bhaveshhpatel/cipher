@@ -1,203 +1,584 @@
 """
-tests/test_flow_store.py
-
-Unit tests for services/flow_store.py.
+Unit tests for services/flow_store.py
 
 Covers:
-  1. flow_episode row has correct schema matching flow_episodes table
-  2. flow_event row has no `id` field (Postgres generates uuid)
-  3. Sparse/None inputs produce safe defaults
-  4. f-string log with None fields does not raise
-  5. Event buffer accumulates and drains correctly
-  6. No-op when SUPABASE_URL/KEY not configured
-  7. persist_flow_episode calls _insert_rows with correct table name
-  8. persist_flow_event buffers row without hitting network
+  persist_flow_event
+  1.  Row appended to buffer for a standard event
+  2.  All expected keys present in buffered row
+  3.  Empty expiry coerced to None (not empty string)
+  4.  occ_symbol forwarded to row
+  5.  is_synthetic_quote forwarded to row (C-018)
+  6.  Defaults applied when fields absent from ev_dict
+  7.  Early flush triggered when buffer hits FLUSH_MAX_ROWS
+  8.  Buffer trimmed correctly after early flush
+  9.  No `id` field in buffered row (Postgres generates uuid)
+
+  _flush_flow_events
+  10. Drains buffer into flow_events on each tick
+  11. Empty buffer skipped (no insert call)
+  12. Buffer over FLUSH_MAX_ROWS trimmed to 100 per tick
+  13. Failed insert logs warning
+
+  persist_flow_episode
+  14. Calls _insert_rows with 'flow_episodes' table
+  15. Row contains expected fields; no `id` field
+  16. Empty expiry coerced to None
+  17. Returns without crashing on insert failure
+  18. Sparse/None inputs produce safe defaults in log formatting
+
+  _insert_rows
+  19. Returns False when URL not configured
+  20. Returns True on 201
+  21. Returns False on 4xx
+  22. Returns False on network exception
+  23. Returns False when rows list is empty
+
+  _bus_signal_listener
+  24. composite_signal triggers persist_flow_episode
+  25. Raw 'signal' message does NOT trigger persist_flow_episode (C-017)
+  26. Non-dict message is ignored
+  27. CancelledError unsubscribes from bus
+
+  constants
+  28. FLUSH_INTERVAL == 0.5
+  29. FLUSH_MAX_ROWS == 100
 """
 import asyncio
 import os
-import sys
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-SAMPLE_SIGNAL_DATA = {
-    "ticker":          "AAPL",
-    "direction":       "REPEAT_BUY",
-    "contract_type":   "CALL",
-    "strike":          185.0,
-    "expiry":          "2026-05-16",
-    "total_premium":   750_000,
-    "trade_count":     5,
-    "alert_level":     "CONVICTION",
-    "is_accelerating": True,
-    "seed_episode":    "5x CALL $185 2026-05-16",
-    "timestamp":       "2026-04-23T19:00:00",
-}
-
-SAMPLE_FLOW_TICK = {
-    "ticker":          "AAPL",
-    "contract_type":   "CALL",
-    "strike":          185.0,
-    "expiry":          "2026-05-16",
-    "premium":         125_000.0,
-    "trade_type":      "SWEEP",
-    "sentiment":       "BULLISH",
-    "influence_tier":  "LARGE",
-    "conviction_score": 0.75,
-    "is_golden_sweep": False,
-}
+import services.flow_store as fs
+from services.flow_store import (
+    _bus_signal_listener,
+    _flush_flow_events,
+    _insert_rows,
+    persist_flow_episode,
+    persist_flow_event,
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers that mirror flow_store row-building logic
-# ---------------------------------------------------------------------------
-
-def _make_episode_row(d: dict) -> dict:
+# ── helpers ─────────────────────────────────────────────────────────────────
+def _ev(
+    ticker="AAPL",
+    contract_type="CALL",
+    strike=180.0,
+    expiry="2026-06-20",
+    dte=56,
+    fill_price=3.50,
+    bid=3.40,
+    ask=3.60,
+    size=10,
+    premium=3500.0,
+    trade_type="SWEEP",
+    bid_ask_class="AT_ASK",
+    is_aggressive=True,
+    is_golden_sweep=False,
+    sentiment="BULLISH",
+    influence_tier="WHALE",
+    conviction_score=0.75,
+    exchange_count=3,
+    fill_count=3,
+    open_interest=5000,
+    iv=0.35,
+    underlying_price=190.0,
+    occ_symbol="AAPL  260620C00180000",
+    is_synthetic_quote=False,
+):
     return {
-        "ticker":          d.get("ticker"),
-        "direction":       d.get("direction"),
-        "contract_type":   d.get("contract_type"),
-        "strike":          d.get("strike"),
-        "expiry":          d.get("expiry"),
-        "total_premium":   d.get("total_premium"),
-        "trade_count":     d.get("trade_count"),
-        "alert_level":     d.get("alert_level"),
-        "is_accelerating": d.get("is_accelerating", False),
-        "seed_episode":    d.get("seed_episode"),
-        "signal_ts":       d.get("timestamp"),
+        "ticker":             ticker,
+        "contract_type":      contract_type,
+        "strike":             strike,
+        "expiry":             expiry,
+        "dte":                dte,
+        "fill_price":         fill_price,
+        "bid":                bid,
+        "ask":                ask,
+        "size":               size,
+        "premium":            premium,
+        "trade_type":         trade_type,
+        "bid_ask_class":      bid_ask_class,
+        "is_aggressive":      is_aggressive,
+        "is_golden_sweep":    is_golden_sweep,
+        "sentiment":          sentiment,
+        "influence_tier":     influence_tier,
+        "conviction_score":   conviction_score,
+        "exchange_count":     exchange_count,
+        "fill_count":         fill_count,
+        "open_interest":      open_interest,
+        "iv":                 iv,
+        "underlying_price":   underlying_price,
+        "occ_symbol":         occ_symbol,
+        "is_synthetic_quote": is_synthetic_quote,
     }
 
 
-def _make_event_row(d: dict) -> dict:
+def _ep_data(
+    ticker="AAPL",
+    direction="BUY",
+    contract_type="CALL",
+    total_premium=2_000_000.0,
+    trade_count=8,
+    alert_level="CONVICTION",
+    is_accelerating=True,
+    seed_episode="8x CALL $180 2026-06-20",
+    timestamp="2026-04-25T10:00:00",
+):
     return {
-        "ticker":           d.get("ticker"),
-        "contract_type":    d.get("contract_type"),
-        "strike":           d.get("strike"),
-        "expiry":           d.get("expiry"),
-        "premium":          d.get("premium"),
-        "trade_type":       d.get("trade_type", "UNKNOWN"),
-        "sentiment":        d.get("sentiment", "UNKNOWN"),
-        "influence_tier":   d.get("influence_tier", "UNKNOWN"),
-        "conviction_score": d.get("conviction_score", 0.0),
-        "is_golden_sweep":  d.get("is_golden_sweep", False),
+        "ticker":          ticker,
+        "direction":       direction,
+        "contract_type":   contract_type,
+        "total_premium":   total_premium,
+        "trade_count":     trade_count,
+        "alert_level":     alert_level,
+        "is_accelerating": is_accelerating,
+        "seed_episode":    seed_episode,
+        "timestamp":       timestamp,
     }
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-def test_flow_episode_row_schema():
-    """Row sent to flow_episodes has correct columns; no old composite_signals columns."""
-    row = _make_episode_row(SAMPLE_SIGNAL_DATA)
-    assert "id" not in row
-    assert row["ticker"] == "AAPL"
-    assert row["alert_level"] == "CONVICTION"
-    assert row["total_premium"] == 750_000
-    assert row["direction"] == "REPEAT_BUY"
-    assert row["is_accelerating"] is True
-    assert row["signal_ts"] == "2026-04-23T19:00:00"
-    # Must NOT contain old composite_signals columns
-    assert "recommendation" not in row
-    assert "composite_score" not in row
-    assert "episode_id" not in row
+def _reset_buffer():
+    fs._flow_event_buffer.clear()
 
 
-def test_flow_event_row_no_id():
-    """flow_events row must not include id — Postgres generates uuid."""
-    row = _make_event_row(SAMPLE_FLOW_TICK)
-    assert "id" not in row
-    assert row["ticker"] == "AAPL"
-    assert row["sentiment"] == "BULLISH"
-    assert row["premium"] == 125_000.0
-    assert row["trade_type"] == "SWEEP"
+# ============================================================
+# persist_flow_event
+# ============================================================
+
+# 1
+def test_persist_flow_event_appends_to_buffer():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    assert len(fs._flow_event_buffer) == 1
 
 
-def test_flow_event_sparse_defaults():
-    """Sparse input with only ticker gets safe defaults for all nullable fields."""
-    row = _make_event_row({"ticker": "TSLA"})
-    assert row["trade_type"] == "UNKNOWN"
-    assert row["sentiment"] == "UNKNOWN"
-    assert row["influence_tier"] == "UNKNOWN"
-    assert row["conviction_score"] == 0.0
-    assert row["is_golden_sweep"] is False
+# 2
+def test_persist_flow_event_row_has_required_keys():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    row = fs._flow_event_buffer[0]
+    for key in [
+        "ticker", "contract_type", "strike", "expiry", "dte",
+        "fill_price", "bid", "ask", "size", "premium",
+        "trade_type", "bid_ask_class", "is_aggressive", "is_golden_sweep",
+        "sentiment", "influence_tier", "conviction_score",
+        "exchange_count", "fill_count", "open_interest",
+        "iv", "underlying_price", "occ_symbol", "is_synthetic_quote",
+    ]:
+        assert key in row, f"Missing key: {key}"
 
 
-def test_fstring_log_none_fields_no_crash():
-    """f-string log formatting with None/zero values must never raise."""
-    row = _make_episode_row({"ticker": None, "contract_type": None,
-                              "alert_level": None, "total_premium": 0})
-    # This is exactly what the fixed log.info f-string does:
-    msg = (
-        f"[flow_store] flow_episode saved: {row['ticker']} {row['contract_type']} "
-        f"alert={row['alert_level']} prem=${(row['total_premium'] or 0):,.0f}"
+# 3
+def test_persist_flow_event_empty_expiry_coerced_to_none():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(expiry="")))
+    assert fs._flow_event_buffer[0]["expiry"] is None
+
+
+# 4
+def test_persist_flow_event_occ_symbol_forwarded():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(
+        persist_flow_event(_ev(occ_symbol="SPY   260117P00450000"))
     )
-    assert "None" in msg  # renders safely as string 'None'
-    assert "$0" in msg
+    assert fs._flow_event_buffer[0]["occ_symbol"] == "SPY   260117P00450000"
 
 
-def test_buffer_accumulate_and_drain():
-    """Buffer collects rows and drains atomically."""
-    buf = []
-    for i in range(4):
-        buf.append(_make_event_row({**SAMPLE_FLOW_TICK, "ticker": f"SYM{i}", "premium": i * 10_000.0}))
-    assert len(buf) == 4
-    batch = buf.copy()
-    buf.clear()
-    assert len(buf) == 0
-    assert len(batch) == 4
-    assert batch[0]["ticker"] == "SYM0"
-    assert batch[3]["ticker"] == "SYM3"
+# 5
+def test_persist_flow_event_is_synthetic_quote_forwarded():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(is_synthetic_quote=True)))
+    assert fs._flow_event_buffer[0]["is_synthetic_quote"] is True
 
 
-def test_no_op_without_supabase_env(monkeypatch):
-    """start_flow_writer returns immediately and does not raise when env vars absent."""
-    monkeypatch.delenv("SUPABASE_URL", raising=False)
-    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
-    monkeypatch.delenv("SUPABASE_KEY", raising=False)
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")
-    assert url is None
-    assert key is None
+# 6
+def test_persist_flow_event_defaults_applied_for_sparse_payload():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event({}))
+    row = fs._flow_event_buffer[0]
+    assert row["ticker"]             == "UNKNOWN"
+    assert row["dte"]                == 0
+    assert row["fill_price"]         == 0.0
+    assert row["sentiment"]          == "NEUTRAL"
+    assert row["influence_tier"]     == "RETAIL"
+    assert row["is_aggressive"]      is False
+    assert row["is_synthetic_quote"] is False
 
 
-@pytest.mark.asyncio
-async def test_persist_flow_episode_calls_correct_table():
-    """persist_flow_episode posts to flow_episodes, not composite_signals."""
-    import services.flow_store as fs
-    fs._SUPABASE_URL = "https://fake.supabase.co"
-    fs._SUPABASE_KEY = "fake-key"
-    with patch.object(fs, "_insert_rows", new_callable=AsyncMock) as mock_insert:
-        mock_insert.return_value = True
-        await fs.persist_flow_episode(SAMPLE_SIGNAL_DATA)
-        mock_insert.assert_called_once()
-        table_arg = mock_insert.call_args[0][0]
-        assert table_arg == "flow_episodes", (
-            f"Expected 'flow_episodes', got '{table_arg}' — "
-            "flow_store is still writing to wrong table"
-        )
-        rows_arg = mock_insert.call_args[0][1]
-        assert len(rows_arg) == 1
-        assert "id" not in rows_arg[0]
-        assert rows_arg[0]["alert_level"] == "CONVICTION"
+# 7
+def test_persist_flow_event_early_flush_at_max_rows():
+    _reset_buffer()
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins:
+            for _ in range(fs._FLUSH_MAX_ROWS):
+                await persist_flow_event(_ev())
+            assert mock_ins.call_count == 1
+            assert mock_ins.call_args[0][0] == "flow_events"
+
+    asyncio.get_event_loop().run_until_complete(_test())
 
 
-@pytest.mark.asyncio
-async def test_persist_flow_event_buffers_without_network():
-    """persist_flow_event appends to buffer without any network call."""
-    import services.flow_store as fs
-    fs._flow_event_buffer.clear()
-    with patch.object(fs, "_insert_rows", new_callable=AsyncMock) as mock_insert:
-        await fs.persist_flow_event(SAMPLE_FLOW_TICK)
-        mock_insert.assert_not_called()  # no immediate DB call
-        assert len(fs._flow_event_buffer) == 1
-        assert fs._flow_event_buffer[0]["ticker"] == "AAPL"
-        assert "id" not in fs._flow_event_buffer[0]
-    fs._flow_event_buffer.clear()
+# 8
+def test_persist_flow_event_buffer_trimmed_after_early_flush():
+    _reset_buffer()
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True):
+            for _ in range(fs._FLUSH_MAX_ROWS + 5):
+                await persist_flow_event(_ev())
+            assert len(fs._flow_event_buffer) == 5
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 9
+def test_persist_flow_event_no_id_field_in_row():
+    _reset_buffer()
+    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    assert "id" not in fs._flow_event_buffer[0]
+
+
+# ============================================================
+# _flush_flow_events
+# ============================================================
+
+# 10
+def test_flush_flow_events_drains_buffer():
+    _reset_buffer()
+    fs._flow_event_buffer.extend([{"ticker": f"T{i}"} for i in range(10)])
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(_flush_flow_events())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert mock_ins.call_count >= 1
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 11
+def test_flush_flow_events_skips_empty_buffer():
+    _reset_buffer()
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(_flush_flow_events())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert mock_ins.call_count == 0
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 12
+def test_flush_trims_to_max_rows_per_tick():
+    _reset_buffer()
+    fs._flow_event_buffer.extend([{"ticker": f"T{i}"} for i in range(150)])
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(_flush_flow_events())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if mock_ins.call_count >= 1:
+                rows_sent = mock_ins.call_args_list[0][0][1]
+                assert len(rows_sent) == 100
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 13
+def test_flush_logs_warning_on_insert_failure(caplog):
+    _reset_buffer()
+    fs._flow_event_buffer.append({"ticker": "AAPL"})
+    import logging
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=False), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             caplog.at_level(logging.WARNING, logger="flow_store"):
+            task = asyncio.create_task(_flush_flow_events())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.get_event_loop().run_until_complete(_test())
+    assert any("failed" in r.message.lower() for r in caplog.records)
+
+
+# ============================================================
+# persist_flow_episode
+# ============================================================
+
+# 14
+def test_persist_flow_episode_calls_correct_table():
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins:
+            await persist_flow_episode(_ep_data())
+            assert mock_ins.call_count == 1
+            assert mock_ins.call_args[0][0] == "flow_episodes"
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 15
+def test_persist_flow_episode_row_fields_and_no_id():
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins:
+            await persist_flow_episode(_ep_data())
+            row = mock_ins.call_args[0][1][0]
+            assert "id" not in row
+            for key in ["ticker", "direction", "contract_type",
+                        "total_premium", "trade_count", "is_accelerating"]:
+                assert key in row
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 16
+def test_persist_flow_episode_empty_expiry_coerced_to_none():
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins:
+            data = _ep_data()
+            data["expiry"] = ""
+            await persist_flow_episode(data)
+            assert mock_ins.call_args[0][1][0]["expiry"] is None
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 17
+def test_persist_flow_episode_no_crash_on_insert_failure():
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=False):
+            await persist_flow_episode(_ep_data())  # must not raise
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 18
+def test_persist_flow_episode_none_fields_log_safe():
+    """f-string log with None/zero total_premium must not raise."""
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True):
+            await persist_flow_episode({
+                "ticker": None, "contract_type": None,
+                "alert_level": None, "total_premium": 0,
+            })
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# ============================================================
+# _insert_rows
+# ============================================================
+
+# 19
+def test_insert_rows_false_when_url_not_set():
+    async def _test():
+        with patch.object(fs, "_SUPABASE_URL", None), \
+             patch.object(fs, "_SUPABASE_KEY", None):
+            return await _insert_rows("flow_events", [{"ticker": "AAPL"}])
+    assert asyncio.get_event_loop().run_until_complete(_test()) is False
+
+
+# 20
+def test_insert_rows_true_on_201():
+    fake_resp = MagicMock()
+    fake_resp.status_code = 201
+
+    async def _test():
+        with patch.object(fs, "_SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(fs, "_SUPABASE_KEY", "key"), \
+             patch("httpx.AsyncClient") as mock_cls:
+            mc = AsyncMock()
+            mc.__aenter__ = AsyncMock(return_value=mc)
+            mc.__aexit__  = AsyncMock(return_value=False)
+            mc.post       = AsyncMock(return_value=fake_resp)
+            mock_cls.return_value = mc
+            return await _insert_rows("flow_events", [{"ticker": "AAPL"}])
+
+    assert asyncio.get_event_loop().run_until_complete(_test()) is True
+
+
+# 21
+def test_insert_rows_false_on_4xx():
+    fake_resp = MagicMock()
+    fake_resp.status_code = 422
+    fake_resp.text        = "Unprocessable"
+
+    async def _test():
+        with patch.object(fs, "_SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(fs, "_SUPABASE_KEY", "key"), \
+             patch("httpx.AsyncClient") as mock_cls:
+            mc = AsyncMock()
+            mc.__aenter__ = AsyncMock(return_value=mc)
+            mc.__aexit__  = AsyncMock(return_value=False)
+            mc.post       = AsyncMock(return_value=fake_resp)
+            mock_cls.return_value = mc
+            return await _insert_rows("flow_events", [{"ticker": "AAPL"}])
+
+    assert asyncio.get_event_loop().run_until_complete(_test()) is False
+
+
+# 22
+def test_insert_rows_false_on_exception():
+    async def _test():
+        with patch.object(fs, "_SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(fs, "_SUPABASE_KEY", "key"), \
+             patch("httpx.AsyncClient") as mock_cls:
+            mc = AsyncMock()
+            mc.__aenter__ = AsyncMock(return_value=mc)
+            mc.__aexit__  = AsyncMock(return_value=False)
+            mc.post       = AsyncMock(side_effect=ConnectionError("timeout"))
+            mock_cls.return_value = mc
+            return await _insert_rows("flow_events", [{"ticker": "AAPL"}])
+
+    assert asyncio.get_event_loop().run_until_complete(_test()) is False
+
+
+# 23
+def test_insert_rows_false_on_empty_rows():
+    async def _test():
+        with patch.object(fs, "_SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(fs, "_SUPABASE_KEY", "key"):
+            return await _insert_rows("flow_events", [])
+
+    assert asyncio.get_event_loop().run_until_complete(_test()) is False
+
+
+# ============================================================
+# _bus_signal_listener
+# ============================================================
+
+def _mock_bus_with_msg(msg):
+    mock_q = asyncio.Queue()
+    asyncio.get_event_loop().run_until_complete(mock_q.put(msg))
+    mock_bus = MagicMock()
+    mock_bus.subscribe.return_value = mock_q
+    mock_bus.unsubscribe            = MagicMock()
+    return mock_bus, mock_q
+
+
+# 24
+def test_bus_listener_composite_signal_triggers_persist_episode():
+    msg = {
+        "type": "composite_signal",
+        "data": {
+            "signal":  {"ticker": "AAPL", "recommendation": "BUY", "reasoning": "x"},
+            "episode": _ep_data(),
+        },
+    }
+    mock_bus, mock_q = _mock_bus_with_msg(msg)
+
+    async def _test():
+        with patch.object(fs, "persist_flow_episode", new_callable=AsyncMock) as mock_ep, \
+             patch("services.flow_store.bus", mock_bus):
+            task = asyncio.create_task(_bus_signal_listener())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert mock_ep.call_count >= 1
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 25
+def test_bus_listener_raw_signal_does_not_trigger_persist():
+    mock_bus, mock_q = _mock_bus_with_msg({"type": "signal", "data": {"ticker": "AAPL"}})
+
+    async def _test():
+        with patch.object(fs, "persist_flow_episode", new_callable=AsyncMock) as mock_ep, \
+             patch("services.flow_store.bus", mock_bus):
+            task = asyncio.create_task(_bus_signal_listener())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert mock_ep.call_count == 0
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 26
+def test_bus_listener_non_dict_message_ignored():
+    mock_bus, mock_q = _mock_bus_with_msg("not-a-dict")
+
+    async def _test():
+        with patch.object(fs, "persist_flow_episode", new_callable=AsyncMock) as mock_ep, \
+             patch("services.flow_store.bus", mock_bus):
+            task = asyncio.create_task(_bus_signal_listener())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert mock_ep.call_count == 0
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# 27
+def test_bus_listener_cancelled_error_unsubscribes():
+    async def _test():
+        mock_q = asyncio.Queue()
+        mock_bus = MagicMock()
+        mock_bus.subscribe.return_value = mock_q
+        mock_bus.unsubscribe            = MagicMock()
+
+        with patch("services.flow_store.bus", mock_bus):
+            task = asyncio.create_task(_bus_signal_listener())
+            await asyncio.sleep(0.02)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            mock_bus.unsubscribe.assert_called_once_with("db_writer", mock_q)
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+# ============================================================
+# constants
+# ============================================================
+
+# 28
+def test_flush_interval_is_500ms():
+    assert fs._FLUSH_INTERVAL == pytest.approx(0.5)
+
+
+# 29
+def test_flush_max_rows_is_100():
+    assert fs._FLUSH_MAX_ROWS == 100
