@@ -34,8 +34,17 @@ class Settings(BaseSettings):
     # Override via Railway env var SWARM_N_AGENTS.
     SWARM_N_AGENTS: int = 6
 
+    # ---------------------------------------------------------------------------
     # Universe pipeline settings
-    UNIVERSE_PRIORITY_SYMBOLS: str = "SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD"
+    # ---------------------------------------------------------------------------
+    # NOTE: UNIVERSE_PRIORITY_SYMBOLS removed in C-020.
+    # Priority tier is now fully dynamic based on volume thresholds.
+    # Tier 1 (Elite):   avg_volume >= TIER1_MIN_VOLUME
+    # Tier 2 (Active):  avg_volume >= TIER2_MIN_VOLUME AND last_price >= TIER2_MIN_PRICE
+    # Tier 3 (Eligible): avg_volume >= UNIVERSE_MIN_VOLUME AND last_price >= UNIVERSE_MIN_PRICE
+    # All tier thresholds are also stored in the `ingestion_config` DB table
+    # and can be changed from the admin UI without restarting the service.
+    # ---------------------------------------------------------------------------
     UNIVERSE_BATCH_DELAY_MS: int = 0
     UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True
 
@@ -44,28 +53,41 @@ class Settings(BaseSettings):
     UNIVERSE_QUOTES_BATCH_SIZE: int = 200
     UNIVERSE_QUOTES_CONCURRENCY: int = 28
 
-    # OCC Symbol Registry settings (Layer 1 of options flow architecture)
-    # Controls how the SymbolRegistry builds and refreshes the OCC contract map.
-    # Override any of these via Railway env vars.
-    #
-    # REGISTRY_MAX_DTE        : only include contracts expiring within N days (default 90)
-    # REGISTRY_ATM_RANGE_PCT  : ±N% of stock price for strike filter (default 0.15 = ±15%)
-    # REGISTRY_REFRESH_MINS   : how often to rebuild the full registry (default 30 min)
-    # REGISTRY_MIN_OI         : minimum open interest to include a contract (default 0 = all)
-    # REGISTRY_EXPIRY_DAY_REFRESH_MINS : faster refresh interval on days with expirations
+    # Tier volume/price thresholds (defaults; overridden by ingestion_config DB at runtime)
+    TIER1_MIN_VOLUME: int = 20_000_000
+    TIER2_MIN_VOLUME: int = 2_000_000
+    TIER2_MIN_PRICE: float = 10.0
+
+    # ---------------------------------------------------------------------------
+    # OCC Symbol Registry settings (Layer 1)
+    # All knobs are also in `ingestion_config` DB table for live admin control.
+    # ---------------------------------------------------------------------------
+    # Single-tier fallback (used when tier-specific knobs not in DB)
     REGISTRY_MAX_DTE: int = 90
     REGISTRY_ATM_RANGE_PCT: float = 0.15
     REGISTRY_REFRESH_MINS: int = 30
     REGISTRY_MIN_OI: int = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int = 15
 
+    # Tier-specific OCC filter knobs (defaults; overridden by ingestion_config DB at runtime)
+    REGISTRY_T1_ATM_PCT: float = 0.20
+    REGISTRY_T1_MAX_DTE: int = 90
+    REGISTRY_T2_ATM_PCT: float = 0.15
+    REGISTRY_T2_MAX_DTE: int = 60
+    REGISTRY_T3_ATM_PCT: float = 0.10
+    REGISTRY_T3_MAX_DTE: int = 30
+
+    # Stream worker connection safety (Fix 1 + 2)
+    STREAM_WORKER_STAGGER_MS: int = 200   # ms between worker spawns
+    STREAM_SESSION_SEM: int = 3            # max concurrent session token fetches
+
+    # OI enrichment
+    OI_REFRESH_MINS: int = 30
+    OI_MIN_THRESHOLD: int = 0
+
     @property
     def origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
-
-    @property
-    def priority_symbols(self) -> List[str]:
-        return [s.strip() for s in self.UNIVERSE_PRIORITY_SYMBOLS.split(",") if s.strip()]
 
 
 settings = Settings()
