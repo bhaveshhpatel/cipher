@@ -17,6 +17,18 @@ Feature 4A — Per-tier ATM range + max DTE:
   matching its tier (T1/T2/T3). REGISTRY_ATM_RANGE_PCT and REGISTRY_MAX_DTE
   in ingestion_config are kept as the T3 / fallback defaults for symbols
   whose tier is unknown.
+
+Feature 4A-OI — Per-symbol average chain OI roll-up:
+  After each registry build, _oi_by_ticker holds the average open_interest
+  across all loaded (post-filter) contracts for each underlying ticker.
+  This is exposed via get_oi_map() so main.py can populate
+  SymbolQuote.open_interest before calling tier_engine.assign_tiers(),
+  making the t1_min_oi / t2_min_oi / t3_min_oi thresholds in
+  tier_thresholds effective at the symbol classification step.
+
+  Formula: avg_oi(ticker) = sum(contract.open_interest) / count(loaded contracts)
+  Only contracts that passed ATM + DTE + min_oi filters are included,
+  so the average reflects the liquidity of contracts Cipher actually monitors.
 """
 import asyncio
 import logging
@@ -86,6 +98,9 @@ class SymbolRegistry:
 
     All filter thresholds are read from ingestion_config + tier_thresholds
     DB tables on every build so admin UI changes take effect without restart.
+
+    After each build, get_oi_map() returns avg chain OI per underlying ticker
+    (Feature 4A-OI) for use by tier_engine.assign_tiers().
     """
 
     def __init__(
@@ -99,6 +114,9 @@ class SymbolRegistry:
         self._stock_prices: dict[str, float]     = {}
         self._last_build: Optional[datetime]     = None
         self._build_lock = asyncio.Lock()
+        # 4A-OI: avg open_interest across loaded contracts per underlying ticker.
+        # Populated on every build; reset at build start inside the lock.
+        self._oi_by_ticker: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public read API
@@ -123,6 +141,20 @@ class SymbolRegistry:
         """Hot-swap the tier map without rebuilding the registry."""
         self._tier_map = tier_map
 
+    def get_oi_map(self) -> dict[str, int]:
+        """
+        Return avg chain OI per underlying ticker from the most recent build.
+
+        Value = mean open_interest across all contracts that passed the
+        ATM + DTE + min_oi filters for that ticker.  Returns 0 for any
+        ticker with no loaded contracts.
+
+        Used by main.py to populate SymbolQuote.open_interest before
+        calling tier_engine.assign_tiers(), activating the t*_min_oi
+        thresholds in tier_thresholds.
+        """
+        return dict(self._oi_by_ticker)
+
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
@@ -132,6 +164,9 @@ class SymbolRegistry:
         Full registry build. Reads live config + tier thresholds from DB, then:
         fetches stock prices -> expirations -> chains per ticker.
         Returns count of OCC symbols loaded.
+
+        After this method returns, get_oi_map() reflects avg chain OI for
+        every ticker that was built (Feature 4A-OI).
         """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds
@@ -150,6 +185,7 @@ class SymbolRegistry:
                 cfg["REGISTRY_MIN_OI"],
             )
             new_registry: dict[str, ContractMeta] = {}
+            new_oi_by_ticker: dict[str, int] = {}  # 4A-OI: reset each build
 
             prices = await self._fetch_stock_prices()
             self._stock_prices = prices
@@ -160,6 +196,7 @@ class SymbolRegistry:
                     ticker,
                     prices.get(ticker, 0.0),
                     new_registry,
+                    new_oi_by_ticker,
                     tier_params,
                 )
                 for ticker in self._watchlist
@@ -167,9 +204,10 @@ class SymbolRegistry:
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            old_count        = len(self._registry)
-            self._registry   = new_registry
-            self._last_build = datetime.utcnow()
+            old_count           = len(self._registry)
+            self._registry      = new_registry
+            self._oi_by_ticker  = new_oi_by_ticker  # 4A-OI: atomic swap
+            self._last_build    = datetime.utcnow()
 
             # Log tier breakdown of loaded contracts
             t_counts = {1: 0, 2: 0, 3: 0}
@@ -177,10 +215,11 @@ class SymbolRegistry:
                 t_counts[m.tier] = t_counts.get(m.tier, 0) + 1
             log.info(
                 "[symbol_registry] Build complete: %d OCC symbols "
-                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d)",
+                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers",
                 len(new_registry),
                 t_counts[1], t_counts[2], t_counts[3],
                 old_count, len(new_registry) - old_count,
+                len(new_oi_by_ticker),
             )
             return len(new_registry)
 
@@ -241,15 +280,19 @@ class SymbolRegistry:
 
     async def _build_ticker(
         self,
-        ticker:      str,
-        stock_price: float,
-        registry:    dict[str, ContractMeta],
-        tier_params: dict[int, _TierParams],
+        ticker:          str,
+        stock_price:     float,
+        registry:        dict[str, ContractMeta],
+        oi_by_ticker:    dict[str, int],
+        tier_params:     dict[int, _TierParams],
     ):
         """
         Fetch expirations + chains for one ticker and populate registry.
         Uses the symbol's tier from self._tier_map to select per-tier
         ATM range and max DTE. Unknown-tier symbols fall back to T3 params.
+
+        4A-OI: After loading all contracts for this ticker, computes avg OI
+        across loaded contracts and stores it in oi_by_ticker[ticker].
         """
         if stock_price <= 0:
             log.warning("[symbol_registry] %s: no stock price — skipping", ticker)
@@ -316,10 +359,25 @@ class SymbolRegistry:
                 except Exception:
                     continue
 
-        ticker_count = sum(1 for m in registry.values() if m.ticker == ticker)
+        # 4A-OI: compute avg OI across all contracts loaded for this ticker.
+        # Only contracts that passed ATM + DTE + min_oi filters are included.
+        loaded_ois = [
+            m.open_interest
+            for m in registry.values()
+            if m.ticker == ticker
+        ]
+        if loaded_ois:
+            oi_by_ticker[ticker] = int(sum(loaded_ois) / len(loaded_ois))
+        else:
+            oi_by_ticker[ticker] = 0
+
+        ticker_count = len(loaded_ois)
         log.debug(
-            "[symbol_registry] %s (T%d): %d contracts loaded (price=$%.2f, atm=+/-%.0f%%, dte<=%d)",
-            ticker, tier, ticker_count, stock_price, params.atm_pct * 100, params.max_dte,
+            "[symbol_registry] %s (T%d): %d contracts loaded "
+            "(price=$%.2f, atm=+/-%.0f%%, dte<=%d, avg_oi=%d)",
+            ticker, tier, ticker_count, stock_price,
+            params.atm_pct * 100, params.max_dte,
+            oi_by_ticker.get(ticker, 0),
         )
 
 
