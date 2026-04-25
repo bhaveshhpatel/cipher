@@ -1,12 +1,78 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-23 (Phase 4)
+> Last updated: 2026-04-24 (Phase 5A)
 
 ---
 
 ## Overview
 
-Cipher is an institutional options flow intelligence platform. It monitors live Tradier WebSocket streams across 2,600+ symbols, classifies each trade tick, detects repetition patterns, and surfaces high-conviction signals to the frontend via WebSocket and persists them to Supabase.
+Cipher is an institutional options flow intelligence platform. It monitors live Tradier WebSocket streams across ~16,000 OCC symbols (split across 32 parallel connections), classifies each trade tick through a 6-layer pipeline, detects repetition patterns, runs a multi-agent AI swarm, and surfaces high-conviction signals to the frontend via WebSocket — persisting all signals to Supabase for historical querying.
+
+---
+
+## The 6-Layer Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Layer 1 — Symbol Registry  (services/symbol_registry.py)        │
+│                                                                   │
+│  Pre-loads all ~16,000 OCC contract metadata at startup into a   │
+│  dict. On each stream tick: O(1) lookup                          │
+│    registry["TSLA260424C00375000"]                               │
+│      → { ticker, strike, expiry, contract_type, DTE }            │
+│  No regex, no API call, no per-tick latency.                     │
+│  Refreshes every REGISTRY_REFRESH_MINS (default 30).            │
+│  On expiry days: refreshes every REGISTRY_EXPIRY_DAY_REFRESH_MINS│
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│  Layer 2 — Stream Manager  (services/stream_manager.py)          │
+│                                                                   │
+│  ~16,000 OCC symbols — Tradier caps each connection at ~500.     │
+│  StreamManager splits into 32 parallel connections, each with    │
+│  its own session token (stream_worker.py per connection).        │
+│  Auto-reconnects on drop. When symbol list refreshes, only       │
+│  affected workers restart — not all 32.                          │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│  Layer 3 — Parser  (parsers/options_flow_parser.py)              │
+│                                                                   │
+│  CRITICAL FIX: stream sends "last" as fill price, not "price".  │
+│  fill_price = float(tick["last"] or tick.get("price") or 0)     │
+│  Also: size==0 guard, OCC regex expanded to {1,10} chars,        │
+│  synthetic bid/ask spread when bid=ask=0 to prevent NEUTRAL mis- │
+│  classification. Unknown contract type → return None (skip).     │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│  Layer 4 — Deduplication  (utils/dedup.py)                       │
+│                                                                   │
+│  Live data shows a single trade reported by 4 exchanges          │
+│  (N, C, M, Q) within 200ms. Without dedup: 4 DB rows per trade. │
+│  2-second TTL cache keyed on:                                    │
+│    (occ_symbol, size, fill_price_2dp, time_bucket_2s)            │
+│  Sweep detection: 3+ exchanges within 5s window.                 │
+│  Module-level singleton: flow_dedup                              │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│  Layer 5 — Batched DB Writes  (services/flow_store.py)           │
+│                                                                   │
+│  Never write one row at a time. Buffer events and flush to       │
+│  Supabase every 500ms OR 100 rows, whichever comes first.        │
+│  Estimated: ~62K filtered rows/day.                              │
+│  Uses SUPABASE_SERVICE_KEY (bypasses RLS).                       │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│  Layer 6 — Supabase Realtime                                     │
+│                                                                   │
+│  Zero extra work. Supabase auto-broadcasts every INSERT to       │
+│  subscribed frontend clients. Frontend subscribes to             │
+│  flow_episodes and signal_history channels.                      │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -17,41 +83,48 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │                        Railway (Backend)                        │
 │                                                                 │
 │  main.py (FastAPI lifespan)                                     │
-│    ├── stream_options_flow()      tradier_stream.py             │
-│    │     ├── _get_session_token() Tradier REST                  │
-│    │     ├── httpx SSE stream     Tradier Stream API            │
-│    │     ├── parse_tradier_trade() parsers/options_flow_parser  │
-│    │     │     └── [Phase 3] size==0 guard → returns None       │
-│    │     ├── [LOG] every tick     Railway logs                  │
-│    │     ├── RepetitionAccumulator signals/repetition_accumulator│
-│    │     ├── [LOG] every signal   Railway logs                  │
-│    │     └── bus.publish_all()    core/async_bus.py             │
-│    │              │                                             │
-│    │         AsyncEventBus (in-memory fan-out)                  │
-│    │              ├── "signals"      → ws.py → WebSocket clients│
-│    │              ├── "db_writer"    → flow_store.py → Supabase │
-│    │              └── "signal_store" → signal_store.py → Supabase [Phase 4]
-│    │                                                            │
-│    ├── start_flow_writer()        services/flow_store.py        │
-│    │     ├── bus.subscribe("db_writer")                         │
-│    │     ├── persist_flow_episode() → flow_episodes             │
-│    │     └── _flush_flow_events()  every 5s → flow_events       │
-│    │                                                            │
-│    ├── start_signal_store()       services/signal_store.py [Phase 4]
-│    │     ├── bus.subscribe("signal_store")                      │
-│    │     └── persist_signal_history() → signal_history          │
-│    │                                                            │
-│    └── _universe_refresh_loop()   every 24h                     │
+│    ├── SymbolRegistry (Layer 1)  services/symbol_registry.py   │
+│    │     └── pre-loads ~16,000 OCC contracts at startup        │
+│    ├── StreamManager (Layer 2)   services/stream_manager.py    │
+│    │     └── 32 parallel Tradier connections via stream_worker  │
+│    │           ├── parse_tradier_trade()  Layer 3               │
+│    │           │     ├── fill_price: tick["last"] (not "price")│
+│    │           │     ├── size==0 guard → skip                  │
+│    │           │     └── OCC regex {1,10} + synthetic spread   │
+│    │           ├── DedupCache.is_duplicate()  Layer 4           │
+│    │           │     └── 2s TTL (symbol,size,price,bucket)     │
+│    │           ├── RepetitionAccumulator                        │
+│    │           │     └── episode when ≥3 trades / ≥$50K prem  │
+│    │           ├── build_composite()                            │
+│    │           │     └── flow×0.55 + backtest×0.35 + vol×0.10  │
+│    │           ├── SwarmEngine  (12 Groq agents)  Layer 5A     │
+│    │           └── bus.publish_all()  core/async_bus.py        │
+│    │                      │                                    │
+│    │              AsyncEventBus (in-memory fan-out)            │
+│    │                ├── "signals"       → ws.py → WS clients  │
+│    │                ├── "db_writer"     → flow_store.py (L5)  │
+│    │                └── "signal_writer" → signal_store.py     │
+│    │                                                           │
+│    ├── start_flow_writer()    services/flow_store.py  (L5)    │
+│    │     ├── buffer events, flush every 500ms or 100 rows      │
+│    │     ├── persist_flow_episode() → flow_episodes            │
+│    │     └── _flush_flow_events()   → flow_events              │
+│    │                                                           │
+│    └── start_signal_writer()  services/signal_store.py        │
+│          ├── persists CompositeSignal + swarm fields           │
+│          └── → signal_history (Supabase Realtime L6)          │
 │                                                                 │
 │  FastAPI Routers                                                │
-│    ├── /api/auth             auth.py                            │
-│    ├── /api/flow/scan        flow.py   (currently mocked)       │
-│    ├── /api/simulate         simulation.py                      │
-│    ├── /ws/signals           ws.py     WebSocket + ping/pong    │
-│    ├── /api/signals/composite     smart_signals.py              │
-│    ├── /api/signals/list          smart_signals.py  [Phase 3]  │
-│    └── /api/signals/history       smart_signals.py  [Phase 4]  │
+│    ├── /api/auth                  auth.py                      │
+│    ├── /api/flow/scan             flow.py                      │
+│    ├── /api/simulate              simulation.py                │
+│    ├── /ws/signals                ws.py (ping/pong heartbeat)  │
+│    ├── /api/signals/composite     smart_signals.py             │
+│    ├── /api/signals/list          smart_signals.py             │
+│    └── /api/signals/history       history.py                   │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                Supabase Realtime (Layer 6)
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -59,32 +132,47 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │   flow_episodes · flow_events · options_universe_snapshots      │
 │   options_universe_symbols · signal_history · auth.users        │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Vercel (Frontend)                            │
+│   Next.js 14, TypeScript, Tailwind CSS                          │
+│   Supabase Realtime subscription — zero-latency INSERT push     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Backend Signal Pipeline — Phase 4
+## Backend Signal Pipeline — Phase 5A
 
 ```
-Tradier SSE tick
-  → parse_tradier_trade()
-       └── [Phase 3] size guard: if size == 0 → return None (skip event)
+Tradier SSE tick (Layer 2 — StreamManager)
+  → parse_tradier_trade()                              Layer 3
+       ├── fill_price = tick["last"] or tick.get("price") or 0
+       ├── size==0 guard → return None (skip)
+       ├── OCC regex {1,10} — ticker/strike/expiry/type
+       └── synthetic spread when bid=ask=0
+  → DedupCache.is_duplicate()                          Layer 4
+       ├── duplicate (same exchange tick) → drop
+       └── canonical → check is_sweep()
   → RepetitionAccumulator.ingest()
-       └── RepetitionEpisode produced when trades ≥ 3 AND premium ≥ $50K
+       └── RepetitionEpisode when trades ≥ 3 AND premium ≥ $50K
   → build_composite(ep, accumulator)
-       ├── compute_flow_score()              × 0.55 weight
-       │     premium (capped $10M) + acceleration bonus + trade count
-       ├── get_backtest_score()              × 0.35 weight
+       ├── compute_flow_score()              × 0.55
+       │     premium (capped $10M) + acceleration + trade count
+       ├── get_backtest_score()              × 0.35
        │     historical win-rate by ticker/type/DTE/tier
-       └── volume_weighted_premium_factor()  × 0.10 weight  [Phase 3]
-             total_premium / (open_interest × 100), capped 0–1
-             falls back to 0.5 neutral when OI unavailable
-  → CompositeSignal { recommendation, composite_score, flow_score,
-                      backtest_score, volume_premium_factor, reasoning }
+       └── volume_weighted_premium_factor()  × 0.10
+             total_premium / (OI × 100), capped 0–1, 0.5 if OI absent
+  → SwarmEngine.run()                                  Phase 5A
+       └── 3/6/9/12 Groq agents → majority vote → EnsembleResult
+  → CompositeSignal { recommendation, composite_score,
+                      swarm_direction, swarm_confidence,
+                      swarm_agents JSONB, bull/bear/hold votes }
   → bus.publish_all()
-       ├── "signals"      → WebSocket clients
-       ├── "db_writer"    → flow_store.py → flow_episodes + flow_events
-       └── "signal_store" → signal_store.py → signal_history  [Phase 4]
+       ├── "signals"       → WebSocket clients (ws.py)
+       ├── "db_writer"     → flow_store.py → flow_episodes + flow_events  (Layer 5)
+       └── "signal_writer" → signal_store.py → signal_history
 ```
 
 ### Composite Score Weights (Phase 3+)
@@ -95,9 +183,11 @@ Tradier SSE tick
 | `backtest_score` | 0.35 | Historical win-rate (ticker/type/DTE/tier) |
 | `volume_premium_factor` | 0.10 | Premium relative to open interest |
 
+**Recommendation threshold:** composite ≥ 0.65 → BUY (bullish) or SELL (bearish)
+
 ---
 
-## WebSocket Heartbeat (Phase 3 — fully resolved Phase 4)
+## WebSocket Heartbeat
 
 Railway terminates idle TCP connections. The WS router runs a full ping/pong loop:
 
@@ -105,124 +195,109 @@ Railway terminates idle TCP connections. The WS router runs a full ping/pong loo
 |-------|---------|
 | Server → client ping | `{"type":"ping"}` every **25 seconds** |
 | Client → server pong | `{"type":"pong"}` expected within **10 seconds** |
-| Pong timeout | Server closes with code `1001`, logs warning |
+| Pong timeout | Server closes with code `1001` |
+| Invalid JWT | Server closes with code `4001` |
 
-**Phase 4:** `useSignalStream.ts` now fully handles `{"type":"ping"}` messages and responds with `{"type":"pong"}` — the TODO from Phase 3 is resolved.
+---
+
+## AI Swarm — Phase 5A
+
+| Setting | Value |
+|---------|-------|
+| Provider | Groq `llama-3.3-70b-versatile` |
+| Agent counts | 3, 6, 9, 12 — set via `SWARM_N_AGENTS` env var |
+| Tier 1 agents (1–6) | Momentum, Contrarian, Fundamental, Technical, Macro, Risk |
+| Tier 2 agents (7–9) | Options Flow Specialist, Quant/Stat Arb, Sentiment |
+| Tier 3 agents (10–12) | Sector Rotation, Volatility Trader, Dark Pool/Tape Reader |
+| Ensemble | Majority vote → `bull_votes`, `bear_votes`, `hold_votes`, `confidence` |
+| Fallback | All agents return HOLD when `GROQ_API_KEY` not set |
 
 ---
 
 ## Signal History — Phase 4
 
-### `signal_history` Table
-
-Persists every composite signal emitted by the engine for historical replay and dashboard display.
+### `signal_history` Table (with Phase 5A swarm fields)
 
 ```sql
 CREATE TABLE signal_history (
-  id              BIGSERIAL PRIMARY KEY,
-  ticker          TEXT NOT NULL,
-  recommendation  TEXT NOT NULL,           -- BUY / SELL / HOLD
-  composite_score NUMERIC NOT NULL,
-  flow_score      NUMERIC NOT NULL,
-  backtest_score  NUMERIC NOT NULL,
+  id                    BIGSERIAL PRIMARY KEY,
+  ticker                TEXT NOT NULL,
+  recommendation        TEXT NOT NULL,           -- BUY / SELL / HOLD
+  composite_score       NUMERIC NOT NULL,
+  flow_score            NUMERIC NOT NULL,
+  backtest_score        NUMERIC NOT NULL,
   volume_premium_factor NUMERIC,
-  reasoning       TEXT,
-  contract_type   TEXT,                    -- CALL / PUT
-  alert_level     TEXT,                    -- WATCH / ALERT / STRONG_SIGNAL / CONVICTION
-  total_premium   NUMERIC,
-  trade_count     INT,
-  signal_ts       TIMESTAMPTZ DEFAULT now(),
-  created_at      TIMESTAMPTZ DEFAULT now()
+  reasoning             TEXT,
+  contract_type         TEXT,                    -- CALL / PUT
+  alert_level           TEXT NOT NULL,           -- WATCH/ALERT/STRONG_SIGNAL/CONVICTION
+  sentiment             TEXT NOT NULL,           -- bullish / bearish / neutral
+  direction             TEXT NOT NULL,           -- BUY / SELL / HOLD
+  influence_tier        TEXT NOT NULL,           -- whale/institutional/large/retail
+  premium               NUMERIC NOT NULL,
+  trade_type            TEXT NOT NULL,           -- SWEEP/BLOCK/SPLIT/SINGLE
+  is_golden_sweep       BOOLEAN NOT NULL DEFAULT false,
+  total_premium         NUMERIC,
+  trade_count           INT,
+  -- Phase 5A swarm fields
+  swarm_direction       TEXT,
+  swarm_confidence      NUMERIC,
+  swarm_agents          JSONB,
+  swarm_bull_votes      INT,
+  swarm_bear_votes      INT,
+  swarm_hold_votes      INT,
+  signal_ts             TIMESTAMPTZ DEFAULT now(),
+  created_at            TIMESTAMPTZ DEFAULT now()
 );
 ```
-
-**Migration file:** `backend/migrations/003_signal_history.sql`
-
-### `GET /api/signals/history`
-
-New paginated endpoint for frontend signal history tab:
-
-| Query Param | Type | Default | Description |
-|-------------|------|---------|-------------|
-| `page` | int | 1 | Page number (1-indexed) |
-| `page_size` | int | 20 | Results per page (max 100) |
-| `ticker` | string | — | Filter by ticker symbol |
-| `recommendation` | string | — | `BUY` / `SELL` / `HOLD` |
-| `min_score` | float | 0.0 | Minimum `composite_score` |
-
-Response: `{ signals[], page, page_size, total }`
 
 ---
 
 ## Smart Signals Endpoints
 
-### `GET /api/signals/list` (Phase 3)
+### `GET /api/signals/history`
 
-| Query Param | Type | Default | Description |
-|-------------|------|---------|-------------|
-| `page` | int | 1 | Page number (1-indexed) |
-| `page_size` | int | 20 | Results per page (max 100) |
+| Param | Type | Default | Constraints |
+|-------|------|---------|-------------|
+| `ticker` | string | — | 1–10 chars |
 | `direction` | string | — | `bullish` / `bearish` / `neutral` |
 | `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
-| `min_conviction` | float | 0.0 | Minimum `composite_score` (0.0–1.0) |
+| `min_conviction` | float | 0.0 | 0.0–1.0 |
+| `limit` | int | 50 | 1–200 |
+| `offset` | int | 0 | ≥0 |
 
-### `GET /api/signals/composite/{ticker}` (Phase 2+)
+### `GET /api/signals/list`
 
-Single-ticker composite endpoint. Response includes `volume_premium_factor` field.
+| Param | Type | Default | Constraints |
+|-------|------|---------|-------------|
+| `page` | int | 1 | ≥1 |
+| `page_size` | int | 20 | 1–100 |
+| `direction` | string | — | `bullish` / `bearish` / `neutral` |
+| `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
+| `min_conviction` | float | 0.0 | 0.0–1.0 |
 
----
+### `GET /api/signals/composite/{ticker}`
 
-## Live Data Pipeline — Step by Step
-
-### Stage 1 — Symbol Universe (Startup)
-
-| Step | What happens | DB table written |
-|------|-------------|------------------|
-| 1 | Load fresh snapshot from DB (< 24h) | read `options_universe_snapshots` |
-| 2 | If stale: fetch from CBOE + Tradier validate + screen | — |
-| 3 | Save validated snapshot | `options_universe_snapshots` |
-| 4 | Upsert per-symbol quotes | `options_universe_symbols` |
-| 5 | Stream starts with stream-eligible symbols (2,600+) | — |
-
-Refreshes every **24 hours** in background.
+Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `swarm_confidence`.
 
 ---
 
-### Stage 2 — Tradier Stream (Live, always-on)
+## Supabase Tables
 
-```
-Tradier SSE tick
-  → parse_tradier_trade()          parse raw JSON into OptionsFlowEvent
-       └── size == 0 → return None   [Phase 3 guard]
-  → [LOG] tradier_stream logger    "[flow] AAPL CALL $180 2024-06-21 | prem=$250,000 ..."
-  → RepetitionAccumulator.ingest() group by (ticker, strike, expiry, contract_type)
-       └── if trades >= 3 AND premium >= $50,000:
-             → RepetitionEpisode produced
-             → [LOG] tradier_stream logger  "[signal] AAPL CALL alert=CONVICTION ..."
-             → bus.publish_all(signal_dict)
-```
+| Table | Writer | Key Used | Notes |
+|-------|--------|----------|-------|
+| `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
+| `flow_events` | `flow_store.py` | SERVICE_KEY | Batched writes; `expiry` nullable |
+| `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields (Phase 5A) |
+| `options_universe_symbols` | `universe_store.py` | ANON_KEY | Symbol quotes, stream_eligible |
+| `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
 
----
+### Supabase Critical Rules
 
-### Stage 3 — Event Bus Fan-out
-
-| Channel | Subscriber | What it does |
-|---------|------------|-------------|
-| `signals` | `ws.py` | Forwards to all connected WebSocket clients |
-| `db_writer` | `flow_store.py` | Persists to `flow_episodes` + `flow_events` |
-| `signal_store` | `signal_store.py` | Persists to `signal_history` [Phase 4] |
-
----
-
-### Stage 4 — DB Persistence
-
-#### `flow_store.py` — flow_episodes + flow_events
-
-See specs.md § Flow Store for full schema and batching details.
-
-#### `signal_store.py` — signal_history (Phase 4)
-
-Subscribes to `signal_store` bus channel. Persists every composite signal row immediately (no batching — signals are low-frequency relative to ticks).
+1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history` — anon key fails with `42501` (RLS)
+2. **Never send `id` fields** — Postgres generates them server-side
+3. **No `.select()` after `.insert()`** in supabase-py v2
+4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
+5. **Env var is `SUPABASE_SERVICE_KEY`** (NOT `SUPABASE_SERVICE_ROLE_KEY`)
 
 ---
 
@@ -230,10 +305,50 @@ Subscribes to `signal_store` bus channel. Persists every composite signal row im
 
 | Level | Criteria |
 |-------|----------|
-| `CONVICTION` | premium >= $5M, OR (accelerating AND premium >= $1M) |
-| `STRONG_SIGNAL` | premium >= $1M |
-| `ALERT` | premium >= $250K |
-| `WATCH` | premium >= $50K (minimum threshold) |
+| `CONVICTION` | premium ≥ $5M, OR (accelerating AND premium ≥ $1M) |
+| `STRONG_SIGNAL` | premium ≥ $1M |
+| `ALERT` | premium ≥ $250K |
+| `WATCH` | premium ≥ $50K (minimum threshold) |
+
+---
+
+## Universe Pipeline (Startup + 24h Refresh)
+
+| Step | Action | Table |
+|------|--------|-------|
+| 1 | CBOE CSV → ~5,500 raw symbols | — |
+| 2 | Tradier `/expirations` validation → ~5,500 confirmed optionable | — |
+| 3 | Tradier batch quotes (200/batch, 28 parallel) → `stream_eligible` flag | `options_universe_symbols` |
+| 4 | Extract `stream_eligible=true` → StreamManager (~1,000–2,000 symbols) | — |
+| 5 | Save snapshot | `options_universe_snapshots` |
+
+**Startup priority:** fresh DB snapshot (< 24h) → Tradier fetch → stale snapshot → `SEED_SYMBOLS`.
+
+---
+
+## ID Generation Contract
+
+> **Rule:** `flow_events`, `flow_episodes`, and `signal_history` rows are **never sent with an `id` field**. Postgres generates IDs server-side. Sending a client-generated `id` causes a 400 / schema mismatch error.
+
+---
+
+## Environment Variables
+
+| Variable | Used by | Required |
+|----------|---------|----------|
+| `TRADIER_API_KEY` | tradier_stream.py | Yes (live mode) |
+| `TRADIER_BASE_URL` | tradier_stream.py | Yes |
+| `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
+| `TRADIER_ACCOUNT_ID` | trade_executor.py | Yes (paper/live trading) |
+| `SUPABASE_URL` | flow_store, signal_store, universe_store | Yes |
+| `SUPABASE_SERVICE_KEY` | flow_store, signal_store | **Yes — service role key** |
+| `SUPABASE_KEY` | universe_store, smart_signals (reads) | Yes (anon key) |
+| `SECRET_KEY` | auth.py | Yes |
+| `ALGORITHM` | auth.py | Yes (default: HS256) |
+| `GROQ_API_KEY` | swarm_engine.py | Yes (swarm; HOLD fallback if absent) |
+| `SWARM_N_AGENTS` | swarm_engine.py | No (default: 6) |
+| `REGISTRY_MAX_DTE` | symbol_registry.py | No (default: 90) |
+| `REGISTRY_REFRESH_MINS` | symbol_registry.py | No (default: 30) |
 
 ---
 
@@ -243,38 +358,20 @@ Subscribes to `signal_store` bus channel. Persists every composite signal row im
 |--------------|---------------|
 | Raw flow ticks (live) | Railway logs → filter `[flow]` |
 | Signal episodes (live) | Railway logs → filter `[signal]` |
-| Persisted signal episodes | Supabase `flow_episodes` table |
-| All raw ticks (persisted) | Supabase `flow_events` table |
-| Signal history (paginated) | `GET /api/signals/history?page=1&min_score=0.65` |
-| Simulation results | Supabase `simulation_results` table |
-| WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
+| Persisted flow episodes | Supabase `flow_episodes` (82k+ rows) |
+| Signal history (paginated) | `GET /api/signals/history?limit=50&min_conviction=0.65` |
 | Paginated signals list | `GET /api/signals/list?page=1&min_conviction=0.65` |
+| WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
+| Swarm agent reasoning | `signal_history.swarm_agents` JSONB column |
 
 ---
 
-## ID Generation Contract
+## Known Issues / Phase 6 TODO
 
-> **Rule:** Neither `flow_events` nor `flow_episodes` nor `signal_history` rows are sent with an `id` field.
-> Postgres generates IDs server-side. Sending a client-generated `id` causes a 400 / schema mismatch error.
-
----
-
-## Environment Variables Required
-
-| Variable | Used by | Required |
-|----------|---------|----------|
-| `TRADIER_API_KEY` | tradier_stream.py | Yes (live mode) |
-| `TRADIER_BASE_URL` | tradier_stream.py | Yes |
-| `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
-| `SUPABASE_URL` | flow_store.py, signal_store.py, universe_store.py | Yes |
-| `SUPABASE_SERVICE_ROLE_KEY` | flow_store.py, signal_store.py | **Yes — service role key, not anon key** |
-| `SUPABASE_KEY` | universe_store.py | Yes (anon key for reads) |
-| `SECRET_KEY` | auth.py | Yes |
-| `ALGORITHM` | auth.py | Yes (default: HS256) |
-
----
-
-## Known Issues / TODO
-
-- `routers/flow.py` (`GET /api/flow/scan`) returns **mock data** — needs to be wired to `flow_events` table query
-- `/api/signals/list` tier filter is pass-through (mock data) — wire to live accumulator query in Phase 5
+- `stream_manager.py` + `stream_worker.py` — confirm wired into main stream loop
+- `symbol_registry.py` — confirm integrated into flow pipeline (Layer 1 hookup)
+- `signals/midcap_screener.py` — confirm integrated into signal pipeline
+- Wire `TradeExecutor` into simulation router for live paper trade execution
+- Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
+- WebSocket fan-out benchmark with 50+ subscribers
+- Redis integration (`REDIS_URL` in config but unused — candidate for WS pub/sub at scale)
