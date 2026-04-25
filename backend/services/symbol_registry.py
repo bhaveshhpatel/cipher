@@ -5,15 +5,22 @@ Builds and maintains a mapping of ALL active OCC option contract symbols
 to their metadata (ticker, strike, expiry, contract_type, DTE).
 
 Config (C-019):
-  All filter constants are now read from the `ingestion_config` Supabase
-  table via services.ingestion_config.get_config() on every build/refresh.
-  Knobs (MAX_DTE, ATM_RANGE_PCT, MIN_OI, REFRESH_MINS, etc.) can be changed
-  from the admin UI without restarting the service.
-  A 60-second TTL cache in ingestion_config.py prevents DB hammering.
+  All filter constants are read from the `ingestion_config` Supabase table
+  via services.ingestion_config.get_config() on every build/refresh.
+  Knobs (MIN_OI, REFRESH_MINS, etc.) can be changed from the admin UI
+  without restarting the service.
+
+Feature 4A — Per-tier ATM range + max DTE:
+  ATM_RANGE_PCT and MAX_DTE are no longer flat globals. On each build,
+  tier_engine fetches the active tier_thresholds row from DB and assembles
+  a per-tier filter dict. Each ticker is built with the ATM/DTE params
+  matching its tier (T1/T2/T3). REGISTRY_ATM_RANGE_PCT and REGISTRY_MAX_DTE
+  in ingestion_config are kept as the T3 / fallback defaults for symbols
+  whose tier is unknown.
 """
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
 
@@ -31,6 +38,44 @@ class ContractMeta:
     contract_type: str    # CALL | PUT
     dte:           int
     open_interest: int
+    tier:          int = 3   # 4A: tier of the underlying symbol (1 | 2 | 3)
+
+
+# ---------------------------------------------------------------------------
+# Per-tier filter params (assembled at build time from tier_thresholds)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TierParams:
+    atm_pct: float
+    max_dte: int
+    min_oi:  int
+
+
+def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParams]:
+    """
+    Convert a tier_thresholds dict (from tier_engine._fetch_thresholds)
+    into a {tier -> _TierParams} map used by _build_ticker.
+    global_min_oi is the REGISTRY_MIN_OI value from ingestion_config
+    (applies as a floor across all tiers).
+    """
+    return {
+        1: _TierParams(
+            atm_pct = float(thresh.get("t1_atm_pct", 0.20)),
+            max_dte = int(thresh.get("t1_max_dte",   90)),
+            min_oi  = max(global_min_oi, int(thresh.get("t1_min_oi", 0))),
+        ),
+        2: _TierParams(
+            atm_pct = float(thresh.get("t2_atm_pct", 0.15)),
+            max_dte = int(thresh.get("t2_max_dte",   60)),
+            min_oi  = max(global_min_oi, int(thresh.get("t2_min_oi", 0))),
+        ),
+        3: _TierParams(
+            atm_pct = float(thresh.get("t3_atm_pct", 0.10)),
+            max_dte = int(thresh.get("t3_max_dte",   30)),
+            min_oi  = max(global_min_oi, int(thresh.get("t3_min_oi", 0))),
+        ),
+    }
 
 
 class SymbolRegistry:
@@ -39,18 +84,25 @@ class SymbolRegistry:
     Rebuilt on a schedule; safe for concurrent reads during rebuild
     (atomic swap of the internal dict on completion).
 
-    All filter thresholds are read from ingestion_config DB table on
-    every build so admin UI changes take effect without restart.
+    All filter thresholds are read from ingestion_config + tier_thresholds
+    DB tables on every build so admin UI changes take effect without restart.
     """
 
-    def __init__(self, watchlist: Optional[list[str]] = None):
-        # 4A: watchlist is now always passed explicitly by the caller.
-        # No longer falls back to the removed priority_symbols config.
-        self._watchlist: list[str] = watchlist or []
-        self._registry: dict[str, ContractMeta] = {}
-        self._stock_prices: dict[str, float] = {}
-        self._last_build: Optional[datetime] = None
+    def __init__(
+        self,
+        watchlist: Optional[list[str]] = None,
+        tier_map:  Optional[dict[str, int]] = None,
+    ):
+        self._watchlist: list[str]      = watchlist or []
+        self._tier_map:  dict[str, int] = tier_map  or {}
+        self._registry:  dict[str, ContractMeta] = {}
+        self._stock_prices: dict[str, float]     = {}
+        self._last_build: Optional[datetime]     = None
         self._build_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Public read API
+    # ------------------------------------------------------------------
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -67,50 +119,79 @@ class SymbolRegistry:
     def is_ready(self) -> bool:
         return len(self._registry) > 0
 
+    def set_tier_map(self, tier_map: dict[str, int]) -> None:
+        """Hot-swap the tier map without rebuilding the registry."""
+        self._tier_map = tier_map
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
     async def build(self) -> int:
         """
-        Full registry build. Reads live config from DB, then:
-        fetches stock prices -> expirations -> chains.
+        Full registry build. Reads live config + tier thresholds from DB, then:
+        fetches stock prices -> expirations -> chains per ticker.
         Returns count of OCC symbols loaded.
         """
         from services.ingestion_config import get_config
-        cfg = await get_config()
+        from services.tier_engine import _fetch_thresholds
+
+        cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
+        tier_params  = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
 
         async with self._build_lock:
             log.info(
-                f"[symbol_registry] Building OCC registry for {len(self._watchlist)} tickers "
-                f"[max_dte={cfg['REGISTRY_MAX_DTE']}, atm_range=+/-{cfg['REGISTRY_ATM_RANGE_PCT']:.0%}, "
-                f"min_oi={cfg['REGISTRY_MIN_OI']}]"
+                "[symbol_registry] Building OCC registry for %d tickers "
+                "[T1: atm=+/-%.0f%% dte=%d | T2: atm=+/-%.0f%% dte=%d | T3: atm=+/-%.0f%% dte=%d | min_oi=%d]",
+                len(self._watchlist),
+                tier_params[1].atm_pct * 100, tier_params[1].max_dte,
+                tier_params[2].atm_pct * 100, tier_params[2].max_dte,
+                tier_params[3].atm_pct * 100, tier_params[3].max_dte,
+                cfg["REGISTRY_MIN_OI"],
             )
             new_registry: dict[str, ContractMeta] = {}
 
             prices = await self._fetch_stock_prices()
             self._stock_prices = prices
-            log.info(f"[symbol_registry] Stock prices fetched: {len(prices)} tickers")
+            log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
             tasks = [
-                self._build_ticker(ticker, prices.get(ticker, 0.0), new_registry, cfg)
+                self._build_ticker(
+                    ticker,
+                    prices.get(ticker, 0.0),
+                    new_registry,
+                    tier_params,
+                )
                 for ticker in self._watchlist
                 if ticker in prices and prices[ticker] > 0
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            old_count = len(self._registry)
-            self._registry = new_registry
+            old_count        = len(self._registry)
+            self._registry   = new_registry
             self._last_build = datetime.utcnow()
 
-            added = len(new_registry) - old_count
+            # Log tier breakdown of loaded contracts
+            t_counts = {1: 0, 2: 0, 3: 0}
+            for m in new_registry.values():
+                t_counts[m.tier] = t_counts.get(m.tier, 0) + 1
             log.info(
-                f"[symbol_registry] Build complete: {len(new_registry):,} OCC symbols "
-                f"(was {old_count:,}, delta={added:+,})"
+                "[symbol_registry] Build complete: %d OCC symbols "
+                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d)",
+                len(new_registry),
+                t_counts[1], t_counts[2], t_counts[3],
+                old_count, len(new_registry) - old_count,
             )
             return len(new_registry)
+
+    # ------------------------------------------------------------------
+    # Refresh loop
+    # ------------------------------------------------------------------
 
     async def refresh_loop(self):
         """
         Background task — rebuilds registry on schedule.
-        Refresh interval is read from DB config on every cycle so changes
-        to REGISTRY_REFRESH_MINS take effect without restart.
+        Refresh interval is read from DB config on every cycle.
         """
         while True:
             from services.ingestion_config import get_config
@@ -128,11 +209,15 @@ class SymbolRegistry:
             )
             await asyncio.sleep(interval_mins * 60)
 
-            log.info(f"[symbol_registry] Scheduled refresh (interval={interval_mins}min)")
+            log.info("[symbol_registry] Scheduled refresh (interval=%dmin)", interval_mins)
             try:
                 await self.build()
             except Exception as e:
-                log.error(f"[symbol_registry] Refresh failed (non-fatal): {e}")
+                log.error("[symbol_registry] Refresh failed (non-fatal): %s", e)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     async def _fetch_stock_prices(self) -> dict[str, float]:
         prices: dict[str, float] = {}
@@ -156,33 +241,32 @@ class SymbolRegistry:
 
     async def _build_ticker(
         self,
-        ticker: str,
+        ticker:      str,
         stock_price: float,
-        registry: dict[str, ContractMeta],
-        cfg: dict,
+        registry:    dict[str, ContractMeta],
+        tier_params: dict[int, _TierParams],
     ):
         """
         Fetch expirations + chains for one ticker and populate registry.
-        Uses config snapshot passed in from build() so all tickers in one
-        build cycle use the same consistent config values.
+        Uses the symbol's tier from self._tier_map to select per-tier
+        ATM range and max DTE. Unknown-tier symbols fall back to T3 params.
         """
         if stock_price <= 0:
-            log.warning(f"[symbol_registry] {ticker}: no stock price — skipping")
+            log.warning("[symbol_registry] %s: no stock price — skipping", ticker)
             return
 
-        max_dte       = cfg["REGISTRY_MAX_DTE"]
-        atm_range_pct = cfg["REGISTRY_ATM_RANGE_PCT"]
-        min_oi        = cfg["REGISTRY_MIN_OI"]
+        tier   = self._tier_map.get(ticker, 3)
+        params = tier_params.get(tier) or tier_params[3]
 
         try:
             expirations = await get_expirations(ticker)
         except Exception as e:
-            log.warning(f"[symbol_registry] {ticker}: expirations fetch failed: {e}")
+            log.warning("[symbol_registry] %s: expirations fetch failed: %s", ticker, e)
             return
 
         today    = date.today()
-        atm_low  = stock_price * (1 - atm_range_pct)
-        atm_high = stock_price * (1 + atm_range_pct)
+        atm_low  = stock_price * (1 - params.atm_pct)
+        atm_high = stock_price * (1 + params.atm_pct)
 
         for expiry_str in expirations:
             try:
@@ -190,13 +274,16 @@ class SymbolRegistry:
             except ValueError:
                 continue
             dte = (exp_date - today).days
-            if dte < 0 or dte > max_dte:
+            if dte < 0 or dte > params.max_dte:
                 continue
 
             try:
                 contracts = await get_option_chain(ticker, expiry_str)
             except Exception as e:
-                log.warning(f"[symbol_registry] {ticker} {expiry_str}: chain fetch failed: {e}")
+                log.warning(
+                    "[symbol_registry] %s %s: chain fetch failed: %s",
+                    ticker, expiry_str, e,
+                )
                 continue
 
             for contract in contracts:
@@ -207,7 +294,7 @@ class SymbolRegistry:
                     if not (atm_low <= strike <= atm_high):
                         continue
                     oi = int(contract.get("open_interest", 0) or 0)
-                    if oi < min_oi:
+                    if oi < params.min_oi:
                         continue
 
                     occ_symbol = contract.get("symbol", "").strip()
@@ -224,13 +311,21 @@ class SymbolRegistry:
                         contract_type = ctype,
                         dte           = dte,
                         open_interest = oi,
+                        tier          = tier,
                     )
                 except Exception:
                     continue
 
         ticker_count = sum(1 for m in registry.values() if m.ticker == ticker)
-        log.debug(f"[symbol_registry] {ticker}: {ticker_count} contracts loaded (price=${stock_price:.2f})")
+        log.debug(
+            "[symbol_registry] %s (T%d): %d contracts loaded (price=$%.2f, atm=+/-%.0f%%, dte<=%d)",
+            ticker, tier, ticker_count, stock_price, params.atm_pct * 100, params.max_dte,
+        )
 
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
 
 _registry: Optional[SymbolRegistry] = None
 
@@ -239,7 +334,10 @@ def get_registry() -> Optional[SymbolRegistry]:
     return _registry
 
 
-def init_registry(watchlist: list[str]) -> SymbolRegistry:
+def init_registry(
+    watchlist: list[str],
+    tier_map:  Optional[dict[str, int]] = None,
+) -> SymbolRegistry:
     global _registry
-    _registry = SymbolRegistry(watchlist=watchlist)
+    _registry = SymbolRegistry(watchlist=watchlist, tier_map=tier_map or {})
     return _registry
