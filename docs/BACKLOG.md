@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-25 (Feature 4A — tier engine + admin tier endpoints)  
+> Last updated: 2026-04-25 (B-019 + B-020 admin tier endpoints — complete)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -25,8 +25,6 @@
 | B-016 | Wire midcap screener into signal pipeline | 🔲 Todo | `signals/midcap_screener.py` exists but not confirmed in signal path. |
 | B-017 | Load test signals endpoints (50 concurrent users) | 🔲 Todo | Benchmark `/api/signals/list` and `/api/signals/history` under load. |
 | B-018 | WebSocket fan-out benchmark (50+ subscribers) | 🔲 Todo | Test `ws.py` throughput with many simultaneous clients. |
-| B-019 | `PATCH /admin/tier-thresholds` endpoint | 🔲 Todo | Admin endpoint to update the active `tier_thresholds` row. Protected by admin whitelist. |
-| B-020 | `GET /admin/tier-distribution` endpoint | 🔲 Todo | Admin endpoint returning count of Tier 1/2/3 symbols in latest universe snapshot. |
 
 ---
 
@@ -34,6 +32,8 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
+| B-019 | Admin tier-thresholds UI + endpoints | 2026-04-25 | `GET /api/admin/tier-thresholds` (returns active row + cache metadata) + `PATCH /api/admin/tier-thresholds` (updates columns, busts in-process cache). `TierThresholdsCard` in admin page — per-field save, T1/T2/T3 grouped, dirty state, cache badge, last-updated footer. Migration 012 (RLS + updated_at trigger). Tests ADM-05 + ADM-06. |
+| B-020 | `GET /admin/tier-distribution` endpoint | 2026-04-25 | Returns `{ snapshot_id, total, tiers: { "1": {count, samples}, "2": ..., "3": ... } }` from active universe snapshot. Shipped in same commit as B-019. |
 | C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json. |
 | C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: ReadableStream body bug, Next.js 15 async params, TS strict mode. |
 | C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. |
@@ -71,6 +71,8 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-25 | Closed B-019 — Admin tier-thresholds: GET read endpoint, PATCH update, TierThresholdsCard UI, migration 012, tests ADM-05/06. |
+| 2026-04-25 | Closed B-020 — GET /admin/tier-distribution endpoint shipped in same commit as B-019. |
 | 2026-04-25 | Added C-020 — Feature 4A tier engine complete. Added B-019, B-020 admin tier endpoints to active backlog. |
 | 2026-04-24 | Added C-019 — Layer 4 dedup TTL overhaul (5 bugs). |
 | 2026-04-24 | Added C-016, C-017, C-018 — 6-layer gap-fix audit. Layer 4 dedup wired, Layer 2 refresh notify hooked, Layer 5 flush corrected to 500ms/100-row. |
@@ -81,7 +83,6 @@
 | 2026-04-23 | Added B-013 — wire signals/list tier filter to live data |
 | 2026-04-23 | Added C-007 — Phase 3 composite score v2 + signals list endpoint |
 | 2026-04-23 | Added C-006 — flow_store fix: wrong table, id field, f-string logs, 8 tests |
-| 2026-04-23 | Closed B-010 → Dropped (superseded by C-006 + C-008) |
 | 2026-04-23 | Added B-012 — wire flow scan endpoint to live flow_episodes table |
 | 2026-04-23 | Added C-005 — Tradier market-hours guard + session_ticks backoff fix |
 | 2026-04-23 | Added C-004 options universe persistence — 30 tests |
