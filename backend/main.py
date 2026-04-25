@@ -15,6 +15,7 @@ from routers import auth, flow, simulation, ws, smart_signals
 from routers.smart_signals import stream_stats
 from routers import history
 from routers import admin
+from routers import health          # B-008: stream health router
 from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
@@ -277,13 +278,14 @@ app.include_router(ws.router)
 app.include_router(smart_signals.router)
 app.include_router(history.router)       # Phase 4: signal history endpoint
 app.include_router(admin.router)         # Phase 5B: admin demo toggle
+app.include_router(health.router)        # B-008: stream health
 
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
 
 @app.get("/health", tags=["health"])
-async def health():
+async def health_root():
     return JSONResponse({"status": "ok", "service": "cipher-api"})
 
 @app.get("/", tags=["health"])

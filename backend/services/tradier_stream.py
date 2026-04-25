@@ -66,6 +66,12 @@ Fix (C-019) — Dedup TTL & Sweep Overhaul (Layer 4):
   - _stats now includes "deduped" counter exposed via /health endpoint.
   - DedupCache.dedup_stats() merged into get_stats() for full observability.
 
+B-008 — Stream Health:
+  - _stats gains last_tick_at (float epoch, updated on every classified tick)
+    and last_reconnect_at (float epoch, updated on every reconnect attempt).
+  - _stream_start_at records process start time for uptime_seconds calculation.
+  - get_stats() exposes all counters + timestamps for GET /health/stream.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -124,17 +130,22 @@ _MARKET_CLOSE = time(16, 0)
 _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
-# Global stats (read by /health endpoint)
+# Global stats (read by /health/stream endpoint)
+# B-008: added last_tick_at, last_reconnect_at; _stream_start_at for uptime
 # ---------------------------------------------------------------------------
+_stream_start_at: float = _time.time()
+
 _stats = {
-    "active_symbols": 0,
-    "ticks":          0,
-    "classified":     0,
-    "deduped":        0,   # C-019: events dropped by dedup cache
-    "signals":        0,
-    "errors":         0,
-    "reconnects":     0,
-    "mode":           "starting",
+    "active_symbols":    0,
+    "ticks":             0,
+    "classified":        0,
+    "deduped":           0,   # C-019: events dropped by dedup cache
+    "signals":           0,
+    "errors":            0,
+    "reconnects":        0,
+    "mode":              "starting",
+    "last_tick_at":      None,       # B-008: epoch float, set on each classified tick
+    "last_reconnect_at": None,       # B-008: epoch float, set on each reconnect attempt
 }
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
@@ -142,6 +153,7 @@ accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium
 
 def get_stats() -> dict:
     stats = dict(_stats)
+    stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)  # B-008
     stats.update(flow_dedup.dedup_stats())  # C-019: merge dedup counters
     return stats
 
@@ -317,6 +329,10 @@ async def _process_trade(raw: dict):
       the canonical CBOE print are silently dropped. If 3+ distinct exchanges
       report the same trade within 8s, trade_type is upgraded to SWEEP and
       exchange_count is set to the real unique-exchange count.
+
+    B-008:
+      last_tick_at is updated on every classified (non-deduped) tick so
+      /health/stream can report stream liveness.
     """
     _stats["ticks"] += 1
 
@@ -340,10 +356,6 @@ async def _process_trade(raw: dict):
 
     # ------------------------------------------------------------------
     # Layer 4: Deduplication (C-019)
-    # Drop events that are duplicates of a trade already seen within 5s.
-    # "exch" = real Tradier field; "exchange" = demo engine field.
-    # Use monotonic arrival time so Tradier late-delivery batches are
-    # correctly identified as duplicates even if their timestamps differ.
     # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
@@ -376,6 +388,7 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
 
     _stats["classified"] += 1
+    _stats["last_tick_at"] = _time.time()   # B-008: record wall-clock time of last classified tick
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
@@ -537,6 +550,7 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["ticks"]      += 1
             _stats["classified"] += 1
             _stats["signals"]    += 1
+            _stats["last_tick_at"] = _time.time()  # B-008
             await bus.publish_all(signal)
 
             composite_score = round(rng.uniform(0.40, 0.95), 3)
