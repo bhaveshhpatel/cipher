@@ -4,6 +4,48 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## T-001 — Unit Test Suite: OCC Parser, Bid/Ask Classifier, Repetition Engine
+
+**Date:** 2026-04-25
+**Type:** Test coverage
+**Files added:**
+- `backend/tests/test_occ_parser.py` (40 tests)
+- `backend/tests/test_classifier.py` (24 tests)
+- `backend/tests/test_repetition_engine.py` (22 tests)
+
+### Coverage Added
+
+**`test_occ_parser.py`** — `parsers/options_flow_parser.py`
+- `_parse_occ_symbol`: CALL/PUT/SPXW parse, whitespace padding, invalid symbol, invalid date (month 13), empty string, strike÷1000 precision
+- `_calc_dte`: future date, empty string→0, past date clamped to 0, unparseable string→0
+- `_parse_timestamp`: epoch ms, ISO string, None fallback, garbage string fallback
+- `parse_tradier_trade` (full path): `last` field primary / `price` fallback / bid-ask mid fallback (C-015); OCC-derived ticker when `underlying` absent (C-010); OCC-derived strike/expiry/ctype when stream fields missing (C-011); DTE auto-calc (C-011); `is_synthetic_quote=True` when bid=ask=0 (C-018); `is_synthetic_quote=False` with real NBBO; premium formula; `size=0`→None; malformed payload→None (no exception); all 4 influence tiers (WHALE/INSTITUTIONAL/LARGE/RETAIL); conviction score in [0,1]; golden sweep flag; registry enrichment override; registry failure non-fatal
+
+**`test_classifier.py`** — `parsers/bid_ask_classifier.py` + `parsers/trade_type_detector.py`
+- `classify_bid_ask`: ABOVE_ASK, AT_ASK, AT_BID, BELOW_BID, MID, crossed market→MID, all zeros→MID, exact midpoint
+- `is_aggressive`: ABOVE_ASK/AT_ASK→True; MID/AT_BID/BELOW_BID/unknown→False
+- `detect_trade_type`: SWEEP (exchange_count≥3), SPLIT (fill_count≥3), BLOCK (size≥50 + premium≥500k), SINGLE (fallback); SWEEP beats BLOCK; SPLIT≠SWEEP
+- `is_golden_sweep`: True (SWEEP + ≥1M + aggressive); False for low premium, wrong type, not aggressive
+
+**`test_repetition_engine.py`** — `signals/repetition_accumulator.py`
+- `RepetitionEpisode`: trade_count, total_premium, is_accelerating True/False/too few events, summary_str fields
+- `RepetitionAccumulator.ingest`: below min_trades→None, below min_premium→None, both thresholds met→episode, rolling window prune, cross-contract isolation, accumulation across calls, episode returned on every qualifying call
+- `RepetitionAccumulator.get_alert_level`: CONVICTION (≥5M), CONVICTION (accelerating + ≥1M), STRONG_SIGNAL (≥1M non-accelerating), ALERT (≥250k), WATCH (<250k)
+- Init: default window=30min, min_trades=3, min_premium=50k; custom params respected
+
+### Running Total
+
+| File | Tests |
+|------|-------|
+| `test_occ_parser.py` | 40 |
+| `test_classifier.py` | 24 |
+| `test_repetition_engine.py` | 22 |
+| **T-001 subtotal** | **86** |
+| Prior tests (auth, stream, universe, flow store, signal) | ~164 |
+| **Grand total** | **~250** |
+
+---
+
 ## C-020 — Feature 4A: Tier Engine + Universe Tier Assignment
 
 **Date:** 2026-04-25

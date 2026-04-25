@@ -1,6 +1,6 @@
 # Cipher — Regression & Test Plan
 
-> Last updated: 2026-04-23
+> Last updated: 2026-04-25
 
 ---
 
@@ -13,6 +13,104 @@
 | POST /auth/login — success 200 + JWT | `tests/test_auth.py` | ✅ |
 | GET /auth/me — authenticated | `tests/test_auth.py` | ✅ |
 | GET /auth/me — unauthenticated 401 | `tests/test_auth.py` | ✅ |
+
+### OCC Parser — options_flow_parser.py (T-001)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| OP-1 | Standard CALL symbol parsed correctly | `test_parse_occ_call` | `tests/test_occ_parser.py` |
+| OP-2 | Standard PUT symbol parsed correctly | `test_parse_occ_put` | `tests/test_occ_parser.py` |
+| OP-3 | Long ticker (SPXW) parsed correctly | `test_parse_occ_long_ticker` | `tests/test_occ_parser.py` |
+| OP-4 | Whitespace padding handled | `test_parse_occ_whitespace_padding` | `tests/test_occ_parser.py` |
+| OP-5 | Invalid symbol returns None tuple | `test_parse_occ_invalid_symbol` | `tests/test_occ_parser.py` |
+| OP-6 | Invalid date (month 13) returns None tuple | `test_parse_occ_invalid_date` | `tests/test_occ_parser.py` |
+| OP-7 | Empty string returns None tuple | `test_parse_occ_empty_string` | `tests/test_occ_parser.py` |
+| OP-8 | Strike correctly divided by 1000 | `test_parse_occ_strike_divided_by_1000` | `tests/test_occ_parser.py` |
+| OP-9 | Future expiry returns positive DTE | `test_calc_dte_future` | `tests/test_occ_parser.py` |
+| OP-10 | Empty expiry returns 0 DTE | `test_calc_dte_empty_string` | `tests/test_occ_parser.py` |
+| OP-11 | Past expiry clamped to 0 | `test_calc_dte_past_clamped_to_zero` | `tests/test_occ_parser.py` |
+| OP-12 | Unparseable expiry returns 0 | `test_calc_dte_unparseable` | `tests/test_occ_parser.py` |
+| OP-13 | Epoch ms timestamp parsed correctly | `test_parse_timestamp_epoch_ms` | `tests/test_occ_parser.py` |
+| OP-14 | ISO string timestamp parsed correctly | `test_parse_timestamp_iso_string` | `tests/test_occ_parser.py` |
+| OP-15 | None timestamp falls back to utcnow | `test_parse_timestamp_none_returns_datetime` | `tests/test_occ_parser.py` |
+| OP-16 | Garbage timestamp falls back to utcnow | `test_parse_timestamp_garbage_returns_datetime` | `tests/test_occ_parser.py` |
+| OP-17 | CALL trade with all fields returns valid event | `test_parse_call_returns_event` | `tests/test_occ_parser.py` |
+| OP-18 | PUT trade returns BEARISH sentiment | `test_parse_put_bearish_sentiment` | `tests/test_occ_parser.py` |
+| OP-19 | CALL trade returns BULLISH sentiment | `test_parse_call_bullish_sentiment` | `tests/test_occ_parser.py` |
+| OP-20 | `last` field used as primary fill (C-015) | `test_parse_last_field_primary_fill` | `tests/test_occ_parser.py` |
+| OP-21 | `price` field used as fallback fill | `test_parse_price_field_fallback_fill` | `tests/test_occ_parser.py` |
+| OP-22 | bid+ask mid used when last and price absent | `test_parse_mid_fill_when_no_last_or_price` | `tests/test_occ_parser.py` |
+| OP-23 | Ticker from OCC prefix when `underlying` absent (C-010) | `test_parse_ticker_from_occ_when_no_underlying` | `tests/test_occ_parser.py` |
+| OP-24 | Strike from OCC when stream field is 0 (C-011) | `test_parse_strike_from_occ_when_stream_zero` | `tests/test_occ_parser.py` |
+| OP-25 | Expiry from OCC when stream field absent | `test_parse_expiry_from_occ_when_stream_absent` | `tests/test_occ_parser.py` |
+| OP-26 | contract_type from OCC when option_type absent | `test_parse_contract_type_from_occ_when_option_type_absent` | `tests/test_occ_parser.py` |
+| OP-27 | DTE auto-calculated when dte field is 0 (C-011) | `test_parse_dte_auto_calculated` | `tests/test_occ_parser.py` |
+| OP-28 | `is_synthetic_quote=True` when bid=ask=0, fill>0 (C-018) | `test_parse_is_synthetic_quote_true_when_bid_ask_zero` | `tests/test_occ_parser.py` |
+| OP-29 | `is_synthetic_quote=False` with real bid/ask | `test_parse_is_synthetic_quote_false_when_real_bid_ask` | `tests/test_occ_parser.py` |
+| OP-30 | premium = fill × size × 100 | `test_parse_premium_formula` | `tests/test_occ_parser.py` |
+| OP-31 | size=0 returns None | `test_parse_size_zero_returns_none` | `tests/test_occ_parser.py` |
+| OP-32 | Malformed payload returns None (no exception) | `test_parse_malformed_payload_returns_none` | `tests/test_occ_parser.py` |
+| OP-33 | influence_tier WHALE for premium ≥ 2M | `test_parse_influence_tier_whale` | `tests/test_occ_parser.py` |
+| OP-34 | influence_tier INSTITUTIONAL for 500k–2M | `test_parse_influence_tier_institutional` | `tests/test_occ_parser.py` |
+| OP-35 | influence_tier LARGE for 100k–500k | `test_parse_influence_tier_large` | `tests/test_occ_parser.py` |
+| OP-36 | influence_tier RETAIL below 100k | `test_parse_influence_tier_retail` | `tests/test_occ_parser.py` |
+| OP-37 | conviction_score in [0, 1] | `test_parse_conviction_score_in_range` | `tests/test_occ_parser.py` |
+| OP-38 | is_golden_sweep is bool | `test_parse_is_golden_sweep_true` | `tests/test_occ_parser.py` |
+| OP-39 | Registry enrichment overrides ticker/strike | `test_parse_registry_enrichment_overrides_fields` | `tests/test_occ_parser.py` |
+| OP-40 | Registry failure is non-fatal | `test_parse_registry_failure_non_fatal` | `tests/test_occ_parser.py` |
+
+### Bid/Ask Classifier + Trade Type Detector (T-001)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| CL-1 | fill > ask → ABOVE_ASK | `test_classify_above_ask` | `tests/test_classifier.py` |
+| CL-2 | fill == ask → AT_ASK | `test_classify_at_ask` | `tests/test_classifier.py` |
+| CL-3 | fill == bid → AT_BID | `test_classify_at_bid` | `tests/test_classifier.py` |
+| CL-4 | fill < bid → BELOW_BID | `test_classify_below_bid` | `tests/test_classifier.py` |
+| CL-5 | fill between bid/ask → MID | `test_classify_mid` | `tests/test_classifier.py` |
+| CL-6 | Crossed market (bid > ask) → MID fallback | `test_classify_crossed_market_mid_fallback` | `tests/test_classifier.py` |
+| CL-7 | All zeros → MID fallback | `test_classify_all_zeros_mid_fallback` | `tests/test_classifier.py` |
+| CL-8 | Exact midpoint → MID | `test_classify_exact_midpoint` | `tests/test_classifier.py` |
+| CL-9 | ABOVE_ASK → is_aggressive True | `test_is_aggressive_above_ask` | `tests/test_classifier.py` |
+| CL-10 | AT_ASK → is_aggressive True | `test_is_aggressive_at_ask` | `tests/test_classifier.py` |
+| CL-11 | MID → is_aggressive False | `test_is_aggressive_mid_false` | `tests/test_classifier.py` |
+| CL-12 | AT_BID → is_aggressive False | `test_is_aggressive_at_bid_false` | `tests/test_classifier.py` |
+| CL-13 | BELOW_BID → is_aggressive False | `test_is_aggressive_below_bid_false` | `tests/test_classifier.py` |
+| CL-14 | Unknown class → is_aggressive False | `test_is_aggressive_unknown_false` | `tests/test_classifier.py` |
+| CL-15 | exchange_count ≥ 3 → SWEEP | `test_detect_sweep_exchange_count` | `tests/test_classifier.py` |
+| CL-16 | fill_count ≥ 3 → SPLIT | `test_detect_split_fill_count` | `tests/test_classifier.py` |
+| CL-17 | premium ≥ 500k + size ≥ 50 → BLOCK | `test_detect_block` | `tests/test_classifier.py` |
+| CL-18 | Fallback → SINGLE | `test_detect_single_fallback` | `tests/test_classifier.py` |
+| CL-19 | SWEEP beats BLOCK when exchange_count ≥ 3 | `test_detect_sweep_over_block` | `tests/test_classifier.py` |
+| CL-20 | SPLIT ≠ SWEEP (single exchange) | `test_detect_split_not_sweep_single_exchange` | `tests/test_classifier.py` |
+| CL-21 | SWEEP + ≥1M + aggressive → golden sweep True | `test_is_golden_sweep_true` | `tests/test_classifier.py` |
+| CL-22 | SWEEP + <1M → golden sweep False | `test_is_golden_sweep_false_low_premium` | `tests/test_classifier.py` |
+| CL-23 | BLOCK + ≥1M + aggressive → golden sweep False | `test_is_golden_sweep_false_wrong_type` | `tests/test_classifier.py` |
+| CL-24 | SWEEP + ≥1M + not aggressive → golden sweep False | `test_is_golden_sweep_false_not_aggressive` | `tests/test_classifier.py` |
+
+### Repetition Accumulator (T-001)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| RA-1 | trade_count equals event list length | `test_episode_trade_count` | `tests/test_repetition_engine.py` |
+| RA-2 | total_premium sums all events | `test_episode_total_premium` | `tests/test_repetition_engine.py` |
+| RA-3 | is_accelerating True — last 3 within 60s | `test_episode_is_accelerating_true` | `tests/test_repetition_engine.py` |
+| RA-4 | is_accelerating False — span > 60s | `test_episode_is_accelerating_false_long_span` | `tests/test_repetition_engine.py` |
+| RA-5 | is_accelerating False — fewer than 3 events | `test_episode_is_accelerating_false_too_few_events` | `tests/test_repetition_engine.py` |
+| RA-6 | summary_str contains contract_type, strike, expiry | `test_episode_summary_str_contains_key_fields` | `tests/test_repetition_engine.py` |
+| RA-7 | ingest returns None below min_trades | `test_ingest_returns_none_below_min_trades` | `tests/test_repetition_engine.py` |
+| RA-8 | ingest returns None below min_premium | `test_ingest_returns_none_below_min_premium` | `tests/test_repetition_engine.py` |
+| RA-9 | ingest returns episode when both thresholds met | `test_ingest_returns_episode_when_thresholds_met` | `tests/test_repetition_engine.py` |
+| RA-10 | Rolling window prunes stale events | `test_ingest_prunes_stale_events` | `tests/test_repetition_engine.py` |
+| RA-11 | Different contracts keyed independently | `test_ingest_different_contracts_independent` | `tests/test_repetition_engine.py` |
+| RA-12 | Same contract accumulates across calls | `test_ingest_accumulates_across_calls` | `tests/test_repetition_engine.py` |
+| RA-13 | Episode returned on every qualifying call | `test_ingest_returns_episode_on_every_qualifying_call` | `tests/test_repetition_engine.py` |
+| RA-14 | premium ≥ 5M → CONVICTION | `test_alert_level_conviction_high_premium` | `tests/test_repetition_engine.py` |
+| RA-15 | accelerating + premium ≥ 1M → CONVICTION | `test_alert_level_conviction_accelerating` | `tests/test_repetition_engine.py` |
+| RA-16 | premium ≥ 1M (not accelerating) → STRONG_SIGNAL | `test_alert_level_strong_signal` | `tests/test_repetition_engine.py` |
+| RA-17 | premium ≥ 250k → ALERT | `test_alert_level_alert` | `tests/test_repetition_engine.py` |
+| RA-18 | premium < 250k → WATCH | `test_alert_level_watch` | `tests/test_repetition_engine.py` |
+| RA-19 | Default window is 30 minutes | `test_default_window_30_minutes` | `tests/test_repetition_engine.py` |
+| RA-20 | Default min_trades is 3 | `test_default_min_trades_3` | `tests/test_repetition_engine.py` |
+| RA-21 | Default min_premium is 50k | `test_default_min_premium_50k` | `tests/test_repetition_engine.py` |
+| RA-22 | Custom params respected | `test_custom_params_respected` | `tests/test_repetition_engine.py` |
 
 ### Tradier Stream — Failure Mode Regression (F1–F9)
 | Test ID | Failure Mode | Test Name | File |
@@ -175,6 +273,9 @@ cd backend
 pip install -r requirements-dev.txt
 pytest tests/ -v
 
+# OCC parser, classifier, repetition engine (T-001)
+pytest tests/test_occ_parser.py tests/test_classifier.py tests/test_repetition_engine.py -v
+
 # Flow store tests only (DB persistence regression)
 pytest tests/test_flow_store.py -v
 
@@ -245,3 +346,18 @@ curl -X POST https://api.tradier.com/v1/markets/events/session \
 - Stream processor benchmark under 1k ticks/minute
 - Frontend render profiling for 200-signal feed cap
 - `flow_events` batch write latency under high tick volume (1k+/min)
+
+## Test Count Summary
+
+| Test File | IDs | Count |
+|-----------|-----|-------|
+| `test_occ_parser.py` | OP-1 – OP-40 | 40 |
+| `test_classifier.py` | CL-1 – CL-24 | 24 |
+| `test_repetition_engine.py` | RA-1 – RA-22 | 22 |
+| `test_tradier_stream.py` | F1–F9, MH-1–7, BF-1–3 | ~27 |
+| `test_symbols_loader.py` | SL-1–20 | ~20 |
+| `test_universe_store.py` | US-1–10 | 10 |
+| `test_flow_store.py` | FS-1–8 | 8 |
+| `test_auth.py` | — | 4 |
+| `test_flow.py`, `test_stream.py`, `test_simulation.py`, `test_ws.py` | — | ~4 |
+| **Total** | | **~259** |
