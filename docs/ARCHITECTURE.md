@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-24 (Phase 5A — post gap-fix audit)
+> Last updated: 2026-04-24 (C-019 — Layer 4 dedup TTL overhaul + sweep wiring)
 
 ---
 
@@ -52,20 +52,32 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
-│  Layer 4 — Deduplication  (utils/dedup.py)                       │
+│  Layer 4 — Deduplication  (utils/dedup.py)                 C-019 │
 │                                                                   │
-│  Live data shows a single trade reported by 4 exchanges          │
-│  (N, C, M, Q) within 200ms. Without dedup: 4 DB rows per trade. │
-│  2-second TTL cache keyed on:                                    │
-│    (occ_symbol, size, fill_price_2dp, time_bucket_2s)            │
-│  Sweep detection: 3+ exchanges within 5s window → SWEEP.        │
-│  Module-level singleton: flow_dedup                              │
+│  A single trade prints on CBOE, MIAX, PHLX, AMEX within a       │
+│  reporting window. OPRA exchange lag reality (2026):             │
+│    CBOE:  50-200ms  (fastest, canonical print)                   │
+│    MIAX:  500ms-3s  (routinely late)                             │
+│    PHLX:  2-5s      (worst-case lag on sweeps)                   │
+│    BATO:  1-4s      (common on large prints)                     │
 │                                                                   │
-│  FIX (2026-04-24): DedupCache was fully implemented but was      │
-│  never imported or called in _process_trade(). Every exchange    │
-│  copy of a trade was being written to the DB. Fixed by adding    │
-│  flow_dedup.is_duplicate() gate before persist_flow_event().     │
-│  Also wired is_sweep() upgrade: 3+ exchanges → trade_type=SWEEP.│
+│  C-019 fix (2026-04-24) — 5 bugs fixed:                         │
+│  1. TTL: 2s → 5s  — covers worst-case PHLX/MIAX lag             │
+│  2. Sweep window: 5s → 8s  — matches extended TTL               │
+│  3. Eliminated int(ts//2) bucket boundary bug: CBOE at t=1.99s  │
+│     and MIAX at t=2.01s landed in different buckets, both passed │
+│     as canonical. Pure first-seen TTL comparison replaces this.  │
+│  4. Fill key: 2dp → 1dp — absorbs ±$0.01 feed rounding across   │
+│     exchanges without conflating genuinely different fills.       │
+│  5. flow_dedup was instantiated but NEVER imported or called     │
+│     in _process_trade() — Layer 4 was completely inert in        │
+│     production. Fixed + exchange field now correctly passed      │
+│     via "exch"/"exchange" fallback so sweep detection fires.     │
+│                                                                   │
+│  Key: (occ_symbol, size, round(fill, 1))  — no time bucket      │
+│  Sweep: 3+ unique exchanges within 8s → trade_type = SWEEP      │
+│  Module-level singleton: flow_dedup (TTL=5s, sweep_win=8s)      │
+│  Observability: dedup_stats() exposed via /health endpoint       │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -96,11 +108,13 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 ## 6-Layer Gap Fixes (2026-04-24 Audit)
 
 > Three gaps were discovered during a post-implementation audit. All fixed in commit `309192f`.
+> C-019 adds five additional Layer 4 fixes applied after extended OPRA lag analysis.
 
 | Layer | File | What Was Wrong | Fix |
 |-------|------|----------------|-----|
 | **L2** | `tradier_stream.py` | `registry.refresh_loop()` rebuilt the registry every 30 min but never called `manager.refresh()`. Workers kept streaming stale OCC symbols. | Replaced with `_registry_refresh_with_manager_notify()` which calls `await manager.refresh()` after every rebuild. |
-| **L4** | `tradier_stream.py` | `DedupCache` (`utils/dedup.py`) was fully built and unit-tested, but **never imported or called** in `_process_trade()`. Every exchange copy of a trade wrote a DB row. 4 exchanges → 4× row count. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. Also wired `is_sweep()` upgrade. |
+| **L4 (orig)** | `tradier_stream.py` | `DedupCache` (`utils/dedup.py`) was fully built and unit-tested, but **never imported or called** in `_process_trade()`. Every exchange copy of a trade wrote a DB row. 4 exchanges → 4× row count. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. Also wired `is_sweep()` upgrade. |
+| **L4 (C-019)** | `utils/dedup.py` + `tradier_stream.py` | TTL=2s too tight for PHLX/MIAX lag (2–5s). `int(ts//2)` bucket boundary let MIAX duplicate at t=2.01s slip past CBOE canonical at t=1.99s. Fill key at 2dp conflated ±$0.01 feed rounding. `exchange` field never passed to `is_duplicate()` so sweep detection always saw one exchange and never fired. | TTL→5s, sweep window→8s. Pure first-seen TTL (no buckets). Fill key 1dp. `"exch"/"exchange"` fallback in `_process_trade()`. `get_exchange_count()` + `dedup_stats()` added. |
 | **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. At 62K rows/day: ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()` itself. |
 
 ---
@@ -117,12 +131,14 @@ Cipher is an institutional options flow intelligence platform. It monitors live 
 │    ├── StreamManager (Layer 2)   services/stream_manager.py    │
 │    │     └── 32 parallel Tradier connections via stream_worker  │
 │    │           ├── parse_tradier_trade()  Layer 3               │
-│    │           │     ├── fill_price: tick["last"] (not "price")│
+│    │           │     ├── fill_price: tick["last"] (not "price") │
 │    │           │     ├── size==0 guard → skip                  │
 │    │           │     └── OCC regex {1,10} + synthetic spread   │
-│    │           ├── DedupCache.is_duplicate()  Layer 4  ← FIXED │
-│    │           │     ├── 2s TTL (symbol,size,price,bucket)     │
-│    │           │     └── is_sweep() → trade_type=SWEEP upgrade │
+│    │           ├── DedupCache.is_duplicate()  Layer 4  C-019   │
+│    │           │     ├── 5s TTL (occ_symbol, size, fill_1dp)   │
+│    │           │     ├── "exch"/"exchange" fallback for exch   │
+│    │           │     ├── is_sweep() → 3+ exchanges within 8s   │
+│    │           │     └── → trade_type=SWEEP + exchange_count   │
 │    │           ├── RepetitionAccumulator                        │
 │    │           │     └── episode when ≥3 trades / ≥$50K prem  │
 │    │           ├── build_composite()                            │
@@ -186,10 +202,13 @@ Tradier SSE tick (Layer 2 — StreamManager)
        ├── OCC regex {1,10} — ticker/strike/expiry/type
        ├── synthetic spread when bid=ask=0
        └── registry enrichment → override with chain metadata
-  → DedupCache.is_duplicate()                          Layer 4  ← WIRED
-       ├── duplicate (same trade, different exchange) → DROP
+  → DedupCache.is_duplicate()                          Layer 4  C-019
+       ├── key: (occ_symbol, size, round(fill, 1))
+       ├── TTL: 5s — covers PHLX/MIAX worst-case lag
+       ├── exchange: trade_payload["exch"] or ["exchange"]
+       ├── duplicate (same trade, slower exchange) → DROP
        ├── canonical → check is_sweep()
-       └── 3+ exchanges → trade_type = SWEEP
+       └── 3+ unique exchanges within 8s → trade_type = SWEEP
   → RepetitionAccumulator.ingest()
        └── RepetitionEpisode when trades ≥ 3 AND premium ≥ $50K
   → build_composite(ep, accumulator)
@@ -257,23 +276,22 @@ Railway terminates idle TCP connections. The WS router runs a full ping/pong loo
 CREATE TABLE signal_history (
   id                    BIGSERIAL PRIMARY KEY,
   ticker                TEXT NOT NULL,
-  recommendation        TEXT NOT NULL,           -- BUY / SELL / HOLD
+  recommendation        TEXT NOT NULL,
   composite_score       NUMERIC NOT NULL,
   flow_score            NUMERIC NOT NULL,
   backtest_score        NUMERIC NOT NULL,
   volume_premium_factor NUMERIC,
   reasoning             TEXT,
-  contract_type         TEXT,                    -- CALL / PUT
-  alert_level           TEXT NOT NULL,           -- WATCH/ALERT/STRONG_SIGNAL/CONVICTION
-  sentiment             TEXT NOT NULL,           -- bullish / bearish / neutral
-  direction             TEXT NOT NULL,           -- BUY / SELL / HOLD
-  influence_tier        TEXT NOT NULL,           -- whale/institutional/large/retail
+  contract_type         TEXT,
+  alert_level           TEXT NOT NULL,
+  sentiment             TEXT NOT NULL,
+  direction             TEXT NOT NULL,
+  influence_tier        TEXT NOT NULL,
   premium               NUMERIC NOT NULL,
-  trade_type            TEXT NOT NULL,           -- SWEEP/BLOCK/SPLIT/SINGLE
+  trade_type            TEXT NOT NULL,
   is_golden_sweep       BOOLEAN NOT NULL DEFAULT false,
   total_premium         NUMERIC,
   trade_count           INT,
-  -- Phase 5A swarm fields
   swarm_direction       TEXT,
   swarm_confidence      NUMERIC,
   swarm_agents          JSONB,
@@ -398,7 +416,7 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | Paginated signals list | `GET /api/signals/list?page=1&min_conviction=0.65` |
 | WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
 | Swarm agent reasoning | `signal_history.swarm_agents` JSONB column |
-| Dedup stats (live) | `_stats["deduped"]` via `/health` or Railway logs |
+| Dedup stats (live) | `GET /health` → `dedup_duplicates`, `dedup_sweeps`, `dedup_cache_size` |
 
 ---
 
