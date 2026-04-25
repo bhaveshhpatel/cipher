@@ -29,6 +29,11 @@ ROOT CAUSE FIX (2026-04-23) C-007:
   SUPABASE_SERVICE_KEY was not set. The anon key respects RLS and causes
   42501 policy violations on every server-side INSERT/UPDATE/DELETE.
   Fix: use SUPABASE_SERVICE_KEY ONLY — raise clearly if it is missing.
+
+Feature 4A-OI (2026-04-25):
+  open_interest column (migration 010) is now written by upsert_symbol_quotes()
+  with the avg chain OI value from registry.get_oi_map(), populated by main.py.
+  This column is no longer NULL after the first full startup cycle.
 """
 import asyncio
 import logging
@@ -108,8 +113,12 @@ async def upsert_symbol_quotes(
     tier_map: Optional[dict[str, int]] = None,
 ) -> None:
     """
-    Persist Step 3 quote data (last_price, volume, average_volume, tier,
-    stream_eligible) for each symbol into the most recent active snapshot.
+    Persist Step 3 quote data (last_price, volume, average_volume,
+    open_interest, tier, stream_eligible) for each symbol into the
+    most recent active snapshot.
+
+    open_interest: avg chain OI per ticker, populated on the quote by
+    main.py from registry.get_oi_map() before this is called (Feature 4A-OI).
 
     tier_map: dict[symbol -> tier] from tier_engine.assign_tiers().
     If not provided, all symbols default to tier=3.
@@ -284,7 +293,8 @@ def _sync_save_snapshot(
         }).execute()
 
         # 2. Bulk insert symbols
-        # last_price, volume, average_volume are null at insert time—populated by upsert_symbol_quotes().
+        # last_price, volume, average_volume, open_interest are null at insert time—
+        # populated by upsert_symbol_quotes() after Step 3 quote fetch.
         # tier defaults to 3 here; upsert_symbol_quotes() will overwrite with the computed tier.
         batch_size   = 500
         eligible_set = stream_eligible_set if stream_eligible_set is not None else set(symbols)
@@ -328,8 +338,11 @@ def _sync_save_snapshot(
 
 def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
     """
-    Upsert last_price, volume, average_volume, tier, stream_eligible
-    for every symbol in the active snapshot.
+    Upsert last_price, volume, average_volume, open_interest, tier,
+    stream_eligible for every symbol in the active snapshot.
+
+    open_interest: avg chain OI per ticker sourced from registry.get_oi_map(),
+    set on each SymbolQuote by main.py before this is called (Feature 4A-OI).
 
     tier_map: dict[symbol -> int] from tier_engine.assign_tiers().
     Symbols absent from tier_map default to tier=3.
@@ -369,6 +382,7 @@ def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
                 "last_price":      q.last_price,
                 "volume":          q.volume,
                 "average_volume":  q.average_volume,
+                "open_interest":   q.open_interest,   # 4A-OI: avg chain OI from registry
                 "stream_eligible": q.stream_eligible,
                 "tier":            tier_map.get(q.symbol, 3),
             }
