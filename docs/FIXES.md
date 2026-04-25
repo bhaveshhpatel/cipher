@@ -4,6 +4,64 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## C-019 — Layer 4 dedup TTL too tight / sweep detection inert
+
+**Date:** 2026-04-24
+**Severity:** High — multi-exchange duplicate trades inflating premium tallies in RepetitionAccumulator; sweep detection never firing
+**Files:** `backend/utils/dedup.py`, `backend/services/tradier_stream.py`, `backend/services/demo_engine.py`
+
+### Root Causes (5 separate bugs)
+
+**Bug 1 — TTL too tight (2s) for real OPRA reporting lag**
+MIAX routinely reports 500ms–3s after CBOE on the same trade. PHLX can lag 2–5s on high-volume sweeps. The 2s TTL meant duplicates from MIAX/PHLX slipped through as canonical prints, creating 2–4x row count and proportionally inflated premium totals in the `RepetitionAccumulator`.
+
+**Bug 2 — Time-bucket boundary gap**
+The dedup key used `int(ts // 2)` to bucket time into 2s slots. A CBOE print at `t=1.99s` and its MIAX duplicate at `t=2.01s` landed in *different buckets* and both passed as canonical. This was a systematic gap — any trade where the canonical and duplicate straddled a 2s boundary was double-written.
+
+**Bug 3 — Fill price precision (2dp) too tight**
+Different exchange feeds round fill prices differently. A $3.45 CBOE print and $3.46 MIAX print of the same trade were treated as different trades because `fill:.2f` produced different keys. Changed to `fill:.1f` — absorbs ±$0.01 rounding without conflating genuinely different strikes.
+
+**Bug 4 — Dedup completely inert in production**
+`flow_dedup` was instantiated as a module-level singleton in `utils/dedup.py` but was **never imported into `tradier_stream.py`**. `_process_trade()` never called `is_duplicate()`. Every exchange copy of every trade was written to the DB. Layer 4 has been a no-op in production since initial implementation.
+
+**Bug 5 — Sweep detection never fired**
+`is_duplicate()` accepted an `exchange` parameter, but `_process_trade()` never passed it — `exchange` defaulted to empty string `""`. `_exchange_hits` accumulated `["", "", ""]`. `set(["", "", ""])` has length 1 — the `>= 3` threshold was never reached. Zero sweeps were ever detected.
+
+### Fix Applied
+
+**`utils/dedup.py`**
+- `ttl_seconds`: `2.0 → 5.0`
+- `sweep_window`: `5.0 → 8.0`
+- Eliminated `int(ts // 2)` bucket — replaced with pure `first_seen_ts` + TTL comparison
+- Fill key: `fill:.2f → fill:.1f`
+- `dedup_stats()` method added — exposes `dedup_seen`, `dedup_duplicates`, `dedup_sweeps`, `dedup_cache_size`
+- `get_exchange_count()` method added — returns actual unique exchange count for sweep upgrade in `_process_trade()`
+
+**`tradier_stream.py`**
+- Added `from utils.dedup import flow_dedup`
+- `exchange = trade_payload.get("exch") or trade_payload.get("exchange", "")` — handles both real Tradier feed (`"exch"`) and demo engine (`"exchange"`)
+- `flow_dedup.is_duplicate()` called before `persist_flow_event()` — duplicates dropped, `_stats["deduped"]` incremented
+- Sweep upgrade: `is_sweep()` → `ev.trade_type = "SWEEP"`, `ev.exchange_count = real_exch_count`
+- `_stats` now includes `"deduped": 0` counter
+- `get_stats()` merges `flow_dedup.dedup_stats()` for full `/health` observability
+
+**`demo_engine.py`**
+- `_build_timesale_envelope()` now sets `"exch"` as primary exchange key (matching real Tradier field); `"exchange"` kept as alias for backward compat
+- Inter-exchange delay widened: `20–80ms → 50–300ms` to simulate real MIAX/PHLX lag and exercise the 5s TTL window properly
+- `get_stats()` merges `flow_dedup.dedup_stats()` for live dedup observability from admin panel
+
+### Expected Impact
+
+| Metric | Before C-019 | After C-019 |
+|--------|-------------|-------------|
+| DB rows per trade | 2–4x (one per exchange) | 1x (canonical only) |
+| Premium in accumulator | 2–4x inflated | Accurate |
+| Sweep detection | Never fired | Fires on 3+ exchanges within 8s |
+| MIAX/PHLX dedup | Missed if >2s late | Caught up to 5s lag |
+| `/health` dedup visibility | None | `dedup_duplicates`, `dedup_sweeps`, `dedup_cache_size` |
+
+---
+
 ## C-018 — Synthetic quotes polluting bid_ask_class / is_aggressive metrics
 
 **Date:** 2026-04-24
@@ -61,7 +119,7 @@ WHERE is_synthetic_quote = false
 ## C-017 — Duplicate `flow_episodes` rows per signal episode
 
 **Date:** 2026-04-24
-**Severity:** Medium — 2× rows per episode in `flow_episodes` table
+**Severity:** Medium — 2x rows per episode in `flow_episodes` table
 **Fix:** `_bus_signal_listener` in `flow_store.py` now writes `flow_episodes` ONLY on `composite_signal` events. Raw `signal` events are WebSocket-only and no longer trigger a DB write.
 
 ---
@@ -120,7 +178,7 @@ WHERE is_synthetic_quote = false
 **Severity:** Critical — no flow episodes were ever persisted to DB
 **Symptom in logs:**
 ```
-[flow_store] insert into flow_episodes failed: 401 — {"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"flow_episodes\""}
+[flow_store] insert into flow_episodes failed: 401 — {"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \\"flow_episodes\\""}
 ```
 
 ### Root Cause
@@ -155,8 +213,6 @@ log.warning(
 )
 ```
 
-A detailed module docstring was also added explaining the key selection contract.
-
 ### Action Required on Railway
 
 Verify in Railway → **Settings → Variables** that `SUPABASE_SERVICE_ROLE_KEY` is set to the **service_role** secret key from:
@@ -168,8 +224,8 @@ Do **not** use the `anon` key — it will always fail for server-side writes wit
 
 | Key | Env var | RLS | Use for |
 |-----|---------|-----|--------|
-| Anon / Public | `SUPABASE_KEY` | ✅ Enforced | Client-side / read-only queries |
-| Service Role | `SUPABASE_SERVICE_ROLE_KEY` | ❌ Bypassed | All server-side DB writes |
+| Anon / Public | `SUPABASE_KEY` | Enforced | Client-side / read-only queries |
+| Service Role | `SUPABASE_SERVICE_ROLE_KEY` | Bypassed | All server-side DB writes |
 
 ---
 
