@@ -57,8 +57,8 @@ Fix (C-019) — Dedup TTL & Sweep Overhaul (Layer 4):
   - flow_dedup (DedupCache) is now actively called in _process_trade().
     Previously the singleton was instantiated in utils/dedup.py but never
     imported here — dedup was completely inert in production.
-  - exchange code from trade_payload.get("exch", "") now passed to
-    is_duplicate() and drives real sweep detection.
+  - exchange code read from trade_payload with "exch"/"exchange" fallback
+    to handle both real Tradier feed ("exch") and demo engine ("exchange").
   - If flow_dedup.is_duplicate() returns True → event dropped, _stats["deduped"]
     incremented. No DB write, no accumulator ingest.
   - If is_sweep() returns True after canonical pass → ev.trade_type upgraded to
@@ -287,7 +287,7 @@ _iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
-# Trade processor — shared by StreamManager workers and legacy path
+# Trade processor — shared by StreamManager workers and demo engine
 # ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     """
@@ -297,14 +297,19 @@ async def _process_trade(raw: dict):
       {"type": "timesale", "timesale": { ...option fields... }}
 
     The inner payload has:
-      symbol = full OCC string e.g. "ACGL  260516P00095000"
-      last   = option fill price  (NOTE: field is "last" not "price")
-      bid    = option bid
-      ask    = option ask
-      size   = contract count
-      exch   = exchange code e.g. 'C' (CBOE), 'M' (MIAX), 'Q' (NASDAQ),
-               'X' (PHLX), 'N' (NYSE), 'B' (BATO)
-      date   = epoch ms timestamp
+      symbol   = full OCC string e.g. "ACGL  260516P00095000"
+      last     = option fill price  (NOTE: field is "last" not "price")
+      bid      = option bid
+      ask      = option ask
+      size     = contract count
+      exch     = exchange code e.g. 'C' (CBOE), 'M' (MIAX), 'Q' (NASDAQ),
+                 'X' (PHLX), 'N' (NYSE), 'B' (BATO)
+      date     = epoch ms timestamp
+
+    Exchange field fallback (C-019):
+      Real Tradier feed uses "exch". Demo engine uses "exchange" for
+      human readability. We read "exch" first, fall back to "exchange".
+      This ensures sweep detection works correctly for both paths.
 
     Layer 4 dedup (C-019):
       flow_dedup.is_duplicate() is called before any DB write or accumulator
@@ -336,11 +341,12 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
     # Layer 4: Deduplication (C-019)
     # Drop events that are duplicates of a trade already seen within 5s.
+    # "exch" = real Tradier field; "exchange" = demo engine field.
     # Use monotonic arrival time so Tradier late-delivery batches are
     # correctly identified as duplicates even if their timestamps differ.
     # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
-    exchange   = trade_payload.get("exch", "")   # e.g. 'C', 'M', 'Q', 'X'
+    exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.monotonic()
 
     if flow_dedup.is_duplicate(
@@ -365,7 +371,7 @@ async def _process_trade(raw: dict):
                 f"[dedup] sweep upgrade: {occ_symbol} "
                 f"{real_exch_count} exchanges — {ev.trade_type} → SWEEP"
             )
-            ev.trade_type     = "SWEEP"
+            ev.trade_type = "SWEEP"
         ev.exchange_count = real_exch_count
     # ------------------------------------------------------------------
 
