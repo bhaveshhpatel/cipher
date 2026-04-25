@@ -48,13 +48,6 @@ Architecture change (Layer 1+2):
     which was the root cause of receiving equity events instead of option events.
   - occ_symbol field now passed through to persist_flow_event() and stored in DB.
 
-Architecture fix (Layer 2+4):
-  - registry.refresh_loop() now notifies stream_manager.refresh() after every
-    registry rebuild so only affected workers restart — not all 32.
-  - _process_trade() now calls flow_dedup.is_duplicate() BEFORE persist_flow_event().
-    Without this, every trade printed on 4 exchanges writes 4 DB rows.
-    Layer 4 (DedupCache) was implemented but NOT wired into the hot path — fixed.
-
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -64,9 +57,14 @@ Tradier streaming notes:
   - Tradier closes the stream immediately when the market is closed (no queued data)
   - filter=timesale: symbol field = full OCC option string, price = option fill
   - filter=trade:    symbol field = underlying ticker, price = stock last — DO NOT USE
+
+NOTE (2026-04-25):
+  - Automatic _demo_mode fallback in stream_options_flow() is DISABLED.
+  - The _demo_mode/_demo_mode_once functions are preserved below for future use.
+  - To re-enable: uncomment the _demo_mode(...) call sites in stream_options_flow().
+  - Use the admin panel (/admin) to run the demo engine manually instead.
 """
 import asyncio
-import json
 import logging
 import random
 from datetime import datetime, time
@@ -79,7 +77,6 @@ from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
 from services.flow_store import persist_flow_event
-from utils.dedup import flow_dedup
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
 
@@ -115,7 +112,6 @@ _stats = {
     "errors":         0,
     "reconnects":     0,
     "mode":           "starting",
-    "deduped":        0,   # Layer 4: count of dropped duplicate ticks
 }
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
@@ -188,30 +184,30 @@ async def _get_session_token() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Main streaming entry point — delegates to StreamManager + SymbolRegistry
+# Main streaming entry point — now delegates to StreamManager + SymbolRegistry
 # ---------------------------------------------------------------------------
 async def stream_options_flow(symbols: list[str]):
     """
     Entry point called from main.py lifespan.
     `symbols` is the underlying ticker list (e.g. ["AAPL", "TSLA", ...]).
 
-    Architecture:
-      1. Build the OCC SymbolRegistry (fetches chains for each ticker)
-      2. Pass all OCC contract symbols to StreamManager
-      3. StreamManager spawns parallel StreamWorker instances (500 OCC/conn)
-      4. Each worker pushes raw events to shared queue → _process_trade()
-      5. registry.refresh_loop() runs every 30min and calls manager.refresh()
-         so only affected workers restart — not all 32.
+    Automatic demo-mode fallback is DISABLED (2026-04-25).
+    If Tradier key is missing or OCC registry is empty, the stream simply
+    idles and logs a warning instead of emitting synthetic data.
+    To re-enable demo fallback: uncomment the _demo_mode(...) call sites below.
+    Use the admin panel to start the demo engine manually.
     """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
     if not settings.TRADIER_API_KEY:
-        log.warning("TRADIER_API_KEY not set — running in demo mode")
-        _stats["mode"] = "demo"
-        await _demo_mode(symbols)
+        log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
+        _stats["mode"] = "idle"
+        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
+        # await _demo_mode(symbols)
         return
 
+    # Build OCC symbol registry from ticker watchlist
     from services.symbol_registry import init_registry
     from services.stream_manager import StreamManager
 
@@ -221,44 +217,29 @@ async def stream_options_flow(symbols: list[str]):
     try:
         occ_count = await registry.build()
     except Exception as e:
-        log.error(f"[stream] OCC registry build failed: {e} — falling back to demo mode")
-        _stats["mode"] = "demo"
-        await _demo_mode(symbols)
+        log.error(f"[stream] OCC registry build failed: {e} — stream idle. Use admin panel to start demo engine.")
+        _stats["mode"] = "idle"
+        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
+        # await _demo_mode(symbols)
         return
 
     _stats["active_symbols"] = occ_count
 
     if occ_count == 0:
-        log.warning("[stream] OCC registry is empty — no contracts found. Falling back to demo mode")
-        _stats["mode"] = "demo"
-        await _demo_mode(symbols)
+        log.warning("[stream] OCC registry is empty — stream idle. Use admin panel to start demo engine.")
+        _stats["mode"] = "idle"
+        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
+        # await _demo_mode(symbols)
         return
 
     log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
     _stats["mode"] = "live"
 
+    # Start background 30-min registry refresh
+    asyncio.create_task(registry.refresh_loop())
+
+    # StreamManager handles all parallel workers + queue consumer
     manager = StreamManager(registry=registry, process_fn=_process_trade)
-
-    # Layer 2 fix: hook registry refresh_loop to notify stream_manager.refresh()
-    # so only workers whose symbol sets changed are restarted, not all 32.
-    async def _registry_refresh_with_manager_notify():
-        while True:
-            has_expiry_today = any(
-                meta.expiry == __import__('datetime').date.today().isoformat()
-                for meta in registry._registry.values()
-            )
-            interval_mins = 15 if has_expiry_today else 30
-            await asyncio.sleep(interval_mins * 60)
-            log.info(f"[stream] Scheduled registry refresh (interval={interval_mins}min)")
-            try:
-                await registry.build()
-                await manager.refresh()  # <- the missing link: notify manager after rebuild
-                _stats["active_symbols"] = registry.size()
-            except Exception as e:
-                log.error(f"[stream] Registry refresh failed (non-fatal): {e}")
-
-    asyncio.create_task(_registry_refresh_with_manager_notify())
-
     await manager.run()
 
 
@@ -292,16 +273,15 @@ async def _process_trade(raw: dict):
 
     The inner payload has:
       symbol = full OCC string e.g. "ACGL  260516P00095000"
-      last   = option fill price  (NOTE: field is "last" not "price") — Layer 3 fix
+      last   = option fill price  (NOTE: field is "last" not "price")
       bid    = option bid
       ask    = option ask
       size   = contract count
       date   = epoch ms timestamp
 
-    Layer 4 (Dedup): flow_dedup.is_duplicate() is called BEFORE persist_flow_event().
-    A single trade prints on exchanges N, C, M, Q all within 200ms — without dedup
-    that's 4 DB rows per trade. The 2s TTL cache keyed on (symbol, size, fill, bucket)
-    drops all but the first/canonical print.
+    We unwrap the envelope and pass the inner dict to parse_tradier_trade().
+    Both "timesale" and "trade" envelope types are handled for compatibility.
+    occ_symbol is passed through to persist_flow_event() and stored in DB.
     """
     _stats["ticks"] += 1
 
@@ -313,31 +293,20 @@ async def _process_trade(raw: dict):
         if not isinstance(trade_payload, dict):
             return
     elif event_type in _PROCESSABLE_TYPES:
+        # Flat format — pass through directly
         trade_payload = raw
     else:
+        # Ignore summary, quote, trade (equity) and any other non-timesale events
         return
 
     ev = parse_tradier_trade(trade_payload)
     if not ev:
         return
 
-    # Layer 4 — Dedup: drop exchange duplicates before any DB write
-    occ_symbol = trade_payload.get("symbol", "")
-    exchange   = trade_payload.get("exch", trade_payload.get("exchange", "UNK"))
-    if flow_dedup.is_duplicate(
-        occ_symbol = occ_symbol,
-        size       = ev.size,
-        fill       = ev.fill_price,
-        exchange   = exchange,
-    ):
-        _stats["deduped"] += 1
-        return  # same trade already written by first exchange — drop it
-
-    # Sweep upgrade: if 3+ exchanges printed this contract → mark as SWEEP
-    if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
-        ev.trade_type = "SWEEP"
-
     _stats["classified"] += 1
+
+    # Capture the raw OCC symbol for DB storage
+    occ_symbol = trade_payload.get("symbol", "")
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
@@ -450,7 +419,10 @@ async def _process_trade(raw: dict):
 
 
 # ---------------------------------------------------------------------------
-# Demo mode
+# Demo mode — DISABLED as automatic fallback (2026-04-25)
+# Kept here for future use. To re-enable, uncomment the call sites above
+# in stream_options_flow() and remove the "return" statements that follow.
+# The admin panel (/admin) is the preferred way to run demo data.
 # ---------------------------------------------------------------------------
 async def _demo_mode_once(symbols: list[str]):
     import datetime as dt
