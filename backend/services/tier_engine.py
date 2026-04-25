@@ -6,15 +6,23 @@ admin-configurable thresholds stored in the `tier_thresholds` table.
 
 Tier definitions:
   T1 — Liquid large-caps  (SPY, AAPL, TSLA, NVDA …)
-         volume >= t1_min_volume AND price >= t1_min_last_price AND oi >= t1_min_oi
+         volume >= t1_min_volume AND price >= t1_min_last_price AND avg_chain_oi >= t1_min_oi
   T2 — Mid-cap optionable (HOOD, SOFI, RIVN …)
-         volume >= t2_min_volume AND price >= t2_min_last_price AND oi >= t2_min_oi
+         volume >= t2_min_volume AND price >= t2_min_last_price AND avg_chain_oi >= t2_min_oi
   T3 — Standard           (everything else that passes the universe filter)
+
+OI source (Feature 4A-OI):
+  quote.open_interest is populated by main.py from registry.get_oi_map()
+  before assign_tiers() is called. The value is the average open_interest
+  across all option contracts loaded for that ticker in the most recent
+  symbol_registry build (contracts that passed ATM + DTE + per-tier min_oi
+  filters). This makes t*_min_oi thresholds in tier_thresholds fully
+  effective at the symbol classification step with zero extra API calls.
 
 Usage:
   from services.tier_engine import assign_tiers
 
-  # quotes: list[SymbolQuote] from symbols_loader._fetch_batch_quotes()
+  # quotes: list[SymbolQuote] with open_interest populated from registry
   tiers = await assign_tiers(quotes)   # dict[symbol, int]
 
 Caching:
@@ -130,9 +138,15 @@ async def _fetch_thresholds(force: bool = False) -> dict:
 def _classify(quote: "SymbolQuote", thresh: dict) -> int:
     """
     Return tier 1, 2, or 3 for a single SymbolQuote.
-    OI check uses quote.open_interest if available (populated from
-    ContractMeta in a future 4A phase); until then defaults to 0
-    which means only volume+price drive T1/T2 promotion.
+
+    All three conditions must be satisfied for T1 or T2 promotion:
+      - vol   : quote.average_volume or quote.volume
+      - price : quote.last_price
+      - oi    : quote.open_interest  (avg chain OI from registry.get_oi_map(),
+                                      populated by main.py before assign_tiers)
+
+    A symbol with oi=0 (e.g. no loaded contracts after registry build)
+    will fall through to T3 regardless of vol and price.
     """
     vol   = quote.average_volume or quote.volume or 0
     price = quote.last_price or 0.0
@@ -141,23 +155,14 @@ def _classify(quote: "SymbolQuote", thresh: dict) -> int:
     if (
         vol   >= thresh["t1_min_volume"]
         and price >= thresh["t1_min_last_price"]
-        and oi    >= thresh["t1_min_oi"] or (
-            # OI grace: if OI not yet populated, use vol+price only for T1
-            oi == 0
-            and vol   >= thresh["t1_min_volume"]
-            and price >= thresh["t1_min_last_price"]
-        )
+        and oi    >= thresh["t1_min_oi"]
     ):
         return 1
 
     if (
         vol   >= thresh["t2_min_volume"]
         and price >= thresh["t2_min_last_price"]
-        and oi    >= thresh["t2_min_oi"] or (
-            oi == 0
-            and vol   >= thresh["t2_min_volume"]
-            and price >= thresh["t2_min_last_price"]
-        )
+        and oi    >= thresh["t2_min_oi"]
     ):
         return 2
 
@@ -167,6 +172,9 @@ def _classify(quote: "SymbolQuote", thresh: dict) -> int:
 async def assign_tiers(quotes: list["SymbolQuote"]) -> dict[str, int]:
     """
     Classify a list of SymbolQuotes into tiers.
+
+    Expects quote.open_interest to be pre-populated with avg chain OI
+    from registry.get_oi_map() (done in main.py) before this is called.
 
     Returns dict[symbol -> tier (1|2|3)].
     Falls back to tier=3 for all symbols if thresholds cannot be fetched.
