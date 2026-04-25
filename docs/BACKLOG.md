@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-24 (Phase 5A — post gap-fix audit)  
+> Last updated: 2026-04-25 (Feature 4A — tier engine + admin tier endpoints)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -25,6 +25,8 @@
 | B-016 | Wire midcap screener into signal pipeline | 🔲 Todo | `signals/midcap_screener.py` exists but not confirmed in signal path. |
 | B-017 | Load test signals endpoints (50 concurrent users) | 🔲 Todo | Benchmark `/api/signals/list` and `/api/signals/history` under load. |
 | B-018 | WebSocket fan-out benchmark (50+ subscribers) | 🔲 Todo | Test `ws.py` throughput with many simultaneous clients. |
+| B-019 | `PATCH /admin/tier-thresholds` endpoint | 🔲 Todo | Admin endpoint to update the active `tier_thresholds` row. Protected by admin whitelist. |
+| B-020 | `GET /admin/tier-distribution` endpoint | 🔲 Todo | Admin endpoint returning count of Tier 1/2/3 symbols in latest universe snapshot. |
 
 ---
 
@@ -50,6 +52,8 @@
 | C-016 | Layer 4 dedup not wired into hot path | 2026-04-24 | `DedupCache` was built (C-010) but `flow_dedup.is_duplicate()` was never called in `_process_trade()`. Fixed: added dedup gate + sweep upgrade in `tradier_stream.py`. Added `deduped` stat counter. Regression tests: `test_6layer_regression.py` tests L4-01 through L4-10. |
 | C-017 | Layer 2 manager.refresh() not hooked to registry loop | 2026-04-24 | `registry.refresh_loop()` rebuilt symbols every 30min but never notified `StreamManager`. Workers streamed stale OCC symbols. Fixed: `_registry_refresh_with_manager_notify()` calls `await manager.refresh()` after every rebuild. Regression tests: L2-01 through L2-06. |
 | C-018 | Layer 5 flush interval 5s → 500ms + 100-row early flush | 2026-04-24 | `_FLUSH_INTERVAL` was 5s (spec: 500ms). At 62K rows/day: ~430 rows per flush window. Fixed: `_FLUSH_INTERVAL=0.5`, `_FLUSH_MAX_ROWS=100`, early-flush in `persist_flow_event()`. Regression tests: L5-01 through L5-08. |
+| C-019 | Layer 4 dedup TTL + sweep detection overhaul | 2026-04-24 | TTL 2s→5s, sweep window 5s→8s, eliminated `int(ts//2)` bucket boundary bug, fill key 2dp→1dp, exchange field wired. 5 bugs fixed. Regression tests: C-019 suite in `test_6layer_regression.py`. |
+| C-020 | Feature 4A — Tier engine + universe tier assignment | 2026-04-25 | `services/tier_engine.py` (new): `TierEngine`, `_TierParams`, `set_tier_map()`, `get_tier()`, admin whitelist. `universe_store.load_tier_map()`. Migrations 010 + 011 applied. 35 tests across `test_4a_tier_engine.py`, `test_6layer_regression.py`, `test_universe_store.py`. |
 
 ---
 
@@ -67,6 +71,8 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-25 | Added C-020 — Feature 4A tier engine complete. Added B-019, B-020 admin tier endpoints to active backlog. |
+| 2026-04-24 | Added C-019 — Layer 4 dedup TTL overhaul (5 bugs). |
 | 2026-04-24 | Added C-016, C-017, C-018 — 6-layer gap-fix audit. Layer 4 dedup wired, Layer 2 refresh notify hooked, Layer 5 flush corrected to 500ms/100-row. |
 | 2026-04-24 | Closed B-014 and B-015 — Layer 1 and Layer 2 integration confirmed and verified. |
 | 2026-04-24 | Added C-009 through C-015 — Phase 5A completions (swarm, dedup, registry, stream manager, trade executor, fill_price fix) |
