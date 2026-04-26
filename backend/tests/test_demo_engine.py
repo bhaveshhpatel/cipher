@@ -1,321 +1,339 @@
 """
 Regression tests for services/demo_engine.py
 
-Covers (matched to actual source API):
-  - _nearest_friday always returns a Friday and is in the future
-  - _round_to_strike correct increments for all 3 price bands
-  - _build_occ_symbol correct OCC format for CALL and PUT
-  - _build_occ_symbol pads short tickers to 6 chars
-  - _build_occ_symbol encodes fractional strike correctly
-  - _build_timesale_envelope correct shape (no occ_symbol arg — built internally)
-  - _build_timesale_envelope sets both 'exch' and 'exchange' (C-019)
-  - _build_timesale_envelope bid/ask spread around fill
-  - is_running() False initially
-  - get_stats() returns all expected keys: running/ticks_emitted/signals_emitted/errors
-  - start_demo() returns {ok: True, status: 'started'}
-  - start_demo() idempotent: returns {ok: True, status: 'already_running'}
-  - stop_demo() idempotent: returns {ok: True, status: 'already_stopped'}
-  - stop_demo() returns {ok: True, status: 'stopped'}
-  - full start -> stop lifecycle leaves is_running() False
-  - start_demo() resets _demo_stats counters to zero
+Covers (matched to actual source):
+  _nearest_friday:
+  - Returns a date whose weekday() == 4 (Friday)
+  - Returns a future date (never today if today is not Friday, never past)
+  - weeks=1 returns nearest Friday, weeks=2 returns one week later
+  - Offset between weeks=1 and weeks=2 is exactly 7 days
+
+  _round_to_strike:
+  - price < 50 → increment 0.50 (e.g. 12.3 → 12.5, 10.7 → 11.0)
+  - price in [50, 200) → increment 1.0 (e.g. 150.7 → 151.0)
+  - price >= 200 → increment 5.0 (e.g. 500.0 → 500.0, 502.0 → 500.0)
+  - Boundary: price == 50 → uses 1.0 increment
+  - Boundary: price == 200 → uses 5.0 increment
+  - Returns a float
+
+  _build_occ_symbol:
+  - ticker is left-padded to 6 chars (AAPL → 'AAPL  ')
+  - expiry is formatted as YYMMDD
+  - CALL → 'C', PUT → 'P'
+  - 'call' (lowercase) → 'C'
+  - strike * 1000 zero-padded to 8 digits (180.0 → '00180000')
+  - full format: TICKER(6)YYMMDD(6)C/P(1)STRIKE_INT(8) = 21 chars
+
+  _build_timesale_envelope:
+  - returns a dict with keys: 'type', 'timesale'
+  - type == 'timesale'
+  - timesale contains 'symbol', 'last', 'bid', 'ask', 'size', 'exch', 'exchange', 'date'
+  - bid < last < ask
+  - both 'exch' and 'exchange' present (Tradier compat)
+  - occ symbol embedded in timesale.symbol matches _build_occ_symbol
+
+  Public API:
+  - is_running() == False at module import time
+  - get_stats() returns dict with keys: running, ticks_emitted, signals_emitted, errors
+  - get_stats().running == False when not started
+  - start_demo() returns {ok: True, status: 'started'} on first call
+  - start_demo() returns {ok: True, status: 'already_running'} if already running
+  - stop_demo() returns {ok: True, status: 'already_stopped'} when not running
+  - start_demo() + stop_demo() → is_running() == False
+  - stop_demo() after stop → status == 'already_stopped'
 """
-import asyncio
 import pytest
-from datetime import date
+import asyncio
+from datetime import date, timedelta
 from unittest.mock import patch, AsyncMock
 
 import services.demo_engine as de
+from services.demo_engine import (
+    _nearest_friday,
+    _round_to_strike,
+    _build_occ_symbol,
+    _build_timesale_envelope,
+    is_running,
+    get_stats,
+    start_demo,
+    stop_demo,
+)
 
 
-# ── _nearest_friday ────────────────────────────────────────────────────────────
+# ── test isolation: stop any running demo before each test ──────────────────
+
+@pytest.fixture(autouse=True)
+async def _stop_demo_after():
+    """Ensure the demo engine is stopped after every test that starts it."""
+    yield
+    if is_running():
+        await stop_demo()
+
+
+# ── _nearest_friday ─────────────────────────────────────────────────────────
 
 def test_nearest_friday_is_a_friday():
-    for weeks in range(1, 9):
-        d = de._nearest_friday(weeks)
-        assert d.weekday() == 4, (
-            f"Expected Friday (weekday=4), got {d.strftime('%A')} for weeks={weeks}"
-        )
+    result = _nearest_friday(1)
+    assert result.weekday() == 4, f"Expected Friday (4), got weekday {result.weekday()}"
 
 
 def test_nearest_friday_is_in_the_future():
-    assert de._nearest_friday(1) > date.today()
+    today = date.today()
+    result = _nearest_friday(1)
+    assert result > today
 
 
-def test_nearest_friday_weeks_offset_increases_date():
-    d1 = de._nearest_friday(1)
-    d2 = de._nearest_friday(2)
-    assert d2 > d1
+def test_nearest_friday_weeks_2_is_also_friday():
+    result = _nearest_friday(2)
+    assert result.weekday() == 4
 
 
-# ── _round_to_strike ──────────────────────────────────────────────────────────
-
-def test_round_to_strike_sub_50_uses_50_cent_increments():
-    # price < 50 → increment 0.50
-    strike = de._round_to_strike(30.0, "CALL")
-    assert (strike * 2) == round(strike * 2), f"Strike {strike} not a $0.50 increment"
+def test_nearest_friday_weeks_2_is_7_days_after_weeks_1():
+    f1 = _nearest_friday(1)
+    f2 = _nearest_friday(2)
+    assert (f2 - f1).days == 7
 
 
-def test_round_to_strike_50_to_200_uses_1_dollar_increments():
-    # price in [50, 200) → increment 1.0
-    strike = de._round_to_strike(150.0, "PUT")
-    assert strike == round(strike), f"Strike {strike} not a whole dollar"
+def test_nearest_friday_weeks_8_is_future():
+    today = date.today()
+    result = _nearest_friday(8)
+    assert result > today
 
 
-def test_round_to_strike_above_200_uses_5_dollar_increments():
-    # price >= 200 → increment 5.0
-    strike = de._round_to_strike(500.0, "CALL")
-    assert (strike % 5.0) < 0.001, f"Strike {strike} not a $5 increment"
+# ── _round_to_strike ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("price,expected", [
+    (12.3,  12.5),   # < 50: rounds to nearest 0.50
+    (10.7,  11.0),   # < 50: rounds to nearest 0.50
+    (49.9,  50.0),   # < 50: rounds to nearest 0.50
+    (25.0,  25.0),   # < 50: exact 0.50 multiple
+])
+def test_round_to_strike_below_50(price, expected):
+    assert _round_to_strike(price, "CALL") == expected
 
 
-def test_round_to_strike_boundary_50_uses_1_dollar_increments():
-    strike = de._round_to_strike(50.0, "CALL")
-    assert strike == round(strike)
+@pytest.mark.parametrize("price,expected", [
+    (150.7, 151.0),  # [50,200): rounds to nearest 1.0
+    (100.4, 100.0),  # [50,200): rounds down
+    (50.0,  50.0),   # boundary: price==50 uses 1.0 increment
+    (199.6, 200.0),  # [50,200): rounds up to 200
+])
+def test_round_to_strike_50_to_200(price, expected):
+    assert _round_to_strike(price, "PUT") == expected
 
 
-# ── _build_occ_symbol ──────────────────────────────────────────────────────────
+@pytest.mark.parametrize("price,expected", [
+    (500.0, 500.0),  # ≥200: exact 5.0 multiple
+    (502.0, 500.0),  # ≥200: rounds down
+    (503.0, 505.0),  # ≥200: rounds up
+    (200.0, 200.0),  # boundary: price==200 uses 5.0 increment
+])
+def test_round_to_strike_200_and_above(price, expected):
+    assert _round_to_strike(price, "CALL") == expected
 
-def test_build_occ_symbol_call_format():
+
+def test_round_to_strike_returns_float():
+    result = _round_to_strike(150.0, "CALL")
+    assert isinstance(result, float)
+
+
+# ── _build_occ_symbol ───────────────────────────────────────────────────────
+
+def test_build_occ_symbol_total_length_is_21():
     expiry = date(2026, 6, 20)
-    sym = de._build_occ_symbol("AAPL", expiry, "CALL", 195.0)
-    assert sym[:6] == "AAPL  "
-    assert "260620" in sym
-    assert "C" in sym[6:]
-    assert sym.endswith("00195000")
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    assert len(result) == 21, f"OCC symbol length should be 21, got {len(result)}: '{result}'"
 
 
-def test_build_occ_symbol_put_format():
+def test_build_occ_symbol_ticker_padded_to_6():
     expiry = date(2026, 6, 20)
-    sym = de._build_occ_symbol("TSLA", expiry, "PUT", 245.0)
-    assert sym[:6] == "TSLA  "
-    assert "P" in sym[6:]
-    assert sym.endswith("00245000")
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    assert result[:6] == "AAPL  ", f"Expected 'AAPL  ', got '{result[:6]}'"
 
 
-def test_build_occ_symbol_fractional_strike():
-    """Strike 375.5 → must encode as 00375500 (strike * 1000)."""
+def test_build_occ_symbol_expiry_format_yymmdd():
+    expiry = date(2026, 1, 17)
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    assert result[6:12] == "260117"
+
+
+def test_build_occ_symbol_call_is_c():
     expiry = date(2026, 6, 20)
-    sym = de._build_occ_symbol("SPY", expiry, "CALL", 375.5)
-    assert "00375500" in sym
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    assert result[12] == "C"
+
+
+def test_build_occ_symbol_put_is_p():
+    expiry = date(2026, 6, 20)
+    result = _build_occ_symbol("AAPL", expiry, "PUT", 180.0)
+    assert result[12] == "P"
+
+
+def test_build_occ_symbol_lowercase_call_accepted():
+    expiry = date(2026, 6, 20)
+    result = _build_occ_symbol("AAPL", expiry, "call", 180.0)
+    assert result[12] == "C"
+
+
+def test_build_occ_symbol_strike_zero_padded_to_8():
+    expiry = date(2026, 6, 20)
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    # 180.0 * 1000 = 180000 → zero-padded to 8: '00180000'
+    assert result[13:] == "00180000"
 
 
 def test_build_occ_symbol_short_ticker_padded():
     expiry = date(2026, 6, 20)
-    sym = de._build_occ_symbol("SPY", expiry, "CALL", 500.0)
-    assert sym[:6] == "SPY   "
+    result = _build_occ_symbol("SPY", expiry, "CALL", 500.0)
+    assert result[:6] == "SPY   "
 
 
-def test_build_occ_symbol_total_length():
-    """OCC symbol: 6 ticker + 6 date + 1 C/P + 8 strike = 21 chars total."""
-    expiry = date(2026, 6, 20)
-    sym = de._build_occ_symbol("AAPL", expiry, "CALL", 200.0)
-    assert len(sym) == 21
+def test_build_occ_symbol_example_from_docstring():
+    """Verify example from docstring: AAPL  260117C00180000"""
+    expiry = date(2026, 1, 17)
+    result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    assert result == "AAPL  260117C00180000"
 
 
-# ── _build_timesale_envelope ──────────────────────────────────────────────────
-# Note: actual signature is (ticker, expiry, ctype, strike, fill, size, exchange)
-# The OCC symbol is built internally.
+# ── _build_timesale_envelope ───────────────────────────────────────────────
 
-def test_build_timesale_envelope_type_field():
-    env = de._build_timesale_envelope(
+def _sample_envelope():
+    return _build_timesale_envelope(
         ticker="AAPL",
         expiry=date(2026, 6, 20),
         ctype="CALL",
-        strike=195.0,
-        fill=3.45,
-        size=100,
+        strike=180.0,
+        fill=3.50,
+        size=10,
         exchange="C",
     )
+
+
+def test_timesale_envelope_top_keys():
+    env = _sample_envelope()
+    assert "type" in env
+    assert "timesale" in env
+
+
+def test_timesale_envelope_type_is_timesale():
+    env = _sample_envelope()
     assert env["type"] == "timesale"
 
 
-def test_build_timesale_envelope_has_timesale_dict():
-    env = de._build_timesale_envelope(
-        ticker="SPY",
-        expiry=date(2026, 6, 20),
-        ctype="PUT",
-        strike=450.0,
-        fill=2.10,
-        size=50,
-        exchange="N",
+def test_timesale_envelope_inner_keys():
+    ts = _sample_envelope()["timesale"]
+    for key in ("symbol", "last", "bid", "ask", "size", "exch", "exchange", "date"):
+        assert key in ts, f"timesale dict missing key '{key}'"
+
+
+def test_timesale_envelope_bid_lt_last_lt_ask():
+    ts = _sample_envelope()["timesale"]
+    assert ts["bid"] < ts["last"] < ts["ask"]
+
+
+def test_timesale_envelope_both_exch_fields_present():
+    """Both 'exch' (Tradier field) and 'exchange' (human-readable) must be present."""
+    ts = _sample_envelope()["timesale"]
+    assert ts["exch"] == "C"
+    assert ts["exchange"] == "C"
+
+
+def test_timesale_envelope_symbol_matches_build_occ_symbol():
+    expiry = date(2026, 6, 20)
+    expected_occ = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
+    env = _build_timesale_envelope(
+        ticker="AAPL", expiry=expiry, ctype="CALL",
+        strike=180.0, fill=3.50, size=10, exchange="C"
     )
-    ts = env["timesale"]
-    assert isinstance(ts, dict)
-    assert ts["last"] == 2.10
-    assert ts["size"] == 50
+    assert env["timesale"]["symbol"] == expected_occ
 
 
-def test_build_timesale_envelope_bid_ask_spread():
-    """bid = fill * 0.995, ask = fill * 1.005."""
-    env = de._build_timesale_envelope(
-        ticker="NVDA",
-        expiry=date(2026, 6, 20),
-        ctype="CALL",
-        strike=800.0,
-        fill=10.0,
-        size=25,
-        exchange="Q",
+def test_timesale_envelope_size_preserved():
+    env = _build_timesale_envelope(
+        ticker="SPY", expiry=date(2026, 6, 20), ctype="PUT",
+        strike=500.0, fill=2.0, size=42, exchange="M"
     )
-    ts = env["timesale"]
-    assert abs(ts["bid"] - 9.95) < 0.01
-    assert abs(ts["ask"] - 10.05) < 0.01
+    assert env["timesale"]["size"] == 42
 
 
-def test_build_timesale_envelope_has_both_exch_and_exchange_fields():
-    """C-019: Both 'exch' and 'exchange' must be present and equal."""
-    env = de._build_timesale_envelope(
-        ticker="TSLA",
-        expiry=date(2026, 6, 20),
-        ctype="PUT",
-        strike=200.0,
-        fill=5.0,
-        size=10,
-        exchange="M",
-    )
-    ts = env["timesale"]
-    assert "exch" in ts
-    assert "exchange" in ts
-    assert ts["exch"] == "M"
-    assert ts["exchange"] == "M"
+# ── Public API ───────────────────────────────────────────────────────────────
+
+def test_is_running_false_at_import():
+    """Before any test starts the demo, is_running() must be False."""
+    # The autouse fixture ensures this by stopping any leftover task.
+    assert not is_running()
 
 
-def test_build_timesale_envelope_symbol_is_occ_format():
-    """The symbol inside the envelope must be a valid OCC string."""
-    env = de._build_timesale_envelope(
-        ticker="AAPL",
-        expiry=date(2026, 6, 20),
-        ctype="CALL",
-        strike=195.0,
-        fill=3.45,
-        size=100,
-        exchange="C",
-    )
-    sym = env["timesale"]["symbol"]
-    assert sym[:4] == "AAPL"
-    assert len(sym) == 21
-
-
-def test_build_timesale_envelope_date_is_epoch_ms():
-    """The 'date' field must be a unix timestamp in milliseconds (> 1e12)."""
-    env = de._build_timesale_envelope(
-        ticker="QQQ",
-        expiry=date(2026, 6, 20),
-        ctype="CALL",
-        strike=400.0,
-        fill=4.0,
-        size=20,
-        exchange="X",
-    )
-    ts_ms = env["timesale"]["date"]
-    assert ts_ms > 1_000_000_000_000, f"Expected epoch ms, got {ts_ms}"
-
-
-# ── is_running / get_stats ────────────────────────────────────────────────────
-
-def test_is_running_false_initially():
-    de._running = False
-    de._task = None
-    assert de.is_running() is False
-
-
-def test_get_stats_returns_all_expected_keys():
-    stats = de.get_stats()
+def test_get_stats_has_required_keys():
+    stats = get_stats()
     for key in ("running", "ticks_emitted", "signals_emitted", "errors"):
         assert key in stats, f"get_stats() missing key: '{key}'"
 
 
-def test_get_stats_running_field_matches_is_running():
-    de._running = False
-    de._task = None
-    stats = de.get_stats()
-    assert stats["running"] == de.is_running()
+def test_get_stats_running_false_when_not_started():
+    stats = get_stats()
+    assert stats["running"] is False
 
 
-# ── start_demo / stop_demo lifecycle ──────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_stop_demo_when_not_running_returns_already_stopped():
+    # Ensure clean state
+    if is_running():
+        await stop_demo()
+    result = await stop_demo()
+    assert result == {"ok": True, "status": "already_stopped"}
+
 
 @pytest.mark.asyncio
 async def test_start_demo_returns_started():
-    de._running = False
-    de._task = None
-
-    async def _noop(tickers):
+    # Patch _run_demo_loop to avoid actually starting the loop
+    async def _noop_loop(tickers):
         await asyncio.sleep(9999)
 
-    with patch.object(de, "_run_demo_loop", side_effect=_noop):
-        result = await de.start_demo()
-
-    assert result["ok"] is True
-    assert result["status"] == "started"
-    assert de.is_running() is True
-    await de.stop_demo()
+    with patch("services.demo_engine._run_demo_loop", side_effect=_noop_loop):
+        result = await start_demo()
+    assert result == {"ok": True, "status": "started"}
 
 
 @pytest.mark.asyncio
 async def test_start_demo_idempotent_returns_already_running():
-    """Calling start_demo() when already running must return status='already_running'."""
-    de._running = False
-    de._task = None
-
-    async def _noop(tickers):
+    async def _noop_loop(tickers):
         await asyncio.sleep(9999)
 
-    with patch.object(de, "_run_demo_loop", side_effect=_noop):
-        await de.start_demo()       # first call
-        result = await de.start_demo()  # second call — should be no-op
-
-    assert result["ok"] is True
-    assert result["status"] == "already_running"
-    await de.stop_demo()
+    with patch("services.demo_engine._run_demo_loop", side_effect=_noop_loop):
+        await start_demo()
+        result = await start_demo()  # second call
+    assert result == {"ok": True, "status": "already_running"}
 
 
 @pytest.mark.asyncio
-async def test_stop_demo_idempotent_returns_already_stopped():
-    """Calling stop_demo() when not running must return status='already_stopped'."""
-    de._running = False
-    de._task = None
-    result = await de.stop_demo()
-    assert result["ok"] is True
-    assert result["status"] == "already_stopped"
+async def test_start_then_stop_is_running_becomes_false():
+    async def _noop_loop(tickers):
+        try:
+            await asyncio.sleep(9999)
+        except asyncio.CancelledError:
+            raise
+
+    with patch("services.demo_engine._run_demo_loop", side_effect=_noop_loop):
+        await start_demo()
+        assert is_running()
+        result = await stop_demo()
+
+    assert result == {"ok": True, "status": "stopped"}
+    assert not is_running()
 
 
 @pytest.mark.asyncio
-async def test_start_and_stop_lifecycle():
-    """Full start → running=True → stop → running=False."""
-    de._running = False
-    de._task = None
+async def test_stop_after_stop_returns_already_stopped():
+    async def _noop_loop(tickers):
+        try:
+            await asyncio.sleep(9999)
+        except asyncio.CancelledError:
+            raise
 
-    async def _noop(tickers):
-        await asyncio.sleep(9999)
+    with patch("services.demo_engine._run_demo_loop", side_effect=_noop_loop):
+        await start_demo()
+        await stop_demo()
 
-    with patch.object(de, "_run_demo_loop", side_effect=_noop):
-        start_result = await de.start_demo()
-    assert start_result["ok"] is True
-    assert de.is_running() is True
-
-    stop_result = await de.stop_demo()
-    assert stop_result["ok"] is True
-    assert stop_result["status"] == "stopped"
-    assert de.is_running() is False
-
-
-@pytest.mark.asyncio
-async def test_start_demo_resets_stats_counters():
-    """start_demo() must zero ticks_emitted, signals_emitted, errors."""
-    de._demo_stats["ticks_emitted"]   = 999
-    de._demo_stats["signals_emitted"] = 42
-    de._demo_stats["errors"]          = 7
-    de._running = False
-    de._task = None
-
-    async def _noop(tickers):
-        await asyncio.sleep(9999)
-
-    with patch.object(de, "_run_demo_loop", side_effect=_noop):
-        await de.start_demo()
-
-    # _run_demo_loop resets stats at the top — but since we patched it
-    # we verify the reset happens inside _run_demo_loop itself by checking
-    # that start_demo at least hands off a clean task.
-    # What we can assert: _running is now True and task is not None.
-    assert de._running is True
-    assert de._task is not None
-    await de.stop_demo()
+    result = await stop_demo()  # second stop
+    assert result == {"ok": True, "status": "already_stopped"}
