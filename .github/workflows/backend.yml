@@ -43,8 +43,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Job 2: Regression test suite with coverage gate
-  # Real gate: --cov-fail-under=92 in pytest.
-  # orgoro/coverage is informational (continue-on-error: true).
+  # Gate: --cov-fail-under=92 enforced by pytest.
   # -------------------------------------------------------------------------
   regression:
     name: Regression Tests + Coverage Gate
@@ -117,16 +116,5 @@ jobs:
             backend/coverage.xml
             backend/coverage.json
           retention-days: 14
-
-      - name: Coverage summary comment on PR
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        uses: orgoro/coverage@v3.2
-        with:
-          coverageFile: backend/coverage.xml
-          token:        ${{ secrets.GITHUB_TOKEN }}
-          thresholdAll:      0.92
-          thresholdNew:      0.00
-          thresholdModified: 0.00
 
 # Deploy is handled automatically by Railway's native GitHub integration.
