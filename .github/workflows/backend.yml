@@ -43,8 +43,8 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Job 2: Regression test suite with coverage gate
-  # Overall threshold enforced by --cov-fail-under=92 in pytest.
-  # orgoro/coverage is informational only (thresholds set to 0).
+  # Real gate: --cov-fail-under=92 in pytest.
+  # orgoro/coverage is informational (continue-on-error: true).
   # -------------------------------------------------------------------------
   regression:
     name: Regression Tests + Coverage Gate
@@ -120,6 +120,7 @@ jobs:
 
       - name: Coverage summary comment on PR
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: orgoro/coverage@v3.2
         with:
           coverageFile: backend/coverage.xml
