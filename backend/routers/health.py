@@ -1,7 +1,7 @@
 """
 health.py — Stream health endpoint (B-008).
 
-GET /health/stream
+GET /api/health/stream
   Returns the current state of the Tradier stream pipeline:
     mode            : starting | live | demo | idle | reconnecting | market_closed
     active_symbols  : number of OCC contracts currently streamed
@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from core.auth import get_current_user, TokenData
 from services.tradier_stream import get_stats
 
-router = APIRouter(prefix="/health", tags=["health"])
+router = APIRouter(prefix="/api/health", tags=["health"])
 
 
 class StreamHealthOut(BaseModel):
