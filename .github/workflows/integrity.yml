@@ -1,0 +1,145 @@
+name: Integrity Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+
+jobs:
+  integrity:
+    name: Service File Integrity
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # -----------------------------------------------------------------------
+      # 1. Detect stub/patch placeholders
+      #    Catches files that say "intentionally left as a patch" or
+      #    define __PATCH__ = True instead of real code.
+      # -----------------------------------------------------------------------
+      - name: Detect stub placeholders
+        run: |
+          echo "=== Checking for stub/patch placeholders ==="
+          STUB_HITS=$(grep -rl "__PATCH__\|intentionally left as a patch\|intentionally left blank" backend/services/ backend/config.py backend/main.py 2>/dev/null || true)
+          if [ -n "$STUB_HITS" ]; then
+            echo "FAIL: The following files contain stub/patch placeholders:"
+            echo "$STUB_HITS"
+            echo ""
+            echo "These files must contain real implementation code, not placeholders."
+            exit 1
+          fi
+          echo "OK: No stub placeholders found."
+
+      # -----------------------------------------------------------------------
+      # 2. Check critical service files are not suspiciously small
+      #    A legitimate service file should be > 20 lines.
+      #    A stub is typically 3-5 lines.
+      # -----------------------------------------------------------------------
+      - name: Check service file sizes
+        run: |
+          echo "=== Checking service file sizes ==="
+          FAILED=0
+          CRITICAL_FILES="
+            backend/services/universe_store.py
+            backend/services/symbols_loader.py
+            backend/services/signal_store.py
+            backend/services/stream_manager.py
+            backend/config.py
+            backend/main.py
+          "
+          for FILE in $CRITICAL_FILES; do
+            if [ ! -f "$FILE" ]; then
+              echo "FAIL: $FILE does not exist"
+              FAILED=1
+              continue
+            fi
+            LINES=$(wc -l < "$FILE")
+            if [ "$LINES" -lt 20 ]; then
+              echo "FAIL: $FILE is suspiciously small ($LINES lines). Minimum expected: 20 lines."
+              FAILED=1
+            else
+              echo "OK: $FILE ($LINES lines)"
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "One or more critical files appear to be stubs. Check the files above."
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 3. Verify universe_store.py exports required public functions
+      # -----------------------------------------------------------------------
+      - name: Verify universe_store public API
+        run: |
+          echo "=== Verifying universe_store.py public API ==="
+          FILE="backend/services/universe_store.py"
+          REQUIRED_FUNCTIONS="load_fresh_snapshot load_any_snapshot load_tier_map save_snapshot upsert_symbol_quotes"
+          FAILED=0
+          for FN in $REQUIRED_FUNCTIONS; do
+            if ! grep -q "^async def ${FN}\|^def ${FN}" "$FILE"; then
+              echo "FAIL: $FILE is missing function: $FN"
+              FAILED=1
+            else
+              echo "OK: $FN found"
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 4. Verify symbols_loader.py exports required public functions
+      # -----------------------------------------------------------------------
+      - name: Verify symbols_loader public API
+        run: |
+          echo "=== Verifying symbols_loader.py public API ==="
+          FILE="backend/services/symbols_loader.py"
+          REQUIRED_FUNCTIONS="load_universe"
+          FAILED=0
+          for FN in $REQUIRED_FUNCTIONS; do
+            if ! grep -q "^async def ${FN}\|^def ${FN}" "$FILE"; then
+              echo "FAIL: $FILE is missing function: $FN"
+              FAILED=1
+            else
+              echo "OK: $FN found"
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 5. Verify config.py has all required Settings fields
+      # -----------------------------------------------------------------------
+      - name: Verify config.py required fields
+        run: |
+          echo "=== Verifying config.py required Settings fields ==="
+          FILE="backend/config.py"
+          REQUIRED_FIELDS="TRADIER_BASE_URL TRADIER_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY SECRET_KEY UNIVERSE_MIN_PRICE UNIVERSE_MIN_VOLUME"
+          FAILED=0
+          for FIELD in $REQUIRED_FIELDS; do
+            if ! grep -q "${FIELD}" "$FILE"; then
+              echo "FAIL: config.py is missing field: $FIELD"
+              FAILED=1
+            else
+              echo "OK: $FIELD found"
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: All integrity checks passed
+        run: echo "All integrity checks passed. No clobbered or stubbed files detected."
