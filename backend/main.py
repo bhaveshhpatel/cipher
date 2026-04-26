@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -17,7 +17,6 @@ from routers import history
 from routers import admin
 from routers import health          # B-008: stream health router
 from core.auth import get_current_user
-from fastapi import Depends
 from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
