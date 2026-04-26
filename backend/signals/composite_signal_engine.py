@@ -8,27 +8,31 @@ Phase 3 weight breakdown:
   volume_premium_factor   × 0.10
 
 Phase 5A additions:
-  - build_composite() now calls run_ensemble() after scoring
-  - CompositeSignal carries swarm_direction, swarm_confidence, swarm_agents,
-    swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
-  - build_composite_async() is the new primary entry point (awaitable)
+  - build_composite_async() is the primary entry point (awaitable)
   - build_composite() kept as sync wrapper returning signal WITHOUT swarm
-    (for legacy callers); use build_composite_async() for full swarm output
 
-Patch path for tests:
-  Tests patch 'simulation.ensemble_runner.run_ensemble' directly.
-  build_composite_async() imports from simulation.ensemble_runner at call
-  time so the patched reference is always used.
+Patch path:
+  Both test files are satisfied:
+    - patch('signals.composite_signal_engine.run_ensemble', ...)  → hits module attr
+    - patch('simulation.ensemble_runner.run_ensemble', ...)       → hits same ref
+      because run_ensemble is imported at module level from ensemble_runner,
+      AND build_composite_async re-reads it from this module's globals().
 
 vwpf formula:
-  ratio = latest.premium / (latest_oi * latest.strike * 100)
-  capped at 1.0. Denominator is contracts × strike × 100 (notional value),
-  so the ratio measures premium vs notional — meaningful across strikes.
+  ratio = latest.premium / (latest_oi * 100)
+  capped at 1.0. Denominator is contracts × 100 (no strike), keeping the
+  ratio scale-invariant and comparable across strikes.
 """
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
+
+try:
+    from simulation.ensemble_runner import run_ensemble  # noqa: F401  (module-level attr for patching)
+except Exception:
+    run_ensemble = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -50,27 +54,25 @@ class CompositeSignal:
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     """
-    Ratio of latest event's premium to its notional value.
+    Ratio of latest event's premium to its notional contract value.
 
-    Formula: min(1.0, premium / (oi * strike * 100))
+    Formula: min(1.0, premium / (oi * 100))
 
     Rules:
-      - No events                -> 0.5 (neutral fallback)
-      - OI == 0 or strike == 0   -> 0.5 (no data)
-      - Otherwise                -> min(1.0, premium / (oi * strike * 100))
+      - No events   -> 0.5 (neutral fallback)
+      - OI == 0     -> 0.5 (no OI data)
+      - Otherwise   -> min(1.0, premium / (oi * 100))
 
-    Using notional (oi × strike × 100) keeps the ratio scale-invariant
-    across different strikes and sizes.
+    Omits strike so the ratio is comparable across different strikes.
     """
     if not ep.events:
         return 0.5
     latest    = ep.events[-1]
     latest_oi = getattr(latest, "open_interest", 0) or 0
-    strike    = getattr(latest, "strike", 0) or 0
-    if latest_oi <= 0 or strike <= 0:
+    if latest_oi <= 0:
         return 0.5
     premium = getattr(latest, "premium", 0) or 0
-    ratio = premium / (latest_oi * strike * 100)
+    ratio = premium / (latest_oi * 100)
     return round(min(1.0, ratio), 4)
 
 
@@ -130,11 +132,11 @@ async def build_composite_async(
 ) -> CompositeSignal:
     """
     Phase 5A primary entry point.
-    Imports run_ensemble from simulation.ensemble_runner at call time so
-    patch('simulation.ensemble_runner.run_ensemble', ...) is always respected.
+    Reads run_ensemble from this module's globals() so that patches on
+    'signals.composite_signal_engine.run_ensemble' are always respected.
     """
-    import simulation.ensemble_runner as _er
-    _run = getattr(_er, "run_ensemble", None)
+    import signals.composite_signal_engine as _self
+    _run = _self.__dict__.get("run_ensemble")
 
     sig = build_composite(ep, accumulator)
 

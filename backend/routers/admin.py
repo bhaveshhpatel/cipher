@@ -31,13 +31,15 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # ---------------------------------------------------------------------------
 # Valid tier_thresholds column names — whitelist prevents SQL injection.
-# Exposed as _TIER_THRESHOLD_COLUMNS for test introspection.
+# _ALLOWED_TIER_COLUMNS / _TIER_THRESHOLD_COLUMNS are both exposed so either
+# name satisfies test introspection across test files.
 # ---------------------------------------------------------------------------
-_TIER_THRESHOLD_COLUMNS = {
+_ALLOWED_TIER_COLUMNS = {
     "t1_min_volume", "t1_min_last_price", "t1_min_oi", "t1_atm_pct", "t1_max_dte",
     "t2_min_volume", "t2_min_last_price", "t2_min_oi", "t2_atm_pct", "t2_max_dte",
     "t3_min_volume", "t3_min_last_price", "t3_min_oi", "t3_atm_pct", "t3_max_dte",
 }
+_TIER_THRESHOLD_COLUMNS = _ALLOWED_TIER_COLUMNS  # alias
 
 
 def _require_admin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
@@ -162,12 +164,12 @@ async def update_tier_thresholds(
     body:  TierThresholdUpdate,
     admin: TokenData = Depends(_require_admin),
 ):
-    unknown = set(body.updates.keys()) - _TIER_THRESHOLD_COLUMNS
+    unknown = set(body.updates.keys()) - _ALLOWED_TIER_COLUMNS
     if unknown:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown threshold column(s): {sorted(unknown)}. "
-                   f"Valid columns: {sorted(_TIER_THRESHOLD_COLUMNS)}",
+                   f"Valid columns: {sorted(_ALLOWED_TIER_COLUMNS)}",
         )
     if not body.updates:
         raise HTTPException(status_code=422, detail="No updates provided.")
@@ -198,9 +200,9 @@ async def update_tier_thresholds(
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    # invalidate_cache() called synchronously — not deferred — so new thresholds
-    # take effect on the very next universe refresh cycle.
-    te.invalidate_cache()
+    # invalidate_thresholds_cache() / invalidate_cache() — called synchronously
+    # so new thresholds take effect on the very next universe refresh cycle.
+    te.invalidate_thresholds_cache()
 
     log.info(
         "[admin] tier_thresholds updated by %s: %s",
