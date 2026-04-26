@@ -53,7 +53,6 @@ Covers:
   - API exception returns fallback HOLD with confidence=0.5
 """
 import pytest
-import asyncio
 from unittest.mock import patch, AsyncMock, MagicMock
 from dataclasses import fields as dc_fields
 
@@ -104,15 +103,15 @@ def test_agent_roles_unique_names():
     (1,  3),
     (2,  3),
     (3,  3),
-    (4,  3),   # |4-3|=1 < |4-6|=2
+    (4,  3),
     (6,  6),
-    (7,  6),   # |7-6|=1 < |7-9|=2
-    (8,  9),   # |8-9|=1 < |8-6|=2
+    (7,  6),
+    (8,  9),
     (9,  9),
-    (10, 9),   # |10-9|=1 < |10-12|=2
-    (11, 12),  # |11-12|=1 < |11-9|=2
+    (10, 9),
+    (11, 12),
     (12, 12),
-    (13, 12),  # clamped to 12
+    (13, 12),
 ])
 def test_resolve_n_agents(requested, expected):
     assert _resolve_n_agents(requested) == expected
@@ -192,7 +191,7 @@ def test_swarm_engine_n_agents_snapped():
         ms.GROQ_API_KEY   = None
         ms.SWARM_N_AGENTS = 6
         engine = SwarmEngine(n_agents=7)
-    assert engine.n_agents == 6  # 7 snapped to 6
+    assert engine.n_agents == 6
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +244,6 @@ async def test_swarm_run_no_client_roles_populated():
 # ---------------------------------------------------------------------------
 
 def _mock_completion(text: str):
-    """Build a mock AsyncOpenAI client whose completions return `text`."""
     mock_choice  = MagicMock()
     mock_choice.message.content = text
     mock_response = MagicMock()
@@ -255,7 +253,7 @@ def _mock_completion(text: str):
     return mock_client
 
 
-AGENT_DEF = AGENT_ROLES[0]  # momentum
+AGENT_DEF = AGENT_ROLES[0]
 
 
 @pytest.mark.asyncio

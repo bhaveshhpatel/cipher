@@ -27,10 +27,7 @@ Covers:
 """
 import time
 import asyncio
-import unittest.mock as mock
 from unittest.mock import AsyncMock, patch, MagicMock
-
-import pytest
 
 # Ensure backend/ is on sys.path (conftest.py handles this)
 from utils.dedup import DedupCache, flow_dedup

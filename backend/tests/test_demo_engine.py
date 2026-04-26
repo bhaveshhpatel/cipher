@@ -44,10 +44,9 @@ Covers (matched to actual source):
 """
 import pytest
 import asyncio
-from datetime import date, timedelta
-from unittest.mock import patch, AsyncMock
+from datetime import date
+from unittest.mock import patch
 
-import services.demo_engine as de
 from services.demo_engine import (
     _nearest_friday,
     _round_to_strike,
@@ -103,30 +102,30 @@ def test_nearest_friday_weeks_8_is_future():
 # ── _round_to_strike ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("price,expected", [
-    (12.3,  12.5),   # < 50: rounds to nearest 0.50
-    (10.7,  11.0),   # < 50: rounds to nearest 0.50
-    (49.9,  50.0),   # < 50: rounds to nearest 0.50
-    (25.0,  25.0),   # < 50: exact 0.50 multiple
+    (12.3,  12.5),
+    (10.7,  11.0),
+    (49.9,  50.0),
+    (25.0,  25.0),
 ])
 def test_round_to_strike_below_50(price, expected):
     assert _round_to_strike(price, "CALL") == expected
 
 
 @pytest.mark.parametrize("price,expected", [
-    (150.7, 151.0),  # [50,200): rounds to nearest 1.0
-    (100.4, 100.0),  # [50,200): rounds down
-    (50.0,  50.0),   # boundary: price==50 uses 1.0 increment
-    (199.6, 200.0),  # [50,200): rounds up to 200
+    (150.7, 151.0),
+    (100.4, 100.0),
+    (50.0,  50.0),
+    (199.6, 200.0),
 ])
 def test_round_to_strike_50_to_200(price, expected):
     assert _round_to_strike(price, "PUT") == expected
 
 
 @pytest.mark.parametrize("price,expected", [
-    (500.0, 500.0),  # ≥200: exact 5.0 multiple
-    (502.0, 500.0),  # ≥200: rounds down
-    (503.0, 505.0),  # ≥200: rounds up
-    (200.0, 200.0),  # boundary: price==200 uses 5.0 increment
+    (500.0, 500.0),
+    (502.0, 500.0),
+    (503.0, 505.0),
+    (200.0, 200.0),
 ])
 def test_round_to_strike_200_and_above(price, expected):
     assert _round_to_strike(price, "CALL") == expected
@@ -178,7 +177,6 @@ def test_build_occ_symbol_lowercase_call_accepted():
 def test_build_occ_symbol_strike_zero_padded_to_8():
     expiry = date(2026, 6, 20)
     result = _build_occ_symbol("AAPL", expiry, "CALL", 180.0)
-    # 180.0 * 1000 = 180000 → zero-padded to 8: '00180000'
     assert result[13:] == "00180000"
 
 
@@ -259,8 +257,6 @@ def test_timesale_envelope_size_preserved():
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def test_is_running_false_at_import():
-    """Before any test starts the demo, is_running() must be False."""
-    # The autouse fixture ensures this by stopping any leftover task.
     assert not is_running()
 
 
@@ -277,7 +273,6 @@ def test_get_stats_running_false_when_not_started():
 
 @pytest.mark.asyncio
 async def test_stop_demo_when_not_running_returns_already_stopped():
-    # Ensure clean state
     if is_running():
         await stop_demo()
     result = await stop_demo()
@@ -286,7 +281,6 @@ async def test_stop_demo_when_not_running_returns_already_stopped():
 
 @pytest.mark.asyncio
 async def test_start_demo_returns_started():
-    # Patch _run_demo_loop to avoid actually starting the loop
     async def _noop_loop(tickers):
         await asyncio.sleep(9999)
 
@@ -302,7 +296,7 @@ async def test_start_demo_idempotent_returns_already_running():
 
     with patch("services.demo_engine._run_demo_loop", side_effect=_noop_loop):
         await start_demo()
-        result = await start_demo()  # second call
+        result = await start_demo()
     assert result == {"ok": True, "status": "already_running"}
 
 
@@ -335,5 +329,5 @@ async def test_stop_after_stop_returns_already_stopped():
         await start_demo()
         await stop_demo()
 
-    result = await stop_demo()  # second stop
+    result = await stop_demo()
     assert result == {"ok": True, "status": "already_stopped"}

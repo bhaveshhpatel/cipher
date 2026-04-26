@@ -12,8 +12,7 @@ Covers:
 All tests are pure-Python / asyncio — no Supabase, no network.
 """
 import asyncio
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 
 def run(coro):
@@ -240,8 +239,8 @@ class TestTierParamsAndContractMeta:
 
     # TE-19
     def test_contract_meta_has_tier_field(self):
-        from services.symbol_registry import ContractMeta
         import inspect
+        from services.symbol_registry import ContractMeta
         fields = set()
         if hasattr(ContractMeta, "__dataclass_fields__"):
             fields = set(ContractMeta.__dataclass_fields__.keys())
@@ -254,6 +253,7 @@ class TestTierParamsAndContractMeta:
             "ContractMeta must carry a 'tier' field (int, 1/2/3) so downstream "
             "signal layers know the symbol's tier without re-querying the DB."
         )
+        _ = inspect  # used above
 
     # TE-20
     def test_tier_params_t1_wider_than_t3(self):
