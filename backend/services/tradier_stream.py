@@ -59,9 +59,9 @@ Fix (C-019) — Dedup TTL & Sweep Overhaul (Layer 4):
     imported here — dedup was completely inert in production.
   - exchange code read from trade_payload with "exch"/"exchange" fallback
     to handle both real Tradier feed ("exch") and demo engine ("exchange").
-  - If flow_dedup.is_duplicate() returns True → event dropped, _stats["deduped"]
+  - If flow_dedup.is_duplicate() returns True -> event dropped, _stats["deduped"]
     incremented. No DB write, no accumulator ingest.
-  - If is_sweep() returns True after canonical pass → ev.trade_type upgraded to
+  - If is_sweep() returns True after canonical pass -> ev.trade_type upgraded to
     "SWEEP" and ev.exchange_count set to the real unique-exchange count.
   - _stats now includes "deduped" counter exposed via /health endpoint.
   - DedupCache.dedup_stats() merged into get_stats() for full observability.
@@ -71,6 +71,11 @@ B-008 — Stream Health:
     and last_reconnect_at (float epoch, updated on every reconnect attempt).
   - _stream_start_at records process start time for uptime_seconds calculation.
   - get_stats() exposes all counters + timestamps for GET /health/stream.
+
+B4-001 — start_stream alias:
+  - Tests reference tradier_stream.start_stream([...]); the canonical entry
+    point is stream_options_flow(). Added alias at module level so tests and
+    any future callers resolve without breaking main.py lifespan usage.
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -280,6 +285,11 @@ async def stream_options_flow(symbols: list[str]):
     await manager.run()
 
 
+# B4-001: alias so tests that patch/call tradier_stream.start_stream([...]) resolve
+# correctly. main.py lifespan continues to call stream_options_flow() directly.
+start_stream = stream_options_flow
+
+
 # ---------------------------------------------------------------------------
 # Idle watchdog
 # ---------------------------------------------------------------------------
@@ -378,7 +388,7 @@ async def _process_trade(raw: dict):
         if ev.trade_type != "SWEEP":
             log.debug(
                 f"[dedup] sweep upgrade: {occ_symbol} "
-                f"{real_exch_count} exchanges — {ev.trade_type} → SWEEP"
+                f"{real_exch_count} exchanges — {ev.trade_type} -> SWEEP"
             )
             ev.trade_type = "SWEEP"
         ev.exchange_count = real_exch_count
