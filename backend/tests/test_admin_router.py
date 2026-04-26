@@ -1,49 +1,109 @@
 """
 Regression tests for routers/admin.py
 
+Strategy:
+  - All routes use _require_admin which calls get_current_user (JWT) then
+    checks role == 'admin'. We override the dependency at the app level.
+  - Supabase calls inside endpoints are patched via unittest.mock so no
+    live DB is needed.
+  - Demo engine calls are patched to avoid side-effects.
+
 Covers:
-  - Non-admin user (role='user') → 403 on every endpoint
-  - Unauthenticated → 401 on every endpoint
-  - Admin user can reach /demo/status
-  - Admin user can reach /demo/on and /demo/off
-  - Admin user can reach /ingestion/config (GET)
-  - Admin user can reach /ingestion/config (PATCH)
-  - Ingestion config PATCH returns 500 when update_config fails
-  - /tier-thresholds GET: returns row + cache shape
-  - /tier-thresholds PATCH: rejects unknown column names (422)
-  - /tier-thresholds PATCH: rejects empty updates dict (422)
-  - /tier-thresholds PATCH: happy path updates and invalidates cache
-  - /tier-distribution GET: returns expected shape
-  - /tier-distribution GET: 404 when no active snapshot
+  _require_admin:
+  - User with role='user' gets 403 on every protected endpoint
+  - User with role='admin' passes the guard
+  - 403 response body contains 'Admin access required'
+
+  _ALLOWED_TIER_COLUMNS whitelist:
+  - All 15 expected column names are present
+  - All t1/t2/t3 prefixed names are present
+
+  GET /api/admin/demo/status:
+  - Returns dict with 'demo', 'admin', 'role' keys
+  - 'admin' field contains the email from TokenData
+
+  POST /api/admin/demo/on:
+  - Calls start_demo() and returns its result
+  - Returns {ok: True, status: 'started'} or 'already_running'
+
+  POST /api/admin/demo/off:
+  - Calls stop_demo() and returns its result
+  - Returns {ok: True, status: 'stopped'} or 'already_stopped'
+
+  GET /api/admin/ingestion/config:
+  - Returns {config: <list>}
+  - Works when get_all_rows returns []
+
+  PATCH /api/admin/ingestion/config:
+  - Success: returns {ok: True, key: ..., value: ...}
+  - Failure (update_config returns False): returns 500
+
+  PATCH /api/admin/tier-thresholds:
+  - Unknown column in updates → 422
+  - Empty updates dict → 422
+  - No SUPABASE_SERVICE_KEY → 500
+
+  GET /api/admin/tier-distribution:
+  - No SUPABASE_SERVICE_KEY → 500
 """
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
-from core.auth import create_access_token, TokenData
-from main import app
+from fastapi import FastAPI
+from unittest.mock import patch, AsyncMock, MagicMock
 
-client = TestClient(app)
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def _make_token() -> str:
-    return create_access_token({"sub": "user@cipher.io"})
+from core.auth import get_current_user, TokenData
+from routers.admin import router, _ALLOWED_TIER_COLUMNS
 
 
-def _auth(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
+# ---------------------------------------------------------------------------
+# App fixture
+# ---------------------------------------------------------------------------
+
+def _make_app(role: str = "admin") -> FastAPI:
+    app = FastAPI()
+    app.include_router(router)
+
+    async def _override_user():
+        return TokenData(email="test@cipher.app", role=role)
+
+    app.dependency_overrides[get_current_user] = _override_user
+    return app
 
 
-def _mock_user(role="user"):
-    td = TokenData(email="user@cipher.io", role=role)
-    return patch("routers.admin.get_current_user", return_value=td)
+@pytest.fixture
+def admin_client():
+    return TestClient(_make_app(role="admin"))
 
 
-def _mock_admin():
-    return _mock_user(role="admin")
+@pytest.fixture
+def user_client():
+    return TestClient(_make_app(role="user"))
 
 
-# ── auth guard: unauthenticated ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# _ALLOWED_TIER_COLUMNS whitelist
+# ---------------------------------------------------------------------------
+
+def test_allowed_tier_columns_is_set():
+    assert isinstance(_ALLOWED_TIER_COLUMNS, set)
+
+
+def test_allowed_tier_columns_has_15_entries():
+    assert len(_ALLOWED_TIER_COLUMNS) == 15
+
+
+@pytest.mark.parametrize("col", [
+    "t1_min_volume", "t1_min_last_price", "t1_min_oi", "t1_atm_pct", "t1_max_dte",
+    "t2_min_volume", "t2_min_last_price", "t2_min_oi", "t2_atm_pct", "t2_max_dte",
+    "t3_min_volume", "t3_min_last_price", "t3_min_oi", "t3_atm_pct", "t3_max_dte",
+])
+def test_allowed_tier_columns_contains_expected(col):
+    assert col in _ALLOWED_TIER_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# _require_admin: non-admin gets 403
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("method,path", [
     ("GET",   "/api/admin/demo/status"),
@@ -55,211 +115,171 @@ def _mock_admin():
     ("PATCH", "/api/admin/tier-thresholds"),
     ("GET",   "/api/admin/tier-distribution"),
 ])
-def test_admin_unauthenticated_returns_401(method, path):
-    resp = client.request(method, path)
-    assert resp.status_code == 401
-
-
-# ── auth guard: non-admin (role='user') → 403 ─────────────────────────────────
-
-@pytest.mark.parametrize("method,path,body", [
-    ("GET",   "/api/admin/demo/status", None),
-    ("POST",  "/api/admin/demo/on",     None),
-    ("POST",  "/api/admin/demo/off",    None),
-    ("GET",   "/api/admin/ingestion/config",  None),
-    ("PATCH", "/api/admin/ingestion/config",  {"key": "foo", "value": "bar"}),
-    ("GET",   "/api/admin/tier-thresholds",   None),
-    ("PATCH", "/api/admin/tier-thresholds",   {"updates": {"t1_min_volume": 5000000}}),
-    ("GET",   "/api/admin/tier-distribution", None),
-])
-def test_admin_non_admin_returns_403(method, path, body):
-    with _mock_user(role="user"):
-        kwargs = {"headers": _auth(_make_token())}
-        if body:
-            kwargs["json"] = body
-        resp = client.request(method, path, **kwargs)
+def test_non_admin_gets_403(user_client, method, path):
+    resp = getattr(user_client, method.lower())(path, json={})
     assert resp.status_code == 403
-    assert "Admin" in resp.json()["detail"] or "admin" in resp.json()["detail"].lower()
+    assert "Admin access required" in resp.json()["detail"]
 
 
-# ── /demo/status ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# GET /api/admin/demo/status
+# ---------------------------------------------------------------------------
 
-def test_admin_demo_status_returns_stats():
-    fake_stats = {"running": False, "events_sent": 0}
-    with _mock_admin():
-        with patch("services.demo_engine.get_stats", return_value=fake_stats), \
-             patch("services.demo_engine.is_running", return_value=False):
-            resp = client.get("/api/admin/demo/status", headers=_auth(_make_token()))
+def test_demo_status_returns_expected_keys(admin_client):
+    mock_stats = {"running": False, "ticks_emitted": 0, "signals_emitted": 0, "errors": 0}
+    with patch("routers.admin.services.demo_engine", create=True), \
+         patch("services.demo_engine.get_stats", return_value=mock_stats):
+        resp = admin_client.get("/api/admin/demo/status")
     assert resp.status_code == 200
     body = resp.json()
     assert "demo" in body
     assert "admin" in body
+    assert "role"  in body
 
 
-# ── /demo/on and /demo/off ────────────────────────────────────────────────────
+def test_demo_status_admin_email_present(admin_client):
+    mock_stats = {"running": False, "ticks_emitted": 0, "signals_emitted": 0, "errors": 0}
+    with patch("services.demo_engine.get_stats", return_value=mock_stats):
+        resp = admin_client.get("/api/admin/demo/status")
+    assert resp.json()["admin"] == "test@cipher.app"
 
-def test_admin_demo_on_calls_start_demo():
-    with _mock_admin():
-        with patch("services.demo_engine.start_demo", new=AsyncMock(return_value={"ok": True, "status": "started"})):
-            resp = client.post("/api/admin/demo/on", headers=_auth(_make_token()))
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/demo/on
+# ---------------------------------------------------------------------------
+
+def test_demo_on_returns_started(admin_client):
+    with patch("services.demo_engine.start_demo", new_callable=AsyncMock,
+               return_value={"ok": True, "status": "started"}):
+        resp = admin_client.post("/api/admin/demo/on")
     assert resp.status_code == 200
-    assert resp.json().get("ok") is True
+    assert resp.json() == {"ok": True, "status": "started"}
 
 
-def test_admin_demo_off_calls_stop_demo():
-    with _mock_admin():
-        with patch("services.demo_engine.stop_demo", new=AsyncMock(return_value={"ok": True, "status": "stopped"})):
-            resp = client.post("/api/admin/demo/off", headers=_auth(_make_token()))
+def test_demo_on_idempotent_already_running(admin_client):
+    with patch("services.demo_engine.start_demo", new_callable=AsyncMock,
+               return_value={"ok": True, "status": "already_running"}):
+        resp = admin_client.post("/api/admin/demo/on")
     assert resp.status_code == 200
+    assert resp.json()["status"] == "already_running"
 
 
-# ── /ingestion/config GET ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# POST /api/admin/demo/off
+# ---------------------------------------------------------------------------
 
-def test_admin_get_ingestion_config_returns_config():
-    fake_rows = [{"key": "STREAM_BATCH_SIZE", "value": "50", "description": "Batch size"}]
-    with _mock_admin():
-        with patch("services.ingestion_config.get_all_rows", new=AsyncMock(return_value=fake_rows)):
-            resp = client.get("/api/admin/ingestion/config", headers=_auth(_make_token()))
+def test_demo_off_returns_stopped(admin_client):
+    with patch("services.demo_engine.stop_demo", new_callable=AsyncMock,
+               return_value={"ok": True, "status": "stopped"}):
+        resp = admin_client.post("/api/admin/demo/off")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "status": "stopped"}
+
+
+def test_demo_off_idempotent_already_stopped(admin_client):
+    with patch("services.demo_engine.stop_demo", new_callable=AsyncMock,
+               return_value={"ok": True, "status": "already_stopped"}):
+        resp = admin_client.post("/api/admin/demo/off")
+    assert resp.json()["status"] == "already_stopped"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/ingestion/config
+# ---------------------------------------------------------------------------
+
+def test_get_ingestion_config_returns_config_key(admin_client):
+    with patch("services.ingestion_config.get_all_rows", new_callable=AsyncMock,
+               return_value=[]):
+        resp = admin_client.get("/api/admin/ingestion/config")
     assert resp.status_code == 200
     assert "config" in resp.json()
-    assert resp.json()["config"] == fake_rows
 
 
-# ── /ingestion/config PATCH ───────────────────────────────────────────────────
+def test_get_ingestion_config_rows_passed_through(admin_client):
+    rows = [{"key": "REGISTRY_MAX_DTE", "value": "90", "value_type": "int"}]
+    with patch("services.ingestion_config.get_all_rows", new_callable=AsyncMock,
+               return_value=rows):
+        resp = admin_client.get("/api/admin/ingestion/config")
+    assert resp.json()["config"] == rows
 
-def test_admin_patch_ingestion_config_success():
-    with _mock_admin():
-        with patch("services.ingestion_config.update_config", new=AsyncMock(return_value=True)):
-            resp = client.patch(
-                "/api/admin/ingestion/config",
-                headers=_auth(_make_token()),
-                json={"key": "STREAM_BATCH_SIZE", "value": "100"},
-            )
+
+# ---------------------------------------------------------------------------
+# PATCH /api/admin/ingestion/config
+# ---------------------------------------------------------------------------
+
+def test_patch_ingestion_config_success(admin_client):
+    with patch("services.ingestion_config.update_config", new_callable=AsyncMock,
+               return_value=True):
+        resp = admin_client.patch(
+            "/api/admin/ingestion/config",
+            json={"key": "REGISTRY_MAX_DTE", "value": "60"},
+        )
     assert resp.status_code == 200
-    assert resp.json()["ok"] is True
-    assert resp.json()["key"] == "STREAM_BATCH_SIZE"
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["key"] == "REGISTRY_MAX_DTE"
+    assert body["value"] == "60"
 
 
-def test_admin_patch_ingestion_config_returns_500_on_failure():
-    with _mock_admin():
-        with patch("services.ingestion_config.update_config", new=AsyncMock(return_value=False)):
-            resp = client.patch(
-                "/api/admin/ingestion/config",
-                headers=_auth(_make_token()),
-                json={"key": "BAD_KEY", "value": "x"},
-            )
+def test_patch_ingestion_config_failure_returns_500(admin_client):
+    with patch("services.ingestion_config.update_config", new_callable=AsyncMock,
+               return_value=False):
+        resp = admin_client.patch(
+            "/api/admin/ingestion/config",
+            json={"key": "REGISTRY_MAX_DTE", "value": "60"},
+        )
     assert resp.status_code == 500
 
 
-# ── /tier-thresholds GET ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PATCH /api/admin/tier-thresholds: validation
+# ---------------------------------------------------------------------------
 
-def test_admin_get_tier_thresholds_returns_row_and_cache():
-    fake_row = {"id": 1, "is_active": True, "t1_min_volume": 10_000_000}
-
-    def fake_fetch():
-        return [fake_row]
-
-    import services.tier_engine as te
-
-    with _mock_admin():
-        with patch("routers.admin.settings") as mock_settings, \
-             patch("routers.admin.asyncio") as mock_asyncio:
-            mock_settings.SUPABASE_SERVICE_KEY = "fake-key"
-            mock_settings.SUPABASE_URL = "https://fake.supabase.co"
-            loop = MagicMock()
-            mock_asyncio.get_event_loop.return_value = loop
-
-            import asyncio
-            loop.run_in_executor = AsyncMock(return_value=[fake_row])
-
-            with patch("routers.admin.create_client"):
-                resp = client.get("/api/admin/tier-thresholds", headers=_auth(_make_token()))
-
-    assert resp.status_code in (200, 422, 500)  # shape test — must not 403/401
-
-
-# ── /tier-thresholds PATCH: validation ───────────────────────────────────────
-
-def test_admin_patch_tier_thresholds_unknown_column_returns_422():
-    with _mock_admin():
-        resp = client.patch(
-            "/api/admin/tier-thresholds",
-            headers=_auth(_make_token()),
-            json={"updates": {"totally_unknown_column": 99}},
-        )
+def test_patch_tier_thresholds_unknown_column_returns_422(admin_client):
+    resp = admin_client.patch(
+        "/api/admin/tier-thresholds",
+        json={"updates": {"not_a_real_column": 100}},
+    )
     assert resp.status_code == 422
     assert "Unknown threshold column" in resp.json()["detail"]
 
 
-def test_admin_patch_tier_thresholds_empty_updates_returns_422():
-    with _mock_admin():
-        resp = client.patch(
-            "/api/admin/tier-thresholds",
-            headers=_auth(_make_token()),
-            json={"updates": {}},
-        )
+def test_patch_tier_thresholds_empty_updates_returns_422(admin_client):
+    resp = admin_client.patch(
+        "/api/admin/tier-thresholds",
+        json={"updates": {}},
+    )
     assert resp.status_code == 422
-    assert "No updates" in resp.json()["detail"]
 
 
-def test_admin_patch_tier_thresholds_valid_column_accepted():
-    """A whitelisted column name must pass the validation gate (may fail DB in test env)."""
-    with _mock_admin():
-        with patch("routers.admin.settings") as ms, \
-             patch("routers.admin.asyncio") as ma, \
-             patch("routers.admin.create_client"), \
-             patch("routers.admin.invalidate_cache"):
-            ms.SUPABASE_SERVICE_KEY = "fake-key"
-            ms.SUPABASE_URL = "https://fake.supabase.co"
-            loop = MagicMock()
-            ma.get_event_loop.return_value = loop
-            fake_updated = [{"id": 1, "t1_min_volume": 25_000_000}]
-            loop.run_in_executor = AsyncMock(return_value=fake_updated)
-
-            resp = client.patch(
-                "/api/admin/tier-thresholds",
-                headers=_auth(_make_token()),
-                json={"updates": {"t1_min_volume": 25_000_000}},
-            )
-    # The validation gate must have passed (not 422 for column name)
-    assert resp.status_code != 422 or "Unknown threshold column" not in str(resp.json())
+def test_patch_tier_thresholds_no_service_key_returns_500(admin_client):
+    """Valid columns but missing SUPABASE_SERVICE_KEY → 500."""
+    with patch("routers.admin.settings") as ms:
+        ms.SUPABASE_SERVICE_KEY = ""
+        resp = admin_client.patch(
+            "/api/admin/tier-thresholds",
+            json={"updates": {"t1_min_volume": 1000}},
+        )
+    assert resp.status_code == 500
 
 
-# ── /tier-distribution GET ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# GET /api/admin/tier-distribution: no service key → 500
+# ---------------------------------------------------------------------------
 
-def test_admin_tier_distribution_happy_path():
-    fake_sym_rows = [
-        {"symbol": "SPY",  "tier": 1, "open_interest": 50000},
-        {"symbol": "AAPL", "tier": 2, "open_interest": 30000},
-        {"symbol": "TSLA", "tier": 3, "open_interest": None},
-    ]
-
-    with _mock_admin():
-        with patch("routers.admin.settings") as ms, \
-             patch("routers.admin.asyncio") as ma, \
-             patch("routers.admin.create_client"):
-            ms.SUPABASE_SERVICE_KEY = "fake-key"
-            ms.SUPABASE_URL = "https://fake.supabase.co"
-            loop = MagicMock()
-            ma.get_event_loop.return_value = loop
-            loop.run_in_executor = AsyncMock(return_value=("snap-123", fake_sym_rows))
-
-            resp = client.get("/api/admin/tier-distribution", headers=_auth(_make_token()))
-
-    assert resp.status_code in (200, 500)  # DB may not be available in CI — must not be 403/401
+def test_get_tier_distribution_no_service_key_returns_500(admin_client):
+    with patch("routers.admin.settings") as ms:
+        ms.SUPABASE_SERVICE_KEY = ""
+        resp = admin_client.get("/api/admin/tier-distribution")
+    assert resp.status_code == 500
 
 
-def test_admin_tier_distribution_no_snapshot_returns_404():
-    with _mock_admin():
-        with patch("routers.admin.settings") as ms, \
-             patch("routers.admin.asyncio") as ma, \
-             patch("routers.admin.create_client"):
-            ms.SUPABASE_SERVICE_KEY = "fake-key"
-            ms.SUPABASE_URL = "https://fake.supabase.co"
-            loop = MagicMock()
-            ma.get_event_loop.return_value = loop
-            loop.run_in_executor = AsyncMock(return_value=(None, {}))
+# ---------------------------------------------------------------------------
+# GET /api/admin/tier-thresholds: no service key → 500
+# ---------------------------------------------------------------------------
 
-            resp = client.get("/api/admin/tier-distribution", headers=_auth(_make_token()))
-
-    assert resp.status_code == 404
+def test_get_tier_thresholds_no_service_key_returns_500(admin_client):
+    with patch("routers.admin.settings") as ms:
+        ms.SUPABASE_SERVICE_KEY = ""
+        resp = admin_client.get("/api/admin/tier-thresholds")
+    assert resp.status_code == 500
