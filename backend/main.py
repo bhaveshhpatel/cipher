@@ -343,6 +343,17 @@ app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
 
+# ---------------------------------------------------------------------------
+# Aliases for legacy / health-check paths
+# ---------------------------------------------------------------------------
+
+# Railway health check probe is configured to hit /stream/stats (no /api prefix).
+# Return a simple 200 so the probe passes without requiring auth.
+@app.get("/stream/stats", tags=["health"], include_in_schema=False)
+async def stream_stats_health_alias():
+    return JSONResponse({"status": "ok"})
+
+# /api/stream/stats — authenticated alias kept for backwards compat
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
