@@ -125,7 +125,7 @@ def _build_timesale_envelope(
 # ---------------------------------------------------------------------------
 
 async def _run_demo_loop(tickers: List[str]) -> None:
-    global _stats
+    # NOTE: _stats is mutated in-place (no reassignment) so `global` is not needed.
     _stats["ticks_emitted"]   = 0
     _stats["signals_emitted"] = 0
     _stats["errors"]          = 0

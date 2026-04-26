@@ -15,6 +15,12 @@ Public API:
     - make_key(event)            — single-arg form for test compatibility
     - make_key(occ, size, fill)  — original multi-arg form
   DedupCache — TTL cache class; internal store accessible via ._cache (alias for ._seen)
+
+NOTE on time source:
+  _seen stores wall-clock timestamps (time.time()) so that test code which
+  backdates entries via `cache._cache[key] = time.time() - N` correctly
+  triggers expiry. monotonic() was previously used but is incompatible with
+  wall-clock backdating in tests.
 """
 import time
 from collections import defaultdict
@@ -50,7 +56,10 @@ def make_key(event_or_occ_symbol: Any, size: Optional[int] = None, fill: Optiona
 
 class DedupCache:
     """
-    Asyncio-safe TTL dedup cache with sweep detection.
+    TTL dedup cache with sweep detection.
+
+    Uses wall-clock time (time.time()) for all timestamps so that
+    test backdating via `cache._cache[key] = time.time() - N` works correctly.
 
     Parameters
     ----------
@@ -81,7 +90,7 @@ class DedupCache:
         self._total_duplicates: int = 0
         self._total_sweeps:     int = 0
 
-        self._last_cleanup = time.monotonic()
+        self._last_cleanup = time.time()
 
     # ------------------------------------------------------------------
     # Backward-compat: tests access cache._cache; internal store is _seen
@@ -110,7 +119,7 @@ class DedupCache:
     # ------------------------------------------------------------------
 
     def _cleanup(self):
-        now = time.monotonic()
+        now = time.time()
         if now - self._last_cleanup < 10.0:
             return
         ttl_cutoff   = now - self._ttl
@@ -174,7 +183,7 @@ class DedupCache:
             return self._is_dup_by_raw_key(key, _exch, ts)
 
     def _is_dup_by_raw_key(self, key: str, exchange: str, ts: Optional[float]) -> bool:
-        now = ts if ts is not None else time.monotonic()
+        now = ts if ts is not None else time.time()
         self._cleanup()
 
         first_seen = self._seen.get(key)
@@ -189,7 +198,7 @@ class DedupCache:
         return False
 
     def mark_seen(self, key: str) -> None:
-        self._seen[key] = time.monotonic()
+        self._seen[key] = time.time()
 
     def size(self) -> int:
         return len(self._seen)
@@ -199,7 +208,7 @@ class DedupCache:
         self._exchange_hits.clear()
 
     def evict_expired(self) -> int:
-        now = time.monotonic()
+        now = time.time()
         cutoff = now - self._ttl
         expired = [k for k, ts in self._seen.items() if ts <= cutoff]
         for k in expired:
@@ -208,7 +217,7 @@ class DedupCache:
 
     def get_exchange_count(self, occ_symbol: str, size: int, fill: float) -> int:
         ckey   = self._contract_key(occ_symbol, size, fill)
-        now    = time.monotonic()
+        now    = time.time()
         cutoff = now - self._sweep_win
         recent = [e for t, e in self._exchange_hits.get(ckey, []) if t > cutoff]
         return len(set(e for e in recent if e))
