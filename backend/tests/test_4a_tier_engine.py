@@ -221,17 +221,35 @@ class TestTierMapRoundTrip:
     def test_upsert_symbol_quotes_writes_tier_to_row(self):
         from services import universe_store
         sb = MagicMock()
-        q  = MagicMock()
-        q.upsert.return_value  = q
-        q.execute.return_value = MagicMock(data=[])
-        sb.table.return_value  = q
-        quotes   = {"SPY": {"last": 502.0, "open_interest": 50000, "average_volume": 80_000_000}}
+        tbl = MagicMock()
+        # .select().eq().order().limit().execute() returns snapshot_id
+        tbl.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = \
+            MagicMock(data=[{"id": "snap-123"}])
+        # .upsert().execute() returns success
+        tbl.upsert.return_value.execute.return_value = MagicMock(data=[])
+        sb.table.return_value = tbl
+
+        # _sync_upsert_symbol_quotes expects a list of objects with .symbol, .last_price, etc.
+        quote = _SQ(
+            symbol="SPY",
+            last_price=502.0,
+            volume=80_000_000,
+            average_volume=80_000_000,
+            open_interest=50_000,
+            stream_eligible=True,
+        )
         tier_map = {"SPY": 1}
+
         with patch.object(universe_store, "_client", return_value=sb):
-            universe_store._sync_upsert_symbol_quotes(quotes, tier_map=tier_map)
-        rows = q.upsert.call_args_list[0].args[0]
-        sprow = (rows if not isinstance(rows, list) else next(r for r in rows if r.get("symbol") == "SPY"))
-        assert sprow.get("tier") == 1
+            universe_store._sync_upsert_symbol_quotes([quote], tier_map=tier_map)
+
+        # Verify upsert was called and the row carries tier=1
+        assert tbl.upsert.called, "expected upsert to be called"
+        rows = tbl.upsert.call_args_list[0].args[0]
+        spy_row = rows if not isinstance(rows, list) else next(
+            r for r in rows if r.get("symbol") == "SPY"
+        )
+        assert spy_row.get("tier") == 1
 
 
 # ===========================================================================
