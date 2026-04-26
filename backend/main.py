@@ -4,6 +4,7 @@ Cipher Backend — FastAPI entry point
 import asyncio
 import json
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
@@ -298,28 +299,39 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
-_configured_origins = settings.origins
-_use_wildcard       = "*" in _configured_origins
+# ---------------------------------------------------------------------------
+# CORS — use allow_origin_regex so all Vercel preview URLs are accepted.
+#
+# Pattern covers:
+#   - https://*.vercel.app          (all Vercel production + preview deploys)
+#   - http://localhost:3000/3001    (local dev)
+#   - http://127.0.0.1:3000        (local dev alternative)
+#   - Any explicit origins from CORS_ALLOWED_ORIGINS env var (escaped + OR'd in)
+#
+# We never use allow_origins=["*"] because that breaks allow_credentials=True.
+# ---------------------------------------------------------------------------
+_explicit_origins = settings.origins  # list[str] from env var
 
-if not _use_wildcard:
-    _base = [
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-    ]
-    _allow_origins = list(dict.fromkeys(_base + _configured_origins))
-else:
-    _allow_origins = ["*"]
+# Build regex alternation from any explicit non-wildcard origins in env
+_explicit_patterns = [
+    re.escape(o) for o in _explicit_origins if o != "*"
+]
 
-log.info("CORS allowed origins: %s", _allow_origins)
+_origin_pattern = "|".join(filter(None, [
+    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
+    r"http://localhost:(3000|3001)",
+    r"http://127\.0\.0\.1:3000",
+] + _explicit_patterns))
+
+log.info("CORS allow_origin_regex: %s", _origin_pattern)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = _allow_origins,
-    allow_credentials = not _use_wildcard,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
-    expose_headers    = ["*"],
+    allow_origin_regex = _origin_pattern,
+    allow_credentials  = True,
+    allow_methods      = ["*"],
+    allow_headers      = ["*"],
+    expose_headers     = ["*"],
 )
 
 app.include_router(auth.router)
