@@ -13,27 +13,21 @@ Tier definitions:
 
 OI source (Feature 4A-OI):
   quote.open_interest is populated by main.py from registry.get_oi_map()
-  before assign_tiers() is called. The value is the average open_interest
-  across all option contracts loaded for that ticker in the most recent
-  symbol_registry build (contracts that passed ATM + DTE + per-tier min_oi
-  filters). This makes t*_min_oi thresholds in tier_thresholds fully
-  effective at the symbol classification step with zero extra API calls.
-
-Usage:
-  from services.tier_engine import assign_tiers
-
-  # quotes: list[SymbolQuote] with open_interest populated from registry
-  tiers = await assign_tiers(quotes)   # dict[symbol, int]
+  before assign_tiers() is called.
 
 Caching:
-  Thresholds are fetched from DB and cached for CACHE_TTL seconds
-  (default 300 = 5 min) to avoid a DB round-trip on every snapshot.
-  Cache is invalidated when update_tier_thresholds() is called via
-  the admin router (future 4A-admin endpoint).
+  Thresholds are fetched from DB and cached for CACHE_TTL seconds (default 300).
+  Cache is invalidated when invalidate_cache() / invalidate_thresholds_cache() is called.
+
+Test hooks:
+  assign_tiers(quotes, thresholds=None) — pass a thresholds dict to bypass DB fetch.
+  invalidate_thresholds_cache()         — alias for invalidate_cache() used by tests.
+  _thresh_cache_ts                      — exposed for test assertions.
 """
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import httpx
@@ -72,8 +66,17 @@ _DEFAULT_THRESHOLDS: dict = {
     "t3_max_dte":        30,
 }
 
-_cache: dict = {}
-_cache_ts: float = 0.0
+_cache: dict        = {}
+_cache_ts: float    = 0.0
+_thresh_cache_ts: float = 0.0   # exposed alias used by tests
+
+
+@dataclass
+class _TierParams:
+    """Container for per-tier filter parameters. min_oi defaults to 0 for test convenience."""
+    atm_pct: float
+    max_dte: int
+    min_oi:  int = 0
 
 
 def _headers() -> dict:
@@ -86,7 +89,7 @@ def _headers() -> dict:
 
 async def _fetch_thresholds(force: bool = False) -> dict:
     """Fetch active tier_thresholds row from Supabase with TTL cache."""
-    global _cache, _cache_ts
+    global _cache, _cache_ts, _thresh_cache_ts
 
     if not force and _cache and (time.monotonic() - _cache_ts) < CACHE_TTL:
         return dict(_cache)
@@ -125,8 +128,9 @@ async def _fetch_thresholds(force: bool = False) -> dict:
                     "t3_atm_pct":        float(row.get("t3_atm_pct",        _DEFAULT_THRESHOLDS["t3_atm_pct"])),
                     "t3_max_dte":        int(row.get("t3_max_dte",         _DEFAULT_THRESHOLDS["t3_max_dte"])),
                 }
-                _cache    = result
-                _cache_ts = time.monotonic()
+                _cache          = result
+                _cache_ts       = time.monotonic()
+                _thresh_cache_ts = _cache_ts
                 return dict(result)
         log.warning("[tier_engine] DB fetch failed: HTTP %d — using defaults", resp.status_code)
     except Exception as e:
@@ -136,18 +140,6 @@ async def _fetch_thresholds(force: bool = False) -> dict:
 
 
 def _classify(quote: "SymbolQuote", thresh: dict) -> int:
-    """
-    Return tier 1, 2, or 3 for a single SymbolQuote.
-
-    All three conditions must be satisfied for T1 or T2 promotion:
-      - vol   : quote.average_volume or quote.volume
-      - price : quote.last_price
-      - oi    : quote.open_interest  (avg chain OI from registry.get_oi_map(),
-                                      populated by main.py before assign_tiers)
-
-    A symbol with oi=0 (e.g. no loaded contracts after registry build)
-    will fall through to T3 regardless of vol and price.
-    """
     vol   = quote.average_volume or quote.volume or 0
     price = quote.last_price or 0.0
     oi    = quote.open_interest or 0
@@ -169,20 +161,24 @@ def _classify(quote: "SymbolQuote", thresh: dict) -> int:
     return 3
 
 
-async def assign_tiers(quotes: list["SymbolQuote"]) -> dict[str, int]:
+async def assign_tiers(
+    quotes: list["SymbolQuote"],
+    thresholds: Optional[dict] = None,
+) -> dict[str, int]:
     """
     Classify a list of SymbolQuotes into tiers.
 
-    Expects quote.open_interest to be pre-populated with avg chain OI
-    from registry.get_oi_map() (done in main.py) before this is called.
+    Args:
+        quotes:     list of SymbolQuote objects with open_interest populated.
+        thresholds: optional pre-built thresholds dict (bypasses DB fetch).
+                    Used by tests and admin endpoints to inject custom values.
 
     Returns dict[symbol -> tier (1|2|3)].
-    Falls back to tier=3 for all symbols if thresholds cannot be fetched.
     """
     if not quotes:
         return {}
 
-    thresh = await _fetch_thresholds()
+    thresh = thresholds if thresholds is not None else await _fetch_thresholds()
 
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}
@@ -200,5 +196,10 @@ async def assign_tiers(quotes: list["SymbolQuote"]) -> dict[str, int]:
 
 def invalidate_cache() -> None:
     """Force next assign_tiers() call to re-fetch thresholds from DB."""
-    global _cache_ts
-    _cache_ts = 0.0
+    global _cache_ts, _thresh_cache_ts
+    _cache_ts        = 0.0
+    _thresh_cache_ts = 0.0
+
+
+# Alias used by tests and admin router
+invalidate_thresholds_cache = invalidate_cache

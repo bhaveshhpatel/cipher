@@ -15,20 +15,25 @@ Endpoints:
   PATCH /api/admin/tier-thresholds       — update T1/T2/T3 threshold columns  [4A / B-019]
   GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A / B-020]
 """
+import asyncio
 import logging
+import time
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Any
 from core.auth import get_current_user, TokenData
+from config import settings
+import services.tier_engine as te
 
 log = logging.getLogger("admin")
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # ---------------------------------------------------------------------------
-# Valid tier_thresholds column names (whitelist — prevents arbitrary SQL injection)
+# Valid tier_thresholds column names (whitelist — prevents SQL injection)
+# Exposed as _ALLOWED_TIER_COLUMNS for test introspection.
 # ---------------------------------------------------------------------------
-_TIER_THRESHOLD_COLUMNS = {
+_ALLOWED_TIER_COLUMNS = {
     "t1_min_volume", "t1_min_last_price", "t1_min_oi", "t1_atm_pct", "t1_max_dte",
     "t2_min_volume", "t2_min_last_price", "t2_min_oi", "t2_atm_pct", "t2_max_dte",
     "t3_min_volume", "t3_min_last_price", "t3_min_oi", "t3_atm_pct", "t3_max_dte",
@@ -82,9 +87,6 @@ class IngestionConfigUpdate(BaseModel):
 
 @router.get("/ingestion/config")
 async def get_ingestion_config(admin: TokenData = Depends(_require_admin)):
-    """
-    Return all ingestion config rows with metadata for the admin UI.
-    """
     from services.ingestion_config import get_all_rows
     rows = await get_all_rows()
     return {"config": rows}
@@ -95,11 +97,6 @@ async def update_ingestion_config(
     body:  IngestionConfigUpdate,
     admin: TokenData = Depends(_require_admin),
 ):
-    """
-    Update a single ingestion config key.
-    Change takes effect on the next registry build cycle (<= REGISTRY_REFRESH_MINS).
-    Cache is invalidated immediately so a manual rebuild picks up the new value.
-    """
     from services.ingestion_config import update_config
     ok = await update_config(body.key, body.value, updated_by=admin.email)
     if not ok:
@@ -114,20 +111,12 @@ async def update_ingestion_config(
 
 @router.get("/tier-thresholds")
 async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
-    """
-    Return the active tier_thresholds row plus cache metadata.
-    """
-    import asyncio
-    import time
-    from supabase import create_client
-    from config import settings
-    import services.tier_engine as te
-
     service_key = settings.SUPABASE_SERVICE_KEY
     if not service_key:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
 
     def _fetch():
+        from supabase import create_client
         sb = create_client(settings.SUPABASE_URL, service_key)
         result = (
             sb.table("tier_thresholds")
@@ -173,26 +162,22 @@ async def update_tier_thresholds(
     body:  TierThresholdUpdate,
     admin: TokenData = Depends(_require_admin),
 ):
-    unknown = set(body.updates.keys()) - _TIER_THRESHOLD_COLUMNS
+    unknown = set(body.updates.keys()) - _ALLOWED_TIER_COLUMNS
     if unknown:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown threshold column(s): {sorted(unknown)}. "
-                   f"Valid columns: {sorted(_TIER_THRESHOLD_COLUMNS)}",
+                   f"Valid columns: {sorted(_ALLOWED_TIER_COLUMNS)}",
         )
     if not body.updates:
         raise HTTPException(status_code=422, detail="No updates provided.")
-
-    import asyncio
-    from supabase import create_client
-    from config import settings
-    from services.tier_engine import invalidate_cache
 
     service_key = settings.SUPABASE_SERVICE_KEY
     if not service_key:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
 
     def _do_update():
+        from supabase import create_client
         sb = create_client(settings.SUPABASE_URL, service_key)
         payload = dict(body.updates)
         payload["updated_by"] = admin.email
@@ -213,7 +198,8 @@ async def update_tier_thresholds(
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    invalidate_cache()
+    # Invalidate in-process cache so next classify picks up new values immediately
+    te.invalidate_thresholds_cache()
 
     log.info(
         "[admin] tier_thresholds updated by %s: %s",
@@ -233,15 +219,12 @@ async def update_tier_thresholds(
 
 @router.get("/tier-distribution")
 async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
-    import asyncio
-    from supabase import create_client
-    from config import settings
-
     service_key = settings.SUPABASE_SERVICE_KEY
     if not service_key:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
 
     def _query():
+        from supabase import create_client
         sb = create_client(settings.SUPABASE_URL, service_key)
 
         snap = (
