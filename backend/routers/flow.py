@@ -76,7 +76,6 @@ def _is_malformed(r: dict) -> bool:
     A row is malformed when BOTH expiry and ticker are empty/missing.
     An empty expiry alone is not enough to discard (ticker may still be valid).
     """
-    ticker = (r.get("ticker") or "").strip()
     expiry = (r.get("expiry") or "").strip()
     # Discard only when expiry is empty — matches test expectation that
     # a row with empty expiry but valid ticker is skipped

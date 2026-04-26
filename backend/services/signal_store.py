@@ -277,8 +277,6 @@ async def save_signal(signal) -> bool:
     Dedup: if the signal has an 'id' field, skip storing it in _signal_memory
     if the same id was already stored (prevents duplicate-signal test failures).
     """
-    global _signal_memory, _signal_ids_seen
-
     sig_dict = _coerce_to_dict(signal)
     sig_id   = sig_dict.get("id")
 
