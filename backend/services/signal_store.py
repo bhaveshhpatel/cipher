@@ -13,13 +13,30 @@ Bug fix (2026-04-24 #1):
 
 Bug fix (2026-04-24 #2):
   - direction column check constraint only allows BUY | SELL | HOLD.
-    REPEAT_BUY → BUY, REPEAT_SELL → SELL. (Postgres error 23514)
+    REPEAT_BUY -> BUY, REPEAT_SELL -> SELL. (Postgres error 23514)
   - trade_type check constraint only allows SWEEP | BLOCK | SPLIT | SINGLE.
     Unrecognised values now fall back to 'SINGLE' (NOT NULL column).
 
 Bug fix (2026-04-24 #3):
-  - trade_type is NOT NULL — None caused 23502 again. Falls back to 'SINGLE'.
-  - influence_tier is NOT NULL with no default — falls back to 'RETAIL'.
+  - trade_type is NOT NULL -- None caused 23502 again. Falls back to 'SINGLE'.
+  - influence_tier is NOT NULL with no default -- falls back to 'RETAIL'.
+
+Fix (S-01) -- Env-var name corrected:
+  - _SUPABASE_KEY now reads SUPABASE_SERVICE_ROLE_KEY first (with
+    SUPABASE_SERVICE_KEY as legacy fallback). Previously signal_store
+    only tried SUPABASE_SERVICE_KEY which is NOT the Railway env var name,
+    so every composite signal insert silently failed with a False return
+    from _insert_signal() while the service appeared healthy.
+  - start_signal_writer() warning message updated to name the correct var.
+
+Fix (S-02) -- Retry buffer on insert failure:
+  - _insert_signal_with_retry() wraps _insert_signal() with up to
+    _RETRY_MAX=3 attempts and _RETRY_DELAY_S=1.0s backoff on transient
+    failures (network blip, Supabase 5xx). After all retries an ERROR
+    is logged so the data loss is visible in Railway logs / alerting.
+  - persist_composite_signal() now calls _insert_signal_with_retry()
+    instead of _insert_signal() directly.
+  - Matches the retry pattern introduced for flow_store in Round 1 (F-02).
 
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
@@ -38,7 +55,12 @@ import httpx
 log = logging.getLogger("signal_store")
 
 _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY: Optional[str] = os.environ.get("SUPABASE_SERVICE_KEY")
+# S-01: SUPABASE_SERVICE_ROLE_KEY is the Railway env var name.
+# SUPABASE_SERVICE_KEY kept as legacy fallback so old deploys don't break.
+_SUPABASE_KEY: Optional[str] = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_SERVICE_KEY")
+)
 
 _TABLE = "signal_history"
 
@@ -46,6 +68,10 @@ _TABLE = "signal_history"
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
+
+# S-02: retry constants for failed inserts
+_RETRY_MAX     = 3
+_RETRY_DELAY_S = 1.0
 
 
 def _headers() -> dict:
@@ -73,10 +99,36 @@ async def _insert_signal(row: dict) -> bool:
         return False
 
 
+async def _insert_signal_with_retry(row: dict) -> bool:
+    """
+    S-02: Wrap _insert_signal() with up to _RETRY_MAX attempts.
+
+    On transient failures the insert is retried up to _RETRY_MAX times
+    with _RETRY_DELAY_S sleep between attempts. Returns True on first
+    success. After all retries are exhausted, logs an ERROR (data is lost)
+    and returns False.
+    """
+    for attempt in range(1, _RETRY_MAX + 1):
+        ok = await _insert_signal(row)
+        if ok:
+            return True
+        if attempt < _RETRY_MAX:
+            log.warning(
+                f"[signal_store] insert failed (attempt {attempt}/{_RETRY_MAX}) "
+                f"-- retrying in {_RETRY_DELAY_S}s"
+            )
+            await asyncio.sleep(_RETRY_DELAY_S)
+    log.error(
+        f"[signal_store] insert failed after {_RETRY_MAX} attempts "
+        f"-- signal for {row.get('ticker')} DISCARDED. Check Supabase connectivity."
+    )
+    return False
+
+
 def _normalise_direction(raw: str) -> str:
     """
     Map raw direction values to the DB-allowed set: BUY | SELL | HOLD.
-    REPEAT_BUY → BUY, REPEAT_SELL → SELL.
+    REPEAT_BUY -> BUY, REPEAT_SELL -> SELL.
     Falls back to 'HOLD' for anything unrecognised (column is NOT NULL).
     """
     if not raw:
@@ -94,7 +146,7 @@ def _normalise_direction(raw: str) -> str:
 def _normalise_trade_type(raw: str) -> str:
     """
     Map raw trade_type to the DB-allowed set: SWEEP | BLOCK | SPLIT | SINGLE.
-    Column is NOT NULL — falls back to 'SINGLE' for UNKNOWN or anything
+    Column is NOT NULL -- falls back to 'SINGLE' for UNKNOWN or anything
     unrecognised so the check constraint is never violated.
     """
     if not raw:
@@ -106,7 +158,7 @@ def _normalise_trade_type(raw: str) -> str:
 def _normalise_influence_tier(raw: str) -> str:
     """
     Map raw influence_tier to the DB-allowed set: WHALE | INSTITUTIONAL | LARGE | RETAIL.
-    Column is NOT NULL — falls back to 'RETAIL'.
+    Column is NOT NULL -- falls back to 'RETAIL'.
     """
     if not raw:
         return "RETAIL"
@@ -126,7 +178,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     """
     episode = ep or {}
 
-    # ── Derive alert_level from composite_score when not explicit ───────────
+    # Derive alert_level from composite_score when not explicit
     score = sig.get("composite_score") or 0.0
     if sig.get("alert_level"):
         alert_level = sig["alert_level"]
@@ -139,7 +191,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     else:
         alert_level = "WATCH"
 
-    # ── Derive sentiment from contract_type / direction ──────────────────────
+    # Derive sentiment from contract_type / direction
     ctype   = episode.get("contract_type") or sig.get("contract_type", "")
     raw_dir = episode.get("direction", sig.get("direction", ""))
     if sig.get("sentiment"):
@@ -151,7 +203,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     else:
         sentiment = "NEUTRAL"
 
-    # ── Normalise constrained enum columns (all NOT NULL) ────────────────────
+    # Normalise constrained enum columns (all NOT NULL)
     direction      = _normalise_direction(raw_dir)
     trade_type     = _normalise_trade_type(
         episode.get("trade_type") or sig.get("trade_type", "")
@@ -161,7 +213,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
     )
 
     return {
-        # ── Composite signal fields ─────────────────────────────────────────
+        # Composite signal fields
         "ticker":                sig.get("ticker"),
         "recommendation":        sig.get("recommendation"),
         "composite_score":       sig.get("composite_score"),
@@ -169,7 +221,7 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "backtest_score":        sig.get("backtest_score"),
         "volume_premium_factor": sig.get("volume_premium_factor", 0.5),
         "reasoning":             sig.get("reasoning"),
-        # ── NOT NULL columns ────────────────────────────────────────────────
+        # NOT NULL columns
         "alert_level":           alert_level,
         "direction":             direction,        # BUY | SELL | HOLD
         "sentiment":             sentiment,
@@ -179,25 +231,25 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
         "is_golden_sweep":       bool(
             episode.get("is_golden_sweep") or sig.get("is_golden_sweep", False)
         ),
-        # ── Episode metadata (denormalized, nullable) ───────────────────────
+        # Episode metadata (denormalized, nullable)
         "contract_type":         ctype or None,
         "total_premium":         episode.get("total_premium"),
         "trade_count":           episode.get("trade_count"),
         "is_accelerating":       episode.get("is_accelerating", False),
         "signal_ts":             episode.get("timestamp"),
-        # ── Phase 5A: swarm verdict fields ─────────────────────────────────
+        # Phase 5A: swarm verdict fields
         "swarm_direction":       sig.get("swarm_direction"),
         "swarm_confidence":      sig.get("swarm_confidence"),
         "swarm_bull_votes":      sig.get("swarm_bull_votes"),
         "swarm_bear_votes":      sig.get("swarm_bear_votes"),
         "swarm_hold_votes":      sig.get("swarm_hold_votes"),
-        "swarm_agents":          sig.get("swarm_agents"),  # JSONB — list of agent dicts
+        "swarm_agents":          sig.get("swarm_agents"),  # JSONB
     }
 
 
 async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
     row = _build_row(sig, ep)
-    ok  = await _insert_signal(row)
+    ok  = await _insert_signal_with_retry(row)  # S-02: retry on transient failure
     if ok:
         premium_fmt = f"${row['premium']:,.0f}" if row['premium'] else "$0"
         golden      = " ⚡ GOLDEN SWEEP" if row["is_golden_sweep"] else ""
@@ -243,9 +295,11 @@ async def _bus_signal_listener() -> None:
 async def start_signal_writer() -> None:
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         log.warning(
-            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — "
-            "composite signals will NOT be persisted."
+            # S-01: reference the correct Railway env var name
+            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
+            "composite signals will NOT be persisted. "
+            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
         )
         return
-    log.info("[signal_store] Starting composite signal DB writer")
+    log.info(f"[signal_store] Starting composite signal DB writer (retry_max={_RETRY_MAX})")
     await _bus_signal_listener()

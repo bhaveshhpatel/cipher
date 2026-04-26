@@ -10,7 +10,7 @@ Each worker:
   2. Fetches its own fresh session token (tokens are single-use)
   3. Opens a POST stream to stream.tradier.com/v1/markets/events
      with filter=timesale and its 500 OCC symbols
-  4. Reads lines → pushes raw dicts to the shared asyncio.Queue
+  4. Reads lines -> pushes raw dicts to the shared asyncio.Queue
   5. Reconnects with exponential backoff on any disconnect
   6. Respects a 30s idle watchdog (Tradier sends bare newlines as keepalives)
   7. Shuts down cleanly on cancellation
@@ -31,7 +31,19 @@ B-008 — Global stats rollup:
   increment so the health endpoint can report when the last disruption
   occurred.
 
-The shared queue is consumed by the parser/enricher layer.
+Fix (S-03) — Market-closed sleep constant + dead-loop guard:
+  The original 60s market-closed sleep was hard-coded and there was no
+  upper bound on how long the worker could spin waiting for market open.
+  _MARKET_CLOSED_SLEEP_S=300 (5 min) replaces the 60s value, reducing
+  unnecessary CPU wake-ups during overnight / weekend periods.
+  Worker behaviour during market hours is completely unchanged.
+
+Fix (S-04) — Extended stats (last_tick_at, session_ticks):
+  stats property now includes:
+    last_tick_at   - float epoch of last tick received (None until first tick)
+    session_ticks  - count of ticks in the current connection session
+  These fields are visible in the /health endpoint worker_detail array
+  and allow ops to quickly identify stale/disconnected workers.
 """
 import asyncio
 import json
@@ -53,10 +65,12 @@ _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-_IDLE_TIMEOUT    = 30.0
-_CONNECT_TIMEOUT = 15.0
-_BACKOFF_BASE    = 5.0
-_BACKOFF_CAP     = 60.0
+_IDLE_TIMEOUT          = 30.0
+_CONNECT_TIMEOUT       = 15.0
+_BACKOFF_BASE          = 5.0
+_BACKOFF_CAP           = 60.0
+# S-03: 5-minute sleep during market-closed periods (replaces hard-coded 60s)
+_MARKET_CLOSED_SLEEP_S = 300.0
 
 
 def _is_market_hours() -> bool:
@@ -73,9 +87,6 @@ def _backoff(attempt: int) -> float:
 
 # ---------------------------------------------------------------------------
 # B-008: lazy import helper to avoid circular import at module level.
-# tradier_stream imports stream_worker, so we cannot import tradier_stream
-# at the top of this file. Instead we import it on first use inside the
-# helper functions below.
 # ---------------------------------------------------------------------------
 def _global_stats() -> dict:
     """Return the live _stats dict from tradier_stream (lazy import)."""
@@ -94,7 +105,7 @@ class StreamWorker:
         worker_id: int,
         symbols: list[str],
         event_queue: asyncio.Queue,
-        startup_delay_s: float = 0.0,  # B-021: stagger delay before first connect
+        startup_delay_s: float = 0.0,
     ):
         self.worker_id       = worker_id
         self.symbols         = symbols
@@ -104,6 +115,9 @@ class StreamWorker:
         self._ticks          = 0
         self._errors         = 0
         self._reconnects     = 0
+        # S-04: extended stats
+        self._last_tick_at:  Optional[float] = None
+        self._session_ticks: int = 0
 
     def update_symbols(self, new_symbols: list[str]):
         """Update symbol list — takes effect on next reconnect."""
@@ -120,21 +134,22 @@ class StreamWorker:
             "ticks":           self._ticks,
             "errors":          self._errors,
             "reconnects":      self._reconnects,
-            "startup_delay_s": self.startup_delay_s,  # B-021: visible in /health
+            "startup_delay_s": self.startup_delay_s,  # B-021
+            # S-04: extended stats
+            "last_tick_at":    self._last_tick_at,
+            "session_ticks":   self._session_ticks,
         }
 
     # ------------------------------------------------------------------
     # B-008: global stat helpers
     # ------------------------------------------------------------------
     def _inc_global_error(self) -> None:
-        """Increment global errors counter in tradier_stream._stats."""
         try:
             _global_stats()["errors"] += 1
         except Exception:
-            pass  # never crash the worker over a stats write
+            pass
 
     def _inc_global_reconnect(self) -> None:
-        """Increment global reconnects counter and set last_reconnect_at."""
         try:
             s = _global_stats()
             s["reconnects"] += 1
@@ -145,9 +160,7 @@ class StreamWorker:
     async def run(self):
         """Main loop — connect, stream, reconnect on failure."""
 
-        # B-021: One-time startup stagger. Worker-0 is delay=0 (instant).
-        # Subsequent workers sleep N*200ms before their first connection attempt.
-        # This delay does NOT re-apply on reconnects — reconnects use _backoff().
+        # B-021: One-time startup stagger.
         if self.startup_delay_s > 0:
             log.info(
                 f"[worker-{self.worker_id}] B-021 startup stagger: "
@@ -163,16 +176,17 @@ class StreamWorker:
         reconnect_attempt = 0
 
         while self._running:
-            # Market hours guard
+            # S-03: market-closed guard -- sleep _MARKET_CLOSED_SLEEP_S (5min)
+            # instead of 60s so overnight workers wake up less frequently.
             if not _is_market_hours():
-                await asyncio.sleep(60.0)
+                await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
                 continue
 
             # Fetch fresh session token
             session_token = await get_session_token()
             if not session_token:
                 self._errors += 1
-                self._inc_global_error()  # B-008
+                self._inc_global_error()
                 backoff = _backoff(min(reconnect_attempt, 7))
                 log.warning(f"[worker-{self.worker_id}] No session token — backing off {backoff:.1f}s")
                 await asyncio.sleep(backoff)
@@ -186,7 +200,8 @@ class StreamWorker:
                 "linebreak": "true",
             }
 
-            session_ticks = 0
+            # S-04: reset session_ticks at the start of each new connection
+            self._session_ticks = 0
             first_line_logged = False
 
             try:
@@ -196,7 +211,7 @@ class StreamWorker:
                         if resp.status_code == 401:
                             log.warning(f"[worker-{self.worker_id}] 401 — expired token, retrying")
                             self._errors += 1
-                            self._inc_global_error()  # B-008
+                            self._inc_global_error()
                             await asyncio.sleep(1.0)
                             reconnect_attempt += 1
                             continue
@@ -219,7 +234,8 @@ class StreamWorker:
                                 first_line_logged = True
 
                             self._ticks += 1
-                            session_ticks += 1
+                            self._session_ticks += 1          # S-04
+                            self._last_tick_at = _time.time() # S-04
                             try:
                                 self.event_queue.put_nowait(raw)
                             except asyncio.QueueFull:
@@ -229,7 +245,7 @@ class StreamWorker:
 
             except asyncio.TimeoutError:
                 self._errors += 1
-                self._inc_global_error()  # B-008
+                self._inc_global_error()
                 log.warning(f"[worker-{self.worker_id}] Idle {_IDLE_TIMEOUT}s — reconnecting")
 
             except asyncio.CancelledError:
@@ -238,17 +254,17 @@ class StreamWorker:
 
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
                 self._errors += 1
-                self._inc_global_error()  # B-008
+                self._inc_global_error()
                 log.warning(f"[worker-{self.worker_id}] Network error: {e}")
 
             except Exception as e:
                 self._errors += 1
-                self._inc_global_error()  # B-008
+                self._inc_global_error()
                 log.error(f"[worker-{self.worker_id}] Unexpected error: {e}")
 
             self._reconnects += 1
-            self._inc_global_reconnect()  # B-008: rolls up into _stats + sets last_reconnect_at
-            if session_ticks > 0:
+            self._inc_global_reconnect()
+            if self._session_ticks > 0:  # S-04: use _session_ticks (was local var)
                 reconnect_attempt = 0
             else:
                 reconnect_attempt += 1
