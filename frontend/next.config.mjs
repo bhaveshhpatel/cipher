@@ -8,15 +8,11 @@ const nextConfig = {
    * Rewrites:
    *
    * DEV  → /api/:path* proxied directly to localhost:8000 by Next.js dev server
-   * PROD → /api/:path* rewritten to /api/proxy/api/:path* so the App Router
-   *         catch-all at /api/proxy/[...path] receives path segments that
-   *         INCLUDE the leading "api" segment, preserving the full upstream path.
+   * PROD → /api/:path* rewritten to /api/proxy/:path* so the App Router
+   *         catch-all at /api/proxy/[...path] forwards to Railway.
    *
-   * Example:
-   *   Browser:   GET /api/health/stream
-   *   Rewrite:   GET /api/proxy/api/health/stream
-   *   [...path]: ["api", "health", "stream"]
-   *   Upstream:  BACKEND_URL/api/health/stream  ✓
+   * The proxy handler at /api/proxy/[...path]/route.ts prepends /api/ to the
+   * upstream path so Railway receives the full correct path.
    *
    * The source regex explicitly excludes /api/proxy/* to prevent an infinite
    * rewrite loop where /api/proxy/foo re-matches /api/:path* and loops forever.
@@ -31,13 +27,13 @@ const nextConfig = {
       ];
     }
 
-    // Production: rewrite /api/:path* → /api/proxy/api/:path*
-    // The extra "api" segment ensures the proxy forwards /api/:path* upstream.
+    // Production: rewrite /api/:path* → /api/proxy/:path*
     // Excludes /api/proxy/* to avoid infinite rewrite loop.
+    // The proxy handler prepends /api/ before forwarding to Railway.
     return [
       {
         source:      "/api/:path((?!proxy/).*)",
-        destination: "/api/proxy/api/:path*",
+        destination: "/api/proxy/:path*",
       },
     ];
   },

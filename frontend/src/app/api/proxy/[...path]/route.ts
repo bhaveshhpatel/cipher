@@ -2,10 +2,15 @@
  * Next.js App Router — transparent reverse proxy to Railway backend.
  *
  * Production rewrite rules (next.config.mjs) send:
- *   /api/*    → /api/proxy/api/*    → upstream: BACKEND_URL/api/*
- *   /health/* → /api/proxy/health/* → upstream: BACKEND_URL/health/*
+ *   /api/* → /api/proxy/:path* where [...path] = segments AFTER /api/
  *
- * The proxy forwards the full path as-is — no prefix is added or removed.
+ * Example:
+ *   Browser:       GET /api/health/stream
+ *   After rewrite: GET /api/proxy/health/stream
+ *   [...path]:     ["health", "stream"]
+ *   Upstream:      BACKEND_URL/api/health/stream  ✓
+ *
+ * The proxy PREPENDS /api/ to reconstruct the full upstream path.
  * OPTIONS preflights are handled locally so they never reach Railway.
  */
 
@@ -33,9 +38,10 @@ type Context = { params: Promise<{ path: string[] }> };
 async function handler(req: NextRequest, context: Context): Promise<NextResponse> {
   const { path } = await context.params;
 
-  // Build upstream URL — path segments joined with a leading slash.
-  // The rewrite already includes the correct prefix (api/ or health/).
-  const upstreamPath = "/" + path.join("/");
+  // Reconstruct the full upstream path by prepending /api/.
+  // The rewrite strips /api/ from the path before passing to [...path],
+  // so path=["health","stream"] must become /api/health/stream upstream.
+  const upstreamPath = "/api/" + path.join("/");
   const search = req.nextUrl.search ?? "";
   const upstreamURL = `${BACKEND}${upstreamPath}${search}`;
 
