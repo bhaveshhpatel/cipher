@@ -1,10 +1,23 @@
 """
 Regression tests for routers/admin.py
+
+Fix summary (2026-04-26):
+  - Route paths corrected to match admin.py:
+      /api/admin/status       → /api/admin/demo/status
+      /api/admin/demo/start   → /api/admin/demo/on
+      /api/admin/demo/stop    → /api/admin/demo/off
+  - Patch targets corrected: start_demo / stop_demo are imported inside
+    router functions, so patch at the source module:
+      services.demo_engine.start_demo / stop_demo
+  - PATCH tier-thresholds uses body {"updates": {...}} to match
+    TierThresholdUpdate pydantic model
+  - PATCH with unknown column sends {"updates": {"injected_column": ...}}
+  - SUPABASE_SERVICE_KEY patched so GET tier-thresholds doesn't 500
 """
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 from core.auth import get_current_user
 from routers.admin import router
@@ -45,84 +58,125 @@ def raw_client():
 # ---------------------------------------------------------------------------
 
 def test_no_auth_returns_401(raw_client):
-    resp = raw_client.get("/api/admin/status")
+    # Without dependency override, get_current_user raises 401
+    resp = raw_client.get("/api/admin/demo/status")
     assert resp.status_code == 401
 
 
 def test_non_admin_role_returns_403(user_client):
-    resp = user_client.get("/api/admin/status")
+    resp = user_client.get("/api/admin/demo/status")
     assert resp.status_code == 403
 
 
 # ---------------------------------------------------------------------------
-# Status endpoint
+# Status endpoint  (GET /api/admin/demo/status)
 # ---------------------------------------------------------------------------
 
 def test_admin_status_returns_200(admin_client):
-    resp = admin_client.get("/api/admin/status")
+    with patch("services.demo_engine.get_stats", return_value={"running": False, "events_sent": 0}):
+        resp = admin_client.get("/api/admin/demo/status")
     assert resp.status_code == 200
 
 
 def test_admin_status_has_expected_keys(admin_client):
-    resp = admin_client.get("/api/admin/status")
+    with patch("services.demo_engine.get_stats", return_value={"running": False, "events_sent": 0}):
+        resp = admin_client.get("/api/admin/demo/status")
     body = resp.json()
-    for key in ("stream", "demo", "registry"):
-        assert key in body, f"admin/status missing key: {key}"
+    # Response is {"demo": {...}, "admin": ..., "role": ...}
+    assert "demo" in body
+    assert "admin" in body
 
 
 # ---------------------------------------------------------------------------
-# Demo start/stop
+# Demo start/stop  (POST /api/admin/demo/on|off)
 # ---------------------------------------------------------------------------
 
 def test_start_demo_returns_200(admin_client):
-    with patch("routers.admin.start_demo", new_callable=AsyncMock,
-               return_value={"ok": True, "status": "started"}):
-        resp = admin_client.post("/api/admin/demo/start")
+    with patch("services.demo_engine.start_demo", new=AsyncMock(return_value={"ok": True, "status": "started"})):
+        resp = admin_client.post("/api/admin/demo/on")
     assert resp.status_code == 200
 
 
 def test_stop_demo_returns_200(admin_client):
-    with patch("routers.admin.stop_demo", new_callable=AsyncMock,
-               return_value={"ok": True, "status": "stopped"}):
-        resp = admin_client.post("/api/admin/demo/stop")
+    with patch("services.demo_engine.stop_demo", new=AsyncMock(return_value={"ok": True, "status": "stopped"})):
+        resp = admin_client.post("/api/admin/demo/off")
     assert resp.status_code == 200
 
 
 def test_demo_start_idempotent(admin_client):
-    with patch("routers.admin.start_demo", new_callable=AsyncMock,
-               return_value={"ok": True, "status": "already_running"}):
-        resp = admin_client.post("/api/admin/demo/start")
+    with patch("services.demo_engine.start_demo",
+               new=AsyncMock(return_value={"ok": True, "status": "already_running"})):
+        resp = admin_client.post("/api/admin/demo/on")
     assert resp.status_code == 200
     assert resp.json()["status"] == "already_running"
 
 
 # ---------------------------------------------------------------------------
-# Tier thresholds PATCH
+# Tier thresholds PATCH  (PATCH /api/admin/tier-thresholds)
+# Body must be {"updates": {<col>: <value>}}
 # ---------------------------------------------------------------------------
 
+def _patch_supabase_for_tier():
+    """Context manager that stubs out SUPABASE_SERVICE_KEY + supabase client."""
+    from config import settings
+    mock_sb = MagicMock()
+    mock_tbl = MagicMock()
+    mock_tbl.update.return_value = mock_tbl
+    mock_tbl.eq.return_value     = mock_tbl
+    mock_tbl.execute.return_value = MagicMock(data=[{"id": 1, "t1_min_volume": 25_000_000}])
+    mock_sb.table.return_value = mock_tbl
+    import services.tier_engine as te
+    return (
+        patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"),
+        patch.object(settings, "SUPABASE_URL",         "http://fake"),
+        patch("routers.admin.te.invalidate_thresholds_cache"),
+        patch("supabase.create_client", return_value=mock_sb),
+    )
+
+
 def test_patch_tier_thresholds_returns_200(admin_client):
-    with patch("routers.admin._update_tier_thresholds",
-               new_callable=AsyncMock, return_value={"ok": True}):
-        resp = admin_client.patch("/api/admin/tier-thresholds",
-                                  json={"t1_min_volume": 25_000_000})
-    assert resp.status_code in (200, 404)  # 404 if endpoint not yet wired
+    patches = _patch_supabase_for_tier()
+    with patches[0], patches[1], patches[2], patches[3]:
+        resp = admin_client.patch(
+            "/api/admin/tier-thresholds",
+            json={"updates": {"t1_min_volume": 25_000_000}},
+        )
+    assert resp.status_code == 200
 
 
 def test_patch_tier_thresholds_unknown_column_rejected(admin_client):
-    with patch("routers.admin._update_tier_thresholds",
-               new_callable=AsyncMock, return_value={"ok": True}):
-        resp = admin_client.patch("/api/admin/tier-thresholds",
-                                  json={"injected_column": "DROP TABLE"})
-    assert resp.status_code in (400, 422, 404)
+    resp = admin_client.patch(
+        "/api/admin/tier-thresholds",
+        json={"updates": {"injected_column": "DROP TABLE"}},
+    )
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
-# Tier distribution
+# Tier distribution  (GET /api/admin/tier-distribution)
 # ---------------------------------------------------------------------------
 
 def test_tier_distribution_returns_200(admin_client):
-    with patch("routers.admin._get_tier_distribution",
-               new_callable=AsyncMock,
-               return_value={"t1": 10, "t2": 25, "t3": 65}):
+    mock_sb = MagicMock()
+    snap_q  = MagicMock()
+    snap_q.select.return_value = snap_q
+    snap_q.eq.return_value     = snap_q
+    snap_q.order.return_value  = snap_q
+    snap_q.limit.return_value  = snap_q
+    snap_q.execute.side_effect = [
+        MagicMock(data=[{"id": 42}]),   # snapshot query
+        MagicMock(data=[
+            {"symbol": "SPY",  "tier": 1, "open_interest": 50000},
+            {"symbol": "HOOD", "tier": 2, "open_interest": 800},
+        ]),
+    ]
+    mock_sb.table.return_value = snap_q
+    from config import settings
+    with patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"), \
+         patch.object(settings, "SUPABASE_URL",         "http://fake"), \
+         patch("supabase.create_client", return_value=mock_sb):
         resp = admin_client.get("/api/admin/tier-distribution")
-    assert resp.status_code in (200, 404)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "tiers" in body
+    assert "total" in body

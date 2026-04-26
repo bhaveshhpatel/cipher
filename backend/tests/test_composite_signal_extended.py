@@ -48,23 +48,34 @@ def _make_event(
     ts=None,
     is_golden_sweep=False,
 ) -> OptionsFlowEvent:
+    """Build a minimal OptionsFlowEvent for testing.
+
+    Note: OptionsFlowEvent has no 'exchange' field. Use exchange_count (int)
+    instead. influence_tier is set after construction.
+    """
     ts = ts or datetime(2026, 4, 25, 10, 0, 0)
-    return OptionsFlowEvent(
+    ev = OptionsFlowEvent(
+        id=f"{ticker}_{expiry}_{strike}",
         ticker=ticker,
+        timestamp=ts,
         contract_type="CALL",
         strike=strike,
         expiry=expiry,
-        premium=premium,
-        sentiment=sentiment,
-        influence_tier=tier,
         dte=dte,
+        fill_price=premium / (size * 100) if size else 5.0,
+        bid=4.9,
+        ask=5.1,
         size=size,
-        open_interest=oi,
-        timestamp=ts,
-        is_golden_sweep=is_golden_sweep,
+        premium=premium,
         trade_type="SWEEP",
-        exchange="C",
+        is_golden_sweep=is_golden_sweep,
+        open_interest=oi,
+        exchange_count=3,
+        fill_count=3,
     )
+    ev.sentiment      = sentiment
+    ev.influence_tier = tier
+    return ev
 
 
 def _make_episode(events: List[OptionsFlowEvent], ticker="AAPL") -> RepetitionEpisode:
@@ -104,10 +115,9 @@ class TestBacktestValidator:
         assert s1 == s2
 
     def test_whale_bias_higher_than_retail(self):
-        """On average (many tickers) WHALE score > RETAIL. Test with a fixed pair."""
-        whale = get_backtest_score("WHALETEST", "CALL", 30, "WHALE")
+        whale  = get_backtest_score("WHALETEST", "CALL", 30, "WHALE")
         retail = get_backtest_score("RETAILTEST", "CALL", 30, "RETAIL")
-        assert whale >= 0.2
+        assert whale  >= 0.2
         assert retail >= 0.2
 
     def test_caches_result(self):
@@ -317,7 +327,17 @@ class TestBuildCompositeAsync:
             _make_event(premium=1_000_000, tier="WHALE", ts=base_ts + timedelta(seconds=i))
             for i in range(3)
         ]
-        return _make_episode(events)
+        # episode helper defined at module level — call with list + ticker
+        ep = RepetitionEpisode(
+            ticker="AAPL",
+            contract_type="CALL",
+            strike=200.0,
+            expiry="2026-06-20",
+            events=events,
+            first_seen=events[0].timestamp,
+            last_seen=events[-1].timestamp,
+        )
+        return ep
 
     def test_swarm_results_injected(self):
         from simulation.ensemble_runner import EnsembleResult
