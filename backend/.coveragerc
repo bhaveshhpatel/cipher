@@ -1,30 +1,47 @@
 [run]
-# Source root — measure coverage for the full backend package tree
-source = .
+# Measure only the application source — explicit package list avoids
+# accidentally measuring non-Python files or test files themselves.
+source =
+    config
+    main
+    core
+    execution
+    parsers
+    routers
+    services
+    signals
+    simulation
+    utils
+
 omit =
-    # Test files themselves
+    # Test files
     tests/*
-    tests/**/*
-    # Migration scripts (not application logic)
+    tests/**
+    */tests/*
+    */tests/**
+    # Migration scripts
     migrations/*
-    migrations/**/*
-    # Virtual environment if present locally
+    migrations/**
+    # Virtual environments
     .venv/*
+    .venv/**
     venv/*
-    # conftest helpers
+    venv/**
+    # Conftest helpers
     conftest.py
     tests/conftest.py
+    # Non-application entry points
+    */__main__.py
 
 [report]
 # Fail the build if total coverage drops below this threshold.
-# Matches --cov-fail-under in pytest.ini — one source of truth.
 fail_under = 90
-
-# Suppress files with 100% coverage from the terminal report (less noise)
-skip_covered = True
 
 # Show lines that are missing coverage
 show_missing = True
+
+# Suppress files with 100% coverage from the terminal report (less noise)
+skip_covered = True
 
 # Exclude lines that are genuinely untestable
 exclude_lines =
@@ -32,7 +49,7 @@ exclude_lines =
     pragma: no cover
     # Abstract methods
     @abstractmethod
-    # Debug-only code
+    # Debug-only entry point
     if __name__ == .__main__.
     # Type-checking imports
     if TYPE_CHECKING:
