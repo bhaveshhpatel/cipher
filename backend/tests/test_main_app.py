@@ -12,6 +12,7 @@ Covers:
  - Lifespan startup does not crash with mocked dependencies
  - Rate-limited path still returns a response (not 500)
  - App instance is a FastAPI application
+ - Lifespan spawns the registry pre-warm task
 """
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
@@ -117,3 +118,38 @@ def test_rate_limited_path_returns_response_not_500():
     client = _get_client()
     resp = client.get("/api/flow/scan")
     assert resp.status_code != 500
+
+
+def test_lifespan_spawns_prewarm_task():
+    """Lifespan must create a _registry_prewarm_loop task alongside other background tasks."""
+    import asyncio
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    created_targets: list[str] = []
+    original_create_task = asyncio.create_task
+
+    def tracking_create_task(coro, **kwargs):
+        created_targets.append(getattr(coro, "__name__", repr(coro)))
+        # Cancel immediately so the test loop doesn't block
+        task = original_create_task(coro, **kwargs)
+        task.cancel()
+        return task
+
+    mock_registry = MagicMock()
+    mock_registry.build = AsyncMock(return_value=100)
+    mock_registry.size = MagicMock(return_value=100)
+    mock_registry.get_oi_map = MagicMock(return_value={})
+    mock_registry.refresh_loop = AsyncMock()
+    mock_registry.set_tier_map = MagicMock()
+
+    with patch("main.asyncio.create_task", side_effect=tracking_create_task), \
+         patch("main.init_registry", return_value=mock_registry), \
+         patch("main.assign_tiers", new_callable=AsyncMock, return_value={}), \
+         patch("main._resolve_startup_universe", new_callable=AsyncMock,
+               return_value=([], {}, [])):
+        client = _get_client()
+        client.get("/api/health")
+
+    assert "_registry_prewarm_loop" in created_targets, (
+        f"_registry_prewarm_loop task was not created in lifespan. Tasks found: {created_targets}"
+    )

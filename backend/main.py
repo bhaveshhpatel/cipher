@@ -7,6 +7,8 @@ import logging
 import re
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -231,6 +233,62 @@ async def _universe_refresh_loop():
             log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Registry pre-warm — rebuilds OCC registry at 9:15 AM ET every weekday
+# so workers connect instantly at 9:30 with no cold-start delay.
+# ---------------------------------------------------------------------------
+_ET = ZoneInfo("America/New_York")
+_PREWARM_TIME = time(9, 15)
+
+
+async def _registry_prewarm_loop() -> None:
+    """Rebuild the OCC registry every weekday at 9:15 AM ET.
+
+    The lifespan already performs one build on startup. This loop handles
+    every subsequent trading day, ensuring the registry is fresh and fully
+    loaded 15 minutes before market open at 9:30 AM.
+    """
+    while True:
+        now = datetime.now(_ET)
+
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            log.info("[prewarm] Weekend — sleeping 1h before next check")
+            await asyncio.sleep(3600)
+            continue
+
+        next_prewarm = now.replace(
+            hour=_PREWARM_TIME.hour,
+            minute=_PREWARM_TIME.minute,
+            second=0,
+            microsecond=0,
+        )
+
+        if now >= next_prewarm:
+            next_prewarm += timedelta(days=1)
+            # Advance past any weekend
+            while next_prewarm.weekday() >= 5:
+                next_prewarm += timedelta(days=1)
+
+        sleep_secs = (next_prewarm - now).total_seconds()
+        log.info(
+            "[prewarm] Registry pre-warm scheduled in %.1f min (at %s ET)",
+            sleep_secs / 60,
+            next_prewarm.strftime("%Y-%m-%d %H:%M"),
+        )
+        await asyncio.sleep(sleep_secs)
+
+        log.info("[prewarm] Building OCC registry ahead of market open...")
+        try:
+            registry = get_registry()
+            if registry is None:
+                log.warning("[prewarm] Registry not initialised — skipping pre-warm")
+                continue
+            count = await registry.build()
+            log.info("[prewarm] Registry warm: %d OCC contracts ready for market open", count or 0)
+        except Exception as exc:
+            log.error("[prewarm] Registry pre-warm failed (non-fatal): %s", exc, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
@@ -271,6 +329,7 @@ async def lifespan(app: FastAPI):
         log.info("[registry] Upsert complete — open_interest column now populated in DB")
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
+    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
 
     stream_task       = asyncio.create_task(stream_options_flow(stream_symbols))
     db_write_task     = asyncio.create_task(start_flow_writer())
@@ -280,11 +339,19 @@ async def lifespan(app: FastAPI):
     yield
 
     refresh_task.cancel()
+    prewarm_task.cancel()
     registry_refresh_task.cancel()
     stream_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    for task in (stream_task, db_write_task, signal_write_task, refresh_task, registry_refresh_task):
+    for task in (
+        stream_task,
+        db_write_task,
+        signal_write_task,
+        refresh_task,
+        registry_refresh_task,
+        prewarm_task,
+    ):
         try:
             await task
         except asyncio.CancelledError:
