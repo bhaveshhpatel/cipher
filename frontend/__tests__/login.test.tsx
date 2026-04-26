@@ -15,10 +15,9 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 
 // ── mock next/navigation ──────────────────────────────────────────────────────
-const mockPush    = jest.fn();
-const mockReplace = jest.fn();
+const mockPush = jest.fn();
 jest.mock("next/navigation", () => ({
-  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+  useRouter: () => ({ push: mockPush, replace: jest.fn() }),
 }));
 
 // ── mock next/link ─────────────────────────────────────────────────────────────

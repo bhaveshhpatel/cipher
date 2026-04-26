@@ -9,7 +9,7 @@
  *   - FlowTable: clicking BEARISH filter hides BULLISH rows
  */
 import React from "react";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { FlowTable } from "../src/components/dashboard/FlowTable";
 import type { FlowEvent } from "../src/lib/api";
 
