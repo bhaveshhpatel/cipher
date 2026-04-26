@@ -47,7 +47,7 @@ Covers:
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 
 from core.auth import get_current_user, TokenData
 from routers.history import router, _DIR_TO_REC, _TIER_TO_DB
@@ -265,7 +265,7 @@ def test_limit_and_offset_echoed_in_response(client):
 def test_missing_volume_premium_factor_defaults_to_05(client):
     row = _make_signal_row()
     del row["volume_premium_factor"]
-    row["volume_premium_factor"] = None  # simulate NULL from DB
+    row["volume_premium_factor"] = None
     with _mock_supabase_response([row]):
         resp = client.get("/api/signals/history")
     assert resp.json()["signals"][0]["volume_premium_factor"] == 0.5
@@ -309,11 +309,6 @@ def test_supabase_4xx_returns_empty_signals(client):
 
 
 def test_supabase_exception_returns_empty_signals(client):
-    async def _raise(*a, **kw):
-        raise Exception("connection error")
-
-    # _query_signal_history already handles exceptions internally and returns
-    # ([], 0) — patch it to simulate that already-handled path
     with patch(
         "routers.history._query_signal_history",
         new_callable=AsyncMock,

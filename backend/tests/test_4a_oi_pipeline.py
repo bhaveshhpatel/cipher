@@ -12,16 +12,13 @@ Covers:
 All tests are pure unit tests (no network, no DB, no Tradier).
 External I/O is patched at the module boundary.
 """
-import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
-# Minimal SymbolQuote stub (mirrors services/symbols_loader.SymbolQuote fields
-# used by tier_engine and universe_store)
+# Minimal SymbolQuote stub
 # ---------------------------------------------------------------------------
 @dataclass
 class _Quote:
@@ -61,51 +58,26 @@ def _make_thresh(
     }
 
 
-FAKE_PRICES = {"AAPL": 180.0, "TSLA": 250.0, "HOOD": 15.0,
-               "SPY": 500.0, "SPCE": 2.0, "RIVN": 12.0,
-               "NVDA": 900.0, "UNKNOWN": 50.0, "QQQ": 400.0,
-               "XYZ": 20.0, "META": 500.0, "AMD": 150.0}
-
-
 # ---------------------------------------------------------------------------
 # 1. symbol_registry: get_oi_map returns populated dict after build
 # ---------------------------------------------------------------------------
 
 class TestSymbolRegistryOiMap:
-    """
-    Tests for SymbolRegistry._oi_by_ticker and get_oi_map().
-
-    build() skips tickers not in prices dict, so _fetch_stock_prices is
-    patched to return deterministic values.  _build_ticker is patched to
-    avoid real Tradier / DB calls.
-
-    Real _build_ticker signature:
-        async def _build_ticker(self, ticker, stock_price, registry,
-                                oi_by_ticker, tier_params)
-    The fake must match exactly so patch.object wires args correctly.
-    """
-
     def test_get_oi_map_empty_before_build(self):
-        """get_oi_map() returns {} before build() has run."""
         from services.symbol_registry import SymbolRegistry
         reg = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
         assert reg.get_oi_map() == {}
 
     @pytest.mark.asyncio
     async def test_oi_map_populated_after_build(self):
-        """
-        After build(), get_oi_map() returns avg OI for every ticker.
-        """
         from services.symbol_registry import SymbolRegistry
 
         async def _fake_build_ticker(self_inner, ticker, stock_price,
                                      registry, oi_by_ticker, tier_params):
-            # Simulate loading 3 contracts with OIs 100, 200, 300 -> avg 200
             oi_by_ticker[ticker] = 200
             registry[f"{ticker}250117C00100000"] = MagicMock()
 
         reg = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
-
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
                           AsyncMock(return_value={"AAPL": 180.0, "TSLA": 250.0})), \
              patch.object(SymbolRegistry, "_build_ticker", _fake_build_ticker):
@@ -115,9 +87,6 @@ class TestSymbolRegistryOiMap:
 
     @pytest.mark.asyncio
     async def test_oi_zero_for_ticker_with_no_contracts(self):
-        """
-        Tickers whose _build_ticker loads no contracts get oi=0.
-        """
         from services.symbol_registry import SymbolRegistry
 
         async def _no_contracts(self_inner, ticker, stock_price,
@@ -125,7 +94,6 @@ class TestSymbolRegistryOiMap:
             oi_by_ticker[ticker] = 0
 
         reg = SymbolRegistry(watchlist=["HOOD"], tier_map={})
-
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
                           AsyncMock(return_value={"HOOD": 15.0})), \
              patch.object(SymbolRegistry, "_build_ticker", _no_contracts):
@@ -135,10 +103,6 @@ class TestSymbolRegistryOiMap:
 
     @pytest.mark.asyncio
     async def test_get_oi_map_returns_independent_copy(self):
-        """
-        get_oi_map() returns a copy — mutating it does not affect
-        the internal _oi_by_ticker dict.
-        """
         from services.symbol_registry import SymbolRegistry
 
         async def _fake_build(self_inner, ticker, stock_price,
@@ -146,16 +110,14 @@ class TestSymbolRegistryOiMap:
             oi_by_ticker[ticker] = 500
 
         reg = SymbolRegistry(watchlist=["SPY"], tier_map={})
-
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
                           AsyncMock(return_value={"SPY": 500.0})), \
              patch.object(SymbolRegistry, "_build_ticker", _fake_build):
             await reg.build()
 
         copy1 = reg.get_oi_map()
-        copy1["SPY"] = 999_999       # mutate the copy
-
-        assert reg.get_oi_map()["SPY"] == 500   # internal state unchanged
+        copy1["SPY"] = 999_999
+        assert reg.get_oi_map()["SPY"] == 500
 
 
 # ---------------------------------------------------------------------------
@@ -163,237 +125,143 @@ class TestSymbolRegistryOiMap:
 # ---------------------------------------------------------------------------
 
 class TestClassifyNoGrace:
-    """
-    Verifies that _classify() enforces ALL THREE conditions for T1/T2
-    and that oi=0 always results in T3 regardless of vol and price.
-    """
-
     def _classify(self, quote, thresh):
         from services.tier_engine import _classify
         return _classify(quote, thresh)
 
-    # --- T1 tests ---
-
     def test_t1_all_three_conditions_met(self):
-        """T1 when vol, price, AND oi all meet T1 thresholds."""
         q = _Quote("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=2_000)
         assert self._classify(q, _make_thresh()) == 1
 
     def test_t1_fails_if_oi_zero(self):
-        """
-        oi=0 must NOT be graced into T1 even if vol+price qualify.
-        Old grace path would have returned 1 — this must now return 3.
-        """
         q = _Quote("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=0)
         tier = self._classify(q, _make_thresh())
-        assert tier == 3, (
-            f"Expected T3 (OI grace removed) but got T{tier}. "
-            "_classify() must not promote oi=0 symbols to T1."
-        )
+        assert tier == 3
 
     def test_t1_fails_if_oi_below_threshold(self):
-        """oi=999 just below t1_min_oi=1000 must not get T1."""
         q = _Quote("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=999)
-        tier = self._classify(q, _make_thresh())
-        assert tier != 1
+        assert self._classify(q, _make_thresh()) != 1
 
     def test_t1_fails_if_vol_below_threshold(self):
-        """vol below T1 min, even with good price+oi, must not get T1."""
         q = _Quote("AAPL", last_price=150.0, average_volume=15_000_000, open_interest=2_000)
-        tier = self._classify(q, _make_thresh())
-        assert tier != 1
+        assert self._classify(q, _make_thresh()) != 1
 
     def test_t1_fails_if_price_below_threshold(self):
-        """price below T1 min, even with good vol+oi, must not get T1."""
         q = _Quote("AAPL", last_price=5.0, average_volume=25_000_000, open_interest=2_000)
-        tier = self._classify(q, _make_thresh())
-        assert tier != 1
-
-    # --- T2 tests ---
+        assert self._classify(q, _make_thresh()) != 1
 
     def test_t2_all_three_conditions_met(self):
-        """T2 when vol, price, AND oi all meet T2 (but not T1) thresholds."""
         q = _Quote("HOOD", last_price=15.0, average_volume=3_000_000, open_interest=600)
         assert self._classify(q, _make_thresh()) == 2
 
     def test_t2_fails_if_oi_zero(self):
-        """
-        oi=0 must NOT be graced into T2 even if vol+price qualify.
-        Old grace path would have returned 2 — this must now return 3.
-        """
         q = _Quote("HOOD", last_price=15.0, average_volume=3_000_000, open_interest=0)
-        tier = self._classify(q, _make_thresh())
-        assert tier == 3, (
-            f"Expected T3 (OI grace removed) but got T{tier}. "
-            "_classify() must not promote oi=0 symbols to T2."
-        )
+        assert self._classify(q, _make_thresh()) == 3
 
     def test_t2_fails_if_oi_below_threshold(self):
-        """oi=499 just below t2_min_oi=500 must not get T2."""
         q = _Quote("HOOD", last_price=15.0, average_volume=3_000_000, open_interest=499)
-        tier = self._classify(q, _make_thresh())
-        assert tier == 3
-
-    # --- T3 floor ---
+        assert self._classify(q, _make_thresh()) == 3
 
     def test_t3_floor_when_oi_present_but_below_t2(self):
-        """Symbol with oi=200 (below T2=500) falls cleanly to T3."""
         q = _Quote("RIVN", last_price=12.0, average_volume=3_000_000, open_interest=200)
         assert self._classify(q, _make_thresh()) == 3
 
     def test_t3_for_low_vol_symbol(self):
-        """Low-vol symbol always T3 regardless of price/oi."""
         q = _Quote("XYZ", last_price=20.0, average_volume=100_000, open_interest=5_000)
         assert self._classify(q, _make_thresh()) == 3
 
 
 # ---------------------------------------------------------------------------
-# 3. main._stamp_oi helper
+# 3. main._stamp_oi
 # ---------------------------------------------------------------------------
 
 class TestStampOi:
-    """
-    Tests for main._stamp_oi(quotes, oi_map).
-    """
-
     def _stamp_oi(self, quotes, oi_map):
         from main import _stamp_oi
         return _stamp_oi(quotes, oi_map)
 
     def test_stamps_correct_oi_from_map(self):
-        """Each quote gets its symbol's OI from the map."""
-        quotes = [
-            _Quote("AAPL", open_interest=0),
-            _Quote("TSLA", open_interest=0),
-            _Quote("SPY",  open_interest=0),
-        ]
-        oi_map = {"AAPL": 2000, "TSLA": 800, "SPY": 5000}
-        self._stamp_oi(quotes, oi_map)
+        quotes = [_Quote("AAPL"), _Quote("TSLA"), _Quote("SPY")]
+        self._stamp_oi(quotes, {"AAPL": 2000, "TSLA": 800, "SPY": 5000})
         assert quotes[0].open_interest == 2000
         assert quotes[1].open_interest == 800
         assert quotes[2].open_interest == 5000
 
     def test_missing_ticker_gets_zero(self):
-        """Symbol absent from oi_map gets open_interest=0."""
         quotes = [_Quote("UNKNOWN", open_interest=999)]
-        oi_map = {"AAPL": 2000}
-        self._stamp_oi(quotes, oi_map)
+        self._stamp_oi(quotes, {"AAPL": 2000})
         assert quotes[0].open_interest == 0
 
     def test_mutates_in_place(self):
-        """_stamp_oi returns None and mutates quotes list in place."""
         quotes = [_Quote("AAPL", open_interest=0)]
-        oi_map = {"AAPL": 1500}
-        result = self._stamp_oi(quotes, oi_map)
+        result = self._stamp_oi(quotes, {"AAPL": 1500})
         assert result is None
         assert quotes[0].open_interest == 1500
 
     def test_empty_quotes_is_noop(self):
-        """Empty quote list does not raise."""
-        self._stamp_oi([], {"AAPL": 100})   # must not raise
+        self._stamp_oi([], {"AAPL": 100})
 
     def test_empty_oi_map_zeros_all(self):
-        """All quotes get 0 when oi_map is empty."""
         quotes = [_Quote("AAPL", open_interest=500), _Quote("TSLA", open_interest=300)]
         self._stamp_oi(quotes, {})
         assert all(q.open_interest == 0 for q in quotes)
 
 
 # ---------------------------------------------------------------------------
-# 4. Integration: OI stamp drives real tier demotion
+# 4. Integration
 # ---------------------------------------------------------------------------
 
 class TestOiDrivenTierIntegration:
-    """
-    End-to-end unit integration: simulates the lifespan() sequence
-    (get_oi_map -> _stamp_oi -> assign_tiers) without network/DB.
-    Asserts that OI values from the registry correctly gate T1/T2 promotion.
-    """
-
     @pytest.mark.asyncio
     async def test_oi_drives_t1_demotion_to_t3(self):
-        """
-        Scenario: AAPL has great vol+price but chain OI is 0.
-        After stamp+assign_tiers, AAPL must be T3, not T1.
-        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
-
-        quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000, open_interest=0)]
-        oi_map = {"AAPL": 0}
-
-        _stamp_oi(quotes, oi_map)
-
-        with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
+        quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000)]
+        _stamp_oi(quotes, {"AAPL": 0})
+        with patch("services.tier_engine._fetch_thresholds",
+                   new=AsyncMock(return_value=_make_thresh())):
             tiers = await assign_tiers(quotes)
-
-        assert tiers["AAPL"] == 3, (
-            f"AAPL should be T3 (oi=0, no grace) but got T{tiers['AAPL']}"
-        )
+        assert tiers["AAPL"] == 3
 
     @pytest.mark.asyncio
     async def test_oi_drives_correct_t1_promotion(self):
-        """
-        AAPL has great vol+price AND chain OI=2000 >= t1_min_oi=1000 -> T1.
-        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
-
-        quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000, open_interest=0)]
-        oi_map = {"AAPL": 2000}
-
-        _stamp_oi(quotes, oi_map)
-
-        with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
+        quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000)]
+        _stamp_oi(quotes, {"AAPL": 2000})
+        with patch("services.tier_engine._fetch_thresholds",
+                   new=AsyncMock(return_value=_make_thresh())):
             tiers = await assign_tiers(quotes)
-
         assert tiers["AAPL"] == 1
 
     @pytest.mark.asyncio
     async def test_mixed_oi_produces_mixed_tiers(self):
-        """
-        Three symbols: T1 / T2 / T3 based solely on OI.
-        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
-
         quotes = [
-            _Quote("SPY",  last_price=500.0, average_volume=50_000_000, open_interest=0),
-            _Quote("HOOD", last_price=15.0,  average_volume=3_000_000,  open_interest=0),
-            _Quote("SPCE", last_price=2.0,   average_volume=200_000,    open_interest=0),
+            _Quote("SPY",  last_price=500.0, average_volume=50_000_000),
+            _Quote("HOOD", last_price=15.0,  average_volume=3_000_000),
+            _Quote("SPCE", last_price=2.0,   average_volume=200_000),
         ]
-        oi_map = {"SPY": 5_000, "HOOD": 600, "SPCE": 50}
-
-        _stamp_oi(quotes, oi_map)
-
-        with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
+        _stamp_oi(quotes, {"SPY": 5_000, "HOOD": 600, "SPCE": 50})
+        with patch("services.tier_engine._fetch_thresholds",
+                   new=AsyncMock(return_value=_make_thresh())):
             tiers = await assign_tiers(quotes)
-
-        assert tiers["SPY"]  == 1, f"SPY should be T1 but got T{tiers['SPY']}"
-        assert tiers["HOOD"] == 2, f"HOOD should be T2 but got T{tiers['HOOD']}"
-        assert tiers["SPCE"] == 3, f"SPCE should be T3 but got T{tiers['SPCE']}"
+        assert tiers["SPY"] == 1
+        assert tiers["HOOD"] == 2
+        assert tiers["SPCE"] == 3
 
     @pytest.mark.asyncio
     async def test_preliminary_vs_final_tier_diff(self):
-        """
-        Regression: two-pass design in lifespan() — preliminary (OI=0)
-        differs from final (OI stamped).
-        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
-
-        quotes = [
-            _Quote("NVDA", last_price=900.0, average_volume=25_000_000, open_interest=0),
-        ]
-
-        # Pass 1: preliminary with OI=0
-        with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
+        quotes = [_Quote("NVDA", last_price=900.0, average_volume=25_000_000)]
+        with patch("services.tier_engine._fetch_thresholds",
+                   new=AsyncMock(return_value=_make_thresh())):
             prelim_tiers = await assign_tiers(quotes)
-
-        # Pass 2: stamp real OI then re-classify
         _stamp_oi(quotes, {"NVDA": 3_000})
-        with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
+        with patch("services.tier_engine._fetch_thresholds",
+                   new=AsyncMock(return_value=_make_thresh())):
             final_tiers = await assign_tiers(quotes)
-
-        assert prelim_tiers["NVDA"] == 3, "Preliminary pass (oi=0) should yield T3"
-        assert final_tiers["NVDA"]  == 1, "Final pass (oi=3000) should yield T1"
+        assert prelim_tiers["NVDA"] == 3
+        assert final_tiers["NVDA"]  == 1
