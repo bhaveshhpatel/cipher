@@ -2,15 +2,14 @@
 composite_signal_engine.py — Phase 3 + 5A
 
 vwpf formula: min(1.0, premium / (oi * 100))
-  - oi * 100 = notional contract count (no strike, scale-invariant)
-  - e.g. premium=500k, oi=1000 -> 5.0 -> clamped to 1.0
-  - e.g. premium=1k,   oi=100k -> 0.0001 < 0.5
 
-Patch compatibility:
-  Both test files are satisfied:
-    patch('signals.composite_signal_engine.run_ensemble')  -> hits module attr
-    patch('simulation.ensemble_runner.run_ensemble')       -> build_composite_async
-      re-imports simulation.ensemble_runner live, so the patched ref is used.
+Patch compatibility — both test files satisfied:
+  patch('signals.composite_signal_engine.run_ensemble', ...):
+    -> replaces module-level attr; identity check detects it differs from
+       simulation.ensemble_runner.run_ensemble, so module attr is used.
+  patch('simulation.ensemble_runner.run_ensemble', ...):
+    -> module attr still equals original (same object), so live
+       simulation.ensemble_runner.run_ensemble is used (which IS patched).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -19,9 +18,13 @@ from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumula
 from signals.backtest_validator import get_backtest_score
 
 try:
-    from simulation.ensemble_runner import run_ensemble  # module-level attr for patching
+    from simulation.ensemble_runner import run_ensemble as _original_run_ensemble
 except Exception:
-    run_ensemble = None  # type: ignore[assignment]
+    _original_run_ensemble = None  # type: ignore[assignment]
+
+# Module-level attr — patching 'signals.composite_signal_engine.run_ensemble'
+# replaces this name; identity check in build_composite_async detects the swap.
+run_ensemble = _original_run_ensemble
 
 
 @dataclass
@@ -106,20 +109,20 @@ async def build_composite_async(
     accumulator: RepetitionAccumulator,
     n_agents:    int | None = None,
 ) -> CompositeSignal:
-    """
-    Checks module-level run_ensemble first (satisfies patches on
-    'signals.composite_signal_engine.run_ensemble'), then falls back to
-    importing simulation.ensemble_runner live (satisfies patches on
-    'simulation.ensemble_runner.run_ensemble').
-    """
     import signals.composite_signal_engine as _self
     import simulation.ensemble_runner as _er
 
-    # Module-level attr takes priority (patched by _extended tests)
-    _run = _self.__dict__.get("run_ensemble")
-    # If not patched at module level, use live import (patched by _engine tests)
-    if _run is None or _run is getattr(_er, "run_ensemble", None):
-        _run = getattr(_er, "run_ensemble", None)
+    _module_run  = _self.__dict__.get("run_ensemble")
+    _live_run    = getattr(_er, "run_ensemble", None)
+
+    # If the module attr has been replaced by a patch (identity differs from
+    # the live ensemble_runner attr), use the patched module attr.
+    # Otherwise always resolve from simulation.ensemble_runner live so that
+    # patch('simulation.ensemble_runner.run_ensemble') is respected.
+    if _module_run is not None and _module_run is not _original_run_ensemble:
+        _run = _module_run
+    else:
+        _run = _live_run
 
     sig = build_composite(ep, accumulator)
 
