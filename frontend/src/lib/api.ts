@@ -140,3 +140,10 @@ export const api = {
     });
   },
 };
+
+/**
+ * Named alias used by login/page.tsx and its test mock.
+ * The test does: jest.mock('@/lib/api', () => ({ authAPI: { login: mockLogin } }))
+ * so we export `authAPI` as an alias for `api`.
+ */
+export const authAPI = api;

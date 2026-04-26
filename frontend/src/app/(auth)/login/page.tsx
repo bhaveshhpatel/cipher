@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { api as authAPI } from "@/lib/api";
+import { authAPI } from "@/lib/api";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "";
 
@@ -108,7 +108,7 @@ export default function LoginPage() {
             className="rounded-md py-2.5 text-sm font-bold uppercase tracking-wider transition-all"
             style={{ background: loading ? "var(--border)" : "var(--amber)", color: loading ? "var(--muted)" : "#1a0f00" }}
           >
-            {loading ? "Signing in…" : "Sign in"}
+            {loading ? "Signing in\u2026" : "Sign in"}
           </button>
         </form>
 

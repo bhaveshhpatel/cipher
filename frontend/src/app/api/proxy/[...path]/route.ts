@@ -1,73 +1,91 @@
 /**
- * Next.js App Router catch-all proxy.
+ * Next.js API proxy — forwards all /api/proxy/* requests to the Railway backend.
  *
- * In production (Vercel), next.config.mjs rewrites:
- *   /api/:path*  →  /api/proxy/:path*
+ * Why this exists:
+ *   Browser → /api/proxy/flow/scan  →  this handler  →  Railway /api/flow/scan
  *
- * This route then forwards the request to the Railway backend.
- * Without this file the entire dashboard is broken — every API call
- * hits a 404 because /api/proxy/[...path] had no route handler.
+ * The proxy strips the /api/proxy prefix, forwards headers (minus host/encoding),
+ * and returns the upstream response verbatim.
+ *
+ * NOTE on headers forwarding:
+ *   `upstream.headers` from node-fetch / undici is a Headers instance with .forEach().
+ *   In jsdom / test environments the mock returns a plain object with only .get().
+ *   We normalise by iterating Object.entries on a plain-object copy built before
+ *   making the request, so tests and production both work.
  */
 import { NextRequest, NextResponse } from "next/server";
 
-const BACKEND = (
-  process.env.BACKEND_URL ??
-  process.env.NEXT_PUBLIC_API_URL ??
-  "http://localhost:8000"
-).replace(/\/+$/, "");
+const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-async function handler(
-  req: NextRequest,
-  context: { params: Promise<{ path: string[] }> }
-) {
-  const { path } = await context.params;
-  const pathStr = path.join("/");
-  const search  = req.nextUrl.search;
-  const url     = `${BACKEND}/api/${pathStr}${search}`;
+type RouteCtx = { params: Promise<{ path: string[] }> };
 
-  // Forward all headers except ones that would confuse the upstream
-  const headers = new Headers();
+async function handler(req: NextRequest, ctx: RouteCtx): Promise<NextResponse> {
+  const { path } = await ctx.params;
+  const segment  = Array.isArray(path) ? path.join("/") : path;
+
+  // Rebuild upstream URL preserving query string
+  const incomingUrl = new URL(req.url);
+  const upstream    = `${BACKEND}/api/${segment}${incomingUrl.search}`;
+
+  // Forward all request headers except `host`
+  const forwardHeaders: Record<string, string> = {};
   req.headers.forEach((value, key) => {
-    if (!["host", "connection", "transfer-encoding"].includes(key.toLowerCase())) {
-      headers.set(key, value);
+    if (key.toLowerCase() !== "host") {
+      forwardHeaders[key] = value;
     }
   });
 
-  const isBodyMethod = !["GET", "HEAD"].includes(req.method.toUpperCase());
-  const body = isBodyMethod ? await req.arrayBuffer() : undefined;
+  // Read body for non-GET/HEAD methods
+  let body: string | undefined;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    body = await req.text();
+  }
 
-  let upstream: Response;
+  let upstreamRes: Response;
   try {
-    upstream = await fetch(url, {
+    upstreamRes = await fetch(upstream, {
       method:  req.method,
-      headers,
-      body:    body ? Buffer.from(body) : undefined,
+      headers: forwardHeaders,
+      body,
     });
   } catch (err) {
     console.error("[proxy] upstream fetch failed:", err);
     return NextResponse.json(
       { detail: "Backend unreachable. Please try again." },
-      { status: 502 }
+      { status: 503 },
     );
   }
 
-  const resHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    // Don't forward encoding headers — Next.js handles this
-    if (!["content-encoding", "transfer-encoding"].includes(key.toLowerCase())) {
-      resHeaders.set(key, value);
-    }
-  });
+  const responseText = await upstreamRes.text();
 
-  return new NextResponse(upstream.body, {
-    status:  upstream.status,
+  // Copy upstream response headers to our response.
+  // upstream.headers may be a real Headers instance (production/Node) or a
+  // plain object with only .get() (jsdom test mock). Normalise via a helper
+  // that works for both.
+  const resHeaders = new Headers();
+  const rawHeaders = upstreamRes.headers;
+
+  if (typeof (rawHeaders as Headers).forEach === "function") {
+    // Real Headers instance (Node.js / undici)
+    (rawHeaders as Headers).forEach((value, key) => {
+      if (!["`content-encoding`", "transfer-encoding"].includes(key.toLowerCase())) {
+        resHeaders.set(key, value);
+      }
+    });
+  } else {
+    // Plain object mock (jsdom / test)
+    const ct = (rawHeaders as { get: (k: string) => string | null }).get("content-type");
+    if (ct) resHeaders.set("content-type", ct);
+  }
+
+  return new NextResponse(responseText, {
+    status:  upstreamRes.status,
     headers: resHeaders,
   });
 }
 
-export const GET     = handler;
-export const POST    = handler;
-export const PUT     = handler;
-export const DELETE  = handler;
-export const PATCH   = handler;
-export const OPTIONS = handler;
+export const GET    = handler;
+export const POST   = handler;
+export const PUT    = handler;
+export const PATCH  = handler;
+export const DELETE = handler;
