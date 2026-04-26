@@ -5,7 +5,8 @@ import pytest
 
 
 def test_signal_store_importable():
-    import services.signal_store  # noqa: F401
+    import services.signal_store as _m  # intentional smoke import
+    assert _m is not None
 
 
 @pytest.mark.asyncio

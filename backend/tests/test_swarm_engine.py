@@ -23,7 +23,8 @@ class _Flow:
 
 
 def test_swarm_engine_importable():
-    import services.swarm_engine  # noqa: F401
+    import services.swarm_engine as _m  # intentional smoke import
+    assert _m is not None
 
 
 def test_swarm_engine_has_run_function():
@@ -68,7 +69,7 @@ def test_swarm_engine_has_agents_or_workers():
         hasattr(se, "AGENTS") or hasattr(se, "_agents") or
         hasattr(se, "WORKERS") or hasattr(se, "_workers")
     )
-    assert True  # structural check only
+    assert True
 
 
 @pytest.mark.asyncio

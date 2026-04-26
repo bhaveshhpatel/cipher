@@ -7,11 +7,13 @@ from unittest.mock import AsyncMock, patch
 
 
 def test_tradier_stream_importable():
-    import services.tradier_stream  # noqa: F401
+    import services.tradier_stream as _m  # intentional smoke import
+    assert _m is not None
 
 
 def test_stream_worker_importable():
-    import services.stream_worker  # noqa: F401
+    import services.stream_worker as _m  # intentional smoke import
+    assert _m is not None
 
 
 @pytest.mark.asyncio

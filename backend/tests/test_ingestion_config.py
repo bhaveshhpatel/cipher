@@ -6,7 +6,8 @@ import pytest
 
 
 def test_ingestion_config_importable():
-    import ingestion.config  # noqa: F401
+    import ingestion.config as _m  # intentional smoke import
+    assert _m is not None
 
 
 def test_ingestion_config_has_expected_attributes():
@@ -66,13 +67,8 @@ def test_env_override_symbols(monkeypatch):
 
 
 def test_missing_api_key_env_raises_or_uses_default():
-    """
-    If TRADIER_API_KEY is unset, config should either raise a clear error
-    or fall back to a default/demo value. Must not silently use None.
-    """
     import ingestion.config as cfg
     _ = getattr(cfg, "TRADIER_API_KEY", None) or os.environ.get("TRADIER_API_KEY", None)
-    # Either set or not — just must not crash on import
 
 
 def test_validate_symbol_accepts_valid():

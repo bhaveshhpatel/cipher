@@ -11,12 +11,9 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-# ---------------------------------------------------------------------------
-# Import smoke
-# ---------------------------------------------------------------------------
-
 def test_tradier_client_importable():
-    import utils.tradier_client  # noqa: F401
+    import utils.tradier_client as _m  # intentional smoke import
+    assert _m is not None
 
 
 def test_tradier_client_has_expected_api():
@@ -24,10 +21,6 @@ def test_tradier_client_has_expected_api():
     for name in ("get_quote", "get_options_chain", "get_token"):
         assert hasattr(tc, name), f"Missing: {name}"
 
-
-# ---------------------------------------------------------------------------
-# get_quote
-# ---------------------------------------------------------------------------
 
 class TestGetQuote:
     @staticmethod
@@ -82,10 +75,6 @@ class TestGetQuote:
         assert result is None
 
 
-# ---------------------------------------------------------------------------
-# get_options_chain
-# ---------------------------------------------------------------------------
-
 class TestGetOptionsChain:
     def test_get_options_chain_returns_list(self):
         from utils.tradier_client import get_options_chain
@@ -133,10 +122,6 @@ class TestGetOptionsChain:
         assert result == [] or result is None
 
 
-# ---------------------------------------------------------------------------
-# get_token / session semaphore
-# ---------------------------------------------------------------------------
-
 class TestGetToken:
     def test_get_token_returns_string_on_success(self):
         from utils.tradier_client import get_token
@@ -173,5 +158,5 @@ class TestGetToken:
         import asyncio as aio
         sem = getattr(tc, "_SESSION_SEM", None)
         if sem is None:
-            return  # optional
+            return
         assert isinstance(sem, aio.Semaphore)

@@ -31,7 +31,8 @@ def _flow(ticker="AAPL", premium=100_000.0, sentiment="BULLISH",
 
 
 def test_flow_store_importable():
-    import services.flow_store  # noqa: F401
+    import services.flow_store as _m  # intentional smoke import
+    assert _m is not None
 
 
 def test_flow_store_has_expected_api():
