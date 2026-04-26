@@ -119,8 +119,10 @@ class TestFetchThresholds:
 
     def test_fetch_thresholds_uses_cache_on_second_call(self):
         from services import tier_engine
-        # Prime the cache manually
-        tier_engine._cache    = {"t1_min_volume": 99_999_999, **_thresh()}
+        # Prime the cache manually.
+        # IMPORTANT: explicit override key must come AFTER **_thresh() so it
+        # wins the dict merge — earlier keys are overwritten by later ones.
+        tier_engine._cache    = {**_thresh(), "t1_min_volume": 99_999_999}
         tier_engine._cache_ts = time.monotonic() + 9_999
         with patch.object(tier_engine, "_SUPABASE_URL", None), \
              patch.object(tier_engine, "_SUPABASE_KEY", None):
