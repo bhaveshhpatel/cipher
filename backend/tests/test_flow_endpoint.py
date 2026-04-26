@@ -1,182 +1,258 @@
 """
-Tests for the /api/flow/scan endpoint.
-Run with: pytest backend/tests/test_flow_endpoint.py -v
+Regression tests for routers/flow.py
+
+Covers:
+  - Unauthenticated request returns 401
+  - Authenticated request returns FlowResponse shape (ticker, events, total, limit, offset)
+  - ticker filter is uppercased
+  - limit + offset forwarded to query function and echoed back
+  - limit boundary: limit=1 and limit=200 both accepted
+  - limit out of range: limit=0 → 422, limit=201 → 422
+  - No Supabase env vars → empty list, not 500
+  - direction→sentiment mapping: REPEAT_BUY→BULLISH, REPEAT_SELL→BEARISH, HOLD→NEUTRAL
+  - alert_level→influence_tier mapping: CRITICAL→WHALE, HIGH→INSTITUTIONAL
+  - conviction_score mapping from alert_level (CRITICAL→0.92)
+  - is_accelerating=True → is_golden_sweep=True, trade_type='SWEEP'
+  - is_accelerating=False → is_golden_sweep=False, trade_type='BLOCK'
+  - Malformed row is skipped, rest of response is still returned
+  - Unknown direction/alert values fall back to NEUTRAL / RETAIL
 """
 import pytest
 from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
+from core.auth import create_access_token, TokenData
+from main import app
+
+client = TestClient(app)
 
 
-# ── Fixtures ───────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-MOCK_EPISODES = [
-    {
-        "id": 1,
-        "ticker": "AAPL",
-        "direction": "REPEAT_BUY",
-        "contract_type": "CALL",
-        "strike": "195.00",
-        "expiry": "2025-05-16",
-        "total_premium": "2850000.00",
-        "trade_count": 12,
-        "alert_level": "CRITICAL",
-        "is_accelerating": True,
-        "signal_ts": "2026-04-24T10:00:00+00:00",
-        "created_at": "2026-04-24T10:00:00+00:00",
-    },
-    {
-        "id": 2,
-        "ticker": "TSLA",
-        "direction": "REPEAT_SELL",
-        "contract_type": "PUT",
-        "strike": "175.00",
-        "expiry": "2025-05-09",
-        "total_premium": "3400000.00",
-        "trade_count": 8,
-        "alert_level": "HIGH",
-        "is_accelerating": False,
-        "signal_ts": "2026-04-24T09:55:00+00:00",
-        "created_at": "2026-04-24T09:55:00+00:00",
-    },
-]
+def _make_token() -> str:
+    return create_access_token({"sub": "trader@cipher.io"})
 
 
-@pytest.fixture
-def mock_supabase_episodes():
-    """Patch _query_flow_episodes to return mock data."""
-    with patch(
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _mock_user():
+    td = TokenData(email="trader@cipher.io", role="user")
+    return patch("routers.flow.get_current_user", return_value=td)
+
+
+def _mock_query(rows=None, total=0):
+    return patch(
         "routers.flow._query_flow_episodes",
-        new_callable=AsyncMock,
-        return_value=(MOCK_EPISODES, 2),
-    ) as mock:
-        yield mock
+        new=AsyncMock(return_value=(rows or [], total)),
+    )
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────
-
-class TestFlowDirectionMapping:
-    """Unit tests for direction → sentiment mapping."""
-
-    def test_repeat_buy_maps_to_bullish(self):
-        from routers.flow import _DIRECTION_TO_SENTIMENT
-        assert _DIRECTION_TO_SENTIMENT["REPEAT_BUY"] == "BULLISH"
-
-    def test_repeat_sell_maps_to_bearish(self):
-        from routers.flow import _DIRECTION_TO_SENTIMENT
-        assert _DIRECTION_TO_SENTIMENT["REPEAT_SELL"] == "BEARISH"
-
-    def test_neutral_maps_to_neutral(self):
-        from routers.flow import _DIRECTION_TO_SENTIMENT
-        assert _DIRECTION_TO_SENTIMENT["NEUTRAL"] == "NEUTRAL"
-
-    def test_bullish_direct_maps_correctly(self):
-        from routers.flow import _DIRECTION_TO_SENTIMENT
-        assert _DIRECTION_TO_SENTIMENT["BULLISH"] == "BULLISH"
-
-
-class TestFlowAlertTierMapping:
-    """Unit tests for alert_level → influence_tier mapping."""
-
-    def test_critical_maps_to_whale(self):
-        from routers.flow import _ALERT_TO_TIER
-        assert _ALERT_TO_TIER["CRITICAL"] == "WHALE"
-
-    def test_high_maps_to_institutional(self):
-        from routers.flow import _ALERT_TO_TIER
-        assert _ALERT_TO_TIER["HIGH"] == "INSTITUTIONAL"
-
-    def test_medium_maps_to_large(self):
-        from routers.flow import _ALERT_TO_TIER
-        assert _ALERT_TO_TIER["MEDIUM"] == "LARGE"
-
-    def test_low_maps_to_retail(self):
-        from routers.flow import _ALERT_TO_TIER
-        assert _ALERT_TO_TIER["LOW"] == "RETAIL"
+def _sample_row(
+    ticker="AAPL",
+    direction="BULLISH",
+    alert_level="HIGH",
+    is_accelerating=False,
+) -> dict:
+    return {
+        "id":            1,
+        "ticker":        ticker,
+        "direction":     direction,
+        "contract_type": "CALL",
+        "strike":        195.0,
+        "expiry":        "2026-06-20",
+        "total_premium": 250_000.0,
+        "trade_count":   8,
+        "alert_level":   alert_level,
+        "is_accelerating": is_accelerating,
+        "signal_ts":     "2026-04-25T18:00:00Z",
+        "created_at":    "2026-04-25T18:00:01Z",
+    }
 
 
-class TestFlowScanEndpoint:
-    """Integration tests for GET /api/flow/scan."""
+# ── auth guard ────────────────────────────────────────────────────────────────
 
-    def _get_client(self):
-        """Create test client with auth bypassed."""
-        from main import app
-        from core.auth import get_current_user
-        from pydantic import BaseModel
+def test_flow_scan_unauthenticated_returns_401():
+    resp = client.get("/api/flow/scan")
+    assert resp.status_code == 401
 
-        class FakeToken(BaseModel):
-            sub: str = "test@example.com"
 
-        app.dependency_overrides[get_current_user] = lambda: FakeToken()
-        return TestClient(app)
+# ── happy path ────────────────────────────────────────────────────────────────
 
-    def test_scan_returns_all_events_no_ticker(self, mock_supabase_episodes):
-        """Flow Scanner: no ticker param returns all episodes."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total"] == 2
-        assert len(data["events"]) == 2
-        assert data["ticker"] is None
+def test_flow_scan_returns_valid_response_shape():
+    row = _sample_row()
+    with _mock_user(), _mock_query([row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    body = resp.json()
+    for key in ("ticker", "events", "total", "limit", "offset"):
+        assert key in body
+    assert body["total"] == 1
+    assert len(body["events"]) == 1
+    ev = body["events"][0]
+    for key in ("ticker", "contract_type", "strike", "expiry", "premium",
+                "trade_type", "sentiment", "influence_tier", "conviction_score",
+                "is_golden_sweep"):
+        assert key in ev
 
-    def test_scan_ticker_filter_passed_to_supabase(self, mock_supabase_episodes):
-        """Ticker filter is forwarded correctly to Supabase query."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan?ticker=AAPL")
-        assert resp.status_code == 200
-        # Verify the mock was called with ticker="AAPL"
-        call_kwargs = mock_supabase_episodes.call_args
-        assert call_kwargs[0][0] == "AAPL"  # first positional arg
 
-    def test_scan_event_sentiment_mapped_correctly(self, mock_supabase_episodes):
-        """REPEAT_BUY direction becomes BULLISH sentiment in response."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan")
-        events = resp.json()["events"]
-        aapl_event = next(e for e in events if e["ticker"] == "AAPL")
-        assert aapl_event["sentiment"] == "BULLISH"
+def test_flow_scan_empty_returns_zero_events():
+    with _mock_user(), _mock_query([], total=0):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["events"] == []
+    assert body["total"] == 0
 
-    def test_scan_event_tier_mapped_correctly(self, mock_supabase_episodes):
-        """CRITICAL alert_level becomes WHALE influence_tier in response."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan")
-        events = resp.json()["events"]
-        aapl_event = next(e for e in events if e["ticker"] == "AAPL")
-        assert aapl_event["influence_tier"] == "WHALE"
 
-    def test_scan_golden_sweep_from_is_accelerating(self, mock_supabase_episodes):
-        """is_accelerating=True maps to is_golden_sweep=True."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan")
-        events = resp.json()["events"]
-        aapl_event = next(e for e in events if e["ticker"] == "AAPL")
-        tsla_event = next(e for e in events if e["ticker"] == "TSLA")
-        assert aapl_event["is_golden_sweep"] is True
-        assert tsla_event["is_golden_sweep"] is False
+# ── ticker normalisation ─────────────────────────────────────────────────────
 
-    def test_scan_bearish_event(self, mock_supabase_episodes):
-        """REPEAT_SELL direction → BEARISH sentiment, HIGH alert → INSTITUTIONAL tier."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan")
-        events = resp.json()["events"]
-        tsla_event = next(e for e in events if e["ticker"] == "TSLA")
-        assert tsla_event["sentiment"] == "BEARISH"
-        assert tsla_event["influence_tier"] == "INSTITUTIONAL"
+def test_flow_scan_ticker_is_uppercased():
+    captured = {}
 
-    def test_scan_requires_auth(self):
-        """Unauthenticated request returns 401/403."""
-        from main import app
-        from core.auth import get_current_user
-        app.dependency_overrides.pop(get_current_user, None)
-        client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/api/flow/scan")
-        assert resp.status_code in (401, 403)
+    async def capture(ticker, limit, offset):
+        captured["ticker"] = ticker
+        return [], 0
 
-    def test_scan_pagination_params(self, mock_supabase_episodes):
-        """limit and offset are forwarded to query."""
-        client = self._get_client()
-        resp = client.get("/api/flow/scan?limit=10&offset=20")
-        assert resp.status_code == 200
-        call_kwargs = mock_supabase_episodes.call_args
-        assert call_kwargs[0][1] == 10   # limit
-        assert call_kwargs[0][2] == 20   # offset
+    with _mock_user():
+        with patch("routers.flow._query_flow_episodes", new=AsyncMock(side_effect=capture)):
+            client.get("/api/flow/scan?ticker=tsla", headers=_auth(_make_token()))
+    assert captured["ticker"] == "TSLA"
+
+
+# ── pagination ───────────────────────────────────────────────────────────────
+
+def test_flow_scan_pagination_params_forwarded():
+    captured = {}
+
+    async def capture(ticker, limit, offset):
+        captured["limit"] = limit
+        captured["offset"] = offset
+        return [], 0
+
+    with _mock_user():
+        with patch("routers.flow._query_flow_episodes", new=AsyncMock(side_effect=capture)):
+            resp = client.get(
+                "/api/flow/scan?limit=25&offset=75",
+                headers=_auth(_make_token()),
+            )
+    assert resp.status_code == 200
+    assert captured["limit"] == 25
+    assert captured["offset"] == 75
+
+
+def test_flow_scan_response_echoes_limit_offset():
+    with _mock_user(), _mock_query([], total=0):
+        resp = client.get(
+            "/api/flow/scan?limit=10&offset=20",
+            headers=_auth(_make_token()),
+        )
+    body = resp.json()
+    assert body["limit"] == 10
+    assert body["offset"] == 20
+
+
+def test_flow_scan_limit_min_boundary():
+    with _mock_user(), _mock_query():
+        resp = client.get("/api/flow/scan?limit=1", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+
+
+def test_flow_scan_limit_max_boundary():
+    with _mock_user(), _mock_query():
+        resp = client.get("/api/flow/scan?limit=200", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+
+
+def test_flow_scan_limit_zero_returns_422():
+    with _mock_user(), _mock_query():
+        resp = client.get("/api/flow/scan?limit=0", headers=_auth(_make_token()))
+    assert resp.status_code == 422
+
+
+def test_flow_scan_limit_over_max_returns_422():
+    with _mock_user(), _mock_query():
+        resp = client.get("/api/flow/scan?limit=201", headers=_auth(_make_token()))
+    assert resp.status_code == 422
+
+
+# ── no env vars → empty result, not 500 ───────────────────────────────────────────
+
+def test_flow_scan_no_supabase_env_returns_empty_not_500():
+    with _mock_user():
+        with patch("routers.flow._SUPABASE_URL", None), \
+             patch("routers.flow._SUPABASE_KEY", None):
+            resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    assert resp.json()["events"] == []
+
+
+# ── direction → sentiment mapping ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("direction,expected_sentiment", [
+    ("REPEAT_BUY",  "BULLISH"),
+    ("REPEAT_SELL", "BEARISH"),
+    ("BULLISH",     "BULLISH"),
+    ("BEARISH",     "BEARISH"),
+    ("NEUTRAL",     "NEUTRAL"),
+    ("HOLD",        "NEUTRAL"),
+    ("UNKNOWN_VAL", "NEUTRAL"),  # unmapped falls back to NEUTRAL
+])
+def test_flow_direction_to_sentiment_mapping(direction, expected_sentiment):
+    row = _sample_row(direction=direction)
+    with _mock_user(), _mock_query([row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    assert resp.json()["events"][0]["sentiment"] == expected_sentiment
+
+
+# ── alert_level → influence_tier + conviction_score mapping ────────────────────────
+
+@pytest.mark.parametrize("alert,expected_tier,expected_conviction", [
+    ("CRITICAL", "WHALE",         0.92),
+    ("HIGH",     "INSTITUTIONAL", 0.75),
+    ("MEDIUM",   "LARGE",         0.55),
+    ("LOW",      "RETAIL",        0.35),
+    ("UNKNOWN",  "RETAIL",        0.5),  # unmapped falls back to RETAIL / 0.5
+])
+def test_flow_alert_level_mapping(alert, expected_tier, expected_conviction):
+    row = _sample_row(alert_level=alert)
+    with _mock_user(), _mock_query([row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    ev = resp.json()["events"][0]
+    assert ev["influence_tier"] == expected_tier
+    assert pytest.approx(ev["conviction_score"], abs=0.01) == expected_conviction
+
+
+# ── is_accelerating flag ─────────────────────────────────────────────────────────
+
+def test_flow_is_accelerating_true_sets_golden_sweep_and_sweep_type():
+    row = _sample_row(is_accelerating=True)
+    with _mock_user(), _mock_query([row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    ev = resp.json()["events"][0]
+    assert ev["is_golden_sweep"] is True
+    assert ev["trade_type"] == "SWEEP"
+
+
+def test_flow_is_accelerating_false_sets_block_type():
+    row = _sample_row(is_accelerating=False)
+    with _mock_user(), _mock_query([row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    ev = resp.json()["events"][0]
+    assert ev["is_golden_sweep"] is False
+    assert ev["trade_type"] == "BLOCK"
+
+
+# ── malformed row is skipped ───────────────────────────────────────────────────
+
+def test_flow_scan_malformed_row_is_skipped():
+    bad_row  = {"id": 99}  # missing all required fields
+    good_row = _sample_row(ticker="SPY")
+    with _mock_user(), _mock_query([bad_row, good_row], total=2):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    assert len(events) == 1
+    assert events[0]["ticker"] == "SPY"
