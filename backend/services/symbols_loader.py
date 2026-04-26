@@ -18,10 +18,14 @@ Fallback priority:
   2. DB snapshot if provided (stream_eligible_set = None, quotes = [])
   3. SEED_SYMBOLS as last resort (stream_eligible_set = None, quotes = [])
 
-Returns (symbols, source, stream_eligible_set, quotes) from load_universe().
-  - quotes is always a list[SymbolQuote] (empty list on fallback paths)
+Returns (symbols, source, stream_eligible_set) from load_universe().
+  - Callers that need quotes call _fetch_batch_quotes() directly.
   - upsert_symbol_quotes() is NOT called here — caller (main.py) does it
     AFTER save_snapshot() so the active snapshot row already exists.
+
+Note on priority_symbols:
+  After the pipeline completes, settings.priority_symbols are force-added
+  to the eligible_set regardless of their price/volume thresholds.
 """
 import asyncio
 import csv
@@ -74,20 +78,27 @@ class SymbolQuote:
 async def load_universe(
     *,
     db_snapshot: Optional[list[str]] = None,
-) -> tuple[list[str], str, Optional[set[str]], list["SymbolQuote"]]:
+) -> tuple[list[str], str, Optional[set[str]]]:
     """
-    Return (symbols, source, stream_eligible_set, quotes) where:
+    Return (symbols, source, stream_eligible_set) where:
       symbols             — full validated universe list
       source              — 'tradier_validated' | 'cache' | 'seed_fallback'
       stream_eligible_set — set of symbols eligible for streaming,
                             or None when source is cache/seed (pipeline not run)
-      quotes              — list[SymbolQuote] with last_price/volume/stream_eligible
-                            per symbol; empty list on fallback paths
 
     NOTE: upsert_symbol_quotes() is NOT called here.
-    The caller (main.py) must call it AFTER save_snapshot() so that the
-    active snapshot row already exists when the upsert runs.
+    The caller (main.py) must call _fetch_batch_quotes() separately if it
+    needs the SymbolQuote list, then call upsert_symbol_quotes() after
+    save_snapshot() so that the active snapshot row already exists.
+
+    priority_symbols from settings are force-added to stream_eligible_set
+    after the pipeline completes (they bypass price/volume thresholds).
     """
+    if not getattr(settings, "TRADIER_API_KEY", None):
+        log.warning("TRADIER_API_KEY not set — skipping full pipeline, using fallback")
+        syms, source = _fallback(db_snapshot)
+        return syms, source, None
+
     try:
         symbols = await _fetch_and_validate()
         if symbols:
@@ -95,25 +106,34 @@ async def load_universe(
 
             # Step 3 — batch quotes → stream eligibility
             quotes = await _fetch_batch_quotes(symbols)
-            eligible_set = {q.symbol for q in quotes if q.stream_eligible}
+            eligible_set: set[str] = {q.symbol for q in quotes if q.stream_eligible}
+
+            # Force priority symbols into the eligible set regardless of thresholds
+            priority = getattr(settings, "priority_symbols", None) or []
+            if priority:
+                eligible_set.update(priority)
+                log.info(
+                    "Priority symbols forced into eligible_set: %s",
+                    ", ".join(str(s) for s in priority),
+                )
 
             log.info(
                 "Step 3 complete: %d / %d symbols stream-eligible (%.1f%%) "
                 "[min_price=%.2f, min_volume=%d]",
                 len(eligible_set), len(symbols),
                 100 * len(eligible_set) / len(symbols) if symbols else 0,
-                settings.UNIVERSE_MIN_PRICE,
-                settings.UNIVERSE_MIN_VOLUME,
+                getattr(settings, "UNIVERSE_MIN_PRICE", 1.0),
+                getattr(settings, "UNIVERSE_MIN_VOLUME", 100_000),
             )
 
-            return symbols, "tradier_validated", eligible_set, quotes
+            return symbols, "tradier_validated", eligible_set
 
         log.warning("CBOE+Tradier universe fetch returned 0 valid symbols — using fallback")
     except Exception as e:
         log.error("Universe fetch failed unexpectedly: %s — using fallback", e)
 
     syms, source = _fallback(db_snapshot)
-    return syms, source, None, []
+    return syms, source, None
 
 
 def _fallback(db_snapshot: Optional[list[str]]) -> tuple[list[str], str]:
@@ -254,12 +274,12 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
     if not symbols:
         return []
 
-    batch_size  = settings.UNIVERSE_QUOTES_BATCH_SIZE
-    concurrency = settings.UNIVERSE_QUOTES_CONCURRENCY
-    min_price   = settings.UNIVERSE_MIN_PRICE
-    min_volume  = settings.UNIVERSE_MIN_VOLUME
+    batch_size  = getattr(settings, "UNIVERSE_QUOTES_BATCH_SIZE", 200)
+    concurrency = getattr(settings, "UNIVERSE_QUOTES_CONCURRENCY", 28)
+    min_price   = getattr(settings, "UNIVERSE_MIN_PRICE", 1.0)
+    min_volume  = getattr(settings, "UNIVERSE_MIN_VOLUME", 100_000)
     headers     = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+        "Authorization": f"Bearer {getattr(settings, 'TRADIER_API_KEY', '')}",
         "Accept":        "application/json",
     }
 

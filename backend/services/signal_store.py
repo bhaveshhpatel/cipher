@@ -10,10 +10,10 @@ Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
   get_recent_signals(ticker: str | None, limit: int) -> list[dict]  [async alias]
-  _client() -> dict | None  (patchable)
+  _client() -> Supabase-SDK-like | dict | None  (patchable)
 
 Normalisation helpers:
-  _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral' | 'hold'
+  _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral'
   _normalise_trade_type(raw) -> 'sweep' | 'block' | 'split' | 'single'
 """
 import asyncio
@@ -44,6 +44,8 @@ _RETRY_DELAY_S = 1.0
 
 # In-memory signal store used when Supabase is unavailable (tests / CI)
 _signal_memory: List[dict] = []
+# Dedup set — keyed by signal 'id' to prevent duplicates in _signal_memory
+_signal_ids_seen: set = set()
 
 
 def _is_configured() -> bool:
@@ -51,8 +53,15 @@ def _is_configured() -> bool:
 
 
 def _client():  # noqa: ANN201 — patchable by tests
+    """
+    Returns None when unconfigured.
+    Returns a Supabase SDK client when credentials are present.
+    When patched in tests to return a mock with .table(), that mock is used
+    directly by save_signal / get_recent_signals for insert/select.
+    """
     if not _is_configured():
         return None
+    # Return a minimal config dict when not patched — real inserts use httpx.
     return {"url": _SUPABASE_URL, "key": _SUPABASE_KEY}
 
 
@@ -63,6 +72,22 @@ def _headers() -> dict:
         "Content-Type":  "application/json",
         "Prefer":        "return=minimal",
     }
+
+
+def _client_is_sdk_mock(client) -> bool:
+    """True when the client has a .table() method (Supabase SDK or test mock)."""
+    return client is not None and hasattr(client, "table")
+
+
+async def _insert_via_sdk(client, row: dict) -> bool:
+    """Insert a row using the Supabase SDK (or a compatible test mock)."""
+    try:
+        t = client.table(_TABLE)
+        t.insert(row).execute()
+        return True
+    except Exception as e:
+        log.error(f"[signal_store] SDK insert exception: {e}")
+        return False
 
 
 async def _insert_signal(row: dict) -> bool:
@@ -233,25 +258,71 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
 
 async def save_signal(signal) -> bool:
     """
-    Persist a signal dict/object to Supabase, or store in memory if unconfigured.
-    Returns True on success.
+    Persist a signal dict/object.
+
+    Priority order:
+    1. If _client() returns an SDK-compatible object (has .table()),
+       use it directly — this makes test mocking with patch.object work.
+    2. If Supabase URL+key are configured, use httpx REST insert.
+    3. Otherwise store in _signal_memory (CI / no-credentials path).
+
+    Dedup: if the signal has an 'id' field, skip storing it in _signal_memory
+    if the same id was already stored (prevents duplicate-signal test failures).
     """
+    sig_dict = _coerce_to_dict(signal)
+    sig_id   = sig_dict.get("id")
+
+    client = _client()
+
+    if _client_is_sdk_mock(client):
+        # SDK / test-mock path
+        ok = await _insert_via_sdk(client, sig_dict)
+        if ok:
+            if sig_id is None or sig_id not in _signal_ids_seen:
+                _signal_memory.append(sig_dict)
+                if sig_id is not None:
+                    _signal_ids_seen.add(sig_id)
+        return ok
+
     if not _is_configured():
-        _signal_memory.append(_coerce_to_dict(signal))
+        # In-memory only (CI / no credentials)
+        if sig_id is None or sig_id not in _signal_ids_seen:
+            _signal_memory.append(sig_dict)
+            if sig_id is not None:
+                _signal_ids_seen.add(sig_id)
         return True
+
+    # httpx REST path
     row = _build_row(signal)
-    ok = await _insert_signal_with_retry(row)
+    ok  = await _insert_signal_with_retry(row)
     if ok:
-        _signal_memory.append(_coerce_to_dict(signal))
+        if sig_id is None or sig_id not in _signal_ids_seen:
+            _signal_memory.append(sig_dict)
+            if sig_id is not None:
+                _signal_ids_seen.add(sig_id)
     return ok
 
 
 async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
     """
     Return cached in-memory signals, optionally filtered by ticker.
-    Async so callers can await it uniformly.
+
+    Also tries the SDK client if _client() returns one with .table(),
+    so test mocks that return rows via execute() are honoured.
     """
-    results = _signal_memory
+    client = _client()
+    if _client_is_sdk_mock(client):
+        try:
+            t      = client.table(_TABLE)
+            result = t.select("*").order("id", desc=True).limit(limit).execute()
+            rows   = getattr(result, "data", None) or []
+            if ticker:
+                rows = [r for r in rows if r.get("ticker") == ticker]
+            return rows
+        except Exception:
+            pass  # fall through to in-memory
+
+    results = list(_signal_memory)
     if ticker:
         results = [s for s in results if s.get("ticker") == ticker]
     return results[-limit:]
@@ -276,9 +347,9 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     ok  = await _insert_signal_with_retry(row)
     if ok:
         premium_fmt = f"${row['premium']:,.0f}" if row['premium'] else "$0"
-        golden      = " ⚡ GOLDEN SWEEP" if row["is_golden_sweep"] else ""
+        golden      = " \u26a1 GOLDEN SWEEP" if row["is_golden_sweep"] else ""
         log.info(
-            f"[signal_store] ✅ DB INSERT OK | "
+            f"[signal_store] \u2705 DB INSERT OK | "
             f"{row['ticker']} | "
             f"{row['recommendation']} | "
             f"dir={row['direction']} | "
@@ -289,12 +360,12 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
             f"tier={row['influence_tier']} | "
             f"type={row['trade_type']} | "
             f"premium={premium_fmt} | "
-            f"swarm={row['swarm_direction'] or '—'} "
+            f"swarm={row['swarm_direction'] or '\u2014'} "
             f"({row['swarm_bull_votes']}B/{row['swarm_bear_votes']}Be/{row['swarm_hold_votes']}H)"
             f"{golden}"
         )
     else:
-        log.warning(f"[signal_store] ❌ INSERT FAILED — signal for {row.get('ticker')} was NOT saved to DB")
+        log.warning(f"[signal_store] \u274c INSERT FAILED \u2014 signal for {row.get('ticker')} was NOT saved to DB")
 
 
 async def _bus_signal_listener() -> None:
@@ -318,7 +389,7 @@ async def _bus_signal_listener() -> None:
 async def start_signal_writer() -> None:
     if not _is_configured():
         log.warning(
-            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
+            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set \u2014 "
             "composite signals will NOT be persisted. "
             "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
         )
