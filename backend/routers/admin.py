@@ -51,7 +51,7 @@ def _require_admin(current_user: TokenData = Depends(get_current_user)) -> Token
 
 @router.get("/demo/status")
 async def demo_status(admin: TokenData = Depends(_require_admin)):
-    from services.demo_engine import get_stats, is_running
+    from services.demo_engine import get_stats
     return {"demo": get_stats(), "admin": admin.email, "role": admin.role}
 
 
@@ -116,19 +116,9 @@ async def update_ingestion_config(
 async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
     """
     Return the active tier_thresholds row plus cache metadata.
-
-    Response shape:
-    {
-      "row": { <all 15 threshold columns> + id/updated_at/updated_by/is_active },
-      "cache": {
-        "warm":       true | false,
-        "age_seconds": <seconds since last DB fetch, or null if cold>
-      }
-    }
-
-    Use this to pre-populate the admin UI form and show staleness.
     """
-    import asyncio, time
+    import asyncio
+    import time
     from supabase import create_client
     from config import settings
     import services.tier_engine as te
@@ -158,7 +148,6 @@ async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    # Cache metadata — lets the UI show "cache warm (42 s ago)" or "cache cold"
     now       = time.monotonic()
     cache_ts  = getattr(te, "_cache_ts", 0.0)
     cache_age = now - cache_ts if cache_ts > 0.0 else None
@@ -176,13 +165,6 @@ async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
 
 
 class TierThresholdUpdate(BaseModel):
-    """
-    Update one or more threshold columns on the active tier_thresholds row.
-    Only whitelisted column names are accepted.
-
-    Example body:
-      {"updates": {"t1_min_volume": 25000000, "t2_min_oi": 600}}
-    """
     updates: dict[str, Any]
 
 
@@ -191,13 +173,6 @@ async def update_tier_thresholds(
     body:  TierThresholdUpdate,
     admin: TokenData = Depends(_require_admin),
 ):
-    """
-    Update T1/T2/T3 threshold columns on the active tier_thresholds row.
-    Invalidates the tier_engine in-process cache immediately so the next
-    universe refresh picks up the new values without a restart.
-
-    Only whitelisted column names are accepted. Unknown keys return 422.
-    """
     unknown = set(body.updates.keys()) - _TIER_THRESHOLD_COLUMNS
     if unknown:
         raise HTTPException(
@@ -238,7 +213,6 @@ async def update_tier_thresholds(
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    # Immediately bust the in-process cache so the next assign_tiers() re-fetches
     invalidate_cache()
 
     log.info(
@@ -259,28 +233,6 @@ async def update_tier_thresholds(
 
 @router.get("/tier-distribution")
 async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
-    """
-    Return tier counts and up to 10 sample symbols per tier from the
-    current active snapshot, including avg chain OI (Feature 4A-OI).
-
-    Response shape:
-    {
-      "snapshot_id": "...",
-      "total":       5432,
-      "tiers": {
-        "1": {
-          "count": 87,
-          "samples": [
-            {"symbol": "SPY",  "open_interest": 142300},
-            {"symbol": "AAPL", "open_interest": 98500},
-            ...
-          ]
-        },
-        "2": { ... },
-        "3": { ... }
-      }
-    }
-    """
     import asyncio
     from supabase import create_client
     from config import settings
@@ -292,7 +244,6 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
     def _query():
         sb = create_client(settings.SUPABASE_URL, service_key)
 
-        # Find active snapshot
         snap = (
             sb.table("options_universe_snapshots")
             .select("id")
@@ -307,8 +258,6 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
 
         snapshot_id = rows[0]["id"]
 
-        # Fetch all symbols + tier + open_interest for this snapshot
-        # open_interest is the avg chain OI written by the 4A-OI two-pass pipeline
         result = (
             sb.table("options_universe_symbols")
             .select("symbol, tier, open_interest")
@@ -323,7 +272,6 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
     if snapshot_id is None:
         raise HTTPException(status_code=404, detail="No active snapshot found.")
 
-    # Aggregate — keep symbol + open_interest together for sample objects
     tiers: dict[int, list[dict]] = {1: [], 2: [], 3: []}
     for row in sym_rows:
         t = int(row.get("tier") or 3)
@@ -331,7 +279,7 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
             t = 3
         tiers[t].append({
             "symbol":         row["symbol"],
-            "open_interest":  row.get("open_interest"),  # None when not yet populated
+            "open_interest":  row.get("open_interest"),
         })
 
     return {

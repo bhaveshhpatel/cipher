@@ -19,7 +19,7 @@ from routers import health          # B-008: stream health router
 from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
-from services.symbols_loader import load_universe, SEED_SYMBOLS
+from services.symbols_loader import load_universe
 from services import universe_store
 from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer

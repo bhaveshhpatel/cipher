@@ -15,7 +15,6 @@ Phase 5A additions:
   - build_composite() kept as sync wrapper returning signal WITHOUT swarm
     (for legacy callers); use build_composite_async() for full swarm output
 """
-import asyncio
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
