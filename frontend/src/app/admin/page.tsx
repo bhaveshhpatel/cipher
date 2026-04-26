@@ -407,7 +407,6 @@ function StreamHealthCard({ token }: { token: string | null }) {
 
   const mode     = health?.mode ?? "unknown";
   const modeC    = MODE_COLOR[mode] ?? { color: A.muted, bg: A.surface2, border: A.border };
-  const isLive   = mode === "live" || mode === "demo";
 
   return (
     <AdminCard>
@@ -569,7 +568,7 @@ function DemoEngineCard({
 /* ─── Tier Thresholds card ───────────────────────────────── */
 
 function TierThresholdsCard({ token }: { token: string | null }) {
-  const [row,     setRow]     = useState<TierThresholdsRow | null>(null);
+  const [data,    setData]    = useState<{ row: TierThresholdsRow; cache: CacheMeta } | null>(null);
   const [loading, setLoading] = useState(true);
   const [err,     setErr]     = useState<string | null>(null);
   const [drafts,  setDrafts]  = useState<Record<string, string>>({});
@@ -584,7 +583,7 @@ function TierThresholdsCard({ token }: { token: string | null }) {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setRow(await res.json());
+      setData(await res.json());
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Failed to load tier thresholds");
     } finally {
@@ -594,8 +593,9 @@ function TierThresholdsCard({ token }: { token: string | null }) {
 
   useEffect(() => { fetch_(); }, [fetch_]);
 
+  // Save one or more field updates via PATCH /api/admin/tier-thresholds
   const save = useCallback(async (field: string) => {
-    if (!token || !row) return;
+    if (!token || !data) return;
     const raw = drafts[field];
     const num = Number(raw);
     if (isNaN(num)) {
@@ -604,13 +604,15 @@ function TierThresholdsCard({ token }: { token: string | null }) {
     }
     setSaving(p => ({ ...p, [field]: true }));
     try {
-      const res = await fetch(`/api/admin/tier-thresholds/${field}`, {
-        method: "PATCH",
+      const res = await fetch("/api/admin/tier-thresholds", {
+        method:  "PATCH",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ value: num }),
+        body:    JSON.stringify({ updates: { [field]: num } }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setRow(await res.json());
+      const updated = await res.json();
+      // Backend returns { ok, updated, row, note } — update local row
+      setData(prev => prev ? { ...prev, row: updated.row } : prev);
       setDrafts(p => { const n = { ...p }; delete n[field]; return n; });
       setSaved(p => ({ ...p, [field]: true }));
       setTimeout(() => setSaved(p => ({ ...p, [field]: false })), 2000);
@@ -619,7 +621,9 @@ function TierThresholdsCard({ token }: { token: string | null }) {
     } finally {
       setSaving(p => ({ ...p, [field]: false }));
     }
-  }, [token, row, drafts]);
+  }, [token, data, drafts]);
+
+  const row = data?.row ?? null;
 
   const TIER_FIELDS: { label: string; field: keyof TierThresholdsRow }[][] = [
     [
@@ -711,11 +715,14 @@ function IngestionConfigCard({ token }: { token: string | null }) {
   const fetch_ = useCallback(async () => {
     if (!token) return;
     try {
-      const res = await fetch("/api/admin/config", {
+      // Correct path: /api/admin/ingestion/config
+      const res = await fetch("/api/admin/ingestion/config", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setRows(await res.json());
+      const data = await res.json();
+      // Backend returns { config: [...] }
+      setRows(Array.isArray(data) ? data : (data.config ?? []));
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Failed to load config");
     } finally {
@@ -730,10 +737,11 @@ function IngestionConfigCard({ token }: { token: string | null }) {
     const value = drafts[key];
     setSaving(p => ({ ...p, [key]: true }));
     try {
-      const res = await fetch(`/api/admin/config/${key}`, {
-        method: "PUT",
+      // Correct path: PATCH /api/admin/ingestion/config
+      const res = await fetch("/api/admin/ingestion/config", {
+        method: "PATCH",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ value }),
+        body: JSON.stringify({ key, value }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetch_();
