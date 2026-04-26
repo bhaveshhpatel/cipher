@@ -6,6 +6,14 @@ Phase 4 changes:
   - /composite/{ticker}: queries signal_history for most recent signal for ticker;
     falls back to deterministic mock if no DB record exists
   - /stream/stats: unchanged
+
+B3-001: StatsOut(**get_stats()) replaced with explicit .get() extraction
+  to avoid ValidationError when get_stats() returns extra keys (deduped,
+  reconnects, mode, last_tick_at, last_reconnect_at, uptime_seconds, dedup
+  counters). StatsOut shape kept at 5 fields to preserve test contract.
+
+B3-002: SUPABASE_KEY replaced with SUPABASE_SERVICE_ROLE_KEY preference
+  so DB queries bypass RLS and actually return rows.
 """
 from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from pydantic import BaseModel
@@ -22,7 +30,12 @@ log = logging.getLogger("routers.smart_signals")
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 
 _SUPABASE_URL = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# B3-002: prefer service role key (bypasses RLS) — same precedence as flow_store.py
+_SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_SERVICE_KEY")
+    or os.environ.get("SUPABASE_KEY")
+)
 
 _VALID_DIRECTIONS = {"bullish", "bearish", "neutral"}
 _VALID_TIERS      = {"whale", "institutional", "large", "retail"}
@@ -279,4 +292,14 @@ async def list_signals(
 
 @router.get("/stream/stats", response_model=StatsResponse)
 async def stream_stats(_: TokenData = Depends(get_current_user)):
-    return StatsResponse(stats=StatsOut(**get_stats()))
+    # B3-001: explicit .get() extraction — never passes unknown keys to StatsOut
+    # get_stats() returns many extra fields (deduped, reconnects, mode, timestamps,
+    # uptime_seconds, dedup counters); StatsOut only exposes the 5-field public contract.
+    s = get_stats()
+    return StatsResponse(stats=StatsOut(
+        active_symbols = s.get("active_symbols", 0),
+        ticks          = s.get("ticks", 0),
+        classified     = s.get("classified", 0),
+        signals        = s.get("signals", 0),
+        errors         = s.get("errors", 0),
+    ))
