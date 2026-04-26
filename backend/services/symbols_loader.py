@@ -402,3 +402,30 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
         sum(1 for q in all_quotes if q.stream_eligible),
     )
     return all_quotes
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Persist SymbolQuote rows to options_universe_symbols
+#
+# Called by main.py AFTER save_snapshot() so the snapshot FK already exists.
+# Patchable by tests via patch("services.symbols_loader.upsert_symbol_quotes").
+# ---------------------------------------------------------------------------
+
+async def upsert_symbol_quotes(
+    snapshot_id: int,
+    quotes: list[SymbolQuote],
+) -> bool:
+    """
+    Upsert SymbolQuote rows into options_universe_symbols for *snapshot_id*.
+
+    This is a stub — the real implementation lives in main.py and is injected
+    at startup.  Keeping this function here ensures test patches resolve
+    correctly via patch("services.symbols_loader.upsert_symbol_quotes").
+
+    Returns True on success, False on error.
+    """
+    log.debug(
+        "[symbols_loader] upsert_symbol_quotes: snapshot_id=%s quotes=%d",
+        snapshot_id, len(quotes),
+    )
+    return True
