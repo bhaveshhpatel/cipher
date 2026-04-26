@@ -12,6 +12,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   # ---------------------------------------------------------------------------
   # Backend — pytest + coverage >= 92% + branch coverage
@@ -93,19 +97,8 @@ jobs:
             backend/coverage.json
           retention-days: 30
 
-      - name: Post coverage summary to PR
-        if: github.event_name == 'pull_request'
-        uses: orgoro/coverage@v3.2
-        with:
-          coverageFile:      backend/coverage.xml
-          token:             ${{ secrets.GITHUB_TOKEN }}
-          thresholdAll:      0.92
-          thresholdNew:      0.90
-          thresholdModified: 0.85
-
   # ---------------------------------------------------------------------------
   # Frontend — type-check then Jest + coverageThreshold enforced in jest.config.ts
-  # No package-lock.json in repo — cache: npm intentionally omitted.
   # ---------------------------------------------------------------------------
   frontend:
     name: Frontend Regression Gate
@@ -120,7 +113,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          # cache omitted — no package-lock.json present
 
       - name: Install dependencies
         run: npm install
