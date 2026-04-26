@@ -13,6 +13,9 @@ on:
       - "railway.toml"
 
 jobs:
+  # -------------------------------------------------------------------------
+  # Job 1: Syntax check (fast gate, runs first)
+  # -------------------------------------------------------------------------
   lint:
     name: Syntax Check
     runs-on: ubuntu-latest
@@ -35,7 +38,81 @@ jobs:
           find . -name "*.py" -exec python -m py_compile {} \;
           echo "All Python files OK"
 
+  # -------------------------------------------------------------------------
+  # Job 2: Regression test suite with coverage gate
+  # Phase 5: --cov-fail-under=90 enforced via pytest.ini
+  # -------------------------------------------------------------------------
+  regression:
+    name: Regression Tests + Coverage Gate
+    runs-on: ubuntu-latest
+    needs: lint          # only run if syntax check passes
+
+    env:
+      # Provide dummy values so config.py / settings load without error.
+      # Tests mock all real I/O — these are never sent to live services.
+      SUPABASE_URL:         "https://dummy.supabase.co"
+      SUPABASE_KEY:         "dummy-supabase-key"
+      JWT_SECRET:           "ci-test-jwt-secret-not-used-in-prod"
+      TRADIER_API_KEY:      "dummy-tradier-key"
+      TRADIER_ACCOUNT_ID:   "VA00000000"
+      TRADIER_BASE_URL:     "https://sandbox.tradier.com"
+      GROQ_API_KEY:         ""
+      ALLOWED_ORIGINS:      "http://localhost:3000"
+      ENVIRONMENT:          "test"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install production dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Install dev/test dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Run regression suite with coverage
+        working-directory: backend
+        run: |
+          pytest \
+            --tb=short \
+            -q \
+            --cov=. \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=90
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()          # upload even on test failure so you can inspect
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          retention-days: 14
+
+      - name: Coverage summary comment on PR
+        if: github.event_name == 'pull_request'
+        uses: orgoro/coverage@v3.2
+        with:
+          coverageFile: backend/coverage.xml
+          token:        ${{ secrets.GITHUB_TOKEN }}
+          thresholdAll: 0.90
+          thresholdNew: 0.90
+          thresholdModified: 0.85
+
 # Deploy is handled automatically by Railway's native GitHub integration.
 # Railway watches this repo, detects changes to backend/** via watchPatterns
 # in the root railway.toml, and redeploys without any CLI or token needed.
-# To configure: Railway dashboard -> service -> Settings -> Source -> connect GitHub repo

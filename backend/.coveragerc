@@ -1,0 +1,45 @@
+[run]
+# Source root — measure coverage for the full backend package tree
+source = .
+omit =
+    # Test files themselves
+    tests/*
+    tests/**/*
+    # Migration scripts (not application logic)
+    migrations/*
+    migrations/**/*
+    # Virtual environment if present locally
+    .venv/*
+    venv/*
+    # conftest helpers
+    conftest.py
+    tests/conftest.py
+
+[report]
+# Fail the build if total coverage drops below this threshold.
+# Matches --cov-fail-under in pytest.ini — one source of truth.
+fail_under = 90
+
+# Suppress files with 100% coverage from the terminal report (less noise)
+skip_covered = True
+
+# Show lines that are missing coverage
+show_missing = True
+
+# Exclude lines that are genuinely untestable
+exclude_lines =
+    # Standard pragma
+    pragma: no cover
+    # Abstract methods
+    @abstractmethod
+    # Debug-only code
+    if __name__ == .__main__.
+    # Type-checking imports
+    if TYPE_CHECKING:
+    # Protocol / interface stubs
+    \.\.\.\s*$
+    pass
+
+[html]
+directory = coverage_html
+title     = Cipher Backend Coverage Report
