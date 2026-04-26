@@ -23,12 +23,21 @@ B-021 — Staggered startup:
   The startup_delay_s delay only fires once at the start of run();
   reconnects do NOT re-apply the startup delay.
 
+B-008 — Global stats rollup:
+  On every reconnect and on every error, the worker calls
+  _report_reconnect() / _report_error() which write directly into the
+  tradier_stream._stats dict so GET /health/stream reflects live data.
+  last_reconnect_at is set to time.time() on every self._reconnects
+  increment so the health endpoint can report when the last disruption
+  occurred.
+
 The shared queue is consumed by the parser/enricher layer.
 """
 import asyncio
 import json
 import logging
 import random
+import time as _time
 from datetime import datetime, time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -60,6 +69,18 @@ def _is_market_hours() -> bool:
 def _backoff(attempt: int) -> float:
     delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
     return random.uniform(0, delay)
+
+
+# ---------------------------------------------------------------------------
+# B-008: lazy import helper to avoid circular import at module level.
+# tradier_stream imports stream_worker, so we cannot import tradier_stream
+# at the top of this file. Instead we import it on first use inside the
+# helper functions below.
+# ---------------------------------------------------------------------------
+def _global_stats() -> dict:
+    """Return the live _stats dict from tradier_stream (lazy import)."""
+    from services import tradier_stream  # noqa: PLC0415
+    return tradier_stream._stats
 
 
 class StreamWorker:
@@ -102,6 +123,25 @@ class StreamWorker:
             "startup_delay_s": self.startup_delay_s,  # B-021: visible in /health
         }
 
+    # ------------------------------------------------------------------
+    # B-008: global stat helpers
+    # ------------------------------------------------------------------
+    def _inc_global_error(self) -> None:
+        """Increment global errors counter in tradier_stream._stats."""
+        try:
+            _global_stats()["errors"] += 1
+        except Exception:
+            pass  # never crash the worker over a stats write
+
+    def _inc_global_reconnect(self) -> None:
+        """Increment global reconnects counter and set last_reconnect_at."""
+        try:
+            s = _global_stats()
+            s["reconnects"] += 1
+            s["last_reconnect_at"] = _time.time()
+        except Exception:
+            pass
+
     async def run(self):
         """Main loop — connect, stream, reconnect on failure."""
 
@@ -132,6 +172,7 @@ class StreamWorker:
             session_token = await get_session_token()
             if not session_token:
                 self._errors += 1
+                self._inc_global_error()  # B-008
                 backoff = _backoff(min(reconnect_attempt, 7))
                 log.warning(f"[worker-{self.worker_id}] No session token — backing off {backoff:.1f}s")
                 await asyncio.sleep(backoff)
@@ -155,6 +196,7 @@ class StreamWorker:
                         if resp.status_code == 401:
                             log.warning(f"[worker-{self.worker_id}] 401 — expired token, retrying")
                             self._errors += 1
+                            self._inc_global_error()  # B-008
                             await asyncio.sleep(1.0)
                             reconnect_attempt += 1
                             continue
@@ -187,6 +229,7 @@ class StreamWorker:
 
             except asyncio.TimeoutError:
                 self._errors += 1
+                self._inc_global_error()  # B-008
                 log.warning(f"[worker-{self.worker_id}] Idle {_IDLE_TIMEOUT}s — reconnecting")
 
             except asyncio.CancelledError:
@@ -195,13 +238,16 @@ class StreamWorker:
 
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
                 self._errors += 1
+                self._inc_global_error()  # B-008
                 log.warning(f"[worker-{self.worker_id}] Network error: {e}")
 
             except Exception as e:
                 self._errors += 1
+                self._inc_global_error()  # B-008
                 log.error(f"[worker-{self.worker_id}] Unexpected error: {e}")
 
             self._reconnects += 1
+            self._inc_global_reconnect()  # B-008: rolls up into _stats + sets last_reconnect_at
             if session_ticks > 0:
                 reconnect_attempt = 0
             else:
