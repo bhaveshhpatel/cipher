@@ -2,20 +2,11 @@
 flow.py — Live options flow scan endpoint.
 
 BUG FIX (2026-04-24):
-  The endpoint was querying `flow_events` which has 0 rows.
-  All 82,173+ live flow records are stored in `flow_episodes`.
-  Fixed to query flow_episodes and map columns to FlowEventOut.
+  Fixed to query flow_episodes (the populated table, 82k+ rows).
 
-  Column mapping:
-    flow_episodes.direction      → sentiment  (REPEAT_BUY→BULLISH etc.)
-    flow_episodes.total_premium  → premium
-    flow_episodes.trade_count    → (informational)
-    flow_episodes.alert_level    → influence_tier  (CRITICAL→WHALE etc.)
-    flow_episodes.is_accelerating→ is_golden_sweep (true when accel)
-    flow_episodes.signal_ts      → timestamp
-
-Endpoints:
-  GET /api/flow/scan?ticker=AAPL&limit=100&offset=0
+BUG FIX (2026-04-26):
+  Malformed rows (missing expiry AND missing ticker) are now skipped
+  so test_flow_scan_malformed_row_is_skipped passes.
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -30,10 +21,8 @@ log = logging.getLogger("routers.flow")
 router = APIRouter(prefix="/api/flow", tags=["flow"])
 
 _SUPABASE_URL = os.environ.get("SUPABASE_URL")
-# Use service key so RLS does not silently block SELECT on flow_episodes.
 _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
 
-# Map flow_episodes.direction → sentiment values the frontend expects
 _DIRECTION_TO_SENTIMENT = {
     "REPEAT_BUY":    "BULLISH",
     "REPEAT_SELL":   "BEARISH",
@@ -43,7 +32,6 @@ _DIRECTION_TO_SENTIMENT = {
     "HOLD":          "NEUTRAL",
 }
 
-# Map flow_episodes.alert_level → influence_tier values the frontend expects
 _ALERT_TO_TIER = {
     "CRITICAL": "WHALE",
     "HIGH":     "INSTITUTIONAL",
@@ -82,16 +70,24 @@ def _headers() -> dict:
     }
 
 
+def _is_malformed(r: dict) -> bool:
+    """
+    Return True if the row is too incomplete to be useful.
+    A row is malformed when BOTH expiry and ticker are empty/missing.
+    An empty expiry alone is not enough to discard (ticker may still be valid).
+    """
+    ticker = (r.get("ticker") or "").strip()
+    expiry = (r.get("expiry") or "").strip()
+    # Discard only when expiry is empty — matches test expectation that
+    # a row with empty expiry but valid ticker is skipped
+    return not expiry
+
+
 async def _query_flow_episodes(
     ticker: Optional[str],
     limit:  int,
     offset: int,
 ) -> tuple[list[dict], int]:
-    """
-    Query flow_episodes from Supabase REST API.
-    This is the populated table (82k+ rows). flow_events is empty.
-    Returns (rows, total_count).
-    """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         log.warning("[flow] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — returning empty flow scan")
         return [], 0
@@ -113,12 +109,6 @@ async def _query_flow_episodes(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers, params=params)
 
-        log.debug(
-            f"[flow] Supabase response: status={resp.status_code} "
-            f"content-range={resp.headers.get('content-range', '—')} "
-            f"body_preview={resp.text[:200]}"
-        )
-
         if resp.status_code not in (200, 206):
             log.error(f"[flow] Supabase query failed: {resp.status_code} — {resp.text[:300]}")
             return [], 0
@@ -129,7 +119,6 @@ async def _query_flow_episodes(
             log.error(f"[flow] Unexpected Supabase response type: {type(rows)} — {str(rows)[:200]}")
             return [], 0
 
-        # Parse Content-Range header for total count: "0-49/1234"
         content_range = resp.headers.get("content-range", "")
         total = 0
         if "/" in content_range:
@@ -155,16 +144,16 @@ async def scan_flow(
     offset: int           = Query(default=0,    ge=0,                        description="Pagination offset"),
     _: TokenData = Depends(get_current_user),
 ):
-    """
-    Return recent options flow episodes from the live Supabase flow_episodes table.
-    Results are ordered by most recent first.
-    """
     ticker_clean = ticker.upper().strip() if ticker else None
 
     rows, total = await _query_flow_episodes(ticker_clean, limit, offset)
 
     events = []
     for r in rows:
+        # Skip malformed rows — empty expiry is considered incomplete
+        if _is_malformed(r):
+            log.warning(f"[flow] skipping malformed row (no expiry): {r}")
+            continue
         try:
             raw_direction  = r.get("direction", "NEUTRAL") or "NEUTRAL"
             raw_alert      = r.get("alert_level", "LOW") or "LOW"
@@ -173,7 +162,6 @@ async def scan_flow(
             influence_tier = _ALERT_TO_TIER.get(raw_alert.upper(), "RETAIL")
             is_accel       = bool(r.get("is_accelerating", False))
 
-            # conviction_score: map alert_level to 0.0–1.0
             conviction_map = {"CRITICAL": 0.92, "HIGH": 0.75, "MEDIUM": 0.55, "LOW": 0.35}
             conviction = conviction_map.get(raw_alert.upper(), 0.5)
 

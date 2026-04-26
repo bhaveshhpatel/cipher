@@ -10,6 +10,7 @@ import os
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import computed_field
 from pydantic_settings import BaseSettings
 
 
@@ -49,11 +50,19 @@ class Settings(BaseSettings):
     REGISTRY_MIN_OI:                 int   = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int  = 15
 
-    # ── Alias: JWT_SECRET (tests check for this attribute) ────────────
+    # ── JWT_SECRET: real field alias so hasattr(settings, 'JWT_SECRET') is True
+    # pydantic v2 @property is not visible to hasattr — use computed_field instead.
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def JWT_SECRET(self) -> str:  # noqa: N802
-        """Alias for SECRET_KEY — exposed so tests can assert hasattr(settings, 'JWT_SECRET')."""
+        """Alias for SECRET_KEY — tests assert hasattr(settings, 'JWT_SECRET')."""
         return self.SECRET_KEY
+
+    # ── origins helper used by main.py ────────────────────────────────
+    @property
+    def origins(self) -> list[str]:
+        """Return the configured CORS origins as a list."""
+        return [o.strip() for o in self.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
     class Config:
         env_file = ".env"

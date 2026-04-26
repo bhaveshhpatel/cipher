@@ -64,26 +64,20 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
+# get_config — module-level so tests can patch('main.get_config', ...)
+# ---------------------------------------------------------------------------
+async def get_config() -> dict:
+    """Return current runtime config dict. Patchable by tests."""
+    return {
+        "app_env":  settings.APP_ENV,
+        "log_level": settings.LOG_LEVEL,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Universe loader — returns (stream_symbols, tier_map, quotes)
 # ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
-    """
-    Priority:
-      1. Fresh DB snapshot (< 24h old) — stream starts instantly
-      2. Tradier fetch + validate + screen — saves to DB, then starts
-      3. Any DB snapshot (stale)          — fallback if Tradier is down
-      4. SEED_SYMBOLS                     — last resort
-
-    Returns (stream_symbols, tier_map, quotes) so the registry can be
-    initialised with accurate per-symbol tiers from the first build.
-
-    On the tradier_validated path, tier_map and quotes are preliminary
-    (OI=0). lifespan() re-runs assign_tiers() with real OI after the
-    first registry.build() completes (Feature 4A-OI).
-    On the DB snapshot path (warm start), quotes is [] and OI re-tiering
-    is skipped — the stored tier_map already reflects the last cold-start
-    OI-aware classification.
-    """
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
@@ -92,7 +86,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
             "[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting",
             len(fresh),
         )
-        # Load tier_map from DB so the registry isn't built tier-blind on warm starts
         tier_map = await universe_store.load_tier_map()
         log.info(
             "[universe] Step 1: tier_map loaded (%d symbols mapped, T1=%d T2=%d T3=%d)",
@@ -101,7 +94,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        # Warm start: no quotes available, OI re-tiering skipped
         return fresh, tier_map, []
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -140,8 +132,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
 
         if quotes:
-            # Preliminary tier assignment (OI=0 at this point; real OI comes after
-            # registry.build() in lifespan() — see Feature 4A-OI step there)
             log.info("[universe] Step 3b: preliminary tier assignment for %d symbols (OI not yet available)", len(quotes))
             tier_map = await assign_tiers(quotes)
             log.info(
@@ -173,10 +163,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
 # OI stamp helper
 # ---------------------------------------------------------------------------
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
-    """
-    4A-OI: Set quote.open_interest to avg chain OI for each symbol.
-    Mutates quotes in-place. Symbols absent from oi_map get 0.
-    """
     for q in quotes:
         q.open_interest = oi_map.get(q.symbol, 0)
 
@@ -197,7 +183,6 @@ async def _universe_refresh_loop():
                 tier_map: dict[str, int] = {}
 
                 if saved and quotes:
-                    # 4A-OI: build registry first to get real OI, then re-classify
                     registry = get_registry()
                     if registry:
                         log.info("[universe] Background refresh: rebuilding registry for OI roll-up")
@@ -214,7 +199,6 @@ async def _universe_refresh_loop():
                     tier_map = await assign_tiers(quotes)
                     await universe_store.upsert_symbol_quotes(quotes, tier_map)
 
-                # Hot-swap OI-informed tier_map on the running registry
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
@@ -247,22 +231,17 @@ async def lifespan(app: FastAPI):
 
     stream_symbols, tier_map, quotes = await _resolve_startup_universe()
 
-    # Initialise the OCC symbol registry with preliminary tier-aware watchlist
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
     log.info(
         "[registry] Initialised with %d stream symbols, %d tiers mapped",
         len(stream_symbols), len(tier_map),
     )
 
-    # 4A-OI: await the first build so OI data is ready before tier re-classification.
-    # Only block startup on cold starts (tradier_validated path) where quotes exist.
-    # Warm starts (DB snapshot path) have no quotes so we skip OI re-tiering.
     log.info("[registry] Running first build (blocking startup until OI available)")
     await registry.build()
     log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
 
     if quotes:
-        # 4A-OI: stamp real avg chain OI onto each quote, then re-classify tiers
         oi_map = registry.get_oi_map()
         _stamp_oi(quotes, oi_map)
         log.info(
@@ -279,10 +258,8 @@ async def lifespan(app: FastAPI):
             sum(1 for t in tier_map.values() if t == 3),
         )
 
-        # Hot-swap the OI-informed tier map back into the registry
         registry.set_tier_map(tier_map)
 
-        # Persist OI + final tiers to DB
         log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
         await universe_store.upsert_symbol_quotes(quotes, tier_map)
         log.info("[registry] Upsert complete — open_interest column now populated in DB")
@@ -345,13 +322,18 @@ app.include_router(flow.router)
 app.include_router(simulation.router)
 app.include_router(ws.router)
 app.include_router(smart_signals.router)
-app.include_router(history.router)       # Phase 4: signal history endpoint
-app.include_router(admin.router)         # Phase 5B: admin demo toggle
-app.include_router(health.router)        # B-008: stream health
+app.include_router(history.router)
+app.include_router(admin.router)
+app.include_router(health.router)
 
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
+
+# /api/health — used by test_main_app.test_app_health_endpoint_exists
+@app.get("/api/health", tags=["health"])
+async def api_health():
+    return JSONResponse({"status": "ok", "service": "cipher-api"})
 
 @app.get("/health", tags=["health"])
 async def health_root():

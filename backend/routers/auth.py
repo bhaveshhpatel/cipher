@@ -19,6 +19,12 @@ class RegisterRequest(BaseModel):
     password: str
 
 
+# JSON login schema — used by the /login endpoint tests expect
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -27,6 +33,10 @@ class TokenResponse(BaseModel):
 class MessageResponse(BaseModel):
     message: str
 
+
+# ---------------------------------------------------------------------------
+# Module-level helpers — exposed so tests can patch.object them
+# ---------------------------------------------------------------------------
 
 def _supabase_admin() -> Client | None:
     if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
@@ -44,13 +54,13 @@ def _supabase_admin() -> Client | None:
 
 
 def _supabase_client() -> Client | None:
-    if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
+    if not settings.SUPABASE_URL or not settings.SUPABASE_ANON_KEY:
         log.warning("Supabase anon creds not configured — falling back to in-memory store")
         return None
     try:
         return create_client(
             settings.SUPABASE_URL,
-            settings.SUPABASE_KEY,
+            settings.SUPABASE_ANON_KEY,
             options=ClientOptions(auto_refresh_token=False, persist_session=False),
         )
     except Exception as exc:
@@ -71,6 +81,64 @@ def _find_user_by_email(email: str):
         log.warning("list_users failed: %s", exc)
     return None
 
+
+async def _authenticate_user(email: str, password: str) -> dict | None:
+    """
+    Verify credentials. Returns user dict on success, None on failure.
+    Module-level so tests can patch.object(auth_mod, '_authenticate_user', ...).
+    """
+    # In-memory fallback path
+    hashed = _users.get(email)
+    if hashed and verify_password(password, hashed):
+        return {"email": email, "role": "user"}
+
+    # Supabase path
+    supabase = _supabase_client()
+    if supabase:
+        try:
+            auth_res = supabase.auth.sign_in_with_password(
+                {"email": email, "password": password}
+            )
+            if getattr(auth_res, "user", None):
+                log.info("[auth] Supabase sign-in OK: %s", email)
+                return {"email": email, "role": "user"}
+        except Exception as exc:
+            log.warning("[auth] Supabase sign-in error for %s: %s", email, exc)
+
+    # Check Supabase user_profiles table as secondary lookup
+    try:
+        from services.universe_store import _client as _sb
+        sb = _sb()
+        if sb:
+            res = (
+                sb.table("user_profiles")
+                .select("email,role")
+                .eq("email", email)
+                .maybe_single()
+                .execute()
+            )
+            data = getattr(res, "data", None)
+            if data and data.get("email") == email:
+                stored_hash = data.get("password_hash", "")
+                if verify_password(password, stored_hash):
+                    return {"email": email, "role": data.get("role", "user")}
+    except Exception as exc:
+        log.warning("[auth] user_profiles lookup failed for %s: %s", email, exc)
+
+    return None
+
+
+def _create_access_token(data: dict) -> str:
+    """
+    Thin wrapper around core.auth.create_access_token.
+    Module-level so tests can patch.object(auth_mod, '_create_access_token', ...).
+    """
+    return create_access_token(data)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @router.options("/register")
 async def options_register():
@@ -116,49 +184,38 @@ async def register(body: RegisterRequest):
     return {"message": "Account created successfully"}
 
 
-@router.post("/token", response_model=TokenResponse)
-async def login(form: OAuth2PasswordRequestForm = Depends()):
-    supabase = _supabase_client()
-
-    if supabase:
-        try:
-            auth_res = supabase.auth.sign_in_with_password(
-                {"email": form.username, "password": form.password}
-            )
-            if not getattr(auth_res, "user", None):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid email or password",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            token = create_access_token({"sub": form.username})
-            log.info("Login via Supabase: %s", form.username)
-            return {"access_token": token, "token_type": "bearer"}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            err_lower = str(exc).lower()
-            if any(k in err_lower for k in ("invalid", "credentials", "not found", "email", "password", "user")):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid email or password",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            log.error("Supabase login error: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Authentication service temporarily unavailable. Please try again in a moment.",
-            )
-
-    hashed = _users.get(form.username)
-    if not hashed or not verify_password(form.password, hashed):
+@router.post("/login", response_model=TokenResponse)
+async def login_json(body: LoginRequest):
+    """
+    JSON body login endpoint — used by the frontend React app and tests.
+    Accepts {"email": "...", "password": "..."} application/json.
+    """
+    user = await _authenticate_user(str(body.email), body.password)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = create_access_token({"sub": form.username})
-    log.info("Login via in-memory fallback: %s", form.username)
+    token = _create_access_token({"sub": user["email"]})
+    log.info("Login via /login: %s", body.email)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/token", response_model=TokenResponse)
+async def login(form: OAuth2PasswordRequestForm = Depends()):
+    """
+    OAuth2 form-data login — kept for OAuth2 compatibility / Swagger UI.
+    """
+    user = await _authenticate_user(form.username, form.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = _create_access_token({"sub": form.username})
+    log.info("Login via /token: %s", form.username)
     return {"access_token": token, "token_type": "bearer"}
 
 

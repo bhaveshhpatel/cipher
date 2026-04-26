@@ -14,11 +14,21 @@ Phase 5A additions:
   - build_composite_async() is the new primary entry point (awaitable)
   - build_composite() kept as sync wrapper returning signal WITHOUT swarm
     (for legacy callers); use build_composite_async() for full swarm output
+
+Module-level run_ensemble is imported eagerly so tests can
+patch('signals.composite_signal_engine.run_ensemble', ...).
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
+
+# Eagerly import so patch('signals.composite_signal_engine.run_ensemble') works.
+# Wrapped in try/except so the module still loads if simulation pkg is absent.
+try:
+    from simulation.ensemble_runner import run_ensemble  # noqa: F401
+except Exception:  # pragma: no cover
+    run_ensemble = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -40,9 +50,19 @@ class CompositeSignal:
 
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
+    """
+    Ratio of episode premium to notional OI value.
+    When OI is 0 or unavailable, falls back to premium-only scaling
+    (capped at 1.0) so the factor is not a meaningless 0.5 constant.
+
+    Fix: test_vwpf_low_premium_vs_oi expects factor < 0.5 for small
+    premium (e.g. $5k) with zero OI — old code always returned 0.5.
+    New code: ratio = premium / 1_000_000 cap so $5k → 0.005.
+    """
     latest_oi = ep.events[-1].open_interest if ep.events else 0
     if latest_oi <= 0:
-        return 0.5
+        # No OI data: scale purely on premium magnitude (0–$1M = 0–1.0)
+        return round(min(1.0, ep.total_premium / 1_000_000), 3)
     notional_oi = latest_oi * 100
     ratio = ep.total_premium / max(notional_oi, 1)
     return round(min(1.0, ratio), 3)
@@ -109,9 +129,19 @@ async def build_composite_async(
     Builds composite signal then auto-runs the AI swarm.
     n_agents: overrides SWARM_N_AGENTS env var if provided.
     """
-    from simulation.ensemble_runner import run_ensemble
+    # Use module-level run_ensemble (importable, patchable by tests)
+    _run = run_ensemble
+    if _run is None:
+        try:
+            from simulation.ensemble_runner import run_ensemble as _run_dyn
+            _run = _run_dyn
+        except Exception:
+            _run = None
 
     sig = build_composite(ep, accumulator)
+
+    if _run is None:
+        return sig
 
     # Build flow event list for swarm context
     flow_events = [
@@ -133,7 +163,7 @@ async def build_composite_async(
         kwargs["n_agents"] = n_agents
 
     try:
-        result = await run_ensemble(**kwargs)
+        result = await _run(**kwargs)
         sig.swarm_direction  = result.direction
         sig.swarm_confidence = result.confidence
         sig.swarm_bull_votes = result.bull_votes

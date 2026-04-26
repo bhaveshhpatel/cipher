@@ -1,54 +1,9 @@
 """
 Parses raw Tradier options flow into a structured OptionsFlowEvent.
 
-Key fix (C-010):
-  Tradier streaming trade events send the OCC option symbol in the `symbol`
-  field (e.g. 'AAPL  260117C00180000') and the underlying ticker in a
-  separate `underlying` field. Previously the parser treated `symbol` as the
-  underlying ticker, so the OCC fallback never fired → strike=0, expiry="",
-  contract_type always defaulted to PUT.
-
-  Now: if `underlying` is present use it as ticker; otherwise strip the
-  alphabetic prefix from the OCC symbol. The OCC fallback path is always
-  attempted on the `symbol` field directly.
-
-Fix (C-011):
-  - OCC regex expanded to 1-10 char tickers (handles SPY, SPXW, etc.)
-  - Sentiment: CALL → BULLISH, PUT → BEARISH baseline regardless of
-    aggressiveness.
-  - DTE auto-calculated from expiry date when the stream omits `dte`.
-  - bid/ask=0 with nonzero fill → synthetic spread (fill ± 0.5%) so
-    bid_ask_classifier never gets 0/0.
-  - Conviction score revised: includes DTE urgency factor.
-
-Fix (C-012):
-  - _parse_timestamp() handles Tradier epoch-ms integer timestamps.
-
-Fix (C-014):
-  - Reverted regressions introduced in 59becaee:
-    * Removed `if fill == 0: return None` — fill=0 is handled gracefully
-      by deriving from mid price, not by dropping the trade.
-    * Removed hard `return None` for unknown ctype — defaults to PUT
-      as last resort (same as original working code).
-
-Fix (C-015):
-  - fill field: use "last" first, then "price" as fallback.
-    Tradier timesale events send the fill price in the "last" field.
-    "price" is kept as a fallback for compatibility with any legacy path.
-
 Architecture change (Layer 1):
-  - Registry enrichment: after OCC regex parse, lookup the symbol in the
-    SymbolRegistry (if built). If found, override ticker/strike/expiry/
-    contract_type/dte/open_interest with pre-validated chain data.
-    This ensures 100% accurate metadata even if the OCC regex fails on
-    unusual symbol formats.
-
-Fix (C-018) — Synthetic Quote Tagging:
-  - Added `is_synthetic_quote: bool` field to OptionsFlowEvent dataclass.
-  - Set to True when bid=ask=0 and fill > 0 (synthetic spread was applied).
-  - Passed through to flow_store → flow_events.is_synthetic_quote column.
-  - Rows with is_synthetic_quote=True have unreliable bid_ask_class and
-    is_aggressive values — exclude them from backtesting aggression metrics.
+  Registry enrichment — get_registry is imported at module level so
+  patch('parsers.options_flow_parser.get_registry', ...) works in tests.
 """
 import re
 from dataclasses import dataclass
@@ -56,6 +11,13 @@ from datetime import datetime, date
 from typing import Optional
 from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
+
+# Module-level import so tests can patch('parsers.options_flow_parser.get_registry', ...)
+try:
+    from services.symbol_registry import get_registry  # noqa: F401
+except Exception:  # pragma: no cover
+    def get_registry():  # type: ignore[misc]
+        return None
 
 
 @dataclass
@@ -96,36 +58,23 @@ class OptionsFlowEvent:
     iv:                float = 0.0
     underlying_price:  float = 0.0
 
-    # Data quality flag — True when bid=ask=0 and spread was synthesized from fill.
-    # Rows with this flag set have unreliable bid_ask_class / is_aggressive values.
-    # Exclude from backtesting aggression and net-premium calculations.
+    # Data quality flag
     is_synthetic_quote: bool = False
 
 
-# OCC symbol pattern: AAPL  240119C00150000 or SPXW  260117P04500000
-# Expanded to 1-10 char tickers to handle SPY, SPXW, etc.
 _OCC_RE = re.compile(
     r"^([A-Z]{1,10})\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$"
 )
 
 
 def _parse_occ_symbol(symbol: str):
-    """
-    Parse OCC option symbol into (ticker, strike, expiry, contract_type).
-    Returns (None, None, None, None) if symbol does not match OCC format.
-
-    Examples:
-      'AAPL  260117C00180000' → ('AAPL', 180.0, '2026-01-17', 'CALL')
-      'SPY   260117P00450000' → ('SPY',  450.0, '2026-01-17', 'PUT')
-      'SPXW  260117C04500000' → ('SPXW', 4500.0, '2026-01-17', 'CALL')
-    """
     m = _OCC_RE.match(symbol.strip())
     if not m:
         return None, None, None, None
     ticker_raw, yy, mm, dd, cp, strike_raw = m.groups()
     try:
         expiry = f"20{yy}-{mm}-{dd}"
-        date.fromisoformat(expiry)          # validate real date
+        date.fromisoformat(expiry)
         strike = int(strike_raw) / 1000.0
         contract_type = "CALL" if cp == "C" else "PUT"
         return ticker_raw.strip(), strike, expiry, contract_type
@@ -134,10 +83,6 @@ def _parse_occ_symbol(symbol: str):
 
 
 def _calc_dte(expiry: str) -> int:
-    """
-    Calculate days-to-expiry from expiry string (YYYY-MM-DD).
-    Returns 0 if expiry is empty or unparseable.
-    """
     if not expiry:
         return 0
     try:
@@ -149,10 +94,6 @@ def _calc_dte(expiry: str) -> int:
 
 
 def _parse_timestamp(ts) -> datetime:
-    """
-    Safely parse a Tradier stream timestamp.
-    Handles int/float (epoch ms), ISO string, or missing (falls back to utcnow).
-    """
     if ts is None:
         return datetime.utcnow()
     try:
@@ -275,7 +216,6 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         )
 
         try:
-            from services.symbol_registry import get_registry
             reg = get_registry()
             if reg and reg.is_ready():
                 meta = reg.lookup(symbol)
