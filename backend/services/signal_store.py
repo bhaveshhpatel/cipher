@@ -94,7 +94,7 @@ async def _insert_via_sdk(client, row: dict) -> bool:
         t.insert(row).execute()
         return True
     except Exception as e:
-        log.error(f"[signal_store] SDK insert exception: {e}")
+        log.error("[signal_store] SDK insert exception: %s", e)
         return False
 
 
@@ -107,10 +107,10 @@ async def _insert_signal(row: dict) -> bool:
             resp = await client.post(url, headers=_headers(), json=[row])
         if resp.status_code in (200, 201):
             return True
-        log.error(f"[signal_store] insert failed: {resp.status_code} — {resp.text[:300]}")
+        log.error("[signal_store] insert failed: %s \u2014 %s", resp.status_code, resp.text[:300])
         return False
     except Exception as e:
-        log.error(f"[signal_store] insert exception: {e}")
+        log.error("[signal_store] insert exception: %s", e)
         return False
 
 
@@ -121,13 +121,13 @@ async def _insert_signal_with_retry(row: dict) -> bool:
             return True
         if attempt < _RETRY_MAX:
             log.warning(
-                f"[signal_store] insert failed (attempt {attempt}/{_RETRY_MAX}) "
-                f"-- retrying in {_RETRY_DELAY_S}s"
+                "[signal_store] insert failed (attempt %d/%d) -- retrying in %ss",
+                attempt, _RETRY_MAX, _RETRY_DELAY_S,
             )
             await asyncio.sleep(_RETRY_DELAY_S)
     log.error(
-        f"[signal_store] insert failed after {_RETRY_MAX} attempts "
-        f"-- signal for {row.get('ticker')} DISCARDED."
+        "[signal_store] insert failed after %d attempts -- signal for %s DISCARDED.",
+        _RETRY_MAX, row.get("ticker"),
     )
     return False
 
@@ -356,26 +356,29 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     row = _build_row(sig, ep)
     ok  = await _insert_signal_with_retry(row)
     if ok:
-        premium_fmt = f"${row['premium']:,.0f}" if row['premium'] else "$0"
-        golden      = " \u26a1 GOLDEN SWEEP" if row["is_golden_sweep"] else ""
+        premium_val  = row["premium"]
+        premium_fmt  = "${:,.0f}".format(premium_val) if premium_val else "$0"
+        golden_sweep = row["is_golden_sweep"]
+        golden_tag   = " \u26a1 GOLDEN SWEEP" if golden_sweep else ""
+        swarm_dir    = row["swarm_direction"] or "\u2014"
+        bull         = row["swarm_bull_votes"]
+        bear         = row["swarm_bear_votes"]
+        hold         = row["swarm_hold_votes"]
         log.info(
-            f"[signal_store] \u2705 DB INSERT OK | "
-            f"{row['ticker']} | "
-            f"{row['recommendation']} | "
-            f"dir={row['direction']} | "
-            f"score={row['composite_score']:.3f} | "
-            f"flow={row['flow_score']:.3f} | "
-            f"alert={row['alert_level']} | "
-            f"sentiment={row['sentiment']} | "
-            f"tier={row['influence_tier']} | "
-            f"type={row['trade_type']} | "
-            f"premium={premium_fmt} | "
-            f"swarm={row['swarm_direction'] or '\u2014'} "
-            f"({row['swarm_bull_votes']}B/{row['swarm_bear_votes']}Be/{row['swarm_hold_votes']}H)"
-            f"{golden}"
+            "[signal_store] \u2705 DB INSERT OK | "
+            "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
+            "sentiment=%s | tier=%s | type=%s | premium=%s | "
+            "swarm=%s (%sB/%sBe/%sH)%s",
+            row["ticker"], row["recommendation"], row["direction"],
+            row["composite_score"], row["flow_score"], row["alert_level"],
+            row["sentiment"], row["influence_tier"], row["trade_type"],
+            premium_fmt, swarm_dir, bull, bear, hold, golden_tag,
         )
     else:
-        log.warning(f"[signal_store] \u274c INSERT FAILED \u2014 signal for {row.get('ticker')} was NOT saved to DB")
+        log.warning(
+            "[signal_store] \u274c INSERT FAILED \u2014 signal for %s was NOT saved to DB",
+            row.get("ticker"),
+        )
 
 
 async def _bus_signal_listener() -> None:
@@ -399,10 +402,13 @@ async def _bus_signal_listener() -> None:
 async def start_signal_writer() -> None:
     if not _is_configured():
         log.warning(
-            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set \u2014 "
+            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
             "composite signals will NOT be persisted. "
             "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
         )
         return
-    log.info(f"[signal_store] Starting composite signal DB writer (retry_max={_RETRY_MAX})")
+    log.info(
+        "[signal_store] Starting composite signal DB writer (retry_max=%d)",
+        _RETRY_MAX,
+    )
     await _bus_signal_listener()
