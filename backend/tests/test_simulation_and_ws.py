@@ -73,7 +73,6 @@ def test_websocket_accepted_with_valid_token():
     The first message from the server after the heartbeat interval would be a ping,
     but we just verify the connection is accepted cleanly before closing.
     """
-    from core.auth import get_current_user
     # Patch _verify_token to return a valid email so the connection is accepted
     with patch("routers.ws._verify_token", return_value="sim@example.com"):
         try:
