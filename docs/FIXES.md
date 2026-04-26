@@ -4,6 +4,87 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## B-008 — Stream Health Endpoint: errors/reconnects/last_reconnect_at Never Written
+
+**Date:** 2026-04-25  
+**Type:** Observability fix  
+**Files:** `backend/services/stream_worker.py`, `backend/tests/test_stream_worker_b008.py`
+
+### Root Cause
+
+`GET /health/stream` (B-008) was implemented in `routers/health.py` and wired into `main.py`, but three of its response fields were permanently stale:
+
+1. **`errors`** — `_stats["errors"]` was declared as `0` in `tradier_stream._stats` but no code path ever incremented it. Every error path in `stream_worker.py` incremented the local `self._errors` counter but never touched the global dict.
+2. **`reconnects`** — Same problem. `self._reconnects` was local-only; `_stats["reconnects"]` was always `0`.
+3. **`last_reconnect_at`** — `_stats["last_reconnect_at"]` was declared as `None` and never assigned. The health endpoint always returned `null` for this field regardless of how many reconnects had occurred.
+
+`stream_manager.stats` already aggregated `total_errors` and `total_reconnects` from workers correctly, but `get_stats()` in `tradier_stream.py` did not pull from the manager — it read only its own `_stats` dict which was never updated.
+
+### Symptom
+
+`GET /health/stream` always returned:
+```json
+{ "errors": 0, "reconnects": 0, "last_reconnect_at": null }
+```
+...even during active reconnect storms or after known worker errors.
+
+### Fix Applied
+
+**`backend/services/stream_worker.py`**
+
+Added two private helpers that write directly into `tradier_stream._stats` via a lazy import (avoids circular import since `tradier_stream` imports `stream_worker`):
+
+```python
+def _global_stats() -> dict:
+    from services import tradier_stream
+    return tradier_stream._stats
+
+def _inc_global_error(self) -> None:
+    try:
+        _global_stats()["errors"] += 1
+    except Exception:
+        pass  # never crash the worker over a stats write
+
+def _inc_global_reconnect(self) -> None:
+    try:
+        s = _global_stats()
+        s["reconnects"] += 1
+        s["last_reconnect_at"] = _time.time()
+    except Exception:
+        pass
+```
+
+Wired `_inc_global_error()` at every error site in `run()`:
+- No session token returned
+- HTTP 401 on stream connect
+- `asyncio.TimeoutError` (idle watchdog)
+- `httpx.RemoteProtocolError` / `ReadError` / `ConnectError`
+- Catch-all `Exception`
+
+Wired `_inc_global_reconnect()` at the single reconnect site at the bottom of the `while` loop (after `self._reconnects += 1`), which fires on every reconnect regardless of cause.
+
+### Tests Added
+
+**`backend/tests/test_stream_worker_b008.py`** — 5 tests (SW-01 through SW-05)
+
+| Test | Assertion |
+|------|-----------|
+| SW-01 | `_inc_global_error()` increments `_stats["errors"]` |
+| SW-02 | `_inc_global_reconnect()` increments `_stats["reconnects"]` |
+| SW-03 | `_inc_global_reconnect()` sets `_stats["last_reconnect_at"]` to a recent `float` |
+| SW-04 | `_inc_global_error()` is tolerant of missing key — no exception raised |
+| SW-05 | Multiple workers each calling `_inc_global_reconnect()` accumulate correctly |
+
+### Expected Impact
+
+| Field | Before B-008 fix | After B-008 fix |
+|-------|-----------------|----------------|
+| `errors` | Always `0` | Real cumulative error count across all workers |
+| `reconnects` | Always `0` | Real cumulative reconnect count across all workers |
+| `last_reconnect_at` | Always `null` | ISO-8601 UTC timestamp of most recent reconnect |
+
+---
+
 ## B-023 — Explicit 429 Handling in `get_session_token()`
 
 **Date:** 2026-04-25  
@@ -86,7 +167,7 @@ At startup with >8 workers: intermittent `"No session token — backing off"` lo
 
 ### Root Cause
 
-Before B-021, `StreamManager._spawn_workers()` created all 32 `StreamWorker` tasks in a tight loop with no delay between them. Each worker immediately called `get_session_token()` on startup, producing a ~32-simultaneous-request burst to Tradier’s session endpoint. Even with the B-022 semaphore in place, the stagger further smooths connection load by spreading *when* workers attempt to acquire the semaphore rather than all contending for it instantly.
+Before B-021, `StreamManager._spawn_workers()` created all 32 `StreamWorker` tasks in a tight loop with no delay between them. Each worker immediately called `get_session_token()` on startup, producing a ~32-simultaneous-request burst to Tradier's session endpoint. Even with the B-022 semaphore in place, the stagger further smooths connection load by spreading *when* workers attempt to acquire the semaphore rather than all contending for it instantly.
 
 ### Fix Applied
 
@@ -103,7 +184,7 @@ Before B-021, `StreamManager._spawn_workers()` created all 32 `StreamWorker` tas
 
 **`backend/tests/test_stream_manager.py`**
 - Added `TestB021StaggeredStartup` class — 7 tests (tests 21–27)
-- Covers: constants are 200ms/0.200s, worker-0 delay=0, worker-1 delay=0.2, worker-N delay=N×0.2, stat exposure, one-time fire (reconnects don’t re-apply)
+- Covers: constants are 200ms/0.200s, worker-0 delay=0, worker-1 delay=0.2, worker-N delay=N×0.2, stat exposure, one-time fire (reconnects don't re-apply)
 
 ### Expected Impact
 
@@ -181,7 +262,7 @@ All `options_universe_symbols` rows carried no tier metadata. The `volume_premiu
 - `get_tier(ticker)` — O(1) lookup; returns 3 if ticker not in map
 
 **`backend/services/universe_store.py`**
-- `load_tier_map()` — new function; reads `(ticker, tier)` from latest active snapshot’s symbols; returns `dict[str, int]`; returns `{}` on DB error or missing column
+- `load_tier_map()` — new function; reads `(ticker, tier)` from latest active snapshot's symbols; returns `dict[str, int]`; returns `{}` on DB error or missing column
 
 **`backend/main.py`**
 - After universe load at startup, calls `tier_engine.load_thresholds()` then `set_tier_map(symbols)` so all downstream signal scoring has real tier data from first tick
@@ -424,7 +505,7 @@ _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("S
 ```
 When `SUPABASE_SERVICE_ROLE_KEY` was not set in Railway environment variables, the expression evaluated to `SUPABASE_KEY` — the **anon/public key**. The anon key is subject to Supabase Row Level Security (RLS). Since `flow_episodes` has RLS enabled with no policy permitting anonymous inserts, every write was rejected with HTTP 401 / Postgres error `42501`.
 
-### Why It’s Dangerous
+### Why It's Dangerous
 
 The fallback was silent — no error was thrown at startup. The service appeared to run normally (flow ticks were logged, signals were detected) but **nothing was ever written to the database**. The only indication was the `401` error in Railway logs.
 

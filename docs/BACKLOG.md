@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-25 (B-021 + B-022 + B-023 closed — all three stream worker startup fixes shipped)  
+> Last updated: 2026-04-25 (B-008 closed — stream health endpoint fully operational)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -17,7 +17,6 @@
 | B-005 | Trading options for customers (real or paper) | 🔲 Todo | Customer-facing paper or live trading — requires brokerage integration + risk disclaimers. |
 | B-006 | Product ideation — PM mode | 🔲 Todo | Explore adjacent product ideas; act as PM to define features, user personas, market fit. |
 | B-007 | Charting on dashboard | 🔲 Todo | Add price/signal charts to the main dashboard (e.g. options flow overlaid on price chart). |
-| B-008 | Stream health endpoint | 🔲 Todo | Expose `/health/stream` returning mode (live/demo/reconnecting/market_closed), reconnect count, last tick time, deduped count. |
 | B-009 | Wire `trade_executor.py` into signal flow | 🔲 Todo | `execution/trade_executor.py` exists but is not connected to the composite signal engine output. |
 | B-011 | Redis integration | 🔲 Todo | Redis is in config but not used. Candidate for signal caching + WebSocket pub/sub at scale. |
 | B-012 | Wire `GET /api/flow/scan` to `flow_episodes` table | 🔲 Todo | `routers/flow.py` queries `flow_episodes` (fixed in Phase 4) but full pagination + filters needed. |
@@ -32,6 +31,7 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
+| B-008 | Stream health endpoint `GET /health/stream` | 2026-04-25 | `routers/health.py` — `StreamHealthOut` Pydantic model with 11 fields. `get_stats()` in `tradier_stream.py` exposes `mode`, `active_symbols`, `ticks`, `classified`, `deduped`, `signals`, `errors`, `reconnects`, `last_tick_at`, `last_reconnect_at`, `uptime_seconds`. Fix: `stream_worker.py` wires `_inc_global_error()` + `_inc_global_reconnect()` into all error/reconnect paths via lazy import. Tests: `test_stream_worker_b008.py` SW-01 through SW-05. |
 | B-023 | Handle 429 Explicitly in `get_session_token()` | 2026-04-25 | Explicit `if resp.status_code == 429:` before `raise_for_status()`. Reads `Retry-After` header (default 10s). Sleeps then retries within semaphore hold. `_DEFAULT_RETRY_AFTER_S = 10.0` constant. Tests: `test_tradier_client.py` TC-01 through TC-08. |
 | B-022 | Global Session Token Semaphore (max 3 concurrent) | 2026-04-25 | `_SESSION_SEM = asyncio.Semaphore(3)` wraps `get_session_token()`. 32 workers acquire tokens in ⌈32/3⌉ = 11 batches × ~400ms = ~4.4s one-time startup cost. Zero ongoing latency. Eliminates simultaneous 32-burst that caused silent 429 death spirals. Tests: `test_tradier_client.py` TC-01 through TC-08. |
 | B-021 | Stagger Worker Startup (200ms between workers) | 2026-04-25 | `_WORKER_STARTUP_STAGGER_MS=200` in `stream_manager.py`. Each worker receives `startup_delay_s = idx * 0.200`. One-time 6.4s startup spread; zero ongoing latency. `startup_delay_s` in `worker.stats` for `/health`. Tests: `test_stream_manager.py` tests 21–27 (`TestB021StaggeredStartup`). |
@@ -74,12 +74,10 @@
 
 | Date | Change |
 |------|--------|
+| 2026-04-25 | Closed B-008 — Stream health endpoint: wired errors/reconnects/last_reconnect_at rollup into stream_worker.py via _inc_global_error()/_inc_global_reconnect(). 5 tests added (SW-01–SW-05). |
 | 2026-04-25 | Closed B-021 — Stagger worker startup shipped: `stream_manager.py` + `stream_worker.py` + 7 tests in `test_stream_manager.py`. |
 | 2026-04-25 | Closed B-022 — Session token semaphore(3) shipped in `tradier_client.py`. |
 | 2026-04-25 | Closed B-023 — Explicit 429 + Retry-After handler shipped in `tradier_client.py`. |
-| 2026-04-25 | Added B-021 — Fix 1: Stagger Worker Startup (200ms between workers). |
-| 2026-04-25 | Added B-022 — Fix 2: Global Session Token Semaphore (max 3 concurrent). |
-| 2026-04-25 | Added B-023 — Fix 3: Handle 429 Explicitly. |
 | 2026-04-25 | Closed B-019 — Admin tier-thresholds: GET read endpoint, PATCH update, TierThresholdsCard UI, migration 012, tests ADM-05/06. |
 | 2026-04-25 | Closed B-020 — GET /admin/tier-distribution endpoint shipped in same commit as B-019. |
 | 2026-04-25 | Added C-020 — Feature 4A tier engine complete. Added B-019, B-020 admin tier endpoints to active backlog. |
