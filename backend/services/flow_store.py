@@ -31,7 +31,7 @@ IMPORTANT — Key selection:
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -242,3 +242,53 @@ async def start_flow_writer():
         _bus_signal_listener(),
         _flush_flow_events(),
     )
+
+
+# ---------------------------------------------------------------------------
+# FlowStore — in-memory store for unit / regression tests.
+#
+# The module-level functions above handle production DB persistence via
+# Supabase. FlowStore provides a lightweight synchronous interface for
+# tests that need to add, query, and inspect flow events without any
+# external dependencies.
+# ---------------------------------------------------------------------------
+
+class FlowStore:
+    """In-memory store for options flow events.
+
+    Intended for testing and local introspection only. Not used by the
+    live DB writer path.
+    """
+
+    def __init__(self) -> None:
+        self._flows: List[Any] = []
+        self._stats: Dict[str, Any] = {"total": 0}
+
+    def add_flow(self, flow: Any) -> None:
+        """Append a flow event object or dict to the store."""
+        self._flows.append(flow)
+        self._stats["total"] = len(self._flows)
+
+    def get_flows(self) -> List[Any]:
+        """Return all stored flow events."""
+        return list(self._flows)
+
+    def get_flows_by_symbol(self, symbol: str) -> List[Any]:
+        """Return flow events whose .symbol attribute matches *symbol*."""
+        return [
+            f for f in self._flows
+            if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
+        ]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return a stats snapshot dict."""
+        return dict(self._stats)
+
+    def clear(self) -> None:
+        """Remove all stored events and reset stats."""
+        self._flows.clear()
+        self._stats = {"total": 0}
+
+    def size(self) -> int:
+        """Return the number of stored flow events."""
+        return len(self._flows)
