@@ -1,6 +1,6 @@
 # Cipher — Regression & Test Plan
 
-> Last updated: 2026-04-25
+> Last updated: 2026-04-25 (B-021 staggered startup · B-022 session-token semaphore · B-023 429 handler)
 
 ---
 
@@ -144,6 +144,38 @@
 | BF-2 | `reconnect_attempt` increments when `session_ticks == 0` | `test_backoff_increments_when_no_ticks` | `tests/test_tradier_stream.py` |
 | BF-3 | Backoff reaches ~60s cap after 4+ zero-tick connections | `test_backoff_reaches_cap_after_zero_tick_closes` | `tests/test_tradier_stream.py` |
 
+### Stream Worker — Staggered Startup (B-021)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| SW-B021-1 | First worker (index 0) starts with 0s delay | `test_first_worker_no_delay` | `tests/test_stream_worker_b021.py` |
+| SW-B021-2 | Worker index 1 waits 200ms before token fetch | `test_second_worker_200ms_delay` | `tests/test_stream_worker_b021.py` |
+| SW-B021-3 | Worker index 5 waits 1000ms before token fetch | `test_worker_index_5_delay_1000ms` | `tests/test_stream_worker_b021.py` |
+| SW-B021-4 | `startup_delay_s` env override respected (e.g. 0.5s) | `test_startup_delay_env_override` | `tests/test_stream_worker_b021.py` |
+| SW-B021-5 | Delay is `asyncio.sleep`, not blocking `time.sleep` | `test_startup_delay_is_async_sleep` | `tests/test_stream_worker_b021.py` |
+| SW-B021-6 | 32-worker batch: last worker delay ≤ max_startup_window | `test_32_workers_max_delay_within_window` | `tests/test_stream_worker_b021.py` |
+| SW-B021-7 | Stagger does not apply on reconnect (only first start) | `test_stagger_skipped_on_reconnect` | `tests/test_stream_worker_b021.py` |
+
+### Tradier Client — Session Token Semaphore & 429 Handler (B-022 / B-023)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| TC-01 | Semaphore limits concurrent token fetches to 3 | `test_semaphore_limits_concurrency_to_3` | `tests/test_tradier_client.py` |
+| TC-02 | 4th concurrent caller blocks until a slot is free | `test_4th_caller_blocks_until_slot_free` | `tests/test_tradier_client.py` |
+| TC-03 | Semaphore released on successful fetch | `test_semaphore_released_on_success` | `tests/test_tradier_client.py` |
+| TC-04 | Semaphore released on exception (no deadlock) | `test_semaphore_released_on_exception` | `tests/test_tradier_client.py` |
+| TC-05 | HTTP 429 — `Retry-After` header respected; sleeps exact value | `test_429_retry_after_header_respected` | `tests/test_tradier_client.py` |
+| TC-06 | HTTP 429 — missing `Retry-After` falls back to 60s default | `test_429_missing_retry_after_defaults_60s` | `tests/test_tradier_client.py` |
+| TC-07 | HTTP 429 — retried up to max_retries then returns None | `test_429_exhausted_retries_returns_none` | `tests/test_tradier_client.py` |
+| TC-08 | Non-429 HTTP error (e.g. 500) is not retried via 429 path | `test_non_429_not_retried` | `tests/test_tradier_client.py` |
+
+### Stream Worker — Global Stats Rollup (B-008)
+| Test ID | Scenario | Test Name | File |
+|---------|----------|-----------|------|
+| SW-01 | `_inc_global_error()` increments `_stats["errors"]` | `test_inc_global_error_increments` | `tests/test_stream_worker_b008.py` |
+| SW-02 | `_inc_global_reconnect()` increments `_stats["reconnects"]` | `test_inc_global_reconnect_increments` | `tests/test_stream_worker_b008.py` |
+| SW-03 | `_inc_global_reconnect()` sets `last_reconnect_at` to float within wall-clock bounds | `test_inc_global_reconnect_sets_timestamp` | `tests/test_stream_worker_b008.py` |
+| SW-04 | `_inc_global_error()` is safe when key absent (no crash) | `test_inc_global_error_safe_on_missing_key` | `tests/test_stream_worker_b008.py` |
+| SW-05 | 5 concurrent workers all accumulate into same stats dict | `test_concurrent_workers_accumulate_stats` | `tests/test_stream_worker_b008.py` |
+
 ### Options Universe — symbols_loader.py
 | Test ID | Scenario | File |
 |---------|----------|------|
@@ -285,6 +317,15 @@ pytest tests/test_tradier_stream.py -v
 # Market-hours guard tests only
 pytest tests/test_tradier_stream.py -k "market_hours or backoff" -v
 
+# B-021 staggered startup tests only
+pytest tests/test_stream_worker_b021.py -v
+
+# B-022 / B-023 semaphore + 429 handler tests only
+pytest tests/test_tradier_client.py -v
+
+# B-008 global stats rollup tests only
+pytest tests/test_stream_worker_b008.py -v
+
 # Universe tests only
 pytest tests/test_symbols_loader.py tests/test_universe_store.py -v
 
@@ -327,6 +368,11 @@ curl -X POST https://api.tradier.com/v1/markets/events/session \
 - [ ] **Outside market hours:** logs show `Market closed (ET: ...) — sleeping 60s` once per minute
 - [ ] **Outside market hours:** `/health` mode shows `market_closed`
 - [ ] **At market open (09:30 ET):** stream transitions from `market_closed` → `live` automatically
+- [ ] **B-021:** Railway logs show workers starting at staggered intervals (~200ms apart) on cold boot
+- [ ] **B-021:** No burst of simultaneous token-fetch requests at startup (verify via Tradier API logs)
+- [ ] **B-022:** Under high worker-spawn load, never more than 3 concurrent `/markets/events/session` requests in flight
+- [ ] **B-023:** If Tradier returns 429, Railway logs show `[tradier] 429 — sleeping Xs (Retry-After)` before retry
+- [ ] **B-023:** After `Retry-After` sleep, token fetch resumes automatically — stream comes up without manual intervention
 
 ### DB Signal Persistence (flow_store.py) — commit 701aaf6
 - [ ] Railway logs show `[flow_store] DB writer subscribed to bus — flow_episodes will be persisted`
@@ -355,9 +401,12 @@ curl -X POST https://api.tradier.com/v1/markets/events/session \
 | `test_classifier.py` | CL-1 – CL-24 | 24 |
 | `test_repetition_engine.py` | RA-1 – RA-22 | 22 |
 | `test_tradier_stream.py` | F1–F9, MH-1–7, BF-1–3 | ~27 |
+| `test_tradier_client.py` | TC-01 – TC-08 | 8 |
+| `test_stream_worker_b021.py` | SW-B021-1 – SW-B021-7 | 7 |
+| `test_stream_worker_b008.py` | SW-01 – SW-05 | 5 |
 | `test_symbols_loader.py` | SL-1–20 | ~20 |
 | `test_universe_store.py` | US-1–10 | 10 |
 | `test_flow_store.py` | FS-1–8 | 8 |
 | `test_auth.py` | — | 4 |
 | `test_flow.py`, `test_stream.py`, `test_simulation.py`, `test_ws.py` | — | ~4 |
-| **Total** | | **~259** |
+| **Total** | | **~279** |
