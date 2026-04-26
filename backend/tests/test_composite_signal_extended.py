@@ -11,11 +11,9 @@ Extends existing test_composite_signal_engine.py with:
   - get_backtest_score(): all 4 tier bias buckets, DTE bucketing, determinism
   - RepetitionAccumulator.get_alert_level(): all 4 alert levels
 """
-import pytest
 import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
-from dataclasses import dataclass, field
+from unittest.mock import AsyncMock, patch
 from typing import List
 
 from signals.backtest_validator import get_backtest_score, _dte_bucket, _CACHE
@@ -109,8 +107,7 @@ class TestBacktestValidator:
         """On average (many tickers) WHALE score > RETAIL. Test with a fixed pair."""
         whale = get_backtest_score("WHALETEST", "CALL", 30, "WHALE")
         retail = get_backtest_score("RETAILTEST", "CALL", 30, "RETAIL")
-        # Not guaranteed for every ticker due to random jitter, but base bias holds
-        assert whale >= 0.2  # at least above floor
+        assert whale >= 0.2
         assert retail >= 0.2
 
     def test_caches_result(self):
@@ -144,13 +141,13 @@ class TestMidcapScreener:
         assert abs(ratio - 0.5) < 0.001
 
     def test_is_unusual_activity_above_threshold(self):
-        assert is_unusual_activity(200, 1000, threshold=0.10)  # 20% > 10%
+        assert is_unusual_activity(200, 1000, threshold=0.10)
 
     def test_is_unusual_activity_below_threshold(self):
-        assert not is_unusual_activity(50, 1000, threshold=0.10)  # 5% < 10%
+        assert not is_unusual_activity(50, 1000, threshold=0.10)
 
     def test_is_unusual_activity_exact_threshold(self):
-        assert is_unusual_activity(100, 1000, threshold=0.10)  # exactly 10% → True
+        assert is_unusual_activity(100, 1000, threshold=0.10)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +159,6 @@ class TestAlertLevels:
         base_ts = datetime(2026, 4, 25, 10, 0, 0)
         events = []
         for i in range(3):
-            # For accelerating: space events within 60s; otherwise spread them
             ts = base_ts + timedelta(seconds=i * (10 if accelerating else 300))
             ev = _make_event(premium=premium // 3, ts=ts)
             events.append(ev)
@@ -207,14 +203,12 @@ class TestVolumeWeightedPremiumFactor:
         assert result == 0.5
 
     def test_normal_ratio(self):
-        # total_premium=500_000, notional_oi = 1000*100 = 100_000 → ratio = 5.0 → capped at 1.0
         ev = _make_event(oi=1000, premium=500_000)
         ep = _make_episode([ev, ev, ev])
         result = volume_weighted_premium_factor(ep)
         assert result == 1.0
 
     def test_small_premium_low_ratio(self):
-        # total_premium = 3*1000 = 3_000, notional_oi = 10_000*100 = 1_000_000 → ratio = 0.003
         ev = _make_event(oi=10_000, premium=1_000)
         ep = _make_episode([ev, ev, ev])
         result = volume_weighted_premium_factor(ep)
@@ -270,7 +264,6 @@ class TestComputeFlowScore:
 class TestBuildCompositeRecommendation:
 
     def _make_high_premium_episode(self, sentiment: str) -> RepetitionEpisode:
-        ev = _make_event(premium=3_000_000, sentiment=sentiment, tier="WHALE", dte=14)
         base_ts = datetime(2026, 4, 25, 10, 0, 0)
         events = [
             _make_event(premium=3_000_000, sentiment=sentiment, tier="WHALE", dte=14,
@@ -283,8 +276,6 @@ class TestBuildCompositeRecommendation:
         ep  = self._make_high_premium_episode("BULLISH")
         acc = RepetitionAccumulator()
         sig = build_composite(ep, acc)
-        # High WHALE premium should produce BUY if composite >= 0.65
-        # Result depends on random seed, so just assert valid output
         assert sig.recommendation in {"BUY", "SELL", "HOLD"}
         assert 0.0 <= sig.composite_score <= 1.0
 
@@ -295,7 +286,6 @@ class TestBuildCompositeRecommendation:
         assert sig.recommendation in {"BUY", "SELL", "HOLD"}
 
     def test_hold_for_low_composite(self):
-        # Minimal events → low composite → HOLD
         ev  = _make_event(premium=10, tier="RETAIL", dte=60)
         ep  = _make_episode([ev, ev, ev])
         acc = RepetitionAccumulator()
@@ -312,7 +302,6 @@ class TestBuildCompositeRecommendation:
         ep  = self._make_high_premium_episode("BULLISH")
         acc = RepetitionAccumulator()
         sig = build_composite(ep, acc)
-        # Sync build should have None swarm fields
         assert sig.swarm_direction is None
         assert sig.swarm_confidence is None
 
@@ -358,8 +347,7 @@ class TestBuildCompositeAsync:
             from signals.composite_signal_engine import build_composite_async
             ep  = self._make_episode()
             acc = RepetitionAccumulator()
-            sig = _run(build_composite_async(ep, acc))  # must not raise
-        # Swarm fields remain None when swarm fails
+            sig = _run(build_composite_async(ep, acc))
         assert sig.swarm_direction is None
 
     def test_n_agents_forwarded(self):

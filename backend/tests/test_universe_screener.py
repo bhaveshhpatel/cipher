@@ -29,7 +29,6 @@ from services.universe_screener import (
     get_stream_eligible,
     ScreenResult,
     _nearest_expiry_param,
-    _is_stream_eligible,
 )
 
 
@@ -226,7 +225,6 @@ class TestBatchDelay:
         resp   = _mock_chain_resp(open_interest=100)
 
         sleep_calls = []
-        original_sleep = __import__("asyncio").sleep
 
         async def mock_sleep(delay):
             sleep_calls.append(delay)
@@ -255,8 +253,6 @@ class TestNoDuplicates:
              patch("services.universe_screener.httpx.AsyncClient") as mock_client:
             mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
             result = await screen_universe(["SPY", "QQQ", "AAPL"])
-        # SPY and QQQ are priority — AAPL is screened
-        # Eligible should have all 3 but no duplicates
         assert len(result.eligible) == len(set(result.eligible))
         assert "SPY"  in result.eligible
         assert "QQQ"  in result.eligible
@@ -269,7 +265,6 @@ class TestNoDuplicates:
 class TestNearestExpiry:
     def test_returns_valid_date_string(self):
         result = _nearest_expiry_param()
-        # Should be YYYY-MM-DD
         parsed = date.fromisoformat(result)
         assert parsed >= date.today()
 

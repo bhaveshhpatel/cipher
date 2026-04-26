@@ -165,10 +165,8 @@ def test_ingest_returns_episode_when_thresholds_met():
 # 10
 def test_ingest_prunes_stale_events():
     acc = RepetitionAccumulator(window_minutes=1, min_trades=3, min_premium=50_000)
-    # Ingest 2 events far in the past (> 1 min window)
     for i in range(2):
         acc.ingest(_mock_event(premium=100_000, timestamp=_ts(-200 + i)))
-    # Ingest 1 fresh event — stale ones pruned, count resets to 1
     result = acc.ingest(_mock_event(premium=100_000, timestamp=_ts(0)))
     assert result is None  # only 1 event in window
 
@@ -179,7 +177,6 @@ def test_ingest_different_contracts_independent():
     for i in range(3):
         acc.ingest(_mock_event(ticker="AAPL", contract_type="CALL",
                                strike=180.0, premium=100_000, timestamp=_ts(i * 5)))
-    # Different contract — should not see AAPL's trades
     result_tsla = acc.ingest(_mock_event(ticker="TSLA", contract_type="CALL",
                                           strike=250.0, premium=100_000, timestamp=_ts(0)))
     assert result_tsla is None  # only 1 TSLA trade
@@ -199,10 +196,8 @@ def test_ingest_accumulates_across_calls():
 # 13
 def test_ingest_returns_episode_on_every_qualifying_call():
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    # Cross threshold at trade 3
     for i in range(3):
         acc.ingest(_mock_event(premium=100_000, timestamp=_ts(i * 10)))
-    # 4th and 5th calls should also return an episode
     ep4 = acc.ingest(_mock_event(premium=100_000, timestamp=_ts(30)))
     ep5 = acc.ingest(_mock_event(premium=100_000, timestamp=_ts(40)))
     assert ep4 is not None
@@ -216,9 +211,7 @@ def test_ingest_returns_episode_on_every_qualifying_call():
 
 def _ep_with(total_premium, accelerating=False):
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    # Build events to satisfy is_accelerating logic
     if accelerating:
-        now = _ts(0)
         ep.events = [
             _mock_event(premium=total_premium / 3, timestamp=_ts(0)),
             _mock_event(premium=total_premium / 3, timestamp=_ts(20)),

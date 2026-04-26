@@ -14,7 +14,6 @@ Note: TestClient's websocket_connect() drives the WS endpoint synchronously.
 We patch asyncio.create_task to prevent the background heartbeat from
 running during the synchronous test session.
 """
-import json
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
@@ -72,7 +71,7 @@ def test_ws_valid_token_is_accepted():
     with patch("routers.ws.asyncio.create_task", return_value=mock_task):
         with patch("routers.ws.asyncio.wait_for", new=AsyncMock(side_effect=Exception("disconnect"))):
             try:
-                with client.websocket_connect(f"/ws/signals?token={token}") as ws:
+                with client.websocket_connect(f"/ws/signals?token={token}") as _ws:
                     pass  # accepted — immediately exit context
             except Exception:
                 pass  # expected: wait_for raises to exit loop
@@ -93,7 +92,7 @@ def test_ws_bus_unsubscribe_called_on_disconnect():
          patch("routers.ws.bus.subscribe", return_value=fake_q), \
          patch("routers.ws.bus.unsubscribe") as mock_unsub:
         try:
-            with client.websocket_connect(f"/ws/signals?token={token}") as ws:
+            with client.websocket_connect(f"/ws/signals?token={token}") as _ws:
                 pass
         except Exception:
             pass
