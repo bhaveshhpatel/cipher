@@ -25,12 +25,12 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 @dataclass
 class _Quote:
-    symbol:         str
-    last_price:     float    = 0.0
-    volume:         int      = 0
-    average_volume: int      = 0
-    open_interest:  int      = 0
-    stream_eligible: bool    = True
+    symbol:          str
+    last_price:      float = 0.0
+    volume:          int   = 0
+    average_volume:  int   = 0
+    open_interest:   int   = 0
+    stream_eligible: bool  = True
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,12 @@ def _make_thresh(
     }
 
 
+FAKE_PRICES = {"AAPL": 180.0, "TSLA": 250.0, "HOOD": 15.0,
+               "SPY": 500.0, "SPCE": 2.0, "RIVN": 12.0,
+               "NVDA": 900.0, "UNKNOWN": 50.0, "QQQ": 400.0,
+               "XYZ": 20.0, "META": 500.0, "AMD": 150.0}
+
+
 # ---------------------------------------------------------------------------
 # 1. symbol_registry: get_oi_map returns populated dict after build
 # ---------------------------------------------------------------------------
@@ -68,60 +74,64 @@ def _make_thresh(
 class TestSymbolRegistryOiMap:
     """
     Tests for SymbolRegistry._oi_by_ticker and get_oi_map().
-    We stub _build_ticker to control which OI values are loaded.
+
+    build() skips tickers not in prices dict, so _fetch_stock_prices is
+    patched to return deterministic values.  _build_ticker is patched to
+    avoid real Tradier / DB calls.
+
+    Real _build_ticker signature:
+        async def _build_ticker(self, ticker, stock_price, registry,
+                                oi_by_ticker, tier_params)
+    The fake must match exactly so patch.object wires args correctly.
     """
 
     def test_get_oi_map_empty_before_build(self):
         """get_oi_map() returns {} before build() has run."""
         from services.symbol_registry import SymbolRegistry
         reg = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
-        result = reg.get_oi_map()
-        assert result == {}
+        assert reg.get_oi_map() == {}
 
     @pytest.mark.asyncio
     async def test_oi_map_populated_after_build(self):
         """
-        After build(), get_oi_map() returns avg OI for every ticker
-        whose contracts were loaded.
+        After build(), get_oi_map() returns avg OI for every ticker.
         """
         from services.symbol_registry import SymbolRegistry
 
-        # Patch _build_ticker so it writes synthetic OI into oi_by_ticker
-        # and returns a small non-empty registry dict entry.
-        async def _fake_build_ticker(self_inner, ticker, registry, oi_by_ticker, tier):
+        async def _fake_build_ticker(self_inner, ticker, stock_price,
+                                     registry, oi_by_ticker, tier_params):
             # Simulate loading 3 contracts with OIs 100, 200, 300 -> avg 200
             oi_by_ticker[ticker] = 200
             registry[f"{ticker}250117C00100000"] = MagicMock()
 
         reg = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
 
-        with patch.object(
-            type(reg), "_build_ticker",
-            new=_fake_build_ticker,
-        ):
+        with patch.object(SymbolRegistry, "_fetch_stock_prices",
+                          AsyncMock(return_value={"AAPL": 180.0, "TSLA": 250.0})), \
+             patch.object(SymbolRegistry, "_build_ticker", _fake_build_ticker):
             await reg.build()
 
-        oi = reg.get_oi_map()
-        assert oi == {"AAPL": 200, "TSLA": 200}
+        assert reg.get_oi_map() == {"AAPL": 200, "TSLA": 200}
 
     @pytest.mark.asyncio
     async def test_oi_zero_for_ticker_with_no_contracts(self):
         """
-        Tickers whose _build_ticker loads no contracts get oi=0 in the map.
+        Tickers whose _build_ticker loads no contracts get oi=0.
         """
         from services.symbol_registry import SymbolRegistry
 
-        async def _no_contracts(self_inner, ticker, registry, oi_by_ticker, tier):
-            # No contracts loaded; oi_by_ticker[ticker] set to 0
+        async def _no_contracts(self_inner, ticker, stock_price,
+                                registry, oi_by_ticker, tier_params):
             oi_by_ticker[ticker] = 0
 
         reg = SymbolRegistry(watchlist=["HOOD"], tier_map={})
 
-        with patch.object(type(reg), "_build_ticker", new=_no_contracts):
+        with patch.object(SymbolRegistry, "_fetch_stock_prices",
+                          AsyncMock(return_value={"HOOD": 15.0})), \
+             patch.object(SymbolRegistry, "_build_ticker", _no_contracts):
             await reg.build()
 
-        oi = reg.get_oi_map()
-        assert oi["HOOD"] == 0
+        assert reg.get_oi_map()["HOOD"] == 0
 
     @pytest.mark.asyncio
     async def test_get_oi_map_returns_independent_copy(self):
@@ -131,18 +141,21 @@ class TestSymbolRegistryOiMap:
         """
         from services.symbol_registry import SymbolRegistry
 
-        async def _fake_build(self_inner, ticker, registry, oi_by_ticker, tier):
+        async def _fake_build(self_inner, ticker, stock_price,
+                              registry, oi_by_ticker, tier_params):
             oi_by_ticker[ticker] = 500
 
         reg = SymbolRegistry(watchlist=["SPY"], tier_map={})
-        with patch.object(type(reg), "_build_ticker", new=_fake_build):
+
+        with patch.object(SymbolRegistry, "_fetch_stock_prices",
+                          AsyncMock(return_value={"SPY": 500.0})), \
+             patch.object(SymbolRegistry, "_build_ticker", _fake_build):
             await reg.build()
 
         copy1 = reg.get_oi_map()
-        copy1["SPY"] = 999_999          # mutate the copy
+        copy1["SPY"] = 999_999       # mutate the copy
 
-        copy2 = reg.get_oi_map()
-        assert copy2["SPY"] == 500      # internal state unchanged
+        assert reg.get_oi_map()["SPY"] == 500   # internal state unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +194,6 @@ class TestClassifyNoGrace:
     def test_t1_fails_if_oi_below_threshold(self):
         """oi=999 just below t1_min_oi=1000 must not get T1."""
         q = _Quote("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=999)
-        # May still qualify for T2 depending on T2 thresholds — just not T1
         tier = self._classify(q, _make_thresh())
         assert tier != 1
 
@@ -301,14 +313,14 @@ class TestOiDrivenTierIntegration:
     @pytest.mark.asyncio
     async def test_oi_drives_t1_demotion_to_t3(self):
         """
-        Scenario: AAPL has great vol+price but chain OI is 0 (no contracts loaded).
+        Scenario: AAPL has great vol+price but chain OI is 0.
         After stamp+assign_tiers, AAPL must be T3, not T1.
         """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
 
         quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000, open_interest=0)]
-        oi_map = {"AAPL": 0}   # registry reported no contracts loaded
+        oi_map = {"AAPL": 0}
 
         _stamp_oi(quotes, oi_map)
 
@@ -322,8 +334,7 @@ class TestOiDrivenTierIntegration:
     @pytest.mark.asyncio
     async def test_oi_drives_correct_t1_promotion(self):
         """
-        Scenario: AAPL has great vol+price AND chain OI=2000 >= t1_min_oi=1000.
-        Must be classified T1.
+        AAPL has great vol+price AND chain OI=2000 >= t1_min_oi=1000 -> T1.
         """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
@@ -341,21 +352,17 @@ class TestOiDrivenTierIntegration:
     @pytest.mark.asyncio
     async def test_mixed_oi_produces_mixed_tiers(self):
         """
-        Three symbols: one qualifies T1, one T2, one T3 based solely on OI.
+        Three symbols: T1 / T2 / T3 based solely on OI.
         """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
 
         quotes = [
-            _Quote("SPY",  last_price=500.0, average_volume=50_000_000, open_interest=0),  # -> T1
-            _Quote("HOOD", last_price=15.0,  average_volume=3_000_000,  open_interest=0),  # -> T2
-            _Quote("SPCE", last_price=2.0,   average_volume=200_000,    open_interest=0),  # -> T3
+            _Quote("SPY",  last_price=500.0, average_volume=50_000_000, open_interest=0),
+            _Quote("HOOD", last_price=15.0,  average_volume=3_000_000,  open_interest=0),
+            _Quote("SPCE", last_price=2.0,   average_volume=200_000,    open_interest=0),
         ]
-        oi_map = {
-            "SPY":  5_000,  # >= t1_min_oi=1000
-            "HOOD": 600,    # >= t2_min_oi=500, < t1_min_oi
-            "SPCE": 50,     # < t3_min_oi=100 but T3 is the floor anyway
-        }
+        oi_map = {"SPY": 5_000, "HOOD": 600, "SPCE": 50}
 
         _stamp_oi(quotes, oi_map)
 
@@ -369,9 +376,8 @@ class TestOiDrivenTierIntegration:
     @pytest.mark.asyncio
     async def test_preliminary_vs_final_tier_diff(self):
         """
-        Regression: the preliminary tier assignment (OI=0, before stamp)
-        differs from the final (OI stamped). Ensures the two-pass design
-        in lifespan() produces a different, more accurate result.
+        Regression: two-pass design in lifespan() — preliminary (OI=0)
+        differs from final (OI stamped).
         """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
@@ -380,7 +386,7 @@ class TestOiDrivenTierIntegration:
             _Quote("NVDA", last_price=900.0, average_volume=25_000_000, open_interest=0),
         ]
 
-        # Pass 1: preliminary with OI=0 (what old code did permanently)
+        # Pass 1: preliminary with OI=0
         with patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_make_thresh())):
             prelim_tiers = await assign_tiers(quotes)
 
