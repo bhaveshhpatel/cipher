@@ -16,23 +16,19 @@ Phase 5A additions:
     (for legacy callers); use build_composite_async() for full swarm output
 
 Patch path for tests:
-  Tests patch 'signals.composite_signal_engine.run_ensemble' at the module level.
-  build_composite_async() reads from globals() so the patched name is always used.
+  Tests patch 'simulation.ensemble_runner.run_ensemble' directly.
+  build_composite_async() imports from simulation.ensemble_runner at call
+  time so the patched reference is always used.
 
 vwpf formula:
-  ratio = latest_event.premium / (latest_oi * 100)
-  capped at 1.0. Uses per-event premium (not ep.total_premium) and omits strike
-  so the notional denominator is simply contracts × 100.
+  ratio = latest.premium / (latest_oi * latest.strike * 100)
+  capped at 1.0. Denominator is contracts × strike × 100 (notional value),
+  so the ratio measures premium vs notional — meaningful across strikes.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
-
-try:
-    from simulation.ensemble_runner import run_ensemble  # noqa: F401
-except Exception:
-    run_ensemble = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -54,27 +50,28 @@ class CompositeSignal:
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     """
-    Ratio of the latest event's premium to its notional OI value.
+    Ratio of latest event's premium to its notional value.
 
-    Formula: min(1.0, latest.premium / (latest_oi * 100))
+    Formula: min(1.0, premium / (oi * strike * 100))
 
     Rules:
-      - No events            -> 0.5 (neutral fallback)
-      - OI == 0              -> 0.5 (no OI data)
-      - OI > 0               -> min(1.0, premium / (oi * 100))
+      - No events                -> 0.5 (neutral fallback)
+      - OI == 0 or strike == 0   -> 0.5 (no data)
+      - Otherwise                -> min(1.0, premium / (oi * strike * 100))
 
-    Omits strike from denominator so the result scales with contracts,
-    not with moneyness. This keeps the ratio meaningful across all strikes.
+    Using notional (oi × strike × 100) keeps the ratio scale-invariant
+    across different strikes and sizes.
     """
     if not ep.events:
         return 0.5
-    latest = ep.events[-1]
+    latest    = ep.events[-1]
     latest_oi = getattr(latest, "open_interest", 0) or 0
-    if latest_oi <= 0:
+    strike    = getattr(latest, "strike", 0) or 0
+    if latest_oi <= 0 or strike <= 0:
         return 0.5
     premium = getattr(latest, "premium", 0) or 0
-    ratio = premium / (latest_oi * 100)
-    return round(min(1.0, ratio), 3)
+    ratio = premium / (latest_oi * strike * 100)
+    return round(min(1.0, ratio), 4)
 
 
 def compute_flow_score(ep: RepetitionEpisode) -> float:
@@ -133,11 +130,11 @@ async def build_composite_async(
 ) -> CompositeSignal:
     """
     Phase 5A primary entry point.
-    Reads `run_ensemble` from this module's globals() so that
-    patch('signals.composite_signal_engine.run_ensemble', ...) is always respected.
+    Imports run_ensemble from simulation.ensemble_runner at call time so
+    patch('simulation.ensemble_runner.run_ensemble', ...) is always respected.
     """
-    import signals.composite_signal_engine as _mod
-    _run = _mod.__dict__.get("run_ensemble")
+    import simulation.ensemble_runner as _er
+    _run = getattr(_er, "run_ensemble", None)
 
     sig = build_composite(ep, accumulator)
 
