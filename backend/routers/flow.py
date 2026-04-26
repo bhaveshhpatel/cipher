@@ -5,8 +5,10 @@ BUG FIX (2026-04-24):
   Fixed to query flow_episodes (the populated table, 82k+ rows).
 
 BUG FIX (2026-04-26):
-  Malformed rows (missing expiry AND missing ticker) are now skipped
-  so test_flow_scan_malformed_row_is_skipped passes.
+  Malformed rows (missing expiry) are now skipped so
+  test_flow_scan_malformed_row_is_skipped passes.
+  A row is considered malformed when expiry is empty/null — the ticker
+  alone cannot produce a valid FlowEventOut (expiry is a required field).
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -73,13 +75,12 @@ def _headers() -> dict:
 def _is_malformed(r: dict) -> bool:
     """
     Return True if the row is too incomplete to be useful.
-    A row is malformed when BOTH expiry and ticker are empty/missing.
-    An empty expiry alone is not enough to discard (ticker may still be valid).
+    A row is malformed when expiry is empty/null — expiry is a required
+    field in FlowEventOut and cannot be defaulted.
+    Note: an empty ticker alone does not trigger this check; the row is
+    still attempted and will use the fallback empty string.
     """
-    ticker = (r.get("ticker") or "").strip()
     expiry = (r.get("expiry") or "").strip()
-    # Discard only when expiry is empty — matches test expectation that
-    # a row with empty expiry but valid ticker is skipped
     return not expiry
 
 
@@ -150,7 +151,6 @@ async def scan_flow(
 
     events = []
     for r in rows:
-        # Skip malformed rows — empty expiry is considered incomplete
         if _is_malformed(r):
             log.warning(f"[flow] skipping malformed row (no expiry): {r}")
             continue

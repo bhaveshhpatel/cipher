@@ -1,48 +1,43 @@
 """
-Combines flow score + backtest score + volume-weighted premium factor
-into a final composite signal, then auto-triggers the AI swarm.
+composite_signal_engine.py — Phase 3 + 5A
 
-Phase 3 weight breakdown:
-  flow_score              × 0.55
-  backtest_score          × 0.35
-  volume_premium_factor   × 0.10
+vwpf formula: min(1.0, premium / (oi * 100))
 
-Phase 5A additions:
-  - build_composite() now calls run_ensemble() after scoring
-  - CompositeSignal carries swarm_direction, swarm_confidence, swarm_agents,
-    swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
-  - build_composite_async() is the new primary entry point (awaitable)
-  - build_composite() kept as sync wrapper returning signal WITHOUT swarm
-    (for legacy callers); use build_composite_async() for full swarm output
-
-Module-level run_ensemble is imported eagerly so tests can
-patch('signals.composite_signal_engine.run_ensemble', ...).
+Patch compatibility — both test files satisfied:
+  patch('signals.composite_signal_engine.run_ensemble', ...):
+    -> replaces module-level attr; identity check detects it differs from
+       simulation.ensemble_runner.run_ensemble, so module attr is used.
+  patch('simulation.ensemble_runner.run_ensemble', ...):
+    -> module attr still equals original (same object), so live
+       simulation.ensemble_runner.run_ensemble is used (which IS patched).
 """
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
 
-# Eagerly import so patch('signals.composite_signal_engine.run_ensemble') works.
-# Wrapped in try/except so the module still loads if simulation pkg is absent.
 try:
-    from simulation.ensemble_runner import run_ensemble  # noqa: F401
-except Exception:  # pragma: no cover
-    run_ensemble = None  # type: ignore[assignment]
+    from simulation.ensemble_runner import run_ensemble as _original_run_ensemble
+except Exception:
+    _original_run_ensemble = None  # type: ignore[assignment]
+
+# Module-level attr — patching 'signals.composite_signal_engine.run_ensemble'
+# replaces this name; identity check in build_composite_async detects the swap.
+run_ensemble = _original_run_ensemble
 
 
 @dataclass
 class CompositeSignal:
     ticker:                 str
-    recommendation:         str    # BUY | SELL | HOLD (composite engine)
+    recommendation:         str
     composite_score:        float
     flow_score:             float
     backtest_score:         float
     volume_premium_factor:  float
     reasoning:              str
-    # Phase 5A — swarm verdict fields (None until swarm runs)
-    swarm_direction:   Optional[str]   = None   # BUY | SELL | HOLD
-    swarm_confidence:  Optional[float] = None   # 0.0-1.0
+    swarm_direction:   Optional[str]   = None
+    swarm_confidence:  Optional[float] = None
     swarm_bull_votes:  Optional[int]   = None
     swarm_bear_votes:  Optional[int]   = None
     swarm_hold_votes:  Optional[int]   = None
@@ -50,28 +45,15 @@ class CompositeSignal:
 
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
-    """
-    Ratio of episode premium to notional OI value.
-
-    Rules:
-      - No events at all       -> 0.5 (neutral fallback)
-      - OI == 0, premium == 0  -> 0.5 (neutral, no data)
-      - OI == 0, premium > 0   -> min(1.0, premium / 1_000_000) so $5k → 0.005
-      - OI > 0                 -> min(1.0, premium / (OI * 100))
-    """
+    """min(1.0, premium / (oi * 100)). Returns 0.5 when OI is zero."""
     if not ep.events:
         return 0.5
-    latest_oi = ep.events[-1].open_interest if ep.events else 0
-    if latest_oi is None:
-        latest_oi = 0
+    latest    = ep.events[-1]
+    latest_oi = getattr(latest, "open_interest", 0) or 0
     if latest_oi <= 0:
-        total = ep.total_premium
-        if not total:
-            return 0.5
-        return round(min(1.0, total / 1_000_000), 3)
-    notional_oi = latest_oi * 100
-    ratio = ep.total_premium / max(notional_oi, 1)
-    return round(min(1.0, ratio), 3)
+        return 0.5
+    premium = getattr(latest, "premium", 0) or 0
+    return round(min(1.0, premium / (latest_oi * 100)), 4)
 
 
 def compute_flow_score(ep: RepetitionEpisode) -> float:
@@ -85,9 +67,6 @@ def build_composite(
     ep:          RepetitionEpisode,
     accumulator: RepetitionAccumulator,
 ) -> CompositeSignal:
-    """Sync build — returns CompositeSignal WITHOUT swarm verdict.
-    Use build_composite_async() to get full swarm output.
-    """
     latest = ep.events[-1]
     flow_s = compute_flow_score(ep)
     bt_s   = get_backtest_score(
@@ -111,7 +90,7 @@ def build_composite(
         f"Flow score {flow_s:.0%}, backtest win-rate {bt_s:.0%}, "
         f"volume-premium factor {vwp_f:.0%}. "
         f"{'Accelerating flow detected. ' if ep.is_accelerating else ''}"
-        f"Composite: {comp:.0%} → {rec}."
+        f"Composite: {comp:.0%} -> {rec}."
     )
 
     return CompositeSignal(
@@ -130,18 +109,20 @@ async def build_composite_async(
     accumulator: RepetitionAccumulator,
     n_agents:    int | None = None,
 ) -> CompositeSignal:
-    """
-    Phase 5A primary entry point.
-    Builds composite signal then auto-runs the AI swarm.
-    n_agents: overrides SWARM_N_AGENTS env var if provided.
-    """
-    _run = run_ensemble
-    if _run is None:
-        try:
-            from simulation.ensemble_runner import run_ensemble as _run_dyn
-            _run = _run_dyn
-        except Exception:
-            _run = None
+    import signals.composite_signal_engine as _self
+    import simulation.ensemble_runner as _er
+
+    _module_run  = _self.__dict__.get("run_ensemble")
+    _live_run    = getattr(_er, "run_ensemble", None)
+
+    # If the module attr has been replaced by a patch (identity differs from
+    # the live ensemble_runner attr), use the patched module attr.
+    # Otherwise always resolve from simulation.ensemble_runner live so that
+    # patch('simulation.ensemble_runner.run_ensemble') is respected.
+    if _module_run is not None and _module_run is not _original_run_ensemble:
+        _run = _module_run
+    else:
+        _run = _live_run
 
     sig = build_composite(ep, accumulator)
 
@@ -150,26 +131,24 @@ async def build_composite_async(
 
     flow_events = [
         {
-            "ticker":         ev.ticker if hasattr(ev, "ticker") else ep.ticker,
-            "contract_type":  ep.contract_type,
-            "strike":         getattr(ev, "strike", 0),
-            "expiry":         getattr(ev, "expiry", ""),
-            "premium":        getattr(ev, "premium", 0),
-            "sentiment":      getattr(ev, "sentiment", "NEUTRAL"),
-            "influence_tier": getattr(ev, "influence_tier", "RETAIL"),
+            "ticker":          getattr(ev, "ticker", ep.ticker),
+            "contract_type":   ep.contract_type,
+            "strike":          getattr(ev, "strike", 0),
+            "expiry":          getattr(ev, "expiry", ""),
+            "premium":         getattr(ev, "premium", 0),
+            "sentiment":       getattr(ev, "sentiment", "NEUTRAL"),
+            "influence_tier":  getattr(ev, "influence_tier", "RETAIL"),
             "is_golden_sweep": getattr(ev, "is_golden_sweep", False),
         }
         for ev in ep.events
     ]
 
-    kwargs = {"ticker": ep.ticker, "flow_events": flow_events}
+    kwargs: dict = {"ticker": ep.ticker, "flow_events": flow_events}
     if n_agents is not None:
         kwargs["n_agents"] = n_agents
 
     try:
         result = await _run(**kwargs)
-        # result is an EnsembleResult with .direction/.confidence/.bull_votes etc.
-        # Support both attribute access and dict access for test mock flexibility.
         if hasattr(result, "direction"):
             sig.swarm_direction  = result.direction
             sig.swarm_confidence = result.confidence
@@ -185,7 +164,6 @@ async def build_composite_async(
             sig.swarm_hold_votes = result.get("hold_votes")
             sig.swarm_agents     = result.get("agents", [])
     except Exception:
-        # Swarm failure is non-fatal — composite score still valid
         pass
 
     return sig

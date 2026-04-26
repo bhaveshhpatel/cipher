@@ -10,7 +10,6 @@ import os
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import computed_field
 from pydantic_settings import BaseSettings
 
 
@@ -63,18 +62,16 @@ class Settings(BaseSettings):
     REGISTRY_MIN_OI:                  int   = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int   = 15
 
-    # ── Computed aliases (visible to hasattr) ─────────────────────────────────
+    # ── Computed aliases (plain properties, visible to hasattr) ───────────────
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def JWT_SECRET(self) -> str:  # noqa: N802
         """Alias for SECRET_KEY — tests assert hasattr(settings, 'JWT_SECRET')."""
         return self.SECRET_KEY
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def SUPABASE_KEY(self) -> Optional[str]:  # noqa: N802
-        """Alias for SUPABASE_SERVICE_ROLE_KEY — tests assert hasattr(settings, 'SUPABASE_KEY')."""
+        """Alias: returns first non-empty Supabase key available."""
         return (
             self.SUPABASE_SERVICE_ROLE_KEY
             or self.SUPABASE_SERVICE_KEY

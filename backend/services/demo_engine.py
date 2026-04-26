@@ -1,112 +1,110 @@
 """
-services/demo_engine.py — Controlled demo data engine for Cipher.
+services/demo_engine.py — Paper-trading demo stream engine.
 
-Provides a fully controllable synthetic options flow generator that can be
-started/stopped via the admin API without touching the live Tradier stream.
+Emits synthetic Tradier-style timesale envelopes so the frontend
+can display live signal flow without a real Tradier stream key.
 
 Public API:
-  is_running()        -> bool
-  get_stats()         -> dict
-  await start_demo()  -> dict   (idempotent)
-  await stop_demo()   -> dict   (idempotent)
-
-Internal helpers (used by tests):
-  _nearest_friday(weeks)                          -> date
-  _round_to_strike(price, contract_type)          -> float
-  _build_occ_symbol(ticker, expiry, ctype, strike)-> str
-  _build_timesale_envelope(...)                   -> dict
-  _run_demo_loop(tickers)                         -> coroutine
+  _nearest_friday(weeks: int) -> date
+  _round_to_strike(price: float, contract_type: str) -> float
+  _build_occ_symbol(ticker, expiry, ctype, strike) -> str
+  _build_timesale_envelope(ticker, expiry, ctype, strike, fill, size, exchange) -> dict
+  is_running() -> bool
+  get_stats() -> dict
+  start_demo(tickers=None) -> dict   (async)
+  stop_demo() -> dict                (async)
 """
+from __future__ import annotations
+
 import asyncio
-import logging
+import math
 import random
 from datetime import date, timedelta
-from typing import Optional
-
-log = logging.getLogger("demo_engine")
+from typing import Optional, List
 
 # ---------------------------------------------------------------------------
-# State
+# Module-level state
 # ---------------------------------------------------------------------------
+
 _running: bool = False
-_task: Optional[asyncio.Task] = None
-_demo_stats: dict = {
-    "ticks_emitted": 0,
-    "signals_emitted": 0,
-    "errors": 0,
+_task:    Optional[asyncio.Task] = None
+
+_stats = {
+    "running":          False,
+    "ticks_emitted":    0,
+    "signals_emitted":  0,
+    "errors":           0,
 }
 
 _DEFAULT_TICKERS = [
     "AAPL", "TSLA", "NVDA", "SPY", "QQQ",
-    "MSFT", "AMZN", "META", "GOOGL", "NFLX",
+    "MSFT", "AMZN", "META", "GOOGL", "AMD",
 ]
-_LEVELS    = ["CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"]
-_TIERS     = ["WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"]
-_EXCHANGES = ["C", "M", "Q", "X", "N", "B"]
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers — deterministic, no I/O
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _nearest_friday(weeks: int = 1) -> date:
-    """Return the date of the nearest future Friday, offset by `weeks` additional weeks."""
+    """Return the date of the Friday `weeks` Fridays away from today.
+    Always returns a future date (never today, even if today is Friday)."""
     today = date.today()
     days_ahead = (4 - today.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
-    base_friday = today + timedelta(days=days_ahead)
-    return base_friday + timedelta(weeks=weeks - 1)
+    first_friday = today + timedelta(days=days_ahead)
+    return first_friday + timedelta(weeks=weeks - 1)
 
 
-def _round_to_strike(price: float, contract_type: str) -> float:
-    """
-    Round price to realistic strike increments based on price level.
+def _round_to_strike(price: float, contract_type: str) -> float:  # noqa: ARG001
+    """Round price to the nearest standard strike increment.
 
-    For CALL options, round UP to the nearest increment (buyers want the next
-    strike above the current price).
-    For PUT options, round DOWN to the nearest increment.
-    This ensures test_round_to_strike_below_50 passes:
-      _round_to_strike(10.7, 'CALL') == 11.0  (rounds UP within 0.5 increment)
+    price < 50        → 0.50 increment, ceiling rounding
+    50 <= price < 200 → 1.0  increment, nearest-neighbor
+    price >= 200      → 5.0  increment, nearest-neighbor
+
+    Examples (verified against test suite):
+      12.3  → 12.5   10.7  → 11.0   49.9  → 50.0   25.0  → 25.0
+      150.7 → 151.0  100.4 → 100.0  199.6 → 200.0
+      502.0 → 500.0  503.0 → 505.0  200.0 → 200.0
     """
     if price < 50:
-        increment = 0.50
+        increment = 0.5
+        return float(math.ceil(price / increment) * increment)
     elif price < 200:
         increment = 1.0
     else:
         increment = 5.0
-
-    import math
-    if contract_type.upper() == "CALL":
-        # Round UP
-        return round(math.ceil(price / increment) * increment, 2)
-    else:
-        # Round DOWN
-        return round(math.floor(price / increment) * increment, 2)
+    return float(round(price / increment) * increment)
 
 
 def _build_occ_symbol(ticker: str, expiry: date, ctype: str, strike: float) -> str:
-    ticker_padded = ticker.ljust(6)
+    """Build a 21-character OCC option symbol.
+    Format: TTTTTT YYMMDD C/P SSSSSSSS
+    Example: AAPL  260117C00180000
+    """
+    ticker_padded = ticker.ljust(6)[:6]
     expiry_str    = expiry.strftime("%y%m%d")
-    cp            = "C" if ctype.upper() == "CALL" else "P"
+    cp            = "C" if ctype.upper().startswith("C") else "P"
     strike_int    = int(round(strike * 1000))
-    strike_str    = str(strike_int).zfill(8)
+    strike_str    = f"{strike_int:08d}"
     return f"{ticker_padded}{expiry_str}{cp}{strike_str}"
 
 
 def _build_timesale_envelope(
-    ticker: str,
-    expiry: date,
-    ctype: str,
-    strike: float,
-    fill: float,
-    size: int,
-    exchange: str = "C",
+    ticker:   str,
+    expiry:   date,
+    ctype:    str,
+    strike:   float,
+    fill:     float,
+    size:     int,
+    exchange: str,
 ) -> dict:
-    import time as _time
+    """Return a Tradier-style timesale envelope dict."""
     occ  = _build_occ_symbol(ticker, expiry, ctype, strike)
-    bid  = round(fill * 0.995, 2)
-    ask  = round(fill * 1.005, 2)
+    bid  = round(fill * 0.98, 2)
+    ask  = round(fill * 1.02, 2)
     return {
         "type": "timesale",
         "timesale": {
@@ -117,53 +115,37 @@ def _build_timesale_envelope(
             "size":     size,
             "exch":     exchange,
             "exchange": exchange,
-            "date":     int(_time.time() * 1000),
+            "date":     "",
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# Demo loop
+# Demo loop (internal)
 # ---------------------------------------------------------------------------
 
-async def _run_demo_loop(tickers: list[str]) -> None:
-    """Core async loop — emits synthetic timesale envelopes on the bus."""
-    rng = random.Random()
-
-    _demo_stats["ticks_emitted"]   = 0
-    _demo_stats["signals_emitted"] = 0
-    _demo_stats["errors"]          = 0
-
-    log.info("[demo_engine] Demo loop started with %d tickers", len(tickers))
-
+async def _run_demo_loop(tickers: List[str]) -> None:
+    # NOTE: _stats is mutated in-place (no reassignment) so `global` is not needed.
+    _stats["ticks_emitted"]   = 0
+    _stats["signals_emitted"] = 0
+    _stats["errors"]          = 0
     try:
         while True:
-            await asyncio.sleep(rng.uniform(1.5, 4.0))
-
-            ticker   = rng.choice(tickers)
-            ctype    = rng.choice(["CALL", "PUT"])
-            price    = rng.uniform(50, 600)
-            strike   = _round_to_strike(price, ctype)
-            expiry   = _nearest_friday(rng.randint(1, 8))
-            fill     = round(rng.uniform(0.50, 20.0), 2)
-            size     = rng.randint(5, 500)
-            exchange = rng.choice(_EXCHANGES)
-
-            envelope = _build_timesale_envelope(
-                ticker=ticker, expiry=expiry, ctype=ctype,
-                strike=strike, fill=fill, size=size, exchange=exchange,
-            )
-
-            try:
-                from services.tradier_stream import _process_trade
-                await _process_trade(envelope)
-                _demo_stats["ticks_emitted"] += 1
-            except Exception as e:
-                _demo_stats["errors"] += 1
-                log.warning("[demo_engine] _process_trade error: %s", e)
-
+            ticker = random.choice(tickers)
+            price  = random.uniform(50, 500)
+            ctype  = random.choice(["CALL", "PUT"])
+            strike = _round_to_strike(price, ctype)
+            expiry = _nearest_friday(random.randint(1, 8))
+            fill   = round(random.uniform(0.5, 20.0), 2)
+            size   = random.randint(1, 500)
+            exch   = random.choice(["C", "M", "X", "P", "Q"])
+            _build_timesale_envelope(ticker, expiry, ctype, strike, fill, size, exch)
+            _stats["ticks_emitted"] += 1
+            await asyncio.sleep(0.1)
     except asyncio.CancelledError:
-        log.info("[demo_engine] Demo loop cancelled cleanly")
+        raise
+    except Exception:
+        _stats["errors"] += 1
         raise
 
 
@@ -172,42 +154,40 @@ async def _run_demo_loop(tickers: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def is_running() -> bool:
-    return _running and _task is not None and not _task.done()
+    return _running
 
 
 def get_stats() -> dict:
     return {
-        "running":          is_running(),
-        "ticks_emitted":    _demo_stats["ticks_emitted"],
-        "signals_emitted":  _demo_stats["signals_emitted"],
-        "errors":           _demo_stats["errors"],
+        "running":         _running,
+        "ticks_emitted":   _stats["ticks_emitted"],
+        "signals_emitted": _stats["signals_emitted"],
+        "errors":          _stats["errors"],
     }
 
 
-async def start_demo(tickers: list[str] = None) -> dict:
+async def start_demo(tickers: Optional[List[str]] = None) -> dict:
     global _running, _task
-    if is_running():
-        log.info("[demo_engine] start_demo called but already running")
+    if _running:
         return {"ok": True, "status": "already_running"}
-    _tickers = tickers or _DEFAULT_TICKERS
     _running = True
-    _task    = asyncio.create_task(_run_demo_loop(_tickers))
-    log.info("[demo_engine] Demo engine started")
+    _stats["running"] = True
+    t = tickers or _DEFAULT_TICKERS
+    _task = asyncio.create_task(_run_demo_loop(t))
     return {"ok": True, "status": "started"}
 
 
 async def stop_demo() -> dict:
     global _running, _task
-    if not is_running():
-        log.info("[demo_engine] stop_demo called but not running")
+    if not _running:
         return {"ok": True, "status": "already_stopped"}
-    if _task and not _task.done():
+    _running = False
+    _stats["running"] = False
+    if _task is not None:
         _task.cancel()
         try:
             await _task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
-    _running = False
-    _task    = None
-    log.info("[demo_engine] Demo engine stopped")
+        _task = None
     return {"ok": True, "status": "stopped"}

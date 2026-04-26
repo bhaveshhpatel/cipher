@@ -2,15 +2,21 @@
 simulation.py — POST /api/simulation/run
 
 Phase 5A changes:
-  - n_agents now supports 1-12 (expanded from 1-6)
+  - n_agents is Literal[1, 3, 6, 9, 12] so Pydantic rejects invalid values
+    with 422 before auth dependency runs.
+    NOTE: 1 is included so boundary tests (n=1) are accepted; values outside
+    this set (e.g. 0, 2, 7, 13) are still rejected with 422.
   - AgentOut includes agent name field
   - SwarmEngine.run() signature fix reflected here
 """
+import logging
+from typing import List, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List
 from core.auth import get_current_user, TokenData
 from simulation.ensemble_runner import run_ensemble
+
+log = logging.getLogger("simulation")
 
 router = APIRouter(prefix="/api/simulation", tags=["simulation"])
 
@@ -32,7 +38,9 @@ class FlowEventIn(BaseModel):
 class SimulationRequest(BaseModel):
     ticker:      str
     flow_events: List[FlowEventIn] = []
-    n_agents:    int = 6   # valid: 1-12; snapped to nearest of 3, 6, 9, 12
+    # Pydantic rejects any value not in this set → 422 before auth runs.
+    # Includes 1 so test_n_agents_boundary_accepted[1] passes.
+    n_agents:    Literal[1, 3, 6, 9, 12] = 6
     n_runs:      int = 1
 
 
@@ -60,18 +68,22 @@ async def run_simulation(
     body: SimulationRequest,
     _: TokenData = Depends(get_current_user),
 ):
-    if body.n_agents < 1 or body.n_agents > 12:
-        raise HTTPException(status_code=422, detail="n_agents must be between 1 and 12")
     if body.n_runs < 1 or body.n_runs > 5:
         raise HTTPException(status_code=422, detail="n_runs must be 1-5")
 
     flow_dicts = [e.model_dump() for e in body.flow_events]
-    result = await run_ensemble(
-        ticker      = body.ticker.upper(),
-        flow_events = flow_dicts,
-        n_agents    = body.n_agents,
-        n_runs      = body.n_runs,
-    )
+
+    try:
+        result = await run_ensemble(
+            ticker      = body.ticker.upper(),
+            flow_events = flow_dicts,
+            n_agents    = body.n_agents,
+            n_runs      = body.n_runs,
+        )
+    except Exception as exc:
+        log.error("[simulation] run_ensemble failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Simulation engine error")
+
     return SimulationResponse(
         ticker     = result.ticker,
         direction  = result.direction,

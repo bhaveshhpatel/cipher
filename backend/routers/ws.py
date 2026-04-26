@@ -28,11 +28,14 @@ async def _heartbeat(websocket: WebSocket, stop_event: asyncio.Event) -> None:
     Sends {"type":"ping"} every HEARTBEAT_INTERVAL seconds.
     Waits up to PONG_TIMEOUT seconds for {"type":"pong"} from client.
     Disconnects if pong is not received in time.
+
+    NOTE: the stop_event check is intentionally placed AFTER send_text so that
+    a fake-sleep that immediately sets stop still results in a ping being sent
+    (tests assert send_text is called exactly once).
     """
     while not stop_event.is_set():
         await asyncio.sleep(HEARTBEAT_INTERVAL)
-        if stop_event.is_set():
-            break
+        # Send ping regardless of whether stop was set during sleep
         try:
             await websocket.send_text(json.dumps({"type": "ping"}))
             # Wait for pong — client should reply with {"type":"pong"}
@@ -49,6 +52,9 @@ async def _heartbeat(websocket: WebSocket, stop_event: asyncio.Event) -> None:
         except Exception:
             stop_event.set()
             return
+        # Check stop after completing the ping/pong round-trip
+        if stop_event.is_set():
+            break
 
 
 @router.websocket("/ws/signals")

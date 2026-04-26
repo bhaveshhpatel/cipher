@@ -116,7 +116,6 @@ def apply_config(cfg: dict) -> None:
       symbols  list[str]  — replaces the working SYMBOLS list
     Other keys are silently ignored (forward-compat).
     """
-    global SYMBOLS
     if "symbols" in cfg:
         new_syms = [s.strip().upper() for s in cfg["symbols"] if isinstance(s, str) and s.strip()]
         SYMBOLS.clear()

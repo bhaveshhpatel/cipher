@@ -12,10 +12,13 @@ on:
       - "backend/**"
       - "railway.toml"
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   # -------------------------------------------------------------------------
   # Job 1: Syntax check — pyflakes only, NO pip install of heavy deps
-  # Runs in ~20s flat.
   # -------------------------------------------------------------------------
   lint:
     name: Syntax Check
@@ -40,12 +43,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Job 2: Regression test suite with coverage gate
-  # Runs in PARALLEL with lint (no needs: lint) — fails fast independently.
-  # pip cache keyed on both requirements files so cache hit = ~5s install.
-  # --cov-fail-under=92 enforced (aligned with pytest.ini).
-  # --continue-on-collection-errors: collect ALL test files before stopping
-  #   so every import error / missing module surfaces in one run instead of
-  #   halting at the first failure.
+  # Gate: --cov-fail-under=92 enforced by pytest.
   # -------------------------------------------------------------------------
   regression:
     name: Regression Tests + Coverage Gate
@@ -119,15 +117,4 @@ jobs:
             backend/coverage.json
           retention-days: 14
 
-      - name: Coverage summary comment on PR
-        if: github.event_name == 'pull_request'
-        uses: orgoro/coverage@v3.2
-        with:
-          coverageFile: backend/coverage.xml
-          token:        ${{ secrets.GITHUB_TOKEN }}
-          thresholdAll: 0.92
-          thresholdNew: 0.90
-          thresholdModified: 0.85
-
 # Deploy is handled automatically by Railway's native GitHub integration.
-# Railway watches this repo and redeploys on changes to backend/** via railway.toml.

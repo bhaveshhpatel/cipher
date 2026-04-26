@@ -6,7 +6,6 @@ StreamManager() with no arguments.
 """
 import asyncio
 import logging
-import time as _time
 from typing import Callable, Awaitable, Optional
 
 log = logging.getLogger("stream_manager")

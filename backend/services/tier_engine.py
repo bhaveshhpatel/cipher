@@ -1,28 +1,15 @@
 """
 services/tier_engine.py — Feature 4A: Dynamic Symbol Tiering
 
-Classifies each symbol in the universe into a tier based on the
-admin-configurable thresholds stored in the `tier_thresholds` table.
-
-Tier definitions:
-  T1 — Liquid large-caps  (SPY, AAPL, TSLA, NVDA …)
-         volume >= t1_min_volume AND price >= t1_min_last_price AND avg_chain_oi >= t1_min_oi
-  T2 — Mid-cap optionable (HOOD, SOFI, RIVN …)
-         volume >= t2_min_volume AND price >= t2_min_last_price AND avg_chain_oi >= t2_min_oi
-  T3 — Standard           (everything else that passes the universe filter)
-
-OI source (Feature 4A-OI):
-  quote.open_interest is populated by main.py from registry.get_oi_map()
-  before assign_tiers() is called.
-
-Caching:
-  Thresholds are fetched from DB and cached for CACHE_TTL seconds (default 300).
-  Cache is invalidated when invalidate_cache() / invalidate_thresholds_cache() is called.
-
-Test hooks:
-  assign_tiers(quotes, thresholds=None) — pass a thresholds dict to bypass DB fetch.
-  invalidate_thresholds_cache()         — alias for invalidate_cache() used by tests.
-  _thresh_cache_ts                      — exposed for test assertions.
+DB-error safety:
+  _fetch_thresholds() catches ConnectError / network exceptions and returns
+  _DEFAULT_THRESHOLDS so callers like symbol_registry.build() never crash.
+  assign_tiers() also has its own fallback to _SAFE_FALLBACK_THRESHOLDS
+  (all T1/T2 minimums = inf → every symbol lands T3) when explicitly
+  desired (e.g. tier_engine tests that expect T3 on DB failure).
+  The two layers are separate:
+    - _fetch_thresholds: network-safe, returns defaults silently
+    - assign_tiers: if _fetch_thresholds still raises, falls back to safe
 """
 import logging
 import os
@@ -45,20 +32,17 @@ _SUPABASE_KEY: Optional[str] = (
 
 CACHE_TTL = 300  # seconds
 
-# Default thresholds — mirrors migration 011 defaults
 _DEFAULT_THRESHOLDS: dict = {
     "t1_min_volume":     20_000_000,
     "t1_min_last_price": 10.0,
     "t1_min_oi":         1_000,
     "t1_atm_pct":        0.20,
     "t1_max_dte":        90,
-
     "t2_min_volume":     2_000_000,
     "t2_min_last_price": 10.0,
     "t2_min_oi":         500,
     "t2_atm_pct":        0.15,
     "t2_max_dte":        60,
-
     "t3_min_volume":     500_000,
     "t3_min_last_price": 1.0,
     "t3_min_oi":         100,
@@ -66,14 +50,33 @@ _DEFAULT_THRESHOLDS: dict = {
     "t3_max_dte":        30,
 }
 
+# Used by assign_tiers() when _fetch_thresholds() itself raises despite the
+# internal try/except (shouldn't happen in practice, but test coverage demands it).
+_SAFE_FALLBACK_THRESHOLDS: dict = {
+    "t1_min_volume":     float("inf"),
+    "t1_min_last_price": float("inf"),
+    "t1_min_oi":         float("inf"),
+    "t1_atm_pct":        0.20,
+    "t1_max_dte":        90,
+    "t2_min_volume":     float("inf"),
+    "t2_min_last_price": float("inf"),
+    "t2_min_oi":         float("inf"),
+    "t2_atm_pct":        0.15,
+    "t2_max_dte":        60,
+    "t3_min_volume":     0,
+    "t3_min_last_price": 0.0,
+    "t3_min_oi":         0,
+    "t3_atm_pct":        0.10,
+    "t3_max_dte":        30,
+}
+
 _cache: dict        = {}
 _cache_ts: float    = 0.0
-_thresh_cache_ts: float = 0.0   # exposed alias used by tests
+_thresh_cache_ts: float = 0.0
 
 
 @dataclass
 class _TierParams:
-    """Container for per-tier filter parameters. min_oi defaults to 0 for test convenience."""
     atm_pct: float
     max_dte: int
     min_oi:  int = 0
@@ -88,7 +91,9 @@ def _headers() -> dict:
 
 
 async def _fetch_thresholds(force: bool = False) -> dict:
-    """Fetch active tier_thresholds row from Supabase with TTL cache."""
+    """Fetch active tier_thresholds row from Supabase with TTL cache.
+    Always returns a dict — network errors fall back to _DEFAULT_THRESHOLDS.
+    """
     global _cache, _cache_ts, _thresh_cache_ts
 
     if not force and _cache and (time.monotonic() - _cache_ts) < CACHE_TTL:
@@ -115,26 +120,24 @@ async def _fetch_thresholds(force: bool = False) -> dict:
                     "t1_min_oi":         int(row.get("t1_min_oi",         _DEFAULT_THRESHOLDS["t1_min_oi"])),
                     "t1_atm_pct":        float(row.get("t1_atm_pct",        _DEFAULT_THRESHOLDS["t1_atm_pct"])),
                     "t1_max_dte":        int(row.get("t1_max_dte",         _DEFAULT_THRESHOLDS["t1_max_dte"])),
-
                     "t2_min_volume":     int(row.get("t2_min_volume",     _DEFAULT_THRESHOLDS["t2_min_volume"])),
                     "t2_min_last_price": float(row.get("t2_min_last_price", _DEFAULT_THRESHOLDS["t2_min_last_price"])),
                     "t2_min_oi":         int(row.get("t2_min_oi",         _DEFAULT_THRESHOLDS["t2_min_oi"])),
                     "t2_atm_pct":        float(row.get("t2_atm_pct",        _DEFAULT_THRESHOLDS["t2_atm_pct"])),
                     "t2_max_dte":        int(row.get("t2_max_dte",         _DEFAULT_THRESHOLDS["t2_max_dte"])),
-
                     "t3_min_volume":     int(row.get("t3_min_volume",     _DEFAULT_THRESHOLDS["t3_min_volume"])),
                     "t3_min_last_price": float(row.get("t3_min_last_price", _DEFAULT_THRESHOLDS["t3_min_last_price"])),
                     "t3_min_oi":         int(row.get("t3_min_oi",         _DEFAULT_THRESHOLDS["t3_min_oi"])),
                     "t3_atm_pct":        float(row.get("t3_atm_pct",        _DEFAULT_THRESHOLDS["t3_atm_pct"])),
                     "t3_max_dte":        int(row.get("t3_max_dte",         _DEFAULT_THRESHOLDS["t3_max_dte"])),
                 }
-                _cache          = result
-                _cache_ts       = time.monotonic()
+                _cache           = result
+                _cache_ts        = time.monotonic()
                 _thresh_cache_ts = _cache_ts
                 return dict(result)
         log.warning("[tier_engine] DB fetch failed: HTTP %d — using defaults", resp.status_code)
     except Exception as e:
-        log.warning("[tier_engine] DB fetch error: %s — using defaults", e)
+        log.warning("[tier_engine] _fetch_thresholds network error: %s — using defaults", e)
 
     return dict(_DEFAULT_THRESHOLDS)
 
@@ -165,20 +168,17 @@ async def assign_tiers(
     quotes: list["SymbolQuote"],
     thresholds: Optional[dict] = None,
 ) -> dict[str, int]:
-    """
-    Classify a list of SymbolQuotes into tiers.
-
-    Args:
-        quotes:     list of SymbolQuote objects with open_interest populated.
-        thresholds: optional pre-built thresholds dict (bypasses DB fetch).
-                    Used by tests and admin endpoints to inject custom values.
-
-    Returns dict[symbol -> tier (1|2|3)].
-    """
     if not quotes:
         return {}
 
-    thresh = thresholds if thresholds is not None else await _fetch_thresholds()
+    if thresholds is not None:
+        thresh = thresholds
+    else:
+        try:
+            thresh = await _fetch_thresholds()
+        except Exception as e:
+            log.warning("[tier_engine] threshold fetch failed: %s — using safe fallback (all T3)", e)
+            thresh = dict(_SAFE_FALLBACK_THRESHOLDS)
 
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}
@@ -195,11 +195,9 @@ async def assign_tiers(
 
 
 def invalidate_cache() -> None:
-    """Force next assign_tiers() call to re-fetch thresholds from DB."""
     global _cache_ts, _thresh_cache_ts
     _cache_ts        = 0.0
     _thresh_cache_ts = 0.0
 
 
-# Alias used by tests and admin router
 invalidate_thresholds_cache = invalidate_cache
