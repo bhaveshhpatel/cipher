@@ -1,6 +1,9 @@
 [run]
 # Measure only the application source — explicit package list avoids
 # accidentally measuring non-Python files or test files themselves.
+# branch = true enables branch-arc coverage (if/else paths).
+branch = true
+
 source =
     config
     main
@@ -34,14 +37,17 @@ omit =
     */__main__.py
 
 [report]
-# Fail the build if total coverage drops below this threshold.
-fail_under = 90
+# Hard gate — fail the build if total coverage drops below this.
+fail_under = 92
 
 # Show lines that are missing coverage
 show_missing = True
 
 # Suppress files with 100% coverage from the terminal report (less noise)
 skip_covered = True
+
+# Precision for reported percentages
+precision = 1
 
 # Exclude lines that are genuinely untestable
 exclude_lines =
@@ -60,3 +66,10 @@ exclude_lines =
 [html]
 directory = coverage_html
 title     = Cipher Backend Coverage Report
+
+[xml]
+output = coverage.xml
+
+[json]
+output      = coverage.json
+pretty_print = true

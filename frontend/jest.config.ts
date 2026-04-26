@@ -1,7 +1,7 @@
 import type { Config } from 'jest'
 
 const config: Config = {
-  // Use jsdom for React component tests
+  // jsdom environment for React component + hook tests
   testEnvironment: 'jsdom',
 
   // TypeScript transform via ts-jest
@@ -13,17 +13,16 @@ const config: Config = {
     }],
   },
 
-  // Module resolution — mirror Next.js path aliases
+  // Module resolution — mirror Next.js path aliases defined in tsconfig.json
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
     // Static asset stubs
-    '\\.(css|less|scss|sass)$': '<rootDir>/__mocks__/styleMock.ts',
+    '\\.(css|less|scss|sass)$':            '<rootDir>/__mocks__/styleMock.ts',
     '\\.(jpg|jpeg|png|gif|svg|ico|webp)$': '<rootDir>/__mocks__/fileMock.ts',
   },
 
-  // Setup files run after jest is initialised
-  setupFilesAfterFramework: [],
-  setupFilesAfterFramework: [],
+  // Global test setup (e.g. jest-dom matchers) — add files here as needed
+  setupFilesAfterFramework: ['<rootDir>/jest.setup.ts'],
 
   // Pattern for test files
   testMatch: [
@@ -31,44 +30,63 @@ const config: Config = {
     '**/?(*.)+(spec|test).(ts|tsx)',
   ],
 
-  // Coverage collection
+  // ---------------------------------------------------------------------------
+  // Coverage collection — src only, exclude non-logic files
+  // ---------------------------------------------------------------------------
   collectCoverageFrom: [
     'src/**/*.{ts,tsx}',
     '!src/**/*.d.ts',
-    '!src/**/index.ts',          // barrel files — no logic
-    '!src/app/layout.tsx',       // Next.js shell — no testable logic
+    '!src/**/index.ts',           // barrel files — no logic
+    '!src/app/layout.tsx',        // Next.js shell — no testable logic
     '!src/app/globals.css',
     '!src/types/**',
     '!src/**/__mocks__/**',
   ],
 
+  // Coverage output formats — lcov for artifact upload, json-summary for CI
+  coverageReporters: ['text', 'lcov', 'json-summary'],
+
   // ---------------------------------------------------------------------------
-  // Phase 5: Coverage thresholds — CI will fail if any metric drops below these
+  // Phase 5 final: Coverage thresholds
+  //
+  // Global thresholds apply to the entire src/ collection.
+  // Per-file thresholds apply to individual critical files.
+  // CI fails immediately if ANY threshold is breached.
   // ---------------------------------------------------------------------------
   coverageThreshold: {
     global: {
-      branches:   70,
-      functions:  75,
-      lines:      75,
-      statements: 75,
+      branches:   80,   // raised from 70
+      functions:  85,   // raised from 75
+      lines:      85,   // raised from 75
+      statements: 85,   // raised from 75
     },
-    // Critical auth hook — must stay at near-100%
+
+    // Auth hook — security critical, near-full coverage required
     './src/hooks/useAuth.ts': {
-      branches:   90,
+      branches:   95,   // raised from 90
+      functions:  95,
+      lines:      95,
+      statements: 95,
+    },
+
+    // Flow data hook — core data path
+    './src/hooks/useFlow.ts': {
+      branches:   90,   // raised from 85
       functions:  90,
       lines:      90,
       statements: 90,
     },
-    // Flow data hook
-    './src/hooks/useFlow.ts': {
-      branches:   85,
-      functions:  85,
-      lines:      85,
-      statements: 85,
+
+    // API client — all request/response paths must be exercised
+    './src/lib/api.ts': {
+      branches:   80,
+      functions:  80,
+      lines:      80,
+      statements: 80,
     },
   },
 
-  // Ignore Next.js build output
+  // Ignore Next.js build output and node_modules
   testPathIgnorePatterns: [
     '<rootDir>/.next/',
     '<rootDir>/node_modules/',

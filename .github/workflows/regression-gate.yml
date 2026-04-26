@@ -1,0 +1,162 @@
+# =============================================================================
+# Cipher — Unified Regression Gate
+# =============================================================================
+# This workflow is the REQUIRED status check that must pass before any PR
+# can be merged into main. It runs both the backend and frontend regression
+# suites in parallel and enforces coverage thresholds on both.
+#
+# How to add this as a required check:
+#   GitHub → Settings → Branches → main → Require status checks to pass
+#   Add: "Backend Regression Gate" and "Frontend Regression Gate"
+# =============================================================================
+name: Regression Gate
+
+on:
+  pull_request:
+    branches: [main]
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend regression — pytest + coverage >= 92%
+  # ---------------------------------------------------------------------------
+  backend:
+    name: Backend Regression Gate
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_URL:              "https://dummy.supabase.co"
+      SUPABASE_KEY:              "dummy-supabase-key"
+      SUPABASE_SERVICE_KEY:      "dummy-service-key"
+      SUPABASE_SERVICE_ROLE_KEY: "dummy-service-role-key"
+      JWT_SECRET:                "ci-test-jwt-secret-not-used-in-prod"
+      SECRET_KEY:                "ci-test-secret-key"
+      TRADIER_API_KEY:           "dummy-tradier-key"
+      TRADIER_ACCOUNT_ID:        "VA00000000"
+      TRADIER_BASE_URL:          "https://sandbox.tradier.com"
+      GROQ_API_KEY:              ""
+      ALLOWED_ORIGINS:           "http://localhost:3000,http://testserver,http://test"
+      ENVIRONMENT:               "test"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Purge bytecode cache
+        working-directory: backend
+        run: |
+          find . -type f -name '*.pyc' -delete
+          find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Run regression suite
+        working-directory: backend
+        run: |
+          pytest \
+            -x \
+            --tb=short \
+            -q \
+            --cov=. \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=json:coverage.json \
+            --cov-fail-under=92 \
+            --cov-config=.coveragerc
+
+      - name: Upload backend coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage-gate
+          path: |
+            backend/coverage.xml
+            backend/coverage.json
+          retention-days: 30
+
+      - name: Post coverage summary to PR
+        if: github.event_name == 'pull_request'
+        uses: orgoro/coverage@v3.2
+        with:
+          coverageFile:       backend/coverage.xml
+          token:              ${{ secrets.GITHUB_TOKEN }}
+          thresholdAll:       0.92
+          thresholdNew:       0.90
+          thresholdModified:  0.85
+
+  # ---------------------------------------------------------------------------
+  # Frontend regression — Jest + coverageThreshold enforced in jest.config.ts
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend Regression Gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run regression tests with coverage
+        # --ci:       fail on snapshot updates
+        # --coverage: enforces jest.config.ts coverageThreshold
+        # Zero tests = CI fail (--passWithNoTests intentionally omitted)
+        run: npx jest --ci --coverage --forceExit
+
+      - name: Upload frontend coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage-gate
+          path: frontend/coverage/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Gate summary — single job that depends on both; add THIS as required check
+  # in GitHub branch protection if you prefer one status check over two.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: All Regression Gates Passed
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check all jobs passed
+        run: |
+          echo "Backend status : ${{ needs.backend.result }}"
+          echo "Frontend status: ${{ needs.frontend.result }}"
+          if [[ "${{ needs.backend.result }}" != "success" || "${{ needs.frontend.result }}" != "success" ]]; then
+            echo "One or more regression gates FAILED. Merge is blocked."
+            exit 1
+          fi
+          echo "All regression gates passed. Safe to merge."
