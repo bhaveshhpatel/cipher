@@ -1,94 +1,82 @@
-/**
- * Next.js catch-all API proxy → Railway backend
- *
- * All requests to /api/* from the frontend are forwarded here.
- * Running server-side on Vercel so there is NO cross-origin constraint
- * between this proxy and Railway — we strip origin/host so Railway's
- * CORS middleware never rejects the request.
- *
- * CORS preflights (OPTIONS) are handled here directly and never
- * forwarded to Railway.
- */
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from "next/server";
 
-const BACKEND =
-  process.env.BACKEND_URL ||
-  process.env.NEXT_PUBLIC_API_URL ||
-  'http://localhost:8000';
-
-// Headers we never forward to Railway
-const STRIP_REQUEST_HEADERS = new Set([
-  'host',
-  'origin',
-  'referer',
-  'x-forwarded-host',
-]);
-
-// CORS headers returned on every preflight + real response
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin':  '*',
-  'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization,Content-Type,X-Requested-With',
-  'Access-Control-Max-Age':       '86400',
+type RouteContext = {
+  params: Promise<{ path: string[] }>;
 };
 
-// ---------------------------------------------------------------------------
-// OPTIONS — answer preflight here, never hit Railway
-// ---------------------------------------------------------------------------
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 200, headers: CORS_HEADERS });
+const BACKEND_URL =
+  process.env.BACKEND_URL ||
+  process.env.NEXT_PUBLIC_BACKEND_URL ||
+  "http://localhost:8000";
+
+function buildBackendUrl(pathSegments: string[], search: string): string {
+  const joined = pathSegments.join("/");
+  return search
+    ? `${BACKEND_URL}/api/${joined}?${search}`
+    : `${BACKEND_URL}/api/${joined}`;
 }
 
-// ---------------------------------------------------------------------------
-// Shared proxy handler
-// ---------------------------------------------------------------------------
-async function handler(req: NextRequest): Promise<NextResponse> {
-  // Reconstruct target URL: strip the /api/proxy prefix
-  const url = new URL(req.url);
-  const stripped = url.pathname.replace(/^\/api\/proxy/, '');
-  const target = `${BACKEND}${stripped}${url.search}`;
-
-  // Build forwarded headers — drop the ones Railway must not see
-  const forwardedHeaders: Record<string, string> = {};
+function forwardHeaders(req: NextRequest): Record<string, string> {
+  const headers: Record<string, string> = {};
   req.headers.forEach((value, key) => {
-    if (!STRIP_REQUEST_HEADERS.has(key.toLowerCase())) {
-      forwardedHeaders[key] = value;
-    }
+    if (key.toLowerCase() === "host") return; // strip host
+    headers[key] = value;
   });
+  return headers;
+}
 
+async function proxyRequest(
+  req: NextRequest,
+  context: RouteContext
+): Promise<NextResponse> {
   try {
-    const upstream = await fetch(target, {
-      method:  req.method,
-      headers: forwardedHeaders,
-      body:    ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
-      // @ts-expect-error — Node 18 fetch supports duplex for streaming bodies
-      duplex: 'half',
+    const { path } = await context.params;
+    const { search } = new URL(req.url);
+    const searchStr = search.startsWith("?") ? search.slice(1) : search;
+    const backendUrl = buildBackendUrl(path, searchStr);
+    const headers = forwardHeaders(req);
+
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    const body = hasBody ? await req.text() : undefined;
+
+    const backendRes = await fetch(backendUrl, {
+      method: req.method,
+      headers,
+      body,
     });
 
-    // Stream response body back, attach CORS headers so browser is happy
-    const responseHeaders = new Headers(CORS_HEADERS);
-    upstream.headers.forEach((value, key) => {
-      // Don't forward upstream CORS headers — ours override them
-      if (!key.toLowerCase().startsWith('access-control-')) {
-        responseHeaders.set(key, value);
-      }
-    });
+    const text = await backendRes.text();
+    const contentType = backendRes.headers.get("content-type") ?? "application/json";
 
-    return new NextResponse(upstream.body, {
-      status:  upstream.status,
-      headers: responseHeaders,
+    return new NextResponse(text, {
+      status: backendRes.status,
+      headers: { "content-type": contentType },
     });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { detail: `Backend unreachable: ${msg}` },
-      { status: 503, headers: CORS_HEADERS },
+      { detail: `Backend unreachable: ${message}` },
+      { status: 503 }
     );
   }
 }
 
-export const GET    = handler;
-export const POST   = handler;
-export const PUT    = handler;
-export const PATCH  = handler;
-export const DELETE = handler;
+export async function GET(req: NextRequest, context: RouteContext) {
+  return proxyRequest(req, context);
+}
+
+export async function POST(req: NextRequest, context: RouteContext) {
+  return proxyRequest(req, context);
+}
+
+export async function PUT(req: NextRequest, context: RouteContext) {
+  return proxyRequest(req, context);
+}
+
+export async function PATCH(req: NextRequest, context: RouteContext) {
+  return proxyRequest(req, context);
+}
+
+export async function DELETE(req: NextRequest, context: RouteContext) {
+  return proxyRequest(req, context);
+}
