@@ -6,11 +6,14 @@ Phase 5A changes:
   - AgentOut includes agent name field
   - SwarmEngine.run() signature fix reflected here
 """
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List
 from core.auth import get_current_user, TokenData
 from simulation.ensemble_runner import run_ensemble
+
+log = logging.getLogger("simulation")
 
 router = APIRouter(prefix="/api/simulation", tags=["simulation"])
 
@@ -66,12 +69,20 @@ async def run_simulation(
         raise HTTPException(status_code=422, detail="n_runs must be 1-5")
 
     flow_dicts = [e.model_dump() for e in body.flow_events]
-    result = await run_ensemble(
-        ticker      = body.ticker.upper(),
-        flow_events = flow_dicts,
-        n_agents    = body.n_agents,
-        n_runs      = body.n_runs,
-    )
+
+    # FIX: catch any exception from run_ensemble and return 500 instead of
+    # letting it propagate as an unhandled server error.
+    try:
+        result = await run_ensemble(
+            ticker      = body.ticker.upper(),
+            flow_events = flow_dicts,
+            n_agents    = body.n_agents,
+            n_runs      = body.n_runs,
+        )
+    except Exception as exc:
+        log.error("[simulation] run_ensemble failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Simulation engine error")
+
     return SimulationResponse(
         ticker     = result.ticker,
         direction  = result.direction,

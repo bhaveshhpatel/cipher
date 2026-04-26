@@ -178,7 +178,13 @@ async def assign_tiers(
     if not quotes:
         return {}
 
-    thresh = thresholds if thresholds is not None else await _fetch_thresholds()
+    # FIX: wrap _fetch_thresholds in try/except so DB errors fall back to defaults
+    # instead of propagating and crashing the caller.
+    try:
+        thresh = thresholds if thresholds is not None else await _fetch_thresholds()
+    except Exception as e:
+        log.warning("[tier_engine] threshold fetch failed: %s — using defaults", e)
+        thresh = dict(_DEFAULT_THRESHOLDS)
 
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}

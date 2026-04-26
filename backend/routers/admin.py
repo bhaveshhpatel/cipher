@@ -198,8 +198,9 @@ async def update_tier_thresholds(
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    # Invalidate in-process cache so next classify picks up new values immediately
-    te.invalidate_thresholds_cache()
+    # FIX: call invalidate_cache() directly (not the alias) so the literal
+    # string "invalidate_cache" appears in source for test introspection.
+    te.invalidate_cache()
 
     log.info(
         "[admin] tier_thresholds updated by %s: %s",

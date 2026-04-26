@@ -197,7 +197,7 @@ def _sync_load_tier_map() -> dict[str, int]:
     """
     Load symbol -> tier mapping from the current active snapshot.
     Queries options_universe_symbols for the active snapshot_id.
-    Symbols with NULL tier default to 3.
+    Symbols with NULL or missing tier column default to 3.
     Returns {} on error or missing snapshot.
     """
     try:
@@ -223,8 +223,11 @@ def _sync_load_tier_map() -> dict[str, int]:
             .eq("snapshot_id", snapshot_id)
             .execute()
         )
+        # FIX: use r.get("tier") instead of r["tier"] so rows missing the
+        # tier column (pre-migration 010 data) silently default to 3 rather
+        # than raising a KeyError and returning an empty map.
         tier_map = {
-            r["symbol"]: int(r["tier"] or 3)
+            r["symbol"]: int(r.get("tier") or 3)
             for r in (result.data or [])
             if r.get("symbol")
         }
