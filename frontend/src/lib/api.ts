@@ -112,8 +112,9 @@ export const api = {
       headers: { Authorization: `Bearer ${token}` },
     }),
 
+  // fixed: /api/signals/stream/stats (prefix=/api/signals, path=/stream/stats)
   getStats: (token: string) =>
-    req<{ stats: StreamStats }>("/api/stream/stats", {
+    req<{ stats: StreamStats }>("/api/signals/stream/stats", {
       headers: { Authorization: `Bearer ${token}` },
     }),
 

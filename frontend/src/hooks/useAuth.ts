@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+// All fetch calls use RELATIVE paths so they go through the Next.js proxy
+// (Vercel → /api/proxy/... → Railway). Never call Railway directly from the
+// browser — doing so causes cross-origin CORS 400s on OPTIONS preflights.
 
 interface AuthState {
   token:           string | null;
@@ -50,7 +52,7 @@ export function useAuth() {
    */
   const fetchMe = useCallback(async (token: string) => {
     try {
-      const res = await fetch(`${API}/api/auth/me`, {
+      const res = await fetch("/api/auth/me", {
         headers: { Authorization: `Bearer ${token}` },
       });
 
@@ -106,7 +108,7 @@ export function useAuth() {
   const login = useCallback(async (email: string, password: string) => {
     setState(s => ({ ...s, loading: true, error: null }));
     try {
-      const res = await fetch(`${API}/api/auth/token`, {
+      const res = await fetch("/api/auth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ username: email, password }),
@@ -118,7 +120,7 @@ export function useAuth() {
       const { access_token } = await res.json();
       localStorage.setItem("cipher_token", access_token);
 
-      const me = await fetch(`${API}/api/auth/me`, {
+      const me = await fetch("/api/auth/me", {
         headers: { Authorization: `Bearer ${access_token}` },
       });
       let resolvedEmail = email;
@@ -149,7 +151,7 @@ export function useAuth() {
   const register = useCallback(async (email: string, password: string) => {
     setState(s => ({ ...s, loading: true, error: null }));
     try {
-      const res = await fetch(`${API}/api/auth/register`, {
+      const res = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
