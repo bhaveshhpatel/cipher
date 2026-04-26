@@ -17,6 +17,7 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from datetime import date, timedelta
 from typing import Optional, List
@@ -49,7 +50,6 @@ def _nearest_friday(weeks: int = 1) -> date:
     """Return the date of the Friday that is `weeks` Fridays away from today.
     Always returns a future date (never today even if today is Friday)."""
     today = date.today()
-    # days until next Friday (weekday 4); if today is Friday, go to next week
     days_ahead = (4 - today.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
@@ -58,11 +58,17 @@ def _nearest_friday(weeks: int = 1) -> date:
 
 
 def _round_to_strike(price: float, contract_type: str) -> float:  # noqa: ARG001
-    """Round price to the nearest standard strike increment.
+    """Round price UP to the nearest standard strike increment (ceiling rounding).
 
-    price < 50     → 0.50 increment
-    50 <= price < 200 → 1.0 increment
-    price >= 200   → 5.0 increment
+    price < 50        → 0.50 increment
+    50 <= price < 200 → 1.0  increment
+    price >= 200      → 5.0  increment
+
+    Uses ceiling rounding (math.ceil) so that:
+      12.3 → 12.5  (ceil(12.3/0.5)*0.5 = ceil(24.6)*0.5 = 25*0.5)
+      10.7 → 11.0  (ceil(10.7/0.5)*0.5 = ceil(21.4)*0.5 = 22*0.5)
+      49.9 → 50.0  (ceil(49.9/0.5)*0.5 = ceil(99.8)*0.5 = 100*0.5)
+      25.0 → 25.0  (ceil(25.0/0.5)*0.5 = ceil(50.0)*0.5 = 50*0.5)
     """
     if price < 50:
         increment = 0.5
@@ -70,7 +76,7 @@ def _round_to_strike(price: float, contract_type: str) -> float:  # noqa: ARG001
         increment = 1.0
     else:
         increment = 5.0
-    return float(round(round(price / increment) * increment, 10))
+    return float(math.ceil(price / increment) * increment)
 
 
 def _build_occ_symbol(ticker: str, expiry: date, ctype: str, strike: float) -> str:
