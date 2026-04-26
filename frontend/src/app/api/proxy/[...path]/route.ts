@@ -1,87 +1,90 @@
 /**
- * Next.js App Router proxy – forwards /api/* requests to the Railway backend.
+ * Next.js catch-all API proxy → Railway backend
  *
- * Environment variables:
- *   BACKEND_URL  – Railway backend origin, e.g. https://cipher-production-6cd8.up.railway.app
- *                  Falls back to NEXT_PUBLIC_API_URL for local-dev compatibility.
+ * All requests to /api/* from the frontend are forwarded here.
+ * Running server-side on Vercel so there is NO cross-origin constraint
+ * between this proxy and Railway — we strip origin/host so Railway's
+ * CORS middleware never rejects the request.
  *
- * Behaviour:
- *   - Strips the `host` header before forwarding (prevents SNI mismatch on Railway).
- *   - Returns HTTP 503 + JSON { detail } when the backend is unreachable.
- *   - Forwards all other headers (Authorization, Content-Type, etc.) unchanged.
- *   - Preserves query-string from the original request.
- *   - Supports GET, POST, PUT, PATCH, DELETE via a single shared handler.
+ * CORS preflights (OPTIONS) are handled here directly and never
+ * forwarded to Railway.
  */
-
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from 'next/server';
 
 const BACKEND =
-  (
-    process.env.BACKEND_URL ||
-    process.env.NEXT_PUBLIC_API_URL ||
-    "http://localhost:8000"
-  ).replace(/\/+$/, ""); // strip trailing slash
+  process.env.BACKEND_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  'http://localhost:8000';
 
-type RouteContext = { params: Promise<{ path: string[] }> };
+// Headers we never forward to Railway
+const STRIP_REQUEST_HEADERS = new Set([
+  'host',
+  'origin',
+  'referer',
+  'x-forwarded-host',
+]);
 
-/** Build the upstream URL from the catch-all path segments + original query string. */
-function buildUpstreamUrl(req: NextRequest, pathSegments: string[]): string {
-  const joined = pathSegments.join("/");
-  const search = req.nextUrl.search ?? "";
-  return `${BACKEND}/api/${joined}${search}`;
+// CORS headers returned on every preflight + real response
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Authorization,Content-Type,X-Requested-With',
+  'Access-Control-Max-Age':       '86400',
+};
+
+// ---------------------------------------------------------------------------
+// OPTIONS — answer preflight here, never hit Railway
+// ---------------------------------------------------------------------------
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 200, headers: CORS_HEADERS });
 }
 
-/** Copy all request headers except `host` into a plain object for fetch(). */
-function forwardHeaders(req: NextRequest): Record<string, string> {
-  const out: Record<string, string> = {};
-  // NextRequest.headers is a real Headers instance in the Node runtime.
-  // Use Object.fromEntries for environments where .forEach may not be present.
-  Object.entries(Object.fromEntries(req.headers)).forEach(([key, value]) => {
-    if (key.toLowerCase() !== "host") {
-      out[key] = value;
+// ---------------------------------------------------------------------------
+// Shared proxy handler
+// ---------------------------------------------------------------------------
+async function handler(req: NextRequest): Promise<NextResponse> {
+  // Reconstruct target URL: strip the /api/proxy prefix
+  const url = new URL(req.url);
+  const stripped = url.pathname.replace(/^\/api\/proxy/, '');
+  const target = `${BACKEND}${stripped}${url.search}`;
+
+  // Build forwarded headers — drop the ones Railway must not see
+  const forwardedHeaders: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    if (!STRIP_REQUEST_HEADERS.has(key.toLowerCase())) {
+      forwardedHeaders[key] = value;
     }
   });
-  return out;
-}
 
-async function handler(
-  req: NextRequest,
-  ctx: RouteContext
-): Promise<NextResponse> {
-  const { path: pathSegments } = await ctx.params;
-  const upstreamUrl = buildUpstreamUrl(req, pathSegments);
-  const headers = forwardHeaders(req);
-
-  // Read body for methods that carry one
-  const body =
-    req.method === "GET" || req.method === "HEAD"
-      ? undefined
-      : await req.text();
-
-  let upstream: Response;
   try {
-    upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      headers,
-      body,
+    const upstream = await fetch(target, {
+      method:  req.method,
+      headers: forwardedHeaders,
+      body:    ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
+      // @ts-expect-error — Node 18 fetch supports duplex for streaming bodies
+      duplex: 'half',
     });
-  } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Unknown network error";
+
+    // Stream response body back, attach CORS headers so browser is happy
+    const responseHeaders = new Headers(CORS_HEADERS);
+    upstream.headers.forEach((value, key) => {
+      // Don't forward upstream CORS headers — ours override them
+      if (!key.toLowerCase().startsWith('access-control-')) {
+        responseHeaders.set(key, value);
+      }
+    });
+
+    return new NextResponse(upstream.body, {
+      status:  upstream.status,
+      headers: responseHeaders,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { detail: `Backend unreachable: ${message}` },
-      { status: 503 }
+      { detail: `Backend unreachable: ${msg}` },
+      { status: 503, headers: CORS_HEADERS },
     );
   }
-
-  const responseText = await upstream.text();
-  const contentType =
-    upstream.headers.get("content-type") ?? "application/json";
-
-  return new NextResponse(responseText, {
-    status: upstream.status,
-    headers: { "content-type": contentType },
-  });
 }
 
 export const GET    = handler;
