@@ -1,72 +1,63 @@
 /**
- * Next.js App Router — transparent reverse proxy to Railway backend.
+ * Next.js API route — proxy all /api/proxy/[...path] requests to the Railway backend.
  *
- * Production rewrite rules (next.config.mjs) send:
- *   /api/* → /api/proxy/:path* where [...path] = segments AFTER /api/
- *
- * Example:
- *   Browser:       GET /api/health/stream
- *   After rewrite: GET /api/proxy/health/stream
- *   [...path]:     ["health", "stream"]
- *   Upstream:      BACKEND_URL/api/health/stream  ✓
- *
- * The proxy PREPENDS /api/ to reconstruct the full upstream path.
- * OPTIONS preflights are handled locally so they never reach Railway.
+ * Why a proxy?
+ *   - The frontend is on Vercel (different domain from Railway).
+ *   - We can't expose BACKEND_URL to the browser (CORS, secrets).
+ *   - All fetch calls in src/lib/api.ts use relative /api/... paths.
+ *   - next.config.mjs rewrites /api/* → /api/proxy/* so every API call
+ *     lands here and gets forwarded to Railway.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 
-const BACKEND = (
-  process.env.BACKEND_URL ??
-  process.env.NEXT_PUBLIC_API_URL ??
-  "http://localhost:8000"
-).replace(/\/+$/, "");
+const BACKEND_URL = process.env.BACKEND_URL ?? "";
 
-// Headers that must not be forwarded to the upstream service.
-const STRIP_HEADERS = new Set([
-  "host",
-  "origin",
-  "referer",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-vercel-forwarded-for",
-  "x-vercel-id",
-]);
+/** Headers that must not be forwarded upstream. */
+const HOP_BY_HOP = new Set(["host", "connection", "transfer-encoding", "te", "trailer", "upgrade"]);
 
-type Context = { params: Promise<{ path: string[] }> };
+async function proxyRequest(req: NextRequest, params: { path: string[] }): Promise<NextResponse> {
+  const pathSegments = params.path ?? [];
+  const upstreamPath = "/api/" + pathSegments.join("/");
 
-async function handler(req: NextRequest, context: Context): Promise<NextResponse> {
-  const { path } = await context.params;
+  // Preserve query string from the original request.
+  const search = new URL(req.url).search;
+  const upstreamURL = `${BACKEND_URL}${upstreamPath}${search}`;
 
-  // Reconstruct the full upstream path by prepending /api/.
-  // The rewrite strips /api/ from the path before passing to [...path],
-  // so path=["health","stream"] must become /api/health/stream upstream.
-  const upstreamPath = "/api/" + path.join("/");
-  const search = req.nextUrl.search ?? "";
-  const upstreamURL = `${BACKEND}${upstreamPath}${search}`;
-
-  // Copy headers, stripping ones that would confuse Railway's CORS/routing.
+  // Forward request headers, stripping hop-by-hop headers.
   const forwardHeaders: Record<string, string> = {};
   req.headers.forEach((value, key) => {
-    if (!STRIP_HEADERS.has(key.toLowerCase())) {
+    if (!HOP_BY_HOP.has(key.toLowerCase())) {
       forwardHeaders[key] = value;
     }
   });
 
-  // Read body for methods that carry one.
-  let body: ArrayBuffer | null = null;
+  // For POST/PUT/PATCH forward the body as text.
+  let body: string | undefined;
   if (req.method !== "GET" && req.method !== "HEAD") {
-    body = await req.arrayBuffer();
+    body = await req.text();
   }
 
-  let upstream: Response;
   try {
-    upstream = await fetch(upstreamURL, {
+    const upstream = await fetch(upstreamURL, {
       method:  req.method,
       headers: forwardHeaders,
-      body:    body ?? undefined,
-      // @ts-expect-error — Node 18 fetch supports duplex
-      duplex:  body ? "half" : undefined,
+      body,
+    });
+
+    // Stream response body back to the browser.
+    const responseText = await upstream.text();
+    const responseHeaders = new Headers();
+    upstream.headers.forEach((value, key) => {
+      // Let Next.js manage these — don't copy them from upstream.
+      if (!HOP_BY_HOP.has(key.toLowerCase())) {
+        responseHeaders.set(key, value);
+      }
+    });
+
+    return new NextResponse(responseText, {
+      status:  upstream.status,
+      headers: responseHeaders,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -76,44 +67,24 @@ async function handler(req: NextRequest, context: Context): Promise<NextResponse
       { status: 503 },
     );
   }
-
-  // Stream response body back to the browser.
-  const responseBody = await upstream.arrayBuffer();
-  const responseHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    // Let Next.js manage these — don't copy them from upstream.
-    if (
-      key.toLowerCase() !== "content-encoding" &&
-      key.toLowerCase() !== "transfer-encoding"
-    ) {
-      responseHeaders.set(key, value);
-    }
-  });
-
-  return new NextResponse(responseBody, {
-    status:  upstream.status,
-    headers: responseHeaders,
-  });
 }
 
-// Handle CORS preflights locally — never forward OPTIONS to Railway.
-export async function OPTIONS(
-  _req: NextRequest,
-  _context: Context,
-): Promise<NextResponse> {
-  return new NextResponse(null, {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin":  "*",
-      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-      "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
-      "Access-Control-Max-Age":       "86400",
-    },
-  });
+export async function GET(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, await params);
 }
 
-export const GET    = handler;
-export const POST   = handler;
-export const PUT    = handler;
-export const PATCH  = handler;
-export const DELETE = handler;
+export async function POST(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, await params);
+}
+
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, await params);
+}
+
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, await params);
+}
+
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, await params);
+}
