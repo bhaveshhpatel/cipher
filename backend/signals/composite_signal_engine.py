@@ -1,27 +1,16 @@
 """
-Combines flow score + backtest score + volume-weighted premium factor
-into a final composite signal, then auto-triggers the AI swarm.
+composite_signal_engine.py — Phase 3 + 5A
 
-Phase 3 weight breakdown:
-  flow_score              × 0.55
-  backtest_score          × 0.35
-  volume_premium_factor   × 0.10
+vwpf formula: min(1.0, premium / (oi * 100))
+  - oi * 100 = notional contract count (no strike, scale-invariant)
+  - e.g. premium=500k, oi=1000 -> 5.0 -> clamped to 1.0
+  - e.g. premium=1k,   oi=100k -> 0.0001 < 0.5
 
-Phase 5A additions:
-  - build_composite_async() is the primary entry point (awaitable)
-  - build_composite() kept as sync wrapper returning signal WITHOUT swarm
-
-Patch path:
+Patch compatibility:
   Both test files are satisfied:
-    - patch('signals.composite_signal_engine.run_ensemble', ...)  → hits module attr
-    - patch('simulation.ensemble_runner.run_ensemble', ...)       → hits same ref
-      because run_ensemble is imported at module level from ensemble_runner,
-      AND build_composite_async re-reads it from this module's globals().
-
-vwpf formula:
-  ratio = latest.premium / (latest_oi * 100)
-  capped at 1.0. Denominator is contracts × 100 (no strike), keeping the
-  ratio scale-invariant and comparable across strikes.
+    patch('signals.composite_signal_engine.run_ensemble')  -> hits module attr
+    patch('simulation.ensemble_runner.run_ensemble')       -> build_composite_async
+      re-imports simulation.ensemble_runner live, so the patched ref is used.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -30,7 +19,7 @@ from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumula
 from signals.backtest_validator import get_backtest_score
 
 try:
-    from simulation.ensemble_runner import run_ensemble  # noqa: F401  (module-level attr for patching)
+    from simulation.ensemble_runner import run_ensemble  # module-level attr for patching
 except Exception:
     run_ensemble = None  # type: ignore[assignment]
 
@@ -53,18 +42,7 @@ class CompositeSignal:
 
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
-    """
-    Ratio of latest event's premium to its notional contract value.
-
-    Formula: min(1.0, premium / (oi * 100))
-
-    Rules:
-      - No events   -> 0.5 (neutral fallback)
-      - OI == 0     -> 0.5 (no OI data)
-      - Otherwise   -> min(1.0, premium / (oi * 100))
-
-    Omits strike so the ratio is comparable across different strikes.
-    """
+    """min(1.0, premium / (oi * 100)). Returns 0.5 when OI is zero."""
     if not ep.events:
         return 0.5
     latest    = ep.events[-1]
@@ -72,8 +50,7 @@ def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     if latest_oi <= 0:
         return 0.5
     premium = getattr(latest, "premium", 0) or 0
-    ratio = premium / (latest_oi * 100)
-    return round(min(1.0, ratio), 4)
+    return round(min(1.0, premium / (latest_oi * 100)), 4)
 
 
 def compute_flow_score(ep: RepetitionEpisode) -> float:
@@ -87,7 +64,6 @@ def build_composite(
     ep:          RepetitionEpisode,
     accumulator: RepetitionAccumulator,
 ) -> CompositeSignal:
-    """Sync build — returns CompositeSignal WITHOUT swarm verdict."""
     latest = ep.events[-1]
     flow_s = compute_flow_score(ep)
     bt_s   = get_backtest_score(
@@ -111,7 +87,7 @@ def build_composite(
         f"Flow score {flow_s:.0%}, backtest win-rate {bt_s:.0%}, "
         f"volume-premium factor {vwp_f:.0%}. "
         f"{'Accelerating flow detected. ' if ep.is_accelerating else ''}"
-        f"Composite: {comp:.0%} → {rec}."
+        f"Composite: {comp:.0%} -> {rec}."
     )
 
     return CompositeSignal(
@@ -131,12 +107,19 @@ async def build_composite_async(
     n_agents:    int | None = None,
 ) -> CompositeSignal:
     """
-    Phase 5A primary entry point.
-    Reads run_ensemble from this module's globals() so that patches on
-    'signals.composite_signal_engine.run_ensemble' are always respected.
+    Checks module-level run_ensemble first (satisfies patches on
+    'signals.composite_signal_engine.run_ensemble'), then falls back to
+    importing simulation.ensemble_runner live (satisfies patches on
+    'simulation.ensemble_runner.run_ensemble').
     """
     import signals.composite_signal_engine as _self
+    import simulation.ensemble_runner as _er
+
+    # Module-level attr takes priority (patched by _extended tests)
     _run = _self.__dict__.get("run_ensemble")
+    # If not patched at module level, use live import (patched by _engine tests)
+    if _run is None or _run is getattr(_er, "run_ensemble", None):
+        _run = getattr(_er, "run_ensemble", None)
 
     sig = build_composite(ep, accumulator)
 

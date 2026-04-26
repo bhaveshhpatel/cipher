@@ -131,7 +131,8 @@ def test_vwpf_zero_open_interest_returns_half():
 
 
 def test_vwpf_low_premium_vs_oi():
-    ep = _fake_episode(n_events=1, premium_each=1_000.0, open_interest=10)
+    # premium=1000, oi=100_000 -> 1000/(100_000*100)=0.0001 < 0.5
+    ep = _fake_episode(n_events=1, premium_each=1_000.0, open_interest=100_000)
     factor = volume_weighted_premium_factor(ep)
     assert factor < 0.5
 
