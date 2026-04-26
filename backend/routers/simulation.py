@@ -2,14 +2,15 @@
 simulation.py — POST /api/simulation/run
 
 Phase 5A changes:
-  - n_agents now supports 1-12 (expanded from 1-6)
+  - n_agents is Literal[3, 6, 9, 12] so Pydantic rejects invalid values
+    with 422 before auth dependency runs.
   - AgentOut includes agent name field
   - SwarmEngine.run() signature fix reflected here
 """
 import logging
+from typing import List, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List
 from core.auth import get_current_user, TokenData
 from simulation.ensemble_runner import run_ensemble
 
@@ -35,7 +36,7 @@ class FlowEventIn(BaseModel):
 class SimulationRequest(BaseModel):
     ticker:      str
     flow_events: List[FlowEventIn] = []
-    n_agents:    int = 6   # valid: 1-12; snapped to nearest of 3, 6, 9, 12
+    n_agents:    Literal[3, 6, 9, 12] = 6  # Pydantic rejects any other int → 422
     n_runs:      int = 1
 
 
@@ -63,15 +64,11 @@ async def run_simulation(
     body: SimulationRequest,
     _: TokenData = Depends(get_current_user),
 ):
-    if body.n_agents < 1 or body.n_agents > 12:
-        raise HTTPException(status_code=422, detail="n_agents must be between 1 and 12")
     if body.n_runs < 1 or body.n_runs > 5:
         raise HTTPException(status_code=422, detail="n_runs must be 1-5")
 
     flow_dicts = [e.model_dump() for e in body.flow_events]
 
-    # FIX: catch any exception from run_ensemble and return 500 instead of
-    # letting it propagate as an unhandled server error.
     try:
         result = await run_ensemble(
             ticker      = body.ticker.upper(),

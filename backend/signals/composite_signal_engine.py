@@ -55,21 +55,17 @@ def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
 
     Rules:
       - No events at all       -> 0.5 (neutral fallback)
-      - OI == 0, premium == 0  -> 0.5 (neutral, no data)
-      - OI == 0, premium > 0   -> min(1.0, premium / 1_000_000) so $5k → 0.005
-      - OI > 0                 -> min(1.0, premium / (OI * 100))
+      - OI == 0                -> 0.5 (no OI data, neutral)
+      - OI > 0                 -> min(1.0, premium / (OI * strike * 100))
     """
     if not ep.events:
         return 0.5
-    latest_oi = ep.events[-1].open_interest if ep.events else 0
-    if latest_oi is None:
-        latest_oi = 0
+    latest = ep.events[-1]
+    latest_oi = latest.open_interest if latest.open_interest else 0
     if latest_oi <= 0:
-        total = ep.total_premium
-        if not total:
-            return 0.5
-        return round(min(1.0, total / 1_000_000), 3)
-    notional_oi = latest_oi * 100
+        return 0.5
+    strike = float(getattr(latest, 'strike', 0) or 0) or 1.0
+    notional_oi = latest_oi * strike * 100
     ratio = ep.total_premium / max(notional_oi, 1)
     return round(min(1.0, ratio), 3)
 
@@ -134,14 +130,16 @@ async def build_composite_async(
     Phase 5A primary entry point.
     Builds composite signal then auto-runs the AI swarm.
     n_agents: overrides SWARM_N_AGENTS env var if provided.
+
+    NOTE: always does a fresh import of run_ensemble so that test patches on
+    simulation.ensemble_runner.run_ensemble are respected.
     """
-    _run = run_ensemble
-    if _run is None:
-        try:
-            from simulation.ensemble_runner import run_ensemble as _run_dyn
-            _run = _run_dyn
-        except Exception:
-            _run = None
+    _run = None
+    try:
+        from simulation.ensemble_runner import run_ensemble as _run_dyn
+        _run = _run_dyn
+    except Exception:
+        _run = None
 
     sig = build_composite(ep, accumulator)
 
@@ -150,13 +148,13 @@ async def build_composite_async(
 
     flow_events = [
         {
-            "ticker":         ev.ticker if hasattr(ev, "ticker") else ep.ticker,
-            "contract_type":  ep.contract_type,
-            "strike":         getattr(ev, "strike", 0),
-            "expiry":         getattr(ev, "expiry", ""),
-            "premium":        getattr(ev, "premium", 0),
-            "sentiment":      getattr(ev, "sentiment", "NEUTRAL"),
-            "influence_tier": getattr(ev, "influence_tier", "RETAIL"),
+            "ticker":          ev.ticker if hasattr(ev, "ticker") else ep.ticker,
+            "contract_type":   ep.contract_type,
+            "strike":          getattr(ev, "strike", 0),
+            "expiry":          getattr(ev, "expiry", ""),
+            "premium":         getattr(ev, "premium", 0),
+            "sentiment":       getattr(ev, "sentiment", "NEUTRAL"),
+            "influence_tier":  getattr(ev, "influence_tier", "RETAIL"),
             "is_golden_sweep": getattr(ev, "is_golden_sweep", False),
         }
         for ev in ep.events
@@ -168,8 +166,6 @@ async def build_composite_async(
 
     try:
         result = await _run(**kwargs)
-        # result is an EnsembleResult with .direction/.confidence/.bull_votes etc.
-        # Support both attribute access and dict access for test mock flexibility.
         if hasattr(result, "direction"):
             sig.swarm_direction  = result.direction
             sig.swarm_confidence = result.confidence
@@ -185,7 +181,6 @@ async def build_composite_async(
             sig.swarm_hold_votes = result.get("hold_votes")
             sig.swarm_agents     = result.get("agents", [])
     except Exception:
-        # Swarm failure is non-fatal — composite score still valid
         pass
 
     return sig
