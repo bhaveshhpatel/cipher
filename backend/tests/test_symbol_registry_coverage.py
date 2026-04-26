@@ -1,19 +1,14 @@
 """
 Coverage boost for services/symbol_registry.py.
 
-Covers:
-  - SymbolRegistry construction and property methods
-  - lookup(), all_symbols(), size(), stock_price(), is_ready()
-  - set_tier_map(), get_oi_map()
-  - init_registry() / get_registry() module singletons
-  - build() full path with mocked tradier calls
-  - _build_ticker() happy path and skip cases
-  - refresh_loop() one iteration with mocked sleep
-  - _build_tier_params() parameter derivation
+get_config and _fetch_thresholds are imported inside build() / refresh_loop()
+using local imports, so patches must target those source modules directly:
+  - services.ingestion_config.get_config
+  - services.tier_engine._fetch_thresholds
 """
 import asyncio
 from datetime import date, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -55,12 +50,10 @@ def _reg(watchlist=None, tier_map=None):
 
 
 def test_registry_is_not_ready_when_empty():
-    r = _reg()
-    assert r.is_ready() is False
+    assert _reg().is_ready() is False
 
 def test_registry_lookup_missing_returns_none():
-    r = _reg()
-    assert r.lookup("AAPL231215C00180000") is None
+    assert _reg().lookup("AAPL231215C00180000") is None
 
 def test_registry_all_symbols_empty():
     assert _reg().all_symbols() == []
@@ -88,7 +81,7 @@ def test_init_and_get_registry():
     assert r._tier_map["AAPL"] == 1
 
 
-# --- build() full path ---
+# --- Shared patch helpers ---
 
 _FAKE_THRESH = {
     "t1_atm_pct": 0.20, "t1_max_dte": 90, "t1_min_oi": 0,
@@ -110,22 +103,46 @@ _FAKE_CHAIN = [
     {"symbol": "AAPL231215P00175000", "strike": 175.0,
      "option_type": "P", "open_interest": 500},
     {"symbol": "AAPL231215C00999000", "strike": 999.0,
-     "option_type": "C", "open_interest": 100},  # out of ATM range
+     "option_type": "C", "open_interest": 100},
 ]
 
+
+def _patches(chain=_FAKE_CHAIN, expirations=None, expirations_side_effect=None,
+             chain_side_effect=None):
+    """Return a list of patch() context managers for build() dependencies."""
+    expiry_mock = AsyncMock(return_value=expirations if expirations is not None else [_NEAR_EXPIRY])
+    if expirations_side_effect:
+        expiry_mock.side_effect = expirations_side_effect
+
+    chain_mock = AsyncMock(return_value=chain)
+    if chain_side_effect:
+        chain_mock.side_effect = chain_side_effect
+
+    return [
+        patch("services.ingestion_config.get_config",  new=AsyncMock(return_value=_FAKE_CONFIG)),
+        patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)),
+        patch("services.symbol_registry.get_quotes_batch", new=AsyncMock(return_value={"AAPL": {"last": 185.0}})),
+        patch("services.symbol_registry.get_expirations",  new=expiry_mock),
+        patch("services.symbol_registry.get_option_chain", new=chain_mock),
+    ]
+
+
+# --- build() tests ---
 
 def test_registry_build_populates_contracts():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",     new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})), \
-             patch("services.symbol_registry.get_expirations",   new=AsyncMock(return_value=[_NEAR_EXPIRY])), \
-             patch("services.symbol_registry.get_option_chain",  new=AsyncMock(return_value=_FAKE_CHAIN)):
+        with _patches()[0], _patches()[1], _patches()[2], _patches()[3], _patches()[4]:
             return await r.build()
 
-    count = asyncio.get_event_loop().run_until_complete(_run())
+    # Use stacked context managers the correct way
+    async def _run2():
+        p = _patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            return await r.build()
+
+    count = asyncio.get_event_loop().run_until_complete(_run2())
     assert count >= 1
     assert r.is_ready()
     assert r.size() == count
@@ -136,23 +153,20 @@ def test_registry_build_skips_ticker_with_no_price():
     r = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",      new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})):
+        p = _patches()
+        with p[0], p[1], p[2]:
             return await r.build()
 
     asyncio.get_event_loop().run_until_complete(_run())
-    assert "TSLA" not in r._stock_prices or r._stock_prices.get("TSLA", 0) == 0
+    assert r._stock_prices.get("TSLA", 0) == 0
 
 
 def test_registry_build_ticker_expiry_fetch_error():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",      new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})), \
-             patch("services.symbol_registry.get_expirations",   new=AsyncMock(side_effect=RuntimeError("api down"))):
+        p = _patches(expirations_side_effect=RuntimeError("api down"))
+        with p[0], p[1], p[2], p[3]:
             return await r.build()
 
     count = asyncio.get_event_loop().run_until_complete(_run())
@@ -163,11 +177,8 @@ def test_registry_build_chain_fetch_error_continues():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",      new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})), \
-             patch("services.symbol_registry.get_expirations",   new=AsyncMock(return_value=[_NEAR_EXPIRY])), \
-             patch("services.symbol_registry.get_option_chain",  new=AsyncMock(side_effect=RuntimeError("chain down"))):
+        p = _patches(chain_side_effect=RuntimeError("chain down"))
+        with p[0], p[1], p[2], p[3], p[4]:
             return await r.build()
 
     count = asyncio.get_event_loop().run_until_complete(_run())
@@ -178,11 +189,8 @@ def test_registry_lookup_after_build():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",      new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})), \
-             patch("services.symbol_registry.get_expirations",   new=AsyncMock(return_value=[_NEAR_EXPIRY])), \
-             patch("services.symbol_registry.get_option_chain",  new=AsyncMock(return_value=_FAKE_CHAIN)):
+        p = _patches()
+        with p[0], p[1], p[2], p[3], p[4]:
             await r.build()
 
     asyncio.get_event_loop().run_until_complete(_run())
@@ -201,15 +209,12 @@ def test_refresh_loop_runs_one_iter_and_cancels():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={})
 
     async def _run():
-        with patch("services.symbol_registry.get_config",      new=AsyncMock(return_value=_FAKE_CONFIG)), \
-             patch("services.symbol_registry._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)), \
-             patch("services.symbol_registry.get_quotes_batch",  new=AsyncMock(return_value={"AAPL": {"last": 185.0}})), \
-             patch("services.symbol_registry.get_expirations",   new=AsyncMock(return_value=[_NEAR_EXPIRY])), \
-             patch("services.symbol_registry.get_option_chain",  new=AsyncMock(return_value=_FAKE_CHAIN)), \
-             patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
-            try:
-                await r.refresh_loop()
-            except asyncio.CancelledError:
-                pass
+        p = _patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            with patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+                try:
+                    await r.refresh_loop()
+                except asyncio.CancelledError:
+                    pass
 
     asyncio.get_event_loop().run_until_complete(_run())

@@ -1,11 +1,5 @@
 """
-Coverage boost for simulation/swarm_engine.py:
-  - _resolve_n_agents snapping
-  - _build_flow_summary (list form, string passthrough, empty, >20 events, golden sweep)
-  - SwarmEngine.__init__ (no key branch)
-  - SwarmEngine.run() with no-client path (all agents return HOLD fallback)
-  - SwarmEngine.run() with mocked AsyncOpenAI client — BUY/SELL/HOLD parse paths
-  - _run_agent LLM response parsing (verdict lines, confidence, fallback on exception)
+Coverage boost for simulation/swarm_engine.py.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +12,6 @@ from simulation.swarm_engine import (
     _resolve_n_agents,
     _run_agent,
     AGENT_ROLES,
-    AgentVerdict,
 )
 
 
@@ -78,7 +71,7 @@ def test_flow_summary_caps_at_20_events():
         for _ in range(25)
     ]
     s = _build_flow_summary(events)
-    lines = [l for l in s.splitlines() if l.strip()]
+    lines = [ln for ln in s.splitlines() if ln.strip()]
     assert len(lines) == 20
 
 
@@ -218,8 +211,6 @@ def test_run_agent_clamps_confidence():
 
 def test_swarm_engine_run_with_mocked_client():
     """Exercises the asyncio.gather(_run_agent...) path with a real client mock."""
-    buy_response = _make_response("VERDICT: BUY\nREASONING: whale flow\nCONFIDENCE: 0.8")
-
     async def _run():
         with patch("simulation.swarm_engine.settings") as mock_settings:
             mock_settings.GROQ_API_KEY = "fake-key"

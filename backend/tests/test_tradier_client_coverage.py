@@ -1,20 +1,10 @@
 """
 Coverage boost for utils/tradier_client.py.
-
-Covers:
-  - get_quote: 200 success (list form, dict form), non-200, exception
-  - get_quotes_batch: empty input, 200 success, non-200, exception, single-dict response
-  - get_expirations: 200 list, 200 single string, non-200, exception
-  - get_option_chain: 200 list, 200 single dict, non-200, exception
-  - get_options_chain alias
-  - get_session_token: success, 429 then success, 429 exhausted, 401, timeout, missing sessionid
-  - get_token alias
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import pytest
 
 from utils.tradier_client import (
     get_quote,
@@ -28,7 +18,6 @@ from utils.tradier_client import (
 
 
 def _async_client_mock(resp):
-    """Return a context manager mock that yields a client whose .get / .post returns resp."""
     mock_client = MagicMock()
     mock_client.get  = AsyncMock(return_value=resp)
     mock_client.post = AsyncMock(return_value=resp)
@@ -188,11 +177,11 @@ def test_get_session_token_401_returns_none():
     assert result is None
 
 def test_get_session_token_429_then_success():
-    """First call returns 429 with Retry-After:0, second returns 200."""
     r_429 = _resp(429, headers={"Retry-After": "0"})
     r_200 = _resp(200, {"stream": {"sessionid": "tok-xyz"}})
 
     call_count = 0
+
     async def _post(*args, **kwargs):
         nonlocal call_count
         call_count += 1
@@ -237,9 +226,7 @@ def test_get_session_token_timeout_retries_then_none():
 
 def test_get_session_token_connect_error_retries_then_none():
     mock_client = MagicMock()
-    mock_client.post = AsyncMock(
-        side_effect=httpx.ConnectError("refused")
-    )
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=mock_client)
     ctx.__aexit__  = AsyncMock(return_value=False)
