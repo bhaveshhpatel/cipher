@@ -45,15 +45,18 @@ async function proxyRequest(req: NextRequest, params: { path: string[] }): Promi
       body,
     });
 
-    // Stream response body back to the browser.
+    // Read response body as text.
     const responseText = await upstream.text();
+
+    // Copy response headers — guard against plain-object mocks that lack forEach.
     const responseHeaders = new Headers();
-    upstream.headers.forEach((value, key) => {
-      // Let Next.js manage these — don't copy them from upstream.
-      if (!HOP_BY_HOP.has(key.toLowerCase())) {
-        responseHeaders.set(key, value);
-      }
-    });
+    if (typeof upstream.headers.forEach === "function") {
+      upstream.headers.forEach((value: string, key: string) => {
+        if (!HOP_BY_HOP.has(key.toLowerCase())) {
+          responseHeaders.set(key, value);
+        }
+      });
+    }
 
     return new NextResponse(responseText, {
       status:  upstream.status,
