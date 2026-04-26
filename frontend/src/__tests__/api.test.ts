@@ -35,7 +35,7 @@
  *   - Sends Authorization header
  *
  *   api.getStats:
- *   - Calls /api/stream/stats
+ *   - Calls /api/signals/stream/stats
  *   - Sends Authorization header
  *
  *   api.getSignalHistory:
@@ -247,12 +247,12 @@ test('api.getComposite sends Authorization header', async () => {
 
 // ── api.getStats ──────────────────────────────────────────────────────────────
 
-test('api.getStats calls /api/stream/stats', async () => {
+test('api.getStats calls /api/signals/stream/stats', async () => {
   mockFetch.mockReturnValue(_ok({ stats: { active_symbols: 5, ticks: 100,
     classified: 90, signals: 10, errors: 0 } }));
   await api.getStats(TOKEN);
   const [url] = mockFetch.mock.calls[0] as [string];
-  expect(url).toBe('/api/stream/stats');
+  expect(url).toBe('/api/signals/stream/stats');
 });
 
 test('api.getStats sends Authorization header', async () => {
@@ -323,7 +323,6 @@ test('api.getSignalHistory with no params does not include undefined params', as
   mockFetch.mockReturnValue(_historyOk());
   await api.getSignalHistory(TOKEN, {});
   const [url] = mockFetch.mock.calls[0] as [string];
-  // Should not include empty/undefined params
   expect(url).not.toContain('ticker=');
   expect(url).not.toContain('direction=');
   expect(url).not.toContain('tier=');

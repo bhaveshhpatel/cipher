@@ -10,7 +10,7 @@
  *   - api.register sends JSON body with email+password
  *   - api.getFlow builds correct query string (ticker, limit, offset)
  *   - api.getFlow omits ticker when empty string
- *   - api.getStats sends Authorization header
+ *   - api.getStats sends Authorization header to /api/signals/stream/stats
  *   - api.getComposite constructs correct URL path
  *   - api.runSimulation sends correct JSON body
  *   - api.getSignalHistory builds correct query string with all params
@@ -120,11 +120,11 @@ describe("api.ts", () => {
 
   // ── api.getStats ──────────────────────────────────────────────────────────
 
-  it("api.getStats sends Authorization header to /api/stream/stats", async () => {
+  it("api.getStats sends Authorization header to /api/signals/stream/stats", async () => {
     mockFetch(200, { stats: null });
     await api.getStats(TOKEN);
     const call = (global.fetch as jest.Mock).mock.calls[0];
-    expect(call[0]).toContain("/api/stream/stats");
+    expect(call[0]).toContain("/api/signals/stream/stats");
     expect(call[1].headers["Authorization"]).toBe(`Bearer ${TOKEN}`);
   });
 
@@ -171,7 +171,6 @@ describe("api.ts", () => {
     mockFetch(200, { signals: [], total: 0, limit: 50, offset: 0 });
     await api.getSignalHistory(TOKEN, {});
     const url = (global.fetch as jest.Mock).mock.calls[0][0] as string;
-    // With no params, query string should be empty
     expect(url).not.toContain("ticker=");
     expect(url).not.toContain("direction=");
     expect(url).not.toContain("tier=");
