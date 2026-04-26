@@ -12,6 +12,10 @@ on:
       - "backend/**"
       - "railway.toml"
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   # -------------------------------------------------------------------------
   # Job 1: Syntax check — pyflakes only, NO pip install of heavy deps
