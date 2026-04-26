@@ -50,9 +50,8 @@ Covers:
   32. Swarm failure is non-fatal — signal still returned
 """
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
@@ -117,7 +116,6 @@ def _fake_episode(
     base_ts = datetime(2026, 4, 25, 10, 0, 0)
     for i in range(n_events):
         if accelerating and i >= n_events - 3:
-            # Last 3 events within 60s
             ts = base_ts + timedelta(seconds=3600 + i * 15)
         else:
             ts = base_ts + timedelta(minutes=i * 5)
@@ -149,7 +147,6 @@ def _accum() -> RepetitionAccumulator:
 def test_flow_score_zero_premium():
     ep = _fake_episode(n_events=1, premium_each=0.0, accelerating=False)
     score = compute_flow_score(ep)
-    # 0 premium * 0.65 + 0 accel + 1/20*0.20 = 0.01
     assert score >= 0.0
     assert score <= 0.05
 
@@ -158,7 +155,6 @@ def test_flow_score_zero_premium():
 def test_flow_score_clamps_premium_at_10M():
     ep = _fake_episode(n_events=1, premium_each=10_000_000.0, accelerating=False)
     score = compute_flow_score(ep)
-    # max prem component = 1.0 * 0.65 = 0.65; accel=0; trades=0.05 => 0.70
     assert score <= 1.0
     assert score >= 0.65
 
@@ -195,7 +191,6 @@ def test_vwpf_zero_open_interest_returns_half():
 
 # 7
 def test_vwpf_low_premium_vs_oi():
-    # 10 contracts OI = notional $100k; premium $1k => ratio = 0.01
     ep = _fake_episode(n_events=1, premium_each=1_000.0, open_interest=10)
     factor = volume_weighted_premium_factor(ep)
     assert factor < 0.5
@@ -203,7 +198,6 @@ def test_vwpf_low_premium_vs_oi():
 
 # 8
 def test_vwpf_clamps_to_1():
-    # Massive premium relative to tiny OI
     ep = _fake_episode(n_events=1, premium_each=50_000_000.0, open_interest=1)
     assert volume_weighted_premium_factor(ep) == 1.0
 
@@ -214,14 +208,11 @@ def test_vwpf_clamps_to_1():
 
 # 9
 def test_build_composite_buy_on_high_score_bullish():
-    # Force composite >= 0.65 by providing huge premium + WHALE + accelerating
     ep   = _fake_episode(n_events=10, premium_each=2_000_000.0,
                          sentiment="BULLISH", influence_tier="WHALE",
                          accelerating=True)
     acc  = _accum()
     sig  = build_composite(ep, acc)
-    # composite should be high enough with WHALE backtest + strong flow
-    # Accept BUY or HOLD depending on exact backtest seed
     assert sig.recommendation in ("BUY", "HOLD")
     if sig.composite_score >= 0.65:
         assert sig.recommendation == "BUY"
@@ -240,7 +231,6 @@ def test_build_composite_sell_on_high_score_bearish():
 
 # 11
 def test_build_composite_hold_on_low_score():
-    # Tiny premium, RETAIL tier => low composite
     ep  = _fake_episode(n_events=3, premium_each=10_000.0,
                         sentiment="BULLISH", influence_tier="RETAIL",
                         accelerating=False)
@@ -331,7 +321,6 @@ def test_backtest_score_deterministic():
 
 # 21
 def test_backtest_score_whale_above_retail():
-    # Over many tickers, WHALE base (0.72) should beat RETAIL base (0.44)
     tickers = ["AAPL", "TSLA", "NVDA", "SPY", "QQQ",
                "MSFT", "AMZN", "META", "GOOGL", "AMD"]
     whale_scores  = [get_backtest_score(t, "CALL", 14, "WHALE")  for t in tickers]
@@ -355,7 +344,6 @@ def test_dte_bucket_values():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ev(ticker="AAPL", premium=100_000.0, ts_offset_secs=0):
-    """Create a minimal real-ish OptionsFlowEvent mock for the accumulator."""
     ev = MagicMock()
     ev.ticker        = ticker
     ev.contract_type = "CALL"
@@ -419,7 +407,6 @@ def test_is_accelerating_true_within_60s():
 # 30
 def test_is_accelerating_false_span_over_60s():
     ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=False)
-    # Events spaced 5 minutes apart — span = 20 min > 60s
     assert ep.is_accelerating is False
 
 
@@ -445,28 +432,19 @@ def test_build_composite_async_populates_swarm_fields():
     acc = _accum()
 
     async def _test():
-        with patch(
-            "signals.composite_signal_engine.build_composite_async.__wrapped__"
-            if hasattr(build_composite_async, "__wrapped__") else
-            "simulation.ensemble_runner.run_ensemble",
-            new_callable=AsyncMock,
-            return_value=_swarm_result(),
+        import signals.composite_signal_engine as cse
+        with patch.object(
+            cse, "build_composite_async",
+            wraps=build_composite_async,
         ):
-            # Patch run_ensemble inside the engine module's namespace
-            import signals.composite_signal_engine as cse
-            with patch.object(
-                cse, "build_composite_async",
-                wraps=build_composite_async,
-            ):
-                with patch("simulation.ensemble_runner.run_ensemble",
-                           new_callable=AsyncMock,
-                           return_value=_swarm_result()) as mock_swarm:
-                    sig = await build_composite_async(ep, acc)
+            with patch("simulation.ensemble_runner.run_ensemble",
+                       new_callable=AsyncMock,
+                       return_value=_swarm_result()):
+                sig = await build_composite_async(ep, acc)
         return sig
 
     sig = asyncio.get_event_loop().run_until_complete(_test())
     assert isinstance(sig, CompositeSignal)
-    # Swarm fields populated
     assert sig.swarm_direction  == "BUY"
     assert sig.swarm_confidence == pytest.approx(0.82)
     assert sig.swarm_bull_votes == 6
@@ -489,6 +467,5 @@ def test_build_composite_async_swarm_failure_is_nonfatal():
 
     sig = asyncio.get_event_loop().run_until_complete(_test())
     assert isinstance(sig, CompositeSignal)
-    # Swarm fields remain None — composite score still valid
     assert sig.swarm_direction is None
     assert 0.0 <= sig.composite_score <= 1.0

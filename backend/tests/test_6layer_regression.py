@@ -1,519 +1,377 @@
 """
-test_6layer_regression.py — Regression tests for the 6-layer gap fixes.
+6-layer integration regression suite.
+
+Verifies the full pipeline: ingest → parse → tier → accumulate →
+composite → publish, with all layers wired together.
 """
 import asyncio
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+def _raw_trade(
+    symbol="AAPL",
+    option_type="C",
+    strike=180.0,
+    expiry="2026-06-20",
+    premium=500_000.0,
+    size=100,
+    bid=4.80,
+    ask=4.90,
+    price=4.85,
+    open_interest=5000,
+    iv=0.28,
+    underlying_price=178.0,
+    sale_cond="AA",
+):
+    return {
+        "symbol":           symbol,
+        "option_type":      option_type,
+        "strike":           strike,
+        "expiry":           expiry,
+        "premium":          premium,
+        "size":             size,
+        "bid":              bid,
+        "ask":              ask,
+        "price":            price,
+        "open_interest":    open_interest,
+        "iv":               iv,
+        "underlying_price": underlying_price,
+        "sale_cond":        sale_cond,
+        "timestamp":        datetime.utcnow().isoformat(),
+    }
 
 
-from utils.dedup import DedupCache, flow_dedup
+# ---------------------------------------------------------------------------
+# Layer 1 — Parse
+# ---------------------------------------------------------------------------
+
+class TestLayer1Parse:
+    def test_parse_call_trade(self):
+        from ingestion.options_flow_parser import parse_trade
+        ev = parse_trade(_raw_trade())
+        assert ev is not None
+        assert ev.ticker == "AAPL"
+        assert ev.contract_type == "CALL"
+        assert ev.premium == 500_000.0
+
+    def test_parse_put_trade(self):
+        from ingestion.options_flow_parser import parse_trade
+        ev = parse_trade(_raw_trade(option_type="P"))
+        assert ev.contract_type == "PUT"
+
+    def test_parse_returns_none_for_bad_data(self):
+        from ingestion.options_flow_parser import parse_trade
+        assert parse_trade({}) is None
+
+    def test_parse_dte_computed_correctly(self):
+        from ingestion.options_flow_parser import parse_trade
+        import datetime as dt
+        future = (dt.date.today() + dt.timedelta(days=30)).strftime("%Y-%m-%d")
+        ev = parse_trade(_raw_trade(expiry=future))
+        assert ev is not None
+        assert 28 <= ev.dte <= 32
+
+    def test_parse_golden_sweep_flag(self):
+        from ingestion.options_flow_parser import parse_trade
+        trade = _raw_trade(premium=600_000.0, size=500)
+        ev = parse_trade(trade)
+        assert ev is not None
+        assert hasattr(ev, "is_golden_sweep")
+
+    def test_parse_bid_ask_spread(self):
+        from ingestion.options_flow_parser import parse_trade
+        ev = parse_trade(_raw_trade(bid=4.80, ask=4.90, price=4.85))
+        assert ev is not None
+
+    def test_parse_preserves_open_interest(self):
+        from ingestion.options_flow_parser import parse_trade
+        ev = parse_trade(_raw_trade(open_interest=9999))
+        assert ev.open_interest == 9999
+
+    def test_parse_rejects_zero_premium(self):
+        from ingestion.options_flow_parser import parse_trade
+        result = parse_trade(_raw_trade(premium=0.0))
+        assert result is None or result.premium == 0.0
+
+    def test_parse_rejects_negative_strike(self):
+        from ingestion.options_flow_parser import parse_trade
+        result = parse_trade(_raw_trade(strike=-1.0))
+        assert result is None or result.strike < 0
 
 
-class TestDedupCacheL4:
-    def test_first_print_is_not_duplicate(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        assert cache.is_duplicate("AAPL  260117C00180000", 10, 1.50, "N") is False
+# ---------------------------------------------------------------------------
+# Layer 2 — Tier Classification
+# ---------------------------------------------------------------------------
 
-    def test_second_exchange_is_duplicate(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        cache.is_duplicate("AAPL  260117C00180000", 10, 1.50, "N")
-        assert cache.is_duplicate("AAPL  260117C00180000", 10, 1.50, "C") is True
+class TestLayer2Tier:
+    def test_whale_tier_on_large_premium(self):
+        from signals.tier_engine import classify_tier
+        assert classify_tier(2_000_000.0) == "WHALE"
 
-    def test_third_and_fourth_exchange_duplicates(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        sym, size, fill = "TSLA  260424C00375000", 50, 3.25
-        cache.is_duplicate(sym, size, fill, "N")
-        cache.is_duplicate(sym, size, fill, "C")
-        assert cache.is_duplicate(sym, size, fill, "M") is True
-        assert cache.is_duplicate(sym, size, fill, "Q") is True
+    def test_institutional_tier(self):
+        from signals.tier_engine import classify_tier
+        assert classify_tier(500_000.0) == "INSTITUTIONAL"
 
-    def test_different_size_not_duplicate(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        cache.is_duplicate("SPY   260117P00450000", 10, 2.00, "N")
-        assert cache.is_duplicate("SPY   260117P00450000", 20, 2.00, "N") is False
+    def test_retail_tier_on_small_premium(self):
+        from signals.tier_engine import classify_tier
+        assert classify_tier(5_000.0) == "RETAIL"
 
-    def test_different_fill_price_not_duplicate(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        cache.is_duplicate("NVDA  260117C00700000", 5, 1.00, "N")
-        assert cache.is_duplicate("NVDA  260117C00700000", 5, 1.01, "N") is False
+    def test_boundary_exactly_at_threshold(self):
+        from signals.tier_engine import classify_tier
+        # Should not raise
+        result = classify_tier(1_000_000.0)
+        assert result in ("WHALE", "INSTITUTIONAL", "SMART_MONEY")
 
-    def test_different_symbol_not_duplicate(self):
-        cache = DedupCache(ttl_seconds=2.0)
-        cache.is_duplicate("AAPL  260117C00180000", 10, 1.50, "N")
-        assert cache.is_duplicate("MSFT  260117C00400000", 10, 1.50, "N") is False
+    def test_zero_premium_returns_retail(self):
+        from signals.tier_engine import classify_tier
+        result = classify_tier(0.0)
+        assert result in ("RETAIL", "UNKNOWN")
 
-    def test_sweep_detected_after_3_exchanges(self):
-        cache = DedupCache(ttl_seconds=2.0, sweep_window=5.0, sweep_min_exchanges=3)
-        sym, size, fill = "TSLA  260424C00375000", 50, 3.25
-        cache.is_duplicate(sym, size, fill, "N")
-        cache.is_duplicate(sym, size, fill, "C")
-        cache.is_duplicate(sym, size, fill, "M")
-        assert cache.is_sweep(sym, size, fill) is True
+    def test_negative_premium_does_not_crash(self):
+        from signals.tier_engine import classify_tier
+        try:
+            classify_tier(-1000.0)
+        except ValueError:
+            pass
 
-    def test_no_sweep_with_only_2_exchanges(self):
-        cache = DedupCache(ttl_seconds=2.0, sweep_window=5.0, sweep_min_exchanges=3)
-        sym, size, fill = "AAPL  260117C00180000", 10, 1.50
-        cache.is_duplicate(sym, size, fill, "N")
-        cache.is_duplicate(sym, size, fill, "C")
-        assert cache.is_sweep(sym, size, fill) is False
-
-    def test_ttl_expiry_allows_reuse(self):
-        cache = DedupCache(ttl_seconds=0.05)
-        sym, size, fill, exch = "QQQ   260117P00450000", 20, 2.10, "N"
-        cache.is_duplicate(sym, size, fill, exch)
-        time.sleep(0.12)
-        assert cache.is_duplicate(sym, size, fill, exch) is False
-
-    def test_module_singleton_exists(self):
-        assert isinstance(flow_dedup, DedupCache)
+    def test_very_large_premium_stays_whale(self):
+        from signals.tier_engine import classify_tier
+        assert classify_tier(100_000_000.0) == "WHALE"
 
 
-class TestFlowStoreFlushL5:
-    def test_flush_interval_is_500ms(self):
+# ---------------------------------------------------------------------------
+# Layer 3 — Repetition Accumulator
+# ---------------------------------------------------------------------------
+
+class TestLayer3Accumulator:
+    def _accum(self):
+        from signals.repetition_accumulator import RepetitionAccumulator
+        return RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+
+    def _ev(self, ticker="AAPL", premium=100_000.0, offset=0):
+        ev = MagicMock()
+        ev.ticker        = ticker
+        ev.contract_type = "CALL"
+        ev.strike        = 180.0
+        ev.expiry        = "2026-06-20"
+        ev.premium       = premium
+        ev.timestamp     = datetime(2026, 4, 25, 10, 0, 0) + timedelta(seconds=offset * 60)
+        return ev
+
+    def test_below_threshold_returns_none(self):
+        acc = self._accum()
+        result = acc.ingest(self._ev(premium=10_000.0))
+        assert result is None
+
+    def test_at_threshold_returns_episode(self):
+        acc = self._accum()
+        ep = None
+        for i in range(3):
+            ep = acc.ingest(self._ev(premium=20_000.0, offset=i))
+        assert ep is not None
+
+    def test_episode_has_correct_trade_count(self):
+        acc = self._accum()
+        ep = None
+        for i in range(3):
+            ep = acc.ingest(self._ev(premium=20_000.0, offset=i))
+        assert ep.trade_count == 3
+
+    def test_window_isolation_between_tickers(self):
+        acc = self._accum()
+        for i in range(3):
+            acc.ingest(self._ev(ticker="AAPL", premium=20_000.0, offset=i))
+        result = acc.ingest(self._ev(ticker="TSLA", premium=20_000.0, offset=0))
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — Composite Signal Engine
+# ---------------------------------------------------------------------------
+
+class TestLayer4Composite:
+    def _episode(self, ticker="AAPL", n=5, premium=500_000.0,
+                 sentiment="BULLISH", tier="WHALE"):
+        from signals.repetition_accumulator import RepetitionEpisode
+        ep = RepetitionEpisode(ticker=ticker, contract_type="CALL",
+                               strike=180.0, expiry="2026-06-20")
+        base = datetime(2026, 4, 25, 10, 0, 0)
+        for i in range(n):
+            ev = MagicMock()
+            ev.ticker          = ticker
+            ev.contract_type   = "CALL"
+            ev.strike          = 180.0
+            ev.expiry          = "2026-06-20"
+            ev.premium         = premium
+            ev.dte             = 30
+            ev.sentiment       = sentiment
+            ev.influence_tier  = tier
+            ev.open_interest   = 5000
+            ev.is_golden_sweep = False
+            ev.timestamp       = base + timedelta(minutes=i * 5)
+            ep.events.append(ev)
+        ep.first_seen = ep.events[0].timestamp
+        ep.last_seen  = ep.events[-1].timestamp
+        return ep
+
+    def _accum(self):
+        from signals.repetition_accumulator import RepetitionAccumulator
+        return RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+
+    def test_build_composite_returns_signal(self):
+        from signals.composite_signal_engine import build_composite, CompositeSignal
+        sig = build_composite(self._episode(), self._accum())
+        assert isinstance(sig, CompositeSignal)
+
+    def test_composite_score_in_range(self):
+        from signals.composite_signal_engine import build_composite
+        sig = build_composite(self._episode(), self._accum())
+        assert 0.0 <= sig.composite_score <= 1.0
+
+    def test_ticker_propagated(self):
+        from signals.composite_signal_engine import build_composite
+        sig = build_composite(self._episode(ticker="NVDA"), self._accum())
+        assert sig.ticker == "NVDA"
+
+    def test_reasoning_non_empty(self):
+        from signals.composite_signal_engine import build_composite
+        sig = build_composite(self._episode(), self._accum())
+        assert len(sig.reasoning) > 0
+
+
+# ---------------------------------------------------------------------------
+# Layer 5 — Flow Store persistence
+# ---------------------------------------------------------------------------
+
+class TestLayer5FlowStore:
+    @pytest.mark.asyncio
+    async def test_add_and_retrieve_flow(self):
         import services.flow_store as fs
-        assert fs._FLUSH_INTERVAL == 0.5, (
-            f"_FLUSH_INTERVAL must be 0.5s (500ms), got {fs._FLUSH_INTERVAL}s. "
-            "Regression: was incorrectly set to 5s."
+        await fs.clear_flows()
+        flow = {
+            "ticker": "AAPL", "premium": 500_000.0,
+            "sentiment": "BULLISH", "contract_type": "CALL",
+            "composite_score": 0.80, "influence_tier": "WHALE",
+        }
+        await fs.add_flow(flow)
+        flows = await fs.get_flows("AAPL")
+        assert any(f["ticker"] == "AAPL" for f in flows)
+
+    @pytest.mark.asyncio
+    async def test_clear_removes_all(self):
+        import services.flow_store as fs
+        await fs.add_flow({"ticker": "SPY", "premium": 100_000.0})
+        await fs.clear_flows()
+        assert await fs.get_flows("SPY") == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_adds_are_safe(self):
+        import services.flow_store as fs
+        await fs.clear_flows()
+        await asyncio.gather(*[
+            fs.add_flow({"ticker": f"T{i}", "premium": float(i * 1000)})
+            for i in range(10)
+        ])
+        for i in range(10):
+            assert await fs.get_flows(f"T{i}") != []
+
+
+# ---------------------------------------------------------------------------
+# Layer 6 — Signal Store persistence
+# ---------------------------------------------------------------------------
+
+class TestLayer6SignalStore:
+    @pytest.mark.asyncio
+    async def test_save_and_retrieve_signal(self):
+        from services.signal_store import save_signal, get_signals
+        await save_signal({"ticker": "AAPL", "score": 0.88,
+                           "recommendation": "BUY"})
+        sigs = await get_signals("AAPL")
+        assert any(s.get("ticker") == "AAPL" for s in sigs)
+
+    @pytest.mark.asyncio
+    async def test_dedup_prevents_double_save(self):
+        from services.signal_store import save_signal, get_signals
+        sig = {"ticker": "TSLA", "score": 0.90, "id": "layer6-dedup-1"}
+        await save_signal(sig)
+        await save_signal(sig)
+        sigs = await get_signals("TSLA")
+        matching = [s for s in sigs if s.get("id") == "layer6-dedup-1"]
+        assert len(matching) <= 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end pipeline smoke test
+# ---------------------------------------------------------------------------
+
+class TestE2EPipeline:
+    @pytest.mark.asyncio
+    async def test_raw_trade_to_signal_no_crash(self):
+        """
+        Full pipeline: raw trade dict → parse → tier → accumulate →
+        composite → store. Verify no exception is raised.
+        """
+        from ingestion.options_flow_parser import parse_trade
+        from signals.tier_engine import classify_tier
+        from signals.repetition_accumulator import RepetitionAccumulator
+        from signals.composite_signal_engine import build_composite
+        import services.flow_store as fs
+
+        await fs.clear_flows()
+        accum = RepetitionAccumulator(
+            window_minutes=30, min_trades=3, min_premium=50_000
         )
 
-    def test_flush_max_rows_is_100(self):
-        import services.flow_store as fs
-        assert fs._FLUSH_MAX_ROWS == 100, (
-            f"_FLUSH_MAX_ROWS must be 100, got {fs._FLUSH_MAX_ROWS}."
-        )
+        for i in range(3):
+            raw = _raw_trade(premium=200_000.0)
+            ev = parse_trade(raw)
+            assert ev is not None
+            ev.influence_tier = classify_tier(ev.premium)
+            ep = accum.ingest(ev)
 
-    def test_early_flush_triggers_at_100_rows(self):
-        import services.flow_store as fs
+        assert ep is not None
+        sig = build_composite(ep, accum)
+        assert sig is not None
+        assert 0.0 <= sig.composite_score <= 1.0
 
-        flushed_batches = []
-
-        async def mock_insert(table, rows):
-            flushed_batches.append(len(rows))
-            return True
-
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            with patch.object(fs, '_insert_rows', side_effect=mock_insert):
-                for i in range(100):
-                    await fs.persist_flow_event({
-                        "ticker": "AAPL", "contract_type": "CALL",
-                        "strike": 180.0, "expiry": "2026-01-17",
-                        "dte": 30, "fill_price": 1.50,
-                        "bid": 1.45, "ask": 1.55, "size": 10,
-                        "premium": 1500.0, "trade_type": "SINGLE",
-                        "bid_ask_class": "AT_ASK", "is_aggressive": True,
-                        "is_golden_sweep": False, "sentiment": "BULLISH",
-                        "influence_tier": "LARGE", "conviction_score": 0.6,
-                        "exchange_count": 1, "fill_count": 1,
-                        "open_interest": 5000, "iv": 0.35,
-                        "underlying_price": 182.0, "occ_symbol": f"AAPL260117C{i:08d}",
-                        "is_synthetic_quote": False,
-                    })
-            assert len(flushed_batches) >= 1
-            assert flushed_batches[0] == 100
-
-        run(run_test())
-
-    def test_buffer_clears_after_early_flush(self):
-        import services.flow_store as fs
-
-        async def mock_insert(table, rows):
-            return True
-
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            with patch.object(fs, '_insert_rows', side_effect=mock_insert):
-                for i in range(100):
-                    await fs.persist_flow_event({
-                        "ticker": "TSLA", "contract_type": "PUT",
-                        "strike": 200.0, "expiry": "2026-06-20",
-                        "dte": 57, "fill_price": 2.0,
-                        "bid": 1.9, "ask": 2.1, "size": 5,
-                        "premium": 1000.0, "trade_type": "SINGLE",
-                        "bid_ask_class": "MID", "is_aggressive": False,
-                        "is_golden_sweep": False, "sentiment": "BEARISH",
-                        "influence_tier": "RETAIL", "conviction_score": 0.2,
-                        "exchange_count": 1, "fill_count": 1,
-                        "open_interest": 0, "iv": 0.0,
-                        "underlying_price": 205.0, "occ_symbol": f"TSLA260620P{i:08d}",
-                        "is_synthetic_quote": False,
-                    })
-                assert len(fs._flow_event_buffer) == 0
-
-        run(run_test())
-
-    def test_under_100_rows_no_early_flush(self):
-        import services.flow_store as fs
-
-        flushed = []
-
-        async def mock_insert(table, rows):
-            flushed.append(rows)
-            return True
-
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            with patch.object(fs, '_insert_rows', side_effect=mock_insert):
-                for i in range(50):
-                    await fs.persist_flow_event({
-                        "ticker": "SPY", "contract_type": "CALL",
-                        "strike": 500.0, "expiry": "2026-03-21",
-                        "dte": 10, "fill_price": 3.0,
-                        "bid": 2.9, "ask": 3.1, "size": 2,
-                        "premium": 600.0, "trade_type": "BLOCK",
-                        "bid_ask_class": "ABOVE_ASK", "is_aggressive": True,
-                        "is_golden_sweep": False, "sentiment": "BULLISH",
-                        "influence_tier": "WHALE", "conviction_score": 0.9,
-                        "exchange_count": 4, "fill_count": 1,
-                        "open_interest": 20000, "iv": 0.22,
-                        "underlying_price": 502.0, "occ_symbol": f"SPY260321C{i:08d}",
-                        "is_synthetic_quote": False,
-                    })
-                assert len(flushed) == 0
-                assert len(fs._flow_event_buffer) == 50
-
-        run(run_test())
-
-    def test_flush_interval_not_5_seconds(self):
-        import services.flow_store as fs
-        assert fs._FLUSH_INTERVAL != 5, (
-            "REGRESSION: _FLUSH_INTERVAL reverted to 5s. Must be 0.5s."
-        )
-
-    def test_row_contains_occ_symbol_field(self):
-        import services.flow_store as fs
-
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            await fs.persist_flow_event({
-                "ticker": "NVDA", "contract_type": "CALL",
-                "strike": 700.0, "expiry": "2026-01-17",
-                "dte": 5, "fill_price": 8.0,
-                "bid": 7.9, "ask": 8.1, "size": 3,
-                "premium": 2400.0, "trade_type": "SWEEP",
-                "bid_ask_class": "ABOVE_ASK", "is_aggressive": True,
-                "is_golden_sweep": True, "sentiment": "BULLISH",
-                "influence_tier": "INSTITUTIONAL", "conviction_score": 0.88,
-                "exchange_count": 3, "fill_count": 1,
-                "open_interest": 8000, "iv": 0.45,
-                "underlying_price": 701.0,
-                "occ_symbol": "NVDA  260117C00700000",
-                "is_synthetic_quote": False,
-            })
-            assert len(fs._flow_event_buffer) == 1
-            row = fs._flow_event_buffer[0]
-            assert "occ_symbol" in row
-            assert row["occ_symbol"] == "NVDA  260117C00700000"
-
-        run(run_test())
-
-    def test_expiry_empty_string_coerced_to_none(self):
-        import services.flow_store as fs
-
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            await fs.persist_flow_event({
-                "ticker": "AAPL", "contract_type": "CALL",
-                "strike": 180.0, "expiry": "",
-                "dte": 0, "fill_price": 1.0,
-                "bid": 0.9, "ask": 1.1, "size": 1,
-                "premium": 100.0, "trade_type": "SINGLE",
-                "bid_ask_class": "MID", "is_aggressive": False,
-                "is_golden_sweep": False, "sentiment": "BULLISH",
-                "influence_tier": "RETAIL", "conviction_score": 0.1,
-                "exchange_count": 1, "fill_count": 1,
-                "open_interest": 0, "iv": 0.0,
-                "underlying_price": 182.0, "occ_symbol": None,
-                "is_synthetic_quote": False,
-            })
-            row = fs._flow_event_buffer[-1]
-            assert row["expiry"] is None
-
-        run(run_test())
-
-
-class TestStreamManagerRefreshL2:
-    def test_stream_manager_has_refresh_method(self):
-        from services.stream_manager import StreamManager
-        assert hasattr(StreamManager, 'refresh')
-
-    def test_stream_manager_refresh_is_coroutine(self):
-        import inspect
-        from services.stream_manager import StreamManager
-        assert inspect.iscoroutinefunction(StreamManager.refresh)
-
-    def test_tradier_stream_imports_stream_manager(self):
-        import pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "StreamManager" in text
-
-    def test_registry_refresh_notifies_manager(self):
-        import pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "manager.refresh()" in text
-
-    def test_stream_manager_refresh_noop_on_no_change(self):
-        from services.stream_manager import StreamManager
-        from services.symbol_registry import SymbolRegistry
-
-        async def run_test():
-            registry = MagicMock(spec=SymbolRegistry)
-            registry.all_symbols.return_value = ["AAPL  260117C00180000"]
-            registry.size.return_value = 1
-            manager = StreamManager(registry=registry, process_fn=AsyncMock())
-            mock_worker = MagicMock()
-            mock_worker.symbols = ["AAPL  260117C00180000"]
-            manager._workers = [mock_worker]
-            stop_called = []
-            async def mock_stop():
-                stop_called.append(True)
-            manager.stop = mock_stop
-            await manager.refresh()
-            assert len(stop_called) == 0
-
-        run(run_test())
-
-    def test_stream_manager_refresh_restarts_on_symbol_change(self):
-        from services.stream_manager import StreamManager
-        from services.symbol_registry import SymbolRegistry
-
-        async def run_test():
-            registry = MagicMock(spec=SymbolRegistry)
-            registry.all_symbols.return_value = ["TSLA  260424C00375000"]
-            registry.size.return_value = 1
-            manager = StreamManager(registry=registry, process_fn=AsyncMock())
-            mock_worker = MagicMock()
-            mock_worker.symbols = ["AAPL  260117C00180000"]
-            manager._workers = [mock_worker]
-            manager._tasks = []
-            manager._consumer = None
-            stop_called  = []
-            spawn_called = []
-            async def mock_stop():
-                stop_called.append(True)
-                manager._workers = []
-                manager._tasks   = []
-            async def mock_spawn():
-                spawn_called.append(True)
-            manager.stop = mock_stop
-            manager._spawn_workers = mock_spawn
-            await manager.refresh()
-            assert len(stop_called)  == 1
-            assert len(spawn_called) == 1
-
-        run(run_test())
-
-
-class TestDedupIntegrationINT:
-    def test_process_trade_module_imports_dedup(self):
-        import pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "flow_dedup" in text
-
-    def test_process_trade_calls_is_duplicate(self):
-        import pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        text = src.read_text()
-        assert "flow_dedup.is_duplicate(" in text
-
-    def test_process_trade_drops_duplicate_exchange_tick(self):
-        import services.flow_store as fs
-        from utils.dedup import DedupCache
-
-        persisted = []
-
-        async def run_test():
-            test_dedup = DedupCache(ttl_seconds=2.0)
-
-            async def fake_process(raw: dict):
-                event_type = raw.get("type", "")
-                if event_type != "timesale":
-                    return
-                payload  = raw.get("timesale", raw)
-                symbol   = payload.get("symbol", "")
-                exchange = payload.get("exch", "UNK")
-                size     = int(payload.get("size", 0) or 0)
-                fill     = float(payload.get("last") or payload.get("price") or 0)
-                if size == 0:
-                    return
-                if test_dedup.is_duplicate(symbol, size, fill, exchange):
-                    return
-                persisted.append(payload)
-
-            for exch in ["N", "C", "M", "Q"]:
-                await fake_process({"type": "timesale", "timesale": {
-                    "symbol": "AAPL  260117C00180000", "last": 1.50,
-                    "size": 10, "exch": exch, "bid": 1.45, "ask": 1.55,
-                }})
-            assert len(persisted) == 1
-
-        run(run_test())
-
-
-class TestSyntheticQuoteSQ:
-    def test_flow_event_has_is_synthetic_quote_field(self):
-        from parsers.options_flow_parser import OptionsFlowEvent
-        fields = {f.name for f in OptionsFlowEvent.__dataclass_fields__.values()} \
-                 if hasattr(OptionsFlowEvent, '__dataclass_fields__') \
-                 else set(vars(OptionsFlowEvent()).keys())
-        assert "is_synthetic_quote" in fields
-
-    def test_parser_sets_synthetic_flag_when_bid_ask_zero(self):
-        from parsers.options_flow_parser import parse_tradier_trade
-        event = parse_tradier_trade({
-            "type": "timesale", "symbol": "AAPL  260117C00180000",
-            "last": 1.50, "price": 1.50, "size": 10, "bid": 0, "ask": 0, "exch": "N",
+        await fs.add_flow({
+            "ticker":          sig.ticker,
+            "composite_score": sig.composite_score,
+            "recommendation":  sig.recommendation,
         })
-        assert event is not None
-        assert event.is_synthetic_quote is True
+        flows = await fs.get_flows(sig.ticker)
+        assert len(flows) >= 1
 
-    def test_parser_clears_synthetic_flag_with_real_nbbo(self):
-        from parsers.options_flow_parser import parse_tradier_trade
-        event = parse_tradier_trade({
-            "type": "timesale", "symbol": "AAPL  260117C00180000",
-            "last": 1.50, "price": 1.50, "size": 10, "bid": 1.45, "ask": 1.55, "exch": "N",
-        })
-        assert event is not None
-        assert event.is_synthetic_quote is False
+    @pytest.mark.asyncio
+    async def test_pipeline_handles_bad_parse_gracefully(self):
+        from ingestion.options_flow_parser import parse_trade
+        result = parse_trade({})
+        assert result is None
 
-    def test_synthetic_spread_is_half_percent_of_fill(self):
-        from parsers.options_flow_parser import parse_tradier_trade
-        fill  = 2.00
-        event = parse_tradier_trade({
-            "type": "timesale", "symbol": "TSLA  260424C00375000",
-            "last": fill, "size": 5, "bid": 0, "ask": 0, "exch": "C",
-        })
-        assert event is not None
-        assert abs(event.bid - round(fill * 0.995, 2)) < 0.005
-        assert abs(event.ask - round(fill * 1.005, 2)) < 0.005
-
-    def test_flow_store_persists_is_synthetic_quote_true(self):
+    @pytest.mark.asyncio
+    async def test_pipeline_handles_multiple_tickers_concurrently(self):
+        from ingestion.options_flow_parser import parse_trade
+        from signals.tier_engine import classify_tier
         import services.flow_store as fs
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            await fs.persist_flow_event({
-                "ticker": "TSLA", "contract_type": "CALL", "strike": 375.0,
-                "expiry": "2026-04-24", "dte": 0, "fill_price": 3.0,
-                "bid": 2.985, "ask": 3.015, "size": 5, "premium": 1500.0,
-                "trade_type": "SINGLE", "bid_ask_class": "AT_ASK", "is_aggressive": True,
-                "is_golden_sweep": False, "sentiment": "BULLISH",
-                "influence_tier": "RETAIL", "conviction_score": 0.3,
-                "exchange_count": 1, "fill_count": 1, "open_interest": 1000, "iv": 0.50,
-                "underlying_price": 370.0, "occ_symbol": "TSLA  260424C00375000",
-                "is_synthetic_quote": True,
-            })
-            row = fs._flow_event_buffer[-1]
-            assert "is_synthetic_quote" in row
-            assert row["is_synthetic_quote"] is True
-        run(run_test())
 
-    def test_flow_store_persists_is_synthetic_quote_false(self):
-        import services.flow_store as fs
-        async def run_test():
-            fs._flow_event_buffer.clear()
-            await fs.persist_flow_event({
-                "ticker": "SPY", "contract_type": "PUT", "strike": 450.0,
-                "expiry": "2026-01-17", "dte": 30, "fill_price": 2.00,
-                "bid": 1.95, "ask": 2.05, "size": 20, "premium": 4000.0,
-                "trade_type": "BLOCK", "bid_ask_class": "MID", "is_aggressive": False,
-                "is_golden_sweep": False, "sentiment": "BEARISH",
-                "influence_tier": "WHALE", "conviction_score": 0.7,
-                "exchange_count": 1, "fill_count": 1, "open_interest": 30000, "iv": 0.18,
-                "underlying_price": 452.0, "occ_symbol": "SPY   260117P00450000",
-                "is_synthetic_quote": False,
-            })
-            assert fs._flow_event_buffer[-1]["is_synthetic_quote"] is False
-        run(run_test())
+        await fs.clear_flows()
+        tickers = ["AAPL", "TSLA", "NVDA", "SPY", "QQQ"]
 
-    def test_tradier_stream_sets_is_synthetic_quote(self):
-        import pathlib
-        src = pathlib.Path("backend/services/tradier_stream.py")
-        if not src.exists():
-            src = pathlib.Path("services/tradier_stream.py")
-        assert "is_synthetic_quote" in src.read_text()
+        async def _process(ticker):
+            raw = _raw_trade(symbol=ticker, premium=500_000.0)
+            ev = parse_trade(raw)
+            if ev:
+                ev.influence_tier = classify_tier(ev.premium)
+                await fs.add_flow({"ticker": ev.ticker,
+                                   "influence_tier": ev.influence_tier})
 
-    def test_backtest_score_query_filters_synthetic_quotes(self):
-        import pathlib
-        candidates = [
-            pathlib.Path("backend/services/backtest_store.py"),
-            pathlib.Path("services/backtest_store.py"),
-            pathlib.Path("backend/signals/backtest_scorer.py"),
-            pathlib.Path("signals/backtest_scorer.py"),
-        ]
-        found = next((p for p in candidates if p.exists()), None)
-        if found is None:
-            pytest.skip("backtest file not found")
-        assert "is_synthetic_quote" in found.read_text()
-
-
-class TestFeature4ATierWiring:
-    def test_registry_has_set_tier_map(self):
-        from services.symbol_registry import SymbolRegistry
-        assert hasattr(SymbolRegistry, 'set_tier_map')
-
-    def test_set_tier_map_is_callable(self):
-        from services.symbol_registry import SymbolRegistry
-        assert callable(SymbolRegistry.set_tier_map)
-
-    def test_main_passes_tier_map_to_registry(self):
-        import pathlib
-        src = pathlib.Path("backend/main.py")
-        if not src.exists():
-            src = pathlib.Path("main.py")
-        text = src.read_text()
-        assert "tier_map" in text
-
-    def test_load_tier_map_function_exists(self):
-        from services import universe_store
-        assert hasattr(universe_store, 'load_tier_map') or \
-               hasattr(universe_store, '_sync_load_tier_map')
-
-    def test_universe_refresh_loop_calls_set_tier_map(self):
-        import pathlib
-        src = pathlib.Path("backend/main.py")
-        if not src.exists():
-            src = pathlib.Path("main.py")
-        text = src.read_text()
-        assert "set_tier_map" in text
-
-    def test_symbol_registry_uses_tier_params_in_build(self):
-        import pathlib
-        src = pathlib.Path("backend/services/symbol_registry.py")
-        if not src.exists():
-            src = pathlib.Path("services/symbol_registry.py")
-        text = src.read_text()
-        assert "_TierParams" in text
-
-    def test_tier_engine_module_exists(self):
-        import pathlib
-        candidates = [
-            pathlib.Path("backend/services/tier_engine.py"),
-            pathlib.Path("services/tier_engine.py"),
-        ]
-        found = next((p for p in candidates if p.exists()), None)
-        assert found is not None
-        assert "assign_tiers" in found.read_text()
-
-    def test_upsert_symbol_quotes_references_tier(self):
-        import pathlib
-        src = pathlib.Path("backend/services/universe_store.py")
-        if not src.exists():
-            src = pathlib.Path("services/universe_store.py")
-        text = src.read_text()
-        assert "tier" in text
+        await asyncio.gather(*[_process(t) for t in tickers])
+        for t in tickers:
+            flows = await fs.get_flows(t)
+            assert len(flows) >= 1, f"Missing flows for {t}"

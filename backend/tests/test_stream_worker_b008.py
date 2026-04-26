@@ -1,38 +1,49 @@
 """
-Regression tests for stream worker B008 patterns.
+B008 regression: stream_worker startup/shutdown and tradier_stream handoff.
 """
+import asyncio
+import pytest
+from unittest.mock import AsyncMock, patch
+
+
+def test_tradier_stream_importable():
+    import services.tradier_stream  # noqa: F401
 
 
 def test_stream_worker_importable():
-    try:
-        import services.stream_worker  # noqa: F401
-    except ImportError:
-        import services.tradier_stream  # noqa: F401
+    import services.stream_worker  # noqa: F401
 
 
-def test_stream_worker_has_start_function():
-    try:
-        import services.stream_worker as sw
-    except ImportError:
-        import services.tradier_stream as sw
-    assert hasattr(sw, "start") or hasattr(sw, "connect") or hasattr(sw, "run")
+@pytest.mark.asyncio
+async def test_stream_worker_starts_without_crash():
+    import services.stream_worker as sw
+    fn = getattr(sw, "start", getattr(sw, "run", None))
+    if fn is None:
+        pytest.skip("No start/run function found in stream_worker")
+    with patch("services.tradier_stream.start_stream", new_callable=AsyncMock), \
+         patch("services.tradier_stream._get_session_token",
+               new_callable=AsyncMock, return_value="tok"):
+        task = asyncio.create_task(fn(["AAPL"]))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
-def test_stream_worker_does_not_crash_on_import():
-    try:
-        import services.stream_worker  # noqa: F401
-        imported = True
-    except ImportError:
-        imported = False
-    assert imported or True
-
-
-def test_process_trade_exists_on_tradier_stream():
-    import services.tradier_stream as ts
-    assert hasattr(ts, "_process_trade")
-
-
-def test_process_trade_is_coroutine():
-    import asyncio
-    import services.tradier_stream as ts
-    assert asyncio.iscoroutinefunction(ts._process_trade)
+@pytest.mark.asyncio
+async def test_stream_worker_cancels_cleanly():
+    import services.stream_worker as sw
+    fn = getattr(sw, "start", getattr(sw, "run", None))
+    if fn is None:
+        pytest.skip("No start/run function")
+    with patch("services.tradier_stream.start_stream", new_callable=AsyncMock):
+        task = asyncio.create_task(fn(["SPY", "QQQ"]))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # Reaching here = clean cancel

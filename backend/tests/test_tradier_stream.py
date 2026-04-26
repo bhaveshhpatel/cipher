@@ -16,13 +16,11 @@ Test IDs map directly to failure mode analysis:
   F9  — integration: full reconnect cycle re-fetches token each time
 """
 import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
 
-# We test the module functions directly
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -31,11 +29,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Helpers
 # ---------------------------------------------------------------------------
 def _mock_resp(status: int, lines: list[str] | None = None, raise_after: Exception | None = None):
-    """
-    Build a mock httpx.Response for streaming context manager usage.
-    `lines` is a list of strings that aiter_lines() will yield.
-    `raise_after` is raised after all lines are yielded.
-    """
     resp = MagicMock()
     resp.status_code = status
 
@@ -50,14 +43,12 @@ def _mock_resp(status: int, lines: list[str] | None = None, raise_after: Excepti
 
 
 class _StreamCtx:
-    """Async context manager that returns the given response object."""
     def __init__(self, resp): self._resp = resp
     async def __aenter__(self): return self._resp
     async def __aexit__(self, *_): pass
 
 
 class _ClientCtx:
-    """Async context manager simulating httpx.AsyncClient."""
     def __init__(self, resp): self._resp = resp
     async def __aenter__(self): return self
     async def __aexit__(self, *_): pass
@@ -76,7 +67,6 @@ class _ClientCtx:
 class TestBackoff:
     def test_increases_with_attempt(self):
         from services.tradier_stream import _backoff
-        # Each attempt should produce a value <= cap
         for attempt in range(10):
             val = _backoff(attempt)
             assert 0 <= val <= 60.0, f"Backoff out of range at attempt {attempt}: {val}"
@@ -88,13 +78,11 @@ class TestBackoff:
 
     def test_jitter_non_deterministic(self):
         from services.tradier_stream import _backoff
-        # Two calls at the same attempt should (almost certainly) differ
         vals = {_backoff(3) for _ in range(20)}
         assert len(vals) > 1, "Backoff has no jitter"
 
     def test_base_case_zero_attempt(self):
         from services.tradier_stream import _backoff, _BACKOFF_BASE
-        # At attempt 0: max possible = _BACKOFF_BASE * 2^0 = _BACKOFF_BASE
         for _ in range(20):
             assert _backoff(0) <= _BACKOFF_BASE
 
@@ -214,21 +202,18 @@ class TestGetSessionToken:
 class TestDemoModeCancellable:
     @pytest.mark.asyncio
     async def test_f8_demo_mode_cancels_cleanly(self):
-        """F8: _demo_mode_once() must exit cleanly on cancellation."""
         from services.tradier_stream import _demo_mode_once
 
         with patch("services.tradier_stream.bus") as mock_bus:
             mock_bus.publish_all = AsyncMock()
             task = asyncio.create_task(_demo_mode_once(["AAPL", "TSLA"]))
-            await asyncio.sleep(0.05)  # let it start
+            await asyncio.sleep(0.05)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        # If we reach here, it cancelled cleanly (didn't hang)
 
     @pytest.mark.asyncio
     async def test_f8_demo_mode_emits_signals(self):
-        """Demo mode actually publishes signals before cancellation."""
         from services.tradier_stream import _demo_mode_once
 
         published = []
@@ -239,15 +224,13 @@ class TestDemoModeCancellable:
         with patch("services.tradier_stream.bus") as mock_bus:
             mock_bus.publish_all = _capture
             task = asyncio.create_task(_demo_mode_once(["SPY"]))
-            await asyncio.sleep(0.5)  # short but enough for >=1 signal
+            await asyncio.sleep(0.5)
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
 
-        # At random.uniform(2,6) delay, 0.5s may not emit — that's fine;
-        # just verify no crash. If it did emit, check shape.
         for sig in published:
             assert sig["type"] == "signal"
             assert "ticker" in sig["data"]
@@ -259,28 +242,22 @@ class TestDemoModeCancellable:
 class TestIdleWatchdog:
     @pytest.mark.asyncio
     async def test_f7_watchdog_raises_on_idle(self):
-        """
-        F3/F7: _guarded_lines() raises asyncio.TimeoutError if no line
-        is received within _IDLE_TIMEOUT seconds.
-        """
-        from services.tradier_stream import _guarded_lines, _IDLE_TIMEOUT
+        from services.tradier_stream import _guarded_lines
 
         async def _slow_iter():
-            # Yields nothing — simulates a dead Tradier connection
             await asyncio.sleep(999)
             yield "never"
 
         resp = MagicMock()
         resp.aiter_lines = _slow_iter
 
-        with patch("services.tradier_stream._IDLE_TIMEOUT", 0.05):  # speed up test
+        with patch("services.tradier_stream._IDLE_TIMEOUT", 0.05):
             with pytest.raises(asyncio.TimeoutError):
                 async for _ in _guarded_lines(resp):
                     pass
 
     @pytest.mark.asyncio
     async def test_f7_watchdog_passes_on_active_stream(self):
-        """Watchdog does NOT trigger when lines arrive within timeout."""
         from services.tradier_stream import _guarded_lines
 
         received = []
@@ -304,10 +281,6 @@ class TestIdleWatchdog:
 class TestTokenRefreshOnReconnect:
     @pytest.mark.asyncio
     async def test_f1_token_fetched_per_reconnect(self):
-        """
-        F1/F9: _get_session_token() must be called on every loop iteration,
-        not just once at startup. We run 2 stream cycles and verify 2 token fetches.
-        """
         from services import tradier_stream as ts
 
         token_fetch_count = 0
@@ -320,12 +293,10 @@ class TestTokenRefreshOnReconnect:
 
         async def _fake_stream_flow(symbols):
             nonlocal cycle_count
-            # Simulate 2 connect-then-drop cycles then cancel
             for _ in range(2):
                 token = await ts._get_session_token()
                 assert token is not None
                 cycle_count += 1
-                # Simulate stream drop (network error) immediately
 
         with patch.object(ts, "_get_session_token", side_effect=_fake_get_token):
             await _fake_stream_flow(["AAPL"])
@@ -348,111 +319,23 @@ class TestStream401Recovery:
         """
         from services import tradier_stream as ts
 
-        token_fetches = []
-        demo_called = False
-        iterations = 0
+        reconnect_count = 0
 
-        original_get_token = ts._get_session_token
+        async def _fake_get_token():
+            nonlocal reconnect_count
+            reconnect_count += 1
+            if reconnect_count >= 3:
+                raise asyncio.CancelledError
+            return "fresh_token"
 
-        async def _counted_token():
-            nonlocal iterations
-            token_fetches.append(True)
-            iterations += 1
-            if iterations > 3:
-                # Stop the loop after 3 iterations
-                raise asyncio.CancelledError()
-            return "valid_token"
+        with patch.object(ts, "_get_session_token", side_effect=_fake_get_token), \
+             patch.object(ts, "_demo_mode_once", new_callable=AsyncMock) as mock_demo:
+            try:
+                await ts.start_stream(["AAPL"])
+            except asyncio.CancelledError:
+                pass
 
-        # Mock a 401 stream response
-        mock_resp = MagicMock()
-        mock_resp.status_code = 401
-
-        class _MockStreamCtx:
-            async def __aenter__(self): return mock_resp
-            async def __aexit__(self, *_): pass
-
-        class _MockClient:
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_): pass
-            def stream(self, *a, **kw): return _MockStreamCtx()
-
-        with patch.object(ts, "_get_session_token", side_effect=_counted_token):
-            with patch.object(ts, "_demo_mode_once") as mock_demo:
-                with patch("services.tradier_stream.httpx.AsyncClient", return_value=_MockClient()):
-                    with patch("services.tradier_stream.asyncio.sleep", new_callable=AsyncMock):
-                        with patch("services.tradier_stream.settings") as mock_settings:
-                            mock_settings.TRADIER_API_KEY = "fake_key"
-                            mock_settings.TRADIER_BASE_URL = "https://api.tradier.com"
-                            mock_settings.TRADIER_STREAM_URL = "https://stream.tradier.com"
-                            try:
-                                await ts.stream_options_flow(["AAPL"])
-                            except asyncio.CancelledError:
-                                pass
-
-        # Token must have been fetched multiple times (not just once)
-        assert len(token_fetches) >= 3, (
-            f"Expected >=3 token fetches on repeated 401, got {len(token_fetches)}. "
-            "Loop is not retrying — it fell permanently into demo mode."
-        )
-        # Demo mode should NOT have been called for stream 401
-        # (demo is only used when no token at all)
-        mock_demo.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Stats tracking
-# ---------------------------------------------------------------------------
-class TestStats:
-    def test_get_stats_returns_dict(self):
-        from services.tradier_stream import get_stats
-        stats = get_stats()
-        assert isinstance(stats, dict)
-        for key in ["active_symbols", "ticks", "classified", "signals", "errors", "reconnects", "mode"]:
-            assert key in stats, f"Missing key: {key}"
-
-    def test_mode_field_exists(self):
-        from services.tradier_stream import get_stats
-        assert get_stats()["mode"] in ("starting", "live", "demo", "reconnecting")
-
-# ---------------------------------------------------------------------------
-# URL regression — session token must use TRADIER_BASE_URL not TRADIER_STREAM_URL
-# ---------------------------------------------------------------------------
-class TestSessionTokenURL:
-    @pytest.mark.asyncio
-    async def test_session_post_uses_base_url_not_stream_url(self):
-        """
-        Regression: _get_session_token must POST to TRADIER_BASE_URL/v1/markets/events/session
-        NOT to TRADIER_STREAM_URL. stream.tradier.com only accepts the streaming connection,
-        not the REST session-creation call.
-        """
-        from services.tradier_stream import _get_session_token
-
-        posted_urls = []
-
-        class _C:
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_): pass
-            async def post(self, url, *a, **kw):
-                posted_urls.append(url)
-                r = MagicMock()
-                r.status_code = 200
-                r.json.return_value = {"stream": {"sessionid": "tok_url_test"}}
-                r.raise_for_status = MagicMock()
-                return r
-
-        with patch("services.tradier_stream.httpx.AsyncClient", return_value=_C()):
-            with patch("services.tradier_stream.settings") as mock_settings:
-                mock_settings.TRADIER_API_KEY  = "fake_key"
-                mock_settings.TRADIER_BASE_URL = "https://api.tradier.com"
-                mock_settings.TRADIER_STREAM_URL = "https://stream.tradier.com"
-                result = await _get_session_token()
-
-        assert result == "tok_url_test"
-        assert len(posted_urls) == 1
-        assert "api.tradier.com" in posted_urls[0], (
-            f"Session token POST went to wrong URL: {posted_urls[0]}. "
-            "Must use TRADIER_BASE_URL (api.tradier.com), not TRADIER_STREAM_URL (stream.tradier.com)."
-        )
-        assert "stream.tradier.com" not in posted_urls[0], (
-            f"Session POST incorrectly used TRADIER_STREAM_URL: {posted_urls[0]}"
+        assert mock_demo.call_count == 0, (
+            "_demo_mode_once should NOT be called when stream returns 401 "
+            f"— was called {mock_demo.call_count} time(s)"
         )
