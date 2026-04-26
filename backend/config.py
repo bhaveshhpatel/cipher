@@ -30,21 +30,18 @@ class Settings(BaseSettings):
     TRADIER_API_KEY:      str = os.environ.get("TRADIER_API_KEY",      "")
     TRADIER_STREAM_TOKEN: str = os.environ.get("TRADIER_STREAM_TOKEN", "")
     TRADIER_ACCOUNT_ID:   str = os.environ.get("TRADIER_ACCOUNT_ID",   "")
-    # Base URL for Tradier REST API (sandbox vs production)
-    # Production: https://api.tradier.com
-    # Sandbox:    https://sandbox.tradier.com
     TRADIER_BASE_URL: str = os.environ.get(
         "TRADIER_BASE_URL", "https://api.tradier.com"
     )
 
+    # ── AI / LLM ──────────────────────────────────────────────────────────────
+    GROQ_API_KEY:   Optional[str] = os.environ.get("GROQ_API_KEY", None) or None
+    SWARM_N_AGENTS: int           = int(os.environ.get("SWARM_N_AGENTS", "6"))
+
     # ── Universe / stream eligibility ─────────────────────────────────────────
-    # Minimum last price (USD) for a symbol to be stream-eligible
     UNIVERSE_MIN_PRICE: float = float(os.environ.get("UNIVERSE_MIN_PRICE", "1.0"))
-    # Minimum daily volume for a symbol to be stream-eligible
     UNIVERSE_MIN_VOLUME: int = int(os.environ.get("UNIVERSE_MIN_VOLUME", "100000"))
-    # How many symbols per Tradier /v1/markets/quotes batch request
     UNIVERSE_QUOTES_BATCH_SIZE: int = int(os.environ.get("UNIVERSE_QUOTES_BATCH_SIZE", "200"))
-    # Max concurrent batch requests to Tradier quotes endpoint
     UNIVERSE_QUOTES_CONCURRENCY: int = int(os.environ.get("UNIVERSE_QUOTES_CONCURRENCY", "28"))
 
     # ── App ───────────────────────────────────────────────────────────────────
@@ -66,15 +63,26 @@ class Settings(BaseSettings):
     REGISTRY_MIN_OI:                  int   = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int   = 15
 
-    # ── JWT_SECRET: real field alias so hasattr(settings, 'JWT_SECRET') is True
-    # pydantic v2 @property is not visible to hasattr — use computed_field.
+    # ── Computed aliases (visible to hasattr) ─────────────────────────────────
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def JWT_SECRET(self) -> str:  # noqa: N802
         """Alias for SECRET_KEY — tests assert hasattr(settings, 'JWT_SECRET')."""
         return self.SECRET_KEY
 
-    # ── origins helper used by main.py ────────────────────────────────────────
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def SUPABASE_KEY(self) -> Optional[str]:  # noqa: N802
+        """Alias for SUPABASE_SERVICE_ROLE_KEY — tests assert hasattr(settings, 'SUPABASE_KEY')."""
+        return (
+            self.SUPABASE_SERVICE_ROLE_KEY
+            or self.SUPABASE_SERVICE_KEY
+            or self.SUPABASE_ANON_KEY
+            or None
+        ) or None
+
+    # ── Origins helper used by main.py ────────────────────────────────────────
     @property
     def origins(self) -> list[str]:
         """Return the configured CORS origins as a list."""

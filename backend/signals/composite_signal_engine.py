@@ -52,17 +52,23 @@ class CompositeSignal:
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     """
     Ratio of episode premium to notional OI value.
-    When OI is 0 or unavailable, falls back to premium-only scaling
-    (capped at 1.0) so the factor is not a meaningless 0.5 constant.
 
-    Fix: test_vwpf_low_premium_vs_oi expects factor < 0.5 for small
-    premium (e.g. $5k) with zero OI — old code always returned 0.5.
-    New code: ratio = premium / 1_000_000 cap so $5k → 0.005.
+    Rules:
+      - No events at all       -> 0.5 (neutral fallback)
+      - OI == 0, premium == 0  -> 0.5 (neutral, no data)
+      - OI == 0, premium > 0   -> min(1.0, premium / 1_000_000) so $5k → 0.005
+      - OI > 0                 -> min(1.0, premium / (OI * 100))
     """
+    if not ep.events:
+        return 0.5
     latest_oi = ep.events[-1].open_interest if ep.events else 0
+    if latest_oi is None:
+        latest_oi = 0
     if latest_oi <= 0:
-        # No OI data: scale purely on premium magnitude (0–$1M = 0–1.0)
-        return round(min(1.0, ep.total_premium / 1_000_000), 3)
+        total = ep.total_premium
+        if not total:
+            return 0.5
+        return round(min(1.0, total / 1_000_000), 3)
     notional_oi = latest_oi * 100
     ratio = ep.total_premium / max(notional_oi, 1)
     return round(min(1.0, ratio), 3)
@@ -129,7 +135,6 @@ async def build_composite_async(
     Builds composite signal then auto-runs the AI swarm.
     n_agents: overrides SWARM_N_AGENTS env var if provided.
     """
-    # Use module-level run_ensemble (importable, patchable by tests)
     _run = run_ensemble
     if _run is None:
         try:
@@ -143,7 +148,6 @@ async def build_composite_async(
     if _run is None:
         return sig
 
-    # Build flow event list for swarm context
     flow_events = [
         {
             "ticker":         ev.ticker if hasattr(ev, "ticker") else ep.ticker,
@@ -164,12 +168,22 @@ async def build_composite_async(
 
     try:
         result = await _run(**kwargs)
-        sig.swarm_direction  = result.direction
-        sig.swarm_confidence = result.confidence
-        sig.swarm_bull_votes = result.bull_votes
-        sig.swarm_bear_votes = result.bear_votes
-        sig.swarm_hold_votes = result.hold_votes
-        sig.swarm_agents     = result.agents
+        # result is an EnsembleResult with .direction/.confidence/.bull_votes etc.
+        # Support both attribute access and dict access for test mock flexibility.
+        if hasattr(result, "direction"):
+            sig.swarm_direction  = result.direction
+            sig.swarm_confidence = result.confidence
+            sig.swarm_bull_votes = result.bull_votes
+            sig.swarm_bear_votes = result.bear_votes
+            sig.swarm_hold_votes = result.hold_votes
+            sig.swarm_agents     = result.agents if hasattr(result, "agents") else []
+        elif isinstance(result, dict):
+            sig.swarm_direction  = result.get("direction")
+            sig.swarm_confidence = result.get("confidence")
+            sig.swarm_bull_votes = result.get("bull_votes")
+            sig.swarm_bear_votes = result.get("bear_votes")
+            sig.swarm_hold_votes = result.get("hold_votes")
+            sig.swarm_agents     = result.get("agents", [])
     except Exception:
         # Swarm failure is non-fatal — composite score still valid
         pass

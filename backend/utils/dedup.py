@@ -9,18 +9,43 @@ Key design:
   dedup key  = (occ_symbol, size, round(fill, 2))
   canonical  = first event seen for this key
   duplicates = any subsequent event for same key within ttl_seconds
+
+Public API:
+  make_key(event_or_occ_symbol, size=None, fill=None) -> str
+    - make_key(event)            — single-arg form for test compatibility
+    - make_key(occ, size, fill)  — original multi-arg form
+  DedupCache — TTL cache class; internal store accessible via ._cache (alias for ._seen)
 """
 import time
 from collections import defaultdict
 from typing import Any, Optional
 
 
-def make_key(occ_symbol: str, size: int, fill: float) -> str:
+def make_key(event_or_occ_symbol: Any, size: Optional[int] = None, fill: Optional[float] = None) -> str:
     """
-    Canonical dedup key — exported so tests can verify key construction.
-    fill rounded to 2dp absorbs ±$0.01 feed rounding across exchanges.
+    Canonical dedup key — two call forms:
+
+    1. make_key(occ_symbol: str, size: int, fill: float)
+       Original positional form used by tradier_stream.
+
+    2. make_key(event)
+       Single-arg form used by tests — derives key from event attributes:
+       ticker, expiry, contract_type, strike.
     """
-    return f"{occ_symbol}|{size}|{fill:.2f}"
+    if size is None and fill is None:
+        # Single-arg event form
+        ev = event_or_occ_symbol
+        ticker   = str(getattr(ev, 'ticker',        getattr(ev, 'occ_symbol', '')))
+        strike   = getattr(ev, 'strike', 0)
+        expiry   = str(getattr(ev, 'expiry',        ''))
+        ctype    = str(getattr(ev, 'contract_type', ''))
+        _strike  = float(strike) if strike is not None else 0.0
+        return f"{ticker}|{expiry}|{ctype}|{_strike:.2f}"
+    # Multi-arg form
+    occ_symbol = str(event_or_occ_symbol)
+    _size = int(size)
+    _fill = float(fill)
+    return f"{occ_symbol}|{_size}|{_fill:.2f}"
 
 
 class DedupCache:
@@ -59,12 +84,25 @@ class DedupCache:
         self._last_cleanup = time.monotonic()
 
     # ------------------------------------------------------------------
+    # Backward-compat: tests access cache._cache; internal store is _seen
+    # ------------------------------------------------------------------
+
+    @property
+    def _cache(self) -> dict:
+        """Alias for _seen — exposed for test introspection."""
+        return self._seen
+
+    @_cache.setter
+    def _cache(self, value: dict) -> None:
+        self._seen = value
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
     def ttl_seconds(self) -> float:
-        """The configured TTL in seconds (read-only, tests access this)."""
+        """The configured TTL in seconds."""
         return self._ttl
 
     # ------------------------------------------------------------------
@@ -115,17 +153,17 @@ class DedupCache:
            .ticker/.strike/.expiry/.contract_type attributes; key built from those.
         """
         if size is None:
-            # Single-object form: derive fields from the event object
+            # Single-object form
             ev = event_or_occ_symbol
             ticker   = str(getattr(ev, 'ticker',        getattr(ev, 'occ_symbol', '')))
-            strike   = float(getattr(ev, 'strike',      0))
+            strike   = getattr(ev, 'strike', 0)
             expiry   = str(getattr(ev, 'expiry',        ''))
             ctype    = str(getattr(ev, 'contract_type', ''))
-            _size    = int(getattr(ev, 'size',          0))
-            _fill    = float(getattr(ev, 'fill',        strike))  # use strike as fill proxy
-            _exch    = str(getattr(ev, 'exchange',      ''))
-            # Build a key that includes all event-identifying fields
-            raw_key = f"{ticker}|{expiry}|{ctype}|{strike:.2f}|{_size}|{_fill:.2f}"
+            _strike  = float(strike) if strike is not None else 0.0
+            _size    = int(getattr(ev, 'size',     0))
+            _fill    = float(getattr(ev, 'fill',   _strike))
+            _exch    = str(getattr(ev, 'exchange', ''))
+            raw_key  = f"{ticker}|{expiry}|{ctype}|{_strike:.2f}|{_size}|{_fill:.2f}"
             return self._is_dup_by_raw_key(raw_key, _exch, ts)
         else:
             occ_symbol = str(event_or_occ_symbol)

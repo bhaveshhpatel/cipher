@@ -46,6 +46,10 @@ class StreamManager:
     def running(self, value: bool) -> None:
         self._running = value
 
+    def is_running(self) -> bool:
+        """Method form of running check — for test compatibility."""
+        return self._running
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

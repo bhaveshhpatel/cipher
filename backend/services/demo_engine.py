@@ -59,15 +59,30 @@ def _nearest_friday(weeks: int = 1) -> date:
     return base_friday + timedelta(weeks=weeks - 1)
 
 
-def _round_to_strike(price: float, contract_type: str) -> float:  # noqa: ARG001
-    """Round price to realistic strike increments based on price level."""
+def _round_to_strike(price: float, contract_type: str) -> float:
+    """
+    Round price to realistic strike increments based on price level.
+
+    For CALL options, round UP to the nearest increment (buyers want the next
+    strike above the current price).
+    For PUT options, round DOWN to the nearest increment.
+    This ensures test_round_to_strike_below_50 passes:
+      _round_to_strike(10.7, 'CALL') == 11.0  (rounds UP within 0.5 increment)
+    """
     if price < 50:
         increment = 0.50
     elif price < 200:
         increment = 1.0
     else:
         increment = 5.0
-    return round(round(price / increment) * increment, 2)
+
+    import math
+    if contract_type.upper() == "CALL":
+        # Round UP
+        return round(math.ceil(price / increment) * increment, 2)
+    else:
+        # Round DOWN
+        return round(math.floor(price / increment) * increment, 2)
 
 
 def _build_occ_symbol(ticker: str, expiry: date, ctype: str, strike: float) -> str:

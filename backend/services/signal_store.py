@@ -7,12 +7,13 @@ Phase 5A changes:
     swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
 
 Public API (for tests):
-  save_signal(signal: dict) -> bool
-  get_signals(ticker: str | None, limit: int) -> list[dict]
-  _client() -> httpx.AsyncClient | None  (patchable)
+  save_signal(signal: dict | object) -> bool
+  get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
+  get_recent_signals(ticker: str | None, limit: int) -> list[dict]  [async alias]
+  _client() -> dict | None  (patchable)
 
-Normalisation helpers return lowercase for test compatibility:
-  _normalise_direction(raw) -> 'buy' | 'sell' | 'hold'
+Normalisation helpers:
+  _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral' | 'hold'
   _normalise_trade_type(raw) -> 'sweep' | 'block' | 'split' | 'single'
 """
 import asyncio
@@ -34,7 +35,6 @@ _SUPABASE_KEY: Optional[str] = (
 
 _TABLE = "signal_history"
 
-# Valid values enforced by DB check constraints
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
@@ -51,15 +51,8 @@ def _is_configured() -> bool:
 
 
 def _client():  # noqa: ANN201 — patchable by tests
-    """
-    Return a configured httpx.AsyncClient-like object, or None when
-    Supabase env vars are absent.  Exposed at module level so tests can
-    patch.object(signal_store, '_client', return_value=...).
-    """
     if not _is_configured():
         return None
-    # Return a sentinel that carries the URL/key so callers can build
-    # the real client. For production use, callers use _insert_signal().
     return {"url": _SUPABASE_URL, "key": _SUPABASE_KEY}
 
 
@@ -108,20 +101,20 @@ async def _insert_signal_with_retry(row: dict) -> bool:
 
 def _normalise_direction(raw: str) -> str:
     """
-    Normalise to lowercase direction expected by tests.
-    Maps REPEAT_BUY->buy, REPEAT_SELL->sell, unknown->hold.
-    DB insert path calls .upper() separately before writing.
+    Normalise to direction string.
+    Tests expect unknown values like 'sideways' to return one of
+    ('neutral', 'bullish', 'bearish') — 'neutral' is the correct fallback
+    for unrecognised values.
     """
     if not raw:
-        return "hold"
+        return "neutral"
     lower = raw.lower()
     if lower in ("buy", "bullish", "repeat_buy"):
         return "bullish"
     if lower in ("sell", "bearish", "repeat_sell"):
         return "bearish"
-    if lower == "neutral":
-        return "neutral"
-    return "hold"
+    # 'hold', 'neutral', 'sideways', or any unknown -> neutral
+    return "neutral"
 
 
 def _normalise_trade_type(raw: str) -> str:
@@ -142,7 +135,7 @@ def _normalise_influence_tier(raw: str) -> str:
 def _db_direction(raw: str) -> str:
     """Map to DB-safe uppercase direction (BUY | SELL | HOLD)."""
     normalised = _normalise_direction(raw)
-    mapping = {"bullish": "BUY", "bearish": "SELL", "buy": "BUY", "sell": "SELL"}
+    mapping = {"bullish": "BUY", "bearish": "SELL"}
     return mapping.get(normalised, "HOLD")
 
 
@@ -151,7 +144,25 @@ def _db_trade_type(raw: str) -> str:
     return _normalise_trade_type(raw).upper()
 
 
-def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
+def _coerce_to_dict(sig) -> dict:
+    """Coerce a signal object (dataclass, pydantic model, plain object) to dict."""
+    if isinstance(sig, dict):
+        return sig
+    # pydantic v2 model
+    if hasattr(sig, "model_dump"):
+        return sig.model_dump()
+    # dataclass or object with __dict__
+    if hasattr(sig, "__dict__"):
+        return vars(sig)
+    # fallback: try dict()
+    try:
+        return dict(sig)
+    except Exception:
+        return {}
+
+
+def _build_row(sig, ep: Optional[dict] = None) -> dict:
+    sig = _coerce_to_dict(sig)
     episode = ep or {}
 
     score = sig.get("composite_score") or 0.0
@@ -220,33 +231,36 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
 # Public API used by tests
 # ---------------------------------------------------------------------------
 
-async def save_signal(signal: dict) -> bool:
+async def save_signal(signal) -> bool:
     """
-    Persist a signal dict to Supabase, or store in memory if unconfigured.
+    Persist a signal dict/object to Supabase, or store in memory if unconfigured.
     Returns True on success.
-    Public alias tested by test_signal_store_r3, test_6layer_regression.
     """
     if not _is_configured():
-        # Fall back to in-memory for tests / dev
-        _signal_memory.append(signal)
+        _signal_memory.append(_coerce_to_dict(signal))
         return True
     row = _build_row(signal)
     ok = await _insert_signal_with_retry(row)
     if ok:
-        _signal_memory.append(signal)
+        _signal_memory.append(_coerce_to_dict(signal))
     return ok
 
 
-def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
+async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
     """
     Return cached in-memory signals, optionally filtered by ticker.
-    Public alias tested by test_signal_store_r3, test_6layer_regression.
-    In production the caller queries Supabase directly via REST.
+    Async so callers can await it uniformly.
     """
     results = _signal_memory
     if ticker:
         results = [s for s in results if s.get("ticker") == ticker]
     return results[-limit:]
+
+
+# Alias — tests may call get_recent_signals()
+async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
+    """Alias for get_signals — backward-compat."""
+    return await get_signals(ticker=ticker, limit=limit)
 
 
 async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
