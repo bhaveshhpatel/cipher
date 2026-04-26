@@ -9,9 +9,8 @@ Covers:
  - WebSocket /ws/signals connects and is accepted with a valid token
  - WebSocket /ws/signals with invalid token is rejected (4001 / 403)
 """
-import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from main import app
 
 client = TestClient(app)

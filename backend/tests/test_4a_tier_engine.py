@@ -13,7 +13,7 @@ All tests are pure-Python / asyncio — no Supabase, no network.
 """
 import asyncio
 import time
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
 
 
