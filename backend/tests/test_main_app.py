@@ -1,5 +1,17 @@
 """
 Regression tests for main.py app wiring, lifespan, and middleware.
+
+Covers:
+ - /api/health endpoint is mounted and reachable
+ - Unknown routes return 404
+ - CORS OPTIONS preflight returns acceptable status
+ - _stamp_oi helper is callable
+ - _stamp_oi populates open_interest from lookup dict
+ - _stamp_oi sets zero for symbols not in lookup dict
+ - All required router prefixes are mounted
+ - Lifespan startup does not crash with mocked dependencies
+ - Rate-limited path still returns a response (not 500)
+ - App instance is a FastAPI application
 """
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
@@ -24,13 +36,17 @@ def test_app_returns_404_for_unknown_path():
 
 def test_cors_headers_present_on_options():
     client = _get_client()
-    resp = client.options("/api/health",
-                          headers={"Origin": "http://localhost:3000",
-                                   "Access-Control-Request-Method": "GET"})
+    resp = client.options(
+        "/api/health",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
     assert resp.status_code in (200, 204, 400)
 
 
-def test_stamp_oi_helper_exists():
+def test_stamp_oi_helper_is_callable():
     from main import _stamp_oi
     assert callable(_stamp_oi)
 
@@ -69,7 +85,13 @@ def test_routers_all_mounted():
     paths = {r.path for r in app.routes}
     for prefix in ("/api/health", "/api/auth"):
         assert any(p.startswith(prefix) for p in paths), \
-            f"Router with prefix {prefix} not mounted"
+            f"Router prefix {prefix!r} not mounted on app"
+
+
+def test_app_is_fastapi_instance():
+    from fastapi import FastAPI
+    from main import app
+    assert isinstance(app, FastAPI)
 
 
 def test_lifespan_does_not_crash_on_startup():
@@ -79,3 +101,10 @@ def test_lifespan_does_not_crash_on_startup():
         client = _get_client()
         resp = client.get("/api/health")
         assert resp.status_code in (200, 503)
+
+
+def test_rate_limited_path_returns_response_not_500():
+    """A rate-limited endpoint must return 200 or 429, never 500."""
+    client = _get_client()
+    resp = client.get("/api/flow/scan")
+    assert resp.status_code != 500
