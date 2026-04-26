@@ -3,9 +3,7 @@ import type { Config } from "jest";
 const config: Config = {
   preset: "ts-jest",
   testEnvironment: "jsdom",
-  setupFilesAfterFramework: undefined,
-  // Load @testing-library/jest-dom matchers after the test framework
-  setupFilesAfterEach: undefined,
+  setupFilesAfterFramework: ["<rootDir>/jest.setup.ts"],
   globals: {
     "ts-jest": {
       tsconfig: "<rootDir>/tsconfig.json",
