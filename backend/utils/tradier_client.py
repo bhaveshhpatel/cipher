@@ -11,22 +11,20 @@ Rate limits:
   → use asyncio.Semaphore(3) for session token fetches (B-022)
 
 B-022 — Global Session Token Semaphore:
-  _SESSION_SEM = asyncio.Semaphore(3) wraps get_session_token().
-  With 32 workers all calling get_session_token() at startup, the
-  semaphore limits concurrent Tradier session requests to 3 at any
-  time. Each call takes ~200–500ms round-trip, so 32 workers complete
-  in ~⌈32/3⌉ × 400ms ≈ 4.3s instead of a simultaneous burst that
-  caused silent 429s and reconnect death spirals.
-  The semaphore also applies during the 30-min registry refresh
-  worker restart, keeping token pressure controlled.
+  _SESSION_SEM = asyncio.Semaphore(3) wraps get_session_token() / get_token().
 
 B-023 — Explicit 429 Handling:
   If Tradier returns HTTP 429, get_session_token() reads the
-  Retry-After header (default 10s if absent) and sleeps that long
-  before retrying. Previously raise_for_status() turned a 429 into
-  an unhandled exception → worker returned None → immediate re-backoff
-  → re-attempt anyway, burning more API budget. The explicit handler
-  is smarter and reduces overall token request pressure.
+  Retry-After header (default 10s if absent) and sleeps that long before retrying.
+
+Public API:
+  get_quote(symbol)                      -> Optional[dict]
+  get_quotes_batch(symbols)              -> dict[str, dict]
+  get_expirations(symbol)                -> list[str]
+  get_option_chain(symbol, expiration)   -> list[dict]
+  get_options_chain(symbol, expiration)  -> list[dict]  (alias)
+  get_session_token()                    -> Optional[str]
+  get_token()                            -> Optional[str]  (alias)
 
 All methods return None / [] on error — callers must handle gracefully.
 """
@@ -147,6 +145,10 @@ async def get_option_chain(symbol: str, expiration: str) -> list[dict]:
             return []
 
 
+# Alias: tests import get_options_chain (plural)
+get_options_chain = get_option_chain
+
+
 async def get_session_token() -> Optional[str]:
     """
     Fetch a fresh Tradier streaming session token.
@@ -196,3 +198,7 @@ async def get_session_token() -> Optional[str]:
                     await asyncio.sleep(2.0)
 
     return None
+
+
+# Alias: tests import get_token
+get_token = get_session_token
