@@ -24,8 +24,6 @@ def run(coro):
 # ===========================================================================
 
 class TestAssignTiers:
-    """Feature 4A: assign_tiers() classifies symbols into T1/T2/T3 correctly."""
-
     def _thresholds(self):
         return {
             "t1_min_volume": 20_000_000, "t1_min_last_price": 10.0,
@@ -39,42 +37,26 @@ class TestAssignTiers:
     def _quote(self, volume, price, oi):
         return {"average_volume": volume, "last": price, "open_interest": oi}
 
-    # TE-01
     def test_spy_tier1(self):
         from services.tier_engine import assign_tiers
-        quotes = {"SPY": self._quote(80_000_000, 502.0, 50000)}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["SPY"] == 1
+        assert assign_tiers({"SPY": self._quote(80_000_000, 502.0, 50000)}, self._thresholds())["SPY"] == 1
 
-    # TE-02
     def test_hood_tier2(self):
         from services.tier_engine import assign_tiers
-        quotes = {"HOOD": self._quote(5_000_000, 25.0, 800)}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["HOOD"] == 2
+        assert assign_tiers({"HOOD": self._quote(5_000_000, 25.0, 800)}, self._thresholds())["HOOD"] == 2
 
-    # TE-03
     def test_low_volume_tier3(self):
         from services.tier_engine import assign_tiers
-        quotes = {"XYZ": self._quote(600_000, 5.0, 150)}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["XYZ"] == 3
+        assert assign_tiers({"XYZ": self._quote(600_000, 5.0, 150)}, self._thresholds())["XYZ"] == 3
 
-    # TE-04
     def test_below_t3_minimum_still_tier3(self):
-        """Symbols below all thresholds should still land in tier 3 (default)."""
         from services.tier_engine import assign_tiers
-        quotes = {"PENNY": self._quote(100_000, 0.50, 10)}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["PENNY"] == 3
+        assert assign_tiers({"PENNY": self._quote(100_000, 0.50, 10)}, self._thresholds())["PENNY"] == 3
 
-    # TE-05
     def test_empty_quotes_returns_empty_dict(self):
         from services.tier_engine import assign_tiers
-        result = assign_tiers({}, self._thresholds())
-        assert result == {}
+        assert assign_tiers({}, self._thresholds()) == {}
 
-    # TE-06
     def test_multiple_symbols_classified_independently(self):
         from services.tier_engine import assign_tiers
         quotes = {
@@ -83,24 +65,15 @@ class TestAssignTiers:
             "XYZ":  self._quote(600_000,    5.0,   150),
         }
         result = assign_tiers(quotes, self._thresholds())
-        assert result["SPY"]  == 1
-        assert result["HOOD"] == 2
-        assert result["XYZ"]  == 3
+        assert result["SPY"] == 1 and result["HOOD"] == 2 and result["XYZ"] == 3
 
-    # TE-07
     def test_tier1_boundary_exactly_at_threshold(self):
         from services.tier_engine import assign_tiers
-        quotes = {"EDGE": self._quote(20_000_000, 10.0, 1000)}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["EDGE"] == 1
+        assert assign_tiers({"EDGE": self._quote(20_000_000, 10.0, 1000)}, self._thresholds())["EDGE"] == 1
 
-    # TE-08
     def test_missing_fields_default_to_zero_not_crash(self):
-        """Quotes missing volume/price/oi keys must not raise — default to tier 3."""
         from services.tier_engine import assign_tiers
-        quotes = {"BARE": {}}
-        result = assign_tiers(quotes, self._thresholds())
-        assert result["BARE"] == 3
+        assert assign_tiers({"BARE": {}}, self._thresholds())["BARE"] == 3
 
 
 # ===========================================================================
@@ -108,9 +81,6 @@ class TestAssignTiers:
 # ===========================================================================
 
 class TestFetchThresholds:
-    """Feature 4A: _fetch_thresholds() returns active row and caches result."""
-
-    # TE-09
     def test_fetch_thresholds_returns_dict(self):
         from services import tier_engine
         mock_row = {
@@ -128,32 +98,26 @@ class TestFetchThresholds:
         q.limit.return_value  = q
         q.execute.return_value = MagicMock(data=[mock_row])
         sb.table.return_value = q
-
         with patch.object(tier_engine, "_client", return_value=sb):
             tier_engine._thresholds_cache = None
             result = tier_engine._fetch_thresholds()
         assert isinstance(result, dict)
         assert result["t1_min_volume"] == 20000000
 
-    # TE-10
     def test_fetch_thresholds_uses_cache_on_second_call(self):
         from services import tier_engine
         cached = {"t1_min_volume": 99999999}
-        tier_engine._thresholds_cache     = cached
-        tier_engine._thresholds_cache_ts  = 9_999_999_999  # far future
-        result = tier_engine._fetch_thresholds()
-        assert result is cached
+        tier_engine._thresholds_cache    = cached
+        tier_engine._thresholds_cache_ts = 9_999_999_999
+        assert tier_engine._fetch_thresholds() is cached
 
-    # TE-11
     def test_fetch_thresholds_falls_back_to_defaults_on_error(self):
         from services import tier_engine
         with patch.object(tier_engine, "_client", side_effect=Exception("DB down")):
             tier_engine._thresholds_cache = None
             result = tier_engine._fetch_thresholds()
-        assert isinstance(result, dict)
-        assert "t1_min_volume" in result
+        assert isinstance(result, dict) and "t1_min_volume" in result
 
-    # TE-12
     def test_invalidate_clears_cache(self):
         from services import tier_engine
         tier_engine._thresholds_cache = {"t1_min_volume": 1}
@@ -162,247 +126,122 @@ class TestFetchThresholds:
 
 
 # ===========================================================================
-# TE-13 … TE-16  Admin endpoint: PATCH /tier-thresholds column whitelist
+# TE-13 … TE-16  Admin endpoint
 # ===========================================================================
 
 class TestAdminTierThresholds:
-    """Feature 4A: PATCH /tier-thresholds must only accept known columns."""
+    def _admin_src(self):
+        import pathlib
+        p = pathlib.Path("backend/routers/admin.py")
+        if not p.exists():
+            p = pathlib.Path("routers/admin.py")
+        return p.read_text()
 
-    # TE-13
     def test_admin_module_has_patch_tier_thresholds_route(self):
-        import pathlib
-        src = pathlib.Path("backend/routers/admin.py")
-        if not src.exists():
-            src = pathlib.Path("routers/admin.py")
-        text = src.read_text()
-        assert "tier-thresholds" in text or "tier_thresholds" in text, (
-            "admin.py must define the PATCH /tier-thresholds endpoint (Feature 4A)."
-        )
+        text = self._admin_src()
+        assert "tier-thresholds" in text or "tier_thresholds" in text
 
-    # TE-14
     def test_admin_tier_thresholds_route_has_whitelist(self):
-        import pathlib
-        src = pathlib.Path("backend/routers/admin.py")
-        if not src.exists():
-            src = pathlib.Path("routers/admin.py")
-        text = src.read_text()
-        assert "ALLOWED_TIER_COLUMNS" in text or "allowed_columns" in text.lower(), (
-            "PATCH /tier-thresholds must define a column whitelist to prevent "
-            "injection of arbitrary DB columns."
-        )
+        text = self._admin_src()
+        assert "ALLOWED_TIER_COLUMNS" in text or "allowed_columns" in text.lower()
 
-    # TE-15
     def test_admin_tier_distribution_route_exists(self):
-        import pathlib
-        src = pathlib.Path("backend/routers/admin.py")
-        if not src.exists():
-            src = pathlib.Path("routers/admin.py")
-        text = src.read_text()
-        assert "tier-distribution" in text or "tier_distribution" in text, (
-            "admin.py must define GET /tier-distribution endpoint (Feature 4A)."
-        )
+        text = self._admin_src()
+        assert "tier-distribution" in text or "tier_distribution" in text
 
-    # TE-16
     def test_admin_invalidates_cache_after_patch(self):
-        """PATCH handler must call invalidate_thresholds_cache() after DB update."""
-        import pathlib
-        src = pathlib.Path("backend/routers/admin.py")
-        if not src.exists():
-            src = pathlib.Path("routers/admin.py")
-        text = src.read_text()
-        assert "invalidate_thresholds_cache" in text, (
-            "PATCH /tier-thresholds must invalidate the in-process cache after "
-            "updating the DB row, or stale thresholds will be used until restart."
-        )
+        assert "invalidate_thresholds_cache" in self._admin_src()
 
 
 # ===========================================================================
-# TE-17 … TE-20  _TierParams + ContractMeta.tier (symbol_registry.py)
+# TE-17 … TE-20  _TierParams + ContractMeta.tier
 # ===========================================================================
 
 class TestTierParamsAndContractMeta:
-    """Feature 4A: _TierParams dataclass and ContractMeta.tier field."""
-
-    # TE-17
     def test_tier_params_dataclass_exists(self):
         from services.symbol_registry import _TierParams
-        assert hasattr(_TierParams, "__dataclass_fields__") or hasattr(_TierParams, "atm_pct"), (
-            "symbol_registry._TierParams must be a dataclass with atm_pct/max_dte fields."
-        )
+        assert hasattr(_TierParams, "__dataclass_fields__") or hasattr(_TierParams, "atm_pct")
 
-    # TE-18
     def test_tier_params_has_atm_pct_and_max_dte(self):
         from services.symbol_registry import _TierParams
         p = _TierParams(atm_pct=0.20, max_dte=90)
-        assert p.atm_pct == 0.20
-        assert p.max_dte == 90
+        assert p.atm_pct == 0.20 and p.max_dte == 90
 
-    # TE-19
     def test_contract_meta_has_tier_field(self):
         import inspect
         from services.symbol_registry import ContractMeta
-        fields = set()
         if hasattr(ContractMeta, "__dataclass_fields__"):
             fields = set(ContractMeta.__dataclass_fields__.keys())
         else:
-            try:
-                fields = set(vars(ContractMeta()).keys())
-            except Exception:
-                pass
-        assert "tier" in fields, (
-            "ContractMeta must carry a 'tier' field (int, 1/2/3) so downstream "
-            "signal layers know the symbol's tier without re-querying the DB."
-        )
-        _ = inspect  # used above
+            fields = set(inspect.signature(ContractMeta.__init__).parameters.keys()) - {"self"}
+        assert "tier" in fields
 
-    # TE-20
     def test_tier_params_t1_wider_than_t3(self):
-        """T1 must have wider ATM window and longer DTE than T3 by default."""
         from services.symbol_registry import _TierParams
         t1 = _TierParams(atm_pct=0.20, max_dte=90)
         t3 = _TierParams(atm_pct=0.10, max_dte=30)
-        assert t1.atm_pct > t3.atm_pct
-        assert t1.max_dte > t3.max_dte
+        assert t1.atm_pct > t3.atm_pct and t1.max_dte > t3.max_dte
 
 
 # ===========================================================================
-# TE-21 … TE-22  tier_map round-trip via upsert_symbol_quotes
+# TE-21 … TE-22  tier_map round-trip
 # ===========================================================================
 
 class TestTierMapRoundTrip:
-    """Feature 4A: upsert_symbol_quotes must write tier column to DB rows."""
-
-    # TE-21
     def test_upsert_symbol_quotes_accepts_tier_map(self):
-        """upsert_symbol_quotes signature must accept a tier_map kwarg."""
         import inspect
         from services.universe_store import upsert_symbol_quotes
-        sig = inspect.signature(upsert_symbol_quotes)
-        assert "tier_map" in sig.parameters, (
-            "upsert_symbol_quotes() must accept a tier_map parameter (Feature 4A)."
-        )
+        assert "tier_map" in inspect.signature(upsert_symbol_quotes).parameters
 
-    # TE-22
     def test_upsert_symbol_quotes_writes_tier_to_row(self):
-        """When tier_map is provided, each upserted row must include the tier value."""
         from services import universe_store
-
-        sb   = MagicMock()
-        q    = MagicMock()
+        sb = MagicMock()
+        q  = MagicMock()
         q.upsert.return_value  = q
         q.execute.return_value = MagicMock(data=[])
         sb.table.return_value  = q
-
         quotes   = {"SPY": {"last": 502.0, "open_interest": 50000, "average_volume": 80_000_000}}
         tier_map = {"SPY": 1}
-
         with patch.object(universe_store, "_client", return_value=sb):
             universe_store._sync_upsert_symbol_quotes(quotes, tier_map=tier_map)
-
-        upsert_calls = q.upsert.call_args_list
-        assert len(upsert_calls) >= 1
-        rows = upsert_calls[0].args[0]
-        if isinstance(rows, list):
-            rows_with_tier = [r for r in rows if r.get("symbol") == "SPY"]
-            assert len(rows_with_tier) == 1
-            assert rows_with_tier[0].get("tier") == 1, (
-                "upsert_symbol_quotes must write tier=1 for SPY when tier_map={SPY:1}."
-            )
-        else:
-            assert rows.get("tier") == 1
+        rows = q.upsert.call_args_list[0].args[0]
+        sprow = (rows if not isinstance(rows, list) else next(r for r in rows if r.get("symbol") == "SPY"))
+        assert sprow.get("tier") == 1
 
 
 # ===========================================================================
-# TE-23 … TE-26  OI grace-path removal regression (Feature 4A-OI)
+# TE-23 … TE-26  OI grace-path removal regression
 # ===========================================================================
 
 class TestOiGracePathRemoved:
-    """
-    Regression guard: ensures the OI grace path (promoting oi=0 symbols to
-    T1/T2 based on vol+price alone) is permanently gone from _classify().
-
-    If Chunk 1B is ever reverted, TE-23 and TE-24 will fail immediately.
-    These tests use _classify() directly so they are independent of the
-    async assign_tiers() machinery.
-    """
-
     def _thresh(self):
         return {
-            "t1_min_volume":     20_000_000,
-            "t1_min_last_price": 10.0,
-            "t1_min_oi":         1_000,
-            "t1_atm_pct":        0.20,
-            "t1_max_dte":        90,
-            "t2_min_volume":     2_000_000,
-            "t2_min_last_price": 10.0,
-            "t2_min_oi":         500,
-            "t2_atm_pct":        0.15,
-            "t2_max_dte":        60,
-            "t3_min_volume":     500_000,
-            "t3_min_last_price": 1.0,
-            "t3_min_oi":         100,
-            "t3_atm_pct":        0.10,
-            "t3_max_dte":        30,
+            "t1_min_volume": 20_000_000, "t1_min_last_price": 10.0, "t1_min_oi": 1_000,
+            "t1_atm_pct": 0.20, "t1_max_dte": 90,
+            "t2_min_volume": 2_000_000,  "t2_min_last_price": 10.0, "t2_min_oi": 500,
+            "t2_atm_pct": 0.15, "t2_max_dte": 60,
+            "t3_min_volume": 500_000,    "t3_min_last_price": 1.0,  "t3_min_oi": 100,
+            "t3_atm_pct": 0.10, "t3_max_dte": 30,
         }
 
-    def _make_quote(self, symbol, vol, price, oi):
-        """Minimal SymbolQuote-compatible object for _classify()."""
+    def _q(self, sym, vol, price, oi):
         q = MagicMock()
-        q.symbol         = symbol
-        q.average_volume = vol
-        q.volume         = vol
-        q.last_price     = price
-        q.open_interest  = oi
+        q.symbol = sym; q.average_volume = vol; q.volume = vol
+        q.last_price = price; q.open_interest = oi
         return q
 
-    # TE-23
     def test_oi_zero_t1_vol_price_yields_t3_not_t1(self):
-        """
-        REGRESSION: symbol with T1-qualifying vol+price but oi=0 must be T3.
-        Old grace path returned 1; correct behaviour is 3.
-        """
         from services.tier_engine import _classify
-        q    = self._make_quote("AAPL", vol=25_000_000, price=150.0, oi=0)
-        tier = _classify(q, self._thresh())
-        assert tier == 3, (
-            f"Grace path regression: oi=0 AAPL should be T3 but _classify() returned T{tier}. "
-            "Chunk 1B (OI grace removal) may have been reverted."
-        )
+        assert _classify(self._q("AAPL", 25_000_000, 150.0, 0), self._thresh()) == 3
 
-    # TE-24
     def test_oi_zero_t2_vol_price_yields_t3_not_t2(self):
-        """
-        REGRESSION: symbol with T2-qualifying vol+price but oi=0 must be T3.
-        Old grace path returned 2; correct behaviour is 3.
-        """
         from services.tier_engine import _classify
-        q    = self._make_quote("HOOD", vol=3_000_000, price=15.0, oi=0)
-        tier = _classify(q, self._thresh())
-        assert tier == 3, (
-            f"Grace path regression: oi=0 HOOD should be T3 but _classify() returned T{tier}. "
-            "Chunk 1B (OI grace removal) may have been reverted."
-        )
+        assert _classify(self._q("HOOD", 3_000_000, 15.0, 0), self._thresh()) == 3
 
-    # TE-25
     def test_real_oi_at_t1_threshold_promotes_to_t1(self):
-        """oi exactly at t1_min_oi=1000 with T1 vol+price must yield T1."""
         from services.tier_engine import _classify
-        q    = self._make_quote("NVDA", vol=25_000_000, price=900.0, oi=1_000)
-        tier = _classify(q, self._thresh())
-        assert tier == 1, (
-            f"NVDA with oi=1000 (== t1_min_oi) should be T1 but got T{tier}."
-        )
+        assert _classify(self._q("NVDA", 25_000_000, 900.0, 1_000), self._thresh()) == 1
 
-    # TE-26
     def test_real_oi_one_below_t1_threshold_stays_t2(self):
-        """
-        Off-by-one boundary: oi=999 (< t1_min_oi=1000) with T1 vol+price
-        must fall to T2, not T1, because the check is >=.
-        """
         from services.tier_engine import _classify
-        q    = self._make_quote("NVDA", vol=25_000_000, price=900.0, oi=999)
-        tier = _classify(q, self._thresh())
-        assert tier == 2, (
-            f"NVDA with oi=999 (one below t1_min_oi=1000) should be T2 but got T{tier}. "
-            "Check that T1 condition uses >= not >."
-        )
+        assert _classify(self._q("NVDA", 25_000_000, 900.0, 999), self._thresh()) == 2
