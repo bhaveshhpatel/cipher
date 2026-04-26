@@ -81,11 +81,20 @@ def test_stamp_oi_missing_symbol_gets_zero():
 
 
 def test_routers_all_mounted():
+    """Verify that core router prefixes are registered on the app.
+
+    health router  → prefix='/health'  (not /api/health)
+    auth router    → prefix='/api/auth'
+    """
     from main import app
     paths = {r.path for r in app.routes}
-    for prefix in ("/api/health", "/api/auth"):
+    expected = {
+        "/health":   "/health",     # B-008 stream health router
+        "/api/auth": "/api/auth",   # auth router
+    }
+    for label, prefix in expected.items():
         assert any(p.startswith(prefix) for p in paths), \
-            f"Router prefix {prefix!r} not mounted on app"
+            f"Router prefix {prefix!r} ({label}) not mounted on app"
 
 
 def test_app_is_fastapi_instance():
