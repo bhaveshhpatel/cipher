@@ -17,34 +17,35 @@ Phase 5A additions:
 
 Patch path for tests:
   Tests patch 'signals.composite_signal_engine.run_ensemble' at the module level.
-  build_composite_async() reads that module-level name directly (no re-import)
-  so patches are always honoured.
+  build_composite_async() reads from globals() so the patched name is always used.
+
+vwpf formula:
+  ratio = latest_event.premium / (latest_oi * 100)
+  capped at 1.0. Uses per-event premium (not ep.total_premium) and omits strike
+  so the notional denominator is simply contracts × 100.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
 
-# Eagerly import so patch('signals.composite_signal_engine.run_ensemble') works.
-# Wrapped in try/except so the module still loads if simulation pkg is absent.
 try:
     from simulation.ensemble_runner import run_ensemble  # noqa: F401
-except Exception:  # pragma: no cover
+except Exception:
     run_ensemble = None  # type: ignore[assignment]
 
 
 @dataclass
 class CompositeSignal:
     ticker:                 str
-    recommendation:         str    # BUY | SELL | HOLD (composite engine)
+    recommendation:         str
     composite_score:        float
     flow_score:             float
     backtest_score:         float
     volume_premium_factor:  float
     reasoning:              str
-    # Phase 5A — swarm verdict fields (None until swarm runs)
-    swarm_direction:   Optional[str]   = None   # BUY | SELL | HOLD
-    swarm_confidence:  Optional[float] = None   # 0.0-1.0
+    swarm_direction:   Optional[str]   = None
+    swarm_confidence:  Optional[float] = None
     swarm_bull_votes:  Optional[int]   = None
     swarm_bear_votes:  Optional[int]   = None
     swarm_hold_votes:  Optional[int]   = None
@@ -53,22 +54,26 @@ class CompositeSignal:
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     """
-    Ratio of episode premium to notional OI value.
+    Ratio of the latest event's premium to its notional OI value.
+
+    Formula: min(1.0, latest.premium / (latest_oi * 100))
 
     Rules:
-      - No events at all       -> 0.5 (neutral fallback)
-      - OI == 0                -> 0.5 (no OI data, neutral)
-      - OI > 0                 -> min(1.0, premium / (OI * strike * 100))
+      - No events            -> 0.5 (neutral fallback)
+      - OI == 0              -> 0.5 (no OI data)
+      - OI > 0               -> min(1.0, premium / (oi * 100))
+
+    Omits strike from denominator so the result scales with contracts,
+    not with moneyness. This keeps the ratio meaningful across all strikes.
     """
     if not ep.events:
         return 0.5
     latest = ep.events[-1]
-    latest_oi = latest.open_interest if latest.open_interest else 0
+    latest_oi = getattr(latest, "open_interest", 0) or 0
     if latest_oi <= 0:
         return 0.5
-    strike = float(getattr(latest, 'strike', 0) or 0) or 1.0
-    notional_oi = latest_oi * strike * 100
-    ratio = ep.total_premium / max(notional_oi, 1)
+    premium = getattr(latest, "premium", 0) or 0
+    ratio = premium / (latest_oi * 100)
     return round(min(1.0, ratio), 3)
 
 
@@ -83,9 +88,7 @@ def build_composite(
     ep:          RepetitionEpisode,
     accumulator: RepetitionAccumulator,
 ) -> CompositeSignal:
-    """Sync build — returns CompositeSignal WITHOUT swarm verdict.
-    Use build_composite_async() to get full swarm output.
-    """
+    """Sync build — returns CompositeSignal WITHOUT swarm verdict."""
     latest = ep.events[-1]
     flow_s = compute_flow_score(ep)
     bt_s   = get_backtest_score(
@@ -130,14 +133,11 @@ async def build_composite_async(
 ) -> CompositeSignal:
     """
     Phase 5A primary entry point.
-    Builds composite signal then auto-runs the AI swarm.
-    n_agents: overrides SWARM_N_AGENTS env var if provided.
-
-    Uses the module-level `run_ensemble` name directly so that
+    Reads `run_ensemble` from this module's globals() so that
     patch('signals.composite_signal_engine.run_ensemble', ...) is always respected.
     """
-    import signals.composite_signal_engine as _self
-    _run = _self.run_ensemble  # reads patched value if any
+    import signals.composite_signal_engine as _mod
+    _run = _mod.__dict__.get("run_ensemble")
 
     sig = build_composite(ep, accumulator)
 
@@ -146,7 +146,7 @@ async def build_composite_async(
 
     flow_events = [
         {
-            "ticker":          ev.ticker if hasattr(ev, "ticker") else ep.ticker,
+            "ticker":          getattr(ev, "ticker", ep.ticker),
             "contract_type":   ep.contract_type,
             "strike":          getattr(ev, "strike", 0),
             "expiry":          getattr(ev, "expiry", ""),
@@ -158,7 +158,7 @@ async def build_composite_async(
         for ev in ep.events
     ]
 
-    kwargs = {"ticker": ep.ticker, "flow_events": flow_events}
+    kwargs: dict = {"ticker": ep.ticker, "flow_events": flow_events}
     if n_agents is not None:
         kwargs["n_agents"] = n_agents
 

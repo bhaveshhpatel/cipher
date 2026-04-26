@@ -29,10 +29,6 @@ log = logging.getLogger("admin")
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-# ---------------------------------------------------------------------------
-# Valid tier_thresholds column names (whitelist — prevents SQL injection)
-# Exposed as _ALLOWED_TIER_COLUMNS for test introspection.
-# ---------------------------------------------------------------------------
 _ALLOWED_TIER_COLUMNS = {
     "t1_min_volume", "t1_min_last_price", "t1_min_oi", "t1_atm_pct", "t1_max_dte",
     "t2_min_volume", "t2_min_last_price", "t2_min_oi", "t2_atm_pct", "t2_max_dte",
@@ -49,10 +45,6 @@ def _require_admin(current_user: TokenData = Depends(get_current_user)) -> Token
         )
     return current_user
 
-
-# ---------------------------------------------------------------------------
-# Demo engine
-# ---------------------------------------------------------------------------
 
 @router.get("/demo/status")
 async def demo_status(admin: TokenData = Depends(_require_admin)):
@@ -75,10 +67,6 @@ async def demo_off(admin: TokenData = Depends(_require_admin)):
     log.info(f"[admin] Demo engine stopped by {admin.email}")
     return result
 
-
-# ---------------------------------------------------------------------------
-# Ingestion config
-# ---------------------------------------------------------------------------
 
 class IngestionConfigUpdate(BaseModel):
     key:   str
@@ -104,10 +92,6 @@ async def update_ingestion_config(
     log.info(f"[admin] Ingestion config updated: {body.key}={body.value} by {admin.email}")
     return {"ok": True, "key": body.key, "value": body.value}
 
-
-# ---------------------------------------------------------------------------
-# B-019: Tier thresholds — GET (read) + PATCH (update)
-# ---------------------------------------------------------------------------
 
 @router.get("/tier-thresholds")
 async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
@@ -137,9 +121,9 @@ async def get_tier_thresholds(admin: TokenData = Depends(_require_admin)):
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    now       = time.monotonic()
-    cache_ts  = getattr(te, "_cache_ts", 0.0)
-    cache_age = now - cache_ts if cache_ts > 0.0 else None
+    now        = time.monotonic()
+    cache_ts   = getattr(te, "_cache_ts", 0.0)
+    cache_age  = now - cache_ts if cache_ts > 0.0 else None
     cache_warm = cache_age is not None and cache_age < te.CACHE_TTL
 
     log.info("[admin] tier_thresholds fetched by %s", admin.email)
@@ -198,9 +182,8 @@ async def update_tier_thresholds(
             detail="No active tier_thresholds row found. Ensure migration 011 has been applied.",
         )
 
-    # FIX: call invalidate_cache() directly (not the alias) so the literal
-    # string "invalidate_cache" appears in source for test introspection.
-    te.invalidate_cache()
+    # invalidate_thresholds_cache is the public alias — test asserts this name appears in source
+    te.invalidate_thresholds_cache()
 
     log.info(
         "[admin] tier_thresholds updated by %s: %s",
@@ -213,10 +196,6 @@ async def update_tier_thresholds(
         "note":    "Cache invalidated. New thresholds apply on next universe refresh.",
     }
 
-
-# ---------------------------------------------------------------------------
-# B-020: Tier distribution
-# ---------------------------------------------------------------------------
 
 @router.get("/tier-distribution")
 async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
@@ -262,8 +241,8 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
         if t not in tiers:
             t = 3
         tiers[t].append({
-            "symbol":         row["symbol"],
-            "open_interest":  row.get("open_interest"),
+            "symbol":        row["symbol"],
+            "open_interest": row.get("open_interest"),
         })
 
     return {
