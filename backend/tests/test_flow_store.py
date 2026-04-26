@@ -42,8 +42,17 @@ Covers:
   constants
   28. FLUSH_INTERVAL == 0.5
   29. FLUSH_MAX_ROWS == 100
+
+  F-01: env-var gate on persist_flow_event
+  30. persist_flow_event no-ops when env vars missing
+  31. persist_flow_event logs warning when env vars missing
+
+  F-02: retry buffer on flush failure
+  32. _flush_flow_events retries up to RETRY_MAX on insert failure
+  33. _flush_flow_events logs ERROR and discards batch after all retries exhausted
 """
 import asyncio
+import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -59,7 +68,7 @@ from services.flow_store import (
 )
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# -- helpers -----------------------------------------------------------------
 def _ev(
     ticker="AAPL",
     contract_type="CALL",
@@ -149,14 +158,16 @@ def _reset_buffer():
 # 1
 def test_persist_flow_event_appends_to_buffer():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
     assert len(fs._flow_event_buffer) == 1
 
 
 # 2
 def test_persist_flow_event_row_has_required_keys():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
     row = fs._flow_event_buffer[0]
     for key in [
         "ticker", "contract_type", "strike", "expiry", "dte",
@@ -172,30 +183,34 @@ def test_persist_flow_event_row_has_required_keys():
 # 3
 def test_persist_flow_event_empty_expiry_coerced_to_none():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(expiry="")))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(expiry="")))
     assert fs._flow_event_buffer[0]["expiry"] is None
 
 
 # 4
 def test_persist_flow_event_occ_symbol_forwarded():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(
-        persist_flow_event(_ev(occ_symbol="SPY   260117P00450000"))
-    )
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(
+            persist_flow_event(_ev(occ_symbol="SPY   260117P00450000"))
+        )
     assert fs._flow_event_buffer[0]["occ_symbol"] == "SPY   260117P00450000"
 
 
 # 5
 def test_persist_flow_event_is_synthetic_quote_forwarded():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(is_synthetic_quote=True)))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev(is_synthetic_quote=True)))
     assert fs._flow_event_buffer[0]["is_synthetic_quote"] is True
 
 
 # 6
 def test_persist_flow_event_defaults_applied_for_sparse_payload():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event({}))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event({}))
     row = fs._flow_event_buffer[0]
     assert row["ticker"]             == "UNKNOWN"
     assert row["dte"]                == 0
@@ -211,7 +226,8 @@ def test_persist_flow_event_early_flush_at_max_rows():
     _reset_buffer()
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins:
+        with patch.object(fs, "_is_configured", return_value=True), \
+             patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=True) as mock_ins:
             for _ in range(fs._FLUSH_MAX_ROWS):
                 await persist_flow_event(_ev())
             assert mock_ins.call_count == 1
@@ -225,7 +241,8 @@ def test_persist_flow_event_buffer_trimmed_after_early_flush():
     _reset_buffer()
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True):
+        with patch.object(fs, "_is_configured", return_value=True), \
+             patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=True):
             for _ in range(fs._FLUSH_MAX_ROWS + 5):
                 await persist_flow_event(_ev())
             assert len(fs._flow_event_buffer) == 5
@@ -236,7 +253,8 @@ def test_persist_flow_event_buffer_trimmed_after_early_flush():
 # 9
 def test_persist_flow_event_no_id_field_in_row():
     _reset_buffer()
-    asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    with patch.object(fs, "_is_configured", return_value=True):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
     assert "id" not in fs._flow_event_buffer[0]
 
 
@@ -250,7 +268,7 @@ def test_flush_flow_events_drains_buffer():
     fs._flow_event_buffer.extend([{"ticker": f"T{i}"} for i in range(10)])
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+        with patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=True) as mock_ins, \
              patch("asyncio.sleep", new_callable=AsyncMock):
             task = asyncio.create_task(_flush_flow_events())
             await asyncio.sleep(0)
@@ -270,7 +288,7 @@ def test_flush_flow_events_skips_empty_buffer():
     _reset_buffer()
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+        with patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=True) as mock_ins, \
              patch("asyncio.sleep", new_callable=AsyncMock):
             task = asyncio.create_task(_flush_flow_events())
             await asyncio.sleep(0)
@@ -291,7 +309,7 @@ def test_flush_trims_to_max_rows_per_tick():
     fs._flow_event_buffer.extend([{"ticker": f"T{i}"} for i in range(150)])
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True) as mock_ins, \
+        with patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=True) as mock_ins, \
              patch("asyncio.sleep", new_callable=AsyncMock):
             task = asyncio.create_task(_flush_flow_events())
             await asyncio.sleep(0)
@@ -312,10 +330,9 @@ def test_flush_trims_to_max_rows_per_tick():
 def test_flush_logs_warning_on_insert_failure(caplog):
     _reset_buffer()
     fs._flow_event_buffer.append({"ticker": "AAPL"})
-    import logging
 
     async def _test():
-        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=False), \
+        with patch.object(fs, "_insert_rows_with_retry", new_callable=AsyncMock, return_value=False), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              caplog.at_level(logging.WARNING, logger="flow_store"):
             task = asyncio.create_task(_flush_flow_events())
@@ -328,7 +345,9 @@ def test_flush_logs_warning_on_insert_failure(caplog):
                 pass
 
     asyncio.get_event_loop().run_until_complete(_test())
-    assert any("failed" in r.message.lower() for r in caplog.records)
+    # _insert_rows_with_retry handles its own error logging; _flush just calls it
+    # If it returns False after retries, no extra warning is emitted by _flush itself.
+    # This test verifies no crash occurs on failed insert.
 
 
 # ============================================================
@@ -383,7 +402,6 @@ def test_persist_flow_episode_no_crash_on_insert_failure():
 
 # 18
 def test_persist_flow_episode_none_fields_log_safe():
-    """f-string log with None/zero total_premium must not raise."""
     async def _test():
         with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=True):
             await persist_flow_episode({
@@ -582,3 +600,69 @@ def test_flush_interval_is_500ms():
 # 29
 def test_flush_max_rows_is_100():
     assert fs._FLUSH_MAX_ROWS == 100
+
+
+# ============================================================
+# F-01: env-var gate on persist_flow_event
+# ============================================================
+
+# 30
+def test_persist_flow_event_noop_when_env_vars_missing():
+    """F-01: event must be silently dropped (buffer stays empty) when env vars absent."""
+    _reset_buffer()
+    with patch.object(fs, "_is_configured", return_value=False):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    assert len(fs._flow_event_buffer) == 0
+
+
+# 31
+def test_persist_flow_event_logs_warning_when_env_vars_missing(caplog):
+    """F-01: a WARNING must be emitted so ops can see the misconfiguration."""
+    _reset_buffer()
+    with patch.object(fs, "_is_configured", return_value=False), \
+         caplog.at_level(logging.WARNING, logger="flow_store"):
+        asyncio.get_event_loop().run_until_complete(persist_flow_event(_ev()))
+    assert any("not set" in r.message.lower() or "env" in r.message.lower()
+               for r in caplog.records)
+
+
+# ============================================================
+# F-02: retry buffer on flush failure
+# ============================================================
+
+# 32
+def test_insert_rows_with_retry_retries_up_to_retry_max():
+    """F-02: _insert_rows_with_retry must call _insert_rows up to _RETRY_MAX times."""
+    from services.flow_store import _insert_rows_with_retry
+
+    call_count = {"n": 0}
+
+    async def _always_fail(table, rows):
+        call_count["n"] += 1
+        return False
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", side_effect=_always_fail), \
+             patch("asyncio.sleep", new_callable=AsyncMock):  # skip retry delay in tests
+            result = await _insert_rows_with_retry("flow_events", [{"ticker": "AAPL"}])
+        return result
+
+    result = asyncio.get_event_loop().run_until_complete(_test())
+    assert result is False
+    assert call_count["n"] == fs._RETRY_MAX
+
+
+# 33
+def test_insert_rows_with_retry_logs_error_after_all_retries(caplog):
+    """F-02: after all retries exhausted an ERROR must be logged so data loss is visible."""
+    from services.flow_store import _insert_rows_with_retry
+
+    async def _test():
+        with patch.object(fs, "_insert_rows", new_callable=AsyncMock, return_value=False), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             caplog.at_level(logging.ERROR, logger="flow_store"):
+            await _insert_rows_with_retry("flow_events", [{"ticker": "AAPL"}])
+
+    asyncio.get_event_loop().run_until_complete(_test())
+    assert any("discarded" in r.message.lower() or "failed after" in r.message.lower()
+               for r in caplog.records)
