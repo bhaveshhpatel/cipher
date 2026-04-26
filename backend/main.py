@@ -19,7 +19,7 @@ from routers import health          # B-008: stream health router
 from core.auth import get_current_user
 from fastapi import Depends
 from services.tradier_stream import stream_options_flow
-from services.symbols_loader import load_universe
+from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
 from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
@@ -110,7 +110,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
     )
 
     log.info("[universe] Step 2b: calling load_universe (CBOE + Tradier validate + screen)")
-    symbols, source, stream_eligible_set, quotes = await load_universe(db_snapshot=stale)
+    symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
     log.info(
         "[universe] Step 2b: load_universe returned source=%s symbols=%d eligible=%s",
         source, len(symbols),
@@ -118,6 +118,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
     )
 
     tier_map: dict[str, int] = {}
+    quotes: list = []
 
     if source == "tradier_validated":
         log.info(
@@ -131,6 +132,9 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
         else:
             log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
 
+        # Fetch quotes separately now that load_universe no longer returns them
+        log.info("[universe] Step 3b: fetching batch quotes for %d symbols", len(symbols))
+        quotes = await _fetch_batch_quotes(symbols)
         if quotes:
             log.info("[universe] Step 3b: preliminary tier assignment for %d symbols (OI not yet available)", len(quotes))
             tier_map = await assign_tiers(quotes)
@@ -145,7 +149,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
             source,
         )
-        quotes = []
 
     stream_symbols = (
         [s for s in symbols if s in stream_eligible_set]
@@ -177,11 +180,14 @@ async def _universe_refresh_loop():
         log.info("[universe] Background refresh starting")
         try:
             stale = await universe_store.load_any_snapshot()
-            symbols, source, stream_eligible_set, quotes = await load_universe(db_snapshot=stale)
+            symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
+            quotes: list = []
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
                 tier_map: dict[str, int] = {}
 
+                # Fetch quotes separately
+                quotes = await _fetch_batch_quotes(symbols)
                 if saved and quotes:
                     registry = get_registry()
                     if registry:
