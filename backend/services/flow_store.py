@@ -292,3 +292,35 @@ class FlowStore:
     def size(self) -> int:
         """Return the number of stored flow events."""
         return len(self._flows)
+
+
+# ---------------------------------------------------------------------------
+# Module-level in-memory async API — used by Layer5/E2E regression tests.
+#
+# Tests call:  await fs.add_flow(...)  /  await fs.get_flows(ticker)  /
+#              await fs.clear_flows()
+# on the module directly (import services.flow_store as fs).
+#
+# This singleton is intentionally separate from the Supabase DB writer path
+# so tests never touch the network.
+# ---------------------------------------------------------------------------
+
+_store = FlowStore()
+
+
+async def add_flow(flow: dict) -> None:
+    """Append *flow* to the module-level in-memory store."""
+    _store.add_flow(flow)
+
+
+async def get_flows(ticker: str) -> List[dict]:
+    """Return all in-memory flow events whose 'ticker' key matches *ticker*."""
+    return [
+        f for f in _store.get_flows()
+        if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
+    ]
+
+
+async def clear_flows() -> None:
+    """Clear the module-level in-memory store. Called between tests."""
+    _store.clear()
