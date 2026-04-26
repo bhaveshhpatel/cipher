@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+// Always use relative URLs so requests go through the Next.js proxy.
+// Direct use of NEXT_PUBLIC_API_URL bypasses the proxy and causes CORS
+// preflight failures in production.
 
 export interface DemoStats {
   running:           boolean;
@@ -27,7 +29,7 @@ export function useAdminDemo(token: string | null) {
   const fetchStatus = useCallback(async () => {
     if (!token) return;
     try {
-      const res = await fetch(`${API}/api/admin/demo/status`, {
+      const res = await fetch("/api/admin/demo/status", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
@@ -49,7 +51,7 @@ export function useAdminDemo(token: string | null) {
     setError(null);
     try {
       const endpoint = on ? "on" : "off";
-      const res = await fetch(`${API}/api/admin/demo/${endpoint}`, {
+      const res = await fetch(`/api/admin/demo/${endpoint}`, {
         method:  "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -62,7 +64,6 @@ export function useAdminDemo(token: string | null) {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      // Always clear loading — even on error
       setLoading(false);
     }
   }, [token, fetchStatus]);
