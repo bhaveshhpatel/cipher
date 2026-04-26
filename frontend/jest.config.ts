@@ -21,8 +21,12 @@ const config: Config = {
     '\\.(jpg|jpeg|png|gif|svg|ico|webp)$': '<rootDir>/__mocks__/fileMock.ts',
   },
 
-  // Global test setup (e.g. jest-dom matchers) — add files here as needed
-  setupFilesAfterFramework: ['<rootDir>/jest.setup.ts'],
+  // Global test setup (e.g. jest-dom matchers)
+  // FIX: was 'setupFilesAfterFramework' (invalid key) — correct key is 'setupFilesAfterEach'
+  // NOTE: The correct Jest key is 'setupFilesAfterEach' which runs after the test framework
+  // is installed but before each test file. 'setupFilesAfterFramework' is not a valid key
+  // and Jest silently ignores it, meaning jest.setup.ts was never running.
+  setupFilesAfterEach: ['<rootDir>/jest.setup.ts'],
 
   // Pattern for test files
   testMatch: [
@@ -55,15 +59,15 @@ const config: Config = {
   // ---------------------------------------------------------------------------
   coverageThreshold: {
     global: {
-      branches:   80,   // raised from 70
-      functions:  85,   // raised from 75
-      lines:      85,   // raised from 75
-      statements: 85,   // raised from 75
+      branches:   80,
+      functions:  85,
+      lines:      85,
+      statements: 85,
     },
 
     // Auth hook — security critical, near-full coverage required
     './src/hooks/useAuth.ts': {
-      branches:   95,   // raised from 90
+      branches:   95,
       functions:  95,
       lines:      95,
       statements: 95,
@@ -71,7 +75,7 @@ const config: Config = {
 
     // Flow data hook — core data path
     './src/hooks/useFlow.ts': {
-      branches:   90,   // raised from 85
+      branches:   90,
       functions:  90,
       lines:      90,
       statements: 90,

@@ -42,7 +42,7 @@ jobs:
   # Job 2: Regression test suite with coverage gate
   # Runs in PARALLEL with lint (no needs: lint) — fails fast independently.
   # pip cache keyed on both requirements files so cache hit = ~5s install.
-  # --cov-fail-under=90 enforced.
+  # --cov-fail-under=92 enforced (aligned with pytest.ini).
   # -------------------------------------------------------------------------
   regression:
     name: Regression Tests + Coverage Gate
@@ -98,16 +98,21 @@ jobs:
             --tb=short \
             -q \
             --cov=. \
+            --cov-branch \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
-            --cov-fail-under=90
+            --cov-report=json:coverage.json \
+            --cov-fail-under=92 \
+            --cov-config=.coveragerc
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: backend-coverage
-          path: backend/coverage.xml
+          path: |
+            backend/coverage.xml
+            backend/coverage.json
           retention-days: 14
 
       - name: Coverage summary comment on PR
@@ -116,7 +121,7 @@ jobs:
         with:
           coverageFile: backend/coverage.xml
           token:        ${{ secrets.GITHUB_TOKEN }}
-          thresholdAll: 0.90
+          thresholdAll: 0.92
           thresholdNew: 0.90
           thresholdModified: 0.85
 

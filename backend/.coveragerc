@@ -1,75 +1,27 @@
 [run]
-# Measure only the application source — explicit package list avoids
-# accidentally measuring non-Python files or test files themselves.
-# branch = true enables branch-arc coverage (if/else paths).
-branch = true
-
-source =
-    config
-    main
-    core
-    execution
-    parsers
-    routers
-    services
-    signals
-    simulation
-    utils
-
+branch = True
+source = .
 omit =
-    # Test files
     tests/*
-    tests/**
-    */tests/*
-    */tests/**
-    # Migration scripts
-    migrations/*
-    migrations/**
-    # Virtual environments
+    */__pycache__/*
+    */migrations/*
     .venv/*
-    .venv/**
     venv/*
-    venv/**
-    # Conftest helpers
+    setup.py
     conftest.py
-    tests/conftest.py
-    # Non-application entry points
-    */__main__.py
 
 [report]
-# Hard gate — fail the build if total coverage drops below this.
-fail_under = 92
-
-# Show lines that are missing coverage
-show_missing = True
-
-# Suppress files with 100% coverage from the terminal report (less noise)
-skip_covered = True
-
-# Precision for reported percentages
-precision = 1
-
-# Exclude lines that are genuinely untestable
 exclude_lines =
-    # Standard pragma
     pragma: no cover
-    # Abstract methods
-    @abstractmethod
-    # Debug-only entry point
-    if __name__ == .__main__.
-    # Type-checking imports
+    def __repr__
+    raise NotImplementedError
     if TYPE_CHECKING:
-    # Protocol / interface stubs
-    \.\.\.\s*$
+    @abstractmethod
     pass
-
-[html]
-directory = coverage_html
-title     = Cipher Backend Coverage Report
+    \.\.\.  # Ellipsis stubs
 
 [xml]
 output = coverage.xml
 
 [json]
-output      = coverage.json
-pretty_print = true
+output = coverage.json

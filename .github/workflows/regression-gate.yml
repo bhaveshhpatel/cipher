@@ -14,7 +14,7 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Backend — pytest + coverage >= 92%
+  # Backend — pytest + coverage >= 92% + branch coverage
   # ---------------------------------------------------------------------------
   backend:
     name: Backend Regression Gate
@@ -54,6 +54,13 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+
+      - name: Syntax check (pyflakes)
+        working-directory: backend
+        run: |
+          pip install pyflakes
+          python -m pyflakes .
+          echo "Syntax check passed"
 
       - name: Purge bytecode cache
         working-directory: backend
@@ -97,7 +104,7 @@ jobs:
           thresholdModified: 0.85
 
   # ---------------------------------------------------------------------------
-  # Frontend — Jest + coverageThreshold enforced in jest.config.ts
+  # Frontend — type-check then Jest + coverageThreshold enforced in jest.config.ts
   # No package-lock.json in repo — cache: npm intentionally omitted.
   # ---------------------------------------------------------------------------
   frontend:
@@ -134,6 +141,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Gate — depends on both jobs. Add THIS as the required status check.
+  # Treats 'skipped' as a failure so jobs cannot be bypassed.
   # ---------------------------------------------------------------------------
   gate:
     name: All Regression Gates Passed
@@ -146,8 +154,9 @@ jobs:
         run: |
           echo "Backend status : ${{ needs.backend.result }}"
           echo "Frontend status: ${{ needs.frontend.result }}"
-          if [[ "${{ needs.backend.result }}" != "success" || "${{ needs.frontend.result }}" != "success" ]]; then
-            echo "One or more regression gates FAILED. Merge is blocked."
+          if [[ "${{ needs.backend.result }}"  != "success" || \
+                "${{ needs.frontend.result }}" != "success" ]]; then
+            echo "One or more regression gates FAILED or were SKIPPED. Merge is blocked."
             exit 1
           fi
           echo "All regression gates passed. Safe to merge."
