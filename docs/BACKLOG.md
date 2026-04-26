@@ -1,7 +1,7 @@
 # Cipher — Product Backlog
 
 > Maintained by: Dhruv Patel (bhaveshhpatel@yahoo.com)  
-> Last updated: 2026-04-25 (B-008 closed — stream health endpoint fully operational)  
+> Last updated: 2026-04-25 (Phase 5B — Regression Test Suite + CI Gate)  
 > **Status legend:** `🔲 Todo` · `🔄 In Progress` · `✅ Done` · `🚫 Dropped`
 
 ---
@@ -24,6 +24,10 @@
 | B-016 | Wire midcap screener into signal pipeline | 🔲 Todo | `signals/midcap_screener.py` exists but not confirmed in signal path. |
 | B-017 | Load test signals endpoints (50 concurrent users) | 🔲 Todo | Benchmark `/api/signals/list` and `/api/signals/history` under load. |
 | B-018 | WebSocket fan-out benchmark (50+ subscribers) | 🔲 Todo | Test `ws.py` throughput with many simultaneous clients. |
+| B-024 | Regression P4 — history/flow/ws full test coverage | 🔄 In Progress | `test_history_router.py`, `test_flow_router.py`, `test_ws_router.py` |
+| B-025 | Regression P5 — frontend UI component tests | 🔲 Todo | SignalFeed, FlowTable, SimulationPanel, login page, dashboard page |
+| B-026 | Frontend WS pong implementation | 🔲 Todo | Frontend must send `{"type":"pong"}` within 10s of ping or Railway kills connection (code 1001) |
+| B-027 | Raise coverage gates Phase 6 | 🔲 Todo | Backend: 90% → 95%. Frontend: 75% → 85% global. After P5 UI tests complete. |
 
 ---
 
@@ -31,32 +35,36 @@
 
 | # | Item | Completed | Notes |
 |---|------|-----------|-------|
-| B-008 | Stream health endpoint `GET /health/stream` | 2026-04-25 | `routers/health.py` — `StreamHealthOut` Pydantic model with 11 fields. `get_stats()` in `tradier_stream.py` exposes `mode`, `active_symbols`, `ticks`, `classified`, `deduped`, `signals`, `errors`, `reconnects`, `last_tick_at`, `last_reconnect_at`, `uptime_seconds`. Fix: `stream_worker.py` wires `_inc_global_error()` + `_inc_global_reconnect()` into all error/reconnect paths via lazy import. Tests: `test_stream_worker_b008.py` SW-01 through SW-05. |
-| B-023 | Handle 429 Explicitly in `get_session_token()` | 2026-04-25 | Explicit `if resp.status_code == 429:` before `raise_for_status()`. Reads `Retry-After` header (default 10s). Sleeps then retries within semaphore hold. `_DEFAULT_RETRY_AFTER_S = 10.0` constant. Tests: `test_tradier_client.py` TC-01 through TC-08. |
-| B-022 | Global Session Token Semaphore (max 3 concurrent) | 2026-04-25 | `_SESSION_SEM = asyncio.Semaphore(3)` wraps `get_session_token()`. 32 workers acquire tokens in ⌈32/3⌉ = 11 batches × ~400ms = ~4.4s one-time startup cost. Zero ongoing latency. Eliminates simultaneous 32-burst that caused silent 429 death spirals. Tests: `test_tradier_client.py` TC-01 through TC-08. |
-| B-021 | Stagger Worker Startup (200ms between workers) | 2026-04-25 | `_WORKER_STARTUP_STAGGER_MS=200` in `stream_manager.py`. Each worker receives `startup_delay_s = idx * 0.200`. One-time 6.4s startup spread; zero ongoing latency. `startup_delay_s` in `worker.stats` for `/health`. Tests: `test_stream_manager.py` tests 21–27 (`TestB021StaggeredStartup`). |
-| B-019 | Admin tier-thresholds UI + endpoints | 2026-04-25 | `GET /api/admin/tier-thresholds` (returns active row + cache metadata) + `PATCH /api/admin/tier-thresholds` (updates columns, busts in-process cache). `TierThresholdsCard` in admin page — per-field save, T1/T2/T3 grouped, dirty state, cache badge, last-updated footer. Migration 012 (RLS + updated_at trigger). Tests ADM-05 + ADM-06. |
-| B-020 | `GET /admin/tier-distribution` endpoint | 2026-04-25 | Returns `{ snapshot_id, total, tiers: { "1": {count, samples}, "2": ..., "3": ... } }` from active universe snapshot. Shipped in same commit as B-019. |
+| B-025-P1 | Regression P1 — auth/admin/config tests | 2026-04-25 | `test_auth_router.py` AUTH-01–15, `test_admin_router.py` ADMIN-01–12, `test_config.py` CFG-01–10, `test_demo_engine.py` DEMO-01–14 |
+| B-025-P2 | Regression P2 — dedup/swarm/ensemble/screener tests | 2026-04-25 | `test_dedup.py` DEDUP-01–22, `test_swarm_engine.py` SWM-01–25, `test_ensemble_runner.py` ENS-01–18, `test_midcap_screener.py` MCS-01–10 |
+| B-025-P3 | Regression P3 — executor/routers/main tests | 2026-04-25 | `test_trade_executor.py` TE-01–14, `test_simulation_router.py` SIM-01–12, `test_smart_signals_router.py` SS-01–16, `test_main_app.py` MAIN-01–15 |
+| B-025-CI | Regression CI gate setup | 2026-04-25 | `pytest.ini`, `.coveragerc`, `requirements-dev.txt` updated. `backend.yml` rebuilt (lint→regression). `frontend.yml` rebuilt (typecheck→regression→build→deploy). `jest.config.ts` with coverageThreshold. PR coverage bot via `orgoro/coverage@v3.2`. |
+| B-008 | Stream health endpoint `GET /health/stream` | 2026-04-25 | `routers/health.py` — `StreamHealthOut` Pydantic model with 11 fields. |
+| B-023 | Handle 429 Explicitly in `get_session_token()` | 2026-04-25 | Explicit `if resp.status_code == 429:`. Reads `Retry-After` header (default 10s). |
+| B-022 | Global Session Token Semaphore (max 3 concurrent) | 2026-04-25 | `_SESSION_SEM = asyncio.Semaphore(3)` wraps `get_session_token()`. |
+| B-021 | Stagger Worker Startup (200ms between workers) | 2026-04-25 | `_WORKER_STARTUP_STAGGER_MS=200` in `stream_manager.py`. |
+| B-019 | Admin tier-thresholds UI + endpoints | 2026-04-25 | `GET /api/admin/tier-thresholds` + `PATCH`. `TierThresholdsCard` UI. Migration 012. |
+| B-020 | `GET /admin/tier-distribution` endpoint | 2026-04-25 | Returns tier distribution from active universe snapshot. |
 | C-001 | Frontend deployment CI/CD fixed | 2026-04-22 | Fixed double-nested path bug, removed broken @secret refs from vercel.json. |
 | C-002 | Auth register/login 501 error fixed | 2026-04-23 | Next.js proxy: ReadableStream body bug, Next.js 15 async params, TS strict mode. |
 | C-003 | Tradier stream — 9 failure modes fixed | 2026-04-23 | Full production-grade resilience rewrite. |
-| C-004 | Options universe persistence | 2026-04-23 | ~8,000-symbol universe in Supabase. DB-first startup, 24h refresh, full fallback chain. 30 tests. |
-| C-005 | Tradier stream — market-hours guard + backoff fix | 2026-04-23 | `_is_market_hours()`, session_ticks-aware backoff, `market_closed` mode. |
-| C-006 | flow_store.py — fix wrong table + id field + log crash | 2026-04-23 | `persist_flow_episode()` targets `flow_episodes`. No `id` in row builders. f-string logs. 8 tests. |
-| C-007 | Phase 3 — composite score v2 + signals list | 2026-04-23 | `volume_premium_factor` (×0.10), weights 0.55/0.35/0.10, `/api/signals/list` endpoint, size==0 guard. |
-| C-008 | Phase 4 — signal history | 2026-04-23 | `signal_history` table, `signal_store.py`, `GET /api/signals/history`, `SignalHistory` component, History tab. |
-| C-009 | Phase 5A — AI swarm expansion (12 agents) | 2026-04-24 | `swarm_engine.py` 12-agent Groq swarm, `SWARM_N_AGENTS` config, swarm fields in `signal_history`. |
-| C-010 | Phase 5A — DedupCache (Layer 4) | 2026-04-24 | `utils/dedup.py` — 2s TTL dedup, sweep detection, module-level `flow_dedup` singleton. |
-| C-011 | Phase 5A — Symbol Registry (Layer 1) | 2026-04-24 | `services/symbol_registry.py` — OCC contract map, O(1) lookup, 30-min refresh. |
-| C-012 | Phase 5A — Stream Manager/Worker (Layer 2) | 2026-04-24 | `services/stream_manager.py` + `stream_worker.py` — 32 parallel Tradier connections. |
-| C-013 | Phase 5A — Trade Executor | 2026-04-24 | `execution/trade_executor.py` — Tradier REST order placement, paper + live mode. |
-| C-014 | Phase 5A — Migration 004 (swarm fields) | 2026-04-24 | `004_swarm_fields.sql` — adds swarm_direction, swarm_confidence, swarm_agents JSONB, vote counts. |
-| C-015 | fill_price bug fix — Layer 3 parser | 2026-04-24 | Stream sends `last` as fill price, not `price`. Fixed: `tick["last"] or tick.get("price") or 0`. |
-| C-016 | Layer 4 dedup not wired into hot path | 2026-04-24 | `DedupCache` was built (C-010) but `flow_dedup.is_duplicate()` was never called in `_process_trade()`. Fixed: added dedup gate + sweep upgrade in `tradier_stream.py`. Added `deduped` stat counter. Regression tests: `test_6layer_regression.py` tests L4-01 through L4-10. |
-| C-017 | Layer 2 manager.refresh() not hooked to registry loop | 2026-04-24 | `registry.refresh_loop()` rebuilt symbols every 30min but never notified `StreamManager`. Workers streamed stale OCC symbols. Fixed: `_registry_refresh_with_manager_notify()` calls `await manager.refresh()` after every rebuild. Regression tests: L2-01 through L2-06. |
-| C-018 | Layer 5 flush interval 5s → 500ms + 100-row early flush | 2026-04-24 | `_FLUSH_INTERVAL` was 5s (spec: 500ms). At 62K rows/day: ~430 rows per flush window. Fixed: `_FLUSH_INTERVAL=0.5`, `_FLUSH_MAX_ROWS=100`, early-flush in `persist_flow_event()`. Regression tests: L5-01 through L5-08. |
-| C-019 | Layer 4 dedup TTL + sweep detection overhaul | 2026-04-24 | TTL 2s→5s, sweep window 5s→8s, eliminated `int(ts//2)` bucket boundary bug, fill key 2dp→1dp, exchange field wired. 5 bugs fixed. Regression tests: C-019 suite in `test_6layer_regression.py`. |
-| C-020 | Feature 4A — Tier engine + universe tier assignment | 2026-04-25 | `services/tier_engine.py` (new): `TierEngine`, `_TierParams`, `set_tier_map()`, `get_tier()`, admin whitelist. `universe_store.load_tier_map()`. Migrations 010 + 011 applied. 35 tests across `test_4a_tier_engine.py`, `test_6layer_regression.py`, `test_universe_store.py`. |
+| C-004 | Options universe persistence | 2026-04-23 | ~8,000-symbol universe in Supabase. DB-first startup, 24h refresh, full fallback chain. |
+| C-005 | Tradier stream — market-hours guard + backoff fix | 2026-04-23 | |
+| C-006 | flow_store.py — fix wrong table + id field + log crash | 2026-04-23 | |
+| C-007 | Phase 3 — composite score v2 + signals list | 2026-04-23 | |
+| C-008 | Phase 4 — signal history | 2026-04-23 | |
+| C-009 | Phase 5A — AI swarm expansion (12 agents) | 2026-04-24 | |
+| C-010 | Phase 5A — DedupCache (Layer 4) | 2026-04-24 | |
+| C-011 | Phase 5A — Symbol Registry (Layer 1) | 2026-04-24 | |
+| C-012 | Phase 5A — Stream Manager/Worker (Layer 2) | 2026-04-24 | |
+| C-013 | Phase 5A — Trade Executor | 2026-04-24 | |
+| C-014 | Phase 5A — Migration 004 (swarm fields) | 2026-04-24 | |
+| C-015 | fill_price bug fix — Layer 3 parser | 2026-04-24 | |
+| C-016 | Layer 4 dedup not wired into hot path | 2026-04-24 | |
+| C-017 | Layer 2 manager.refresh() not hooked to registry loop | 2026-04-24 | |
+| C-018 | Layer 5 flush interval 5s → 500ms + 100-row early flush | 2026-04-24 | |
+| C-019 | Layer 4 dedup TTL + sweep detection overhaul | 2026-04-24 | |
+| C-020 | Feature 4A — Tier engine + universe tier assignment | 2026-04-25 | |
 
 ---
 
@@ -65,8 +73,8 @@
 | # | Item | Dropped | Reason |
 |---|------|---------|--------|
 | B-010 | Supabase DB — signal storage | 2026-04-23 | Completed as C-006 + C-008. All three signal tables live. |
-| B-014 | Confirm Layer 1 (SymbolRegistry) wired into stream pipeline | 2026-04-24 | Confirmed wired — registry enrichment in parser + registry built in stream_options_flow(). |
-| B-015 | Confirm Layer 2 (StreamManager + StreamWorker) wired into main | 2026-04-24 | Confirmed wired — StreamManager spawned in stream_options_flow() with process_fn=_process_trade. |
+| B-014 | Confirm Layer 1 (SymbolRegistry) wired into stream pipeline | 2026-04-24 | Confirmed wired. |
+| B-015 | Confirm Layer 2 (StreamManager + StreamWorker) wired into main | 2026-04-24 | Confirmed wired. |
 
 ---
 
@@ -74,26 +82,15 @@
 
 | Date | Change |
 |------|--------|
-| 2026-04-25 | Closed B-008 — Stream health endpoint: wired errors/reconnects/last_reconnect_at rollup into stream_worker.py via _inc_global_error()/_inc_global_reconnect(). 5 tests added (SW-01–SW-05). |
-| 2026-04-25 | Closed B-021 — Stagger worker startup shipped: `stream_manager.py` + `stream_worker.py` + 7 tests in `test_stream_manager.py`. |
-| 2026-04-25 | Closed B-022 — Session token semaphore(3) shipped in `tradier_client.py`. |
-| 2026-04-25 | Closed B-023 — Explicit 429 + Retry-After handler shipped in `tradier_client.py`. |
-| 2026-04-25 | Closed B-019 — Admin tier-thresholds: GET read endpoint, PATCH update, TierThresholdsCard UI, migration 012, tests ADM-05/06. |
-| 2026-04-25 | Closed B-020 — GET /admin/tier-distribution endpoint shipped in same commit as B-019. |
-| 2026-04-25 | Added C-020 — Feature 4A tier engine complete. Added B-019, B-020 admin tier endpoints to active backlog. |
-| 2026-04-24 | Added C-019 — Layer 4 dedup TTL overhaul (5 bugs). |
-| 2026-04-24 | Added C-016, C-017, C-018 — 6-layer gap-fix audit. Layer 4 dedup wired, Layer 2 refresh notify hooked, Layer 5 flush corrected to 500ms/100-row. |
-| 2026-04-24 | Closed B-014 and B-015 — Layer 1 and Layer 2 integration confirmed and verified. |
-| 2026-04-24 | Added C-009 through C-015 — Phase 5A completions (swarm, dedup, registry, stream manager, trade executor, fill_price fix) |
-| 2026-04-24 | Added B-014 through B-018 — Phase 6 TODOs (Layer 1/2 integration confirm, midcap screener, load tests) |
-| 2026-04-23 | Added C-008 — Phase 4 signal history |
-| 2026-04-23 | Added B-013 — wire signals/list tier filter to live data |
-| 2026-04-23 | Added C-007 — Phase 3 composite score v2 + signals list endpoint |
-| 2026-04-23 | Added C-006 — flow_store fix: wrong table, id field, f-string logs, 8 tests |
-| 2026-04-23 | Added B-012 — wire flow scan endpoint to live flow_episodes table |
-| 2026-04-23 | Added C-005 — Tradier market-hours guard + session_ticks backoff fix |
-| 2026-04-23 | Added C-004 options universe persistence — 30 tests |
-| 2026-04-22 | Created backlog with B-001 through B-007 |
-| 2026-04-22 | Added C-001 frontend deployment fix |
-| 2026-04-23 | Added C-002 auth 501 fix |
-| 2026-04-23 | Added C-003 Tradier stream resilience fix |
+| 2026-04-25 | Phase 5B complete: ~380 test cases, CI hard gate (≥90% backend, ≥75% frontend), PR coverage bot. Added B-024–B-027. |
+| 2026-04-25 | Closed B-008 — Stream health endpoint wired. |
+| 2026-04-25 | Closed B-021 — Stagger worker startup. |
+| 2026-04-25 | Closed B-022 — Session token semaphore(3). |
+| 2026-04-25 | Closed B-023 — Explicit 429 + Retry-After handler. |
+| 2026-04-25 | Closed B-019 — Admin tier-thresholds endpoints + UI. |
+| 2026-04-25 | Closed B-020 — GET /admin/tier-distribution. |
+| 2026-04-25 | Added C-020 — Feature 4A tier engine complete. |
+| 2026-04-24 | Added C-016, C-017, C-018, C-019 — 6-layer gap-fix audit. |
+| 2026-04-24 | Closed B-014 and B-015 — Layer 1 and Layer 2 integration confirmed. |
+| 2026-04-24 | Added C-009 through C-015 — Phase 5A completions. |
+| 2026-04-23 | Added C-001 through C-008. |

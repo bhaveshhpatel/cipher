@@ -1,6 +1,6 @@
 # Cipher — Claude Context File
 
-> Last updated: 2026-04-24 (Phase 5A)
+> Last updated: 2026-04-25 (Phase 5B — Regression Test Suite + CI Gate)
 > This file is the authoritative AI-assistant context document for the Cipher codebase.
 > Keep it updated after every phase so future sessions have full project context.
 
@@ -37,7 +37,7 @@ Built with:
 | Database | Supabase (PostgreSQL) |
 | Deploy (BE) | Railway |
 | Deploy (FE) | Vercel |
-| CI/CD | GitHub Actions |
+| CI/CD | GitHub Actions (regression-gated — see Phase 5B) |
 
 ---
 
@@ -62,7 +62,6 @@ Built with:
 - `smart_signals.py` router — `/api/signals/composite/{ticker}` endpoint
 - Multiple stream failure mode fixes (F1–F9): token refresh, 401 handling, watchdog, backoff with jitter
 - Flow store fixes (REG-FS-1 through REG-FS-3)
-- Comprehensive test suite
 
 ### Phase 3 — Volume-Weighted Scoring, Filters, Heartbeat
 - `options_flow_parser.py`: `size == 0` guard
@@ -74,28 +73,97 @@ Built with:
 
 ### Phase 4 — Live DB Wiring, Signal History, Flow Fix
 - **`services/signal_store.py`** (NEW): subscribes to `signal_writer` bus channel, persists every `CompositeSignal` to `signal_history` table using `SUPABASE_SERVICE_KEY`
-- **`routers/history.py`** (NEW): `GET /api/signals/history` — queries `signal_history` with full pagination + filters (ticker, direction, tier, min_conviction, limit, offset)
-- **`routers/flow.py`** (FIXED): was querying empty `flow_events` table — now correctly queries `flow_episodes` (82k+ live rows). Maps `direction→sentiment`, `alert_level→influence_tier`
-- **`routers/smart_signals.py`** (UPDATED): `/list` and `/composite/{ticker}` now query live `signal_history` DB first, fall back to deterministic mock if DB empty
-- **`main.py`** (UPDATED): registers `history.router`, starts `signal_write_task` (`start_signal_writer()`) alongside stream and flow writer tasks
-- **Migration 003**: `signal_history` table created
-- **Migration 005**: `signal_history` schema repair (NOT NULL columns, check constraints)
-- **Migration 006**: RLS policies for flow tables
-- **Migration 007**: Seed data
-- **Migration 008**: `flow_events.expiry` made nullable
+- **`routers/history.py`** (NEW): `GET /api/signals/history` — queries `signal_history` with full pagination + filters
+- **`routers/flow.py`** (FIXED): was querying empty `flow_events` — now correctly queries `flow_episodes` (82k+ live rows)
+- **`routers/smart_signals.py`** (UPDATED): live DB first, mock fallback
+- **`main.py`** (UPDATED): registers `history.router`, starts `signal_write_task`
+- Migrations 003, 005, 006, 007, 008
 
-### Phase 5A — AI Swarm Expansion + Dedup + Trade Executor (current)
-- **`simulation/swarm_engine.py`** (UPDATED): agent roster expanded to 12 (configurable via `SWARM_N_AGENTS` env var, snaps to nearest of 3/6/9/12). Primary provider: Groq `llama-3.3-70b-versatile`. Graceful HOLD fallback when no API key. `run()` accepts flow_events list OR pre-built summary string.
-- **`simulation/ensemble_runner.py`** (UPDATED): `run_ensemble()` correctly passes `flow_events` list to `SwarmEngine.run()`. `EnsembleResult` includes per-agent `name` field.
-- **`services/signal_store.py`** (UPDATED): `_build_row()` now persists swarm fields: `swarm_direction`, `swarm_confidence`, `swarm_agents` (JSONB), `swarm_bull_votes`, `swarm_bear_votes`, `swarm_hold_votes`. Three bug fixes applied (Postgres 23502, 23514 errors).
-- **`utils/dedup.py`** (NEW): 2-second TTL deduplication cache (`DedupCache`). Keys events on `(occ_symbol, size, fill_price_2dp, time_bucket_2s)`. Prevents same trade printing 4× across exchanges. Also detects sweeps (3+ exchanges within 5s window). Module-level singleton: `flow_dedup`.
-- **`utils/tradier_client.py`** (NEW): Tradier REST API client utility.
-- **`execution/trade_executor.py`** (NEW): `TradeExecutor` class — places option orders via Tradier REST API (`place_option_order`, `get_positions`). Used for paper trading or live execution.
-- **`services/stream_manager.py`** (NEW): Stream pool manager service.
-- **`services/stream_worker.py`** (NEW): Stream worker service.
-- **`services/symbol_registry.py`** (NEW): OCC Symbol Registry — Layer 1 of options flow architecture. Builds and refreshes OCC contract map. Configurable via `REGISTRY_*` env vars.
-- **`signals/midcap_screener.py`** (NEW): Mid-cap screener for signal filtering.
-- **Migration 004**: swarm fields added to `signal_history`
+### Phase 5A — AI Swarm Expansion + Dedup + Trade Executor
+- **`simulation/swarm_engine.py`**: 12-agent Groq `llama-3.3-70b-versatile` swarm. HOLD fallback when no API key.
+- **`simulation/ensemble_runner.py`**: majority-vote aggregator. `EnsembleResult` includes per-agent `name` field.
+- **`services/signal_store.py`**: persists swarm fields: `swarm_direction`, `swarm_confidence`, `swarm_agents` (JSONB), vote counts.
+- **`utils/dedup.py`** (NEW): 2s TTL dedup cache (`DedupCache`). Sweep = 3+ exchanges within 5s. Singleton: `flow_dedup`.
+- **`utils/tradier_client.py`** (NEW): Tradier REST API client.
+- **`execution/trade_executor.py`** (NEW): `TradeExecutor` — `place_option_order`, `get_positions`.
+- **`services/stream_manager.py`**, **`stream_worker.py`** (NEW): stream pool (32 parallel workers).
+- **`services/symbol_registry.py`** (NEW): OCC contract map registry.
+- **`signals/midcap_screener.py`** (NEW): mid-cap screener.
+- Migration 004: swarm fields on `signal_history`
+
+### Phase 5B — Regression Test Suite + CI Gate (CURRENT)
+- **Full automated regression test suite** covering the entire backend and frontend codebase.
+- **~380 test cases** across 13+ backend test files and frontend hook tests.
+- **CI hard gate**: backend ≥90% coverage (`--cov-fail-under=90`), frontend ≥75% lines/functions globally.
+- **Nothing deploys** to Railway or Vercel unless regression tests pass.
+- **PR coverage bot**: `orgoro/coverage@v3.2` posts coverage diff comment on every PR.
+- See `docs/REGRESSION_TESTING.md` for full test inventory, config files, and CI workflow YAMLs.
+
+#### New test files added in Phase 5B:
+| File | Cases | Covers |
+|---|---|---|
+| `test_auth_router.py` | ~15 | JWT register/login/me, expired token 401, missing header |
+| `test_admin_router.py` | ~12 | Tier CRUD, admin role guard, 403 non-admin |
+| `test_config.py` | ~10 | Settings types, defaults, key presence |
+| `test_demo_engine.py` | ~14 | Demo mode, mock determinism |
+| `test_ingestion_config.py` | ~12 | Ingestion toggle, env overrides |
+| `test_midcap_screener.py` | ~10 | Filter thresholds, pass/fail |
+| `test_ensemble_runner.py` | ~18 | Majority vote, tie-breaking, per-agent name |
+| `test_dedup.py` | ~22 | TTL dedup, sweep detection, singleton |
+| `test_swarm_engine.py` | ~25 | All 12 roles, HOLD fallback, confidence |
+| `test_trade_executor.py` | ~14 | market/limit order, OCC root, error paths |
+| `test_simulation_router.py` | ~12 | Validation bounds, flow_events serialised |
+| `test_smart_signals_router.py` | ~16 | DB hit/miss, filters, _row_to_composite |
+| `test_main_app.py` | ~15 | /health, routers mounted, _JsonFormatter, _stamp_oi |
+
+#### New CI/config files:
+- `backend/pytest.ini` — `asyncio_mode=auto`, `--cov-fail-under=90`, XML/HTML/terminal reports
+- `backend/.coveragerc` — omit rules, exclude_lines, `fail_under=90`
+- `backend/requirements-dev.txt` — added `pytest-cov`, `fastapi[all]`
+- `frontend/jest.config.ts` — `coverageThreshold` (global 75%, useAuth.ts 90%, useFlow.ts 85%)
+- `frontend/__mocks__/styleMock.ts` + `fileMock.ts`
+- `.github/workflows/backend.yml` — `lint → regression` jobs, dummy env vars, pip cache, coverage XML artifact, PR comment
+- `.github/workflows/frontend.yml` — `typecheck → regression → build → deploy` pipeline
+
+---
+
+## Test Suite — How to Run
+
+```bash
+# Backend — full suite
+cd backend
+pip install -r requirements-dev.txt
+pytest
+
+# Backend — skip coverage for speed
+pytest --no-cov
+
+# Frontend
+cd frontend
+npx jest --coverage
+```
+
+See `docs/REGRESSION_TESTING.md` for full reference.
+
+---
+
+## CI/CD Pipeline (Post Phase 5B)
+
+```
+Push to main (backend/**)
+  └── lint
+        └── regression (--cov-fail-under=90)
+              └── Railway auto-deploys via native integration
+
+Push to main (frontend/**)
+  └── typecheck + lint
+        └── regression (jest --ci --coverage, thresholds in jest.config.ts)
+              └── build
+                    └── deploy (vercel --prod)
+
+Pull Request
+  └── Same gates + orgoro/coverage posts PR comment with coverage diff
+```
 
 ---
 
@@ -115,7 +183,6 @@ Step 3: Tradier batch quotes → /v1/markets/quotes
         - Priority symbols always forced eligible
         - Upsert all symbols into options_universe_symbols table
 Step 4: Extract stream_eligible=true symbols → StreamPoolManager
-        (~1,000–2,000 after price/volume filter)
 Step 5: Save snapshot to options_universe_snapshots
 ```
 
@@ -129,7 +196,7 @@ Background refresh loop runs every 24h.
 
 ---
 
-## Signal Pipeline (Phase 5A)
+## Signal Pipeline
 
 ```
 Tradier SSE tick
@@ -168,7 +235,7 @@ Falls back to `0.5` neutral when OI is unavailable. Do not treat 0.5 as a signal
 
 ---
 
-## AI Swarm (Phase 5A)
+## AI Swarm
 
 - **Provider:** Groq `llama-3.3-70b-versatile` via OpenAI-compatible client
 - **Agent counts:** 3, 6, 9, or 12 — configured via `SWARM_N_AGENTS` env var, snaps to nearest valid
@@ -177,7 +244,7 @@ Falls back to `0.5` neutral when OI is unavailable. Do not treat 0.5 as a signal
   - Tier 2 (7–9): Options Flow Specialist, Quant/Statistical Arb, Sentiment Analyst
   - Tier 3 (10–12): Sector Rotation Strategist, Volatility Trader, Dark Pool/Tape Reader
 - **Verdict format:** each agent returns `VERDICT: BUY|SELL|HOLD`, `REASONING: ...`, `CONFIDENCE: 0.0–1.0`
-- **Ensemble:** majority vote → `EnsembleResult` with `bull_votes`, `bear_votes`, `hold_votes`, `confidence`
+- **Ensemble:** majority vote → `EnsembleResult`
 - **Swarm fields persisted to `signal_history`:** `swarm_direction`, `swarm_confidence`, `swarm_bull_votes`, `swarm_bear_votes`, `swarm_hold_votes`, `swarm_agents` (JSONB)
 - **Fallback:** all agents return HOLD when `GROQ_API_KEY` not set
 
@@ -205,78 +272,91 @@ Connection close codes:
 cipher/
 ├── .github/
 │   └── workflows/
-│       ├── backend.yml        # CI only — syntax check; NO deploy steps
-│       └── frontend.yml       # Vercel deploy via CLI
+│       ├── backend.yml        # lint → regression (≥90%) → Railway
+│       └── frontend.yml       # typecheck → regression (≥75%) → build → Vercel
 ├── backend/
-│   ├── main.py                # FastAPI app — startup, router registration, lifespan tasks
-│   ├── config.py              # pydantic-settings v2 — all env vars incl. SWARM_N_AGENTS, REGISTRY_*
+│   ├── main.py
+│   ├── config.py
+│   ├── pytest.ini             # ★ Phase 5B: coverage gate config
+│   ├── .coveragerc            # ★ Phase 5B: omit rules
 │   ├── requirements.txt
-│   ├── requirements-dev.txt
-│   ├── nixpacks.toml
-│   ├── runtime.txt            # python-3.11.9
-│   ├── .python-version        # 3.11.9
-│   ├── migrations/
-│   │   ├── 001_options_universe.sql
-│   │   ├── 002_universe_symbols_quotes.sql
-│   │   ├── 003_signal_history.sql
-│   │   ├── 004_swarm_fields.sql
-│   │   ├── 005_signal_history_repair.sql
-│   │   ├── 006_flow_tables_rls.sql
-│   │   ├── 007_seed_data.sql
-│   │   └── 008_flow_events_expiry_nullable.sql
+│   ├── requirements-dev.txt   # ★ Phase 5B: pytest-cov added
+│   ├── migrations/            # 001–012
 │   ├── core/
 │   │   ├── auth.py
 │   │   └── async_bus.py
 │   ├── parsers/
-│   │   ├── options_flow_parser.py     # size==0 guard
+│   │   ├── options_flow_parser.py
 │   │   ├── bid_ask_classifier.py
 │   │   └── trade_type_detector.py
 │   ├── services/
-│   │   ├── flow_store.py          # DB writer: flow_events + flow_episodes — SERVICE ROLE KEY only
-│   │   ├── signal_store.py        # [Phase 4/5A] DB writer: signal_history — SERVICE ROLE KEY only
-│   │   ├── symbols_loader.py      # Steps 1–3: CBOE fetch, validation, batch quotes
-│   │   ├── universe_store.py      # Steps 4–5: DB read/write + upsert_symbol_quotes
-│   │   ├── universe_screener.py   # DEPRECATED — OI-based screener, no longer called
-│   │   ├── tradier_stream.py      # Resilient WebSocket stream processor
-│   │   ├── stream_manager.py      # [Phase 5A] Stream pool manager
-│   │   ├── stream_worker.py       # [Phase 5A] Stream worker
-│   │   └── symbol_registry.py     # [Phase 5A] OCC contract map registry
+│   │   ├── flow_store.py
+│   │   ├── signal_store.py
+│   │   ├── symbols_loader.py
+│   │   ├── universe_store.py
+│   │   ├── tradier_stream.py
+│   │   ├── stream_manager.py
+│   │   ├── stream_worker.py
+│   │   └── symbol_registry.py
 │   ├── signals/
 │   │   ├── repetition_accumulator.py
-│   │   ├── composite_signal_engine.py   # 3-component scoring
+│   │   ├── composite_signal_engine.py
 │   │   ├── backtest_validator.py
-│   │   └── midcap_screener.py           # [Phase 5A]
+│   │   └── midcap_screener.py
 │   ├── simulation/
-│   │   ├── swarm_engine.py        # [Phase 5A] 12-agent Groq LLM swarm
-│   │   └── ensemble_runner.py     # [Phase 5A] Majority-vote aggregator
+│   │   ├── swarm_engine.py
+│   │   └── ensemble_runner.py
 │   ├── execution/
-│   │   └── trade_executor.py      # [Phase 5A] Tradier order placement
+│   │   └── trade_executor.py
 │   ├── utils/
-│   │   ├── dedup.py               # [Phase 5A] 2s TTL dedup + sweep detection
-│   │   └── tradier_client.py      # [Phase 5A] Tradier REST client
+│   │   ├── dedup.py
+│   │   └── tradier_client.py
 │   ├── routers/
-│   │   ├── ws.py              # WebSocket + ping/pong heartbeat
-│   │   ├── smart_signals.py   # /composite/{ticker} + /list — live DB + mock fallback
-│   │   ├── history.py         # [Phase 4] /api/signals/history — signal_history table
-│   │   ├── flow.py            # /api/flow/scan — queries flow_episodes (FIXED Phase 4)
+│   │   ├── ws.py
+│   │   ├── smart_signals.py
+│   │   ├── history.py
+│   │   ├── flow.py
 │   │   ├── auth.py
-│   │   └── simulation.py
-│   └── tests/
+│   │   ├── simulation.py
+│   │   ├── admin.py
+│   │   └── health.py
+│   └── tests/                 # ★ Phase 5B: ~380 cases across 19+ files
+│       ├── test_auth_router.py
+│       ├── test_admin_router.py
+│       ├── test_config.py
+│       ├── test_demo_engine.py
+│       ├── test_ingestion_config.py
+│       ├── test_midcap_screener.py
+│       ├── test_ensemble_runner.py
+│       ├── test_dedup.py
+│       ├── test_swarm_engine.py
+│       ├── test_trade_executor.py
+│       ├── test_simulation_router.py
+│       ├── test_smart_signals_router.py
+│       ├── test_main_app.py
 │       ├── test_symbols_loader.py
 │       ├── test_tradier_stream.py
 │       ├── test_flow_store.py
-│       └── test_universe_store.py
+│       ├── test_universe_store.py
+│       ├── test_4a_tier_engine.py
+│       └── test_health_stream.py
 ├── frontend/
-│   └── (Next.js 14 app — src/, __tests__/, vercel.json)
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── BACKLOG.md
-│   ├── FIXES.md
-│   ├── SIGNAL_ENGINE.md
-│   ├── features.md
-│   ├── regression-test-plan.md
-│   └── specs.md
-└── claude.md                  # This file
+│   ├── jest.config.ts         # ★ Phase 5B: coverageThreshold enforced
+│   ├── __mocks__/
+│   │   ├── styleMock.ts
+│   │   └── fileMock.ts
+│   └── src/
+│       ├── app/
+│       ├── components/
+│       ├── hooks/
+│       ├── lib/api.ts
+│       └── types/
+└── docs/
+    ├── REGRESSION_TESTING.md  # ★ Phase 5B: full test suite reference (NEW)
+    ├── ARCHITECTURE.md
+    ├── BACKLOG.md
+    ├── FIXES.md
+    └── SIGNAL_ENGINE.md
 ```
 
 ---
@@ -287,6 +367,8 @@ cipher/
 |------|---------|
 | `backend/main.py` | FastAPI app, lifespan startup, all router registration |
 | `backend/config.py` | Pydantic settings — all env vars |
+| `backend/pytest.ini` | pytest config — `asyncio_mode=auto`, `--cov-fail-under=90` |
+| `backend/.coveragerc` | coverage.py omit rules, `fail_under=90` |
 | `backend/services/tradier_stream.py` | SSE stream loop, market-hours guard, demo mode, stats |
 | `backend/parsers/options_flow_parser.py` | Tradier tick → `OptionsFlowEvent`, size==0 guard |
 | `backend/parsers/bid_ask_classifier.py` | ABOVE_ASK / AT_ASK / MID / AT_BID / BELOW_BID |
@@ -310,6 +392,8 @@ cipher/
 | `backend/routers/simulation.py` | Paper trading simulation |
 | `backend/core/async_bus.py` | In-memory async event bus |
 | `backend/core/auth.py` | JWT decode, `get_current_user` dependency |
+| `frontend/jest.config.ts` | Jest config with `coverageThreshold` per-file and global |
+| `docs/REGRESSION_TESTING.md` | Full regression test suite reference |
 
 ---
 
@@ -320,37 +404,19 @@ cipher/
 | POST | `/api/auth/register` | No | Register user |
 | POST | `/api/auth/login` | No | Login, returns JWT |
 | GET | `/api/auth/me` | JWT | Current user info |
-| GET | `/api/signals/composite/{ticker}` | JWT | Single-ticker composite signal (DB first, mock fallback) |
-| GET | `/api/signals/list` | JWT | Paginated signal list (DB first, mock fallback) |
-| GET | `/api/signals/history` | JWT | Paginated signal_history with full filters |
-| GET | `/api/signals/stream/stats` | JWT | Stream stats (ticks, signals, mode) |
-| GET | `/api/stream/stats` | JWT | Alias for stream stats |
-| GET | `/api/flow/scan` | JWT | Live flow scan from flow_episodes table |
-| POST | `/api/simulate` | JWT | Run paper trading simulation |
+| GET | `/api/signals/composite/{ticker}` | JWT | Single-ticker composite signal |
+| GET | `/api/signals/list` | JWT | Paginated signal list |
+| GET | `/api/signals/history` | JWT | Paginated signal_history |
+| GET | `/api/signals/stream/stats` | JWT | Stream stats |
+| GET | `/api/flow/scan` | JWT | Live flow scan |
+| POST | `/api/simulation/run` | JWT | Run swarm simulation |
+| GET | `/api/admin/tier-thresholds` | JWT+Admin | Read tier thresholds |
+| PATCH | `/api/admin/tier-thresholds` | JWT+Admin | Update tier thresholds |
+| GET | `/api/admin/tier-distribution` | JWT+Admin | Current tier distribution |
+| GET | `/api/health/stream` | No | Stream health |
 | WS | `/ws/signals?token=<jwt>` | JWT (query) | Live signal stream |
 | GET | `/health` | No | Health check |
 | GET | `/` | No | Root — version info |
-
-### `/api/signals/history` Query Params
-
-| Param | Type | Default | Constraints |
-|-------|------|---------|-------------|
-| `ticker` | string | — | 1–10 chars |
-| `direction` | string | — | `bullish` / `bearish` / `neutral` |
-| `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
-| `min_conviction` | float | 0.0 | 0.0–1.0 |
-| `limit` | int | 50 | 1–200 |
-| `offset` | int | 0 | ≥0 |
-
-### `/api/signals/list` Query Params
-
-| Param | Type | Default | Constraints |
-|-------|------|---------|-------------|
-| `page` | int | 1 | ≥1 |
-| `page_size` | int | 20 | 1–100 |
-| `direction` | string | — | `bullish` / `bearish` / `neutral` |
-| `tier` | string | — | `whale` / `institutional` / `large` / `retail` |
-| `min_conviction` | float | 0.0 | 0.0–1.0 |
 
 ---
 
@@ -363,16 +429,17 @@ cipher/
 | `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields |
 | `options_universe_symbols` | `universe_store.py` | ANON_KEY | Symbol quotes, stream_eligible |
 | `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
+| `tier_thresholds` | Admin API | SERVICE_KEY | T1/T2/T3 classification thresholds |
 
 ---
 
 ## Supabase Critical Rules
 
-1. **Always use `SUPABASE_SERVICE_KEY`** for all writes to `flow_episodes`, `flow_events`, `signal_history` — the anon key fails with `42501` due to RLS
-2. **Never send `id` fields** for `flow_events` (uuid) or `flow_episodes` (bigserial) — Postgres generates them
+1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`
+2. **Never send `id` fields** for `flow_events` (uuid) or `flow_episodes` (bigserial)
 3. **No `.select()` chained after `.insert()`** in supabase-py v2
 4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
-5. **Env var is `SUPABASE_SERVICE_KEY`** (NOT `SUPABASE_SERVICE_ROLE_KEY`) — config.py uses `SUPABASE_SERVICE_KEY`
+5. **Env var is `SUPABASE_SERVICE_KEY`** (NOT `SUPABASE_SERVICE_ROLE_KEY`)
 
 ### Supabase Key Reference
 
@@ -394,7 +461,7 @@ cipher/
 | C-009 | `universe_screener.py` deprecated — replaced by `_fetch_batch_quotes()` |
 | C-010 | `flow_store.py` was falling back to anon key — fixed to require `SUPABASE_SERVICE_KEY` exclusively |
 | C-011 | `flow.py` was querying empty `flow_events` — fixed to query `flow_episodes` |
-| C-012 | `signal_store.py` `_build_row()` omitting NOT NULL columns — Postgres 23502. Fixed: `alert_level`, `sentiment`, `premium`, `trade_type`, `is_golden_sweep` now always populated |
+| C-012 | `signal_store.py` `_build_row()` omitting NOT NULL columns — Postgres 23502 |
 | C-013 | `direction` column check constraint — REPEAT_BUY→BUY, REPEAT_SELL→SELL. Postgres 23514 |
 | C-014 | `trade_type` NOT NULL — unrecognised values fall back to `SINGLE` |
 | C-015 | `influence_tier` NOT NULL — unrecognised values fall back to `RETAIL` |
@@ -421,18 +488,13 @@ TRADIER_BASE_URL=https://api.tradier.com
 TRADIER_STREAM_URL=https://stream.tradier.com
 
 # AI
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
 GROQ_API_KEY=                  # PRIMARY — used by swarm_engine.py (llama-3.3-70b-versatile)
 
 # Misc
-REDIS_URL=redis://localhost:6379
 ALLOWED_ORIGINS=http://localhost:3000
 
 # Universe pipeline
 UNIVERSE_PRIORITY_SYMBOLS=SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD
-UNIVERSE_BATCH_DELAY_MS=0
-UNIVERSE_STREAM_ELIGIBLE_DEFAULT=true
 UNIVERSE_MIN_PRICE=1.0
 UNIVERSE_MIN_VOLUME=500000
 UNIVERSE_QUOTES_BATCH_SIZE=200
@@ -454,7 +516,7 @@ REGISTRY_EXPIRY_DAY_REFRESH_MINS=15
 ## Important Implementation Notes
 
 ### SUPABASE_SERVICE_KEY vs SUPABASE_SERVICE_ROLE_KEY
-The env var in `config.py` and throughout the codebase is **`SUPABASE_SERVICE_KEY`** (no `_ROLE_` in the name). Old docs referenced `SUPABASE_SERVICE_ROLE_KEY` — that is wrong. Always use `SUPABASE_SERVICE_KEY`.
+The env var in `config.py` is **`SUPABASE_SERVICE_KEY`** (no `_ROLE_`). Old docs used `SUPABASE_SERVICE_ROLE_KEY` — that is wrong.
 
 ### flow_events vs flow_episodes
 `flow_events` has 0 rows. All 82k+ live flow records are in `flow_episodes`. Never query `flow_events` for live data.
@@ -476,7 +538,7 @@ if isinstance(quotes_raw, dict):
 DEPRECATED. Kept for backward test compatibility only. Do NOT re-add call from `load_universe()`.
 
 ### volume_premium_factor OI Fallback
-Falls back to `0.5` neutral when OI unavailable. Do not treat 0.5 as a signal — it means OI data was absent.
+Falls back to `0.5` neutral when OI unavailable. Do not treat 0.5 as a signal.
 
 ### Frontend WS Pong
 Frontend must send `{"type":"pong"}` within 10s of receiving `{"type":"ping"}` or connection closes with code 1001. **Status: not yet confirmed implemented in frontend.**
@@ -488,8 +550,11 @@ Frontend must send `{"type":"pong"}` within 10s of receiving `{"type":"ping"}` o
 - Frontend: implement WS pong response
 - Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
 - WebSocket fan-out benchmark with 50+ subscribers
-- Investigate OI field availability per symbol (affects `volume_premium_factor` fallback rate)
 - Wire `TradeExecutor` into simulation router for live paper trade execution
-- `stream_manager.py` + `stream_worker.py` integration — confirm wired into main stream loop
-- `symbol_registry.py` — confirm integrated into flow pipeline
-- `signals/midcap_screener.py` — confirm integrated into signal pipeline
+- Confirm `stream_manager.py` + `stream_worker.py` wired into main stream loop
+- Confirm `symbol_registry.py` integrated into flow pipeline
+- Confirm `signals/midcap_screener.py` integrated into signal pipeline
+- Investigate OI field availability per symbol (affects `volume_premium_factor` fallback rate)
+- Add frontend UI component tests (SignalFeed, FlowTable, SimulationPanel, login page)
+- Raise backend `--cov-fail-under` from 90% to 95% once UI tests added
+- Raise frontend Jest global threshold from 75% to 85%
