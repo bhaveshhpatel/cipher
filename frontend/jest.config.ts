@@ -22,11 +22,7 @@ const config: Config = {
   },
 
   // Global test setup (e.g. jest-dom matchers)
-  // FIX: was 'setupFilesAfterFramework' (invalid key) — correct key is 'setupFilesAfterEach'
-  // NOTE: The correct Jest key is 'setupFilesAfterEach' which runs after the test framework
-  // is installed but before each test file. 'setupFilesAfterFramework' is not a valid key
-  // and Jest silently ignores it, meaning jest.setup.ts was never running.
-  setupFilesAfterEach: ['<rootDir>/jest.setup.ts'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.ts'],
 
   // Pattern for test files
   testMatch: [

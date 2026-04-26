@@ -24,7 +24,7 @@ jest.mock("next/navigation", () => ({
 const mockLogout = jest.fn();
 
 const defaultAuthState = {
-  token:           "fake.jwt.token",
+  token:           "fake.jwt.token" as string | undefined,
   email:           "trader@cipher.io",
   isAuthenticated: true,
   ready:           true,
@@ -84,13 +84,13 @@ describe("DashboardPage", () => {
   // ── auth guard ──────────────────────────────────────────────────────────────
 
   it("[AUTH GUARD] redirects to / when not authenticated and ready", async () => {
-    withAuthState({ isAuthenticated: false, ready: true, token: null });
+    withAuthState({ isAuthenticated: false, ready: true, token: undefined });
     render(<DashboardPage />);
     await waitFor(() => expect(mockReplace).toHaveBeenCalledWith("/"));
   });
 
   it("[AUTH GUARD] does NOT redirect while ready=false (prevents flicker)", () => {
-    withAuthState({ isAuthenticated: false, ready: false, token: null });
+    withAuthState({ isAuthenticated: false, ready: false, token: undefined });
     render(<DashboardPage />);
     expect(mockReplace).not.toHaveBeenCalled();
   });

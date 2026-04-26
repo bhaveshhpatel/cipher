@@ -54,17 +54,17 @@ function dbRowToWsSignal(row: {
 }): WsSignal {
   const dir = row.direction?.toUpperCase() ?? row.recommendation;
   return {
-    ticker:         row.ticker,
-    direction:      dir === "BUY" || dir === "SELL" ? dir : "HOLD",
-    alert_level:    row.composite_score >= 0.75 ? "CONVICTION" : row.composite_score >= 0.55 ? "STRONG_SIGNAL" : "ALERT",
+    ticker:           row.ticker,
+    direction:        dir === "BUY" || dir === "SELL" ? dir : "HOLD",
+    alert_level:      row.composite_score >= 0.75 ? "CONVICTION" : row.composite_score >= 0.55 ? "STRONG_SIGNAL" : "ALERT",
     conviction_score: row.composite_score,
-    total_premium:  row.total_premium ?? 0,
-    trade_count:    row.trade_count ?? 0,
-    is_accelerating: row.is_accelerating,
-    timestamp:      row.created_at,
-    contract_type:  row.contract_type ?? undefined,
-    strike:         undefined,
-    expiry:         undefined,
+    total_premium:    row.total_premium ?? 0,
+    trade_count:      row.trade_count ?? 0,
+    is_accelerating:  row.is_accelerating,
+    timestamp:        row.created_at,
+    contract_type:    row.contract_type ?? undefined,
+    strike:           undefined,
+    expiry:           undefined,
   };
 }
 
@@ -150,9 +150,9 @@ export function SignalFeed({ signals, connected, token }: Props) {
             <span className="text-xs font-mono" style={{ color: "var(--muted)" }}>{s.expiry}</span>
           )}
 
-          {s.total_premium > 0 && (
+          {(s.total_premium ?? 0) > 0 && (
             <span className="font-mono font-semibold text-sm tabular" style={{ color: "var(--amber)" }}>
-              {fmt$(s.total_premium)}
+              {fmt$(s.total_premium ?? 0)}
             </span>
           )}
 
@@ -165,7 +165,7 @@ export function SignalFeed({ signals, connected, token }: Props) {
 
           {s.is_accelerating && <span className="badge badge-amber">⚡ Accel</span>}
 
-          {s.trade_count > 0 && (
+          {(s.trade_count ?? 0) > 0 && (
             <span className="text-xs font-mono" style={{ color: "var(--faint)" }}>
               {s.trade_count} trades
             </span>

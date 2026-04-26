@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { authAPI } from "@/lib/api";
+import { api as authAPI } from "@/lib/api";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "";
 

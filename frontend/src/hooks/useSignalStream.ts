@@ -5,6 +5,7 @@ export interface WsSignal {
   ticker: string; direction: string; contract_type?: string; strike?: number;
   expiry?: string; total_premium?: number; trade_count?: number; alert_level: string;
   is_accelerating?: boolean; seed_episode?: string; timestamp: string;
+  conviction_score?: number;
 }
 
 /**

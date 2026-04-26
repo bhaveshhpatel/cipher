@@ -1,6 +1,5 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
 
 interface SmartSignal {
   ticker:           string;
@@ -48,10 +47,23 @@ export function SmartSignals() {
   const [sortDir, setSortDir] = useState<"asc"|"desc">("desc");
 
   useEffect(() => {
+    const token = typeof window !== "undefined"
+      ? localStorage.getItem("cipher_token")
+      : null;
+    if (!token) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
-    api.get<SmartSignal[]>("/smart-signals")
-      .then(d => { setSignals(d); setLoading(false); })
-      .catch(e => { setError(e.message); setLoading(false); });
+    fetch("/api/signals/smart", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as Promise<SmartSignal[]>;
+      })
+      .then((d: SmartSignal[]) => { setSignals(d); setLoading(false); })
+      .catch((e: Error) => { setError(e.message); setLoading(false); });
   }, []);
 
   const sorted = [...signals].sort((a, b) => {
@@ -157,6 +169,7 @@ export function SmartSignals() {
                       </span>
                     </td>
                     <td className="px-3 py-3">
+
                       <span className="text-xs font-bold uppercase tracking-wider" style={{ color: alertColor(s.alert_level) }}>
                         {s.alert_level.replace("_", " ")}
                       </span>

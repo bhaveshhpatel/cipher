@@ -25,7 +25,7 @@ export function StreamStatsBar({ stats }: Props) {
     : "—";
 
   return (
-    <div className="flex items-center justify-center flex-wrap divide-x" style={{ divideColor: "var(--border)" }}>
+    <div className="flex items-center justify-center flex-wrap divide-x divide-[var(--border)]">
       <StatItem label="Active Symbols" value={stats.active_symbols} accent="var(--amber)" />
       <StatItem label="Ticks"          value={stats.ticks} />
       <StatItem label="Classified"     value={stats.classified} />

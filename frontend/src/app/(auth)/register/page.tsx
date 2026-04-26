@@ -2,11 +2,11 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { authAPI } from "@/lib/api";
+import { api as authAPI } from "@/lib/api";
 
 export default function RegisterPage() {
   const router = useRouter();
-  const [form,    setForm]    = useState({ username: "", email: "", password: "", confirm: "" });
+  const [form,    setForm]    = useState({ email: "", password: "", confirm: "" });
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState<string | null>(null);
 
@@ -15,10 +15,10 @@ export default function RegisterPage() {
     if (form.password !== form.confirm) { setError("Passwords do not match"); return; }
     setLoading(true); setError(null);
     try {
-      await authAPI.register(form.username, form.email, form.password);
+      await authAPI.register(form.email, form.password);
       router.push("/login?registered=1");
-    } catch (err: any) {
-      setError(err.message ?? "Registration failed");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
       setLoading(false);
     }
@@ -52,7 +52,6 @@ export default function RegisterPage() {
           )}
 
           {[
-            { label: "Username", key: "username", type: "text",     autoComplete: "username" },
             { label: "Email",    key: "email",    type: "email",    autoComplete: "email" },
             { label: "Password", key: "password", type: "password", autoComplete: "new-password" },
             { label: "Confirm Password", key: "confirm", type: "password", autoComplete: "new-password" },
@@ -62,7 +61,7 @@ export default function RegisterPage() {
                      style={{ color: "var(--faint)" }}>{label}</label>
               <input
                 type={type} required autoComplete={autoComplete}
-                value={(form as any)[key]}
+                value={(form as Record<string, string>)[key]}
                 onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
                 className="rounded-md px-3 py-2.5 text-sm font-mono outline-none transition-all"
                 style={inputStyle}

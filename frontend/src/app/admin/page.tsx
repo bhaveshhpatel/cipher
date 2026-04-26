@@ -756,7 +756,7 @@ function TierThresholdsCard({ token }: { token: string | null }) {
   const isDirty = (key: string) =>
     row !== null &&
     edits[key] !== undefined &&
-    edits[key] !== String((row as Record<string, unknown>)[key] ?? "");
+    edits[key] !== String((row as unknown as Record<string, unknown>)[key] ?? "");
 
   const tierGroups: { tier: 1 | 2 | 3; fields: typeof TIER_FIELDS }[] = [
     { tier: 1, fields: TIER_FIELDS.filter(f => f.tier === 1) },
