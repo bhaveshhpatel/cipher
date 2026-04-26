@@ -39,6 +39,18 @@ Fix (F-03) -- Surgical worker restart on refresh():
   their original index (idx * _WORKER_STARTUP_STAGGER_S) to maintain
   B-021 behaviour.
 
+Fix (S-06) -- Stale-worker detection in stats (Round 3):
+  stats property now includes:
+    stale_workers  -- count of workers whose last_tick_at is None (never
+                      ticked) or older than _STALE_WORKER_THRESHOLD_S (60s).
+                      Surfaces directly in /health so ops can detect
+                      disconnected/frozen workers without iterating
+                      worker_detail.
+    worker_detail  -- each row now carries last_tick_at and session_ticks
+                      forwarded from the S-04 worker stats (Round 2).
+  _STALE_WORKER_THRESHOLD_S = 60.0 constant added.
+  No behaviour changes -- purely additive to the stats property.
+
 USAGE in main.py:
   manager = StreamManager(registry=registry, process_fn=_process_trade)
   asyncio.create_task(manager.run())
@@ -46,6 +58,7 @@ USAGE in main.py:
 import asyncio
 import logging
 import math
+import time as _time
 from typing import Callable, Awaitable, Optional
 
 from services.symbol_registry import SymbolRegistry
@@ -59,6 +72,9 @@ _QUEUE_SIZE  = 10_000  # max buffered events before dropping
 # B-021: delay between successive worker starts (seconds)
 _WORKER_STARTUP_STAGGER_MS: int   = 200
 _WORKER_STARTUP_STAGGER_S:  float = _WORKER_STARTUP_STAGGER_MS / 1000.0
+
+# S-06: a worker is considered stale if it hasn't ticked within this window
+_STALE_WORKER_THRESHOLD_S: float = 60.0
 
 
 class StreamManager:
@@ -242,9 +258,18 @@ class StreamManager:
 
     @property
     def stats(self) -> dict:
+        now              = _time.time()
         total_ticks      = sum(w._ticks      for w in self._workers)
         total_errors     = sum(w._errors     for w in self._workers)
         total_reconnects = sum(w._reconnects for w in self._workers)
+
+        # S-06: count workers that have never ticked or haven't ticked recently
+        stale_workers = sum(
+            1 for w in self._workers
+            if w._last_tick_at is None
+            or (now - w._last_tick_at) > _STALE_WORKER_THRESHOLD_S
+        )
+
         return {
             "workers":           len(self._workers),
             "active_symbols":    self._registry.size(),
@@ -252,6 +277,9 @@ class StreamManager:
             "total_ticks":       total_ticks,
             "total_errors":      total_errors,
             "total_reconnects":  total_reconnects,
+            # S-06: stale worker count surfaces directly in /health
+            "stale_workers":     stale_workers,
+            # S-06: forward S-04 worker fields into worker_detail
             "worker_detail":     [w.stats for w in self._workers],
         }
 

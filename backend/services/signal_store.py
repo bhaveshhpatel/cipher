@@ -21,22 +21,22 @@ Bug fix (2026-04-24 #3):
   - trade_type is NOT NULL -- None caused 23502 again. Falls back to 'SINGLE'.
   - influence_tier is NOT NULL with no default -- falls back to 'RETAIL'.
 
-Fix (S-01) -- Env-var name corrected:
+Fix (S-01) -- Env-var name corrected (Round 2):
   - _SUPABASE_KEY now reads SUPABASE_SERVICE_ROLE_KEY first (with
-    SUPABASE_SERVICE_KEY as legacy fallback). Previously signal_store
-    only tried SUPABASE_SERVICE_KEY which is NOT the Railway env var name,
-    so every composite signal insert silently failed with a False return
-    from _insert_signal() while the service appeared healthy.
-  - start_signal_writer() warning message updated to name the correct var.
+    SUPABASE_SERVICE_KEY as legacy fallback).
 
-Fix (S-02) -- Retry buffer on insert failure:
+Fix (S-02) -- Retry buffer on insert failure (Round 2):
   - _insert_signal_with_retry() wraps _insert_signal() with up to
-    _RETRY_MAX=3 attempts and _RETRY_DELAY_S=1.0s backoff on transient
-    failures (network blip, Supabase 5xx). After all retries an ERROR
-    is logged so the data loss is visible in Railway logs / alerting.
-  - persist_composite_signal() now calls _insert_signal_with_retry()
-    instead of _insert_signal() directly.
-  - Matches the retry pattern introduced for flow_store in Round 1 (F-02).
+    _RETRY_MAX=3 attempts and _RETRY_DELAY_S=1.0s backoff.
+
+Fix (S-05) -- Mid-run env-var guard (Round 3):
+  - _is_configured() helper mirrors flow_store._is_configured().
+  - persist_composite_signal() calls _is_configured() at entry and returns
+    immediately (with a WARNING log) if env vars are absent. Previously
+    the function only bailed silently deep inside _insert_signal_with_retry,
+    with no per-call warning visible in logs.
+  - start_signal_writer() early-return check refactored to use
+    _is_configured() for consistency.
 
 Subscribes to the async event bus on the 'signal_writer' channel and
 persists every CompositeSignal to the `signal_history` table.
@@ -72,6 +72,15 @@ _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
 # S-02: retry constants for failed inserts
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
+
+
+def _is_configured() -> bool:
+    """
+    S-05: Return True only when both Supabase env vars are present.
+    Mirrors flow_store._is_configured() so callers can guard cheaply
+    before attempting any network I/O.
+    """
+    return bool(_SUPABASE_URL and _SUPABASE_KEY)
 
 
 def _headers() -> dict:
@@ -248,6 +257,16 @@ def _build_row(sig: dict, ep: Optional[dict] = None) -> dict:
 
 
 async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
+    # S-05: guard at the call site so a missing env var is visible in logs
+    # immediately rather than silently failing deep inside the retry loop.
+    if not _is_configured():
+        log.warning(
+            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set "
+            "-- composite signal for %s DROPPED (not persisted).",
+            sig.get("ticker", "UNKNOWN"),
+        )
+        return
+
     row = _build_row(sig, ep)
     ok  = await _insert_signal_with_retry(row)  # S-02: retry on transient failure
     if ok:
@@ -293,9 +312,9 @@ async def _bus_signal_listener() -> None:
 
 
 async def start_signal_writer() -> None:
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
+    # S-05: use _is_configured() for consistency with persist_composite_signal
+    if not _is_configured():
         log.warning(
-            # S-01: reference the correct Railway env var name
             "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
             "composite signals will NOT be persisted. "
             "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
