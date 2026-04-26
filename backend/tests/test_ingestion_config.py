@@ -3,12 +3,7 @@ Regression tests for ingestion config loading and validation.
 """
 import os
 import pytest
-from unittest.mock import patch
 
-
-# ---------------------------------------------------------------------------
-# Import smoke
-# ---------------------------------------------------------------------------
 
 def test_ingestion_config_importable():
     import ingestion.config  # noqa: F401
@@ -16,14 +11,9 @@ def test_ingestion_config_importable():
 
 def test_ingestion_config_has_expected_attributes():
     import ingestion.config as cfg
-    # At minimum, a config module should expose some symbol/setting
     assert hasattr(cfg, "SYMBOLS") or hasattr(cfg, "DEFAULT_SYMBOLS") \
         or hasattr(cfg, "get_symbols") or hasattr(cfg, "settings")
 
-
-# ---------------------------------------------------------------------------
-# Symbol loading
-# ---------------------------------------------------------------------------
 
 def test_get_symbols_returns_list():
     import ingestion.config as cfg
@@ -63,10 +53,6 @@ def test_default_symbols_contains_spy():
     assert "SPY" in symbols or "AAPL" in symbols
 
 
-# ---------------------------------------------------------------------------
-# Env-var overrides
-# ---------------------------------------------------------------------------
-
 def test_env_override_symbols(monkeypatch):
     monkeypatch.setenv("SYMBOLS", "AAPL,TSLA,NVDA")
     import importlib
@@ -85,15 +71,9 @@ def test_missing_api_key_env_raises_or_uses_default():
     or fall back to a default/demo value. Must not silently use None.
     """
     import ingestion.config as cfg
-    api_key = getattr(cfg, "TRADIER_API_KEY", None) \
-        or os.environ.get("TRADIER_API_KEY", None)
+    _ = getattr(cfg, "TRADIER_API_KEY", None) or os.environ.get("TRADIER_API_KEY", None)
     # Either set or not — just must not crash on import
-    assert True
 
-
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
 
 def test_validate_symbol_accepts_valid():
     import ingestion.config as cfg
@@ -119,10 +99,6 @@ def test_validate_symbol_rejects_numeric():
     assert fn("12345") is False
 
 
-# ---------------------------------------------------------------------------
-# Premium filter thresholds
-# ---------------------------------------------------------------------------
-
 def test_min_premium_threshold_is_positive():
     import ingestion.config as cfg
     threshold = getattr(cfg, "MIN_PREMIUM", None) \
@@ -138,13 +114,8 @@ def test_min_premium_threshold_reasonable():
         or getattr(cfg, "PREMIUM_THRESHOLD", None)
     if threshold is None:
         pytest.skip("No MIN_PREMIUM constant defined")
-    # Should be between $1k and $10M to be sensible
     assert 1_000 <= threshold <= 10_000_000
 
-
-# ---------------------------------------------------------------------------
-# Config reload idempotency
-# ---------------------------------------------------------------------------
 
 def test_reload_is_idempotent():
     import importlib
@@ -157,10 +128,6 @@ def test_reload_is_idempotent():
     assert before == after
 
 
-# ---------------------------------------------------------------------------
-# Ingestion gate (enable/disable switch)
-# ---------------------------------------------------------------------------
-
 def test_ingestion_enabled_flag_is_bool():
     import ingestion.config as cfg
     flag = getattr(cfg, "INGESTION_ENABLED", None)
@@ -168,10 +135,6 @@ def test_ingestion_enabled_flag_is_bool():
         pytest.skip("INGESTION_ENABLED not defined")
     assert isinstance(flag, bool)
 
-
-# ---------------------------------------------------------------------------
-# add_symbol / remove_symbol (if supported)
-# ---------------------------------------------------------------------------
 
 def test_add_symbol_appears_in_list():
     import ingestion.config as cfg
@@ -203,12 +166,8 @@ def test_remove_nonexistent_symbol_does_not_crash():
     try:
         fn("NONEXISTENT_XYZ")
     except (ValueError, KeyError):
-        pass  # acceptable
+        pass
 
-
-# ---------------------------------------------------------------------------
-# apply_config (if supported)
-# ---------------------------------------------------------------------------
 
 def test_apply_config_with_valid_dict():
     import ingestion.config as cfg
@@ -216,7 +175,6 @@ def test_apply_config_with_valid_dict():
     if fn is None:
         pytest.skip("apply_config not defined")
     fn({"symbols": ["AAPL", "TSLA"]})
-    # Must not raise
 
 
 def test_apply_config_is_idempotent():
@@ -227,4 +185,3 @@ def test_apply_config_is_idempotent():
     conf = {"symbols": ["AAPL"]}
     fn(conf)
     fn(conf)
-    # No crash on double apply

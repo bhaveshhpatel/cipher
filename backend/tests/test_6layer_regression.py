@@ -1,18 +1,11 @@
 """
 6-layer integration regression suite.
-
-Verifies the full pipeline: ingest → parse → tier → accumulate →
-composite → publish, with all layers wired together.
 """
 import asyncio
 import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
-
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
 
 def _raw_trade(
     symbol="AAPL",
@@ -46,10 +39,6 @@ def _raw_trade(
         "timestamp":        datetime.utcnow().isoformat(),
     }
 
-
-# ---------------------------------------------------------------------------
-# Layer 1 — Parse
-# ---------------------------------------------------------------------------
 
 class TestLayer1Parse:
     def test_parse_call_trade(self):
@@ -105,10 +94,6 @@ class TestLayer1Parse:
         assert result is None or result.strike < 0
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 — Tier Classification
-# ---------------------------------------------------------------------------
-
 class TestLayer2Tier:
     def test_whale_tier_on_large_premium(self):
         from signals.tier_engine import classify_tier
@@ -124,7 +109,6 @@ class TestLayer2Tier:
 
     def test_boundary_exactly_at_threshold(self):
         from signals.tier_engine import classify_tier
-        # Should not raise
         result = classify_tier(1_000_000.0)
         assert result in ("WHALE", "INSTITUTIONAL", "SMART_MONEY")
 
@@ -144,10 +128,6 @@ class TestLayer2Tier:
         from signals.tier_engine import classify_tier
         assert classify_tier(100_000_000.0) == "WHALE"
 
-
-# ---------------------------------------------------------------------------
-# Layer 3 — Repetition Accumulator
-# ---------------------------------------------------------------------------
 
 class TestLayer3Accumulator:
     def _accum(self):
@@ -190,10 +170,6 @@ class TestLayer3Accumulator:
         result = acc.ingest(self._ev(ticker="TSLA", premium=20_000.0, offset=0))
         assert result is None
 
-
-# ---------------------------------------------------------------------------
-# Layer 4 — Composite Signal Engine
-# ---------------------------------------------------------------------------
 
 class TestLayer4Composite:
     def _episode(self, ticker="AAPL", n=5, premium=500_000.0,
@@ -245,10 +221,6 @@ class TestLayer4Composite:
         assert len(sig.reasoning) > 0
 
 
-# ---------------------------------------------------------------------------
-# Layer 5 — Flow Store persistence
-# ---------------------------------------------------------------------------
-
 class TestLayer5FlowStore:
     @pytest.mark.asyncio
     async def test_add_and_retrieve_flow(self):
@@ -282,10 +254,6 @@ class TestLayer5FlowStore:
             assert await fs.get_flows(f"T{i}") != []
 
 
-# ---------------------------------------------------------------------------
-# Layer 6 — Signal Store persistence
-# ---------------------------------------------------------------------------
-
 class TestLayer6SignalStore:
     @pytest.mark.asyncio
     async def test_save_and_retrieve_signal(self):
@@ -306,17 +274,9 @@ class TestLayer6SignalStore:
         assert len(matching) <= 1
 
 
-# ---------------------------------------------------------------------------
-# End-to-end pipeline smoke test
-# ---------------------------------------------------------------------------
-
 class TestE2EPipeline:
     @pytest.mark.asyncio
     async def test_raw_trade_to_signal_no_crash(self):
-        """
-        Full pipeline: raw trade dict → parse → tier → accumulate →
-        composite → store. Verify no exception is raised.
-        """
         from ingestion.options_flow_parser import parse_trade
         from signals.tier_engine import classify_tier
         from signals.repetition_accumulator import RepetitionAccumulator
@@ -324,10 +284,9 @@ class TestE2EPipeline:
         import services.flow_store as fs
 
         await fs.clear_flows()
-        accum = RepetitionAccumulator(
-            window_minutes=30, min_trades=3, min_premium=50_000
-        )
+        accum = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
 
+        ep = None
         for i in range(3):
             raw = _raw_trade(premium=200_000.0)
             ev = parse_trade(raw)

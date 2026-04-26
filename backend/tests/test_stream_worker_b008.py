@@ -46,4 +46,3 @@ async def test_stream_worker_cancels_cleanly():
             await task
         except asyncio.CancelledError:
             pass
-    # Reaching here = clean cancel

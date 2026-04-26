@@ -1,16 +1,15 @@
+"""
+Regression tests for services/flow_store.py
+"""
 import asyncio
 import time
 import sys
+import os
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 
-import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _flow(ticker="AAPL", premium=100_000.0, sentiment="BULLISH",
           contract_type="CALL", score=0.75, tier="WHALE",
@@ -31,10 +30,6 @@ def _flow(ticker="AAPL", premium=100_000.0, sentiment="BULLISH",
     }
 
 
-# ---------------------------------------------------------------------------
-# Import smoke
-# ---------------------------------------------------------------------------
-
 def test_flow_store_importable():
     import services.flow_store  # noqa: F401
 
@@ -44,10 +39,6 @@ def test_flow_store_has_expected_api():
     for name in ("add_flow", "get_flows", "clear_flows"):
         assert hasattr(fs, name), f"Missing: {name}"
 
-
-# ---------------------------------------------------------------------------
-# Basic add / get
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_add_and_get_single_flow():
@@ -88,10 +79,6 @@ async def test_flows_different_tickers_are_isolated():
     assert all(f["ticker"] == "NVDA" for f in nvda)
 
 
-# ---------------------------------------------------------------------------
-# Clear
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_clear_flows_removes_all():
     import services.flow_store as fs
@@ -101,25 +88,16 @@ async def test_clear_flows_removes_all():
     assert flows == []
 
 
-# ---------------------------------------------------------------------------
-# TTL / expiry
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_expired_flows_not_returned():
     import services.flow_store as fs
     await fs.clear_flows()
     old_flow = _flow("QQQ")
-    old_flow["timestamp"] = time.time() - 99999  # far in the past
+    old_flow["timestamp"] = time.time() - 99999
     await fs.add_flow(old_flow)
     flows = await fs.get_flows("QQQ")
-    # Either TTL-expired entries are filtered, or store returns them — just check no crash
     assert isinstance(flows, list)
 
-
-# ---------------------------------------------------------------------------
-# Golden sweep flag propagation
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_golden_sweep_flag_preserved():
@@ -129,10 +107,6 @@ async def test_golden_sweep_flag_preserved():
     flows = await fs.get_flows("AAPL")
     assert any(f.get("is_golden_sweep") is True for f in flows)
 
-
-# ---------------------------------------------------------------------------
-# Ordering — most recent first (if the store guarantees it)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_flows_ordered_most_recent_first():
@@ -146,13 +120,8 @@ async def test_flows_ordered_most_recent_first():
     flows = await fs.get_flows("MSFT")
     if len(flows) > 1:
         timestamps = [f.get("timestamp", 0) for f in flows]
-        # Accept either ordering — just no duplicates
         assert len(timestamps) == len(set(timestamps))
 
-
-# ---------------------------------------------------------------------------
-# Concurrent writes
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_concurrent_add_flow_no_data_loss():
@@ -164,10 +133,6 @@ async def test_concurrent_add_flow_no_data_loss():
         flows = await fs.get_flows(t)
         assert len(flows) >= 1, f"Missing flows for {t}"
 
-
-# ---------------------------------------------------------------------------
-# Score / tier filtering (if supported)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_whale_flow_stored_with_correct_tier():
@@ -187,10 +152,6 @@ async def test_retail_flow_stored_with_correct_tier():
     assert any(f.get("influence_tier") == "RETAIL" for f in flows)
 
 
-# ---------------------------------------------------------------------------
-# Capacity / cap (store should not grow unbounded)
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_flow_store_does_not_grow_unbounded():
     import services.flow_store as fs
@@ -198,13 +159,8 @@ async def test_flow_store_does_not_grow_unbounded():
     for i in range(200):
         await fs.add_flow(_flow("AAPL", premium=float(i * 1000)))
     flows = await fs.get_flows("AAPL")
-    # Should cap at some reasonable number (e.g., <= 200)
     assert len(flows) <= 200
 
-
-# ---------------------------------------------------------------------------
-# Edge: empty ticker
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_add_flow_with_empty_ticker_does_not_crash():
@@ -212,13 +168,8 @@ async def test_add_flow_with_empty_ticker_does_not_crash():
     try:
         await fs.add_flow(_flow(""))
     except (ValueError, KeyError):
-        pass  # Validation rejection is fine
-    # Must not raise unhandled exception
+        pass
 
-
-# ---------------------------------------------------------------------------
-# get_all_flows (if supported)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_all_flows_returns_list():
@@ -229,10 +180,6 @@ async def test_get_all_flows_returns_list():
     assert isinstance(flows, list)
 
 
-# ---------------------------------------------------------------------------
-# Bus integration smoke (if store publishes to bus)
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_add_flow_publishes_to_bus_if_wired():
     import services.flow_store as fs
@@ -240,5 +187,4 @@ async def test_add_flow_publishes_to_bus_if_wired():
         pytest.skip("No bus wired")
     with patch.object(fs.bus, "publish_all", new_callable=AsyncMock) as mock_pub:
         await fs.add_flow(_flow("AAPL"))
-        # Bus may or may not be called depending on implementation
-        assert mock_pub.call_count >= 0  # no crash
+        assert mock_pub.call_count >= 0
