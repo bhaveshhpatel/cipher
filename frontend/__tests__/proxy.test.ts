@@ -1,6 +1,8 @@
 /**
  * Tests for the Next.js proxy route handler.
  * Run with: npx jest __tests__/proxy.test.ts
+ *
+ * @jest-environment node
  */
 
 const MOCK_BACKEND = "https://mock-railway.up.railway.app";

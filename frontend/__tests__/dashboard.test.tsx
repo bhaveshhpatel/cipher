@@ -31,8 +31,9 @@ const defaultAuthState = {
   logout:          mockLogout,
 };
 
+// useAuth MUST be a jest.fn() so mockReturnValue / mockReturnValueOnce work in beforeEach / withAuthState
 jest.mock("@/hooks/useAuth", () => ({
-  useAuth: () => defaultAuthState,
+  useAuth: jest.fn(),
 }));
 
 jest.mock("@/hooks/useFlow", () => ({

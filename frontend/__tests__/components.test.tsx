@@ -71,8 +71,8 @@ describe("FlowTable", () => {
     );
     expect(screen.getByText("AAPL")).toBeInTheDocument();
     expect(screen.getByText("CALL")).toBeInTheDocument();
-    // Premium $250K should format as $250.0K
-    expect(screen.getByText(/\$250\.0K/)).toBeInTheDocument();
+    // $250.0K appears in both the summary stat card and the table row — use getAllByText
+    expect(screen.getAllByText(/\$250\.0K/).length).toBeGreaterThan(0);
   });
 
   it("renders the golden-sweep star ★ for is_golden_sweep=true rows", () => {
