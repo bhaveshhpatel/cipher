@@ -35,6 +35,8 @@ from typing import Optional
 
 import httpx
 
+from core.async_bus import bus  # module-level import so patch('services.flow_store.bus') works
+
 log = logging.getLogger("flow_store")
 
 _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
@@ -195,7 +197,6 @@ async def persist_flow_episode(signal_data: dict):
 
 
 async def _bus_signal_listener():
-    from core.async_bus import bus
     q = bus.subscribe("db_writer")
     log.info("[flow_store] DB writer subscribed to bus -- flow_episodes written on composite_signal only")
     try:

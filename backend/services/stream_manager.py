@@ -108,6 +108,7 @@ class StreamManager:
         ]
 
         for idx in affected_indices:
+            # Cancel the existing task if it exists within current bounds
             if idx < len(self._tasks):
                 self._tasks[idx].cancel()
                 try:
@@ -118,6 +119,7 @@ class StreamManager:
             if idx < len(chunks):
                 new_chunk = chunks[idx]
             else:
+                # This worker index no longer maps to any chunk — remove it
                 if idx < len(self._workers):
                     self._workers[idx] = None  # type: ignore[assignment]
                 if idx < len(self._tasks):
@@ -135,11 +137,21 @@ class StreamManager:
                 new_worker.run(), name=f"stream-worker-{idx}"
             )
 
+            # Guard: extend lists if idx is beyond current length
+            # (can happen when refresh() is called before run() populates _workers/_tasks)
             if idx < len(self._workers):
                 self._workers[idx] = new_worker
-                self._tasks[idx]   = new_task
             else:
+                # Pad to idx then append
+                while len(self._workers) < idx:
+                    self._workers.append(None)  # type: ignore[arg-type]
                 self._workers.append(new_worker)
+
+            if idx < len(self._tasks):
+                self._tasks[idx] = new_task
+            else:
+                while len(self._tasks) < idx:
+                    self._tasks.append(None)  # type: ignore[arg-type]
                 self._tasks.append(new_task)
 
         for idx in range(len(self._workers), len(chunks)):

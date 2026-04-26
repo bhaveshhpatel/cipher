@@ -59,7 +59,7 @@ jobs:
       TRADIER_ACCOUNT_ID:   "VA00000000"
       TRADIER_BASE_URL:     "https://sandbox.tradier.com"
       GROQ_API_KEY:         ""
-      ALLOWED_ORIGINS:      "http://localhost:3000"
+      ALLOWED_ORIGINS:      "http://localhost:3000,http://testserver,http://test"
       ENVIRONMENT:          "test"
 
     steps:
@@ -83,6 +83,13 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+
+      - name: Purge stale Python bytecode cache
+        working-directory: backend
+        run: |
+          find . -type f -name '*.pyc' -delete
+          find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+          echo "Bytecode cache purged"
 
       - name: Run regression suite with coverage
         working-directory: backend

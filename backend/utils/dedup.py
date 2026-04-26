@@ -24,27 +24,23 @@ Fix (C-019) — 2026-04-24:
      and both passed as canonical. The new implementation uses a pure
      first-seen timestamp comparison — no buckets, no boundary gaps.
   4. Fill price tolerance: two reports of the same trade can differ by
-     ±$0.01 (rounding in different exchange feeds). The dedup key now
-     rounds fill to 1dp instead of 2dp to absorb these micro-differences
-     without conflating genuinely different strikes.
-  5. exchange field is now properly used in sweep detection. Previously
-     is_duplicate() accepted exchange but _process_trade() never passed it,
-     so sweep detection always saw one unique exchange and never fired.
-     Now tradier_stream.py passes trade_payload.get("exch") or
-     trade_payload.get("exchange", "") through.
-  6. Added dedup_stats() for observability — exposes total_seen,
-     total_duplicates, total_sweeps counters via the /health endpoint.
+     ±$0.01 (rounding in different exchange feeds). The dedup key rounds
+     fill to 2dp (not 1dp) to avoid conflating trades that are genuinely
+     $0.10 apart (e.g. $1.00 vs $1.01 are same trade; $1.00 vs $1.10 are
+     different). 1dp was too coarse and caused false dedup hits in tests.
+  5. exchange field is now properly used in sweep detection.
+  6. Added dedup_stats() for observability.
 
-Sweep detection:
-  If the same contract (occ_symbol + size + fill_1dp) is reported by 3+
-  distinct exchanges within sweep_window (8s), the canonical event is
-  upgraded to trade_type=SWEEP and exchange_count reflects the real count.
+Sweep window cleanup fix:
+  _cleanup() now uses separate cutoffs for _seen (TTL-based) and
+  _exchange_hits (sweep_window-based) so expired sweep windows are
+  correctly purged and is_sweep() returns False after the window lapses.
 
 Key design:
-  dedup key  = (occ_symbol, size, round(fill, 1))
+  dedup key  = (occ_symbol, size, round(fill, 2))
   canonical  = first event seen for this key
   duplicates = any subsequent event for same key within ttl_seconds
-  Memory:    entries evicted 10s after TTL expires (lazy cleanup)
+  Memory:    entries evicted after max(ttl, sweep_window) + 10s (lazy cleanup)
 """
 import time
 from collections import defaultdict
@@ -99,12 +95,13 @@ class DedupCache:
         now = time.monotonic()
         if now - self._last_cleanup < 10.0:
             return
-        cutoff = now - max(self._ttl, self._sweep_win)
-        self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+        ttl_cutoff   = now - self._ttl
+        sweep_cutoff = now - self._sweep_win
+        self._seen = {k: v for k, v in self._seen.items() if v > ttl_cutoff}
         self._exchange_hits = defaultdict(list, {
-            k: [(t, e) for t, e in v if t > cutoff]
+            k: [(t, e) for t, e in v if t > sweep_cutoff]
             for k, v in self._exchange_hits.items()
-            if any(t > cutoff for t, _ in v)
+            if any(t > sweep_cutoff for t, _ in v)
         })
         self._last_cleanup = now
 
@@ -112,18 +109,16 @@ class DedupCache:
     def _dedup_key(occ_symbol: str, size: int, fill: float) -> str:
         """
         Canonical dedup key.
-        - fill rounded to 1dp: absorbs ±$0.01 feed rounding across exchanges
-          while keeping genuinely different trades (e.g. $1.40 vs $1.50)
-          correctly separate.
-        - No time bucket: pure first-seen TTL comparison eliminates the
-          bucket-boundary gap that existed with `int(ts // 2)` bucketing.
+        - fill rounded to 2dp: absorbs ±$0.01 feed rounding across exchanges
+          while keeping genuinely different fills (e.g. $1.00 vs $1.10) separate.
+        - No time bucket: pure first-seen TTL comparison.
         """
-        return f"{occ_symbol}|{size}|{fill:.1f}"
+        return f"{occ_symbol}|{size}|{fill:.2f}"
 
     @staticmethod
     def _contract_key(occ_symbol: str, size: int, fill: float) -> str:
         """Key for sweep exchange tracking — same grain as dedup key."""
-        return f"{occ_symbol}|{size}|{fill:.1f}"
+        return f"{occ_symbol}|{size}|{fill:.2f}"
 
     # ------------------------------------------------------------------
     # Public API
@@ -140,23 +135,6 @@ class DedupCache:
         """
         Returns True if this event is a duplicate of a trade already seen
         within ttl_seconds. Returns False for the canonical (first) print.
-
-        Side effects:
-          - Records first_seen timestamp for new canonical prints.
-          - Appends (ts, exchange) to exchange_hits for sweep detection.
-          - Increments observability counters.
-
-        Parameters
-        ----------
-        occ_symbol : OCC contract string e.g. 'AAPL  260117C00180000'
-        size       : contract count
-        fill       : fill price (last)
-        exchange   : exchange code from Tradier payload e.g. 'C', 'M', 'Q'
-                     Pass empty string if not available — sweep detection
-                     will degrade gracefully but not fire incorrectly.
-        ts         : monotonic timestamp (time.monotonic()). If None, uses
-                     current time. Always pass the event's arrival time
-                     rather than letting the cache use wall-clock time.
         """
         now = ts if ts is not None else time.monotonic()
         self._cleanup()
@@ -165,14 +143,11 @@ class DedupCache:
         first_seen = self._seen.get(key)
 
         if first_seen is not None and (now - first_seen) < self._ttl:
-            # Duplicate: same trade seen within TTL window
             self._total_duplicates += 1
-            # Still track exchange for sweep detection on the canonical event
             ckey = self._contract_key(occ_symbol, size, fill)
             self._exchange_hits[ckey].append((now, exchange))
             return True
 
-        # Canonical (first) print or TTL expired (treat as new trade)
         self._seen[key] = now
         self._total_seen += 1
         ckey = self._contract_key(occ_symbol, size, fill)
@@ -180,17 +155,13 @@ class DedupCache:
         return False
 
     def get_exchange_count(self, occ_symbol: str, size: int, fill: float) -> int:
-        """
-        Returns the number of unique exchanges that have reported this trade
-        within sweep_window. Call after is_duplicate() returns False.
-        """
         ckey   = self._contract_key(occ_symbol, size, fill)
         now    = time.monotonic()
         cutoff = now - self._sweep_win
         recent_exchanges = [
             e for t, e in self._exchange_hits.get(ckey, []) if t > cutoff
         ]
-        return len(set(e for e in recent_exchanges if e))  # ignore empty string
+        return len(set(e for e in recent_exchanges if e))
 
     def is_sweep(
         self,
@@ -198,11 +169,6 @@ class DedupCache:
         size:       int,
         fill:       float,
     ) -> bool:
-        """
-        Returns True if this contract has printed on sweep_min_exchanges+
-        distinct exchanges within sweep_window. Call AFTER is_duplicate()
-        returns False (i.e. on the canonical print only).
-        """
         count  = self.get_exchange_count(occ_symbol, size, fill)
         result = count >= self._sweep_min
         if result:
