@@ -295,9 +295,6 @@ async def _guarded_lines(resp: httpx.Response):
             raise
 
 
-_iter_lines_with_watchdog = _guarded_lines  # type: ignore[assignment]
-
-
 # ---------------------------------------------------------------------------
 # Trade processor — shared by StreamManager workers and demo engine
 # ---------------------------------------------------------------------------
@@ -581,6 +578,9 @@ async def _demo_mode_once(symbols: list[str]):
                 },
             }
             await bus.publish_all(composite_msg)
+
+            # suppress unused variable warnings for demo-only locals
+            _ = (bid, ask, size, dte)
     except asyncio.CancelledError:
         log.info("Demo mode cancelled — live stream connection established")
         raise
