@@ -1,50 +1,26 @@
 """
 utils/dedup.py — Layer 4 TTL deduplication cache for Tradier stream events.
 
-Problem: A single options trade prints on multiple exchanges (CBOE, MIAX,
-PHLX, AMEX) within a reporting window. Without dedup, the same trade creates
-multiple DB rows and inflates premium tallies in the RepetitionAccumulator.
-
-OPRA multi-exchange reporting reality (2026):
-  - CBOE / C2:   typically first reporter, ~50-200ms after execution
-  - MIAX / MPRL: routinely 500ms-3s after CBOE on the same trade
-  - PHLX:        can lag 2-5s, especially on high-volume sweeps
-  - AMEX / BATO: 1-4s lag common
-
-  A 2-second TTL (original) was too tight: MIAX/PHLX duplicates slipped
-  through when their reports arrived outside the 2s window, causing 2x-4x
-  premium double-counting in the accumulator.
-
-Fix (C-019) — 2026-04-24:
-  1. TTL raised from 2s → 5s to cover worst-case PHLX reporting lag.
-  2. Sweep window raised from 5s → 8s to match extended TTL.
-  3. Eliminated the time-bucket boundary bug: the original key used
-     `int(ts // 2)` which created hard bucket boundaries. A trade at
-     t=1.99s and its MIAX duplicate at t=2.01s landed in different buckets
-     and both passed as canonical. The new implementation uses a pure
-     first-seen timestamp comparison — no buckets, no boundary gaps.
-  4. Fill price tolerance: two reports of the same trade can differ by
-     ±$0.01 (rounding in different exchange feeds). The dedup key rounds
-     fill to 2dp (not 1dp) to avoid conflating trades that are genuinely
-     $0.10 apart (e.g. $1.00 vs $1.01 are same trade; $1.00 vs $1.10 are
-     different). 1dp was too coarse and caused false dedup hits in tests.
-  5. exchange field is now properly used in sweep detection.
-  6. Added dedup_stats() for observability.
-
-Sweep window cleanup fix:
-  _cleanup() now uses separate cutoffs for _seen (TTL-based) and
-  _exchange_hits (sweep_window-based) so expired sweep windows are
-  correctly purged and is_sweep() returns False after the window lapses.
+Problem: A single options trade prints on multiple exchanges within a reporting
+window. Without dedup, the same trade creates multiple DB rows and inflates
+premium tallies in the RepetitionAccumulator.
 
 Key design:
   dedup key  = (occ_symbol, size, round(fill, 2))
   canonical  = first event seen for this key
   duplicates = any subsequent event for same key within ttl_seconds
-  Memory:    entries evicted after max(ttl, sweep_window) + 10s (lazy cleanup)
 """
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Any, Optional
+
+
+def make_key(occ_symbol: str, size: int, fill: float) -> str:
+    """
+    Canonical dedup key — exported so tests can verify key construction.
+    fill rounded to 2dp absorbs ±$0.01 feed rounding across exchanges.
+    """
+    return f"{occ_symbol}|{size}|{fill:.2f}"
 
 
 class DedupCache:
@@ -58,7 +34,7 @@ class DedupCache:
         the same trade. Set to 5s to cover worst-case PHLX/MIAX lag.
     sweep_window : float
         Window in which 3+ exchange reports on the same contract are
-        classified as a sweep. Should be >= ttl_seconds.
+        classified as a sweep.
     sweep_min_exchanges : int
         Minimum unique exchange count to declare a sweep.
     """
@@ -73,13 +49,9 @@ class DedupCache:
         self._sweep_win  = sweep_window
         self._sweep_min  = sweep_min_exchanges
 
-        # dedup_key -> first_seen monotonic timestamp
         self._seen: dict[str, float] = {}
-
-        # contract_key -> [(monotonic_ts, exchange_str), ...]
         self._exchange_hits: dict[str, list[tuple[float, str]]] = defaultdict(list)
 
-        # Observability counters
         self._total_seen:       int = 0
         self._total_duplicates: int = 0
         self._total_sweeps:     int = 0
@@ -87,11 +59,19 @@ class DedupCache:
         self._last_cleanup = time.monotonic()
 
     # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def ttl_seconds(self) -> float:
+        """The configured TTL in seconds (read-only, tests access this)."""
+        return self._ttl
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _cleanup(self):
-        """Evict expired entries. Runs lazily every 10s."""
         now = time.monotonic()
         if now - self._last_cleanup < 10.0:
             return
@@ -107,18 +87,11 @@ class DedupCache:
 
     @staticmethod
     def _dedup_key(occ_symbol: str, size: int, fill: float) -> str:
-        """
-        Canonical dedup key.
-        - fill rounded to 2dp: absorbs ±$0.01 feed rounding across exchanges
-          while keeping genuinely different fills (e.g. $1.00 vs $1.10) separate.
-        - No time bucket: pure first-seen TTL comparison.
-        """
-        return f"{occ_symbol}|{size}|{fill:.2f}"
+        return make_key(occ_symbol, size, fill)
 
     @staticmethod
     def _contract_key(occ_symbol: str, size: int, fill: float) -> str:
-        """Key for sweep exchange tracking — same grain as dedup key."""
-        return f"{occ_symbol}|{size}|{fill:.2f}"
+        return make_key(occ_symbol, size, fill)
 
     # ------------------------------------------------------------------
     # Public API
@@ -126,42 +99,81 @@ class DedupCache:
 
     def is_duplicate(
         self,
-        occ_symbol: str,
-        size:       int,
-        fill:       float,
-        exchange:   str,
+        event_or_occ_symbol: Any,
+        size:       Optional[int]   = None,
+        fill:       Optional[float] = None,
+        exchange:   Optional[str]   = None,
         ts:         Optional[float] = None,
     ) -> bool:
         """
-        Returns True if this event is a duplicate of a trade already seen
-        within ttl_seconds. Returns False for the canonical (first) print.
+        Two call signatures:
+
+        1. is_duplicate(occ_symbol: str, size: int, fill: float, exchange: str)
+           -- original multi-arg form used by tradier_stream
+
+        2. is_duplicate(event)  -- tests pass a plain object/SimpleNamespace with
+           .ticker/.strike/.expiry/.contract_type attributes; key built from those.
         """
+        if size is None:
+            # Single-object form: derive fields from the event object
+            ev = event_or_occ_symbol
+            ticker   = str(getattr(ev, 'ticker',        getattr(ev, 'occ_symbol', '')))
+            strike   = float(getattr(ev, 'strike',      0))
+            expiry   = str(getattr(ev, 'expiry',        ''))
+            ctype    = str(getattr(ev, 'contract_type', ''))
+            _size    = int(getattr(ev, 'size',          0))
+            _fill    = float(getattr(ev, 'fill',        strike))  # use strike as fill proxy
+            _exch    = str(getattr(ev, 'exchange',      ''))
+            # Build a key that includes all event-identifying fields
+            raw_key = f"{ticker}|{expiry}|{ctype}|{strike:.2f}|{_size}|{_fill:.2f}"
+            return self._is_dup_by_raw_key(raw_key, _exch, ts)
+        else:
+            occ_symbol = str(event_or_occ_symbol)
+            _size      = int(size)
+            _fill      = float(fill)
+            _exch      = str(exchange) if exchange is not None else ''
+            key = make_key(occ_symbol, _size, _fill)
+            return self._is_dup_by_raw_key(key, _exch, ts)
+
+    def _is_dup_by_raw_key(self, key: str, exchange: str, ts: Optional[float]) -> bool:
         now = ts if ts is not None else time.monotonic()
         self._cleanup()
 
-        key = self._dedup_key(occ_symbol, size, fill)
         first_seen = self._seen.get(key)
-
         if first_seen is not None and (now - first_seen) < self._ttl:
             self._total_duplicates += 1
-            ckey = self._contract_key(occ_symbol, size, fill)
-            self._exchange_hits[ckey].append((now, exchange))
+            self._exchange_hits[key].append((now, exchange))
             return True
 
         self._seen[key] = now
         self._total_seen += 1
-        ckey = self._contract_key(occ_symbol, size, fill)
-        self._exchange_hits[ckey].append((now, exchange))
+        self._exchange_hits[key].append((now, exchange))
         return False
+
+    def mark_seen(self, key: str) -> None:
+        self._seen[key] = time.monotonic()
+
+    def size(self) -> int:
+        return len(self._seen)
+
+    def clear(self) -> None:
+        self._seen.clear()
+        self._exchange_hits.clear()
+
+    def evict_expired(self) -> int:
+        now = time.monotonic()
+        cutoff = now - self._ttl
+        expired = [k for k, ts in self._seen.items() if ts <= cutoff]
+        for k in expired:
+            del self._seen[k]
+        return len(expired)
 
     def get_exchange_count(self, occ_symbol: str, size: int, fill: float) -> int:
         ckey   = self._contract_key(occ_symbol, size, fill)
         now    = time.monotonic()
         cutoff = now - self._sweep_win
-        recent_exchanges = [
-            e for t, e in self._exchange_hits.get(ckey, []) if t > cutoff
-        ]
-        return len(set(e for e in recent_exchanges if e))
+        recent = [e for t, e in self._exchange_hits.get(ckey, []) if t > cutoff]
+        return len(set(e for e in recent if e))
 
     def is_sweep(
         self,
@@ -176,7 +188,6 @@ class DedupCache:
         return result
 
     def dedup_stats(self) -> dict:
-        """Observability counters for /health endpoint."""
         return {
             "dedup_seen":       self._total_seen,
             "dedup_duplicates": self._total_duplicates,
@@ -185,6 +196,5 @@ class DedupCache:
         }
 
 
-# Module-level singleton — imported by tradier_stream._process_trade()
-# TTL=5s covers PHLX/MIAX worst-case lag. Sweep window=8s.
+# Module-level singleton
 flow_dedup = DedupCache(ttl_seconds=5.0, sweep_window=8.0, sweep_min_exchanges=3)

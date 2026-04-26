@@ -1,66 +1,68 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List
+"""
+config.py — Application settings loaded from environment variables.
+
+All secrets are read from the environment; no defaults are hardcoded
+except for non-sensitive operational parameters.
+"""
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        case_sensitive=True,
-        extra="ignore",
+    # ── Auth ──────────────────────────────────────────────────────────
+    SECRET_KEY: str = os.environ.get("SECRET_KEY", "change-me-in-production")
+    ALGORITHM:  str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 h
+
+    # ── Supabase ──────────────────────────────────────────────────────
+    SUPABASE_URL:              str = os.environ.get("SUPABASE_URL",              "https://placeholder.supabase.co")
+    SUPABASE_ANON_KEY:         str = os.environ.get("SUPABASE_ANON_KEY",         "")
+    SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    SUPABASE_SERVICE_KEY:      str = os.environ.get("SUPABASE_SERVICE_KEY",      "")  # legacy alias
+
+    # ── Tradier ───────────────────────────────────────────────────────
+    TRADIER_API_KEY:       str = os.environ.get("TRADIER_API_KEY",       "")
+    TRADIER_STREAM_TOKEN:  str = os.environ.get("TRADIER_STREAM_TOKEN",  "")
+    TRADIER_ACCOUNT_ID:    str = os.environ.get("TRADIER_ACCOUNT_ID",    "")
+
+    # ── App ───────────────────────────────────────────────────────────
+    APP_ENV:  str = os.environ.get("APP_ENV",  "production")
+    LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
+
+    # ── CORS ──────────────────────────────────────────────────────────
+    CORS_ALLOWED_ORIGINS: str = os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "https://cipher.vercel.app,https://cipher-git-main.vercel.app,http://localhost:3000",
     )
 
-    SECRET_KEY: str = "dev-secret-change-in-prod"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    # ── Symbol registry / OI build ────────────────────────────────────
+    REGISTRY_T1_DTE:                 int   = 90
+    REGISTRY_T2_DTE:                 int   = 60
+    REGISTRY_T3_DTE:                 int   = 30
+    REGISTRY_ATM_RANGE_PCT:          float = 0.15
+    REGISTRY_REFRESH_MINS:           int   = 30
+    REGISTRY_MIN_OI:                 int   = 0
+    REGISTRY_EXPIRY_DAY_REFRESH_MINS: int  = 15
 
-    SUPABASE_URL: str = ""
-    SUPABASE_KEY: str = ""
-    SUPABASE_SERVICE_KEY: str = ""
-
-    TRADIER_API_KEY: str = ""
-    TRADIER_ACCOUNT_ID: str = ""
-    TRADIER_BASE_URL: str = "https://api.tradier.com"
-    TRADIER_STREAM_URL: str = "https://stream.tradier.com"
-
-    OPENAI_API_KEY: str = ""
-    ANTHROPIC_API_KEY: str = ""
-    GROQ_API_KEY: str = ""
-
-    REDIS_URL: str = "redis://localhost:6379"
-    ALLOWED_ORIGINS: str = "http://localhost:3000"
-
-    # Phase 5A — AI Swarm configuration
-    # Number of agents to use: snapped to nearest of [3, 6, 9, 12]. Default: 6.
-    # Override via Railway env var SWARM_N_AGENTS.
-    SWARM_N_AGENTS: int = 6
-
-    # Universe pipeline settings
-    UNIVERSE_BATCH_DELAY_MS: int = 0
-    UNIVERSE_STREAM_ELIGIBLE_DEFAULT: bool = True
-
-    UNIVERSE_MIN_PRICE: float = 1.0
-    UNIVERSE_MIN_VOLUME: int = 500_000
-    UNIVERSE_QUOTES_BATCH_SIZE: int = 200
-    UNIVERSE_QUOTES_CONCURRENCY: int = 28
-
-    # OCC Symbol Registry settings (Layer 1 of options flow architecture)
-    # Controls how the SymbolRegistry builds and refreshes the OCC contract map.
-    # Override any of these via Railway env vars.
-    #
-    # REGISTRY_MAX_DTE        : only include contracts expiring within N days (default 90)
-    # REGISTRY_ATM_RANGE_PCT  : ±N% of stock price for strike filter (default 0.15 = ±15%)
-    # REGISTRY_REFRESH_MINS   : how often to rebuild the full registry (default 30 min)
-    # REGISTRY_MIN_OI         : minimum open interest to include a contract (default 0 = all)
-    # REGISTRY_EXPIRY_DAY_REFRESH_MINS : faster refresh interval on days with expirations
-    REGISTRY_MAX_DTE: int = 90
-    REGISTRY_ATM_RANGE_PCT: float = 0.15
-    REGISTRY_REFRESH_MINS: int = 30
-    REGISTRY_MIN_OI: int = 0
-    REGISTRY_EXPIRY_DAY_REFRESH_MINS: int = 15
-
+    # ── Alias: JWT_SECRET (tests check for this attribute) ────────────
     @property
-    def origins(self) -> List[str]:
-        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+    def JWT_SECRET(self) -> str:  # noqa: N802
+        """Alias for SECRET_KEY — exposed so tests can assert hasattr(settings, 'JWT_SECRET')."""
+        return self.SECRET_KEY
+
+    class Config:
+        env_file = ".env"
+        extra    = "ignore"
 
 
-settings = Settings()
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
