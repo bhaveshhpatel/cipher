@@ -9,8 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.signal_store import (
     _clear_signal_memory,
-    _normalise_direction,
-    _normalise_trade_type,
     _build_row,
     _coerce_to_dict,
     save_signal,
@@ -35,7 +33,6 @@ def test_coerce_dict_passthrough():
 
 def test_coerce_object_with_dict():
     class Obj:
-        ticker = "TSLA"
         def __init__(self): self.ticker = "TSLA"
     assert _coerce_to_dict(Obj())["ticker"] == "TSLA"
 
@@ -47,7 +44,6 @@ def test_coerce_pydantic_like():
 def test_coerce_fallback_empty():
     class Bad:
         pass
-    # no __dict__ iteration possible — returns {} via dict(sig) fallback
     result = _coerce_to_dict(Bad())
     assert isinstance(result, dict)
 
@@ -307,7 +303,6 @@ def test_start_signal_writer_configured_cancels():
 
 def test_bus_signal_listener_processes_composite_signal_and_cancels():
     from services import signal_store
-    import asyncio as _asyncio
 
     call_log = []
 
@@ -326,7 +321,6 @@ def test_bus_signal_listener_processes_composite_signal_and_cancels():
             mock_bus.subscribe.return_value = q
             mock_bus.unsubscribe = MagicMock()
 
-            # Second item cancels the loop
             async def _cancel_after_first():
                 await asyncio.sleep(0.05)
                 task.cancel()

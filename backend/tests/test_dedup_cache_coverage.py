@@ -2,7 +2,6 @@
 Coverage boost for services/dedup_cache.py.
 Targets: evict_expired (lines 58-62).
 """
-from unittest.mock import patch
 import time
 
 from services.dedup_cache import DedupCache
@@ -12,7 +11,6 @@ def test_evict_expired_removes_old_keys():
     cache = DedupCache(ttl_seconds=0.01)
     cache.mark_seen("key1")
     cache.mark_seen("key2")
-    # Force expiry by backdating timestamps
     for k in list(cache._store):
         cache._store[k] = time.monotonic() - 1.0
     removed = cache.evict_expired()
