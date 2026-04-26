@@ -15,8 +15,10 @@ Phase 5A additions:
   - build_composite() kept as sync wrapper returning signal WITHOUT swarm
     (for legacy callers); use build_composite_async() for full swarm output
 
-Module-level run_ensemble is imported eagerly so tests can
-patch('signals.composite_signal_engine.run_ensemble', ...).
+Patch path for tests:
+  Tests patch 'signals.composite_signal_engine.run_ensemble' at the module level.
+  build_composite_async() reads that module-level name directly (no re-import)
+  so patches are always honoured.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -131,15 +133,11 @@ async def build_composite_async(
     Builds composite signal then auto-runs the AI swarm.
     n_agents: overrides SWARM_N_AGENTS env var if provided.
 
-    NOTE: always does a fresh import of run_ensemble so that test patches on
-    simulation.ensemble_runner.run_ensemble are respected.
+    Uses the module-level `run_ensemble` name directly so that
+    patch('signals.composite_signal_engine.run_ensemble', ...) is always respected.
     """
-    _run = None
-    try:
-        from simulation.ensemble_runner import run_ensemble as _run_dyn
-        _run = _run_dyn
-    except Exception:
-        _run = None
+    import signals.composite_signal_engine as _self
+    _run = _self.run_ensemble  # reads patched value if any
 
     sig = build_composite(ep, accumulator)
 

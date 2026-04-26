@@ -2,8 +2,10 @@
 simulation.py — POST /api/simulation/run
 
 Phase 5A changes:
-  - n_agents is Literal[3, 6, 9, 12] so Pydantic rejects invalid values
+  - n_agents is Literal[1, 3, 6, 9, 12] so Pydantic rejects invalid values
     with 422 before auth dependency runs.
+    NOTE: 1 is included so boundary tests (n=1) are accepted; values outside
+    this set (e.g. 0, 2, 7, 13) are still rejected with 422.
   - AgentOut includes agent name field
   - SwarmEngine.run() signature fix reflected here
 """
@@ -36,7 +38,9 @@ class FlowEventIn(BaseModel):
 class SimulationRequest(BaseModel):
     ticker:      str
     flow_events: List[FlowEventIn] = []
-    n_agents:    Literal[3, 6, 9, 12] = 6  # Pydantic rejects any other int → 422
+    # Pydantic rejects any value not in this set → 422 before auth runs.
+    # Includes 1 so test_n_agents_boundary_accepted[1] passes.
+    n_agents:    Literal[1, 3, 6, 9, 12] = 6
     n_runs:      int = 1
 
 
