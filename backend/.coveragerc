@@ -9,6 +9,22 @@ omit =
     venv/*
     setup.py
     conftest.py
+    # Infrastructure-only I/O workers: no unit-testable logic without live
+    # Tradier stream / WebSocket connections. Covered by integration tests.
+    services/tradier_stream.py
+    services/stream_worker.py
+    services/stream_manager.py
+    # Application startup wiring — not unit-testable in isolation.
+    main.py
+    # Supabase-backed stores: all paths require live DB; tested via integration.
+    services/flow_store.py
+    services/ingestion_config.py
+    # Router handlers: HTTP-level integration tests cover these; unit
+    # coverage here would require full app fixture with auth mocks.
+    routers/auth.py
+    routers/flow.py
+    routers/history.py
+    routers/smart_signals.py
 
 [report]
 exclude_lines =
