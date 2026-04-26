@@ -39,5 +39,4 @@ def test_save_signal_with_none_supabase_does_not_raise():
 def test_get_recent_signals_returns_list_with_no_client():
     from services import signal_store
     with patch.object(signal_store, "_client", return_value=None):
-        result = _run(signal_store.get_recent_signals())
-    assert isinstance(result, list)
+        assert isinstance(_run(signal_store.get_recent_signals()), list)

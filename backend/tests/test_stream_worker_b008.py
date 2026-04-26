@@ -1,7 +1,6 @@
 """
 Regression tests for stream worker B008 patterns.
 """
-from unittest.mock import patch, AsyncMock
 
 
 def test_stream_worker_importable():
@@ -25,7 +24,7 @@ def test_stream_worker_does_not_crash_on_import():
         imported = True
     except ImportError:
         imported = False
-    assert imported or True  # acceptable to not exist
+    assert imported or True
 
 
 def test_process_trade_exists_on_tradier_stream():

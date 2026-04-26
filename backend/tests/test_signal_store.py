@@ -2,9 +2,8 @@
 Regression tests for services/signal_store.py
 """
 import asyncio
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, MagicMock
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass
@@ -27,10 +26,6 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
-# ---------------------------------------------------------------------------
-# _normalise helpers
-# ---------------------------------------------------------------------------
-
 def test_normalise_direction_bullish():
     from services.signal_store import _normalise_direction
     assert _normalise_direction("bullish") == "bullish"
@@ -48,8 +43,7 @@ def test_normalise_influence_tier_whale():
 
 def test_normalise_influence_tier_unknown_returns_retail():
     from services.signal_store import _normalise_influence_tier
-    result = _normalise_influence_tier("UNKNOWN")
-    assert result in ("RETAIL", "WHALE", "INSTITUTIONAL", "LARGE")
+    assert _normalise_influence_tier("UNKNOWN") in ("RETAIL", "WHALE", "INSTITUTIONAL", "LARGE")
 
 
 def test_normalise_trade_type_sweep():
@@ -57,29 +51,22 @@ def test_normalise_trade_type_sweep():
     assert _normalise_trade_type("sweep") == "sweep"
 
 
-# ---------------------------------------------------------------------------
-# save_signal
-# ---------------------------------------------------------------------------
-
 def test_save_signal_calls_supabase_insert():
     from services import signal_store
     sb = MagicMock()
     t  = MagicMock()
-    t.insert.return_value = t
+    t.insert.return_value  = t
     t.execute.return_value = MagicMock(data=[{"id": 1}])
-    sb.table.return_value = t
-
-    flow = _Flow("AAPL")
+    sb.table.return_value  = t
     with patch.object(signal_store, "_client", return_value=sb):
-        _run(signal_store.save_signal(flow))
-
+        _run(signal_store.save_signal(_Flow("AAPL")))
     assert t.insert.called
 
 
 def test_save_signal_no_supabase_does_not_raise():
     from services import signal_store
     with patch.object(signal_store, "_client", return_value=None):
-        _run(signal_store.save_signal(_Flow("TSLA")))  # must not raise
+        _run(signal_store.save_signal(_Flow("TSLA")))
 
 
 def test_save_signal_db_exception_does_not_raise():
@@ -87,20 +74,16 @@ def test_save_signal_db_exception_does_not_raise():
     sb = MagicMock()
     sb.table.side_effect = Exception("DB error")
     with patch.object(signal_store, "_client", return_value=sb):
-        _run(signal_store.save_signal(_Flow("SPY")))  # must not raise
+        _run(signal_store.save_signal(_Flow("SPY")))
 
-
-# ---------------------------------------------------------------------------
-# get_recent_signals
-# ---------------------------------------------------------------------------
 
 def test_get_recent_signals_returns_list():
     from services import signal_store
     sb = MagicMock()
     t  = MagicMock()
-    t.select.return_value = t
-    t.order.return_value  = t
-    t.limit.return_value  = t
+    t.select.return_value  = t
+    t.order.return_value   = t
+    t.limit.return_value   = t
     t.execute.return_value = MagicMock(data=[{"ticker": "AAPL"}])
     sb.table.return_value  = t
     with patch.object(signal_store, "_client", return_value=sb):
@@ -111,5 +94,4 @@ def test_get_recent_signals_returns_list():
 def test_get_recent_signals_no_supabase_returns_empty():
     from services import signal_store
     with patch.object(signal_store, "_client", return_value=None):
-        result = _run(signal_store.get_recent_signals())
-    assert result == []
+        assert _run(signal_store.get_recent_signals()) == []

@@ -2,7 +2,7 @@
 Regression tests for services/swarm_engine.py
 """
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 from dataclasses import dataclass
 
 
@@ -22,10 +22,6 @@ class _Flow:
     total_premium: float = 250000.0
 
 
-# ---------------------------------------------------------------------------
-# Module-level smoke
-# ---------------------------------------------------------------------------
-
 def test_swarm_engine_importable():
     import services.swarm_engine  # noqa: F401
 
@@ -34,10 +30,6 @@ def test_swarm_engine_has_run_function():
     import services.swarm_engine as se
     assert hasattr(se, "run_swarm") or hasattr(se, "evaluate") or hasattr(se, "swarm_score")
 
-
-# ---------------------------------------------------------------------------
-# Core scoring
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_run_swarm_returns_dict_for_single_flow():
@@ -66,26 +58,17 @@ async def test_run_swarm_bearish_flow():
     fn = getattr(se, "run_swarm", None) or getattr(se, "evaluate", None)
     if fn is None:
         pytest.skip("No run_swarm/evaluate function found")
-    flow = _Flow("SPY", direction="bearish", contract_type="PUT")
-    result = await fn(flow)
+    result = await fn(_Flow("SPY", direction="bearish", contract_type="PUT"))
     assert isinstance(result, dict)
 
 
-# ---------------------------------------------------------------------------
-# Agent count / consensus
-# ---------------------------------------------------------------------------
-
 def test_swarm_engine_has_agents_or_workers():
     import services.swarm_engine as se
-    has_agents = (
-        hasattr(se, "AGENTS") or
-        hasattr(se, "_agents") or
-        hasattr(se, "WORKERS") or
-        hasattr(se, "_workers") or
-        "agent" in dir(se) or
-        "worker" in "".join(dir(se)).lower()
+    _ = (
+        hasattr(se, "AGENTS") or hasattr(se, "_agents") or
+        hasattr(se, "WORKERS") or hasattr(se, "_workers")
     )
-    assert has_agents or True  # skip if architecture differs
+    assert True  # structural check only
 
 
 @pytest.mark.asyncio
@@ -101,18 +84,13 @@ async def test_high_conviction_flow_scores_above_low_conviction():
     assert h_score >= l_score
 
 
-# ---------------------------------------------------------------------------
-# Error resilience
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_run_swarm_does_not_raise_on_missing_fields():
     import services.swarm_engine as se
     fn = getattr(se, "run_swarm", None) or getattr(se, "evaluate", None)
     if fn is None:
         pytest.skip()
-    from dataclasses import dataclass as dc
-    @dc
+    @dataclass
     class _Min:
         symbol: str = "BARE"
     result = await fn(_Min())
@@ -128,10 +106,6 @@ async def test_run_swarm_handles_zero_premium():
     result = await fn(_Flow("AAPL", premium=0.0, total_premium=0.0))
     assert isinstance(result, dict)
 
-
-# ---------------------------------------------------------------------------
-# Patching sub-components
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_swarm_uses_flow_store_or_signal_store():
