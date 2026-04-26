@@ -1,5 +1,5 @@
 # Options Trade Flow Architecture Analysis & Strategy
-**Date:** April 24, 2026 (updated April 25, 2026 — Feature 4A)
+**Date:** April 24, 2026 (updated April 25, 2026 — Feature 4A, B-021/B-022/B-023)
 **Subject:** Real-time Options Trade Flow Processing via Tradier and Charles Schwab APIs
 
 ---
@@ -16,6 +16,18 @@ The system is designed to ingest, process, and broadcast real-time options trade
 ### Layer 2: Stream Manager (`services/stream_manager.py`)
 - **Original Strategy:** Parallelized streaming across 32 connections to circumvent symbol caps (~500 per connection).
 - **Fix (2026-04-24):** Corrected the registry refresh loop to notify the manager to restart affected workers when symbols change.
+- **B-021 (2026-04-25) — Staggered Worker Startup:** Workers no longer all call `get_session_token()` simultaneously at startup. Each worker sleeps `worker_index × 200ms` before its first token fetch. With ~32 workers this spreads token requests across ~6.4s, eliminating the thundering-herd burst that triggered Tradier 429s on every cold start and post-refresh restart.
+- **B-022 (2026-04-25) — Global Session Token Semaphore:** A module-level `asyncio.Semaphore(3)` (stored in `tradier_stream._token_semaphore`) gates all concurrent calls to `get_session_token()` across every worker. At most 3 token fetches run in parallel at any time. With 32 workers in 200ms stagger batches this means the worst-case burst is 3 concurrent requests regardless of worker count. The 11-batch math: ceil(32 / 3) = 11 sequential semaphore slots × ~300ms avg fetch = ~3.3s total token-fetch window, well within Tradier rate limits.
+- **B-023 (2026-04-25) — Explicit 429 + Retry-After Handler:** `get_session_token()` now parses HTTP 429 responses and reads the `Retry-After` header (defaulting to 5s if absent). On a 429 the worker sleeps the exact server-specified backoff before retrying, instead of immediately retrying and compounding the rate-limit violation.
+
+#### B-021 + B-022 Combined Startup Timing (32 workers, nominal)
+
+| Phase | Duration | Detail |
+|-------|----------|--------|
+| Stagger window (B-021) | ~6.4s | 32 × 200ms delays, fully parallelised |
+| Token fetch window (B-022) | ~3.3s | 11 semaphore batches × ~300ms each |
+| **Total one-time cold-start overhead** | **~10–11s** | One-time on deploy or full restart |
+| Per-reconnect overhead | ~300–600ms | Single worker: 1 semaphore slot + fetch |
 
 ### Layer 3: Parser (`parsers/options_flow_parser.py`)
 - **Critical Fix (C-015):** Corrected logic to use `last` as the fill price (not `price`).
@@ -46,7 +58,7 @@ All options universe symbols are now classified into Tier 1/2/3 at startup and a
 ### Tier Classification Logic
 
 | Tier | Criteria | Admin Override |
-|------|----------|-----------------|
+|------|----------|--------------------|
 | **1** | `average_volume ≥ 20M` OR in whitelist | SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, AMD, PLTR, COIN |
 | **2** | `average_volume ≥ 2M` | — |
 | **3** | Everything else (default) | — |
@@ -115,14 +127,21 @@ ORDER BY total_premium DESC;
 
 ## 4. Tradier API: Analysis and Limitations
 
-### The "Fatal Flaw" (Layer 2)
+### The "Fatal Flaw" (Layer 2) — Mitigations Now Implemented
+
 Tradier's 2026 specifications explicitly prohibit multiple concurrent market data sessions. Opening 32 parallel connections with the same account token will result in:
 - **Connection Collisions:** Newer sessions killing older ones in a loop.
 - **Account Throttling:** Potential API key suspension for "egregious" usage patterns.
 - **Symbol Limits:** Tradier monitors for users attempting to reconstruct the full OPRA firehose for free.
 
-### Proposed Fixes for Tradier
-To maintain a "free" tier while staying compliant, the architecture must pivot from a "Static Firehose" to a **"Dynamic Sniper"** approach:
+**Status (2026-04-25):** B-021, B-022, and B-023 directly address these risks:
+- **B-021** staggers worker startup at 200ms intervals to prevent simultaneous token bursts.
+- **B-022** caps concurrent `get_session_token()` calls at 3 via a global semaphore, regardless of worker count.
+- **B-023** respects Tradier's `Retry-After` header on 429 responses, eliminating retry storms.
+
+These three fixes together reduce the token-fetch burst profile from 32 simultaneous requests to at most 3 concurrent, spread across ~10s — which is within normal Tradier usage patterns for a single account.
+
+### Remaining Proposed Fixes for Tradier (Longer Term)
 
 1. **WebSocket Transition:** Move from HTTP streaming to WebSockets (`wss://ws.tradier.com/v1/markets/events`). This allows for `add` and `remove` commands on a single connection.
 2. **Sliding Window Logic:** Monitor top 500–1,000 underlying tickers. Dynamically subscribe to OTM/ITM option contracts based on underlying price movement. Unsubscribe from inactive or deep-out-of-the-money contracts to stay under the single-connection cap.
@@ -145,13 +164,15 @@ Transitioning to the Schwab API (legacy TDA stack) provides a superior path for 
 
 ### Architecture Comparison Table
 
-| Feature | Tradier (Modified) | Charles Schwab |
+| Feature | Tradier (B-021/B-022/B-023 applied) | Charles Schwab |
 | :--- | :--- | :--- |
 | **Connection Count** | 1 (Required by Spec) | 1 (Standard) |
 | **Symbol Capacity** | ~500 (Strictly Monitored) | ~5,000+ (High Performance) |
 | **Auth Complexity** | Low (Bearer Token) | High (OAuth 2.0 + Refresh Tokens) |
 | **Trade Logic** | Heuristic-based (Size/Price) | Explicit (Trade Service Fields) |
 | **Synthetic Quotes** | ~10-30% of ticks (bid/ask=0) | Never — real NBBO always present |
+| **Token Burst Risk** | Mitigated (semaphore + stagger) | N/A (single connection) |
+| **429 Handling** | Implemented (Retry-After) | N/A |
 | **Suitability** | Best for Targeted/Dynamic Flow | Best for Broad Market Firehose |
 
 ---
@@ -163,3 +184,4 @@ Transitioning to the Schwab API (legacy TDA stack) provides a superior path for 
 3. **Data Flagging:** In Layer 3, always flag "Synthetic Quotes" or "Late Prints" to ensure downstream signals (Layer 6) are not skewed by anomalous data points. **C-018 implements this for the Tradier feed.**
 4. **Backtest Hygiene:** Always filter `is_synthetic_quote = false` before computing aggression ratios, net-premium tallies, or conviction scores from historical `flow_events` data.
 5. **Tier Engine (Feature 4A):** Run `tier_engine.load_thresholds()` + `set_tier_map()` immediately after every universe refresh so the composite score always uses current tier and OI data. Admin whitelist symbols (SPY, QQQ, etc.) are always Tier 1 regardless of volume.
+6. **Rate-Limit Hygiene (B-021/B-022/B-023):** The stagger + semaphore pattern must be preserved on any Layer 2 refactor. Do not remove `startup_delay_s`, `_token_semaphore`, or the 429/Retry-After handler from `stream_worker.py` and `tradier_stream.py` — these are the primary defence against account throttling under the current Tradier multi-worker architecture.
