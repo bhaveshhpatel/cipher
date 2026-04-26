@@ -43,6 +43,9 @@ jobs:
   # Runs in PARALLEL with lint (no needs: lint) — fails fast independently.
   # pip cache keyed on both requirements files so cache hit = ~5s install.
   # --cov-fail-under=92 enforced (aligned with pytest.ini).
+  # --continue-on-collection-errors: collect ALL test files before stopping
+  #   so every import error / missing module surfaces in one run instead of
+  #   halting at the first failure.
   # -------------------------------------------------------------------------
   regression:
     name: Regression Tests + Coverage Gate
@@ -97,6 +100,7 @@ jobs:
           pytest \
             --tb=short \
             -q \
+            --continue-on-collection-errors \
             --cov=. \
             --cov-branch \
             --cov-report=term-missing \
