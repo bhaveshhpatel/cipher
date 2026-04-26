@@ -41,7 +41,7 @@ function EmptyState({ ticker }: { ticker: string }) {
         No composite signal for {ticker}
       </p>
       <p className="text-sm" style={{ color: "var(--faint)" }}>
-        Click "Analyze {ticker}" to run multi-factor scoring.
+        Click &ldquo;Analyze {ticker}&rdquo; to run multi-factor scoring.
       </p>
     </div>
   );

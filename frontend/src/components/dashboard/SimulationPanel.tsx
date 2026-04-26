@@ -39,7 +39,7 @@ function EmptyState() {
     <div className="card flex flex-col items-center justify-center py-20 gap-4">
       <span className="text-4xl" style={{ color: "var(--faint)" }}>⬡</span>
       <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>No simulation results yet</p>
-      <p className="text-sm" style={{ color: "var(--faint)" }}>Scan flow events for a ticker, then click "Run AI Simulation".</p>
+      <p className="text-sm" style={{ color: "var(--faint)" }}>Scan flow events for a ticker, then click &ldquo;Run AI Simulation&rdquo;.</p>
     </div>
   );
 }
