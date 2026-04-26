@@ -13,6 +13,15 @@ Responsibilities:
   5. On registry refresh: diff old vs new symbols, restart only affected workers
   6. Expose aggregate stats for /health endpoint
 
+B-021 — Staggered worker startup:
+  Workers are started with a 200ms delay between each one.
+  With 32 workers this adds a one-time 6.4s startup cost before all
+  workers are streaming. There is zero ongoing latency impact — once
+  connected each worker streams in real-time exactly as before.
+  The stagger prevents a simultaneous burst of ~32 session-token
+  requests hitting Tradier at t=0, which was causing silent 429s and
+  immediate reconnect death spirals.
+
 USAGE in main.py:
   manager = StreamManager(registry=registry, process_fn=_process_trade)
   asyncio.create_task(manager.run())
@@ -28,6 +37,10 @@ log = logging.getLogger("stream_manager")
 
 _CHUNK_SIZE  = 500    # OCC symbols per stream connection
 _QUEUE_SIZE  = 10_000  # max buffered events before dropping
+
+# B-021: delay between successive worker starts (seconds)
+_WORKER_STARTUP_STAGGER_MS: int = 200
+_WORKER_STARTUP_STAGGER_S: float = _WORKER_STARTUP_STAGGER_MS / 1000.0
 
 
 class StreamManager:
@@ -117,17 +130,17 @@ class StreamManager:
 
     @property
     def stats(self) -> dict:
-        total_ticks    = sum(w._ticks    for w in self._workers)
-        total_errors   = sum(w._errors   for w in self._workers)
+        total_ticks      = sum(w._ticks      for w in self._workers)
+        total_errors     = sum(w._errors     for w in self._workers)
         total_reconnects = sum(w._reconnects for w in self._workers)
         return {
-            "workers":      len(self._workers),
-            "active_symbols": self._registry.size(),
-            "queue_size":   self._queue.qsize(),
-            "total_ticks":  total_ticks,
-            "total_errors": total_errors,
-            "total_reconnects": total_reconnects,
-            "worker_detail": [w.stats for w in self._workers],
+            "workers":           len(self._workers),
+            "active_symbols":    self._registry.size(),
+            "queue_size":        self._queue.qsize(),
+            "total_ticks":       total_ticks,
+            "total_errors":      total_errors,
+            "total_reconnects":  total_reconnects,
+            "worker_detail":     [w.stats for w in self._workers],
         }
 
     # ------------------------------------------------------------------
@@ -135,7 +148,16 @@ class StreamManager:
     # ------------------------------------------------------------------
 
     async def _spawn_workers(self):
-        """Create StreamWorker for each 500-symbol chunk and start tasks."""
+        """
+        Create StreamWorker for each 500-symbol chunk and start tasks.
+
+        B-021: Workers are staggered by _WORKER_STARTUP_STAGGER_S (200ms)
+        between each spawn. Each worker receives its startup_delay_s so it
+        can sleep before opening its first Tradier connection. This spreads
+        32 simultaneous session-token requests over ~6.4 seconds, preventing
+        Tradier 429 bursts at startup. There is zero ongoing latency impact
+        once all workers are connected.
+        """
         all_symbols = self._registry.all_symbols()
         if not all_symbols:
             log.warning("[stream_manager] Registry is empty — no workers spawned")
@@ -145,18 +167,27 @@ class StreamManager:
             all_symbols[i:i + _CHUNK_SIZE]
             for i in range(0, len(all_symbols), _CHUNK_SIZE)
         ]
+        total_stagger_s = (len(chunks) - 1) * _WORKER_STARTUP_STAGGER_S
         log.info(
             f"[stream_manager] Spawning {len(chunks)} workers "
-            f"for {len(all_symbols):,} OCC symbols ({_CHUNK_SIZE} symbols/worker)"
+            f"for {len(all_symbols):,} OCC symbols ({_CHUNK_SIZE} symbols/worker) "
+            f"| stagger={_WORKER_STARTUP_STAGGER_MS}ms between workers "
+            f"| total startup window={total_stagger_s:.1f}s (B-021)"
         )
 
         self._workers = []
         self._tasks   = []
         for idx, chunk in enumerate(chunks):
+            # B-021: each worker is told its startup delay up front so the
+            # sleep happens inside worker.run() before the first connection
+            # attempt. This keeps _spawn_workers() itself fast (no await
+            # sleep here) while still spreading the connection load.
+            startup_delay = idx * _WORKER_STARTUP_STAGGER_S
             worker = StreamWorker(
-                worker_id   = idx,
-                symbols     = chunk,
-                event_queue = self._queue,
+                worker_id     = idx,
+                symbols       = chunk,
+                event_queue   = self._queue,
+                startup_delay_s = startup_delay,
             )
             self._workers.append(worker)
             task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")

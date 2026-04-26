@@ -6,13 +6,22 @@ Each StreamWorker manages one Tradier streaming connection for up to
 to cover the full OCC registry (~16,000 symbols = ~32 workers).
 
 Each worker:
-  1. Fetches its own fresh session token (tokens are single-use)
-  2. Opens a POST stream to stream.tradier.com/v1/markets/events
+  1. Sleeps startup_delay_s before opening its first connection (B-021)
+  2. Fetches its own fresh session token (tokens are single-use)
+  3. Opens a POST stream to stream.tradier.com/v1/markets/events
      with filter=timesale and its 500 OCC symbols
-  3. Reads lines → pushes raw dicts to the shared asyncio.Queue
-  4. Reconnects with exponential backoff on any disconnect
-  5. Respects a 30s idle watchdog (Tradier sends bare newlines as keepalives)
-  6. Shuts down cleanly on cancellation
+  4. Reads lines → pushes raw dicts to the shared asyncio.Queue
+  5. Reconnects with exponential backoff on any disconnect
+  6. Respects a 30s idle watchdog (Tradier sends bare newlines as keepalives)
+  7. Shuts down cleanly on cancellation
+
+B-021 — Staggered startup:
+  StreamManager passes startup_delay_s = idx * 0.200 to each worker.
+  Worker-0 has delay=0 (connects immediately), worker-1 delays 200ms,
+  worker-31 delays 6.2s. After the initial delay the worker runs its
+  normal market-hours guard and reconnect loop with zero extra latency.
+  The startup_delay_s delay only fires once at the start of run();
+  reconnects do NOT re-apply the startup delay.
 
 The shared queue is consumed by the parser/enricher layer.
 """
@@ -64,14 +73,16 @@ class StreamWorker:
         worker_id: int,
         symbols: list[str],
         event_queue: asyncio.Queue,
+        startup_delay_s: float = 0.0,  # B-021: stagger delay before first connect
     ):
-        self.worker_id   = worker_id
-        self.symbols     = symbols
-        self.event_queue = event_queue
-        self._running    = True
-        self._ticks      = 0
-        self._errors     = 0
-        self._reconnects = 0
+        self.worker_id       = worker_id
+        self.symbols         = symbols
+        self.event_queue     = event_queue
+        self.startup_delay_s = startup_delay_s  # B-021
+        self._running        = True
+        self._ticks          = 0
+        self._errors         = 0
+        self._reconnects     = 0
 
     def update_symbols(self, new_symbols: list[str]):
         """Update symbol list — takes effect on next reconnect."""
@@ -83,15 +94,27 @@ class StreamWorker:
     @property
     def stats(self) -> dict:
         return {
-            "worker_id":  self.worker_id,
-            "symbols":    len(self.symbols),
-            "ticks":      self._ticks,
-            "errors":     self._errors,
-            "reconnects": self._reconnects,
+            "worker_id":       self.worker_id,
+            "symbols":         len(self.symbols),
+            "ticks":           self._ticks,
+            "errors":          self._errors,
+            "reconnects":      self._reconnects,
+            "startup_delay_s": self.startup_delay_s,  # B-021: visible in /health
         }
 
     async def run(self):
         """Main loop — connect, stream, reconnect on failure."""
+
+        # B-021: One-time startup stagger. Worker-0 is delay=0 (instant).
+        # Subsequent workers sleep N*200ms before their first connection attempt.
+        # This delay does NOT re-apply on reconnects — reconnects use _backoff().
+        if self.startup_delay_s > 0:
+            log.info(
+                f"[worker-{self.worker_id}] B-021 startup stagger: "
+                f"sleeping {self.startup_delay_s:.1f}s before first connect"
+            )
+            await asyncio.sleep(self.startup_delay_s)
+
         url = f"{settings.TRADIER_STREAM_URL}/v1/markets/events"
         stream_headers = {
             "Authorization": f"Bearer {settings.TRADIER_API_KEY}",

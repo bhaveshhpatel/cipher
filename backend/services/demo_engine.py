@@ -35,6 +35,12 @@ C-019 changes:
   - Inter-exchange delay widened from 20-80ms to 50-300ms to properly
     exercise the 5s TTL window and simulate MIAX/PHLX lag realistically.
   - get_stats() now includes dedup_stats() from flow_dedup for observability.
+
+B-021 note:
+  The demo engine bypasses StreamManager/StreamWorker entirely — it calls
+  _process_trade() directly. The 200ms worker stagger is therefore not
+  simulated or applied here. This is correct behaviour: the demo engine
+  exists to test the signal pipeline, not the connection layer.
 """
 import asyncio
 import logging
@@ -202,6 +208,10 @@ async def _run_demo_loop():
       - burst_fill uses ±0.5% variation per burst; with fill:.1f key
         rounding, fills like $3.45 and $3.46 both round to $3.5 and
         are correctly deduplicated as the same trade.
+
+    B-021 note:
+      Demo engine bypasses StreamWorker — _process_trade() is called
+      directly. The 200ms worker stagger is not replicated here.
     """
     global _demo_running, _demo_stats
     from services.tradier_stream import _process_trade
@@ -209,6 +219,7 @@ async def _run_demo_loop():
     rng = random.Random()
     _demo_stats["started_at"] = datetime.utcnow().isoformat()
     log.info("[demo_engine] Demo engine started — emitting realistic Tradier timesale events")
+    log.info("[demo_engine] Note: B-021 worker stagger not simulated (demo bypasses StreamWorker)")
 
     try:
         while _demo_running:
