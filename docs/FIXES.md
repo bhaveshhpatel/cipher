@@ -4,6 +4,117 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## B-023 — Explicit 429 Handling in `get_session_token()`
+
+**Date:** 2026-04-25  
+**Type:** Reliability fix  
+**Files:** `backend/utils/tradier_client.py`
+
+### Root Cause
+
+`get_session_token()` called `resp.raise_for_status()` without first checking for HTTP 429. When Tradier rate-limited a session token request, `raise_for_status()` converted the 429 into an unhandled `httpx.HTTPStatusError`. The worker caught this as a generic exception, returned `None`, immediately hit its backoff sleep, then retried — re-requesting a token without waiting for the rate-limit window to reset. This burned more API budget and deepened the 429 spiral.
+
+### Symptom
+
+Workers entering a crash-loop under load: `None` token → backoff sleep → retry → 429 again → repeat. Logs showed repeated `"No session token — backing off"` at startup with 32 workers attempting simultaneous connections.
+
+### Fix Applied
+
+**`backend/utils/tradier_client.py`**
+- Added explicit `if resp.status_code == 429:` check **before** `raise_for_status()`
+- Reads `Retry-After` header (defaults to `_DEFAULT_RETRY_AFTER_S = 10.0` if absent)
+- Sleeps `retry_after` seconds, then `continue`s to retry within the same semaphore hold
+- `_DEFAULT_RETRY_AFTER_S = 10.0` module constant — easily tunable
+
+### Expected Impact
+
+| Scenario | Before B-023 | After B-023 |
+|----------|-------------|-------------|
+| Tradier returns 429 | Unhandled exception → crash loop | Sleep Retry-After, then retry |
+| API budget under load | Burned faster (crash-loop re-requests) | Controlled — respects rate-limit window |
+| Worker restart time after 429 | Unpredictable (backoff jitter) | Deterministic (Retry-After header) |
+
+---
+
+## B-022 — Global Session Token Semaphore (`max 3 concurrent`)
+
+**Date:** 2026-04-25  
+**Type:** Reliability fix  
+**Files:** `backend/utils/tradier_client.py`
+
+### Root Cause
+
+With 32 `StreamWorker` instances all calling `get_session_token()` at startup (and again during the 30-min registry refresh restart), Tradier received ~32 simultaneous POST requests to `/v1/markets/events/session`. Tradier's rate limiter silently returned 429s for the overflow requests. Because the 429 was not handled explicitly (B-023), workers entered a reconnect death spiral: failed token → backoff → retry → another 429 → repeat. The net result was that many workers never established a stream connection at all, leaving large gaps in OCC symbol coverage.
+
+### Symptom
+
+At startup with >8 workers: intermittent `"No session token — backing off"` log spam across many workers, with only a subset (typically the first 3–6) successfully connecting. Stream coverage dropped silently — no error surfaced at the `StreamManager` level.
+
+### Fix Applied
+
+**`backend/utils/tradier_client.py`**
+- Added `_SESSION_SEM = asyncio.Semaphore(3)` module-level constant
+- Wrapped entire `get_session_token()` body in `async with _SESSION_SEM:`
+- With Semaphore(3) and ~400ms per token round-trip: 32 workers acquire tokens in ⌈32/3⌉ = 11 batches × ~400ms = **~4.4s total** (one-time startup cost)
+- Semaphore also controls token pressure during the 30-min registry refresh restart
+
+### Startup Timing (combined B-021 + B-022)
+
+| Step | Time |
+|------|------|
+| B-021 worker stagger (32 workers × 200ms) | 6.4s |
+| B-022 token batching (⌈32/3⌉ batches × 400ms avg) | ~4.4s |
+| **Total one-time startup window** | **~10–11s** |
+| Ongoing per-signal latency impact | **Zero** |
+
+### Expected Impact
+
+| Metric | Before B-022 | After B-022 |
+|--------|-------------|-------------|
+| Concurrent token requests at startup | 32 (burst) | Max 3 |
+| Silent 429s at startup | Common (>8 workers) | Eliminated |
+| Workers failing to connect | Up to ~28/32 | Zero (all connect, serially batched) |
+| 30-min refresh token pressure | Same burst problem | Controlled |
+
+---
+
+## B-021 — Staggered Worker Startup (200ms between workers)
+
+**Date:** 2026-04-25  
+**Type:** Reliability fix  
+**Files:** `backend/services/stream_manager.py`, `backend/services/stream_worker.py`, `backend/tests/test_stream_manager.py`
+
+### Root Cause
+
+Before B-021, `StreamManager._spawn_workers()` created all 32 `StreamWorker` tasks in a tight loop with no delay between them. Each worker immediately called `get_session_token()` on startup, producing a ~32-simultaneous-request burst to Tradier’s session endpoint. Even with the B-022 semaphore in place, the stagger further smooths connection load by spreading *when* workers attempt to acquire the semaphore rather than all contending for it instantly.
+
+### Fix Applied
+
+**`backend/services/stream_manager.py`**
+- Added `_WORKER_STARTUP_STAGGER_MS = 200` and `_WORKER_STARTUP_STAGGER_S = 0.200` constants
+- Each worker receives `startup_delay_s = idx * 0.200` — worker-0 gets 0s, worker-31 gets 6.2s
+- `_spawn_workers()` passes `startup_delay_s` to `StreamWorker.__init__()` as a constructor arg
+
+**`backend/services/stream_worker.py`**
+- `__init__` accepts `startup_delay_s: float = 0.0`
+- `run()` calls `await asyncio.sleep(startup_delay_s)` **once** at the top before any connection attempt
+- Reconnects do **not** re-apply the startup delay — they use the standard `_backoff()` function
+- `startup_delay_s` exposed in `worker.stats` for `/health` observability
+
+**`backend/tests/test_stream_manager.py`**
+- Added `TestB021StaggeredStartup` class — 7 tests (tests 21–27)
+- Covers: constants are 200ms/0.200s, worker-0 delay=0, worker-1 delay=0.2, worker-N delay=N×0.2, stat exposure, one-time fire (reconnects don’t re-apply)
+
+### Expected Impact
+
+| Metric | Before B-021 | After B-021 |
+|--------|-------------|-------------|
+| Token request burst at startup | 32 simultaneous | Spread over 6.4s |
+| Per-signal latency (ongoing) | — | Zero impact |
+| Worker startup observability | None | `startup_delay_s` in `/health` |
+
+---
+
 ## T-001 — Unit Test Suite: OCC Parser, Bid/Ask Classifier, Repetition Engine
 
 **Date:** 2026-04-25
@@ -70,7 +181,7 @@ All `options_universe_symbols` rows carried no tier metadata. The `volume_premiu
 - `get_tier(ticker)` — O(1) lookup; returns 3 if ticker not in map
 
 **`backend/services/universe_store.py`**
-- `load_tier_map()` — new function; reads `(ticker, tier)` from latest active snapshot's symbols; returns `dict[str, int]`; returns `{}` on DB error or missing column
+- `load_tier_map()` — new function; reads `(ticker, tier)` from latest active snapshot’s symbols; returns `dict[str, int]`; returns `{}` on DB error or missing column
 
 **`backend/main.py`**
 - After universe load at startup, calls `tier_engine.load_thresholds()` then `set_tier_map(symbols)` so all downstream signal scoring has real tier data from first tick
@@ -313,7 +424,7 @@ _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("S
 ```
 When `SUPABASE_SERVICE_ROLE_KEY` was not set in Railway environment variables, the expression evaluated to `SUPABASE_KEY` — the **anon/public key**. The anon key is subject to Supabase Row Level Security (RLS). Since `flow_episodes` has RLS enabled with no policy permitting anonymous inserts, every write was rejected with HTTP 401 / Postgres error `42501`.
 
-### Why It's Dangerous
+### Why It’s Dangerous
 
 The fallback was silent — no error was thrown at startup. The service appeared to run normally (flow ticks were logged, signals were detected) but **nothing was ever written to the database**. The only indication was the `401` error in Railway logs.
 
