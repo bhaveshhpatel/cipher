@@ -73,7 +73,8 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
-  # Job 3: Build
+  # Job 3: Build (validates the Next.js build compiles cleanly)
+  # Deploy is handled automatically by Vercel's GitHub integration on push to main.
   # ---------------------------------------------------------------------------
   build:
     name: Build
@@ -98,43 +99,3 @@ jobs:
         env:
           NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
           NEXT_PUBLIC_WS_URL:  ${{ secrets.NEXT_PUBLIC_WS_URL }}
-
-  # ---------------------------------------------------------------------------
-  # Job 4: Deploy to Vercel (only on push to main after build passes)
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy to Vercel
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install Vercel CLI
-        run: npm i -g vercel
-
-      - name: Pull Vercel environment & settings
-        env:
-          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel pull --yes --environment=production --token=$VERCEL_TOKEN
-
-      - name: Build (Vercel)
-        env:
-          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel build --prod --token=$VERCEL_TOKEN
-
-      - name: Deploy prebuilt
-        env:
-          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN
