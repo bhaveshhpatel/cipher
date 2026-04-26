@@ -44,10 +44,7 @@ Covers:
   31. refresh() full spawn fallback fires when _workers list is empty
 """
 import asyncio
-import unittest.mock as mock
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 
 # -- helpers ------------------------------------------------------------------
@@ -80,8 +77,8 @@ class TestStreamWorker:
 
     # -- 1 -------------------------------------------------------------------
     def test_stats_initial(self):
-        w = self._worker()
-        s = w.stats
+        _w = self._worker()
+        s = _w.stats
         assert s["worker_id"]  == 0
         assert s["symbols"]    == 1
         assert s["ticks"]      == 0
@@ -90,24 +87,24 @@ class TestStreamWorker:
 
     # -- 2 -------------------------------------------------------------------
     def test_update_symbols(self):
-        w = self._worker()
+        _w = self._worker()
         new = ["TSLA  260117C00250000", "NVDA  260117C00600000"]
-        w.update_symbols(new)
-        assert w.symbols == new
-        assert w.stats["symbols"] == 2
+        _w.update_symbols(new)
+        assert _w.symbols == new
+        assert _w.stats["symbols"] == 2
 
     # -- 3 -------------------------------------------------------------------
     def test_stop_sets_running_false(self):
-        w = self._worker()
-        assert w._running is True
-        w.stop()
-        assert w._running is False
+        _w = self._worker()
+        assert _w._running is True
+        _w.stop()
+        assert _w._running is False
 
     # -- 4 -------------------------------------------------------------------
     def test_queue_full_drops_tick_silently(self):
         from services.stream_worker import StreamWorker
         q = asyncio.Queue(maxsize=1)
-        w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
+        _w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
         q.put_nowait({"type": "timesale"})
         try:
             q.put_nowait({"type": "timesale"})
@@ -122,15 +119,15 @@ class TestStreamWorker:
 
         async def _test():
             q = asyncio.Queue()
-            w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
+            _w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
             with patch("services.stream_worker._is_market_hours", return_value=True), \
                  patch("services.stream_worker.get_session_token", new_callable=AsyncMock) as mock_tok:
                 mock_tok.side_effect = asyncio.CancelledError
                 try:
-                    await w.run()
+                    await _w.run()
                 except asyncio.CancelledError:
                     pass
-            assert w._running is True
+            assert _w._running is True
 
         _run(_test())
 
@@ -141,18 +138,18 @@ class TestStreamWorker:
 
         async def _test():
             q = asyncio.Queue()
-            w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
+            _w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
             iteration = {"i": 0}
 
             async def fake_sleep(secs):
                 iteration["i"] += 1
                 if iteration["i"] >= 2:
-                    w._running = False
+                    _w._running = False
 
             with patch("services.stream_worker._is_market_hours", return_value=False), \
                  patch("services.stream_worker.get_session_token", new_callable=AsyncMock) as mock_tok, \
                  patch("asyncio.sleep", side_effect=fake_sleep):
-                await w.run()
+                await _w.run()
                 call_count["n"] = mock_tok.call_count
 
         _run(_test())
@@ -164,20 +161,20 @@ class TestStreamWorker:
 
         async def _test():
             q = asyncio.Queue()
-            w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
+            _w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
             iteration = {"i": 0}
 
             async def fake_sleep(secs):
                 iteration["i"] += 1
                 if iteration["i"] >= 2:
-                    w._running = False
+                    _w._running = False
 
             with patch("services.stream_worker._is_market_hours", return_value=True), \
                  patch("services.stream_worker.get_session_token",
                         new_callable=AsyncMock, return_value=None), \
                  patch("asyncio.sleep", side_effect=fake_sleep):
-                await w.run()
-            return w._errors
+                await _w.run()
+            return _w._errors
 
         errors = _run(_test())
         assert errors >= 1
@@ -188,20 +185,20 @@ class TestStreamWorker:
 
         async def _test():
             q = asyncio.Queue()
-            w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
+            _w = StreamWorker(worker_id=0, symbols=["X"], event_queue=q)
             iteration = {"i": 0}
 
             async def fake_sleep(secs):
                 iteration["i"] += 1
                 if iteration["i"] >= 3:
-                    w._running = False
+                    _w._running = False
 
             with patch("services.stream_worker._is_market_hours", return_value=True), \
                  patch("services.stream_worker.get_session_token",
                         new_callable=AsyncMock, return_value=None), \
                  patch("asyncio.sleep", side_effect=fake_sleep):
-                await w.run()
-            return w._reconnects
+                await _w.run()
+            return _w._reconnects
 
         reconnects = _run(_test())
         assert reconnects >= 1
@@ -338,9 +335,9 @@ class TestStreamManager:
         reg = _make_registry(syms)
         mgr = StreamManager(registry=reg, process_fn=AsyncMock())
         for s in syms:
-            w = MagicMock()
-            w.symbols = [s]
-            mgr._workers.append(w)
+            _w = MagicMock()
+            _w.symbols = [s]
+            mgr._workers.append(_w)
 
         stop_called = {"n": 0}
         original_stop = mgr.stop
@@ -359,9 +356,9 @@ class TestStreamManager:
         reg = _make_registry(["A", "B", "C", "D"])
         mgr = StreamManager(registry=reg, process_fn=AsyncMock())
         for s in ["A", "B"]:
-            w = MagicMock()
-            w.symbols = [s]
-            mgr._workers.append(w)
+            _w = MagicMock()
+            _w.symbols = [s]
+            mgr._workers.append(_w)
 
         spawn_called = {"n": 0}
 
@@ -490,8 +487,8 @@ class TestB021StaggeredStartup:
     def test_startup_delay_exposed_in_stats(self):
         from services.stream_worker import StreamWorker
         q = asyncio.Queue()
-        w = StreamWorker(worker_id=3, symbols=["A", "B"], event_queue=q, startup_delay_s=0.6)
-        s = w.stats
+        _w = StreamWorker(worker_id=3, symbols=["A", "B"], event_queue=q, startup_delay_s=0.6)
+        s = _w.stats
         assert "startup_delay_s" in s
         assert abs(s["startup_delay_s"] - 0.6) < 1e-9
 
@@ -502,18 +499,18 @@ class TestB021StaggeredStartup:
 
         async def _test():
             q = asyncio.Queue()
-            w = StreamWorker(worker_id=2, symbols=["X"], event_queue=q, startup_delay_s=0.4)
+            _w = StreamWorker(worker_id=2, symbols=["X"], event_queue=q, startup_delay_s=0.4)
 
             async def fake_sleep(secs):
                 sleep_calls.append(secs)
                 if len(sleep_calls) >= 2:
-                    w._running = False
+                    _w._running = False
 
             with patch("services.stream_worker._is_market_hours", return_value=True), \
                  patch("services.stream_worker.get_session_token",
                         new_callable=AsyncMock, return_value=None), \
                  patch("asyncio.sleep", side_effect=fake_sleep):
-                await w.run()
+                await _w.run()
 
         _run(_test())
         assert len(sleep_calls) >= 1
@@ -566,7 +563,7 @@ class TestF03SurgicalRestart:
                 MockWorker.return_value = mock_inst
 
                 # Patch asyncio.create_task to avoid actual task creation
-                with patch("asyncio.create_task", return_value=MagicMock()) as mock_create:
+                with patch("asyncio.create_task", return_value=MagicMock()):
                     await mgr.refresh()
 
             # Worker whose chunk overlapped diff (A,B) was cancelled
@@ -588,12 +585,12 @@ class TestF03SurgicalRestart:
         mgr = StreamManager(registry=reg, process_fn=AsyncMock())
 
         def _make_worker_task(syms):
-            w = MagicMock()
-            w.symbols = syms
+            _w = MagicMock()
+            _w.symbols = syms
             t = MagicMock()
             t.cancel = MagicMock()
             t.done   = MagicMock(return_value=False)
-            return w, t
+            return _w, t
 
         w0, t0 = _make_worker_task(["A", "B"])
         w1, t1 = _make_worker_task(["C", "D"])
@@ -670,7 +667,6 @@ class TestF03SurgicalRestart:
         assert mgr._workers == []
 
         spawn_called = {"n": 0}
-        original_spawn = mgr._spawn_workers
 
         async def counted_spawn():
             spawn_called["n"] += 1

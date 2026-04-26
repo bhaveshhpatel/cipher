@@ -43,8 +43,6 @@ Covers:
 import asyncio
 from asyncio import Queue
 
-import pytest
-
 from core.async_bus import AsyncEventBus, bus
 
 
@@ -98,8 +96,8 @@ def test_subscribe_different_channels_independent():
 # 5
 def test_subscribe_same_subscriber_twice_gives_two_queues():
     b = fresh()
-    q1 = b.subscribe("ch")
-    q2 = b.subscribe("ch")
+    _q1 = b.subscribe("ch")
+    _q2 = b.subscribe("ch")
     assert len(b._subscribers["ch"]) == 2
 
 
@@ -290,12 +288,12 @@ def test_subscribe_publish_unsubscribe_resubscribe_cycle():
 
 # 24
 def test_full_queue_does_not_block_other_subscribers():
-    b = fresh()
-    q_full = b.subscribe("ch")
-    q_ok   = b.subscribe("ch")
+    _b = fresh()
+    q_full = _b.subscribe("ch")
+    q_ok   = _b.subscribe("ch")
     # Fill q_full
     for i in range(500):
         q_full.put_nowait(i)
     # Publish — q_full is dropped, q_ok still receives
-    run(b.publish("ch", "important"))
+    run(_b.publish("ch", "important"))
     assert q_ok.get_nowait() == "important"
