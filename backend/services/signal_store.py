@@ -11,6 +11,7 @@ Public API (for tests):
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
   get_recent_signals(ticker: str | None, limit: int) -> list[dict]  [async alias]
   _client() -> Supabase-SDK-like | dict | None  (patchable)
+  _clear_signal_memory() -> None               (test isolation helper)
 
 Normalisation helpers:
   _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral'
@@ -46,6 +47,13 @@ _RETRY_DELAY_S = 1.0
 _signal_memory: List[dict] = []
 # Dedup set — keyed by signal 'id' to prevent duplicates in _signal_memory
 _signal_ids_seen: set = set()
+
+
+def _clear_signal_memory() -> None:
+    """Reset in-memory signal store and dedup set. Used by test fixtures for isolation."""
+    global _signal_memory, _signal_ids_seen
+    _signal_memory = []
+    _signal_ids_seen = set()
 
 
 def _is_configured() -> bool:
@@ -269,6 +277,8 @@ async def save_signal(signal) -> bool:
     Dedup: if the signal has an 'id' field, skip storing it in _signal_memory
     if the same id was already stored (prevents duplicate-signal test failures).
     """
+    global _signal_memory, _signal_ids_seen
+
     sig_dict = _coerce_to_dict(signal)
     sig_id   = sig_dict.get("id")
 
