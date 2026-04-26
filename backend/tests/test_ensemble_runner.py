@@ -1,25 +1,12 @@
 """
 Phase 3 — test_ensemble_runner.py
-
-Covers:
-  - run_ensemble() vote aggregation: BUY majority, SELL majority, HOLD/tie
-  - confidence calculation for each direction
-  - summary string format
-  - agents list shape (role, name, direction, reasoning, confidence)
-  - zero-agent edge (total=0 → HOLD, confidence=0.0)
-  - n_agents snap passed through to SwarmEngine
-  - flow_events as string passthrough
-  - swarm exception → bubbles out (no silent swallow at this layer)
 """
-import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
-# ---------------------------------------------------------------------------
-# Minimal stub for AgentVerdict so tests don't need a live Groq key
-# ---------------------------------------------------------------------------
+
 @dataclass
 class _Verdict:
     role:       str
@@ -40,10 +27,6 @@ def _make_verdicts(buy: int, sell: int, hold: int) -> List[_Verdict]:
     return verdicts
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -62,14 +45,9 @@ FLOW_EVENTS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 class TestEnsembleAggregation:
 
     def _patch_swarm(self, verdicts):
-        """Patch SwarmEngine.run() to return given verdicts."""
         mock_engine = MagicMock()
         mock_engine.run = AsyncMock(return_value=verdicts)
         return patch("simulation.ensemble_runner.SwarmEngine", return_value=mock_engine)
@@ -94,7 +72,6 @@ class TestEnsembleAggregation:
         assert result.confidence == round(4 / 6, 3)
 
     def test_hold_on_tie(self):
-        # buy==bear, neither dominates → HOLD
         verdicts = _make_verdicts(buy=2, sell=2, hold=2)
         with self._patch_swarm(verdicts):
             from simulation.ensemble_runner import run_ensemble
@@ -141,7 +118,6 @@ class TestEnsembleAggregation:
         assert result.ticker == "MSFT"
 
     def test_flow_events_as_string(self):
-        """run_ensemble accepts a pre-built summary string — passes straight to SwarmEngine."""
         verdicts = _make_verdicts(buy=2, sell=1, hold=0)
         with self._patch_swarm(verdicts):
             from simulation.ensemble_runner import run_ensemble
@@ -157,7 +133,6 @@ class TestEnsembleAggregation:
         assert result.confidence == 1.0
 
     def test_n_agents_passed_to_engine(self):
-        """n_agents kwarg should be forwarded to SwarmEngine constructor."""
         verdicts = _make_verdicts(buy=3, sell=0, hold=0)
         with patch("simulation.ensemble_runner.SwarmEngine") as mock_cls:
             mock_engine = MagicMock()
@@ -168,7 +143,6 @@ class TestEnsembleAggregation:
             mock_cls.assert_called_once_with(n_agents=9)
 
     def test_confidence_capped_at_1(self):
-        """All 6 votes in same direction → confidence = 1.0."""
         verdicts = _make_verdicts(buy=6, sell=0, hold=0)
         with self._patch_swarm(verdicts):
             from simulation.ensemble_runner import run_ensemble

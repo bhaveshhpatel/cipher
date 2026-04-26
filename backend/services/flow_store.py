@@ -27,69 +27,10 @@ IMPORTANT — Key selection:
   inserts. The anon/public key (SUPABASE_KEY) respects RLS and will
   cause every insert to fail with a 42501 policy violation. Never use
   the anon key for backend DB writes.
-
-Fix (C-010):
-  - Env var corrected: SUPABASE_SERVICE_KEY -> SUPABASE_SERVICE_ROLE_KEY
-  - persist_flow_event() now writes ALL flow_events columns:
-    fill_price, bid, ask, size, dte, bid_ask_class, is_aggressive,
-    exchange_count, fill_count, open_interest, iv, underlying_price.
-  - expiry sent as None (not "") when empty so Postgres DATE/TEXT column
-    does not receive an empty string that triggers a cast error.
-
-Fix (C-011):
-  - strike=0 sent as 0.0 (not None) -- parser now skips zero-strike trades
-    so any trade reaching here has a valid strike.
-  - persist_flow_event logs a warning when strike or expiry is missing
-    so parsing quality can be monitored in Railway logs.
-
-Architecture change (Layer 1+2):
-  - occ_symbol field now written to flow_events.occ_symbol column.
-    This stores the raw OCC contract string (e.g. "AAPL  260117C00180000")
-    for every persisted trade, enabling contract-level querying and auditing.
-
-Architecture fix (Layer 5):
-  - FLUSH_INTERVAL corrected from 5s -> 0.5s (500ms) to match the 6-layer
-    architecture spec (flush every 500ms or 100 rows, whichever comes first).
-    The previous 5s interval was an oversight -- at 62K rows/day the buffer
-    would grow ~430 rows before each flush, risking data loss on crash.
-  - _flush_flow_events() now also flushes early if buffer hits FLUSH_MAX_ROWS=100.
-
-Fix (C-016):
-  - Added `global _flow_event_buffer` declaration inside persist_flow_event().
-    Without it, Python treats the local reassignment as a local variable binding
-    for the entire function scope, causing an UnboundLocalError on .append().
-
-Fix (C-017):
-  - _bus_signal_listener now writes flow_episodes ONLY on 'composite_signal' events.
-    Previously it also wrote on raw 'signal' events, causing 2 rows per episode.
-    Fix: drop the 'signal' handler for flow_episodes entirely. The composite_signal
-    message always follows immediately and contains richer data.
-
-Fix (C-018) -- Synthetic Quote Tagging:
-  - is_synthetic_quote field now written to flow_events.is_synthetic_quote column.
-
-Fix (F-01) -- Env-var gate on persist_flow_event:
-  - Previously start_flow_writer() returned early on missing env vars, but
-    persist_flow_event() had no guard of its own. Callers from tradier_stream
-    could still invoke it directly, causing the buffer to grow indefinitely
-    with rows that could never be flushed -> unbounded memory growth -> OOM.
-  - Now persist_flow_event() checks _SUPABASE_URL/_SUPABASE_KEY and returns
-    immediately with a warning when either is absent.
-
-Fix (F-02) -- Retry buffer on flush failure:
-  - _flush_flow_events() previously dropped the batch silently on any
-    Supabase error (network blip, transient 5xx). Data was logged as
-    'data lost' with no recovery path.
-  - Now uses _insert_rows_with_retry() which retries up to _RETRY_MAX=3
-    times with _RETRY_DELAY_S=1.0s backoff before discarding.
-  - Same retry logic applied to the early-flush path in persist_flow_event().
-  - After all retries exhausted the batch is discarded with log.error so
-    the data loss is visible in Railway logs / alerting.
 """
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -99,26 +40,20 @@ log = logging.getLogger("flow_store")
 _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
 
 # IMPORTANT: Use the service role key ONLY -- it bypasses RLS.
-# Never fall back to the anon key (SUPABASE_KEY) here; the anon key
-# respects RLS and will produce 401/42501 errors on every insert.
-# Env var name: SUPABASE_SERVICE_ROLE_KEY  (Railway config)
 _SUPABASE_KEY: Optional[str] = (
     os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     or os.environ.get("SUPABASE_SERVICE_KEY")  # legacy fallback
 )
 
-# Layer 5: Batch insert flow_events every 500ms OR 100 rows -- whichever first.
-_FLUSH_INTERVAL  = 0.5   # seconds (500ms)
-_FLUSH_MAX_ROWS  = 100   # flush early if buffer hits this size
+_FLUSH_INTERVAL  = 0.5
+_FLUSH_MAX_ROWS  = 100
 _flow_event_buffer: list[dict] = []
 
-# F-02: retry constants for failed inserts
-_RETRY_MAX     = 3    # max insert attempts before discarding batch
-_RETRY_DELAY_S = 1.0  # seconds between retry attempts
+_RETRY_MAX     = 3
+_RETRY_DELAY_S = 1.0
 
 
 def _is_configured() -> bool:
-    """Return True when Supabase URL and service-role key are both present."""
     return bool(_SUPABASE_URL and _SUPABASE_KEY)
 
 
@@ -132,7 +67,6 @@ def _headers() -> dict:
 
 
 async def _insert_rows(table: str, rows: list[dict]) -> bool:
-    """POST rows to a Supabase REST table. Returns True on success."""
     if not rows or not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
     url = f"{_SUPABASE_URL}/rest/v1/{table}"
@@ -149,15 +83,6 @@ async def _insert_rows(table: str, rows: list[dict]) -> bool:
 
 
 async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
-    """
-    F-02: Wrap _insert_rows() with up to _RETRY_MAX attempts.
-
-    On transient failures (network blip, Supabase 5xx) the batch is
-    retried up to _RETRY_MAX times with _RETRY_DELAY_S sleep between
-    attempts. Returns True on first success. After all retries are
-    exhausted, logs an ERROR (data is lost) and returns False so the
-    caller knows the batch was not persisted.
-    """
     for attempt in range(1, _RETRY_MAX + 1):
         ok = await _insert_rows(table, rows)
         if ok:
@@ -176,14 +101,6 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 
 
 async def _flush_flow_events():
-    """
-    Layer 5: Periodic flusher -- drains buffer into flow_events table.
-    Flushes every 500ms (FLUSH_INTERVAL) or when buffer hits 100 rows
-    (FLUSH_MAX_ROWS), whichever comes first.
-
-    F-02: Uses _insert_rows_with_retry() so transient Supabase errors
-    are retried up to _RETRY_MAX times before the batch is discarded.
-    """
     global _flow_event_buffer
     while True:
         await asyncio.sleep(_FLUSH_INTERVAL)
@@ -194,24 +111,11 @@ async def _flush_flow_events():
         ok = await _insert_rows_with_retry("flow_events", batch)
         if ok:
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
-        # On failure _insert_rows_with_retry already logs ERROR; no extra log needed.
 
 
 async def persist_flow_event(ev_dict: dict):
-    """
-    Buffer a raw classified flow tick for batch insert into flow_events.
-    Flushes immediately if buffer has hit FLUSH_MAX_ROWS (100).
+    global _flow_event_buffer
 
-    F-01: Returns early (no-op with warning) when Supabase env vars are
-    not configured. Previously this function had no guard and callers from
-    tradier_stream could fill the buffer indefinitely on a misconfigured
-    deploy, leading to unbounded memory growth and eventual OOM.
-
-    NOTE: No `id` field is sent -- flow_events.id is a uuid generated by Postgres.
-    """
-    global _flow_event_buffer  # required: we reassign the list reference on early flush
-
-    # F-01: gate — refuse to buffer rows that can never be flushed
     if not _is_configured():
         log.warning(
             "[flow_store] persist_flow_event: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY "
@@ -254,7 +158,6 @@ async def persist_flow_event(ev_dict: dict):
         "iv":                   ev_dict.get("iv", 0.0),
         "underlying_price":     ev_dict.get("underlying_price", 0.0),
         "occ_symbol":           ev_dict.get("occ_symbol"),
-        # C-018: tag rows where bid/ask were synthesised -- unreliable for backtesting
         "is_synthetic_quote":   ev_dict.get("is_synthetic_quote", False),
     }
     _flow_event_buffer.append(row)
@@ -262,18 +165,12 @@ async def persist_flow_event(ev_dict: dict):
     if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
         batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
         _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
-        # F-02: retry on early flush too
         ok = await _insert_rows_with_retry("flow_events", batch)
         if ok:
             log.info(f"[flow_store] early flush ({_FLUSH_MAX_ROWS} rows) -- buffer hit max")
 
 
 async def persist_flow_episode(signal_data: dict):
-    """
-    Immediately insert a flow signal episode into flow_episodes.
-
-    NOTE: No `id` field is sent -- flow_episodes.id is a bigserial generated by Postgres.
-    """
     expiry = signal_data.get("expiry") or None
 
     row = {
@@ -298,14 +195,6 @@ async def persist_flow_episode(signal_data: dict):
 
 
 async def _bus_signal_listener():
-    """
-    Subscribe to the async bus on the 'db_writer' channel.
-
-    Only 'composite_signal' events write to flow_episodes -- they contain the
-    full composite score, recommendation, and reasoning string. Raw 'signal'
-    events are intentionally ignored here to prevent duplicate rows; they are
-    still broadcast on the WebSocket bus for real-time frontend delivery.
-    """
     from core.async_bus import bus
     q = bus.subscribe("db_writer")
     log.info("[flow_store] DB writer subscribed to bus -- flow_episodes written on composite_signal only")
@@ -332,9 +221,6 @@ async def _bus_signal_listener():
                     "seed_episode":    sig.get("reasoning"),
                     "timestamp":       ep.get("timestamp"),
                 })
-            # 'signal' events are intentionally not written to DB here --
-            # they are WebSocket-only. composite_signal is the single source
-            # of truth for flow_episodes persistence.
     except asyncio.CancelledError:
         bus.unsubscribe("db_writer", q)
         log.info("[flow_store] DB writer unsubscribed from bus")
@@ -342,10 +228,6 @@ async def _bus_signal_listener():
 
 
 async def start_flow_writer():
-    """
-    Entry point -- start both the bus listener and the periodic flusher.
-    Call this once from main.py lifespan as an asyncio task.
-    """
     if not _is_configured():
         log.warning(
             "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "

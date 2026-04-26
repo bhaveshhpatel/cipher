@@ -15,15 +15,13 @@ Covers:
   - Supabase unavailable (env vars missing) returns empty list, not 500
 """
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from core.auth import create_access_token, TokenData
 from main import app
 
 client = TestClient(app)
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _make_token(email="trader@cipher.io", role="user") -> str:
     return create_access_token({"sub": email})
@@ -34,13 +32,11 @@ def _auth(token: str) -> dict:
 
 
 def _mock_user(role="user"):
-    """Patch get_current_user to bypass Supabase user_profiles lookup."""
     td = TokenData(email="trader@cipher.io", role=role)
     return patch("routers.history.get_current_user", return_value=td)
 
 
 def _mock_query(rows=None, total=0):
-    """Patch the internal Supabase query helper."""
     return patch(
         "routers.history._query_signal_history",
         new=AsyncMock(return_value=(rows or [], total)),
@@ -67,14 +63,10 @@ _SAMPLE_ROW = {
 }
 
 
-# ── auth guard ────────────────────────────────────────────────────────────────
-
 def test_history_unauthenticated_returns_401():
     resp = client.get("/api/signals/history")
     assert resp.status_code == 401
 
-
-# ── happy path ────────────────────────────────────────────────────────────────
 
 def test_history_returns_valid_response_shape():
     with _mock_user(), _mock_query([_SAMPLE_ROW], total=1):
@@ -107,8 +99,6 @@ def test_history_empty_result_returns_zero_list():
     assert body["signals"] == []
     assert body["total"] == 0
 
-
-# ── validation ────────────────────────────────────────────────────────────────
 
 def test_history_invalid_direction_returns_422():
     with _mock_user(), _mock_query():
@@ -148,8 +138,6 @@ def test_history_min_conviction_below_0_returns_422():
     assert resp.status_code == 422
 
 
-# ── valid enum values ─────────────────────────────────────────────────────────
-
 @pytest.mark.parametrize("direction", ["bullish", "bearish", "neutral"])
 def test_history_valid_directions_accepted(direction):
     with _mock_user(), _mock_query():
@@ -170,10 +158,7 @@ def test_history_valid_tiers_accepted(tier):
     assert resp.status_code == 200
 
 
-# ── direction→recommendation mapping ─────────────────────────────────────────
-
 def test_history_direction_bullish_maps_to_BUY():
-    """Ensure the direction→recommendation mapping is not silently broken."""
     captured = {}
 
     async def capture_query(**kwargs):
@@ -205,8 +190,6 @@ def test_history_direction_bearish_maps_to_SELL():
     assert captured.get("recommendation") == "SELL"
 
 
-# ── ticker normalisation ──────────────────────────────────────────────────────
-
 def test_history_ticker_is_uppercased():
     captured = {}
 
@@ -222,8 +205,6 @@ def test_history_ticker_is_uppercased():
             )
     assert captured.get("ticker") == "AAPL"
 
-
-# ── pagination forwarding ─────────────────────────────────────────────────────
 
 def test_history_pagination_params_forwarded():
     captured = {}
@@ -254,13 +235,7 @@ def test_history_response_echoes_limit_and_offset():
     assert body["offset"] == 20
 
 
-# ── DB unavailable (no env vars) ──────────────────────────────────────────────
-
 def test_history_no_supabase_env_returns_empty_not_500():
-    """
-    When SUPABASE_URL / SUPABASE_KEY are not set, the endpoint must
-    return an empty list rather than crashing with a 500.
-    """
     with _mock_user():
         with patch("routers.history._SUPABASE_URL", None), \
              patch("routers.history._SUPABASE_KEY", None):
@@ -273,10 +248,8 @@ def test_history_no_supabase_env_returns_empty_not_500():
     assert resp.json()["total"] == 0
 
 
-# ── malformed row is skipped, not crashing the whole response ─────────────────
-
 def test_history_malformed_row_is_skipped():
-    bad_row = {"id": 2, "ticker": "SPY"}  # missing required fields
+    bad_row = {"id": 2, "ticker": "SPY"}
     good_row = _SAMPLE_ROW.copy()
     with _mock_user(), _mock_query([bad_row, good_row], total=2):
         resp = client.get(
@@ -285,6 +258,5 @@ def test_history_malformed_row_is_skipped():
         )
     assert resp.status_code == 200
     body = resp.json()
-    # Only the good row survives
     assert len(body["signals"]) == 1
     assert body["signals"][0]["ticker"] == "AAPL"

@@ -51,7 +51,7 @@ Fix (C-018) — Synthetic Quote Tagging:
     is_aggressive values — exclude them from backtesting aggression metrics.
 """
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
 from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
@@ -164,33 +164,13 @@ def _parse_timestamp(ts) -> datetime:
 
 
 def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
-    """Parse a single Tradier stream trade dict into OptionsFlowEvent.
-
-    Tradier streaming payload anatomy (filter=timesale):
-      - `symbol`          : OCC option symbol  e.g. 'AAPL  260117C00180000'
-      - `underlying`      : underlying ticker  e.g. 'AAPL'  (may be absent)
-      - `last`            : fill price  ← PRIMARY field for timesale events
-      - `price`           : fill price  ← FALLBACK (some legacy feed formats)
-      - `bid` / `ask`     : NBBO at time of trade (may be 0 in some feeds)
-      - `size`            : contract count
-      - `option_type`     : 'call' | 'put'  (often absent in stream)
-      - `strike`          : float            (often absent in stream)
-      - `expiration_date` : YYYY-MM-DD       (often absent in stream)
-      - `timestamp`       : int (epoch ms) or ISO str
-
-    When option_type / strike / expiration_date are absent the OCC symbol
-    is the only reliable source — parse it directly.
-
-    Fill price priority: "last" → "price" → mid(bid, ask) → 0
-    """
+    """Parse a single Tradier stream trade dict into OptionsFlowEvent."""
     try:
         symbol = raw.get("symbol", "")
 
         bid  = float(raw.get("bid",  0) or 0)
         ask  = float(raw.get("ask",  0) or 0)
 
-        # FIX: Tradier timesale sends fill price in "last" field, not "price".
-        # Fall back to "price" for compatibility, then mid, then 0.
         fill = float(
             raw.get("last") or
             raw.get("price") or
@@ -199,28 +179,23 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
 
         size = int(raw.get("size") or 0)
 
-        # Only skip genuinely zero-size events
         if size == 0:
             return None
 
         premium = fill * size * 100
 
-        # -- Primary: use top-level fields if present
         ctype_raw = raw.get("option_type", "") or ""
         strike    = float(raw.get("strike", 0) or 0)
         expiry    = raw.get("expiration_date", "") or ""
 
-        # -- Always attempt OCC parse on `symbol` field
         occ_ticker, occ_strike, occ_expiry, occ_ctype = _parse_occ_symbol(symbol)
 
-        # Ticker: prefer explicit `underlying` field, fall back to OCC prefix
         ticker = (
             raw.get("underlying")
             or occ_ticker
             or (symbol.split()[0] if symbol.split() else symbol)
         )
 
-        # Fill in missing contract details from OCC parse
         if strike == 0 and occ_strike is not None:
             strike = occ_strike
         if not expiry and occ_expiry is not None:
@@ -228,10 +203,8 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         if not ctype_raw and occ_ctype is not None:
             ctype_raw = occ_ctype
 
-        # Normalize contract type — default to PUT as last resort
         ctype = "CALL" if ctype_raw.upper() in ("C", "CALL") else "PUT"
 
-        # DTE: use stream value if provided, otherwise calculate from expiry
         dte = int(raw.get("dte", 0) or 0)
         if dte == 0 and expiry:
             dte = _calc_dte(expiry)
@@ -239,9 +212,6 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         exc_cnt  = int(raw.get("exchange_count", 1) or 1)
         fill_cnt = int(raw.get("fill_count", 1) or 1)
 
-        # Synthetic spread when bid/ask both 0 but fill is nonzero.
-        # Tag the event so downstream backtesting can exclude these rows
-        # from aggression and net-premium calculations.
         is_synthetic_quote = False
         effective_bid = bid
         effective_ask = ask
@@ -280,13 +250,11 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             is_synthetic_quote = is_synthetic_quote,
         )
 
-        # Sentiment: CALL = BULLISH baseline, PUT = BEARISH baseline
         if ctype == "CALL":
             ev.sentiment = "BULLISH"
         elif ctype == "PUT":
             ev.sentiment = "BEARISH"
 
-        # Influence tier
         if premium >= 2_000_000:
             ev.influence_tier = "WHALE"
         elif premium >= 500_000:
@@ -294,7 +262,6 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         elif premium >= 100_000:
             ev.influence_tier = "LARGE"
 
-        # Conviction score
         dte_urgency = 0.1 if dte <= 7 else (0.05 if dte <= 30 else 0.0)
         ev.conviction_score = round(
             min(
@@ -307,10 +274,6 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             3,
         )
 
-        # Registry enrichment — override parsed fields with pre-validated chain metadata.
-        # If the OCC SymbolRegistry is built, use it as ground truth for ticker/strike/
-        # expiry/contract_type/dte/open_interest. Falls back gracefully to OCC regex
-        # parse above if registry is not yet available.
         try:
             from services.symbol_registry import get_registry
             reg = get_registry()
@@ -325,7 +288,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
                     ev.open_interest = meta.open_interest
                     ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
         except Exception:
-            pass  # registry not yet built — OCC regex parse above is sufficient
+            pass
 
         return ev
     except Exception:
