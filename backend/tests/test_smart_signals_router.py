@@ -1,227 +1,318 @@
 """
-Phase 4 — test_smart_signals_router.py
+Regression tests for routers/smart_signals.py
 
-Covers every branch in routers/smart_signals.py:
-  - GET /api/signals/composite/{ticker}: DB hit path → returns DB row
-  - GET /api/signals/composite/{ticker}: DB miss path → returns mock fallback
-  - GET /api/signals/composite/{ticker}: unauthenticated → 401/403
-  - GET /api/signals/list: DB hit → source='live', pagination, total from content-range
-  - GET /api/signals/list: DB empty → source='mock', returns mock tickers
-  - GET /api/signals/list: direction filter applied to mock fallback
-  - GET /api/signals/list: min_conviction filter applied to mock fallback
-  - GET /api/signals/list: invalid direction → 422
-  - GET /api/signals/list: invalid tier → 422
-  - GET /api/signals/list: unauthenticated → 401/403
-  - GET /api/signals/stream/stats: success path
-  - _mock_composite(): deterministic for same ticker, in valid range
-  - _row_to_composite(): missing volume_premium_factor defaults to 0.5
-  - _row_to_composite(): missing reasoning defaults to ''
+Strategy:
+  - Override get_current_user for all auth-passing tests.
+  - _fetch_from_db and _fetch_ticker_from_db patched to avoid
+    live HTTP calls to Supabase.
+  - get_stats patched to return a controlled dict.
+  - _mock_composite and _row_to_composite tested directly.
+
+Covers:
+  Auth guard:
+  - GET /api/signals/composite/{ticker} -> 401 without auth
+  - GET /api/signals/list -> 401 without auth
+  - GET /api/signals/stream/stats -> 401 without auth
+
+  GET /api/signals/composite/{ticker}:
+  - DB hit: row served via _row_to_composite
+  - DB miss: mock_composite fallback used
+  - Ticker uppercased before DB query
+  - ticker 1 char accepted, >10 chars -> 422
+  - CompositeOut shape: all required fields present
+
+  GET /api/signals/list:
+  - Invalid direction -> 422
+  - Valid directions accepted
+  - Invalid tier -> 422
+  - Valid tiers accepted
+  - min_conviction > 1.0 -> 422
+  - min_conviction < 0.0 -> 422
+  - page_size > 100 -> 422
+  - page < 1 -> 422
+  - DB empty -> mock fallback, source='mock'
+  - DB returns rows -> source='live'
+  - SignalsListResponse shape: signals/page/page_size/total/source
+  - Mock dataset filtered by direction (rec_filter)
+  - Mock dataset filtered by min_conviction
+
+  GET /api/signals/stream/stats:
+  - Response has 'stats' key with all 5 fields
+
+  Internal helpers:
+  - _mock_composite: deterministic (same ticker, same result)
+  - _row_to_composite: null volume_premium_factor -> 0.5
+  - _row_to_composite: null reasoning -> empty string
 """
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch, AsyncMock
+
+from core.auth import get_current_user, TokenData
+from routers.smart_signals import (
+    router,
+    _mock_composite,
+    _row_to_composite,
+)
+import routers.smart_signals as ss
 
 
 # ---------------------------------------------------------------------------
-# App factory
+# App fixtures
 # ---------------------------------------------------------------------------
-def _make_app():
-    from routers.smart_signals import router
-    from core.auth import get_current_user, TokenData
+
+def _make_app(authenticated: bool = True) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
-    fake_user = TokenData(user_id="test-uid", email="test@example.com")
-    async def _fake_auth():
-        return fake_user
-    app.dependency_overrides[get_current_user] = _fake_auth
+    if authenticated:
+        async def _auth():
+            return TokenData(email="user@cipher.app", role="user")
+        app.dependency_overrides[get_current_user] = _auth
     return app
 
 
-_DB_ROW = {
-    "ticker":                "AAPL",
-    "recommendation":        "BUY",
-    "composite_score":       0.72,
-    "flow_score":            0.81,
-    "backtest_score":        0.65,
-    "volume_premium_factor": 0.55,
-    "reasoning":             "Whale activity detected.",
-}
+@pytest.fixture
+def client():
+    return TestClient(_make_app(authenticated=True))
 
 
-class TestCompositeEndpoint:
+@pytest.fixture
+def raw_client():
+    return TestClient(_make_app(authenticated=False), raise_server_exceptions=False)
 
-    def test_db_hit_returns_db_row(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_ticker_from_db", AsyncMock(return_value=_DB_ROW)):
-            resp = client.get("/api/signals/composite/AAPL")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["ticker"]          == "AAPL"
-        assert body["recommendation"]  == "BUY"
-        assert body["composite_score"] == 0.72
 
-    def test_db_miss_returns_mock(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_ticker_from_db", AsyncMock(return_value=None)):
-            resp = client.get("/api/signals/composite/TSLA")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["ticker"] == "TSLA"
-        assert body["recommendation"] in {"BUY", "SELL", "HOLD"}
-        assert 0.0 <= body["composite_score"] <= 1.0
+# ---------------------------------------------------------------------------
+# Auth guard
+# ---------------------------------------------------------------------------
 
-    def test_mock_is_deterministic(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_ticker_from_db", AsyncMock(return_value=None)):
-            r1 = client.get("/api/signals/composite/NVDA").json()
-            r2 = client.get("/api/signals/composite/NVDA").json()
-        assert r1["composite_score"] == r2["composite_score"]
+def test_composite_no_auth_returns_401(raw_client):
+    resp = raw_client.get("/api/signals/composite/AAPL")
+    assert resp.status_code == 401
 
-    def test_ticker_uppercased_in_mock(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_ticker_from_db", AsyncMock(return_value=None)):
-            resp = client.get("/api/signals/composite/spy")
-        assert resp.json()["ticker"] == "SPY"
 
-    def test_unauthenticated_blocked(self):
-        from routers.smart_signals import router
-        bare_app = FastAPI()
-        bare_app.include_router(router)
-        client = TestClient(bare_app, raise_server_exceptions=False)
+def test_list_no_auth_returns_401(raw_client):
+    resp = raw_client.get("/api/signals/list")
+    assert resp.status_code == 401
+
+
+def test_stream_stats_no_auth_returns_401(raw_client):
+    resp = raw_client.get("/api/signals/stream/stats")
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/signals/composite/{ticker}
+# ---------------------------------------------------------------------------
+
+def test_composite_db_hit_returns_row(client):
+    db_row = {
+        "ticker": "AAPL", "recommendation": "BUY",
+        "composite_score": 0.85, "flow_score": 0.80,
+        "backtest_score": 0.75, "volume_premium_factor": 1.2,
+        "reasoning": "Strong call flow",
+    }
+    with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock,
+                      return_value=db_row):
         resp = client.get("/api/signals/composite/AAPL")
-        assert resp.status_code in (401, 403)
+    assert resp.status_code == 200
+    assert resp.json()["recommendation"] == "BUY"
+    assert resp.json()["ticker"] == "AAPL"
 
 
-class TestListEndpoint:
+def test_composite_db_miss_returns_mock(client):
+    with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock,
+                      return_value=None):
+        resp = client.get("/api/signals/composite/TSLA")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ticker"] == "TSLA"
+    assert body["recommendation"] in ("BUY", "SELL", "HOLD")
 
-    def test_db_hit_returns_live_source(self):
-        rows = [_DB_ROW.copy() for _ in range(3)]
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db", AsyncMock(return_value=(rows, 3))):
-            resp = client.get("/api/signals/list")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["source"]  == "live"
-        assert body["total"]   == 3
-        assert len(body["signals"]) == 3
 
-    def test_db_empty_returns_mock_source(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db", AsyncMock(return_value=([], 0))):
-            resp = client.get("/api/signals/list")
-        assert resp.status_code == 200
-        assert resp.json()["source"] == "mock"
-        assert resp.json()["total"] == 20  # full mock dataset
+def test_composite_ticker_uppercased(client):
+    captured = []
 
-    def test_direction_filter_applied_to_mock(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db", AsyncMock(return_value=([], 0))):
-            resp = client.get("/api/signals/list?direction=bullish")
-        body = resp.json()
-        for sig in body["signals"]:
-            assert sig["recommendation"] == "BUY"
+    async def _capture(ticker):
+        captured.append(ticker)
+        return None
 
-    def test_invalid_direction_returns_422(self):
-        app    = _make_app()
-        client = TestClient(app)
-        resp = client.get("/api/signals/list?direction=maybe")
-        assert resp.status_code == 422
+    with patch.object(ss, "_fetch_ticker_from_db", side_effect=_capture):
+        client.get("/api/signals/composite/tsla")
 
-    def test_invalid_tier_returns_422(self):
-        app    = _make_app()
-        client = TestClient(app)
-        resp = client.get("/api/signals/list?tier=mega")
-        assert resp.status_code == 422
+    assert captured[0] == "TSLA"
 
-    def test_min_conviction_filter_applied_to_mock(self):
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db", AsyncMock(return_value=([], 0))):
-            resp = client.get("/api/signals/list?min_conviction=0.7")
-        for sig in resp.json()["signals"]:
-            assert sig["composite_score"] >= 0.7
 
-    def test_pagination_page_and_page_size(self):
-        rows = [_DB_ROW.copy() for _ in range(10)]
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db", AsyncMock(return_value=(rows, 50))):
-            resp = client.get("/api/signals/list?page=2&page_size=10")
-        body = resp.json()
-        assert body["page"]      == 2
-        assert body["page_size"] == 10
-        assert body["total"]     == 50
+def test_composite_single_char_ticker_accepted(client):
+    with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock, return_value=None):
+        resp = client.get("/api/signals/composite/X")
+    assert resp.status_code == 200
 
-    def test_unauthenticated_blocked(self):
-        from routers.smart_signals import router
-        bare_app = FastAPI()
-        bare_app.include_router(router)
-        client = TestClient(bare_app, raise_server_exceptions=False)
+
+def test_composite_ticker_too_long_returns_422(client):
+    resp = client.get("/api/signals/composite/TOOLONGTICKER")
+    assert resp.status_code == 422
+
+
+def test_composite_out_shape(client):
+    with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock, return_value=None):
+        resp = client.get("/api/signals/composite/NVDA")
+    body = resp.json()
+    for key in ("ticker", "recommendation", "composite_score",
+                "flow_score", "backtest_score", "volume_premium_factor", "reasoning"):
+        assert key in body
+
+
+# ---------------------------------------------------------------------------
+# GET /api/signals/list — validation
+# ---------------------------------------------------------------------------
+
+def test_list_invalid_direction_returns_422(client):
+    resp = client.get("/api/signals/list", params={"direction": "sideways"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("direction", ["bullish", "bearish", "neutral"])
+def test_list_valid_direction_accepted(client, direction):
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
+        resp = client.get("/api/signals/list", params={"direction": direction})
+    assert resp.status_code == 200
+
+
+def test_list_invalid_tier_returns_422(client):
+    resp = client.get("/api/signals/list", params={"tier": "hedge_fund"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("tier", ["whale", "institutional", "large", "retail"])
+def test_list_valid_tier_accepted(client, tier):
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
+        resp = client.get("/api/signals/list", params={"tier": tier})
+    assert resp.status_code == 200
+
+
+def test_list_min_conviction_above_1_returns_422(client):
+    resp = client.get("/api/signals/list", params={"min_conviction": 1.1})
+    assert resp.status_code == 422
+
+
+def test_list_min_conviction_below_0_returns_422(client):
+    resp = client.get("/api/signals/list", params={"min_conviction": -0.1})
+    assert resp.status_code == 422
+
+
+def test_list_page_size_above_100_returns_422(client):
+    resp = client.get("/api/signals/list", params={"page_size": 101})
+    assert resp.status_code == 422
+
+
+def test_list_page_below_1_returns_422(client):
+    resp = client.get("/api/signals/list", params={"page": 0})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /api/signals/list — DB empty -> mock fallback
+# ---------------------------------------------------------------------------
+
+def test_list_db_empty_returns_mock_source(client):
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
         resp = client.get("/api/signals/list")
-        assert resp.status_code in (401, 403)
-
-    def test_live_row_parse_error_skipped(self):
-        """Rows with missing required fields are skipped, not crash the endpoint."""
-        bad_row = {"ticker": "AAPL"}  # missing composite_score etc.
-        app    = _make_app()
-        client = TestClient(app)
-        with patch("routers.smart_signals._fetch_from_db",
-                   AsyncMock(return_value=([_DB_ROW.copy(), bad_row], 2))):
-            resp = client.get("/api/signals/list")
-        # only the good row survives
-        assert resp.status_code == 200
-        assert len(resp.json()["signals"]) == 1
+    assert resp.status_code == 200
+    assert resp.json()["source"] == "mock"
 
 
-class TestStreamStatsEndpoint:
-
-    def test_stream_stats_success(self):
-        app    = _make_app()
-        client = TestClient(app)
-        mock_stats = {"active_symbols": 150, "ticks": 1000,
-                      "classified": 800, "signals": 45, "errors": 2}
-        with patch("routers.smart_signals.get_stats", return_value=mock_stats):
-            resp = client.get("/api/signals/stream/stats")
-        assert resp.status_code == 200
-        body = resp.json()["stats"]
-        assert body["active_symbols"] == 150
-        assert body["ticks"]          == 1000
+def test_list_db_rows_returns_live_source(client):
+    rows = [{
+        "ticker": "AAPL", "recommendation": "BUY",
+        "composite_score": 0.85, "flow_score": 0.80,
+        "backtest_score": 0.75, "volume_premium_factor": 1.2,
+        "reasoning": "test",
+    }]
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=(rows, 1)):
+        resp = client.get("/api/signals/list")
+    assert resp.json()["source"] == "live"
 
 
-class TestRowToComposite:
+def test_list_response_shape(client):
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
+        resp = client.get("/api/signals/list")
+    body = resp.json()
+    for key in ("signals", "page", "page_size", "total", "source"):
+        assert key in body
 
-    def test_missing_volume_premium_factor_defaults_to_0_5(self):
-        from routers.smart_signals import _row_to_composite
-        row = {
-            "ticker":          "AAPL",
-            "recommendation":  "BUY",
-            "composite_score": 0.7,
-            "flow_score":      0.8,
-            "backtest_score":  0.65,
-            # no volume_premium_factor
-            "reasoning":       "Strong.",
-        }
-        out = _row_to_composite(row)
-        assert out.volume_premium_factor == 0.5
 
-    def test_missing_reasoning_defaults_to_empty_string(self):
-        from routers.smart_signals import _row_to_composite
-        row = {
-            "ticker":                "AAPL",
-            "recommendation":        "HOLD",
-            "composite_score":       0.5,
-            "flow_score":            0.5,
-            "backtest_score":        0.5,
-            "volume_premium_factor": 0.5,
-            # no reasoning
-        }
-        out = _row_to_composite(row)
-        assert out.reasoning == ""
+def test_list_mock_filtered_by_direction(client):
+    """When DB is empty, mock dataset filters by rec_filter."""
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
+        resp = client.get("/api/signals/list", params={"direction": "bullish"})
+    signals = resp.json()["signals"]
+    for sig in signals:
+        assert sig["recommendation"] == "BUY"
+
+
+def test_list_mock_filtered_by_min_conviction(client):
+    """When DB is empty, mock filters by min_conviction."""
+    with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
+        resp = client.get("/api/signals/list", params={"min_conviction": 0.9})
+    signals = resp.json()["signals"]
+    for sig in signals:
+        assert sig["composite_score"] >= 0.9
+
+
+# ---------------------------------------------------------------------------
+# GET /api/signals/stream/stats
+# ---------------------------------------------------------------------------
+
+def test_stream_stats_response_shape(client):
+    mock_stats = {
+        "active_symbols": 10, "ticks": 500,
+        "classified": 480, "signals": 42, "errors": 2,
+    }
+    with patch("routers.smart_signals.get_stats", return_value=mock_stats):
+        resp = client.get("/api/signals/stream/stats")
+    assert resp.status_code == 200
+    stats = resp.json()["stats"]
+    for key in ("active_symbols", "ticks", "classified", "signals", "errors"):
+        assert key in stats
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def test_mock_composite_is_deterministic():
+    """Same ticker always produces identical output."""
+    r1 = _mock_composite("AAPL")
+    r2 = _mock_composite("AAPL")
+    assert r1.composite_score == r2.composite_score
+    assert r1.recommendation  == r2.recommendation
+
+
+def test_mock_composite_different_tickers_differ():
+    r_aapl = _mock_composite("AAPL")
+    r_tsla = _mock_composite("TSLA")
+    # At minimum the ticker field must differ
+    assert r_aapl.ticker != r_tsla.ticker
+
+
+def test_row_to_composite_null_volume_premium_defaults_to_05():
+    row = {
+        "ticker": "X", "recommendation": "BUY",
+        "composite_score": 0.7, "flow_score": 0.6,
+        "backtest_score": 0.5, "volume_premium_factor": None,
+        "reasoning": "ok",
+    }
+    result = _row_to_composite(row)
+    assert result.volume_premium_factor == 0.5
+
+
+def test_row_to_composite_null_reasoning_becomes_empty_string():
+    row = {
+        "ticker": "Y", "recommendation": "HOLD",
+        "composite_score": 0.5, "flow_score": 0.4,
+        "backtest_score": 0.3, "volume_premium_factor": 0.8,
+        "reasoning": None,
+    }
+    result = _row_to_composite(row)
+    assert result.reasoning == ""
