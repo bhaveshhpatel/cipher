@@ -121,7 +121,20 @@ def test_rate_limited_path_returns_response_not_500():
 
 
 def test_lifespan_spawns_prewarm_task():
-    """Lifespan must create a _registry_prewarm_loop task alongside other background tasks."""
+    """
+    Lifespan must create a _registry_prewarm_loop task alongside other background tasks.
+
+    Patches the full dependency chain that the lifespan exercises before it
+    reaches the asyncio.create_task() block:
+      - _resolve_startup_universe   → returns ([], {}, []) so quotes-branch is skipped
+      - init_registry               → returns mock_registry
+      - registry.build / size       → AsyncMock / MagicMock returning sensible values
+      - stream_options_flow         → AsyncMock (prevents real stream coroutine)
+      - start_flow_writer           → AsyncMock
+      - start_signal_writer         → AsyncMock
+      - _universe_refresh_loop      → AsyncMock
+      - universe_store.upsert_symbol_quotes → AsyncMock (safety net)
+    """
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -130,7 +143,6 @@ def test_lifespan_spawns_prewarm_task():
 
     def tracking_create_task(coro, **kwargs):
         created_targets.append(getattr(coro, "__name__", repr(coro)))
-        # Cancel immediately so the test loop doesn't block
         task = original_create_task(coro, **kwargs)
         task.cancel()
         return task
@@ -146,7 +158,12 @@ def test_lifespan_spawns_prewarm_task():
          patch("main.init_registry", return_value=mock_registry), \
          patch("main.assign_tiers", new_callable=AsyncMock, return_value={}), \
          patch("main._resolve_startup_universe", new_callable=AsyncMock,
-               return_value=([], {}, [])):
+               return_value=([], {}, [])), \
+         patch("main.stream_options_flow", new_callable=AsyncMock), \
+         patch("main.start_flow_writer", new_callable=AsyncMock), \
+         patch("main.start_signal_writer", new_callable=AsyncMock), \
+         patch("main._universe_refresh_loop", new_callable=AsyncMock), \
+         patch("main.universe_store.upsert_symbol_quotes", new_callable=AsyncMock):
         client = _get_client()
         client.get("/api/health")
 
