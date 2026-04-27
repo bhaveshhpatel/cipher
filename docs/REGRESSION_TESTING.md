@@ -1,152 +1,130 @@
-# Cipher — Regression Testing Guide
+# Cipher — Regression Test Suite
 
-This document explains the full regression test suite, how to run it locally,
-and how the CI enforcement gates work.
+> Last updated: 2026-04-26
+> Backend: 48 test files · CI gate ≥ 90% coverage (`--cov-fail-under=90`)
+> Frontend: jest · CI gate ≥ 75% lines/functions globally
 
 ---
 
-## Quick Start
+## How to Run
 
-### Backend
 ```bash
+# Backend — full suite with coverage
 cd backend
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -r requirements-dev.txt
 pytest
-```
-This runs all tests with coverage. The gate is **92% total, branch coverage enabled**.
-A failing test or coverage drop below 92% exits with a non-zero code.
 
-### Frontend
-```bash
-cd frontend
-npm ci
-npx jest --coverage
-```
-This runs all Jest tests with coverage thresholds enforced per `jest.config.ts`.
-
----
-
-## Running a Subset
-
-```bash
-# Backend — single file
-pytest tests/test_auth_router.py -v
-
-# Backend — by marker
-pytest -m regression
-
-# Backend — skip slow tests
-pytest -m "not slow"
-
-# Frontend — single file
-npx jest src/hooks/useAuth.test.ts --coverage
-```
-
----
-
-## Coverage Gates
-
-### Backend (`pytest.ini` + `.coveragerc`)
-
-| Metric | Threshold |
-|---|---|
-| Total line coverage | ≥ 92% |
-| Branch coverage | Enabled (measured, not separately gated) |
-| New files on PR | ≥ 90% (via `orgoro/coverage` action) |
-| Modified files on PR | ≥ 85% |
-
-### Frontend (`jest.config.ts`)
-
-| Scope | Branches | Functions | Lines | Statements |
-|---|---|---|---|---|
-| Global (all `src/`) | 80% | 85% | 85% | 85% |
-| `src/hooks/useAuth.ts` | 95% | 95% | 95% | 95% |
-| `src/hooks/useFlow.ts` | 90% | 90% | 90% | 90% |
-| `src/lib/api.ts` | 80% | 80% | 80% | 80% |
-
----
-
-## CI Workflows
-
-### `regression-gate.yml` (required check)
-Triggered on every PR to `main`. Runs backend + frontend in parallel.
-Both must pass before GitHub allows the merge button.
-
-To enforce it:
-1. Go to **GitHub → Settings → Branches → main → Branch protection rules**
-2. Enable **Require status checks to pass before merging**
-3. Add `All Regression Gates Passed` as a required check
-
-### `backend.yml`
-Triggered on push/PR when `backend/**` changes. Runs lint + regression.
-
-### `frontend.yml`
-Triggered on push/PR when `frontend/**` changes.
-Pipeline: typecheck → regression → build → deploy (main only).
-
----
-
-## Test Suite Map
-
-### Backend (350 tests across 18 files)
-
-| File | Phase | Tests |
-|---|---|---|
-| `test_auth_router.py` | P1 | Auth endpoints, JWT validation, refresh, /me |
-| `test_admin_router.py` | P1 | Admin endpoints, 403 guard tests |
-| `test_history_router.py` | P1 | History endpoint, DB queries |
-| `test_config.py` | P1 | Settings, env var validation |
-| `test_demo_engine.py` | P2 | Demo mode flow events |
-| `test_ingestion_config.py` | P2 | Ticker + ingestion config |
-| `test_midcap_screener.py` | P2 | Mid-cap screening logic |
-| `test_ws_router.py` | P3 | WebSocket auth, heartbeat, pong timeout |
-| `test_simulation_router.py` | P3 | Simulation endpoint, n_agents/n_runs validation |
-| `test_smart_signals_router.py` | P3 | Composite signals, mock vs live source |
-| `test_ensemble_runner.py` | P4 | Vote aggregation, confidence, agents list |
-| `test_swarm_engine.py` | P4 | Agent snapping, flow summary, LLM parsing |
-| `test_trade_executor.py` | P4 | HTTP order placement, error handling |
-| `test_flow_store.py` | Existing | Flow event CRUD |
-| `test_signal_store.py` | Existing | Signal CRUD |
-| `test_tier_engine.py` | Existing | Tier classification |
-| `test_tradier_stream.py` | Existing | Stream parsing |
-| `test_parsers.py` | Existing | Event parsing |
-
-### Frontend (hooks + pages + components)
-
-| File | Tests |
-|---|---|
-| `useAuth.test.ts` | Token management, refresh, expiry |
-| `useFlow.test.ts` | Flow event subscription, state updates |
-| `login.test.tsx` | Login form, error states, redirect |
-| `dashboard.test.tsx` | Dashboard render, auth guard |
-| `components.test.tsx` | Shared UI components |
-| `api.test.ts` | API client, error handling |
-
----
-
-## Adding a New Test
-
-1. **Backend**: Create `backend/tests/test_<module>.py`. Follow the existing
-   pattern — patch external I/O, no real HTTP/DB calls in unit tests.
-   Mark with `@pytest.mark.regression`.
-
-2. **Frontend**: Create `src/**/__tests__/<Component>.test.tsx` or
-   `src/hooks/<hook>.test.ts`. Mock `fetch` via `jest.fn()` or `msw`.
-
-3. The CI gate will automatically pick up the new file and enforce thresholds.
-
----
-
-## Generating a Local HTML Report
-
-```bash
-# Backend
-cd backend
-pytest --cov-report=html:coverage_html
-open coverage_html/index.html
+# Backend — skip coverage for speed
+pytest --no-cov
 
 # Frontend
 cd frontend
-npx jest --coverage --coverageReporters=html
-open coverage/index.html
+npx jest --coverage
 ```
+
+---
+
+## CI Gates
+
+```
+Push to main (backend/**)
+  └── lint
+        └── regression (--cov-fail-under=90)
+              └── Railway auto-deploys
+
+Push to main (frontend/**)
+  └── typecheck + lint
+        └── regression (jest --ci --coverage, thresholds in jest.config.ts)
+              └── build
+                    └── deploy (vercel --prod)
+
+Pull Request
+  └── Same gates + orgoro/coverage posts PR comment with coverage diff
+```
+
+---
+
+## Backend Test File Inventory
+
+| File | What It Covers |
+|------|----------------|
+| `conftest.py` | Shared fixtures and pytest configuration |
+| `test_4a_oi_pipeline.py` | OI-gated tier classification two-pass pipeline (Feature 4A-OI) |
+| `test_4a_tier_engine.py` | TierEngine: assign_tiers, OI grace path removed, T1/T2/T3 with all 3 conditions |
+| `test_6layer_regression.py` | Full 6-layer pipeline end-to-end regression: Layer 1–6 integration |
+| `test_admin_router.py` | `/admin/tier-thresholds` GET/PATCH, `/admin/tier-distribution` GET, admin JWT auth |
+| `test_async_bus.py` | `AsyncEventBus` publish, subscribe, fan-out, channel isolation |
+| `test_async_bus_coverage.py` | Edge cases and branch coverage for `core/async_bus.py` |
+| `test_auth_cors_regression.py` | CORS allow_origin_regex: Vercel preview URLs, localhost:3000/3001, explicit origins |
+| `test_auth_flow.py` | Register → login → `/auth/me` JWT flow, expired token rejection, wrong password |
+| `test_auth_router.py` | Auth router unit tests: register/login endpoint contracts |
+| `test_classifier.py` | `bid_ask_classifier.py`: ABOVE_ASK/AT_ASK/MID/AT_BID/BELOW_BID; `trade_type_detector.py`: SWEEP/BLOCK/SPLIT/SINGLE; `is_golden_sweep` |
+| `test_composite_signal_engine.py` | `build_composite()`: 3-component score weights (flow×0.55 + backtest×0.35 + vol×0.10), BUY/SELL/HOLD threshold at 0.65, volume_premium_factor OI fallback |
+| `test_composite_signal_extended.py` | Extended composite signal scenarios: edge cases, tier impact, zero OI, capped premium |
+| `test_config.py` | `config.py` Pydantic settings: env var parsing, `priority_symbols` property, defaults |
+| `test_dedup_cache.py` | `DedupCache`: TTL=5s, key=(occ_symbol, size, round(fill,1)), is_duplicate, is_sweep |
+| `test_dedup_cache_coverage.py` | Branch/edge coverage for `DedupCache` |
+| `test_dedup_coverage.py` | Dedup full coverage: sweep window=8s, exchange count, dedup_stats(), get_exchange_count() |
+| `test_dedup_edge_cases.py` | C-019 edge cases: TTL boundary, fill rounding 1dp, multi-exchange sweep detection, bucket boundary fix |
+| `test_demo_engine.py` | `demo_engine.py`: timesale envelope, exchange field (`exch`), inter-exchange delay 50–300ms, dedup wiring |
+| `test_demo_engine_coverage.py` | Branch coverage for demo_engine |
+| `test_ensemble_runner.py` | `EnsembleRunner`: majority vote, `EnsembleResult`, per-agent `name` field, bull/bear/hold counts |
+| `test_flow_and_stats.py` | Flow stats helpers and `get_stats()` merge with dedup_stats |
+| `test_flow_endpoint.py` | `GET /api/flow/scan`: queries `flow_episodes` (not `flow_events`), pagination, filters |
+| `test_flow_store.py` | `flow_store.py`: flush interval 500ms, _FLUSH_MAX_ROWS=100 early-flush, SERVICE_ROLE_KEY only |
+| `test_health_stream.py` | `GET /health/stream`: errors/reconnects/last_reconnect_at fields (B-008) |
+| `test_history_router.py` | `GET /api/signals/history`: pagination, filters (ticker/direction/tier/min_conviction), SERVICE_ROLE_KEY |
+| `test_ingestion_config.py` | Universe ingestion config: UNIVERSE_MIN_PRICE, UNIVERSE_MIN_VOLUME, priority_symbols, SEED_SYMBOLS |
+| `test_main_app.py` | FastAPI app: all routers registered, health endpoints, lifespan spawns prewarm_task, `test_lifespan_spawns_prewarm_task` |
+| `test_midcap_screener.py` | `midcap_screener.py`: mid-cap symbol filtering logic |
+| `test_occ_parser.py` | `_parse_occ_symbol`, `_calc_dte`, `_parse_timestamp`, `parse_tradier_trade` full path (C-015 `last` field, C-010 OCC-derived ticker, C-011 DTE/strike/expiry, C-018 synthetic quote flag) |
+| `test_options_flow_parser.py` | Extended parser tests: fill_price fallback chain, is_synthetic_quote, registry enrichment, all 4 influence tiers, conviction score, golden sweep |
+| `test_registry_prewarm.py` | `_registry_prewarm_loop()`: weekend skip, weekday 09:15 ET scheduling, registry.build() called, exception non-fatal (5 cases) |
+| `test_repetition_engine.py` | `RepetitionAccumulator`: ≥3 trades + ≥$50K threshold, rolling window prune, cross-contract isolation; `RepetitionEpisode`: is_accelerating, summary_str; `get_alert_level()`: CONVICTION/STRONG_SIGNAL/ALERT/WATCH |
+| `test_signal_store.py` | `signal_store.py`: CompositeSignal persistence, swarm fields (direction/confidence/agents JSONB/votes), SERVICE_ROLE_KEY |
+| `test_signal_store_coverage.py` | Extended signal_store coverage: error paths, partial swarm data, bus channel wiring |
+| `test_signal_store_r3.py` | signal_store regression-3 scenarios |
+| `test_simulation_and_ws.py` | Simulation + WS integration: swarm triggered from WS signal, ensemble result forwarded |
+| `test_simulation_router.py` | `POST /api/simulate`: swarm invocation, HOLD fallback without GROQ_API_KEY, agent count snapping |
+| `test_smart_signals_router.py` | `/api/signals/composite/{ticker}`, `/api/signals/list`: live DB first, mock fallback, pagination |
+| `test_stream_manager.py` | `StreamManager`: worker spawn, symbol diff on refresh, `_spawn_workers()` |
+| `test_stream_manager_r3.py` | Stream manager regression-3: B-021 stagger constants (200ms/0.200s), worker-N delay = N×0.2 |
+| `test_stream_worker_b008.py` | B-008: `_inc_global_error()` increments `_stats["errors"]`, `_inc_global_reconnect()` sets `last_reconnect_at` (5 cases: SW-01–SW-05) |
+| `test_swarm_engine.py` | `SwarmEngine`: 3/6/9/12 agent counts, Groq invocation, HOLD fallback, agent roles |
+| `test_swarm_engine_coverage.py` | Swarm engine branch coverage: agent count snapping, partial responses, all 12 agent roles |
+| `test_symbol_registry_coverage.py` | `SymbolRegistry`: build(), size(), get_oi_map(), set_tier_map(), refresh_loop(), per-tier ATM/DTE params |
+| `test_symbols_loader.py` | `load_universe()`: CBOE → Tradier validate → screen pipeline, source tagging, stream_eligible flag |
+| `test_tier_engine.py` | `assign_tiers()`: T1/T2/T3 with vol+price+OI conditions, admin whitelist, DB threshold cache (300s) |
+| `test_trade_executor.py` | `TradeExecutor`: `place_option_order()`, `get_positions()`, paper/live mode |
+| `test_tradier_client.py` | `TradierClient`: session token, `get_session_token()` flow |
+| `test_tradier_client_coverage.py` | B-022 semaphore (max 3 concurrent), B-023 explicit 429 → Retry-After sleep → retry |
+| `test_tradier_stream.py` | `stream_options_flow()`: market-hours guard, demo mode, dedup wiring, stats merge |
+| `test_universe_screener.py` | `universe_screener.py` (deprecated): legacy screen_universe tests kept for reference |
+| `test_universe_screener_coverage.py` | Universe screener branch coverage |
+| `test_universe_store.py` | `universe_store.py`: load_fresh_snapshot, load_any_snapshot, save_snapshot, upsert_symbol_quotes, load_tier_map |
+| `test_ws_lifecycle.py` | WS connection lifecycle: JWT auth on connect, 4001 close on bad token |
+| `test_ws_router.py` | `ws.py`: ping/pong heartbeat (25s ping, 10s pong timeout, 1001 close on timeout), signal delivery |
+
+---
+
+## Coverage Thresholds
+
+| Target | Threshold | Config |
+|--------|-----------|--------|
+| Backend | ≥ 90% | `pytest.ini` `--cov-fail-under=90` + `.coveragerc` `fail_under=90` |
+| Frontend | ≥ 75% lines/functions globally | `jest.config.ts` `coverageThreshold` |
+
+---
+
+## Key Regression Anchors
+
+| Anchor | Test | Why It Matters |
+|--------|------|----------------|
+| Registry prewarm spawned at lifespan | `test_main_app.py::test_lifespan_spawns_prewarm_task` | Ensures `_registry_prewarm_loop` task created on startup |
+| Dedup actually wired in production | `test_dedup_edge_cases.py` | C-019: dedup was inert in prod before fix |
+| flow_dedup sweep detection fires | `test_dedup_edge_cases.py` | C-019: exchange field never passed before fix |
+| B-008 health stats real values | `test_stream_worker_b008.py` | Was always 0/null before fix |
+| CORS Vercel preview URLs | `test_auth_cors_regression.py` | allow_origin_regex not allow_origins=["*"] |
+| Service role key only (no anon fallback) | `test_flow_store.py` | C-010: silent anon fallback caused 42501 RLS errors |
+| flow_episodes not flow_events | `test_flow_endpoint.py` | Phase 4 fix: 82k+ rows in flow_episodes |
+| OI-gated tier classification (all 3 conditions) | `test_4a_oi_pipeline.py` | Feature 4A-OI: vol + price + OI all required for T1/T2 |
