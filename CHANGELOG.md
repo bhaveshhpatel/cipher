@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Tier Fix] — 2026-04-27
+
+### Fixed
+- `symbol_registry.build()`: all tickers now use T3 bootstrap params during chain fetch pass to ensure no symbol is excluded before OI is known. Post-build reclassification via `assign_tiers()` now runs with live price + avg OI data and writes correct T1/T2/T3 back to every `ContractMeta.tier` and `self._tier_map`. Previously stale DB tier_map caused all symbols to permanently land T3.
+
+---
+
 ## [Phase 5C — P2/P3 Coverage Expansion] — 2026-04-27
 
 ### Summary
