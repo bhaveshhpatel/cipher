@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-27 (SwarmEngine per-tick removal, demo-mode disable, 4-tuple startup universe, DB chain fast-seed, bus channel corrections, flow_store/signal_store accuracy pass)
+> Last updated: 2026-04-27 (ingestion pipeline complete — parallel Steps 3+4a, warm-path background quote refresh, two-phase tier assignment)
 
 ---
 
@@ -224,60 +224,79 @@ Cold start is intentionally slower but materially safer. A fast burst that trips
 All tasks are created inside the `lifespan` async context manager and cancelled on shutdown.
 
 | Task variable | Coroutine | Purpose |
-|---------------|-----------|---------| 
+|---------------|-----------|---------|
 | `registry_refresh_task` | `registry.refresh_loop()` | Rebuilds OCC registry every `REGISTRY_REFRESH_MINS` (default 30 min), notifies `StreamManager` to diff/restart affected workers |
 | `prewarm_task` | `_registry_prewarm_loop()` | Rebuilds OCC registry at 9:15 AM ET every weekday — workers are warm before 9:30 market open |
 | `stream_task` | `stream_options_flow(stream_symbols)` | Main Tradier WebSocket pipeline (all 6 layers) |
 | `db_write_task` | `start_flow_writer()` | Batched flow_events writes (500ms/100 rows) + flow_episodes via bus |
 | `signal_write_task` | `start_signal_writer()` | Persists `CompositeSignal` rows to `signal_history` via bus |
 | `refresh_task` | `_universe_refresh_loop()` | Full universe rebuild every 24 h — reloads symbols, re-runs OI stamp + tier assignment, updates DB snapshot |
-
-### Startup Sequence (blocking)
-
-`_resolve_startup_universe()` returns a **4-tuple**: `(stream_symbols, tier_map, quotes, snapshot_id)`.
-
-**DB-hit path** (fresh snapshot ≤ 24h old):
-- Returns `(symbols, tier_map, [], snapshot_id)` — `quotes` is empty, no OI stamp needed.
-
-**Full-load path** (no fresh snapshot):
-- Calls `load_universe()` (CBOE + Tradier validate + screen) — quotes are NOT returned by `load_universe` itself.
-- Calls `_fetch_batch_quotes(symbols)` separately to obtain quotes for tier assignment.
-- Returns `(stream_symbols, tier_map, quotes, snapshot_id)` — `quotes` is populated.
-
-```
-1. _resolve_startup_universe()      — fresh DB snapshot (max_age 24h) or full CBOE+Tradier load
-2. init_registry(watchlist, tier_map) — Layer 1 init
-3. registry.load_from_db(snapshot_id) — fast-seed OCC contracts from DB chain cache (DB-hit path only)
-4. registry.build()                 — first full OCC contract build (blocks lifespan until complete)
-5. _stamp_oi(quotes, oi_map)        — stamps open_interest on quote objects from registry
-                                      (full-load path only; skipped when quotes=[])
-6. assign_tiers(quotes)             — OI-informed tier assignment (T1/T2/T3)
-                                      (full-load path only; skipped when quotes=[])
-7. registry.set_tier_map(tier_map)  — final tier map wired into registry
-8. universe_store.upsert_symbol_quotes() — open_interest + tier written to DB
-```
-After the blocking sequence, all 6 background tasks are spawned.
+| `bg_quote_refresh_task` | `_refresh_quotes_in_background(stream_symbols)` | **Warm path only** — fires once at startup when `quotes=[]` (DB-hit path). Fetches fresh batch quotes, stamps OI from the already-built registry, re-runs `assign_tiers()`, and upserts to DB. Keeps `open_interest` + `tier` columns current without blocking app startup. `None` on the cold path. |
 
 ---
 
-## CORS Configuration (`main.py`)
+## Startup Sequence (`main.py` lifespan)
 
-`allow_origins=["*"]` is **never used** — it breaks `allow_credentials=True`.
-Instead, `allow_origin_regex` accepts a combined pattern:
+`_resolve_startup_universe()` returns a **4-tuple**: `(stream_symbols, tier_map, quotes, snapshot_id)`.
+
+### Cold path (no fresh DB snapshot)
 
 ```
-https://[a-zA-Z0-9\-]+\.vercel\.app   ← all Vercel production + preview deploys
-http://localhost:(3000|3001)           ← local dev
-http://127\.0\.0\.1:3000              ← local dev alternative
-<escaped explicit origins from CORS_ALLOWED_ORIGINS env var>
+Startup
+  │
+  ├─ Step 1: CBOE fetch + Tradier symbol validation              (~10s)
+  │           → symbols list + stream_eligible_set (~4,000)
+  │
+  ├─ Step 2: _fetch_batch_quotes() for validated symbols         (~8s)
+  │           → SymbolQuote list in memory
+  │
+  ├─ Step 4c(i): assign_tiers() — PRELIMINARY                    (~0s, CPU)
+  │           price + volume only (OI not yet available)
+  │           → preliminary tier_map for init_registry()
+  │
+  ├─ Steps 3 + 4a  ──── asyncio.gather() ────────────────────── (PARALLEL)
+  │   ├─ Step 3:  save_snapshot() → DB                           (~3s)
+  │   └─ Step 4a: snapshot_id DB query                           (~1s)
+  │
+  ├─ init_registry(watchlist, tier_map)                          (~0s)
+  ├─ registry.load_from_db(snapshot_id)  — DB chain fast-seed
+  │
+  ├─ Step 4b: registry.build()  ← BOTTLENECK                     (~4–6 min)
+  │           _fetch_expirations + _build_ticker chains
+  │           rate-limited to Tradier 120 req/min
+  │
+  ├─ Step 4c(ii): _stamp_oi(quotes, oi_map)                      (~0s)
+  │           open_interest stamped onto quotes from registry
+  │
+  ├─ Step 4c(ii): assign_tiers() — OI-INFORMED FINAL             (~0s, CPU)
+  │           price + volume + open_interest
+  │           → final tier_map written to registry
+  │
+  └─ Step 5: upsert_symbol_quotes() with OI + final tiers        (~3s)
+              open_interest + tier columns populated in DB
 ```
 
-The pattern is logged at startup:
+### Warm path (fresh DB snapshot ≤ 24h old)
+
 ```
-CORS allow_origin_regex: <pattern>
+Startup
+  │
+  ├─ load_fresh_snapshot()  ← DB HIT                             (~1s)
+  │   → stream_symbols, tier_map, quotes=[], snapshot_id
+  │
+  ├─ init_registry(watchlist, tier_map)
+  ├─ registry.load_from_db(snapshot_id)  — DB chain fast-seed
+  │
+  ├─ registry.build()  ← still required for OI map               (~4–6 min)
+  │
+  └─ [yield — app serves traffic]
+       │
+       └─ bg_quote_refresh_task: _refresh_quotes_in_background()
+               fetch quotes → stamp OI → assign_tiers() → upsert
+               (non-blocking; runs after startup, updates DB shortly after)
 ```
 
-`CORSMiddleware` is configured with `allow_credentials=True`, `allow_methods=["*"]`, `allow_headers=["*"]`, `expose_headers=["*"]`.
+**Key difference:** on the warm path `quotes=[]` so the OI-stamp + final-tier block is skipped in the blocking sequence. The `bg_quote_refresh_task` fills that gap without delaying startup.
 
 ---
 
@@ -291,21 +310,31 @@ CORS allow_origin_regex: <pattern>
 │    │                                                            │
 │    │  BLOCKING STARTUP SEQUENCE                                 │
 │    ├── _resolve_startup_universe()    4-tuple: symbols/tier_map/quotes/snapshot_id  │
+│    │     Cold path:                                             │
+│    │       1. CBOE + Tradier validate → symbols + eligible_set  │
+│    │       2. _fetch_batch_quotes()                             │
+│    │       3. assign_tiers() — preliminary (no OI)              │
+│    │       4. asyncio.gather(save_snapshot(), snapshot_id_query) │
+│    │     Warm path:                                             │
+│    │       1. load_fresh_snapshot() → symbols + tier_map        │
+│    │       2. quotes=[] — background task refreshes later       │
 │    ├── init_registry()               Layer 1 init              │
-│    ├── registry.load_from_db()       DB chain fast-seed (DB-hit path only)  │
+│    ├── registry.load_from_db()       DB chain fast-seed         │
 │    ├── registry.build()              first OCC contract build  │
-│    ├── _stamp_oi(quotes, oi_map)     open_interest → quotes (full-load only) │
-│    ├── assign_tiers(quotes)          OI-informed T1/T2/T3 (full-load only)  │
-│    ├── registry.set_tier_map()       wire final tier map       │
-│    └── universe_store.upsert_symbol_quotes()  OI+tier → DB     │
+│    ├── _stamp_oi(quotes, oi_map)     OI → quotes (cold only)    │
+│    ├── assign_tiers(quotes)          OI-informed T1/T2/T3 (cold only) │
+│    ├── registry.set_tier_map()       wire final tier map        │
+│    └── universe_store.upsert_symbol_quotes()  OI+tier → DB (cold only) │
 │                                                                 │
 │    BACKGROUND TASKS (asyncio)                                   │
 │    ├── registry.refresh_loop()      rebuild OCC every 30 min   │
-│    ├── _registry_prewarm_loop()     rebuild at 9:15 AM ET daily│
+│    ├── _registry_prewarm_loop()     rebuild at 9:15 AM ET daily │
 │    ├── stream_options_flow()        Tradier WS pipeline         │
 │    ├── start_flow_writer()          batched DB writes (L5)      │
 │    ├── start_signal_writer()        signal_history writes (L6)  │
-│    └── _universe_refresh_loop()     full universe refresh 24h   │
+│    ├── _universe_refresh_loop()     full universe refresh 24h   │
+│    └── _refresh_quotes_in_background()  warm path only          │
+│          fetch quotes → stamp OI → assign_tiers → upsert        │
 │                                                                 │
 │  Stream Pipeline (per tick — tradier_stream._process_trade)     │
 │    ├── SymbolRegistry (Layer 1)  services/symbol_registry.py    │
@@ -333,7 +362,7 @@ CORS allow_origin_regex: <pattern>
 │    │     ├── get_signal() → sig_ep (cooldown passed?)           │
 │    │     └── episode when ≥3 trades / ≥$50K premium            │
 │    ├── persist_flow_event()  Layer 5  (services/flow_store.py)  │
-│    │     └── buffered write to flow_events (called on persist_ep)│
+│    │     └── buffered write to flow_events (called on persist_ep) │
 │    └── build_composite()  (signals/composite_signal_engine.py)  │
 │          ├── flow×0.55 + backtest×0.35 + vol×0.10               │
 │          └── bus.publish_all() on sig_ep only (cooldown gate)   │
@@ -507,7 +536,7 @@ Symbols in `TIER_ADMIN_WHITELIST` env var (default: SPY, QQQ, AAPL, TSLA, NVDA, 
 ### Admin endpoints
 
 | Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------| 
+|----------|--------|------|---------|
 | `/admin/tier-thresholds` | `GET` | Admin JWT | Read active threshold row |
 | `/admin/tier-thresholds` | `PATCH` | Admin JWT | Update thresholds live (no redeploy) |
 | `/admin/tier-distribution` | `GET` | Admin JWT | Count of symbols per tier |
@@ -652,7 +681,10 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | **L5 (flush)** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()`. |
 | **L6 (4A)** | `services/tier_engine.py` | `options_universe_symbols` had no tier column — every symbol defaulted to Tier 3. `backtest_score` tier was always 3. | Added `tier_engine.py` with dynamic threshold-driven assignment. `tier_thresholds` admin table (migration 011). Lifespan calls OI stamp + `assign_tiers()` at startup. |
 | **B-008** | `services/stream_worker.py` | `errors`, `reconnects`, `last_reconnect_at` in `_stats` were never updated — `/health/stream` always returned zeros. | Added `_inc_global_error()` / `_inc_global_reconnect()` helpers writing directly into `tradier_stream._stats` via lazy import. |
-| **startup** | `main.py` | `_resolve_startup_universe()` returned 3-tuple. Lifespan could not unpack `snapshot_id` for DB chain fast-seed. | Changed to 4-tuple `(stream_symbols, tier_map, quotes, snapshot_id)`. `load_from_db(snapshot_id)` called in lifespan before `registry.build()`. |
+| **startup (4-tuple)** | `main.py` | `_resolve_startup_universe()` returned 3-tuple. Lifespan could not unpack `snapshot_id` for DB chain fast-seed. | Changed to 4-tuple `(stream_symbols, tier_map, quotes, snapshot_id)`. `load_from_db(snapshot_id)` called in lifespan before `registry.build()`. |
+| **startup (parallel Steps 3+4a)** | `main.py` | `save_snapshot()` and `snapshot_id` DB query ran serially despite having no data dependency on each other — ~3s of wall time wasted on cold path. | Wrapped in `asyncio.gather()` so both fire concurrently. |
+| **startup (warm-path stale OI)** | `main.py` | DB-hit path returned `quotes=[]`, causing `open_interest` and `tier` columns to stay stale for the full 24h snapshot window — no refresh until next cold start. | Added `_refresh_quotes_in_background()` background task: fires on warm path only, fetches quotes → stamps OI → `assign_tiers()` → `upsert_symbol_quotes()` without blocking startup. |
+| **startup (two-phase tiers)** | `main.py` | `assign_tiers()` was called once (OI-informed) but `init_registry()` needed a `tier_map` before `registry.build()` completed. Tier map was empty for the entire build duration. | Separated into two passes: (i) preliminary pass (price+vol only) before `registry.build()` so `init_registry()` has tiers immediately; (ii) OI-informed final pass after `registry.build()` stamps `open_interest`. |
 
 ---
 
