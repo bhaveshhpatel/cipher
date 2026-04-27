@@ -22,18 +22,15 @@ Test IDs:
 
 Run: pytest backend/tests/test_persist_decouple_c008.py -v
 """
-import sys, os
+import asyncio
+import sys
+import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 base_ts = datetime(2026, 4, 26, 14, 30, 0)
 
@@ -111,8 +108,6 @@ def _make_ep(trade_count=3, total_premium=300_000.0):
 class TestC008PersistDuringCooldown:
     @pytest.mark.asyncio
     async def test_c008_1_persist_fires_bus_silent_during_cooldown(self):
-        """C008-1: when ingest_tick returns ep but get_signal returns None (cooldown),
-        persist_flow_event must be called but bus.publish_all must NOT."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -127,8 +122,8 @@ class TestC008PersistDuringCooldown:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = persist_ep
-            mock_acc.get_signal.return_value = None
+            mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
+            mock_acc.get_signal = AsyncMock(return_value=None)
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
@@ -143,8 +138,6 @@ class TestC008PersistDuringCooldown:
 class TestC008BothFireAfterCooldown:
     @pytest.mark.asyncio
     async def test_c008_2_both_fire_after_cooldown(self):
-        """C008-2: when both ingest_tick and get_signal return ep,
-        both persist_flow_event and bus.publish_all must be called."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -160,8 +153,8 @@ class TestC008BothFireAfterCooldown:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = persist_ep
-            mock_acc.get_signal.return_value = persist_ep
+            mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
+            mock_acc.get_signal = AsyncMock(return_value=persist_ep)
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
@@ -177,8 +170,6 @@ class TestC008BothFireAfterCooldown:
 class TestC008SubThresholdNeither:
     @pytest.mark.asyncio
     async def test_c008_3_sub_threshold_neither_fires(self):
-        """C008-3: when ingest_tick returns None (sub-threshold),
-        neither persist nor bus should fire."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -192,7 +183,8 @@ class TestC008SubThresholdNeither:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = None
+            mock_acc.ingest_tick = AsyncMock(return_value=None)
+            mock_acc.get_signal = AsyncMock(return_value=None)
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
@@ -207,8 +199,6 @@ class TestC008SubThresholdNeither:
 class TestC008FirstCrossingBothFire:
     @pytest.mark.asyncio
     async def test_c008_4_first_crossing_both_fire(self):
-        """C008-4: on the very first threshold crossing (last_signal_at=None),
-        both persist and bus must fire."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -224,8 +214,8 @@ class TestC008FirstCrossingBothFire:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = persist_ep
-            mock_acc.get_signal.return_value = persist_ep
+            mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
+            mock_acc.get_signal = AsyncMock(return_value=persist_ep)
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = AsyncMock()
 
@@ -240,7 +230,6 @@ class TestC008FirstCrossingBothFire:
 # ---------------------------------------------------------------------------
 class TestC008IngestShim:
     def test_c008_5_ingest_shim_calls_both(self):
-        """C008-5: ingest() shim must call ingest_tick + get_signal and return signal ep."""
         from signals.repetition_accumulator import RepetitionAccumulator
 
         acc = RepetitionAccumulator(min_trades=2, min_premium=10_000, signal_cooldown=5)
@@ -258,8 +247,8 @@ class TestC008IngestShim:
         ts1 = base_ts
         ts2 = base_ts + timedelta(seconds=10)
 
-        assert acc.ingest(_ev(6_000.0, ts1)) is None
-        result = acc.ingest(_ev(6_000.0, ts2))
+        assert asyncio.run(acc.ingest(_ev(6_000.0, ts1))) is None
+        result = asyncio.run(acc.ingest(_ev(6_000.0, ts2)))
         assert result is not None
         assert result.trade_count == 2
 
@@ -269,8 +258,6 @@ class TestC008IngestShim:
 # ---------------------------------------------------------------------------
 class TestC008IngestTickIgnoresCooldown:
     def test_c008_6_ingest_tick_returns_ep_every_qualifying_tick(self):
-        """C008-6: ingest_tick() must return ep on every call once above threshold,
-        regardless of cooldown state."""
         from signals.repetition_accumulator import RepetitionAccumulator
 
         acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
@@ -286,10 +273,10 @@ class TestC008IngestTickIgnoresCooldown:
             return ev
 
         for i in range(3):
-            acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10)))
+            asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10))))
 
-        ep4 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=1)))
-        ep5 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=2)))
+        ep4 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=1))))
+        ep5 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=2))))
 
         assert ep4 is not None, "ingest_tick should return ep even during cooldown"
         assert ep5 is not None, "ingest_tick should return ep even during cooldown"
@@ -300,7 +287,6 @@ class TestC008IngestTickIgnoresCooldown:
 # ---------------------------------------------------------------------------
 class TestC008GetSignalCooldown:
     def test_c008_7_get_signal_applies_cooldown(self):
-        """C008-7: get_signal() must return None during cooldown and ep after."""
         from signals.repetition_accumulator import RepetitionAccumulator
 
         acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
@@ -317,17 +303,17 @@ class TestC008GetSignalCooldown:
 
         ep = None
         for i in range(3):
-            ep = acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10)))
+            ep = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10))))
 
-        sig1 = acc.get_signal(base_ts + timedelta(seconds=20), ep)
+        sig1 = asyncio.run(acc.get_signal(base_ts + timedelta(seconds=20), ep))
         assert sig1 is not None
 
-        ep2 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=1)))
-        sig2 = acc.get_signal(base_ts + timedelta(minutes=1), ep2)
+        ep2 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=1))))
+        sig2 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=1), ep2))
         assert sig2 is None, "get_signal should return None during cooldown"
 
-        ep3 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=6)))
-        sig3 = acc.get_signal(base_ts + timedelta(minutes=6), ep3)
+        ep3 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=6))))
+        sig3 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=6), ep3))
         assert sig3 is not None, "get_signal should fire after cooldown expires"
 
 
@@ -337,7 +323,6 @@ class TestC008GetSignalCooldown:
 class TestC008DedupRegression:
     @pytest.mark.asyncio
     async def test_c008_8_deduped_never_reach_ingest_or_persist(self):
-        """C008-8: deduped events must not call ingest_tick or persist_flow_event."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
