@@ -39,13 +39,19 @@ class MessageResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _supabase_admin() -> Client | None:
-    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
-        log.warning("Supabase admin creds not configured — falling back to in-memory store")
+    # Fix A: prefer SUPABASE_SERVICE_ROLE_KEY (correct Railway name),
+    # fall back to legacy SUPABASE_SERVICE_KEY alias.
+    key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+    if not settings.SUPABASE_URL or not key:
+        log.warning(
+            "Supabase admin creds not configured (SUPABASE_SERVICE_ROLE_KEY is empty) "
+            "— falling back to in-memory store"
+        )
         return None
     try:
         return create_client(
             settings.SUPABASE_URL,
-            settings.SUPABASE_SERVICE_KEY,
+            key,
             options=ClientOptions(auto_refresh_token=False, persist_session=False),
         )
     except Exception as exc:
@@ -54,8 +60,12 @@ def _supabase_admin() -> Client | None:
 
 
 def _supabase_client() -> Client | None:
+    # Fix B: surface missing SUPABASE_ANON_KEY as an error, not just a warning.
     if not settings.SUPABASE_URL or not settings.SUPABASE_ANON_KEY:
-        log.warning("Supabase anon creds not configured — falling back to in-memory store")
+        log.error(
+            "Supabase anon creds not configured (SUPABASE_ANON_KEY is empty) "
+            "— login via Supabase Auth will be unavailable"
+        )
         return None
     try:
         return create_client(
@@ -86,13 +96,22 @@ async def _authenticate_user(email: str, password: str) -> dict | None:
     """
     Verify credentials. Returns user dict on success, None on failure.
     Module-level so tests can patch.object(auth_mod, '_authenticate_user', ...).
+
+    Auth flow (in order):
+      1. In-memory _users dict — only populated in local/test environments.
+      2. Supabase Auth sign_in_with_password — the sole production authority.
+
+    Fix C: removed the broken user_profiles table fallback (Path 3).
+    It called .maybe_single() on an httpx dict client (not the SDK Client),
+    which raised AttributeError on every call, got swallowed by bare except,
+    and returned None for every valid credential pair.
     """
-    # In-memory fallback path
+    # Path 1 — In-memory fallback (local dev / tests only)
     hashed = _users.get(email)
     if hashed and verify_password(password, hashed):
         return {"email": email, "role": "user"}
 
-    # Supabase path
+    # Path 2 — Supabase Auth (production)
     supabase = _supabase_client()
     if supabase:
         try:
@@ -102,28 +121,12 @@ async def _authenticate_user(email: str, password: str) -> dict | None:
             if getattr(auth_res, "user", None):
                 log.info("[auth] Supabase sign-in OK: %s", email)
                 return {"email": email, "role": "user"}
+            # sign_in returned no user but didn't raise — treat as bad credentials
+            log.warning("[auth] Supabase sign-in returned no user for %s", email)
         except Exception as exc:
             log.warning("[auth] Supabase sign-in error for %s: %s", email, exc)
-
-    # Check Supabase user_profiles table as secondary lookup
-    try:
-        from services.universe_store import _client as _sb
-        sb = _sb()
-        if sb:
-            res = (
-                sb.table("user_profiles")
-                .select("email,role")
-                .eq("email", email)
-                .maybe_single()
-                .execute()
-            )
-            data = getattr(res, "data", None)
-            if data and data.get("email") == email:
-                stored_hash = data.get("password_hash", "")
-                if verify_password(password, stored_hash):
-                    return {"email": email, "role": data.get("role", "user")}
-    except Exception as exc:
-        log.warning("[auth] user_profiles lookup failed for %s: %s", email, exc)
+    else:
+        log.error("[auth] No Supabase client available — cannot authenticate %s", email)
 
     return None
 
