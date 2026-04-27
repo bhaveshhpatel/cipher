@@ -1,269 +1,282 @@
 """
-signals/signal_gate.py — Apex Phase 1: Hard Rejection Gates
+signals/signal_gate.py — Apex Layer 1: Hard Rejection Gates
 
-Five deterministic gates that run AFTER Layer 4 dedup, BEFORE the
-RepetitionAccumulator. All gates are sub-millisecond (no I/O, no AI).
-Any failure immediately drops the event — the accumulator never sees it.
+Sits between L4 (DedupCache) and L5 (RepetitionAccumulator).
+All gates are deterministic, sub-millisecond, zero I/O.
 
-Gates (in order):
-  1. Sweep-only      : trade_type must be SWEEP
-  2. Aggression      : calls AT_ASK/ABOVE_ASK; puts AT_BID/BELOW_BID
-  3. Volume > OI     : open_interest > 0 AND size > open_interest (new-bet filter)
-  4. Spread          : (ask - bid) / mid <= MAX_SPREAD_RATIO (default 0.15)
-  5. Min premium     : fill_price * size * 100 >= MIN_TRADE_PREMIUM (default $5K)
+Gate execution order (fail-fast — cheapest checks first):
+  1. Sweep-only gate       — trade_type must be SWEEP
+  2. Spread gate           — (ask - bid) / mid <= MAX_SPREAD_PCT
+  3. Min premium gate      — individual trade premium >= MIN_TRADE_PREMIUM
+  4. Volume > OI gate      — daily volume > open_interest (new-bet filter)
+  5. Aggression gate       — SOFT flag only (pending final decision)
+                             calls -> AT_ASK or ABOVE_ASK
+                             puts  -> AT_BID or BELOW_BID
 
-Non-sweep events are NOT immediately discarded — they are tagged with
-is_apex_non_sweep=True and returned as REJECTED so the caller can feed
-them to a counter-flow accumulator if desired (Apex Layer 0 spec).
+Note on aggression gate:
+  Currently implemented as GateResult.SOFT_REJECT (reduces score, not dropped).
+  Change AGGRESSION_HARD_REJECT=true in env to flip to hard reject.
+  This allows A/B testing signal volume impact before committing.
 
-Usage:
-    from signals.signal_gate import apex_gate, GateVerdict
-
-    result = apex_gate.check(ev)
-    if result.verdict == GateVerdict.REJECTED:
-        _stats["hard_rejected"] += 1
-        return  # drop — never reaches accumulator
-    # ... proceed to RepetitionAccumulator
-
-Configuration (env vars, all optional):
-    APEX_MODE              = "true"  # must be true for gates to fire
-    APEX_MIN_PREMIUM_GATE  = 5000    # minimum individual trade premium in USD
-    APEX_MAX_SPREAD_RATIO  = 0.15    # maximum (ask-bid)/mid ratio
+Stats counter:
+  signal_gate.stats() returns a dict of per-gate rejection counts
+  for the /health endpoint and Railway observability.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (all overridable via env vars)
 # ---------------------------------------------------------------------------
-_APEX_MODE         = os.getenv("APEX_MODE", "false").lower() == "true"
-_MIN_PREMIUM       = float(os.getenv("APEX_MIN_PREMIUM_GATE", "5000"))
-_MAX_SPREAD_RATIO  = float(os.getenv("APEX_MAX_SPREAD_RATIO", "0.15"))
 
-# Aggression: classes that pass for calls and puts respectively
-_CALL_PASS_CLASSES = frozenset({"AT_ASK", "ABOVE_ASK"})
-_PUT_PASS_CLASSES  = frozenset({"AT_BID", "BELOW_BID"})
+MAX_SPREAD_PCT: float = float(os.getenv("APEX_MAX_SPREAD_PCT", "0.15"))       # 15%
+MIN_TRADE_PREMIUM: float = float(os.getenv("APEX_MIN_TRADE_PREMIUM", "5000")) # $5K
+AGGRESSION_HARD_REJECT: bool = os.getenv("APEX_AGGRESSION_HARD_REJECT", "false").lower() == "true"
+
+# bid_ask classes that count as aggressive for calls
+_CALL_AGGRESSIVE = frozenset({"AT_ASK", "ABOVE_ASK"})
+# bid_ask classes that count as aggressive for puts
+_PUT_AGGRESSIVE = frozenset({"AT_BID", "BELOW_BID"})
 
 
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
+
 class GateVerdict(str, Enum):
-    PASSED   = "PASSED"
-    REJECTED = "REJECTED"
-    BYPASSED = "BYPASSED"  # APEX_MODE=false — gate not active
+    PASS        = "PASS"         # event clears all gates
+    HARD_REJECT = "HARD_REJECT"  # event is dropped immediately
+    SOFT_REJECT = "SOFT_REJECT"  # event passes but conviction is penalised
 
 
 @dataclass
-class HardGateResult:
+class GateResult:
     verdict:      GateVerdict
-    rejected_by:  Optional[str] = None   # gate name that fired
-    reason:       Optional[str] = None   # human-readable detail
-    is_non_sweep: bool          = False  # True for counter-flow tagging
+    failed_gate:  Optional[str] = None   # name of the gate that rejected
+    reason:       Optional[str] = None   # human-readable reason
+    score_penalty: float        = 0.0    # applied to conviction_score on SOFT_REJECT
 
+    @property
+    def passed(self) -> bool:
+        return self.verdict == GateVerdict.PASS
 
-_PASS   = HardGateResult(verdict=GateVerdict.PASSED)
-_BYPASS = HardGateResult(verdict=GateVerdict.BYPASSED)
+    @property
+    def hard_rejected(self) -> bool:
+        return self.verdict == GateVerdict.HARD_REJECT
+
+    @property
+    def soft_rejected(self) -> bool:
+        return self.verdict == GateVerdict.SOFT_REJECT
 
 
 # ---------------------------------------------------------------------------
-# Gate engine
+# Stats
 # ---------------------------------------------------------------------------
-class SignalGate:
+
+@dataclass
+class _GateStats:
+    total_seen:           int = 0
+    hard_rejected:        int = 0
+    soft_rejected:        int = 0
+    passed:               int = 0
+    rejected_sweep_only:  int = 0
+    rejected_spread:      int = 0
+    rejected_min_premium: int = 0
+    rejected_vol_oi:      int = 0
+    flagged_aggression:   int = 0
+
+
+_stats = _GateStats()
+
+
+def stats() -> dict:
+    """Returns current gate rejection counters — safe to call from /health."""
+    return {
+        "gate_total_seen":           _stats.total_seen,
+        "gate_hard_rejected":        _stats.hard_rejected,
+        "gate_soft_rejected":        _stats.soft_rejected,
+        "gate_passed":               _stats.passed,
+        "gate_rejected_sweep_only":  _stats.rejected_sweep_only,
+        "gate_rejected_spread":      _stats.rejected_spread,
+        "gate_rejected_min_premium": _stats.rejected_min_premium,
+        "gate_rejected_vol_oi":      _stats.rejected_vol_oi,
+        "gate_flagged_aggression":   _stats.flagged_aggression,
+    }
+
+
+def reset_stats() -> None:
+    """Reset all counters — used in tests."""
+    global _stats
+    _stats = _GateStats()
+
+
+# ---------------------------------------------------------------------------
+# Gate logic
+# ---------------------------------------------------------------------------
+
+def _gate_sweep_only(ev) -> Optional[GateResult]:
+    """Gate 1: Only SWEEP trades proceed to the accumulator."""
+    trade_type = getattr(ev, "trade_type", "") or ""
+    if trade_type.upper() != "SWEEP":
+        _stats.rejected_sweep_only += 1
+        return GateResult(
+            verdict=GateVerdict.HARD_REJECT,
+            failed_gate="sweep_only",
+            reason=f"trade_type={trade_type!r} is not SWEEP",
+        )
+    return None
+
+
+def _gate_spread(ev) -> Optional[GateResult]:
+    """Gate 2: (ask - bid) / mid must be <= MAX_SPREAD_PCT."""
+    bid = float(getattr(ev, "bid", 0) or 0)
+    ask = float(getattr(ev, "ask", 0) or 0)
+
+    # Skip spread check on synthetic quotes — bid/ask are fabricated
+    if getattr(ev, "is_synthetic_quote", False):
+        return None
+
+    if bid <= 0 or ask <= 0:
+        return None  # can't compute — pass through
+
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+
+    spread_pct = (ask - bid) / mid
+    if spread_pct > MAX_SPREAD_PCT:
+        _stats.rejected_spread += 1
+        return GateResult(
+            verdict=GateVerdict.HARD_REJECT,
+            failed_gate="spread",
+            reason=f"spread {spread_pct:.1%} > {MAX_SPREAD_PCT:.1%} max",
+        )
+    return None
+
+
+def _gate_min_premium(ev) -> Optional[GateResult]:
+    """Gate 3: Individual trade premium must be >= MIN_TRADE_PREMIUM."""
+    premium = float(getattr(ev, "premium", 0) or 0)
+    if premium < MIN_TRADE_PREMIUM:
+        _stats.rejected_min_premium += 1
+        return GateResult(
+            verdict=GateVerdict.HARD_REJECT,
+            failed_gate="min_premium",
+            reason=f"premium ${premium:,.0f} < ${MIN_TRADE_PREMIUM:,.0f} minimum",
+        )
+    return None
+
+
+def _gate_volume_oi(ev) -> Optional[GateResult]:
     """
-    Stateless hard-gate evaluator.
-
-    All gates are pure functions of the OptionsFlowEvent — no state,
-    no I/O, no async. Safe to call from any concurrent worker.
+    Gate 4: Daily volume must exceed open interest.
+    Filters recycled OI — ensures this is a NEW directional bet.
+    Skip when open_interest == 0 (data not available).
     """
+    oi = int(getattr(ev, "open_interest", 0) or 0)
+    if oi == 0:
+        return None  # OI not available — pass through
 
-    def __init__(
-        self,
-        apex_mode:        bool  = _APEX_MODE,
-        min_premium:      float = _MIN_PREMIUM,
-        max_spread_ratio: float = _MAX_SPREAD_RATIO,
-    ):
-        self._active           = apex_mode
-        self._min_premium      = min_premium
-        self._max_spread_ratio = max_spread_ratio
+    # volume field may not exist on OptionsFlowEvent yet;
+    # fall back to size as proxy (single-trade volume)
+    volume = int(getattr(ev, "daily_volume", None) or getattr(ev, "size", 0) or 0)
+    if volume == 0:
+        return None  # can't evaluate — pass through
 
-        # Observability counters
-        self._stats: dict[str, int] = {
-            "gate_evaluated":  0,
-            "gate_passed":     0,
-            "gate_bypassed":   0,
-            "rejected_sweep":  0,   # Gate 1
-            "rejected_aggr":   0,   # Gate 2
-            "rejected_vol_oi": 0,   # Gate 3
-            "rejected_spread": 0,   # Gate 4
-            "rejected_prem":   0,   # Gate 5
-            "total_rejected":  0,
-        }
+    if volume <= oi:
+        _stats.rejected_vol_oi += 1
+        return GateResult(
+            verdict=GateVerdict.HARD_REJECT,
+            failed_gate="volume_oi",
+            reason=f"volume {volume} <= OI {oi} (not a new bet)",
+        )
+    return None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
-    def check(self, ev) -> HardGateResult:  # ev: OptionsFlowEvent
-        """
-        Evaluate all hard gates against the event.
-        Returns HardGateResult with verdict and rejection detail.
-        """
-        self._stats["gate_evaluated"] += 1
+def _gate_aggression(ev) -> Optional[GateResult]:
+    """
+    Gate 5: Aggression check.
+    Calls must fill AT_ASK or ABOVE_ASK.
+    Puts must fill AT_BID or BELOW_BID.
 
-        if not self._active:
-            self._stats["gate_bypassed"] += 1
-            return _BYPASS
+    Currently SOFT_REJECT (score penalty) unless APEX_AGGRESSION_HARD_REJECT=true.
+    Returns None (pass) if bid_ask_class is unknown or empty.
+    """
+    ba_class = (getattr(ev, "bid_ask_class", "") or "").upper()
+    ctype    = (getattr(ev, "contract_type", "") or "").upper()
 
-        # Gate 1 — Sweep only
-        result = self._gate_sweep(ev)
-        if result is not None:
-            self._stats["rejected_sweep"] += 1
-            self._stats["total_rejected"] += 1
-            return result
-
-        # Gate 2 — Aggression
-        result = self._gate_aggression(ev)
-        if result is not None:
-            self._stats["rejected_aggr"] += 1
-            self._stats["total_rejected"] += 1
-            return result
-
-        # Gate 3 — Volume > OI
-        result = self._gate_volume_oi(ev)
-        if result is not None:
-            self._stats["rejected_vol_oi"] += 1
-            self._stats["total_rejected"] += 1
-            return result
-
-        # Gate 4 — Spread
-        result = self._gate_spread(ev)
-        if result is not None:
-            self._stats["rejected_spread"] += 1
-            self._stats["total_rejected"] += 1
-            return result
-
-        # Gate 5 — Min premium
-        result = self._gate_premium(ev)
-        if result is not None:
-            self._stats["rejected_prem"] += 1
-            self._stats["total_rejected"] += 1
-            return result
-
-        self._stats["gate_passed"] += 1
-        return _PASS
-
-    def get_stats(self) -> dict:
-        return dict(self._stats)
-
-    def is_active(self) -> bool:
-        return self._active
-
-    # ------------------------------------------------------------------
-    # Individual gates (return None = passed, HardGateResult = rejected)
-    # ------------------------------------------------------------------
-
-    def _gate_sweep(self, ev) -> Optional[HardGateResult]:
-        """Gate 1: Only SWEEP trade types pass."""
-        trade_type = getattr(ev, "trade_type", "") or ""
-        if trade_type != "SWEEP":
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="sweep_only",
-                reason=f"trade_type={trade_type!r} is not SWEEP",
-                is_non_sweep=(trade_type != "SWEEP"),
-            )
+    if not ba_class or not ctype:
         return None
 
-    def _gate_aggression(self, ev) -> Optional[HardGateResult]:
-        """
-        Gate 2: Aggression check.
-        Calls must fill AT_ASK or ABOVE_ASK.
-        Puts must fill AT_BID or BELOW_BID.
-        Synthetic quotes (bid=ask=0) bypass this gate — aggression unknown.
-        """
-        if getattr(ev, "is_synthetic_quote", False):
-            return None  # cannot assert aggression without real quotes
+    is_aggressive_fill = (
+        (ctype == "CALL" and ba_class in _CALL_AGGRESSIVE) or
+        (ctype == "PUT"  and ba_class in _PUT_AGGRESSIVE)
+    )
 
-        ctype    = getattr(ev, "contract_type", "") or ""
-        ba_class = getattr(ev, "bid_ask_class",  "") or ""
-
-        if ctype == "CALL" and ba_class not in _CALL_PASS_CLASSES:
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="aggression",
-                reason=f"CALL fill at {ba_class!r} — not AT_ASK/ABOVE_ASK",
-            )
-        if ctype == "PUT" and ba_class not in _PUT_PASS_CLASSES:
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="aggression",
-                reason=f"PUT fill at {ba_class!r} — not AT_BID/BELOW_BID",
-            )
-        return None
-
-    def _gate_volume_oi(self, ev) -> Optional[HardGateResult]:
-        """
-        Gate 3: Size must exceed open interest (new-bet filter).
-        Skip if OI is 0 (not yet enriched from registry) — benefit of doubt.
-        """
-        oi   = int(getattr(ev, "open_interest", 0) or 0)
-        size = int(getattr(ev, "size",           0) or 0)
-
-        if oi > 0 and size <= oi:
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="volume_oi",
-                reason=f"size={size} <= open_interest={oi}",
-            )
-        return None
-
-    def _gate_spread(self, ev) -> Optional[HardGateResult]:
-        """
-        Gate 4: Spread must be <= MAX_SPREAD_RATIO.
-        (ask - bid) / mid > threshold -> illiquid contract, skip.
-        Skip if bid=ask=0 (synthetic quote).
-        """
-        bid = float(getattr(ev, "bid", 0) or 0)
-        ask = float(getattr(ev, "ask", 0) or 0)
-
-        if bid == 0 and ask == 0:
-            return None  # synthetic quote — cannot compute spread
-
-        if ask <= bid:
-            return None  # inverted/crossed market — skip spread gate
-
-        mid = (bid + ask) / 2.0
-        if mid <= 0:
-            return None
-
-        spread_ratio = (ask - bid) / mid
-        if spread_ratio > self._max_spread_ratio:
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="spread",
-                reason=f"spread_ratio={spread_ratio:.3f} > {self._max_spread_ratio}",
-            )
-        return None
-
-    def _gate_premium(self, ev) -> Optional[HardGateResult]:
-        """Gate 5: Individual trade premium must meet minimum threshold."""
-        premium = float(getattr(ev, "premium", 0) or 0)
-        if premium < self._min_premium:
-            return HardGateResult(
-                verdict=GateVerdict.REJECTED,
-                rejected_by="min_premium",
-                reason=f"premium=${premium:,.0f} < min=${self._min_premium:,.0f}",
-            )
-        return None
+    if not is_aggressive_fill:
+        _stats.flagged_aggression += 1
+        verdict = GateVerdict.HARD_REJECT if AGGRESSION_HARD_REJECT else GateVerdict.SOFT_REJECT
+        return GateResult(
+            verdict=verdict,
+            failed_gate="aggression",
+            reason=f"{ctype} filled at {ba_class!r} — not aggressive",
+            score_penalty=0.25,  # 25% conviction haircut on soft reject
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
+# Public entry point
 # ---------------------------------------------------------------------------
-apex_gate = SignalGate()
+
+# Ordered gate list — cheapest / most discriminating first
+_GATES = [
+    _gate_sweep_only,
+    _gate_spread,
+    _gate_min_premium,
+    _gate_volume_oi,
+    _gate_aggression,
+]
+
+
+def check(ev) -> GateResult:
+    """
+    Run all gates against the given OptionsFlowEvent.
+
+    Returns GateResult with:
+      .passed        == True   → forward to RepetitionAccumulator
+      .hard_rejected == True   → drop event entirely
+      .soft_rejected == True   → forward but apply .score_penalty to conviction_score
+
+    Call site in tradier_stream._process_trade():
+
+        from signals.signal_gate import check as gate_check, GateVerdict
+
+        result = gate_check(ev)
+        if result.hard_rejected:
+            return          # drop
+        if result.soft_rejected:
+            ev.conviction_score = round(
+                ev.conviction_score * (1 - result.score_penalty), 3
+            )
+        # forward to accumulator
+        await accumulator.ingest(ev)
+    """
+    _stats.total_seen += 1
+
+    for gate_fn in _GATES:
+        result = gate_fn(ev)
+        if result is not None:
+            if result.hard_rejected:
+                _stats.hard_rejected += 1
+            else:
+                _stats.soft_rejected += 1
+            return result
+
+    _stats.passed += 1
+    return GateResult(verdict=GateVerdict.PASS)
