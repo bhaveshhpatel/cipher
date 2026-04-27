@@ -21,7 +21,15 @@ C-008 — Decouple Persist Tier from Signal Tier:
 
   ingest() preserved as backward-compat shim (calls both internally).
   _process_trade now calls ingest_tick + get_signal independently.
+
+Fix (concurrent safety — issues #1+#2):
+  _episode_locks provides a per-key asyncio.Lock so that the
+  prune-append-check sequence in ingest_tick() and the cooldown
+  check+write in get_signal() are each atomic under concurrent coroutines.
+  Without this, two StreamWorker coroutines on the same episode key could
+  interleave mutations (phantom threshold crossings, duplicate signals).
 """
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -75,11 +83,19 @@ class RepetitionAccumulator:
         self.min_premium     = min_premium
         self.signal_cooldown = timedelta(minutes=signal_cooldown)
         self._episodes: Dict[str, RepetitionEpisode] = {}
+        # Per-key asyncio.Lock — makes ingest_tick and get_signal atomic
+        # per episode under concurrent StreamWorker coroutines.
+        self._episode_locks: Dict[str, asyncio.Lock] = {}
 
     def _key(self, ev: OptionsFlowEvent) -> str:
         return f"{ev.ticker}:{ev.contract_type}:{ev.strike}:{ev.expiry}"
 
-    def ingest_tick(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._episode_locks:
+            self._episode_locks[key] = asyncio.Lock()
+        return self._episode_locks[key]
+
+    async def ingest_tick(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
         """
         C-008: Persist tier gate.
 
@@ -91,26 +107,40 @@ class RepetitionAccumulator:
         backtesting fidelity.
 
         Returns None only when thresholds are not yet met.
+
+        Thread safety: holds per-key asyncio.Lock for the full
+        prune-append-check sequence to prevent concurrent coroutine interleave.
         """
-        key = self._key(ev)
-        ep  = self._episodes.setdefault(key, RepetitionEpisode(
-            ticker        = ev.ticker,
-            contract_type = ev.contract_type,
-            strike        = ev.strike,
-            expiry        = ev.expiry,
-        ))
+        key  = self._key(ev)
+        lock = self._get_lock(key)
+        async with lock:
+            ep = self._episodes.setdefault(key, RepetitionEpisode(
+                ticker        = ev.ticker,
+                contract_type = ev.contract_type,
+                strike        = ev.strike,
+                expiry        = ev.expiry,
+            ))
 
-        cutoff    = ev.timestamp - self.window
-        ep.events = [e for e in ep.events if e.timestamp >= cutoff]
-        ep.events.append(ev)
-        ep.first_seen = ep.events[0].timestamp
-        ep.last_seen  = ev.timestamp
+            cutoff    = ev.timestamp - self.window
+            ep.events = [e for e in ep.events if e.timestamp >= cutoff]
+            ep.events.append(ev)
+            ep.first_seen = ep.events[0].timestamp
+            ep.last_seen  = ev.timestamp
 
-        if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
-            return ep
-        return None
+            # Evict stale empty episodes to prevent unbounded dict growth
+            if not ep.events:
+                self._episodes.pop(key, None)
+                return None
 
-    def get_signal(self, ts: datetime, ep: Optional["RepetitionEpisode"]) -> Optional["RepetitionEpisode"]:
+            if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
+                return ep
+            return None
+
+    async def get_signal(
+        self,
+        ts: datetime,
+        ep: Optional["RepetitionEpisode"],
+    ) -> Optional["RepetitionEpisode"]:
         """
         C-008: Signal tier gate.
 
@@ -118,23 +148,30 @@ class RepetitionAccumulator:
         Returns ep if cooldown has elapsed (or this is the first signal).
         Returns None if cooldown is still active — suppresses bus publish.
 
-        ep.last_signal_at is updated here on every fire so that the next
-        call to get_signal() sees the correct elapsed time.
+        ep.last_signal_at is updated atomically inside the per-key lock so
+        that concurrent coroutines cannot both pass the cooldown check before
+        the timestamp is written (double-fire race, issue #2).
 
         Pass ep=None (sub-threshold) and this is a guaranteed no-op returning None.
         """
         if ep is None:
             return None
 
-        if ep.last_signal_at is not None:
-            elapsed = ts - ep.last_signal_at
-            if elapsed < self.signal_cooldown:
-                return None
+        key  = self._key_from_ep(ep)
+        lock = self._get_lock(key)
+        async with lock:
+            if ep.last_signal_at is not None:
+                elapsed = ts - ep.last_signal_at
+                if elapsed < self.signal_cooldown:
+                    return None
 
-        ep.last_signal_at = ts
-        return ep
+            ep.last_signal_at = ts
+            return ep
 
-    def ingest(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
+    def _key_from_ep(self, ep: "RepetitionEpisode") -> str:
+        return f"{ep.ticker}:{ep.contract_type}:{ep.strike}:{ep.expiry}"
+
+    async def ingest(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
         """
         Backward-compat shim for C-002 / C-007 tests and any callers
         that use the original single-return API.
@@ -145,8 +182,8 @@ class RepetitionAccumulator:
         New code in _process_trade should call ingest_tick() and
         get_signal() independently for decoupled persist/signal control.
         """
-        persist_ep = self.ingest_tick(ev)
-        return self.get_signal(ev.timestamp, persist_ep)
+        persist_ep = await self.ingest_tick(ev)
+        return await self.get_signal(ev.timestamp, persist_ep)
 
     def get_alert_level(self, ep: "RepetitionEpisode") -> str:
         prem = ep.total_premium
