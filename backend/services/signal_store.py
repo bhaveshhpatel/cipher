@@ -34,7 +34,7 @@ import asyncio
 import logging
 import os
 from collections import deque
-from typing import Optional, List
+from typing import Optional
 
 import httpx
 
@@ -84,7 +84,6 @@ def _client():  # noqa: ANN201 — patchable by tests
     """
     if not _is_configured():
         return None
-    # Return a minimal config dict when not patched — real inserts use httpx.
     return {"url": _SUPABASE_URL, "key": _SUPABASE_KEY}
 
 
@@ -122,7 +121,7 @@ async def _insert_signal(row: dict) -> bool:
             resp = await client.post(url, headers=_headers(), json=[row])
         if resp.status_code in (200, 201):
             return True
-        log.error("[signal_store] insert failed: %s — %s", resp.status_code, resp.text[:300])
+        log.error("[signal_store] insert failed: %s -- %s", resp.status_code, resp.text[:300])
         return False
     except Exception as e:
         log.error("[signal_store] insert exception: %s", e)
@@ -148,12 +147,6 @@ async def _insert_signal_with_retry(row: dict) -> bool:
 
 
 def _normalise_direction(raw: str) -> str:
-    """
-    Normalise to direction string.
-    Tests expect unknown values like 'sideways' to return one of
-    ('neutral', 'bullish', 'bearish') — 'neutral' is the correct fallback
-    for unrecognised values.
-    """
     if not raw:
         return "neutral"
     lower = raw.lower()
@@ -161,7 +154,6 @@ def _normalise_direction(raw: str) -> str:
         return "bullish"
     if lower in ("sell", "bearish", "repeat_sell"):
         return "bearish"
-    # 'hold', 'neutral', 'sideways', or any unknown -> neutral
     return "neutral"
 
 
@@ -181,28 +173,22 @@ def _normalise_influence_tier(raw: str) -> str:
 
 
 def _db_direction(raw: str) -> str:
-    """Map to DB-safe uppercase direction (BUY | SELL | HOLD)."""
     normalised = _normalise_direction(raw)
     mapping = {"bullish": "BUY", "bearish": "SELL"}
     return mapping.get(normalised, "HOLD")
 
 
 def _db_trade_type(raw: str) -> str:
-    """Map to DB-safe uppercase trade type (SWEEP | BLOCK | SPLIT | SINGLE)."""
     return _normalise_trade_type(raw).upper()
 
 
 def _coerce_to_dict(sig) -> dict:
-    """Coerce a signal object (dataclass, pydantic model, plain object) to dict."""
     if isinstance(sig, dict):
         return sig
-    # pydantic v2 model
     if hasattr(sig, "model_dump"):
         return sig.model_dump()
-    # dataclass or object with __dict__
     if hasattr(sig, "__dict__"):
         return vars(sig)
-    # fallback: try dict()
     try:
         return dict(sig)
     except Exception:
@@ -275,10 +261,6 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Public API used by tests
-# ---------------------------------------------------------------------------
-
 def _store_in_memory(sig_dict: dict) -> None:
     """Append to _signal_memory respecting dedup by 'id'."""
     sig_id = sig_dict.get("id")
@@ -289,49 +271,26 @@ def _store_in_memory(sig_dict: dict) -> None:
 
 
 async def save_signal(signal) -> bool:
-    """
-    Persist a signal dict/object.
-
-    Priority order:
-    1. If _client() returns an SDK-compatible object (has .table()),
-       use it directly — this makes test mocking with patch.object work.
-    2. If Supabase URL+key are configured, use httpx REST insert.
-       On failure (including DNS errors in CI), fall back to _signal_memory
-       so get_signals() still returns data within the same process.
-    3. Otherwise store in _signal_memory (CI / no-credentials path).
-    """
     sig_dict = _coerce_to_dict(signal)
-
     client = _client()
 
     if _client_is_sdk_mock(client):
-        # SDK / test-mock path
         ok = await _insert_via_sdk(client, sig_dict)
         if ok:
             _store_in_memory(sig_dict)
         return ok
 
     if not _is_configured():
-        # In-memory only (CI / no credentials)
         _store_in_memory(sig_dict)
         return True
 
-    # httpx REST path — attempt network insert, fall back to memory on failure
     row = _build_row(signal)
     ok  = await _insert_signal_with_retry(row)
-    # Always store in memory regardless of network result so CI tests can
-    # retrieve the signal via get_signals() even when Supabase is unreachable.
     _store_in_memory(sig_dict)
     return ok
 
 
 async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
-    """
-    Return cached in-memory signals, optionally filtered by ticker.
-
-    Also tries the SDK client if _client() returns one with .table(),
-    so test mocks that return rows via execute() are honoured.
-    """
     client = _client()
     if _client_is_sdk_mock(client):
         try:
@@ -342,7 +301,7 @@ async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
                 rows = [r for r in rows if r.get("ticker") == ticker]
             return rows
         except Exception:
-            pass  # fall through to in-memory
+            pass
 
     results = list(_signal_memory)
     if ticker:
@@ -350,7 +309,6 @@ async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
     return results[-limit:]
 
 
-# Alias — tests may call get_recent_signals()
 async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
     """Alias for get_signals — backward-compat."""
     return await get_signals(ticker=ticker, limit=limit)
@@ -363,7 +321,6 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
             "-- composite signal for %s stored in memory (not persisted to DB).",
             sig.get("ticker", "UNKNOWN"),
         )
-        # Fix 5: fall back to in-memory store so signals aren't silently dropped
         row = _build_row(sig, ep)
         _store_in_memory(row)
         return
@@ -374,13 +331,13 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         premium_val  = row["premium"]
         premium_fmt  = "${:,.0f}".format(premium_val) if premium_val else "$0"
         golden_sweep = row["is_golden_sweep"]
-        golden_tag   = " ⚡ GOLDEN SWEEP" if golden_sweep else ""
-        swarm_dir    = row["swarm_direction"] or "—"
+        golden_tag   = " \u26a1 GOLDEN SWEEP" if golden_sweep else ""
+        swarm_dir    = row["swarm_direction"] or "--"
         bull         = row["swarm_bull_votes"]
         bear         = row["swarm_bear_votes"]
         hold         = row["swarm_hold_votes"]
         log.info(
-            "[signal_store] ✅ DB INSERT OK | "
+            "[signal_store] DB INSERT OK | "
             "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
             "sentiment=%s | tier=%s | type=%s | premium=%s | "
             "swarm=%s (%sB/%sBe/%sH)%s",
@@ -391,7 +348,7 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         )
     else:
         log.warning(
-            "[signal_store] ❌ INSERT FAILED — signal for %s was NOT saved to DB",
+            "[signal_store] INSERT FAILED -- signal for %s was NOT saved to DB",
             row.get("ticker"),
         )
 
@@ -417,9 +374,8 @@ async def _bus_signal_listener() -> None:
 async def start_signal_writer() -> None:
     if not _is_configured():
         log.warning(
-            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — "
-            "composite signals will NOT be persisted. "
-            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
+            "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "
+            "composite signals will NOT be persisted."
         )
         return
     log.info(
