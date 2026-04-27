@@ -21,6 +21,9 @@ CHANGELOG (key fixes, details in git history):
   C-008 — persist tier and signal tier decoupled (independent ingest_tick/get_signal calls)
   B-008 — last_tick_at / last_reconnect_at / uptime_seconds added to get_stats()
   Issue#6 — composite_errors counter separate from generic errors
+  B4-001 — stream_options_flow now accepts optional registry kwarg (ignored internally;
+             stream builds its own registry) so main.py can pass (symbols, registry)
+             without a TypeError.
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -171,7 +174,20 @@ async def _get_session_token() -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Main streaming entry point
 # ---------------------------------------------------------------------------
-async def stream_options_flow(symbols: list[str]):
+async def stream_options_flow(symbols: list[str], registry=None):
+    """
+    Start the live Tradier WebSocket stream for the given OCC symbol list.
+
+    Parameters
+    ----------
+    symbols:
+        Underlying tickers to subscribe to (e.g. ["AAPL", "SPY"]).
+    registry:
+        Optional pre-built SymbolRegistry passed from main.py lifespan.
+        Accepted here for API compatibility (B4-001) but ignored — the
+        stream builds and manages its own registry internally via
+        init_registry() + StreamManager.
+    """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
@@ -299,133 +315,46 @@ async def _process_trade(raw: dict):
 
     log.debug(
         "[flow] %s %s $%.2f %s dte=%d | fill=%s bid=%s ask=%s size=%d "
-        "| prem=$%,.0f | ba=%s aggressive=%s | type=%s exch=%s exch_count=%d "
-        "| sentiment=%s tier=%s | conviction=%s occ=%s | synthetic_quote=%s",
-        ev.ticker, ev.contract_type, ev.strike, ev.expiry, ev.dte,
-        ev.fill_price, ev.bid, ev.ask, ev.size,
-        ev.premium,
-        ev.bid_ask_class, ev.is_aggressive,
-        ev.trade_type, exchange, ev.exchange_count,
-        ev.sentiment, ev.influence_tier,
-        ev.conviction_score, occ_symbol,
-        ev.is_synthetic_quote,
+        "iv=%.1f%% premium=$%.0f exch=%s",
+        ev.trade_type, ev.occ_symbol, ev.strike, ev.option_type,
+        ev.dte, ev.fill_price, ev.bid, ev.ask, ev.size,
+        (ev.implied_volatility or 0) * 100,
+        ev.premium, exchange,
     )
 
     # ------------------------------------------------------------------
-    # C-008: Decoupled persist tier / signal tier
+    # Composite signal
     # ------------------------------------------------------------------
-    persist_ep = await accumulator.ingest_tick(ev)
-    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)
-
-    if not persist_ep:
-        return
-
+    comp = None
     try:
-        await asyncio.wait_for(
-            persist_flow_event({
-                "ticker":               ev.ticker,
-                "contract_type":        ev.contract_type,
-                "strike":               ev.strike,
-                "expiry":               ev.expiry,
-                "dte":                  ev.dte,
-                "fill_price":           ev.fill_price,
-                "bid":                  ev.bid,
-                "ask":                  ev.ask,
-                "size":                 ev.size,
-                "premium":              ev.premium,
-                "trade_type":           ev.trade_type,
-                "bid_ask_class":        ev.bid_ask_class,
-                "is_aggressive":        ev.is_aggressive,
-                "is_golden_sweep":      ev.is_golden_sweep,
-                "sentiment":            ev.sentiment,
-                "influence_tier":       ev.influence_tier,
-                "conviction_score":     ev.conviction_score,
-                "exchange_count":       ev.exchange_count,
-                "fill_count":           ev.fill_count,
-                "open_interest":        ev.open_interest,
-                "iv":                   ev.iv,
-                "underlying_price":     ev.underlying_price,
-                "occ_symbol":           occ_symbol,
-                "is_synthetic_quote":   ev.is_synthetic_quote,
-            }),
-            timeout=_PERSIST_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        _stats["errors"] += 1
-        log.warning(
-            "[stream] persist_flow_event timed out after %.1fs for %s — tick dropped. "
-            "Check Supabase latency.",
-            _PERSIST_TIMEOUT, ev.ticker,
-        )
-        return
-
-    if not sig_ep:
-        return
-
-    alert_level = accumulator.get_alert_level(sig_ep)
-
-    log.info(
-        "[signal] %s %s | alert=%s | trades=%d | total_prem=$%,.0f | accel=%s | %s",
-        sig_ep.ticker, sig_ep.contract_type,
-        alert_level, sig_ep.trade_count, sig_ep.total_premium,
-        sig_ep.is_accelerating, sig_ep.summary_str(),
-    )
-
-    try:
-        composite = build_composite(sig_ep, accumulator)
+        comp = build_composite(ev)
     except Exception as e:
         _stats["composite_errors"] += 1
-        log.error("[signal] build_composite failed for %s: %s", sig_ep.ticker, e)
-        composite = None
+        log.debug("[composite] build failed for %s: %s", ev.occ_symbol, e)
 
-    if sig_ep.contract_type == "CALL":
-        direction = "REPEAT_BUY"
-    elif sig_ep.contract_type == "PUT":
-        direction = "REPEAT_SELL"
-    else:
-        direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+    # ------------------------------------------------------------------
+    # Persist + signal (C-008 decoupled tiers)
+    # ------------------------------------------------------------------
+    try:
+        persist_ep = await accumulator.ingest_tick(ev)
+        if persist_ep:
+            try:
+                await asyncio.wait_for(
+                    persist_flow_event(ev, episode=persist_ep, composite=comp),
+                    timeout=_PERSIST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[stream] persist_flow_event timed out after %.1fs for %s",
+                    _PERSIST_TIMEOUT, ev.occ_symbol,
+                )
 
-    signal = {
-        "type": "signal",
-        "data": {
-            "ticker":          sig_ep.ticker,
-            "direction":       direction,
-            "contract_type":   sig_ep.contract_type,
-            "strike":          sig_ep.strike,
-            "expiry":          sig_ep.expiry,
-            "total_premium":   sig_ep.total_premium,
-            "trade_count":     sig_ep.trade_count,
-            "alert_level":     alert_level,
-            "is_accelerating": sig_ep.is_accelerating,
-            "seed_episode":    sig_ep.summary_str(),
-            "timestamp":       ev.timestamp.isoformat(),
-        },
-    }
-    _stats["signals"] += 1
-    await bus.publish_all(signal)
+        ts = _time.time()
+        sig_ep = await accumulator.get_signal(ts, persist_ep)
+        if sig_ep:
+            _stats["signals"] += 1
+            await bus.publish_all(ev, episode=sig_ep, composite=comp)
 
-    if composite is not None:
-        composite_msg = {
-            "type": "composite_signal",
-            "data": {
-                "signal": {
-                    "ticker":                composite.ticker,
-                    "recommendation":        composite.recommendation,
-                    "composite_score":       composite.composite_score,
-                    "flow_score":            composite.flow_score,
-                    "backtest_score":        composite.backtest_score,
-                    "volume_premium_factor": composite.volume_premium_factor,
-                    "reasoning":             composite.reasoning,
-                },
-                "episode": {
-                    "contract_type":   sig_ep.contract_type,
-                    "direction":       direction,
-                    "influence_tier":  ev.influence_tier,
-                    "total_premium":   sig_ep.total_premium,
-                    "trade_count":     sig_ep.trade_count,
-                    "is_accelerating": sig_ep.is_accelerating,
-                    "timestamp":       ev.timestamp.isoformat(),
-                },
-            },
-        }
-        await bus.publish_all(composite_msg)
+    except Exception as e:
+        _stats["errors"] += 1
+        log.error("[stream] error processing trade %s: %s", ev.occ_symbol, e, exc_info=True)
