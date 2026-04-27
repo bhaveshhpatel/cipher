@@ -63,8 +63,10 @@ class SymbolRegistry:
         self._last_build: Optional[datetime]     = None
         self._build_lock = asyncio.Lock()
         self._oi_by_ticker: dict[str, int] = {}
-        # snapshot_id of the last successfully persisted build
         self._persisted_snapshot_id: Optional[str] = None
+        # Volume data captured during _fetch_stock_prices for tier reclassification
+        self._volume_by_ticker: dict[str, int] = {}
+        self._avg_volume_by_ticker: dict[str, int] = {}
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -88,15 +90,8 @@ class SymbolRegistry:
         return dict(self._oi_by_ticker)
 
     async def load_from_db(self, snapshot_id: str) -> int:
-        """
-        Pre-seed the registry from the DB chain cache for snapshot_id.
-        Called on startup (HIT path) so lookup() works before build() finishes.
-        Returns number of contracts loaded (0 on empty or error).
-        """
         from services.chain_store import load_chain
         chain = await load_chain(snapshot_id)
-        # Explicit None check: empty dict {} means DB returned cleanly but
-        # snapshot has no cached contracts yet — that is not an error.
         if chain is None:
             log.info(
                 "[symbol_registry] load_from_db: DB error for snapshot %s — "
@@ -126,11 +121,7 @@ class SymbolRegistry:
         from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
-        # Use T3 params for the initial build pass — all tickers get widest filter.
-        # After OI is collected, we reclassify and update tier on each ContractMeta.
-        tier_params  = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
-        # Force all tickers through T3 params on first pass so no symbol is excluded
-        # due to a stale T3 tier_map assignment.
+        tier_params      = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
         bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
 
         async with self._build_lock:
@@ -146,7 +137,7 @@ class SymbolRegistry:
             new_registry: dict[str, ContractMeta] = {}
             new_oi_by_ticker: dict[str, int] = {}
 
-            prices = await self._fetch_stock_prices()
+            prices, raw_quotes = await self._fetch_stock_prices()
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
@@ -156,27 +147,37 @@ class SymbolRegistry:
                     prices.get(ticker, 0.0),
                     new_registry,
                     new_oi_by_ticker,
-                    bootstrap_params,  # use T3 params for all tickers on build pass
+                    bootstrap_params,
                 )
                 for ticker in self._watchlist
                 if ticker in prices and prices[ticker] > 0
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # --- Post-build tier reclassification using live price + OI ---
-            # Build synthetic SymbolQuote objects from collected prices and OI
-            # so assign_tiers() can do a proper T1/T2/T3 classification.
-            synthetic_quotes = [
-                SymbolQuote(
+            # --- Post-build tier reclassification using live price + volume + OI ---
+            synthetic_quotes = []
+            for ticker in self._watchlist:
+                if ticker not in prices:
+                    continue
+                q = raw_quotes.get(ticker, {})
+                vol     = 0
+                avg_vol = 0
+                try:
+                    vol = int(q.get("volume") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    avg_vol = int(q.get("average_volume") or 0)
+                except (TypeError, ValueError):
+                    pass
+                synthetic_quotes.append(SymbolQuote(
                     symbol         = ticker,
                     last_price     = prices.get(ticker, 0.0),
-                    volume         = 0,
-                    average_volume = 0,
+                    volume         = vol,
+                    average_volume = avg_vol,
                     open_interest  = new_oi_by_ticker.get(ticker, 0),
-                )
-                for ticker in self._watchlist
-                if ticker in prices
-            ]
+                ))
+
             live_tier_map = await assign_tiers(synthetic_quotes, thresholds=thresh)
             log.info(
                 "[symbol_registry] Post-build tier reclassification: T1=%d T2=%d T3=%d",
@@ -185,12 +186,9 @@ class SymbolRegistry:
                 sum(1 for t in live_tier_map.values() if t == 3),
             )
 
-            # Update tier on every ContractMeta with the reclassified value
             for occ_sym, meta in new_registry.items():
-                new_tier = live_tier_map.get(meta.ticker, 3)
-                meta.tier = new_tier
+                meta.tier = live_tier_map.get(meta.ticker, 3)
 
-            # Store the updated tier_map for future refresh cycles
             self._tier_map = live_tier_map
 
             old_count           = len(self._registry)
@@ -210,16 +208,10 @@ class SymbolRegistry:
                 len(new_oi_by_ticker),
             )
 
-            # Persist to DB so restarts can fast-seed from cache
             await self._persist_to_db(new_registry)
-
             return len(new_registry)
 
     async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:
-        """
-        Persist chain to options_chain_cache for the current active snapshot.
-        Non-fatal — a failure here never breaks the in-memory registry.
-        """
         from services.chain_store import save_chain
         from services import universe_store
         try:
@@ -277,8 +269,14 @@ class SymbolRegistry:
             except Exception as e:
                 log.error("[symbol_registry] Refresh failed (non-fatal): %s", e)
 
-    async def _fetch_stock_prices(self) -> dict[str, float]:
+    async def _fetch_stock_prices(self) -> tuple[dict[str, float], dict[str, dict]]:
+        """
+        Fetch stock quotes for all watchlist tickers.
+        Returns (prices dict, raw_quotes dict) so callers can also access
+        volume and average_volume for tier reclassification.
+        """
         prices: dict[str, float] = {}
+        raw_quotes: dict[str, dict] = {}
         batch_size = 200
         batches = [
             self._watchlist[i:i + batch_size]
@@ -287,6 +285,7 @@ class SymbolRegistry:
         results = await asyncio.gather(*[get_quotes_batch(b) for b in batches])
         for quote_map in results:
             for sym, q in quote_map.items():
+                raw_quotes[sym] = q
                 for key in ("last", "last_price", "close", "prevclose"):
                     val = q.get(key)
                     if val:
@@ -295,7 +294,7 @@ class SymbolRegistry:
                             break
                         except (TypeError, ValueError):
                             pass
-        return prices
+        return prices, raw_quotes
 
     async def _build_ticker(
         self,
