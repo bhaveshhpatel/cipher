@@ -15,7 +15,6 @@ Covers:
   - add_flow / get_flows / clear_flows — in-memory helpers
 """
 import asyncio
-import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -211,7 +210,6 @@ class TestPersistFlowEvent:
         import services.flow_store as fs
         fs._flow_event_buffer.clear()
         fs._buffer_lock = None
-        # Pre-fill to one below threshold so one more write triggers early flush
         fs._flow_event_buffer.extend([{"ticker": "X"} for _ in range(fs._FLUSH_MAX_ROWS - 1)])
         flush_mock = AsyncMock(return_value=True)
         with patch.object(fs, "_SUPABASE_URL", "https://x.supabase.co"), \
@@ -413,8 +411,7 @@ class TestBusSignalListener:
         fake_q  = asyncio.Queue()
         await fake_q.put(msg)
 
-        persist_mock = AsyncMock()
-        call_count   = 0
+        call_count = 0
 
         async def _stop_after_one(*_, **__):
             nonlocal call_count
@@ -437,8 +434,7 @@ class TestBusSignalListener:
         await fake_q.put("not-a-dict")
         await fake_q.put(asyncio.CancelledError())  # sentinel
 
-        persist_mock = AsyncMock()
-        call_count   = 0
+        call_count = 0
 
         async def _cancel_after(*_, **__):
             nonlocal call_count
@@ -457,13 +453,14 @@ class TestBusSignalListener:
 
         fake_q.get = _patched_get
 
+        persist_ep = AsyncMock()
         with patch.object(fs.bus, "subscribe", return_value=fake_q), \
              patch.object(fs.bus, "unsubscribe"), \
-             patch.object(fs, "persist_flow_episode", persist_mock):
+             patch.object(fs, "persist_flow_episode", persist_ep):
             with pytest.raises(asyncio.CancelledError):
                 await fs._bus_signal_listener()
 
-        persist_mock.assert_not_awaited()
+        persist_ep.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +473,6 @@ class TestStartFlowWriter:
         import services.flow_store as fs
         with patch.object(fs, "_SUPABASE_URL", None), \
              patch.object(fs, "_SUPABASE_KEY", None):
-            # Should return without raising
             await fs.start_flow_writer()
 
     @pytest.mark.asyncio
@@ -528,7 +524,6 @@ class TestInMemoryHelpers:
         await fs.clear_flows()
         for i in range(6000):
             await fs.add_flow({"ticker": f"T{i % 10}"})
-        # Should not raise; just capped at 5000
         assert len(fs._mem_store) == 5000
         await fs.clear_flows()
 
@@ -540,8 +535,6 @@ class TestInMemoryHelpers:
             fs.add_flow({"ticker": f"T{i}"})
             for i in range(20)
         ])
-        # Collect counts per ticker with an explicit loop (not a genexpr with
-        # await, which is a SyntaxError in Python 3.11).
         total = 0
         for i in range(20):
             total += len(await fs.get_flows(f"T{i}"))

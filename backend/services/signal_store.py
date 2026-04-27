@@ -99,7 +99,7 @@ def _headers() -> dict:
 
 def _is_sdk_available() -> bool:
     try:
-        from supabase import create_client  # noqa: F401
+        import supabase  # noqa: F401
         return True
     except ImportError:
         return False

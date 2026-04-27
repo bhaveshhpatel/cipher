@@ -8,7 +8,7 @@ Patches follow the same style as test_symbol_registry_coverage.py:
 """
 import asyncio
 from datetime import date, timedelta
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

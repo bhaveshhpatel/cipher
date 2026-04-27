@@ -15,7 +15,6 @@ Covers (merged from test_signal_store_coverage.py as of 2026-04-27):
  - _bus_signal_listener: composite_signal processing + cancel
 """
 import asyncio
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

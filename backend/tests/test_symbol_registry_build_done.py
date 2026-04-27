@@ -171,8 +171,6 @@ async def test_refresh_quotes_waits_for_build_before_oi_map():
     reg = _make_registry()
     oi_map_calls: list[dict] = []
 
-    original_get_oi_map = reg.get_oi_map
-
     def _recording_get_oi_map():
         result = {"AAPL": 999}
         oi_map_calls.append(result)
