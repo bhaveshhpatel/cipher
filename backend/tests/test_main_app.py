@@ -84,8 +84,8 @@ def test_stamp_oi_missing_symbol_gets_zero():
 def test_routers_all_mounted():
     """Verify that core router prefixes are registered on the app.
 
-    health router  → prefix='/health'  (not /api/health)
-    auth router    → prefix='/api/auth'
+    health router  -> prefix='/health'  (not /api/health)
+    auth router    -> prefix='/api/auth'
     """
     from main import app
     paths = {r.path for r in app.routes}
@@ -124,15 +124,15 @@ def test_lifespan_spawns_prewarm_task():
     """
     Lifespan must create a _registry_prewarm_loop background task.
 
-    Strategy: drive `lifespan` directly as an async context manager
-    inside asyncio.run() instead of going through TestClient.
+    Drive `lifespan` directly as an async context manager so we are not
+    subject to the TestClient singleton-caching problem (the app lifespan
+    only runs once per process when using TestClient on a shared app object).
 
-    Why not TestClient: `main.app` is a module-level singleton. Once any
-    earlier test causes it to be imported, TestClient runs (and caches)
-    the lifespan on first use. Subsequent TestClient() calls skip the
-    lifespan entirely, so create_task is never called again and
-    created_targets stays [].  Driving the lifespan function directly
-    guarantees the startup body runs inside our patch context.
+    IMPORTANT: asyncio.run() closes the event loop it creates when it
+    returns. On Python 3.10+ this leaves NO current event loop on the
+    main thread, which would break every subsequent test that calls
+    asyncio.get_event_loop(). We install a fresh loop in a finally block
+    to restore the expected state for the rest of the test session.
     """
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
@@ -140,8 +140,6 @@ def test_lifespan_spawns_prewarm_task():
 
     created_targets: list[str] = []
 
-    # We need a real event loop so create_task works; we cancel tasks
-    # immediately so they don't block.
     async def _run_lifespan():
         real_create_task = asyncio.create_task
 
@@ -159,7 +157,6 @@ def test_lifespan_spawns_prewarm_task():
         mock_registry.refresh_loop = AsyncMock()
         mock_registry.set_tier_map = MagicMock()
 
-        # Patch main module's own names so the lifespan body sees them.
         with patch.object(main_module, "_resolve_startup_universe",
                           new_callable=AsyncMock, return_value=([], {}, [])), \
              patch.object(main_module, "init_registry",
@@ -176,12 +173,16 @@ def test_lifespan_spawns_prewarm_task():
                           new_callable=AsyncMock), \
              patch.object(main_module.asyncio, "create_task",
                           side_effect=tracking_create_task):
-            # Drive the lifespan startup phase only (yield = server running).
-            # We exit immediately so shutdown tasks are also cancelled cleanly.
             async with main_module.lifespan(main_module.app):
-                pass  # startup ran; tasks created; we exit right away
+                pass
 
-    asyncio.run(_run_lifespan())
+    try:
+        asyncio.run(_run_lifespan())
+    finally:
+        # asyncio.run() closes the loop it created. Restore a fresh loop so
+        # subsequent tests that call asyncio.get_event_loop() don't crash.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     assert "_registry_prewarm_loop" in created_targets, (
         f"_registry_prewarm_loop task was not created in lifespan. "
