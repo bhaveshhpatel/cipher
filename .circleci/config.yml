@@ -18,7 +18,7 @@ commands:
             - pip-v1-
       - run:
           name: Install all dependencies
-          working_directory: backend
+          working_directory: ~/project/backend
           command: |
             pip install -r requirements.txt
             pip install -r requirements-dev.txt
@@ -45,7 +45,7 @@ jobs:
           command: pip install pyflakes
       - run:
           name: Syntax check
-          working_directory: backend
+          working_directory: ~/project/backend
           command: |
             python -m pyflakes .
             echo "All Python files OK"
@@ -74,14 +74,14 @@ jobs:
       - install_deps
       - run:
           name: Purge stale bytecode cache
-          working_directory: backend
+          working_directory: ~/project/backend
           command: |
             find . -type f -name '*.pyc' -delete
             find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
             echo "Bytecode cache purged"
       - run:
           name: Run regression suite with coverage
-          working_directory: backend
+          working_directory: ~/project/backend
           command: |
             pytest \
               --tb=short \
@@ -95,10 +95,10 @@ jobs:
               --cov-fail-under=92 \
               --cov-config=.coveragerc
       - store_artifacts:
-          path: backend/coverage.xml
+          path: ~/project/backend/coverage.xml
           destination: coverage.xml
       - store_artifacts:
-          path: backend/coverage.json
+          path: ~/project/backend/coverage.json
           destination: coverage.json
 
   # -----------------------------------------------------------------------
