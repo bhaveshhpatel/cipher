@@ -1,6 +1,6 @@
-&#35; Cipher — AI Context File
+# Cipher — AI Context File
 
-> Last updated: 2026-04-26 (Feature 4A-OI + Registry Prewarm + Test Suite)
+> Last updated: 2026-04-26 (Feature 4A-OI + Registry Prewarm + Test Suite + C-019 dedup fixes + CORS regex + B-008/021/022/023)
 > This file is the authoritative AI-assistant context document for the Cipher codebase.
 > Keep it updated after every phase so future sessions have full project context.
 
@@ -83,7 +83,7 @@ Built with:
 - **`simulation/swarm_engine.py`**: 12-agent Groq `llama-3.3-70b-versatile` swarm. HOLD fallback when no API key.
 - **`simulation/ensemble_runner.py`**: majority-vote aggregator. `EnsembleResult` includes per-agent `name` field.
 - **`services/signal_store.py`**: persists swarm fields: `swarm_direction`, `swarm_confidence`, `swarm_agents` (JSONB), vote counts.
-- **`utils/dedup.py`** (NEW): 2s TTL dedup cache (`DedupCache`). Sweep = 3+ exchanges within 5s. Singleton: `flow_dedup`.
+- **`utils/dedup.py`** (NEW): `DedupCache`. TTL=5s (C-019), sweep_window=8s. Key: `(occ_symbol, size, round(fill,1))`. No time-bucket. Singleton: `flow_dedup`.
 - **`utils/tradier_client.py`** (NEW): Tradier REST API client.
 - **`execution/trade_executor.py`** (NEW): `TradeExecutor` — `place_option_order`, `get_positions`.
 - **`services/stream_manager.py`**, **`stream_worker.py`** (NEW): stream pool (32 parallel workers).
@@ -93,8 +93,7 @@ Built with:
 
 ### Phase 5B — Regression Test Suite + CI Gate
 - **Full automated regression test suite** covering the entire backend and frontend codebase.
-- **~380+ test cases** across 40+ backend test files and frontend hook tests.
-- **CI hard gate**: backend ≥90% coverage (`--cov-fail-under=90`), frontend ≥75% lines/functions globally.
+- **48 backend test files**, CI hard gate: backend ≥90% coverage (`--cov-fail-under=90`), frontend ≥75% lines/functions globally.
 - **Nothing deploys** to Railway or Vercel unless regression tests pass.
 - **PR coverage bot**: `orgoro/coverage@v3.2` posts coverage diff comment on every PR.
 - See `docs/REGRESSION_TESTING.md` for full test inventory.
@@ -117,9 +116,30 @@ Built with:
 ### Registry Prewarm (CURRENT)
 - `main._registry_prewarm_loop()` — background async task that pre-builds the OCC symbol registry each trading day before market open
 - Behavior: skips weekends, sleeps until 09:15 ET on weekdays, calls `get_registry().build()`, catches all exceptions non-fatally
+- Weekend handling: if today is already past 09:15, next_prewarm advances to next weekday
 - Wired into `lifespan()` startup as `prewarm_task = asyncio.create_task(_registry_prewarm_loop())`
-- `prewarm_task` is cancelled and awaited in the lifespan cleanup alongside other background tasks
+- `prewarm_task` is cancelled and awaited in the lifespan cleanup alongside all other background tasks
 - Tests: `backend/tests/test_registry_prewarm.py` (5 cases) + `test_lifespan_spawns_prewarm_task` in `test_main_app.py`
+
+### C-019 — Dedup Layer 4 Overhaul (CURRENT)
+- **TTL**: 2s → 5s — covers worst-case PHLX/MIAX lag (2–5s)
+- **Sweep window**: 5s → 8s
+- **Bucket boundary bug eliminated**: removed `int(ts//2)` — replaced with pure first-seen TTL comparison
+- **Fill key**: 2dp → 1dp — absorbs ±$0.01 feed rounding across exchanges
+- **Dedup was completely inert in production** — `flow_dedup` was never imported or called in `_process_trade()`. Fixed.
+- **Sweep detection never fired** — `exchange` field was never passed to `is_duplicate()`. Fixed via `"exch"/"exchange"` fallback.
+- `dedup_stats()` and `get_exchange_count()` added; merged into `/health` via `get_stats()`
+
+### B-008/B-021/B-022/B-023 — Stream Hardening (CURRENT)
+- **B-008**: `_stats["errors"]`, `_stats["reconnects"]`, `_stats["last_reconnect_at"]` were always 0/null. Fixed via `_inc_global_error()` / `_inc_global_reconnect()` in `stream_worker.py`.
+- **B-021**: Cold-start worker stagger — worker `i` sleeps `i × 0.200s` before first token fetch. Reconnects do NOT re-apply stagger.
+- **B-022**: Global `asyncio.Semaphore(3)` in `tradier_client.py` caps concurrent session token requests at 3.
+- **B-023**: Explicit HTTP 429 handling — reads `Retry-After` header, sleeps that duration (default 10s), then retries.
+
+### CORS Regex (CURRENT)
+- `main.py` uses `allow_origin_regex` (NOT `allow_origins=["*"]` which breaks `allow_credentials=True`)
+- Pattern covers: `https://*.vercel.app`, `http://localhost:3000`, `http://localhost:3001`, `http://127.0.0.1:3000`, plus any explicit origins from `CORS_ALLOWED_ORIGINS` env var
+- Pattern is logged at startup: `[main] CORS allow_origin_regex: ...`
 
 ---
 
@@ -133,14 +153,19 @@ Built with:
    c. Else: stale DB snapshot
    d. Else: SEED_SYMBOLS fallback
 3. Preliminary tier pass (OI=0 placeholder)
-4. Build OCC registry in background → _registry_prewarm_loop waits until 09:15 ET
-5. Stamp OI onto SymbolQuotes → final tier re-classification
-6. Start background tasks:
-   - universe_refresh_task  (24h loop)
-   - signal_write_task
-   - prewarm_task           ← NEW: rebuilds registry each morning at 09:15 ET
-7. Yield (app serves requests)
-8. Shutdown: cancel all tasks, await graceful exit
+4. init_registry(watchlist, tier_map)
+5. registry.build() — blocking until OI available
+6. Stamp OI onto SymbolQuotes → final tier re-classification
+7. registry.set_tier_map(tier_map) + upsert_symbol_quotes()
+8. Start background tasks:
+   - registry_refresh_task  (registry.refresh_loop)
+   - prewarm_task           (_registry_prewarm_loop — rebuilds registry at 09:15 ET each weekday)
+   - stream_task            (stream_options_flow)
+   - db_write_task          (start_flow_writer)
+   - signal_write_task      (start_signal_writer)
+   - refresh_task           (_universe_refresh_loop — 24h loop)
+9. Yield (app serves requests)
+10. Shutdown: cancel all 6 tasks, await graceful exit
 ```
 
 ---
@@ -220,9 +245,14 @@ Background refresh loop runs every 24h.
 Tradier SSE tick
   → parse_tradier_trade()
        └── size == 0 / missing → return None (skip)
-  → DedupCache.is_duplicate()  [utils/dedup.py]
+       └── fill_price = tick["last"] or tick.get("price") or mid  (C-015)
+  → DedupCache.is_duplicate()  [utils/dedup.py]  C-019
+       └── key: (occ_symbol, size, round(fill, 1))
+       └── TTL: 5s  sweep_window: 8s
+       └── exchange: trade_payload["exch"] or ["exchange"]
        └── duplicate → drop
        └── canonical → check is_sweep()
+       └── 3+ unique exchanges within 8s → trade_type = SWEEP
   → RepetitionAccumulator.ingest()
        threshold: ≥3 trades, ≥$50K premium, 30-min rolling window
        → RepetitionEpisode
@@ -271,7 +301,7 @@ Falls back to `0.5` neutral when OI is unavailable. Do not treat 0.5 as a signal
 ## WebSocket Protocol
 
 | Message | Direction | Meaning |
-|---------|-----------|---------| 
+|---------|-----------|---------|
 | Signal JSON | Server → Client | Live signal episode |
 | `{"type":"ping"}` | Server → Client | Heartbeat probe (every 25s) |
 | `{"type":"pong"}` | Client → Server | Heartbeat reply (within 10s) |
@@ -293,7 +323,7 @@ cipher/
 │       ├── backend.yml        # lint → regression (≥90%) → Railway
 │       └── frontend.yml       # typecheck → regression (≥75%) → build → Vercel
 ├── backend/
-│   ├── main.py                # FastAPI app + lifespan + _registry_prewarm_loop
+│   ├── main.py                # FastAPI app + lifespan + _registry_prewarm_loop + CORS regex
 │   ├── config.py
 │   ├── pytest.ini             # asyncio_mode=auto, --cov-fail-under=90
 │   ├── .coveragerc            # omit rules, fail_under=90
@@ -339,11 +369,12 @@ cipher/
 │   │   ├── simulation.py
 │   │   ├── admin.py
 │   │   └── health.py
-│   └── tests/                 # 50+ test files, ~600+ cases
-│       ├── test_registry_prewarm.py        ← NEW: prewarm loop (5 cases)
-│       ├── test_main_app.py                ← UPDATED: + lifespan_spawns_prewarm_task
+│   └── tests/                 # 48 test files
+│       ├── test_registry_prewarm.py        ← prewarm loop (5 cases)
+│       ├── test_main_app.py                ← + lifespan_spawns_prewarm_task
 │       ├── test_4a_oi_pipeline.py
 │       ├── test_4a_tier_engine.py
+│       ├── test_auth_cors_regression.py    ← CORS regex tests
 │       └── [see REGRESSION_TESTING.md for full list]
 ├── frontend/
 │   ├── jest.config.ts
@@ -370,12 +401,12 @@ cipher/
 
 | File | Purpose |
 |------|---------|
-| `backend/main.py` | FastAPI app, lifespan startup, all router registration, `_registry_prewarm_loop` |
+| `backend/main.py` | FastAPI app, lifespan startup, all router registration, `_registry_prewarm_loop`, CORS regex |
 | `backend/config.py` | Pydantic settings — all env vars |
 | `backend/pytest.ini` | pytest config — `asyncio_mode=auto`, `--cov-fail-under=90` |
 | `backend/.coveragerc` | coverage.py omit rules, `fail_under=90` |
-| `backend/services/tradier_stream.py` | SSE stream loop, market-hours guard, demo mode, stats |
-| `backend/parsers/options_flow_parser.py` | Tradier tick → `OptionsFlowEvent`, size==0 guard |
+| `backend/services/tradier_stream.py` | SSE stream loop, market-hours guard, demo mode, stats, dedup wired (C-019) |
+| `backend/parsers/options_flow_parser.py` | Tradier tick → `OptionsFlowEvent`, fill_price=`tick["last"]` (C-015), size==0 guard, `is_synthetic_quote` (C-018) |
 | `backend/parsers/bid_ask_classifier.py` | ABOVE_ASK / AT_ASK / MID / AT_BID / BELOW_BID |
 | `backend/parsers/trade_type_detector.py` | SWEEP / BLOCK / SPLIT / SINGLE |
 | `backend/signals/repetition_accumulator.py` | Groups events into `RepetitionEpisode` |
@@ -384,191 +415,92 @@ cipher/
 | `backend/simulation/swarm_engine.py` | 12-agent Groq LLM swarm |
 | `backend/simulation/ensemble_runner.py` | Majority-vote aggregator → `EnsembleResult` |
 | `backend/execution/trade_executor.py` | Tradier order placement (paper + live) |
-| `backend/utils/dedup.py` | 2s TTL dedup cache + sweep detection. Singleton: `flow_dedup` |
-| `backend/utils/tradier_client.py` | Tradier REST client utility |
+| `backend/utils/dedup.py` | `DedupCache` TTL=5s, sweep_win=8s, key=(occ,size,fill_1dp), no time-bucket. Singleton: `flow_dedup`. C-019. |
+| `backend/utils/tradier_client.py` | Tradier REST client. Semaphore(3) B-022. 429 handler B-023. |
 | `backend/services/signal_store.py` | Supabase writer for `signal_history` — SERVICE KEY only |
-| `backend/services/flow_store.py` | Supabase writer for `flow_episodes`/`flow_events` — SERVICE KEY only |
-| `backend/services/symbol_registry.py` | OCC contract map registry, `get_oi_map()` |
-| `backend/services/tier_engine.py` | Dynamic T1/T2/T3 classification with DB-backed thresholds |
+| `backend/services/flow_store.py` | Supabase writer for `flow_episodes`/`flow_events` — SERVICE KEY only. Flush 500ms/100 rows (L5 fix). |
+| `backend/services/symbol_registry.py` | OCC contract map registry, `get_oi_map()`, `set_tier_map()`, `refresh_loop()` |
+| `backend/services/tier_engine.py` | Dynamic T1/T2/T3 classification. All 3 conditions (vol+price+OI). DB-backed thresholds cached 300s. |
+| `backend/services/stream_manager.py` | `StreamManager`. Worker stagger B-021. |
+| `backend/services/stream_worker.py` | Per-worker stream. `startup_delay_s=i*0.2`. `_inc_global_error/reconnect` B-008. |
 | `backend/routers/ws.py` | WebSocket `/ws/signals` with ping/pong heartbeat |
 | `backend/routers/smart_signals.py` | `/composite/{ticker}` + `/list` — live DB + mock fallback |
 | `backend/routers/history.py` | `/api/signals/history` — paginated signal_history queries |
-| `backend/routers/flow.py` | `/api/flow/scan` — queries live `flow_episodes` table |
-| `backend/routers/auth.py` | JWT auth endpoints |
-| `backend/routers/simulation.py` | Paper trading simulation |
-| `backend/routers/admin.py` | Tier-threshold CRUD, admin role guard |
-| `backend/routers/health.py` | `GET /api/health/stream` |
-| `backend/core/async_bus.py` | In-memory async event bus |
-| `backend/core/auth.py` | JWT decode, `get_current_user` dependency |
-| `backend/tests/test_registry_prewarm.py` | 5 tests for `_registry_prewarm_loop` |
-| `frontend/jest.config.ts` | Jest config with `coverageThreshold` per-file and global |
-| `docs/REGRESSION_TESTING.md` | Full regression test suite reference |
+| `backend/routers/admin.py` | Tier threshold admin endpoints |
+| `backend/routers/health.py` | `/health/stream` — stream stats including dedup_stats (B-008) |
 
 ---
 
-## API Endpoints
+## FastAPI Endpoints
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/auth/register` | No | Register user |
-| POST | `/api/auth/login` | No | Login, returns JWT |
-| GET | `/api/auth/me` | JWT | Current user info |
-| GET | `/api/signals/composite/{ticker}` | JWT | Single-ticker composite signal |
-| GET | `/api/signals/list` | JWT | Paginated signal list |
-| GET | `/api/signals/history` | JWT | Paginated signal_history |
-| GET | `/api/signals/stream/stats` | JWT | Stream stats |
-| GET | `/api/flow/scan` | JWT | Live flow scan |
-| POST | `/api/simulation/run` | JWT | Run swarm simulation |
-| GET | `/api/admin/tier-thresholds` | JWT+Admin | Read tier thresholds + cache age |
-| PATCH | `/api/admin/tier-thresholds` | JWT+Admin | Update tier thresholds |
-| GET | `/api/admin/tier-distribution` | JWT+Admin | Current tier distribution |
-| GET | `/api/health/stream` | No | Stream health |
-| WS | `/ws/signals?token=<jwt>` | JWT (query) | Live signal stream |
-| GET | `/health` | No | Health check |
-| GET | `/` | No | Root — version info |
+| Path | Method | Auth | Notes |
+|------|--------|------|-------|
+| `/` | GET | No | Root health check |
+| `/health` | GET | No | Health root |
+| `/api/health` | GET | No | Health alias |
+| `/stream/stats` | GET | No | Railway health probe alias (no /api prefix) |
+| `/api/stream/stats` | GET | JWT | Authenticated stream stats alias |
+| `/health/stream` | GET | No | Full stream stats incl. dedup (B-008) |
+| `/api/auth/register` | POST | No | Register |
+| `/api/auth/login` | POST | No | Login |
+| `/api/auth/me` | GET | JWT | Current user |
+| `/api/flow/scan` | GET | JWT | Flow episodes (82k+ rows) |
+| `/api/signals/composite/{ticker}` | GET | JWT | Composite signal for ticker |
+| `/api/signals/list` | GET | JWT | Paginated signals |
+| `/api/signals/history` | GET | JWT | Signal history with filters |
+| `/api/simulate` | POST | JWT | Swarm simulation |
+| `/ws/signals` | WS | JWT | Live signal WebSocket |
+| `/admin/tier-thresholds` | GET/PATCH | Admin JWT | Tier threshold admin |
+| `/admin/tier-distribution` | GET | Admin JWT | Tier distribution |
+
+---
+
+## Critical Implementation Rules
+
+1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
+2. **Never send `id` fields** — Postgres generates them server-side
+3. **No `.select()` after `.insert()`** in supabase-py v2
+4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
+5. **`flow_dedup` singleton** in `utils/dedup.py`: TTL=5s, sweep_window=8s, key=(occ_symbol, size, round(fill,1)). No time-bucket. Exchange field passed via `"exch"/"exchange"` fallback.
+6. **CORS**: use `allow_origin_regex` not `allow_origins=["*"]` — wildcard breaks `allow_credentials=True`
+7. **Registry prewarm**: `_registry_prewarm_loop` is a 6th background task in lifespan. Always cancel + await it on shutdown.
+8. **fill_price**: always `tick["last"]` primary, `tick.get("price")` fallback, bid/ask mid last resort (C-015)
 
 ---
 
 ## Supabase Tables
 
 | Table | Writer | Key Used | Notes |
-|-------|--------|----------|-------|
+|-------|--------|----------|---------|
 | `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
-| `flow_events` | `flow_store.py` | SERVICE_KEY | Currently 0 rows — not the live table |
+| `flow_events` | `flow_store.py` | SERVICE_KEY | Batched 500ms/100 rows; `expiry` nullable |
 | `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields |
-| `options_universe_symbols` | `universe_store.py` | ANON_KEY | Symbol quotes, stream_eligible, open_interest |
-| `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
-| `tier_thresholds` | Admin API | SERVICE_KEY | T1/T2/T3 classification thresholds |
+| `options_universe_symbols` | `universe_store.py` + `tier_engine.py` | ANON/SERVICE | Symbol quotes, stream_eligible, tier/OI/avg_vol |
+| `options_universe_snapshots` | `universe_store.py` | ANON | Universe snapshots |
+| `tier_thresholds` | admin endpoint | SERVICE_KEY | Single active row; cached 300s |
 
 ---
 
-## Supabase Critical Rules
+## Environment Variables
 
-1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`
-2. **Never send `id` fields** for `flow_events` (uuid) or `flow_episodes` (bigserial)
-3. **No `.select()` chained after `.insert()`** in supabase-py v2
-4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
-5. **Env var is `SUPABASE_SERVICE_KEY`** (NOT `SUPABASE_SERVICE_ROLE_KEY`)
-
-### Supabase Key Reference
-
-| Key | Env var | Used by | Bypasses RLS? |
-|-----|---------|---------|---------------|
-| Anon / Public | `SUPABASE_KEY` | `universe_store.py`, `smart_signals.py`, `history.py` (reads) | No |
-| Service Role | `SUPABASE_SERVICE_KEY` | `flow_store.py`, `signal_store.py`, `flow.py` (writes + RLS bypass reads) | Yes |
-
----
-
-## Known Fixes Applied
-
-| ID | Description |
-|---|---|
-| C-005 | supabase-py v2 `.select()` after `.insert()` breaks — generate `snapshot_id` via `uuid4()` in Python |
-| C-006 | `options_universe_snapshots.provider` NOT NULL — always pass `"tradier"` explicitly |
-| C-007 | `config.py` missing `priority_symbols` property — added `@property` |
-| C-008 | `stream_eligible` column missing from DB — added in migration 002 |
-| C-009 | `universe_screener.py` deprecated — replaced by `_fetch_batch_quotes()` |
-| C-010 | `flow_store.py` was falling back to anon key — fixed to require `SUPABASE_SERVICE_KEY` exclusively |
-| C-011 | `flow.py` was querying empty `flow_events` — fixed to query `flow_episodes` |
-| C-012 | `signal_store.py` `_build_row()` omitting NOT NULL columns — Postgres 23502 |
-| C-013 | `direction` column check constraint — REPEAT_BUY→BUY, REPEAT_SELL→SELL. Postgres 23514 |
-| C-014 | `trade_type` NOT NULL — unrecognised values fall back to `SINGLE` |
-| C-015 | `influence_tier` NOT NULL — unrecognised values fall back to `RETAIL` |
-
----
-
-## Environment Variables (Full List)
-
-```
-# Auth
-SECRET_KEY=
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-
-# Supabase
-SUPABASE_URL=
-SUPABASE_KEY=                  # anon key — reads only
-SUPABASE_SERVICE_KEY=          # service role key — REQUIRED for all writes
-
-# Tradier
-TRADIER_API_KEY=
-TRADIER_ACCOUNT_ID=
-TRADIER_BASE_URL=https://api.tradier.com
-TRADIER_STREAM_URL=https://stream.tradier.com
-
-# AI
-GROQ_API_KEY=                  # PRIMARY — used by swarm_engine.py (llama-3.3-70b-versatile)
-
-# Misc
-ALLOWED_ORIGINS=http://localhost:3000
-
-# Universe pipeline
-UNIVERSE_PRIORITY_SYMBOLS=SPY,QQQ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOGL,AMD
-UNIVERSE_MIN_PRICE=1.0
-UNIVERSE_MIN_VOLUME=500000
-UNIVERSE_QUOTES_BATCH_SIZE=200
-UNIVERSE_QUOTES_CONCURRENCY=28
-
-# AI Swarm
-SWARM_N_AGENTS=6               # snaps to nearest of 3, 6, 9, 12
-
-# OCC Symbol Registry
-REGISTRY_MAX_DTE=90
-REGISTRY_ATM_RANGE_PCT=0.15
-REGISTRY_REFRESH_MINS=30
-REGISTRY_MIN_OI=0
-REGISTRY_EXPIRY_DAY_REFRESH_MINS=15
-```
-
----
-
-## Important Implementation Notes
-
-### SUPABASE_SERVICE_KEY vs SUPABASE_SERVICE_ROLE_KEY
-The env var in `config.py` is **`SUPABASE_SERVICE_KEY`** (no `_ROLE_`). Old docs used `SUPABASE_SERVICE_ROLE_KEY` — that is wrong.
-
-### flow_events vs flow_episodes
-`flow_events` has 0 rows. All 82k+ live flow records are in `flow_episodes`. Never query `flow_events` for live data.
-
-### DedupCache
-`flow_dedup` is the module-level singleton in `utils/dedup.py`. Key: `(occ_symbol, size, fill_2dp, time_bucket_2s)`. Sweep = 3+ exchanges within 5s window.
-
-### Tradier Single-Symbol Dict Edge Case
-When only 1 symbol in a `/v1/markets/quotes` batch, Tradier returns a dict not a list:
-```python
-if isinstance(quotes_raw, dict):
-    quotes_raw = [quotes_raw]
-```
-
-### Price Field Fallback Order
-`last` → `last_price` → `close` → `prevclose`
-
-### universe_screener.py
-DEPRECATED. Kept for backward test compatibility only. Do NOT re-add call from `load_universe()`.
-
-### volume_premium_factor OI Fallback
-Falls back to `0.5` neutral when OI unavailable. Do not treat 0.5 as a signal.
-
-### OI Gate for Tier Classification
-Symbols with zero OI (after `_stamp_oi()` runs) cannot be classified T1 or T2 regardless of volume or price. This is enforced in `tier_engine._classify()`.
-
-### Registry Prewarm Loop
-`_registry_prewarm_loop()` is an infinite async loop in `main.py`. It sleeps until 09:15 ET each weekday, then calls `get_registry().build()`. Exceptions are caught and logged non-fatally — the loop always continues to the next day. On weekends it sleeps 1 hour and re-checks. The task is cancelled cleanly on shutdown.
-
-### Frontend WS Pong
-Frontend must send `{"type":"pong"}` within 10s of receiving `{"type":"ping"}` or connection closes with code 1001. **Status: not yet confirmed implemented in frontend.**
-
----
-
-## Open / Phase 6 TODO
-
-- Frontend: implement WS pong response
-- Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
-- WebSocket fan-out benchmark with 50+ subscribers
-- Wire `TradeExecutor` into simulation router for live paper trade execution
-- Confirm `stream_manager.py` + `stream_worker.py` wired into main stream loop
-- Confirm `signals/midcap_screener.py` integrated into signal pipeline
-- Investigate OI field availability per symbol (affects `volume_premium_factor` fallback rate)
-- Add frontend UI component tests (SignalFeed, FlowTable, SimulationPanel, login page)
-- Raise backend `--cov-fail-under` from 90% to 95% once UI tests added
-- Raise frontend Jest global threshold from 75% to 85%
+| Variable | Used by | Required |
+|----------|---------|----------|
+| `TRADIER_API_KEY` | tradier_stream.py | Yes (live mode) |
+| `TRADIER_BASE_URL` | tradier_stream.py | Yes |
+| `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
+| `TRADIER_ACCOUNT_ID` | trade_executor.py | Yes (paper/live trading) |
+| `SUPABASE_URL` | flow_store, signal_store, universe_store | Yes |
+| `SUPABASE_SERVICE_KEY` | flow_store, signal_store, tier_engine | **Yes — service role key** |
+| `SUPABASE_KEY` | universe_store, smart_signals (reads) | Yes (anon key) |
+| `SECRET_KEY` | auth.py | Yes |
+| `ALGORITHM` | auth.py | Yes (default: HS256) |
+| `GROQ_API_KEY` | swarm_engine.py | Yes (swarm; HOLD fallback if absent) |
+| `SWARM_N_AGENTS` | swarm_engine.py | No (default: 6) |
+| `REGISTRY_MAX_DTE` | symbol_registry.py | No (default: 90) |
+| `REGISTRY_REFRESH_MINS` | symbol_registry.py | No (default: 30) |
+| `TIER_ADMIN_WHITELIST` | tier_engine.py | No — comma-separated tickers forced to Tier 1 |
+| `TIER_THRESHOLD_CACHE_TTL_S` | tier_engine.py | No (default: 300) |
+| `STREAM_WORKER_STARTUP_DELAY_S` | stream_worker.py | No (default: 0.2) |
+| `TRADIER_SESSION_MAX_CONCURRENCY` | tradier_client.py | No (default: 3) |
+| `TRADIER_SESSION_429_DEFAULT_SLEEP_S` | tradier_client.py | No (default: 10) |
+| `CORS_ALLOWED_ORIGINS` | main.py | No — comma-separated extra origins for CORS regex |
