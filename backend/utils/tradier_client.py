@@ -7,7 +7,7 @@ symbols_loader.py, and tradier_stream.py.
 Rate limits:
   Tradier sandbox: 120 req/min
   Tradier production: 120 req/min (same limit)
-  → use asyncio.Semaphore(10) for chain fetches with 429 retry handling
+  → use asyncio.Semaphore(2) for chain fetches (conservative, avoids daily quota exhaustion)
   → use asyncio.Semaphore(3) for session token fetches (B-022)
 
 B-022 — Global Session Token Semaphore:
@@ -16,11 +16,6 @@ B-022 — Global Session Token Semaphore:
 B-023 — Explicit 429 Handling:
   If Tradier returns HTTP 429, get_session_token() and get_option_chain()
   read the Retry-After header (default 10s if absent) and sleep before retrying.
-
-B-024 — Chain Semaphore raised to 10:
-  _CHAIN_SEM raised from 2 → 10 for production Tradier. Combined with 429
-  retry handling this brings OCC registry build time from ~33min down to ~8min
-  without silently dropping contracts on throttle.
 
 Public API:
   get_quote(symbol)                      -> Optional[dict]
@@ -45,7 +40,7 @@ log = logging.getLogger("tradier_client")
 
 _CONNECT_TIMEOUT = 15.0
 _READ_TIMEOUT    = 20.0
-_CHAIN_SEM       = asyncio.Semaphore(10)  # B-024: raised from 2 → 10 for production throughput
+_CHAIN_SEM       = asyncio.Semaphore(2)   # conservative — avoids daily quota exhaustion
 _SESSION_SEM     = asyncio.Semaphore(3)   # B-022: max 3 concurrent session token fetches
 
 # B-023: fallback Retry-After sleep when header is absent
@@ -142,7 +137,6 @@ async def get_option_chain(symbol: str, expiration: str) -> list[dict]:
     Fetch full option chain for ticker + expiry.
     Returns list of contract dicts (each has symbol, strike, option_type, open_interest).
 
-    B-024: Uses _CHAIN_SEM(10) for production throughput.
     B-023: Explicit 429 handling — reads Retry-After and retries up to
     _CHAIN_MAX_RETRIES times instead of silently returning [].
     """
