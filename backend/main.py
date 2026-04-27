@@ -77,9 +77,9 @@ async def get_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Universe loader — returns (stream_symbols, tier_map, quotes)
+# Universe loader — returns (stream_symbols, tier_map, quotes, snapshot_id)
 # ---------------------------------------------------------------------------
-async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
+async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
@@ -96,7 +96,20 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        return fresh, tier_map, []
+        # Resolve the active snapshot_id so registry can load from DB cache
+        active_snap = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: universe_store._client()
+                .table("options_universe_snapshots")
+                .select("id")
+                .eq("is_active", True)
+                .order("fetched_at", desc=True)
+                .limit(1)
+                .execute()
+                .data,
+        )
+        snapshot_id = active_snap[0]["id"] if active_snap else ""
+        return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
     log.info(
@@ -121,6 +134,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
 
     tier_map: dict[str, int] = {}
     quotes: list = []
+    snapshot_id = ""
 
     if source == "tradier_validated":
         log.info(
@@ -146,6 +160,20 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
                 sum(1 for t in tier_map.values() if t == 2),
                 sum(1 for t in tier_map.values() if t == 3),
             )
+
+        # Resolve the new snapshot_id
+        active_snap = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: universe_store._client()
+                .table("options_universe_snapshots")
+                .select("id")
+                .eq("is_active", True)
+                .order("fetched_at", desc=True)
+                .limit(1)
+                .execute()
+                .data,
+        )
+        snapshot_id = active_snap[0]["id"] if active_snap else ""
     else:
         log.warning(
             "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
@@ -161,7 +189,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list]:
         "[universe] FINAL: stream starting with %d symbols (source=%s, from universe of %d)",
         len(stream_symbols), source, len(symbols),
     )
-    return stream_symbols, tier_map, quotes
+    return stream_symbols, tier_map, quotes, snapshot_id
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +275,10 @@ async def _registry_prewarm_loop() -> None:
     The lifespan already performs one build on startup. This loop handles
     every subsequent trading day, ensuring the registry is fresh and fully
     loaded 15 minutes before market open at 9:30 AM.
+
+    After each build, the registry is persisted to DB via chain_store so that
+    a crash/restart between 9:15 and 9:30 can fast-seed from the DB instead
+    of re-fetching all chains from Tradier.
     """
     while True:
         now = datetime.now(_ET)
@@ -284,7 +316,11 @@ async def _registry_prewarm_loop() -> None:
                 log.warning("[prewarm] Registry not initialised — skipping pre-warm")
                 continue
             count = await registry.build()
-            log.info("[prewarm] Registry warm: %d OCC contracts ready for market open", count or 0)
+            log.info(
+                "[prewarm] Registry warm: %d OCC contracts ready for market open "
+                "(persisted to DB for crash-restart safety)",
+                count or 0,
+            )
         except Exception as exc:
             log.error("[prewarm] Registry pre-warm failed (non-fatal): %s", exc, exc_info=True)
 
@@ -293,13 +329,22 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    stream_symbols, tier_map, quotes = await _resolve_startup_universe()
+    stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
     log.info(
         "[registry] Initialised with %d stream symbols, %d tiers mapped",
         len(stream_symbols), len(tier_map),
     )
+
+    # On HIT path: fast-seed from DB chain cache so lookup() works immediately
+    if snapshot_id:
+        seeded = await registry.load_from_db(snapshot_id)
+        log.info(
+            "[registry] DB chain seed: %d OCC contracts pre-loaded "
+            "(registry is_ready=%s before full build)",
+            seeded, registry.is_ready(),
+        )
 
     log.info("[registry] Running first build (blocking startup until OI available)")
     await registry.build()

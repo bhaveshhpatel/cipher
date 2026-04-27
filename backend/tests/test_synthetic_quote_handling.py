@@ -8,7 +8,6 @@ Covers:
   - Fix 3: is_synthetic_quote field present and accessible (DB column smoke test)
   - Regression: real quotes with bid/ask still classify normally
 """
-import pytest
 from parsers.options_flow_parser import parse_tradier_trade
 
 _BASE = {
@@ -28,7 +27,7 @@ def _synthetic_quote(**overrides):
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 \u2014 bid_ask_class forced to MID on synthetic quotes
+# Fix 1 — bid_ask_class forced to MID on synthetic quotes
 # ---------------------------------------------------------------------------
 
 def test_synthetic_bid_ask_class_is_mid():
@@ -52,7 +51,7 @@ def test_synthetic_is_not_golden_sweep():
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 \u2014 conviction haircut on synthetic quotes
+# Fix 2 — conviction haircut on synthetic quotes
 # ---------------------------------------------------------------------------
 
 def test_synthetic_conviction_is_haircut():
@@ -82,7 +81,7 @@ def test_synthetic_high_premium_conviction_still_haircut():
 
 
 # ---------------------------------------------------------------------------
-# Fix 3 \u2014 is_synthetic_quote flag is set and accessible
+# Fix 3 — is_synthetic_quote flag is set and accessible
 # ---------------------------------------------------------------------------
 
 def test_synthetic_flag_true_when_no_quotes():
@@ -106,7 +105,7 @@ def test_synthetic_flag_false_when_only_bid_present():
 
 
 # ---------------------------------------------------------------------------
-# Regression \u2014 real quotes still classify normally
+# Regression — real quotes still classify normally
 # ---------------------------------------------------------------------------
 
 def test_real_above_ask_still_classified():

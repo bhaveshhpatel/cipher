@@ -63,6 +63,8 @@ class SymbolRegistry:
         self._last_build: Optional[datetime]     = None
         self._build_lock = asyncio.Lock()
         self._oi_by_ticker: dict[str, int] = {}
+        # snapshot_id of the last successfully persisted build
+        self._persisted_snapshot_id: Optional[str] = None
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -84,6 +86,29 @@ class SymbolRegistry:
 
     def get_oi_map(self) -> dict[str, int]:
         return dict(self._oi_by_ticker)
+
+    async def load_from_db(self, snapshot_id: str) -> int:
+        """
+        Pre-seed the registry from the DB chain cache for snapshot_id.
+        Called on startup (HIT path) so lookup() works before build() finishes.
+        Returns number of contracts loaded (0 on empty or error).
+        """
+        from services.chain_store import load_chain
+        chain = await load_chain(snapshot_id)
+        if not chain:
+            log.info(
+                "[symbol_registry] load_from_db: no cached chain for snapshot %s",
+                snapshot_id,
+            )
+            return 0
+        self._registry = chain
+        self._persisted_snapshot_id = snapshot_id
+        log.info(
+            "[symbol_registry] load_from_db: seeded %d OCC contracts from DB "
+            "(snapshot %s) — registry ready before build()",
+            len(chain), snapshot_id,
+        )
+        return len(chain)
 
     async def build(self) -> int:
         from services.ingestion_config import get_config
@@ -138,7 +163,51 @@ class SymbolRegistry:
                 old_count, len(new_registry) - old_count,
                 len(new_oi_by_ticker),
             )
+
+            # Persist to DB so restarts can fast-seed from cache
+            await self._persist_to_db(new_registry)
+
             return len(new_registry)
+
+    async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:
+        """
+        Persist chain to options_chain_cache for the current active snapshot.
+        Non-fatal — a failure here never breaks the in-memory registry.
+        """
+        from services.chain_store import save_chain
+        from services import universe_store
+        try:
+            # Resolve the active snapshot_id
+            loop = asyncio.get_event_loop()
+            snap_rows = await loop.run_in_executor(
+                None,
+                lambda: universe_store._client()
+                    .table("options_universe_snapshots")
+                    .select("id")
+                    .eq("is_active", True)
+                    .order("fetched_at", desc=True)
+                    .limit(1)
+                    .execute()
+                    .data,
+            )
+            if not snap_rows:
+                log.warning(
+                    "[symbol_registry] _persist_to_db: no active snapshot — chain not persisted"
+                )
+                return
+            snapshot_id = snap_rows[0]["id"]
+            ok = await save_chain(snapshot_id, registry_dict)
+            if ok:
+                self._persisted_snapshot_id = snapshot_id
+                log.info(
+                    "[symbol_registry] _persist_to_db: %d contracts persisted "
+                    "to snapshot %s",
+                    len(registry_dict), snapshot_id,
+                )
+        except Exception as exc:
+            log.warning(
+                "[symbol_registry] _persist_to_db error (non-fatal): %s", exc
+            )
 
     async def refresh_loop(self):
         while True:
