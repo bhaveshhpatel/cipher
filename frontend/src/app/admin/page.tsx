@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { useAdminDemo } from "@/hooks/useAdminDemo";
+import { ApexSignalGateCard } from "@/components/ApexSignalGateCard";
 
 /* ─── Types ──────────────────────────────────────────────── */
 
@@ -333,10 +334,11 @@ export default function AdminPage() {
           <StreamHealthCard token={token} />
         </div>
 
-        {/* Row 2: Tier Thresholds (left) + Ingestion Config (right) */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        {/* Row 2: Tier Thresholds + Ingestion Config + Apex Signal Gate */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
           <TierThresholdsCard token={token} />
           <IngestionConfigCard token={token} />
+          <ApexSignalGateCard token={token} />
         </div>
 
         {/* Row 3: Pipeline Overview (full width) */}
@@ -593,7 +595,6 @@ function TierThresholdsCard({ token }: { token: string | null }) {
 
   useEffect(() => { fetch_(); }, [fetch_]);
 
-  // Save one or more field updates via PATCH /api/admin/tier-thresholds
   const save = useCallback(async (field: string) => {
     if (!token || !data) return;
     const raw = drafts[field];
@@ -611,7 +612,6 @@ function TierThresholdsCard({ token }: { token: string | null }) {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const updated = await res.json();
-      // Backend returns { ok, updated, row, note } — update local row
       setData(prev => prev ? { ...prev, row: updated.row } : prev);
       setDrafts(p => { const n = { ...p }; delete n[field]; return n; });
       setSaved(p => ({ ...p, [field]: true }));
@@ -715,13 +715,11 @@ function IngestionConfigCard({ token }: { token: string | null }) {
   const fetch_ = useCallback(async () => {
     if (!token) return;
     try {
-      // Correct path: /api/admin/ingestion/config
       const res = await fetch("/api/admin/ingestion/config", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      // Backend returns { config: [...] }
       setRows(Array.isArray(data) ? data : (data.config ?? []));
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Failed to load config");
@@ -737,7 +735,6 @@ function IngestionConfigCard({ token }: { token: string | null }) {
     const value = drafts[key];
     setSaving(p => ({ ...p, [key]: true }));
     try {
-      // Correct path: PATCH /api/admin/ingestion/config
       const res = await fetch("/api/admin/ingestion/config", {
         method: "PATCH",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
