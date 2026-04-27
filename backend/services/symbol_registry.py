@@ -317,7 +317,13 @@ class SymbolRegistry:
 
                 old_count = len(self._registry)
 
-                self._oi_snapshot    = dict(self._oi_by_ticker)
+                # Snapshot the OI that was just built so the NEXT delta build
+                # has a real prev_oi baseline for drift detection.
+                # On the first build _oi_by_ticker is {} (nothing was built yet),
+                # so we snapshot new_oi_by_ticker directly instead of the empty
+                # dict — this is the key fix: _oi_snapshot must always reflect
+                # what the previous build produced, not the pre-build state.
+                self._oi_snapshot    = dict(new_oi_by_ticker)
                 self._registry       = new_registry
                 self._oi_by_ticker   = new_oi_by_ticker
                 self._expiry_cache   = new_expiry_cache
