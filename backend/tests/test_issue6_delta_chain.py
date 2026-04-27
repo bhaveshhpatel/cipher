@@ -22,7 +22,14 @@ which always diverges from the non-empty cached set, marking every ticker
 as "changed" regardless of OI drift.  We patch `_expiry_in_window` to
 always return True so the comparison is purely string-set equality and
 only OI drift governs the changed/unchanged decision.
+
+Note on *-unpacking inside `with (...)`
+----------------------------------------
+Python's parenthesized `with` statement only accepts a comma-separated list
+of context managers — it does NOT support `*iterable` unpacking.  We use
+`contextlib.ExitStack` to compose the common + per-test patches cleanly.
 """
+import contextlib
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -55,7 +62,7 @@ _FAKE_THRESH = {
     "t3_atm_pct": 0.10, "t3_max_dte": 30, "t3_min_oi": 0,
 }
 
-_CACHED_EXPIRY = "2026-05-02"  # ~5 days from test run date, fits any tier DTE window
+_CACHED_EXPIRY = "2026-05-02"  # ~5 days out, fits any tier DTE window
 
 
 async def _do_first_build(reg, tickers, oi_map: dict):
@@ -88,21 +95,27 @@ async def _do_first_build(reg, tickers, oi_map: dict):
         await reg.build(pre_fetched_quotes=pf)
 
 
-def _delta_patches(reg, extra_patches=()):
+def _enter_delta_patches(stack, reg, extra_cms=()):
     """
-    Return the common context-manager stack used by all delta-build tests.
-    Patches _expiry_in_window to always return True so the expiry-set
-    comparison is purely string equality (cached vs live) and is not
-    accidentally defeated by DTE-window filtering.
+    Enter all common delta-build patches onto `stack` (a contextlib.ExitStack),
+    plus any caller-supplied extra context managers.
+
+    Patches _expiry_in_window to always return True so DTE-window filtering
+    never empties `live_expiries`; only OI drift governs changed/unchanged.
     """
     from services.symbol_registry import SymbolRegistry
-    return (
-        patch.object(SymbolRegistry, "_expiry_in_window", staticmethod(lambda *a, **kw: True)),
+    cms = [
+        patch.object(SymbolRegistry, "_expiry_in_window",
+                     staticmethod(lambda *a, **kw: True)),
         patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
-        patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
-        patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
-        *extra_patches,
-    )
+        patch("services.ingestion_config.get_config",
+              AsyncMock(return_value=_FAKE_CFG)),
+        patch("services.tier_engine._fetch_thresholds",
+              AsyncMock(return_value=_FAKE_THRESH)),
+        *extra_cms,
+    ]
+    for cm in cms:
+        stack.enter_context(cm)
 
 
 class TestDeltaChainFetch:
@@ -121,12 +134,14 @@ class TestDeltaChainFetch:
 
         chain2 = AsyncMock(return_value=[])
 
-        with (
-            patch("services.symbol_registry.get_option_chain", chain2),
-            patch.object(reg, "_safe_get_expirations", AsyncMock(return_value=[_CACHED_EXPIRY])),
-            patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"T1": 3})),
-            *_delta_patches(reg),
-        ):
+        with contextlib.ExitStack() as stack:
+            _enter_delta_patches(stack, reg, extra_cms=[
+                patch("services.symbol_registry.get_option_chain", chain2),
+                patch.object(reg, "_safe_get_expirations",
+                             AsyncMock(return_value=[_CACHED_EXPIRY])),
+                patch("services.tier_engine.assign_tiers",
+                      AsyncMock(return_value={"T1": 3})),
+            ])
             pf2 = {"T1": _make_sq("T1", oi=1000)}
             await reg.build(pre_fetched_quotes=pf2)
 
@@ -143,12 +158,14 @@ class TestDeltaChainFetch:
 
         chain2 = AsyncMock(return_value=[])
 
-        with (
-            patch("services.symbol_registry.get_option_chain", chain2),
-            patch.object(reg, "_safe_get_expirations", AsyncMock(return_value=[_CACHED_EXPIRY])),
-            patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"T1": 3})),
-            *_delta_patches(reg),
-        ):
+        with contextlib.ExitStack() as stack:
+            _enter_delta_patches(stack, reg, extra_cms=[
+                patch("services.symbol_registry.get_option_chain", chain2),
+                patch.object(reg, "_safe_get_expirations",
+                             AsyncMock(return_value=[_CACHED_EXPIRY])),
+                patch("services.tier_engine.assign_tiers",
+                      AsyncMock(return_value={"T1": 3})),
+            ])
             pf2 = {"T1": _make_sq("T1", oi=1150)}
             await reg.build(pre_fetched_quotes=pf2)
 
@@ -161,7 +178,8 @@ class TestDeltaChainFetch:
         Only TSLA should trigger a chain re-fetch.
         """
         reg = _make_registry(["AAPL", "TSLA"])
-        await _do_first_build(reg, ["AAPL", "TSLA"], oi_map={"AAPL": 1000, "TSLA": 1000})
+        await _do_first_build(reg, ["AAPL", "TSLA"],
+                              oi_map={"AAPL": 1000, "TSLA": 1000})
 
         called_tickers: set = set()
 
@@ -172,12 +190,15 @@ class TestDeltaChainFetch:
         async def fake_safe_expirations(ticker):
             return [_CACHED_EXPIRY]
 
-        with (
-            patch("services.symbol_registry.get_option_chain", side_effect=fake_chain),
-            patch.object(reg, "_safe_get_expirations", side_effect=fake_safe_expirations),
-            patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"AAPL": 3, "TSLA": 3})),
-            *_delta_patches(reg),
-        ):
+        with contextlib.ExitStack() as stack:
+            _enter_delta_patches(stack, reg, extra_cms=[
+                patch("services.symbol_registry.get_option_chain",
+                      side_effect=fake_chain),
+                patch.object(reg, "_safe_get_expirations",
+                             side_effect=fake_safe_expirations),
+                patch("services.tier_engine.assign_tiers",
+                      AsyncMock(return_value={"AAPL": 3, "TSLA": 3})),
+            ])
             pf2 = {
                 "AAPL": _make_sq("AAPL", oi=1000),   # no drift
                 "TSLA": _make_sq("TSLA", oi=1300),   # 30% drift, above threshold
