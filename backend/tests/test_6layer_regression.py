@@ -11,16 +11,14 @@ Fix summary (2026-04-26):
       option_type='C'|'P', expiration_date=..., last=..., underlying=...
   - Layer3/Layer4 use real OptionsFlowEvent objects instead of MagicMock so
     RepetitionAccumulator._key() and build_composite() work correctly.
+  - All acc.ingest() / acc.ingest_tick() calls wrapped with asyncio.run()
+    because RepetitionAccumulator methods are now async coroutines.
 """
 import asyncio
 import pytest
 from datetime import datetime, timedelta
 from parsers.options_flow_parser import OptionsFlowEvent
 
-
-# ---------------------------------------------------------------------------
-# Premium → influence tier  (mirrors thresholds in parsers/options_flow_parser)
-# ---------------------------------------------------------------------------
 
 def _classify_tier(premium: float) -> str:
     if premium >= 2_000_000:
@@ -32,26 +30,21 @@ def _classify_tier(premium: float) -> str:
     return "RETAIL"
 
 
-# ---------------------------------------------------------------------------
-# Raw Tradier trade dict  (field names as parse_tradier_trade() reads them)
-# ---------------------------------------------------------------------------
-
 def _raw_trade(
-    symbol="AAPL  260620C00180000",   # OCC symbol — encodes ticker/strike/expiry/type
+    symbol="AAPL  260620C00180000",
     underlying="AAPL",
-    option_type="C",                   # 'C' or 'P'
+    option_type="C",
     strike=180.0,
-    expiry="2026-06-20",              # stored as expiration_date
+    expiry="2026-06-20",
     premium=500_000.0,
     size=100,
     bid=4.80,
     ask=4.90,
-    last=4.85,                         # fill price comes from 'last'
+    last=4.85,
     open_interest=5000,
     iv=0.28,
     underlying_price=178.0,
 ):
-    """Build a minimal Tradier stream trade dict."""
     return {
         "symbol":           symbol,
         "underlying":       underlying,
@@ -68,10 +61,6 @@ def _raw_trade(
         "timestamp":        datetime.utcnow().isoformat(),
     }
 
-
-# ---------------------------------------------------------------------------
-# Minimal real OptionsFlowEvent builder (used in Layer3/4 to avoid MagicMock)
-# ---------------------------------------------------------------------------
 
 def _make_event(
     ticker="AAPL",
@@ -115,8 +104,6 @@ class TestLayer1Parse:
         assert ev is not None
         assert ev.ticker == "AAPL"
         assert ev.contract_type == "CALL"
-        # premium = fill * size * 100 = 4.85 * 100 * 100 = 48_500
-        # We passed premium=500_000 but parse_tradier_trade calculates from fill*size*100
         assert ev.premium > 0
 
     def test_parse_put_trade(self):
@@ -161,14 +148,9 @@ class TestLayer1Parse:
         assert result is None
 
     def test_parse_negative_fill_still_parses(self):
-        """Parser computes premium = fill*size*100; negative fill is unusual
-        but parser does not hard-reject it."""
         from parsers.options_flow_parser import parse_tradier_trade
-        # Use bid/ask > 0 so synthetic-quote path doesn't fire
         raw = _raw_trade(last=-1.0, bid=0.0, ask=0.0)
-        # May return None (size=100 ok, but fill derives to 0 from mid=0)
         result = parse_tradier_trade(raw)
-        # We just assert it does not crash
         assert result is None or isinstance(result, OptionsFlowEvent)
 
 
@@ -200,7 +182,7 @@ class TestLayer2Tier:
 
 
 # ===========================================================================
-# Layer 3 — Accumulator  (uses real OptionsFlowEvent, not MagicMock)
+# Layer 3 — Accumulator  (uses asyncio.run since ingest() is now async)
 # ===========================================================================
 
 class TestLayer3Accumulator:
@@ -211,7 +193,7 @@ class TestLayer3Accumulator:
     def test_below_threshold_returns_none(self):
         acc = self._accum()
         ev = _make_event(premium=10_000.0)
-        result = acc.ingest(ev)
+        result = asyncio.run(acc.ingest(ev))
         assert result is None
 
     def test_at_threshold_returns_episode(self):
@@ -219,9 +201,8 @@ class TestLayer3Accumulator:
         base = datetime(2026, 4, 25, 10, 0, 0)
         ep = None
         for i in range(3):
-            ev = _make_event(premium=20_000.0,
-                             ts=base + timedelta(seconds=i * 60))
-            ep = acc.ingest(ev)
+            ev = _make_event(premium=20_000.0, ts=base + timedelta(seconds=i * 60))
+            ep = asyncio.run(acc.ingest(ev))
         assert ep is not None
 
     def test_episode_has_correct_trade_count(self):
@@ -229,24 +210,22 @@ class TestLayer3Accumulator:
         base = datetime(2026, 4, 25, 10, 0, 0)
         ep = None
         for i in range(3):
-            ev = _make_event(premium=20_000.0,
-                             ts=base + timedelta(seconds=i * 60))
-            ep = acc.ingest(ev)
+            ev = _make_event(premium=20_000.0, ts=base + timedelta(seconds=i * 60))
+            ep = asyncio.run(acc.ingest(ev))
         assert ep.trade_count == 3
 
     def test_window_isolation_between_tickers(self):
         acc = self._accum()
         base = datetime(2026, 4, 25, 10, 0, 0)
         for i in range(3):
-            ev = _make_event(ticker="AAPL", premium=20_000.0,
-                             ts=base + timedelta(seconds=i * 60))
-            acc.ingest(ev)
-        result = acc.ingest(_make_event(ticker="TSLA", premium=20_000.0, ts=base))
+            ev = _make_event(ticker="AAPL", premium=20_000.0, ts=base + timedelta(seconds=i * 60))
+            asyncio.run(acc.ingest(ev))
+        result = asyncio.run(acc.ingest(_make_event(ticker="TSLA", premium=20_000.0, ts=base)))
         assert result is None
 
 
 # ===========================================================================
-# Layer 4 — Composite Signal  (uses real OptionsFlowEvent objects)
+# Layer 4 — Composite Signal
 # ===========================================================================
 
 class TestLayer4Composite:
@@ -382,7 +361,7 @@ class TestE2EPipeline:
             ev = parse_tradier_trade(raw)
             assert ev is not None
             ev.influence_tier = _classify_tier(ev.premium)
-            ep = accum.ingest(ev)
+            ep = await accum.ingest(ev)
 
         assert ep is not None
         sig = build_composite(ep, accum)
@@ -409,7 +388,6 @@ class TestE2EPipeline:
         import services.flow_store as fs
 
         await fs.clear_flows()
-        # Build OCC symbols for each ticker
         ticker_syms = {
             "AAPL": "AAPL  260620C00180000",
             "TSLA": "TSLA  260620C00250000",

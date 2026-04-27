@@ -29,10 +29,6 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _make_ev(
     ticker="AAPL", contract_type="CALL", strike=200.0,
     premium=300_000.0, size=100, fill_price=3.0,
@@ -101,13 +97,9 @@ def _make_raw(occ="AAPL  260521C00200000", exchange="C"):
     }
 
 
-# ---------------------------------------------------------------------------
-# C003-1: 2 exchanges — upgrade NOT fired
-# ---------------------------------------------------------------------------
 class TestC003BelowThreshold:
     @pytest.mark.asyncio
     async def test_c003_1_two_exchanges_no_upgrade(self):
-        """C003-1: when exchange count is 2 (below sweep_min=3), upgrade must not fire."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -126,13 +118,9 @@ class TestC003BelowThreshold:
         mock_upgrade.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# C003-2: 3rd exchange exactly — upgrade fired once
-# ---------------------------------------------------------------------------
 class TestC003ThresholdExactly:
     @pytest.mark.asyncio
     async def test_c003_2_third_exchange_fires_upgrade(self):
-        """C003-2: when exchange count hits exactly 3, upgrade_to_sweep_in_db must be called."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -157,18 +145,12 @@ class TestC003ThresholdExactly:
 
             await ts._process_trade(raw)
 
-        assert len(tasks_created) == 1, (
-            f"Expected 1 create_task call for sweep upgrade, got {len(tasks_created)}"
-        )
+        assert len(tasks_created) == 1, f"Expected 1 create_task call for sweep upgrade, got {len(tasks_created)}"
 
 
-# ---------------------------------------------------------------------------
-# C003-3: 4th exchange — upgrade NOT fired again
-# ---------------------------------------------------------------------------
 class TestC003FourthExchangeNoRepeat:
     @pytest.mark.asyncio
     async def test_c003_3_fourth_exchange_no_upgrade(self):
-        """C003-3: when exchange count is 4 (already past threshold), upgrade must not fire again."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -191,18 +173,12 @@ class TestC003FourthExchangeNoRepeat:
 
             await ts._process_trade(raw)
 
-        assert len(tasks_created) == 0, (
-            f"Expected 0 create_task calls for 4th exchange, got {len(tasks_created)}"
-        )
+        assert len(tasks_created) == 0, f"Expected 0 create_task calls for 4th exchange, got {len(tasks_created)}"
 
 
-# ---------------------------------------------------------------------------
-# C003-4: upgrade_to_sweep_in_db builds correct PATCH URL and payload
-# ---------------------------------------------------------------------------
 class TestC003UpgradeFnPayload:
     @pytest.mark.asyncio
     async def test_c003_4_upgrade_fn_correct_patch_request(self):
-        """C003-4: upgrade_to_sweep_in_db must PATCH with trade_type='SWEEP'."""
         import os
         from services import flow_store
 
@@ -239,13 +215,9 @@ class TestC003UpgradeFnPayload:
         assert "trade_type=neq.SWEEP" in patched_responses[0]["url"]
 
 
-# ---------------------------------------------------------------------------
-# C003-5: upgrade_to_sweep_in_db no-op when not configured
-# ---------------------------------------------------------------------------
 class TestC003NotConfigured:
     @pytest.mark.asyncio
     async def test_c003_5_no_op_when_not_configured(self):
-        """C003-5: upgrade_to_sweep_in_db must return False silently when Supabase not set."""
         from services import flow_store
 
         original_url = flow_store._SUPABASE_URL
@@ -265,9 +237,6 @@ class TestC003NotConfigured:
         assert result is False
 
 
-# ---------------------------------------------------------------------------
-# C003-6: canonical path with established sweep upgrades ev.trade_type inline
-# ---------------------------------------------------------------------------
 class TestC003CanonicalSweepInline:
     @pytest.mark.asyncio
     async def test_c003_6_canonical_with_prior_sweep_pattern(self):
@@ -288,26 +257,20 @@ class TestC003CanonicalSweepInline:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = True
             mock_dedup.get_exchange_count.return_value = 4
-            mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = ep
+            mock_acc.ingest_tick = AsyncMock(return_value=ep)
+            mock_acc.get_signal = AsyncMock(return_value=ep)
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
-        assert ev.trade_type == "SWEEP", (
-            f"Expected ev.trade_type='SWEEP', got '{ev.trade_type}'"
-        )
+        assert ev.trade_type == "SWEEP", f"Expected ev.trade_type='SWEEP', got '{ev.trade_type}'"
         mock_persist.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# C003-7: regression — deduped events still never reach accumulator or persist
-# ---------------------------------------------------------------------------
 class TestC003DedupRegressionCheck:
     @pytest.mark.asyncio
     async def test_c003_7_deduped_no_accumulator_no_persist(self):
-        """C003-7: deduped events must still never reach accumulator.ingest_tick or persist_flow_event."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -329,9 +292,6 @@ class TestC003DedupRegressionCheck:
         mock_persist.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# C003-8: regression — qualifying canonical still writes to DB normally
-# ---------------------------------------------------------------------------
 class TestC003QualifyingCanonicalRegression:
     @pytest.mark.asyncio
     async def test_c003_8_qualifying_canonical_persists(self):
@@ -351,8 +311,8 @@ class TestC003QualifyingCanonicalRegression:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = None
+            mock_acc.ingest_tick = AsyncMock(return_value=ep)
+            mock_acc.get_signal = AsyncMock(return_value=None)
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
