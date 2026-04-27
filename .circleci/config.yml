@@ -1,0 +1,151 @@
+# .circleci/config.yml
+# Mirrors .github/workflows/backend.yml
+# Two jobs: lint (pyflakes) + regression tests with 92% coverage gate.
+# On main branch only: deploys to Railway after tests pass.
+
+version: 2.1
+
+# -----------------------------------------------------------------------
+# Reusable commands
+# -----------------------------------------------------------------------
+commands:
+  install_deps:
+    description: Install Python dependencies with pip cache
+    steps:
+      - restore_cache:
+          keys:
+            - pip-v1-{{ checksum "backend/requirements.txt" }}-{{ checksum "backend/requirements-dev.txt" }}
+            - pip-v1-
+      - run:
+          name: Install all dependencies
+          working_directory: backend
+          command: |
+            pip install -r requirements.txt
+            pip install -r requirements-dev.txt
+      - save_cache:
+          key: pip-v1-{{ checksum "backend/requirements.txt" }}-{{ checksum "backend/requirements-dev.txt" }}
+          paths:
+            - ~/.cache/pip
+
+# -----------------------------------------------------------------------
+# Jobs
+# -----------------------------------------------------------------------
+jobs:
+
+  # -----------------------------------------------------------------------
+  # Job 1: Syntax check — pyflakes only, no heavy deps
+  # -----------------------------------------------------------------------
+  lint:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install pyflakes
+          command: pip install pyflakes
+      - run:
+          name: Syntax check
+          working_directory: backend
+          command: |
+            python -m pyflakes .
+            echo "All Python files OK"
+
+  # -----------------------------------------------------------------------
+  # Job 2: Regression tests + 92% coverage gate
+  # -----------------------------------------------------------------------
+  regression:
+    docker:
+      - image: cimg/python:3.11
+    environment:
+      SUPABASE_URL:              https://dummy.supabase.co
+      SUPABASE_KEY:              dummy-supabase-key
+      SUPABASE_SERVICE_KEY:      dummy-service-key
+      SUPABASE_SERVICE_ROLE_KEY: dummy-service-role-key
+      JWT_SECRET:                ci-test-jwt-secret-not-used-in-prod
+      SECRET_KEY:                ci-test-secret-key
+      TRADIER_API_KEY:           dummy-tradier-key
+      TRADIER_ACCOUNT_ID:        VA00000000
+      TRADIER_BASE_URL:          https://sandbox.tradier.com
+      GROQ_API_KEY:              ""
+      ALLOWED_ORIGINS:           http://localhost:3000,http://testserver,http://test
+      ENVIRONMENT:               test
+    steps:
+      - checkout
+      - install_deps
+      - run:
+          name: Purge stale bytecode cache
+          working_directory: backend
+          command: |
+            find . -type f -name '*.pyc' -delete
+            find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+            echo "Bytecode cache purged"
+      - run:
+          name: Run regression suite with coverage
+          working_directory: backend
+          command: |
+            pytest \
+              --tb=short \
+              -q \
+              --continue-on-collection-errors \
+              --cov=. \
+              --cov-branch \
+              --cov-report=term-missing \
+              --cov-report=xml:coverage.xml \
+              --cov-report=json:coverage.json \
+              --cov-fail-under=92 \
+              --cov-config=.coveragerc
+      - store_artifacts:
+          path: backend/coverage.xml
+          destination: coverage.xml
+      - store_artifacts:
+          path: backend/coverage.json
+          destination: coverage.json
+
+  # -----------------------------------------------------------------------
+  # Job 3: Deploy to Railway (main branch only, after tests pass)
+  # -----------------------------------------------------------------------
+  deploy:
+    docker:
+      - image: cimg/node:lts
+    steps:
+      - checkout
+      - run:
+          name: Install Railway CLI
+          command: npm install -g @railway/cli
+      - run:
+          name: Deploy backend to Railway
+          command: railway up --service backend
+          # RAILWAY_TOKEN is set in CircleCI Project Settings → Environment Variables
+          # Change "backend" to your actual Railway service name if different.
+
+# -----------------------------------------------------------------------
+# Workflows
+# -----------------------------------------------------------------------
+workflows:
+  ci_cd:
+    jobs:
+      - lint:
+          filters:
+            branches:
+              only:
+                - main
+                - /refactor\/.*/
+                - /feature\/.*/
+                - /fix\/.*/
+
+      - regression:
+          filters:
+            branches:
+              only:
+                - main
+                - /refactor\/.*/
+                - /feature\/.*/
+                - /fix\/.*/
+
+      - deploy:
+          requires:
+            - lint
+            - regression        # deploy ONLY if both jobs pass
+          filters:
+            branches:
+              only: main         # deploy ONLY on main, never on feature branches
