@@ -640,13 +640,12 @@ async def _demo_mode_once(symbols: list[str]):
                     "contract_type":   ctype,
                     "strike":          strike,
                     "expiry":          demo_expiry,
-                    "total_premium":   sig_ep.trade_count if False else rng.randint(3, 25),
+                    "total_premium":   prem,
+                    "trade_count":     rng.randint(3, 25),
                     "alert_level":     rng.choices(levels, weights=[5, 15, 30, 50])[0],
                     "is_accelerating": rng.random() < 0.2,
                     "seed_episode":    f"Demo: {ticker} synthetic flow",
                     "timestamp":       dt.datetime.utcnow().isoformat(),
-                    "total_premium":   prem,
-                    "trade_count":     rng.randint(3, 25),
                 },
             }
             _stats["ticks"]      += 1
@@ -684,7 +683,7 @@ async def _demo_mode_once(symbols: list[str]):
             }
             await bus.publish_all(composite_msg)
 
-            _ = (bid, ask, size, dte)
+            _ = (bid, ask, size, dte, fill)
     except asyncio.CancelledError:
         log.info("Demo mode cancelled — live stream connection established")
         raise
