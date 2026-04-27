@@ -64,6 +64,14 @@ def _configure_logging() -> None:
 _configure_logging()
 log = logging.getLogger("main")
 
+# ---------------------------------------------------------------------------
+# Issue 2: module-level lock shared by _refresh_quotes_in_background and
+# _universe_refresh_loop.  Only one _fetch_batch_quotes + upsert call runs
+# at a time.  If the lock is already held the second caller logs and returns
+# immediately rather than queuing a redundant refresh.
+# ---------------------------------------------------------------------------
+_quote_refresh_lock: asyncio.Lock = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # get_config — module-level so tests can patch('main.get_config', ...)
@@ -102,10 +110,10 @@ async def get_config() -> dict:
 #
 # Warm / DB-hit path:
 #   load_fresh_snapshot() returns cached symbols immediately.
-#   Quotes + tiers are refreshed via _refresh_quotes_in_background() so the
-#   app serves traffic without blocking, but open_interest + tier columns
-#   are updated within the first minute of startup rather than staying stale
-#   for the full 24-hour snapshot window.
+#   registry.build() is promoted to a background task — the app yields
+#   immediately and serves DB-seeded contracts from load_from_db() while
+#   build runs.  _refresh_quotes_in_background() awaits wait_for_build()
+#   before calling get_oi_map() so OI is never read before it is populated.
 # ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
@@ -124,8 +132,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        # Resolve the active snapshot_id so registry can load from DB cache.
-        # quotes=[] signals to lifespan that a background refresh is needed.
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: universe_store._client()
@@ -138,7 +144,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
-        # Return empty quotes — lifespan will fire _refresh_quotes_in_background()
         return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -167,11 +172,9 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
     snapshot_id = ""
 
     if source == "tradier_validated":
-        # Step 2 — fetch quotes while save_snapshot + registry.build run in parallel
         log.info("[universe] Step 2: fetching batch quotes for %d symbols", len(symbols))
         quotes = await _fetch_batch_quotes(symbols)
 
-        # Step 4c (i) — preliminary tier assignment (price+vol only, OI not yet available)
         if quotes:
             log.info(
                 "[universe] Step 4c(i): preliminary tier assignment for %d symbols "
@@ -186,8 +189,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 sum(1 for t in tier_map.values() if t == 3),
             )
 
-        # Steps 3 + 4a — run in PARALLEL: save_snapshot has no dependency on
-        # registry.build() and registry.build() has no dependency on the DB write.
         log.info(
             "[universe] Steps 3+4a: launching save_snapshot + registry seed in parallel "
             "(snapshot_id resolved after gather)"
@@ -243,63 +244,101 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gap 2 fix — background quote refresh for DB-hit (warm-start) path.
+# Background quote refresh for DB-hit (warm-start) path.
 #
-# When lifespan loads from a fresh DB snapshot it skips _fetch_batch_quotes,
-# assign_tiers, and upsert_symbol_quotes to avoid blocking startup. This
-# coroutine runs as a fire-and-forget task so the app serves traffic
-# immediately while open_interest + tier columns are kept fresh.
+# Acquires _quote_refresh_lock before calling _fetch_batch_quotes so a
+# concurrent _universe_refresh_loop firing within a few seconds of startup
+# does not trigger a second redundant fetch+upsert (Issue 2).
+#
+# Awaits registry.wait_for_build() before calling get_oi_map() so OI is
+# never read from an empty map on the warm path (Issue 1).
 # ---------------------------------------------------------------------------
 async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
     """Fetch quotes, stamp OI, re-tier, and upsert — non-blocking background task."""
-    log.info(
-        "[universe] Background quote refresh starting for %d stream symbols",
-        len(stream_symbols),
-    )
-    try:
-        quotes = await _fetch_batch_quotes(stream_symbols)
-        if not quotes:
-            log.warning("[universe] Background quote refresh: no quotes returned — skipping")
-            return
+    if _quote_refresh_lock.locked():
+        log.info(
+            "[universe] Background quote refresh: lock held by another refresh — skipping"
+        )
+        return
 
-        registry = get_registry()
-        if registry:
-            oi_map = registry.get_oi_map()
-            _stamp_oi(quotes, oi_map)
+    async with _quote_refresh_lock:
+        log.info(
+            "[universe] Background quote refresh starting for %d stream symbols",
+            len(stream_symbols),
+        )
+        try:
+            quotes = await _fetch_batch_quotes(stream_symbols)
+            if not quotes:
+                log.warning("[universe] Background quote refresh: no quotes returned — skipping")
+                return
+
+            registry = get_registry()
+            if registry:
+                # Issue 1: wait until background build() has finished so
+                # get_oi_map() returns a populated map, not an empty dict.
+                log.info(
+                    "[universe] Background quote refresh: waiting for registry.build() "
+                    "to complete before stamping OI"
+                )
+                await registry.wait_for_build()
+                oi_map = registry.get_oi_map()
+                _stamp_oi(quotes, oi_map)
+                log.info(
+                    "[universe] Background quote refresh: OI stamped on %d quotes "
+                    "(%d tickers with oi>0)",
+                    len(quotes),
+                    sum(1 for v in oi_map.values() if v > 0),
+                )
+
+            tier_map = await assign_tiers(quotes)
             log.info(
-                "[universe] Background quote refresh: OI stamped on %d quotes "
-                "(%d tickers with oi>0)",
-                len(quotes),
-                sum(1 for v in oi_map.values() if v > 0),
+                "[universe] Background quote refresh: tiers — T1=%d T2=%d T3=%d",
+                sum(1 for t in tier_map.values() if t == 1),
+                sum(1 for t in tier_map.values() if t == 2),
+                sum(1 for t in tier_map.values() if t == 3),
             )
 
-        tier_map = await assign_tiers(quotes)
-        log.info(
-            "[universe] Background quote refresh: tiers — T1=%d T2=%d T3=%d",
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
+            if registry:
+                registry.set_tier_map(tier_map)
 
-        if registry:
-            registry.set_tier_map(tier_map)
+            await universe_store.upsert_symbol_quotes(quotes, tier_map)
+            log.info("[universe] Background quote refresh: upsert complete")
 
-        await universe_store.upsert_symbol_quotes(quotes, tier_map)
-        log.info("[universe] Background quote refresh: upsert complete")
-
-    except Exception as exc:
-        log.error(
-            "[universe] Background quote refresh failed (non-fatal): %s", exc, exc_info=True
-        )
+        except Exception as exc:
+            log.error(
+                "[universe] Background quote refresh failed (non-fatal): %s", exc, exc_info=True
+            )
 
 
 # ---------------------------------------------------------------------------
 # Background 24-hour refresh
+#
+# Issue 2 fix: the first sleep is anchored to (REFRESH_INTERVAL - elapsed)
+# where elapsed = now - fetched_at of the most-recent snapshot.  This means
+# a server restart 1 minute before the 24-hour boundary sleeps for ~1 minute
+# rather than a full 24 hours, and a restart 1 hour after the boundary fires
+# immediately (max(0, ...)).
+#
+# _fetch_batch_quotes is guarded by _quote_refresh_lock (shared with
+# _refresh_quotes_in_background) so even if both fire at the same time only
+# one proceeds; the other logs and skips.
 # ---------------------------------------------------------------------------
 async def _universe_refresh_loop():
     REFRESH_INTERVAL = 24 * 60 * 60
+
+    # Anchor first sleep to time elapsed since last snapshot.
+    last_ts = await universe_store.get_latest_snapshot_timestamp()
+    elapsed = (datetime.now(last_ts.tzinfo) - last_ts).total_seconds()
+    first_sleep = max(0.0, REFRESH_INTERVAL - elapsed)
+    log.info(
+        "[universe] Refresh loop: last snapshot was %.1fh ago — "
+        "first refresh in %.1fh",
+        elapsed / 3600,
+        first_sleep / 3600,
+    )
+    await asyncio.sleep(first_sleep)
+
     while True:
-        await asyncio.sleep(REFRESH_INTERVAL)
         log.info("[universe] Background refresh starting")
         try:
             stale = await universe_store.load_any_snapshot()
@@ -309,24 +348,32 @@ async def _universe_refresh_loop():
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
                 tier_map: dict[str, int] = {}
 
-                # Fetch quotes separately
-                quotes = await _fetch_batch_quotes(symbols)
-                if saved and quotes:
-                    registry = get_registry()
-                    if registry:
-                        log.info("[universe] Background refresh: rebuilding registry for OI roll-up")
-                        await registry.build()
-                        oi_map = registry.get_oi_map()
-                        _stamp_oi(quotes, oi_map)
-                        log.info(
-                            "[universe] Background refresh: OI stamped on %d quotes "
-                            "(%d tickers with oi>0)",
-                            len(quotes),
-                            sum(1 for v in oi_map.values() if v > 0),
-                        )
+                if _quote_refresh_lock.locked():
+                    log.info(
+                        "[universe] Background refresh: quote refresh lock held — "
+                        "skipping redundant _fetch_batch_quotes"
+                    )
+                else:
+                    async with _quote_refresh_lock:
+                        quotes = await _fetch_batch_quotes(symbols)
+                        if saved and quotes:
+                            registry = get_registry()
+                            if registry:
+                                log.info(
+                                    "[universe] Background refresh: rebuilding registry for OI roll-up"
+                                )
+                                await registry.build()
+                                oi_map = registry.get_oi_map()
+                                _stamp_oi(quotes, oi_map)
+                                log.info(
+                                    "[universe] Background refresh: OI stamped on %d quotes "
+                                    "(%d tickers with oi>0)",
+                                    len(quotes),
+                                    sum(1 for v in oi_map.values() if v > 0),
+                                )
 
-                    tier_map = await assign_tiers(quotes)
-                    await universe_store.upsert_symbol_quotes(quotes, tier_map)
+                            tier_map = await assign_tiers(quotes)
+                            await universe_store.upsert_symbol_quotes(quotes, tier_map)
 
                 registry = get_registry()
                 if registry and tier_map:
@@ -352,6 +399,8 @@ async def _universe_refresh_loop():
                 )
         except Exception as e:
             log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
+
+        await asyncio.sleep(REFRESH_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +439,6 @@ async def _registry_prewarm_loop() -> None:
 
         if now >= next_prewarm:
             next_prewarm += timedelta(days=1)
-            # Advance past any weekend
             while next_prewarm.weekday() >= 5:
                 next_prewarm += timedelta(days=1)
 
@@ -430,7 +478,6 @@ async def lifespan(app: FastAPI):
         len(stream_symbols), len(tier_map),
     )
 
-    # On HIT path: fast-seed from DB chain cache so lookup() works immediately
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
         log.info(
@@ -439,18 +486,40 @@ async def lifespan(app: FastAPI):
             seeded, registry.is_ready(),
         )
 
-    # Steps 3+4a — on the COLD path save_snapshot already ran in parallel
-    # with the snapshot_id query inside _resolve_startup_universe().
-    # Here we only need to run registry.build() (Step 4b) which is the
-    # rate-limited bottleneck (~4-6 min). On the WARM/HIT path quotes==[] so
-    # this is the only build we do at startup; the background refresh task
-    # (created below) will stamp OI + re-tier after registry.build() finishes.
-    log.info("[registry] Running first build (blocking startup until OI available)")
-    await registry.build()
-    log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
+    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
+    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
+    stream_task           = asyncio.create_task(stream_options_flow(stream_symbols))
+    db_write_task         = asyncio.create_task(start_flow_writer())
+    signal_write_task     = asyncio.create_task(start_signal_writer())
+    refresh_task          = asyncio.create_task(_universe_refresh_loop())
 
-    # Step 4c (ii) — OI-informed tier assignment (cold path only: quotes != [])
-    if quotes:
+    bg_quote_refresh_task = None
+    build_task            = None
+
+    if not quotes:
+        # ----------------------------------------------------------------
+        # WARM PATH (DB hit): promote registry.build() to a background
+        # task and yield immediately so the app serves DB-seeded contracts
+        # right away.  _refresh_quotes_in_background awaits wait_for_build()
+        # internally before reading get_oi_map(), so OI is always correct.
+        # ----------------------------------------------------------------
+        log.info(
+            "[registry] Warm-start path: promoting registry.build() to background task — "
+            "app will serve DB-seeded contracts immediately"
+        )
+        build_task = asyncio.create_task(registry.build())
+        bg_quote_refresh_task = asyncio.create_task(
+            _refresh_quotes_in_background(stream_symbols)
+        )
+    else:
+        # ----------------------------------------------------------------
+        # COLD PATH: build() must finish before yield because OI-informed
+        # tier assignment (Step 4c ii) and upsert depend on get_oi_map().
+        # ----------------------------------------------------------------
+        log.info("[registry] Cold-start path: running registry.build() (blocking until OI available)")
+        await registry.build()
+        log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
+
         oi_map = registry.get_oi_map()
         _stamp_oi(quotes, oi_map)
         log.info(
@@ -469,32 +538,9 @@ async def lifespan(app: FastAPI):
 
         registry.set_tier_map(tier_map)
 
-        # Step 5 — upsert with OI + final tiers (cold path)
         log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
         await universe_store.upsert_symbol_quotes(quotes, tier_map)
         log.info("[registry] Upsert complete — open_interest column now populated in DB")
-
-    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
-
-    stream_task       = asyncio.create_task(stream_options_flow(stream_symbols))
-    db_write_task     = asyncio.create_task(start_flow_writer())
-    signal_write_task = asyncio.create_task(start_signal_writer())
-    refresh_task      = asyncio.create_task(_universe_refresh_loop())
-
-    # Gap 2 fix — warm path: fire quote refresh as a background task so
-    # open_interest + tier columns are updated without blocking app startup.
-    # On the cold path quotes != [] so this branch is skipped (tiers already
-    # stamped via the OI-informed assign_tiers block above).
-    bg_quote_refresh_task = None
-    if not quotes:
-        log.info(
-            "[registry] Warm-start path: scheduling background quote refresh "
-            "(open_interest + tiers will be updated shortly after startup)"
-        )
-        bg_quote_refresh_task = asyncio.create_task(
-            _refresh_quotes_in_background(stream_symbols)
-        )
 
     yield
 
@@ -506,6 +552,8 @@ async def lifespan(app: FastAPI):
     signal_write_task.cancel()
     if bg_quote_refresh_task is not None:
         bg_quote_refresh_task.cancel()
+    if build_task is not None:
+        build_task.cancel()
     for task in filter(None, (
         stream_task,
         db_write_task,
@@ -514,6 +562,7 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         bg_quote_refresh_task,
+        build_task,
     )):
         try:
             await task
@@ -531,18 +580,9 @@ app = FastAPI(
 
 # ---------------------------------------------------------------------------
 # CORS — use allow_origin_regex so all Vercel preview URLs are accepted.
-#
-# Pattern covers:
-#   - https://*.vercel.app          (all Vercel production + preview deploys)
-#   - http://localhost:3000/3001    (local dev)
-#   - http://127.0.0.1:3000        (local dev alternative)
-#   - Any explicit origins from CORS_ALLOWED_ORIGINS env var (escaped + OR'd in)
-#
-# We never use allow_origins=["*"] because that breaks allow_credentials=True.
 # ---------------------------------------------------------------------------
-_explicit_origins = settings.origins  # list[str] from env var
+_explicit_origins = settings.origins
 
-# Build regex alternation from any explicit non-wildcard origins in env
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
 ]
@@ -573,29 +613,26 @@ app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
 
-# ---------------------------------------------------------------------------
-# Aliases for legacy / health-check paths
-# ---------------------------------------------------------------------------
 
-# Railway health check probe is configured to hit /stream/stats (no /api prefix).
-# Return a simple 200 so the probe passes without requiring auth.
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
     return JSONResponse({"status": "ok"})
 
-# /api/stream/stats — authenticated alias kept for backwards compat
+
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
 
-# /api/health — used by test_main_app.test_app_health_endpoint_exists
+
 @app.get("/api/health", tags=["health"])
 async def api_health():
     return JSONResponse({"status": "ok", "service": "cipher-api"})
 
+
 @app.get("/health", tags=["health"])
 async def health_root():
     return JSONResponse({"status": "ok", "service": "cipher-api"})
+
 
 @app.get("/", tags=["health"])
 async def root():

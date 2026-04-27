@@ -64,9 +64,19 @@ class SymbolRegistry:
         self._build_lock = asyncio.Lock()
         self._oi_by_ticker: dict[str, int] = {}
         self._persisted_snapshot_id: Optional[str] = None
-        # Volume data captured during _fetch_stock_prices for tier reclassification
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
+        # Issue 1: signals when build() has completed at least once
+        self._build_done: asyncio.Event = asyncio.Event()
+
+    # ------------------------------------------------------------------
+    # Public: wait until build() has finished at least once.
+    # _refresh_quotes_in_background calls this before get_oi_map() so it
+    # never reads a stale (empty) OI map on the warm path.
+    # ------------------------------------------------------------------
+    async def wait_for_build(self) -> None:
+        """Suspend until build() has completed at least once."""
+        await self._build_done.wait()
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -154,7 +164,6 @@ class SymbolRegistry:
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # --- Post-build tier reclassification using live price + volume + OI ---
             synthetic_quotes = []
             for ticker in self._watchlist:
                 if ticker not in prices:
@@ -209,6 +218,11 @@ class SymbolRegistry:
             )
 
             await self._persist_to_db(new_registry)
+
+            # Signal waiters (e.g. _refresh_quotes_in_background) that
+            # build() has completed and get_oi_map() is now populated.
+            self._build_done.set()
+
             return len(new_registry)
 
     async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:

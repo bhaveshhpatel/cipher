@@ -10,11 +10,12 @@ Tables (must be migrated first):
                                 (includes open_interest, average_volume, tier — migration 010)
 
 Public API:
-  load_fresh_snapshot()         → list[str] | None
-  load_any_snapshot()           → list[str] | None
-  load_tier_map()               → dict[str, int]        [4A]
-  save_snapshot(...)            → bool
-  upsert_symbol_quotes(...)     → None
+  load_fresh_snapshot()             → list[str] | None
+  load_any_snapshot()               → list[str] | None
+  load_tier_map()                   → dict[str, int]        [4A]
+  get_latest_snapshot_timestamp()   → datetime              [Issue 2]
+  save_snapshot(...)                → bool
+  upsert_symbol_quotes(...)         → None
 
 ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 does NOT expose .select() after .insert().
@@ -34,6 +35,12 @@ Feature 4A-OI (2026-04-25):
   open_interest column (migration 010) is now written by upsert_symbol_quotes()
   with the avg chain OI value from registry.get_oi_map(), populated by main.py.
   This column is no longer NULL after the first full startup cycle.
+
+Issue 2 fix (2026-04-27):
+  get_latest_snapshot_timestamp() returns the fetched_at timestamp of the
+  most recent snapshot so _universe_refresh_loop() can anchor its first sleep
+  to (24h - elapsed) rather than a flat 24h, preventing a redundant
+  _fetch_batch_quotes call when the server restarts near the 24h boundary.
 """
 import asyncio
 import logging
@@ -52,6 +59,10 @@ log = logging.getLogger("universe_store")
 _KEEP_SNAPSHOTS  = 7
 _DEFAULT_MAX_AGE = 24   # hours
 _UPSERT_BATCH    = 500  # rows per upsert batch
+
+# Epoch used as the "no snapshot" fallback so the first sleep in
+# _universe_refresh_loop() is effectively 0 (fires immediately on cold start).
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _client() -> Client:
@@ -95,6 +106,21 @@ async def load_tier_map() -> dict[str, int]:
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_load_tier_map)
+
+
+async def get_latest_snapshot_timestamp() -> datetime:
+    """
+    Return the fetched_at timestamp of the most recent snapshot (any status).
+
+    Used by _universe_refresh_loop() to compute how long ago the last
+    universe refresh ran so the first sleep can be anchored to
+    (REFRESH_INTERVAL - elapsed) instead of a flat REFRESH_INTERVAL.
+
+    Returns the Unix epoch (1970-01-01 UTC) when no snapshots exist so the
+    caller treats it as "never refreshed" and fires immediately.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync_get_latest_snapshot_timestamp)
 
 
 async def save_snapshot(
@@ -223,9 +249,6 @@ def _sync_load_tier_map() -> dict[str, int]:
             .eq("snapshot_id", snapshot_id)
             .execute()
         )
-        # FIX: use r.get("tier") instead of r["tier"] so rows missing the
-        # tier column (pre-migration 010 data) silently default to 3 rather
-        # than raising a KeyError and returning an empty map.
         tier_map = {
             r["symbol"]: int(r.get("tier") or 3)
             for r in (result.data or [])
@@ -242,6 +265,38 @@ def _sync_load_tier_map() -> dict[str, int]:
     except Exception as e:
         log.warning("universe_store.load_tier_map error (non-fatal): %s", e, exc_info=True)
         return {}
+
+
+def _sync_get_latest_snapshot_timestamp() -> datetime:
+    """
+    Return the fetched_at of the most-recent snapshot row (any status).
+    Returns _EPOCH when no rows exist.
+    """
+    try:
+        sb = _client()
+        result = (
+            sb.table("options_universe_snapshots")
+            .select("fetched_at")
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows or not rows[0].get("fetched_at"):
+            log.info("universe_store.get_latest_snapshot_timestamp: no snapshots — returning epoch")
+            return _EPOCH
+        raw = rows[0]["fetched_at"]
+        # Supabase returns ISO-8601 strings; parse and ensure tz-aware UTC.
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        log.info("universe_store.get_latest_snapshot_timestamp: %s", dt.isoformat())
+        return dt
+    except Exception as e:
+        log.warning(
+            "universe_store.get_latest_snapshot_timestamp error (non-fatal): %s", e
+        )
+        return _EPOCH
 
 
 def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
