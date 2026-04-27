@@ -2,7 +2,11 @@
 tests/test_symbols_loader.py
 
 Full edge case + regression suite for services/symbols_loader.py
-Covers Steps 1–3: CBOE fetch, Tradier validation, batch quotes + stream_eligible.
+Covers Steps 1 and 3: CBOE fetch and batch quotes + stream_eligible.
+
+Step 2 (_validate_symbols) is DISABLED in production — its tests are marked
+xfail so the suite still documents expected behaviour and will auto-pass if
+the function is reinstated.  See TODO(parallel-schema) in symbols_loader.py.
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,6 +15,7 @@ from services.symbols_loader import (
     load_universe,
     _fetch_cboe_symbols,
     _validate_symbols,
+    _fetch_and_validate,
     _fetch_batch_quotes,
     SymbolQuote,
     SEED_SYMBOLS,
@@ -73,11 +78,45 @@ class TestFetchCboeSymbols:
 
 
 # ---------------------------------------------------------------------------
-# _validate_symbols  (Step 2)
+# _fetch_and_validate  (Step 1 → Step 3 bypass, Step 2 disabled)
+# ---------------------------------------------------------------------------
+
+class TestFetchAndValidate:
+    @pytest.mark.asyncio
+    async def test_cboe_symbols_returned_directly_without_validation(self):
+        """With Step 2 disabled, _fetch_and_validate must return raw CBOE symbols."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = (
+            'Company,Symbol,Exchange,Tick\n'
+            '"Apple","AAPL","C2","NOR"\n'
+            '"Tesla","TSLA","C2","NOR"\n'
+            '"NVDA Corp","NVDA","C2","NOR"\n'
+        )
+        with patch("services.symbols_loader.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_resp)
+            result = await _fetch_and_validate()
+        # All CBOE symbols pass through — no Tradier filter applied
+        assert set(result) == {"AAPL", "TSLA", "NVDA"}
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_cboe_fails(self):
+        with patch("services.symbols_loader._fetch_cboe_symbols", new_callable=AsyncMock) as mock_cboe:
+            mock_cboe.return_value = []
+            result = await _fetch_and_validate()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _validate_symbols  (Step 2 — DISABLED)
+# Tests are xfail: they document expected behaviour when re-enabled.
+# The stub currently returns its input unchanged, so the assertions below
+# would fail if called against the stub — that's intentional.
 # ---------------------------------------------------------------------------
 
 class TestValidateSymbols:
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="Step 2 disabled — TODO(parallel-schema)")
     async def test_passes_symbols_with_expirations(self):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -88,10 +127,11 @@ class TestValidateSymbols:
         with patch("services.symbols_loader.httpx.AsyncClient") as mock_client:
             mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_resp)
             result = await _validate_symbols(["AAPL", "TSLA"])
-        assert "AAPL" in result
-        assert "TSLA" in result
+        # When re-enabled: only symbols with real expiration dates pass
+        assert result == ["AAPL", "TSLA"]
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="Step 2 disabled — TODO(parallel-schema)")
     async def test_filters_symbols_without_expirations(self):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -103,6 +143,7 @@ class TestValidateSymbols:
         assert result == []
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="Step 2 disabled — TODO(parallel-schema)")
     async def test_filters_on_non_200(self):
         mock_resp = MagicMock()
         mock_resp.status_code = 404
@@ -112,6 +153,7 @@ class TestValidateSymbols:
         assert result == []
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="Step 2 disabled — TODO(parallel-schema)")
     async def test_handles_exception_per_symbol(self):
         import httpx
         with patch("services.symbols_loader.httpx.AsyncClient") as mock_client:
@@ -123,6 +165,7 @@ class TestValidateSymbols:
 
     @pytest.mark.asyncio
     async def test_empty_input_returns_empty(self):
+        """Stub still returns empty list for empty input — always passes."""
         result = await _validate_symbols([])
         assert result == []
 
@@ -275,7 +318,7 @@ class TestFetchBatchQuotes:
 class TestLoadUniverse:
     @pytest.mark.asyncio
     async def test_full_pipeline_success(self):
-        """Full Step 1→2→3 pipeline: returns tradier_validated + eligible set."""
+        """Full Step 1→3 pipeline (Step 2 disabled): returns tradier_validated + eligible set."""
         mock_quotes = [
             SymbolQuote(symbol="AAPL", last_price=185.0, volume=500_000, stream_eligible=True),
             SymbolQuote(symbol="TSLA", last_price=210.0, volume=1_200_000, stream_eligible=True),
@@ -284,8 +327,7 @@ class TestLoadUniverse:
         with patch("services.symbols_loader.settings") as mock_settings, \
              patch("services.symbols_loader._fetch_and_validate", new_callable=AsyncMock) as mock_fetch, \
              patch("services.symbols_loader._fetch_batch_quotes", new_callable=AsyncMock) as mock_quotes_fn, \
-             patch("services.symbols_loader.upsert_symbol_quotes", new_callable=AsyncMock), \
-             patch("services.symbols_loader.settings") as mock_settings:
+             patch("services.symbols_loader.upsert_symbol_quotes", new_callable=AsyncMock):
             mock_settings.TRADIER_API_KEY  = "test-key"
             mock_settings.priority_symbols = []
             mock_fetch.return_value        = ["AAPL", "TSLA", "NVDA"]

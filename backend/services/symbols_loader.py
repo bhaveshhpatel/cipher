@@ -6,7 +6,13 @@ stream eligibility via Tradier batch quotes (Step 3).
 
 Universe pipeline:
   Step 1 — CBOE CSV → ~5,500 raw symbols
-  Step 2 — Tradier /expirations validation → ~5,500 confirmed optionable symbols
+  Step 2 — [DISABLED] Tradier /expirations validation — commented out;
+             fired 5,267 serial API calls on cold start, hitting Tradier
+             rate/timeout limits → 0 valid symbols → seed fallback every
+             restart.  Step 3 batch quotes already screens non-tradeable
+             symbols via min_price / min_volume.  Re-enable when parallel
+             schema work (Option A/B) provides a cached validation layer.
+             TODO(parallel-schema): reinstate _validate_symbols() call
   Step 3 — Tradier /v1/markets/quotes batch fetch (200/request, ~28 parallel)
              → last_price, volume, average_volume, open_interest per symbol
              → compute stream_eligible flag
@@ -14,7 +20,7 @@ Universe pipeline:
   Step 5 — Save snapshot to options_universe_snapshots
 
 Fallback priority:
-  1. CBOE + Tradier validated + batch quotes (full pipeline)
+  1. CBOE batch quotes (full pipeline, no per-symbol expiration check)
   2. DB snapshot if provided (stream_eligible_set = None, quotes = [])
   3. SEED_SYMBOLS as last resort (stream_eligible_set = None, quotes = [])
 
@@ -52,7 +58,7 @@ _CBOE_URL             = (
 _CHAIN_URL            = f"{settings.TRADIER_BASE_URL}/v1/markets/options/expirations"
 _QUOTES_URL           = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
 _CONNECT_TIMEOUT      = 20.0
-_VALIDATE_CONCURRENCY = 50   # raised from 20 — reduces symbol dropout from timeouts
+_VALIDATE_CONCURRENCY = 50   # kept for when _validate_symbols is re-enabled
 _VALIDATE_TIMEOUT     = 8.0
 _QUOTES_TIMEOUT       = 12.0
 
@@ -102,7 +108,7 @@ async def load_universe(
     try:
         symbols = await _fetch_and_validate()
         if symbols:
-            log.info("Universe loaded: %d symbols (CBOE + Tradier validated)", len(symbols))
+            log.info("Universe loaded: %d symbols (CBOE, Step 2 validation disabled)", len(symbols))
 
             # Step 3 — batch quotes → stream eligibility
             quotes = await _fetch_batch_quotes(symbols)
@@ -128,7 +134,7 @@ async def load_universe(
 
             return symbols, "tradier_validated", eligible_set
 
-        log.warning("CBOE+Tradier universe fetch returned 0 valid symbols — using fallback")
+        log.warning("CBOE universe fetch returned 0 symbols — using fallback")
     except Exception as e:
         log.error("Universe fetch failed unexpectedly: %s — using fallback", e)
 
@@ -153,19 +159,25 @@ async def _fetch_and_validate() -> list[str]:
     if not raw_symbols:
         return []
 
-    log.info("Fetched %d raw symbols from CBOE — starting Tradier validation", len(raw_symbols))
+    log.info("Fetched %d raw symbols from CBOE — Step 2 validation DISABLED, proceeding to Step 3", len(raw_symbols))
 
-    if not settings.TRADIER_API_KEY:
-        log.warning(
-            "TRADIER_API_KEY not set — skipping per-symbol validation, "
-            "using full CBOE list (%d symbols)",
-            len(raw_symbols),
-        )
-        return raw_symbols
+    # TODO(parallel-schema): reinstate _validate_symbols() call here once a
+    # cached/parallel validation layer exists that won't block startup with
+    # 5,000+ serial Tradier /expirations requests.
+    #
+    # if not settings.TRADIER_API_KEY:
+    #     log.warning(
+    #         "TRADIER_API_KEY not set — skipping per-symbol validation, "
+    #         "using full CBOE list (%d symbols)",
+    #         len(raw_symbols),
+    #     )
+    #     return raw_symbols
+    #
+    # valid = await _validate_symbols(raw_symbols)
+    # log.info("Validation complete: %d / %d symbols passed", len(valid), len(raw_symbols))
+    # return valid
 
-    valid = await _validate_symbols(raw_symbols)
-    log.info("Validation complete: %d / %d symbols passed", len(valid), len(raw_symbols))
-    return valid
+    return raw_symbols
 
 
 async def _fetch_cboe_symbols() -> list[str]:
@@ -219,39 +231,54 @@ async def _fetch_cboe_symbols() -> list[str]:
 
 # ---------------------------------------------------------------------------
 # Step 2: Tradier per-symbol expiration validation
+# DISABLED — see _fetch_and_validate() for rationale and TODO tag.
+# Kept here verbatim so it can be reinstated without archaeology.
 # ---------------------------------------------------------------------------
 
-async def _validate_symbols(symbols: list[str]) -> list[str]:
-    sem     = asyncio.Semaphore(_VALIDATE_CONCURRENCY)
-    headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept": "application/json",
-    }
+# async def _validate_symbols(symbols: list[str]) -> list[str]:
+#     sem     = asyncio.Semaphore(_VALIDATE_CONCURRENCY)
+#     headers = {
+#         "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+#         "Accept": "application/json",
+#     }
+#
+#     async def _check(symbol: str) -> Optional[str]:
+#         async with sem:
+#             try:
+#                 async with httpx.AsyncClient(timeout=_VALIDATE_TIMEOUT) as client:
+#                     resp = await client.get(
+#                         _CHAIN_URL,
+#                         headers=headers,
+#                         params={"symbol": symbol},
+#                     )
+#                 if resp.status_code == 200:
+#                     body = resp.text.strip()
+#                     if not body:
+#                         return None
+#                     data        = resp.json()
+#                     expirations = data.get("expirations") or {}
+#                     dates       = expirations.get("date") or []
+#                     if dates:
+#                         return symbol
+#                 return None
+#             except Exception:
+#                 return None
+#
+#     results = await asyncio.gather(*[_check(s) for s in symbols])
+#     return [s for s in results if s is not None]
 
-    async def _check(symbol: str) -> Optional[str]:
-        async with sem:
-            try:
-                async with httpx.AsyncClient(timeout=_VALIDATE_TIMEOUT) as client:
-                    resp = await client.get(
-                        _CHAIN_URL,
-                        headers=headers,
-                        params={"symbol": symbol},
-                    )
-                if resp.status_code == 200:
-                    body = resp.text.strip()
-                    if not body:
-                        return None
-                    data        = resp.json()
-                    expirations = data.get("expirations") or {}
-                    dates       = expirations.get("date") or []
-                    if dates:
-                        return symbol
-                return None
-            except Exception:
-                return None
 
-    results = await asyncio.gather(*[_check(s) for s in symbols])
-    return [s for s in results if s is not None]
+# Stub exported so existing imports don't break while function is disabled.
+# Remove this stub when _validate_symbols is reinstated.
+async def _validate_symbols(symbols: list[str]) -> list[str]:  # noqa: F811
+    """DISABLED — see Step 2 comment block above.
+    TODO(parallel-schema): remove this stub and uncomment the real implementation.
+    """
+    log.warning(
+        "_validate_symbols() called but is currently DISABLED "
+        "(returns input unchanged). TODO(parallel-schema)."
+    )
+    return list(symbols)
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +372,6 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
                             except (TypeError, ValueError):
                                 pass
 
-                    # Capture average_volume separately (used for tier assignment)
                     avg_vol: int = 0
                     today_vol: int = 0
                     try:
