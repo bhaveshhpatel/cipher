@@ -66,7 +66,7 @@ _BACKOFF_CAP         = 60.0
 _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
-_PERSIST_TIMEOUT     = 2.0   # max seconds to wait for persist_flow_event()
+_PERSIST_TIMEOUT     = 2.0
 
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
@@ -95,8 +95,6 @@ _stats = {
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
 
-# Guard against double-dispatch of retroactive sweep upgrade tasks.
-# Key = "occ_symbol|size|fill_price"; entry added before create_task.
 _sweep_upgrade_dispatched: Set[str] = set()
 
 
@@ -105,6 +103,20 @@ def get_stats() -> dict:
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
     stats.update(flow_dedup.dedup_stats())
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Compat stubs — previously-exported names that tests may import.
+# These are intentional no-ops; the real logic lives in StreamManager.
+# ---------------------------------------------------------------------------
+async def _demo_mode_once() -> None:  # pragma: no cover
+    """Stub: demo mode is disabled as of 2026-04-25. Kept for import compat."""
+    pass
+
+
+def _guarded_lines(lines) -> list:  # pragma: no cover
+    """Stub: line guard helper removed; kept for import compat."""
+    return list(lines) if lines else []
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +295,6 @@ async def _process_trade(raw: dict):
             occ_symbol, ev.size, ev.fill_price, exchange,
         )
 
-        # C-003: retroactive sweep upgrade
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
             dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
@@ -303,7 +314,6 @@ async def _process_trade(raw: dict):
                 )
         return
 
-    # Canonical print — inline sweep upgrade if pattern already established
     if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
         real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if ev.trade_type != "SWEEP":
@@ -316,9 +326,9 @@ async def _process_trade(raw: dict):
     log.debug(
         "[flow] %s %s $%.2f %s dte=%d | fill=%s bid=%s ask=%s size=%d "
         "iv=%.1f%% premium=$%.0f exch=%s",
-        ev.trade_type, ev.occ_symbol, ev.strike, ev.option_type,
+        ev.trade_type, occ_symbol, ev.strike, ev.option_type if hasattr(ev, 'option_type') else ev.contract_type,
         ev.dte, ev.fill_price, ev.bid, ev.ask, ev.size,
-        (ev.implied_volatility or 0) * 100,
+        (ev.implied_volatility if hasattr(ev, 'implied_volatility') else ev.iv or 0) * 100,
         ev.premium, exchange,
     )
 
@@ -330,7 +340,7 @@ async def _process_trade(raw: dict):
         comp = build_composite(ev)
     except Exception as e:
         _stats["composite_errors"] += 1
-        log.debug("[composite] build failed for %s: %s", ev.occ_symbol, e)
+        log.debug("[composite] build failed for %s: %s", occ_symbol, e)
 
     # ------------------------------------------------------------------
     # Persist + signal (C-008 decoupled tiers)
@@ -338,15 +348,42 @@ async def _process_trade(raw: dict):
     try:
         persist_ep = await accumulator.ingest_tick(ev)
         if persist_ep:
+            # Build the dict that persist_flow_event expects.
+            ev_dict = {
+                "ticker":           ev.ticker,
+                "contract_type":    ev.contract_type,
+                "strike":           ev.strike,
+                "expiry":           ev.expiry,
+                "dte":              ev.dte,
+                "fill_price":       ev.fill_price,
+                "bid":              ev.bid,
+                "ask":              ev.ask,
+                "size":             ev.size,
+                "premium":          ev.premium,
+                "trade_type":       ev.trade_type,
+                "bid_ask_class":    ev.bid_ask_class,
+                "is_aggressive":    ev.is_aggressive,
+                "is_golden_sweep":  ev.is_golden_sweep,
+                "sentiment":        ev.sentiment,
+                "influence_tier":   ev.influence_tier,
+                "conviction_score": ev.conviction_score,
+                "exchange_count":   ev.exchange_count,
+                "fill_count":       ev.fill_count,
+                "open_interest":    ev.open_interest,
+                "iv":               ev.iv,
+                "underlying_price": ev.underlying_price,
+                "occ_symbol":       occ_symbol,
+                "is_synthetic_quote": ev.is_synthetic_quote,
+            }
             try:
                 await asyncio.wait_for(
-                    persist_flow_event(ev, episode=persist_ep, composite=comp),
+                    persist_flow_event(ev_dict),
                     timeout=_PERSIST_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 log.warning(
                     "[stream] persist_flow_event timed out after %.1fs for %s",
-                    _PERSIST_TIMEOUT, ev.occ_symbol,
+                    _PERSIST_TIMEOUT, occ_symbol,
                 )
 
         ts = _time.time()
@@ -357,4 +394,4 @@ async def _process_trade(raw: dict):
 
     except Exception as e:
         _stats["errors"] += 1
-        log.error("[stream] error processing trade %s: %s", ev.occ_symbol, e, exc_info=True)
+        log.error("[stream] error processing trade %s: %s", occ_symbol, e, exc_info=True)

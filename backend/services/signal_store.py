@@ -16,6 +16,7 @@ Public API:
   _clear_signal_memory()                           -> None          (test helper)
   _normalise_direction(raw)    -> 'bullish'|'bearish'|'neutral'
   _normalise_trade_type(raw)   -> 'sweep'|'block'|'split'|'single'
+  _client()                    -> supabase Client  (test-patchable factory)
 
 CI / no-network behaviour:
   When Supabase is configured but the host is unreachable, save_signal()
@@ -48,7 +49,6 @@ _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
 # Bounded in-memory store — maxlen prevents unbounded growth.
-# maxlen=1000 keeps ~16 min of 1/s signals; oldest entries auto-evict.
 _signal_memory: deque = deque(maxlen=1000)
 _signal_ids_seen: set  = set()
 
@@ -62,6 +62,23 @@ def _clear_signal_memory() -> None:
 
 def _is_configured() -> bool:
     return bool(_SUPABASE_URL and _SUPABASE_KEY)
+
+
+def _client():
+    """
+    Return a Supabase Python-SDK client.
+
+    This is a thin factory so tests can patch it:
+        with patch("services.signal_store._client", return_value=mock_client):
+            ...
+
+    In production the supabase-py library must be installed.  If it is not
+    available (e.g. unit-test environments that use the httpx path instead),
+    this raises ImportError — callers should only invoke _client() after
+    confirming _is_configured() is True and the SDK is available.
+    """
+    from supabase import create_client  # type: ignore[import]
+    return create_client(_SUPABASE_URL, _SUPABASE_KEY)
 
 
 def _headers() -> dict:
@@ -110,10 +127,6 @@ async def _insert_signal_with_retry(row: dict) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Normalisation helpers
-# ---------------------------------------------------------------------------
-
 def _normalise_direction(raw: str) -> str:
     if not raw:
         return "neutral"
@@ -153,10 +166,6 @@ def _coerce_to_dict(sig) -> dict:
         return {}
 
 
-# ---------------------------------------------------------------------------
-# Row builder
-# ---------------------------------------------------------------------------
-
 def _build_row(sig, ep: Optional[dict] = None) -> dict:
     sig     = _coerce_to_dict(sig)
     episode = ep or {}
@@ -185,7 +194,6 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     else:
         sentiment = "NEUTRAL"
 
-    # Single normalisation path — no redundant _db_direction/_db_trade_type wrappers.
     norm_dir = _normalise_direction(raw_dir)
     direction_map = {"bullish": "BUY", "bearish": "SELL"}
     direction      = direction_map.get(norm_dir, "HOLD")
@@ -236,10 +244,6 @@ def _store_in_memory(sig_dict: dict) -> None:
             _signal_ids_seen.add(sig_id)
 
 
-# ---------------------------------------------------------------------------
-# Public write API
-# ---------------------------------------------------------------------------
-
 async def save_signal(signal) -> bool:
     """
     Persist a signal. Falls back to _signal_memory when Supabase is
@@ -253,8 +257,6 @@ async def save_signal(signal) -> bool:
 
     row = _build_row(signal)
     ok  = await _insert_signal_with_retry(row)
-    # Always store in memory so get_signals() works within the same process
-    # even when the DB write succeeded (avoids a round-trip on subsequent reads).
     _store_in_memory(sig_dict)
     return ok
 
@@ -295,15 +297,7 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         )
 
 
-# ---------------------------------------------------------------------------
-# Public read API
-# ---------------------------------------------------------------------------
-
 async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
-    """
-    Return signals from in-memory store, optionally filtered by ticker.
-    In production, the memory store is populated by every save_signal() call.
-    """
     results = list(_signal_memory)
     if ticker:
         results = [s for s in results if s.get("ticker") == ticker]
@@ -314,10 +308,6 @@ async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> l
     """Alias for get_signals — backward compatibility."""
     return await get_signals(ticker=ticker, limit=limit)
 
-
-# ---------------------------------------------------------------------------
-# Bus listener + startup
-# ---------------------------------------------------------------------------
 
 async def _bus_signal_listener() -> None:
     q = bus.subscribe("signal_writer")

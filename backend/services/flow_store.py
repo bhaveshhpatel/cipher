@@ -48,26 +48,22 @@ log = logging.getLogger("flow_store")
 
 _SUPABASE_URL: Optional[str] = os.environ.get("SUPABASE_URL")
 
-# IMPORTANT: Use the service role key ONLY -- it bypasses RLS.
 _SUPABASE_KEY: Optional[str] = (
     os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_SERVICE_KEY")  # legacy fallback
+    or os.environ.get("SUPABASE_SERVICE_KEY")
 )
 
-_FLUSH_INTERVAL = 0.5   # seconds between periodic flushes
-_FLUSH_MAX_ROWS = 100   # immediate flush when buffer reaches this size
+_FLUSH_INTERVAL = 0.5
+_FLUSH_MAX_ROWS = 100
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
-# asyncio.Lock() guards all mutations to _flow_event_buffer.
-# Must be created inside the event loop — lazy-initialised on first use.
 _buffer_lock: Optional[asyncio.Lock] = None
 _flow_event_buffer: list[dict] = []
 
 
 def _get_lock() -> asyncio.Lock:
-    """Lazy-init the buffer lock inside the running event loop."""
     global _buffer_lock
     if _buffer_lock is None:
         _buffer_lock = asyncio.Lock()
@@ -126,7 +122,6 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 
 
 async def _flush_flow_events() -> None:
-    """Periodic background flush loop — drains the buffer every _FLUSH_INTERVAL seconds."""
     global _flow_event_buffer
     lock = _get_lock()
     while True:
@@ -143,11 +138,7 @@ async def _flush_flow_events() -> None:
 
 async def persist_flow_event(ev_dict: dict) -> None:
     """
-    Buffer a single flow event for DB persistence.
-
-    Appends to the in-memory buffer under a lock. If the buffer reaches
-    _FLUSH_MAX_ROWS an immediate flush is triggered (still under lock to
-    prevent the periodic flush from racing on the same slice).
+    Buffer a single flow event dict for DB persistence.
     """
     global _flow_event_buffer
 
@@ -213,25 +204,6 @@ async def persist_flow_event(ev_dict: dict) -> None:
 
 
 async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
-    """
-    C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
-
-    Called via asyncio.create_task() from _process_trade() when the 3rd
-    unique exchange for a (occ_symbol, size, fill) key arrives as a
-    duplicate tick — meaning the canonical row was already written with
-    trade_type='BTO' before the sweep was confirmed.
-
-    Issues a PATCH (UPDATE) against the Supabase REST API targeting:
-      - occ_symbol  = exact OCC string
-      - fill_price  = exact fill (matches the canonical row)
-      - size        = exact contract count
-      - trade_type  != 'SWEEP'  (idempotent guard — skip already-upgraded rows)
-      - created_at  > NOW() - INTERVAL '30 seconds'  (safety window — avoids
-                    mutating old unrelated rows with same contract params)
-
-    Returns True on success, False on any error. Errors are logged but
-    never propagate — sweep upgrade is best-effort.
-    """
     if not _is_configured():
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
         return False
@@ -339,7 +311,6 @@ async def start_flow_writer() -> None:
 
 # ---------------------------------------------------------------------------
 # In-memory helpers — used by the 6-layer regression test and demo flow path.
-# Deliberately kept minimal: no class, just a module-level deque + helpers.
 # ---------------------------------------------------------------------------
 
 import collections as _collections
@@ -348,12 +319,15 @@ _mem_store: _collections.deque = _collections.deque(maxlen=5_000)
 
 
 async def add_flow(flow: dict) -> None:
-    """Append a flow dict to the in-memory store (used by tests and demo path)."""
+    """Append a flow dict to the in-memory store."""
     _mem_store.append(flow)
 
 
-async def get_flows(ticker: str) -> list[dict]:
-    """Return all in-memory flows for a given ticker."""
+def get_flows_sync(ticker: str) -> list[dict]:
+    """
+    Synchronous version of get_flows — returns a plain list.
+    Used by tests that call sum(get_flows_sync(ticker)) directly.
+    """
     return [
         f for f in _mem_store
         if (
@@ -363,6 +337,49 @@ async def get_flows(ticker: str) -> list[dict]:
     ]
 
 
+async def get_flows(ticker: str) -> list[dict]:
+    """Async version — returns a plain list (NOT an async generator)."""
+    return get_flows_sync(ticker)
+
+
+async def aget_flows(ticker: str):
+    """True async generator for callers that need streaming iteration."""
+    for f in _mem_store:
+        key = f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)
+        if key == ticker:
+            yield f
+
+
 async def clear_flows() -> None:
-    """Clear the in-memory store. Called by tests for isolation."""
+    """Clear the in-memory store."""
     _mem_store.clear()
+
+
+# ---------------------------------------------------------------------------
+# FlowStore — backward-compat class for tests that do:
+#   from services.flow_store import FlowStore
+# Wraps the module-level helpers above.
+# ---------------------------------------------------------------------------
+
+class FlowStore:
+    """
+    Thin wrapper around the module-level flow store functions.
+    Provided for backward compatibility with tests that import FlowStore.
+    All methods delegate to the module-level functions.
+    """
+
+    async def add(self, flow: dict) -> None:
+        await add_flow(flow)
+
+    def get(self, ticker: str) -> list[dict]:
+        return get_flows_sync(ticker)
+
+    async def aget(self, ticker: str):
+        async for f in aget_flows(ticker):
+            yield f
+
+    async def clear(self) -> None:
+        await clear_flows()
+
+    def __len__(self) -> int:
+        return len(_mem_store)
