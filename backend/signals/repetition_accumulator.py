@@ -9,14 +9,18 @@ C-007 — Signal Cooldown:
   when threshold is crossed AND either:
     (a) this is the first signal (last_signal_at is None), OR
     (b) signal_cooldown has elapsed since last_signal_at.
-  Default cooldown: 5 minutes. Configurable via signal_cooldown param.
 
-  Note: asyncio is single-threaded and ingest() has zero await points, so
-  concurrent worker access is safe without locks. The bug was signal spam,
-  not a mutation race.
+C-008 — Decouple Persist Tier from Signal Tier:
+  ingest() was the single gate for both DB writes and bus signals.
+  When C-007 cooldown suppressed ingest(), qualifying ticks during the
+  cooldown window were silently dropped from flow_events — backtesting gap.
 
-Clink 8 (future): decouple persist tier from signal tier so ticks during
-  cooldown still write to flow_events for full backtesting fidelity.
+  Fix: split into two explicit methods:
+    ingest_tick(ev)  -> ep if above threshold (persist gate, ignores cooldown)
+    get_signal(ts, ep) -> ep if cooldown elapsed (signal gate)
+
+  ingest() preserved as backward-compat shim (calls both internally).
+  _process_trade now calls ingest_tick + get_signal independently.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -64,32 +68,29 @@ class RepetitionAccumulator:
         window_minutes:  int   = 30,
         min_trades:      int   = 3,
         min_premium:     float = 50_000,
-        signal_cooldown: int   = 5,   # C-007: minutes between repeated signals on same episode
+        signal_cooldown: int   = 5,   # C-007: minutes between repeated signals
     ):
         self.window          = timedelta(minutes=window_minutes)
         self.min_trades      = min_trades
         self.min_premium     = min_premium
-        self.signal_cooldown = timedelta(minutes=signal_cooldown)  # C-007
+        self.signal_cooldown = timedelta(minutes=signal_cooldown)
         self._episodes: Dict[str, RepetitionEpisode] = {}
 
     def _key(self, ev: OptionsFlowEvent) -> str:
         return f"{ev.ticker}:{ev.contract_type}:{ev.strike}:{ev.expiry}"
 
-    def ingest(self, ev: OptionsFlowEvent) -> Optional[RepetitionEpisode]:
+    def ingest_tick(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
         """
-        Add event to the rolling episode window.
+        C-008: Persist tier gate.
 
-        Returns the episode if:
-          - trade_count >= min_trades AND total_premium >= min_premium, AND
-          - either this is the first qualifying signal (last_signal_at is None)
-            OR signal_cooldown has elapsed since the last signal.
+        Adds ev to episode state, prunes the rolling window, and returns
+        the episode if trade_count >= min_trades AND total_premium >= min_premium.
 
-        Returns None if:
-          - thresholds not yet met, OR
-          - thresholds met but cooldown is still active (suppress spam).
+        Cooldown is NOT applied here — every qualifying tick returns ep so
+        that persist_flow_event() can write it to flow_events for full
+        backtesting fidelity.
 
-        C-007: cooldown is per-episode-key. Different contracts on the same
-        ticker are independent episodes and do not share cooldown state.
+        Returns None only when thresholds are not yet met.
         """
         key = self._key(ev)
         ep  = self._episodes.setdefault(key, RepetitionEpisode(
@@ -99,28 +100,55 @@ class RepetitionAccumulator:
             expiry        = ev.expiry,
         ))
 
-        # Prune stale events outside rolling window
         cutoff    = ev.timestamp - self.window
         ep.events = [e for e in ep.events if e.timestamp >= cutoff]
         ep.events.append(ev)
         ep.first_seen = ep.events[0].timestamp
         ep.last_seen  = ev.timestamp
 
-        # Check thresholds
-        if ep.trade_count < self.min_trades or ep.total_premium < self.min_premium:
+        if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
+            return ep
+        return None
+
+    def get_signal(self, ts: datetime, ep: Optional["RepetitionEpisode"]) -> Optional["RepetitionEpisode"]:
+        """
+        C-008: Signal tier gate.
+
+        Given an episode returned by ingest_tick(), applies the C-007 cooldown.
+        Returns ep if cooldown has elapsed (or this is the first signal).
+        Returns None if cooldown is still active — suppresses bus publish.
+
+        ep.last_signal_at is updated here on every fire so that the next
+        call to get_signal() sees the correct elapsed time.
+
+        Pass ep=None (sub-threshold) and this is a guaranteed no-op returning None.
+        """
+        if ep is None:
             return None
 
-        # C-007: cooldown gate — suppress if signal fired recently
         if ep.last_signal_at is not None:
-            elapsed = ev.timestamp - ep.last_signal_at
+            elapsed = ts - ep.last_signal_at
             if elapsed < self.signal_cooldown:
                 return None
 
-        # Threshold crossed AND (first signal OR cooldown elapsed) — fire
-        ep.last_signal_at = ev.timestamp
+        ep.last_signal_at = ts
         return ep
 
-    def get_alert_level(self, ep: RepetitionEpisode) -> str:
+    def ingest(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
+        """
+        Backward-compat shim for C-002 / C-007 tests and any callers
+        that use the original single-return API.
+
+        Internally calls ingest_tick() + get_signal() and returns the
+        signal ep (None if sub-threshold or cooldown active).
+
+        New code in _process_trade should call ingest_tick() and
+        get_signal() independently for decoupled persist/signal control.
+        """
+        persist_ep = self.ingest_tick(ev)
+        return self.get_signal(ev.timestamp, persist_ep)
+
+    def get_alert_level(self, ep: "RepetitionEpisode") -> str:
         prem = ep.total_premium
         if prem >= 5_000_000 or (ep.is_accelerating and prem >= 1_000_000):
             return "CONVICTION"

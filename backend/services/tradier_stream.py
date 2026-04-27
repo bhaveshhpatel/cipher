@@ -95,6 +95,23 @@ Fix (C-003) — Retroactive Sweep Upgrade:
     The count==sweep_min guard prevents repeated UPDATE calls for 4th, 5th
     exchange echoes.
 
+Fix (C-007) — Signal Spam:
+  - ingest() returned ep on every post-threshold call. 32 workers × N ticks
+    = signal flood on the bus and duplicate flow_episodes rows in DB.
+  - Fix: RepetitionAccumulator tracks last_signal_at per episode with a
+    5-minute cooldown. ingest() returns None during cooldown window.
+
+Fix (C-008) — Decouple Persist Tier from Signal Tier:
+  - With C-007 cooldown active, ingest() returned None during cooldown —
+    persist_flow_event() was also suppressed. Ticks 4-N never wrote to
+    flow_events, creating a backtesting gap.
+  - Fix: _process_trade now calls accumulator.ingest_tick(ev) for the
+    persist gate and accumulator.get_signal(ev.timestamp, persist_ep) for
+    the bus/signal gate independently.
+  - persist_flow_event() fires on every qualifying tick (above threshold).
+  - bus.publish_all() fires only when cooldown passes.
+  - Full episode tick history now recoverable from flow_events.
+
 B-008 — Stream Health:
   - _stats gains last_tick_at (float epoch, updated on every classified tick)
     and last_reconnect_at (float epoch, updated on every reconnect attempt).
@@ -140,7 +157,7 @@ from parsers.options_flow_parser import parse_tradier_trade
 from services.flow_store import persist_flow_event, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
-from utils.dedup import flow_dedup   # C-019: Layer 4 dedup now active
+from utils.dedup import flow_dedup
 
 log = logging.getLogger("tradier_stream")
 
@@ -159,13 +176,10 @@ _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-# Event types we process — timesale carries option OCC symbol + real bid/ask/price
-# trade carries equity events with stock price — do NOT process as options flow
 _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
-# Global stats (read by /health/stream endpoint)
-# B-008: added last_tick_at, last_reconnect_at; _stream_start_at for uptime
+# Global stats
 # ---------------------------------------------------------------------------
 _stream_start_at: float = _time.time()
 
@@ -173,13 +187,13 @@ _stats = {
     "active_symbols":    0,
     "ticks":             0,
     "classified":        0,
-    "deduped":           0,   # C-019: events dropped by dedup cache
+    "deduped":           0,
     "signals":           0,
     "errors":            0,
     "reconnects":        0,
     "mode":              "starting",
-    "last_tick_at":      None,       # B-008: epoch float, set on each classified tick
-    "last_reconnect_at": None,       # B-008: epoch float, set on each reconnect attempt
+    "last_tick_at":      None,
+    "last_reconnect_at": None,
 }
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
@@ -187,8 +201,8 @@ accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium
 
 def get_stats() -> dict:
     stats = dict(_stats)
-    stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)  # B-008
-    stats.update(flow_dedup.dedup_stats())  # C-019: merge dedup counters
+    stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
+    stats.update(flow_dedup.dedup_stats())
     return stats
 
 
@@ -255,19 +269,9 @@ async def _get_session_token() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Main streaming entry point — now delegates to StreamManager + SymbolRegistry
+# Main streaming entry point
 # ---------------------------------------------------------------------------
 async def stream_options_flow(symbols: list[str]):
-    """
-    Entry point called from main.py lifespan.
-    `symbols` is the underlying ticker list (e.g. ["AAPL", "TSLA", ...]).
-
-    Automatic demo-mode fallback is DISABLED (2026-04-25).
-    If Tradier key is missing or OCC registry is empty, the stream simply
-    idles and logs a warning instead of emitting synthetic data.
-    To re-enable demo fallback: uncomment the _demo_mode(...) call sites below.
-    Use the admin panel to start the demo engine manually.
-    """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
@@ -324,19 +328,21 @@ async def _guarded_lines(resp: httpx.Response):
 
 
 # ---------------------------------------------------------------------------
-# Trade processor — shared by StreamManager workers and demo engine
+# Trade processor
 # ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
-    C-003 — Retroactive Sweep Upgrade:
-      On the DUPLICATE path (is_duplicate=True), call get_exchange_count().
-      If the count equals sweep_min_exchanges exactly (default 3), this is
-      the tick that just pushed the exchange count over the sweep threshold
-      for the first time. Fire upgrade_to_sweep_in_db() as a background
-      task so the canonical row already in DB gets patched to trade_type='SWEEP'.
-      The count==3 guard prevents repeated UPDATE calls on 4th+ exchange echoes.
+    C-008 — Decoupled persist/signal tiers:
+      persist_ep = accumulator.ingest_tick(ev)       <- above threshold?
+      sig_ep     = accumulator.get_signal(ts, ep)    <- cooldown passed?
+
+      persist_flow_event() called on persist_ep (every qualifying tick).
+      bus.publish_all() called on sig_ep (only when cooldown passes).
+
+      This ensures flow_events gets the full episode tick history for
+      backtesting, while the bus only fires cooldown-gated signals.
     """
     _stats["ticks"] += 1
 
@@ -375,13 +381,7 @@ async def _process_trade(raw: dict):
             f"fill={ev.fill_price} exch={exchange}"
         )
 
-        # ------------------------------------------------------------------
-        # C-003: Retroactive sweep upgrade.
-        # Check if THIS duplicate tick is the one that just crossed the sweep
-        # threshold (exchange_count transitions to exactly sweep_min_exchanges).
-        # Fire an async DB UPDATE to patch the canonical row from 'BTO' -> 'SWEEP'.
-        # count > sweep_min on 4th/5th echoes — guard prevents duplicate UPDATEs.
-        # ------------------------------------------------------------------
+        # C-003: retroactive sweep upgrade
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
             log.info(
@@ -399,17 +399,12 @@ async def _process_trade(raw: dict):
 
         return
 
-    # Canonical print — check for sweep upgrade (pattern already established)
+    # Canonical print — inline sweep upgrade if pattern established
     if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
         real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if ev.trade_type != "SWEEP":
-            log.debug(
-                f"[dedup] sweep upgrade: {occ_symbol} "
-                f"{real_exch_count} exchanges — {ev.trade_type} -> SWEEP"
-            )
             ev.trade_type = "SWEEP"
         ev.exchange_count = real_exch_count
-    # ------------------------------------------------------------------
 
     _stats["classified"] += 1
     _stats["last_tick_at"] = _time.time()
@@ -426,9 +421,14 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
-    # C-002: Gate DB write on accumulator threshold
-    ep = accumulator.ingest(ev)
-    if not ep:
+    # ------------------------------------------------------------------
+    # C-008: Decoupled persist tier / signal tier
+    # ------------------------------------------------------------------
+    persist_ep = accumulator.ingest_tick(ev)             # above threshold? (no cooldown)
+    sig_ep     = accumulator.get_signal(ev.timestamp, persist_ep)  # cooldown passed?
+
+    # Persist every qualifying tick to flow_events (full backtesting history)
+    if not persist_ep:
         return
 
     await persist_flow_event({
@@ -458,26 +458,30 @@ async def _process_trade(raw: dict):
         "is_synthetic_quote":   ev.is_synthetic_quote,
     })
 
-    alert_level = accumulator.get_alert_level(ep)
+    # Only publish signal to bus if cooldown gate passes
+    if not sig_ep:
+        return
+
+    alert_level = accumulator.get_alert_level(sig_ep)
 
     log.info(
-        f"[signal] {ep.ticker} {ep.contract_type} "
+        f"[signal] {sig_ep.ticker} {sig_ep.contract_type} "
         f"| alert={alert_level} "
-        f"| trades={ep.trade_count} "
-        f"| total_prem=${ep.total_premium:,.0f} "
-        f"| accel={ep.is_accelerating} "
-        f"| {ep.summary_str()}"
+        f"| trades={sig_ep.trade_count} "
+        f"| total_prem=${sig_ep.total_premium:,.0f} "
+        f"| accel={sig_ep.is_accelerating} "
+        f"| {sig_ep.summary_str()}"
     )
 
     try:
-        composite = build_composite(ep, accumulator)
+        composite = build_composite(sig_ep, accumulator)
     except Exception as e:
-        log.error(f"[signal] build_composite failed for {ep.ticker}: {e}")
+        log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
-    if ep.contract_type == "CALL":
+    if sig_ep.contract_type == "CALL":
         direction = "REPEAT_BUY"
-    elif ep.contract_type == "PUT":
+    elif sig_ep.contract_type == "PUT":
         direction = "REPEAT_SELL"
     else:
         direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
@@ -485,16 +489,16 @@ async def _process_trade(raw: dict):
     signal = {
         "type": "signal",
         "data": {
-            "ticker":          ep.ticker,
+            "ticker":          sig_ep.ticker,
             "direction":       direction,
-            "contract_type":   ep.contract_type,
-            "strike":          ep.strike,
-            "expiry":          ep.expiry,
-            "total_premium":   ep.total_premium,
-            "trade_count":     ep.trade_count,
+            "contract_type":   sig_ep.contract_type,
+            "strike":          sig_ep.strike,
+            "expiry":          sig_ep.expiry,
+            "total_premium":   sig_ep.total_premium,
+            "trade_count":     sig_ep.trade_count,
             "alert_level":     alert_level,
-            "is_accelerating": ep.is_accelerating,
-            "seed_episode":    ep.summary_str(),
+            "is_accelerating": sig_ep.is_accelerating,
+            "seed_episode":    sig_ep.summary_str(),
             "timestamp":       ev.timestamp.isoformat(),
         },
     }
@@ -515,12 +519,12 @@ async def _process_trade(raw: dict):
                     "reasoning":             composite.reasoning,
                 },
                 "episode": {
-                    "contract_type":   ep.contract_type,
+                    "contract_type":   sig_ep.contract_type,
                     "direction":       direction,
                     "influence_tier":  ev.influence_tier,
-                    "total_premium":   ep.total_premium,
-                    "trade_count":     ep.trade_count,
-                    "is_accelerating": ep.is_accelerating,
+                    "total_premium":   sig_ep.total_premium,
+                    "trade_count":     sig_ep.trade_count,
+                    "is_accelerating": sig_ep.is_accelerating,
                     "timestamp":       ev.timestamp.isoformat(),
                 },
             },
