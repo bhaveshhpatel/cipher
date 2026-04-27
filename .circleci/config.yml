@@ -114,9 +114,8 @@ jobs:
           command: npm install -g @railway/cli
       - run:
           name: Deploy backend to Railway
-          command: railway up --service backend
+          command: railway up --service cipher
           # RAILWAY_TOKEN is set in CircleCI Project Settings → Environment Variables
-          # Change "backend" to your actual Railway service name if different.
 
 # -----------------------------------------------------------------------
 # Workflows
@@ -145,7 +144,7 @@ workflows:
       - deploy:
           requires:
             - lint
-            - regression        # deploy ONLY if both jobs pass
+            - regression
           filters:
             branches:
-              only: main         # deploy ONLY on main, never on feature branches
+              only: main
