@@ -16,7 +16,7 @@ def test_event_bus_publish_delivers():
         q = b.subscribe("ch")
         await b.publish("ch", {"x": 1})
         return await q.get()
-    result = asyncio.get_event_loop().run_until_complete(_run())
+    result = asyncio.run(_run())
     assert result["x"] == 1
 
 
@@ -38,7 +38,7 @@ def test_event_bus_publish_queue_full_drops_gracefully():
         # This publish should silently drop (QueueFull)
         await b.publish("ch", "overflow")
         return q.qsize()
-    size = asyncio.get_event_loop().run_until_complete(_run())
+    size = asyncio.run(_run())
     assert size == 500  # maxsize, not 501
 
 
@@ -49,7 +49,7 @@ def test_event_bus_publish_all():
         q2 = b.subscribe("b")
         await b.publish_all({"msg": "hi"})
         return await q1.get(), await q2.get()
-    r1, r2 = asyncio.get_event_loop().run_until_complete(_run())
+    r1, r2 = asyncio.run(_run())
     assert r1["msg"] == "hi"
     assert r2["msg"] == "hi"
 
@@ -66,7 +66,7 @@ def test_async_bus_subscribe_and_publish():
         b.subscribe("ch", handler)
         await b.publish("ch", {"val": 42})
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     assert received[0]["val"] == 42
 
 
@@ -104,6 +104,6 @@ def test_async_bus_publish_all():
         b.subscribe("b", hb)
         await b.publish_all({"x": 1})
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     assert received["a"][0]["x"] == 1
     assert received["b"][0]["x"] == 1

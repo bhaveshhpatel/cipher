@@ -44,7 +44,7 @@ def test_get_stats_initial():
 
 def test_start_demo_already_running():
     _de._running = True
-    result = asyncio.get_event_loop().run_until_complete(start_demo())
+    result = asyncio.run(start_demo())
     assert result["status"] == "already_running"
     _de._running = False
 
@@ -52,7 +52,7 @@ def test_start_demo_already_running():
 # --- stop_demo already_stopped ---
 
 def test_stop_demo_already_stopped():
-    result = asyncio.get_event_loop().run_until_complete(stop_demo())
+    result = asyncio.run(stop_demo())
     assert result["status"] == "already_stopped"
 
 
@@ -67,7 +67,7 @@ def test_start_and_stop_demo():
             res_stop = await stop_demo()
             assert res_stop["status"] == "stopped"
             assert is_running() is False
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 # --- _run_demo_loop: CancelledError propagates, error branch ---
@@ -80,7 +80,7 @@ def test_run_demo_loop_cancelled():
                 await _run_demo_loop(["AAPL"])
             except asyncio.CancelledError:
                 pass
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 def test_run_demo_loop_exception_increments_errors():
@@ -94,5 +94,5 @@ def test_run_demo_loop_exception_increments_errors():
                 await _run_demo_loop(["AAPL"])
             except RuntimeError:
                 pass
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     assert _de._stats["errors"] == 1

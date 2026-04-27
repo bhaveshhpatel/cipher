@@ -27,10 +27,6 @@ from signals.composite_signal_engine import (
 from parsers.options_flow_parser import OptionsFlowEvent
 
 
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -48,11 +44,6 @@ def _make_event(
     ts=None,
     is_golden_sweep=False,
 ) -> OptionsFlowEvent:
-    """Build a minimal OptionsFlowEvent for testing.
-
-    Note: OptionsFlowEvent has no 'exchange' field. Use exchange_count (int)
-    instead. influence_tier is set after construction.
-    """
     ts = ts or datetime(2026, 4, 25, 10, 0, 0)
     ev = OptionsFlowEvent(
         id=f"{ticker}_{expiry}_{strike}",
@@ -327,7 +318,6 @@ class TestBuildCompositeAsync:
             _make_event(premium=1_000_000, tier="WHALE", ts=base_ts + timedelta(seconds=i))
             for i in range(3)
         ]
-        # episode helper defined at module level — call with list + ticker
         ep = RepetitionEpisode(
             ticker="AAPL",
             contract_type="CALL",
@@ -355,7 +345,7 @@ class TestBuildCompositeAsync:
             from signals.composite_signal_engine import build_composite_async
             ep  = self._make_episode()
             acc = RepetitionAccumulator()
-            sig = _run(build_composite_async(ep, acc))
+            sig = asyncio.run(build_composite_async(ep, acc))
         assert sig.swarm_direction == "BUY"
         assert sig.swarm_confidence == 0.833
         assert sig.swarm_bull_votes == 5
@@ -367,7 +357,7 @@ class TestBuildCompositeAsync:
             from signals.composite_signal_engine import build_composite_async
             ep  = self._make_episode()
             acc = RepetitionAccumulator()
-            sig = _run(build_composite_async(ep, acc))
+            sig = asyncio.run(build_composite_async(ep, acc))
         assert sig.swarm_direction is None
 
     def test_n_agents_forwarded(self):
@@ -380,6 +370,6 @@ class TestBuildCompositeAsync:
             from signals.composite_signal_engine import build_composite_async
             ep  = self._make_episode()
             acc = RepetitionAccumulator()
-            _run(build_composite_async(ep, acc, n_agents=9))
+            asyncio.run(build_composite_async(ep, acc, n_agents=9))
             call_kwargs = mock_run.call_args[1]
             assert call_kwargs.get("n_agents") == 9

@@ -22,6 +22,12 @@ class _Flow:
     reasoning: str = "test"
 
 
+def setup_function():
+    """Clear in-memory signal store before every test to prevent state bleed."""
+    from services.signal_store import _clear_signal_memory
+    _clear_signal_memory()
+
+
 def test_normalise_direction_bullish():
     from services.signal_store import _normalise_direction
     assert _normalise_direction("bullish") == "bullish"
