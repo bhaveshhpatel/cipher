@@ -153,18 +153,33 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         exc_cnt  = int(raw.get("exchange_count", 1) or 1)
         fill_cnt = int(raw.get("fill_count", 1) or 1)
 
+        # ------------------------------------------------------------------
+        # Synthetic quote handling
+        # When bid=ask=0 we have no real spread data. Instead of fabricating
+        # a tight \u00b10.5% spread and running classification (which almost
+        # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
+        # wide-spread contracts), we:
+        #   1. Flag is_synthetic_quote=True
+        #   2. Force bid_ask_class="MID" \u2014 neutral, unknown fill placement
+        #   3. Force is_aggressive=False \u2014 cannot claim aggression without quotes
+        #   4. Apply a 40% conviction haircut (\u00d70.6) downstream
+        # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
         effective_ask = ask
+
         if effective_bid == 0 and effective_ask == 0 and fill > 0:
             effective_bid = round(fill * 0.995, 4)
             effective_ask = round(fill * 1.005, 4)
             is_synthetic_quote = True
+            ba_class   = "MID"   # force neutral, skip classify_bid_ask
+            aggressive = False   # cannot claim aggression without real quotes
+        else:
+            ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
+            aggressive = is_aggressive(ba_class)
 
-        ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
-        ttype      = detect_trade_type(size, premium, exc_cnt, fill_cnt)
-        aggressive = is_aggressive(ba_class)
-        golden     = is_golden_sweep(ttype, premium, aggressive)
+        ttype  = detect_trade_type(size, premium, exc_cnt, fill_cnt)
+        golden = is_golden_sweep(ttype, premium, aggressive)
 
         ev = OptionsFlowEvent(
             id              = raw.get("id", f"{ticker}_{expiry}_{strike}_{ctype}"),
@@ -204,7 +219,7 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             ev.influence_tier = "LARGE"
 
         dte_urgency = 0.1 if dte <= 7 else (0.05 if dte <= 30 else 0.0)
-        ev.conviction_score = round(
+        raw_conviction = round(
             min(
                 (0.4 if aggressive else 0.15)
                 + (0.25 if golden else 0.0)
@@ -214,6 +229,14 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             ),
             3,
         )
+
+        # 40% conviction haircut for synthetic quotes — prevents wide-spread
+        # contracts with unknown fill placement from scoring as high-conviction
+        # events solely on premium size.
+        if is_synthetic_quote:
+            ev.conviction_score = round(raw_conviction * 0.6, 3)
+        else:
+            ev.conviction_score = raw_conviction
 
         try:
             reg = get_registry()
