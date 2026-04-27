@@ -14,11 +14,12 @@ Endpoints:
   GET   /api/admin/tier-thresholds       — read the active tier_thresholds row + cache state  [B-019]
   PATCH /api/admin/tier-thresholds       — update T1/T2/T3 threshold columns  [4A / B-019]
   GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A / B-020]
+  POST  /api/admin/registry/prewarm      — trigger registry.build() on demand (background task)
 """
 import asyncio
 import logging
 import time
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Any
 from core.auth import get_current_user, TokenData
@@ -281,4 +282,50 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
             }
             for t, syms in tiers.items()
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Registry pre-warm — on-demand trigger
+# Mirrors exactly what _registry_prewarm_loop() does at 9:15 AM ET.
+# Fires registry.build() in a FastAPI BackgroundTask so this endpoint
+# returns 202 immediately without blocking the event loop.
+# ---------------------------------------------------------------------------
+
+async def _run_prewarm(triggered_by: str) -> None:
+    from services.symbol_registry import get_registry
+    log.info("[prewarm] Manual trigger by %s — building OCC registry...", triggered_by)
+    try:
+        registry = get_registry()
+        if registry is None:
+            log.warning("[prewarm] Registry not initialised — cannot pre-warm")
+            return
+        count = await registry.build()
+        log.info(
+            "[prewarm] Manual pre-warm complete: %d OCC contracts ready (triggered by %s)",
+            count or 0, triggered_by,
+        )
+    except Exception as exc:
+        log.error("[prewarm] Manual pre-warm failed: %s", exc, exc_info=True)
+
+
+@router.post("/registry/prewarm", status_code=202)
+async def registry_prewarm(
+    background_tasks: BackgroundTasks,
+    admin: TokenData = Depends(_require_admin),
+):
+    """
+    Trigger an immediate OCC registry build in the background.
+
+    Equivalent to what the scheduled 9:15 AM ET pre-warm does.
+    Returns 202 Accepted immediately; build runs asynchronously.
+    Check Railway logs for '[prewarm] Manual pre-warm complete' to confirm.
+    """
+    log.info("[admin] Registry pre-warm requested by %s", admin.email)
+    background_tasks.add_task(_run_prewarm, admin.email)
+    return {
+        "ok":      True,
+        "status":  "accepted",
+        "message": "Registry build started in background. Watch logs for '[prewarm] Manual pre-warm complete'.",
+        "triggered_by": admin.email,
     }
