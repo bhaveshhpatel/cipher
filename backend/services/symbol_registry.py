@@ -122,10 +122,16 @@ class SymbolRegistry:
 
     async def build(self) -> int:
         from services.ingestion_config import get_config
-        from services.tier_engine import _fetch_thresholds
+        from services.tier_engine import _fetch_thresholds, assign_tiers
+        from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
+        # Use T3 params for the initial build pass — all tickers get widest filter.
+        # After OI is collected, we reclassify and update tier on each ContractMeta.
         tier_params  = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
+        # Force all tickers through T3 params on first pass so no symbol is excluded
+        # due to a stale T3 tier_map assignment.
+        bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
 
         async with self._build_lock:
             log.info(
@@ -150,12 +156,42 @@ class SymbolRegistry:
                     prices.get(ticker, 0.0),
                     new_registry,
                     new_oi_by_ticker,
-                    tier_params,
+                    bootstrap_params,  # use T3 params for all tickers on build pass
                 )
                 for ticker in self._watchlist
                 if ticker in prices and prices[ticker] > 0
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # --- Post-build tier reclassification using live price + OI ---
+            # Build synthetic SymbolQuote objects from collected prices and OI
+            # so assign_tiers() can do a proper T1/T2/T3 classification.
+            synthetic_quotes = [
+                SymbolQuote(
+                    symbol         = ticker,
+                    last_price     = prices.get(ticker, 0.0),
+                    volume         = 0,
+                    average_volume = 0,
+                    open_interest  = new_oi_by_ticker.get(ticker, 0),
+                )
+                for ticker in self._watchlist
+                if ticker in prices
+            ]
+            live_tier_map = await assign_tiers(synthetic_quotes, thresholds=thresh)
+            log.info(
+                "[symbol_registry] Post-build tier reclassification: T1=%d T2=%d T3=%d",
+                sum(1 for t in live_tier_map.values() if t == 1),
+                sum(1 for t in live_tier_map.values() if t == 2),
+                sum(1 for t in live_tier_map.values() if t == 3),
+            )
+
+            # Update tier on every ContractMeta with the reclassified value
+            for occ_sym, meta in new_registry.items():
+                new_tier = live_tier_map.get(meta.ticker, 3)
+                meta.tier = new_tier
+
+            # Store the updated tier_map for future refresh cycles
+            self._tier_map = live_tier_map
 
             old_count           = len(self._registry)
             self._registry      = new_registry
@@ -187,9 +223,6 @@ class SymbolRegistry:
         from services.chain_store import save_chain
         from services import universe_store
         try:
-            # Use get_running_loop() — we are already inside an async method.
-            # get_event_loop() is deprecated in Python 3.10+ and broken in 3.12
-            # when called from a running coroutine.
             loop = asyncio.get_running_loop()
             snap_rows = await loop.run_in_executor(
                 None,
