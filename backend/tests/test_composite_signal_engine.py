@@ -131,7 +131,6 @@ def test_vwpf_zero_open_interest_returns_half():
 
 
 def test_vwpf_low_premium_vs_oi():
-    # premium=1000, oi=100_000 -> 1000/(100_000*100)=0.0001 < 0.5
     ep = _fake_episode(n_events=1, premium_each=1_000.0, open_interest=100_000)
     factor = volume_weighted_premium_factor(ep)
     assert factor < 0.5
@@ -275,14 +274,15 @@ def _ev(ticker="AAPL", premium=100_000.0, ts_offset_secs=0):
 def test_accumulator_returns_none_below_threshold():
     acc = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
     ev  = _ev(premium=10_000.0)
-    result = acc.ingest(ev)
+    result = asyncio.run(acc.ingest(ev))
     assert result is None
 
 
 def test_accumulator_returns_episode_at_threshold():
     acc = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+    result = None
     for i in range(3):
-        result = acc.ingest(_ev(premium=20_000.0, ts_offset_secs=i * 60))
+        result = asyncio.run(acc.ingest(_ev(premium=20_000.0, ts_offset_secs=i * 60)))
     assert result is not None
     assert isinstance(result, RepetitionEpisode)
     assert result.trade_count == 3
@@ -346,7 +346,7 @@ def test_build_composite_async_populates_swarm_fields():
                 sig = await build_composite_async(ep, acc)
         return sig
 
-    sig = asyncio.get_event_loop().run_until_complete(_test())
+    sig = asyncio.run(_test())
     assert isinstance(sig, CompositeSignal)
     assert sig.swarm_direction  == "BUY"
     assert sig.swarm_confidence == pytest.approx(0.82)
@@ -367,7 +367,7 @@ def test_build_composite_async_swarm_failure_is_nonfatal():
             sig = await build_composite_async(ep, acc)
         return sig
 
-    sig = asyncio.get_event_loop().run_until_complete(_test())
+    sig = asyncio.run(_test())
     assert isinstance(sig, CompositeSignal)
     assert sig.swarm_direction is None
     assert 0.0 <= sig.composite_score <= 1.0
