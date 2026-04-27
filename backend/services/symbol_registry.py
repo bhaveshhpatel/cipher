@@ -95,9 +95,19 @@ class SymbolRegistry:
         """
         from services.chain_store import load_chain
         chain = await load_chain(snapshot_id)
+        # Explicit None check: empty dict {} means DB returned cleanly but
+        # snapshot has no cached contracts yet — that is not an error.
+        if chain is None:
+            log.info(
+                "[symbol_registry] load_from_db: DB error for snapshot %s — "
+                "skipping pre-seed, full build() will populate registry",
+                snapshot_id,
+            )
+            return 0
         if not chain:
             log.info(
-                "[symbol_registry] load_from_db: no cached chain for snapshot %s",
+                "[symbol_registry] load_from_db: no cached chain for snapshot %s "
+                "— will build from Tradier",
                 snapshot_id,
             )
             return 0
@@ -177,8 +187,10 @@ class SymbolRegistry:
         from services.chain_store import save_chain
         from services import universe_store
         try:
-            # Resolve the active snapshot_id
-            loop = asyncio.get_event_loop()
+            # Use get_running_loop() — we are already inside an async method.
+            # get_event_loop() is deprecated in Python 3.10+ and broken in 3.12
+            # when called from a running coroutine.
+            loop = asyncio.get_running_loop()
             snap_rows = await loop.run_in_executor(
                 None,
                 lambda: universe_store._client()

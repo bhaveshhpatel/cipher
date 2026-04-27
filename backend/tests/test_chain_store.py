@@ -7,6 +7,7 @@ Covers: save_chain, load_chain, empty inputs, error paths, pagination.
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import services.chain_store as chain_store_mod
 from services.symbol_registry import ContractMeta
 
 
@@ -42,8 +43,6 @@ def _mock_sb(rows=None, upsert_ok=True):
           .range.return_value
           .execute.return_value
     ) = exec_result
-    # table().upsert().execute()
-    upsert_exec = MagicMock()
     if not upsert_ok:
         sb.table.return_value.upsert.side_effect = RuntimeError("DB error")
     else:
@@ -59,11 +58,7 @@ def test_save_chain_success():
     registry = _make_registry(3)
     sb = _mock_sb(upsert_ok=True)
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["save_chain"]).save_chain(
-                "snap-001", registry
-            )
-        )
+        result = asyncio.run(chain_store_mod.save_chain("snap-001", registry))
     assert result is True
     assert sb.table.called
 
@@ -71,11 +66,7 @@ def test_save_chain_success():
 def test_save_chain_empty_registry_returns_true():
     """Empty registry is a no-op and returns True without hitting DB."""
     with patch("services.chain_store._client") as mock_client:
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["save_chain"]).save_chain(
-                "snap-001", {}
-            )
-        )
+        result = asyncio.run(chain_store_mod.save_chain("snap-001", {}))
     assert result is True
     mock_client.assert_not_called()
 
@@ -84,11 +75,7 @@ def test_save_chain_db_error_returns_false():
     sb = _mock_sb(upsert_ok=False)
     registry = _make_registry(2)
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["save_chain"]).save_chain(
-                "snap-001", registry
-            )
-        )
+        result = asyncio.run(chain_store_mod.save_chain("snap-001", registry))
     assert result is False
 
 
@@ -97,25 +84,17 @@ def test_save_chain_batches_correctly():
     registry = _make_registry(601)
     sb = _mock_sb(upsert_ok=True)
     with patch("services.chain_store._client", return_value=sb):
-        asyncio.run(
-            __import__("services.chain_store", fromlist=["save_chain"]).save_chain(
-                "snap-002", registry
-            )
-        )
+        asyncio.run(chain_store_mod.save_chain("snap-002", registry))
     assert sb.table.return_value.upsert.call_count == 2
 
 
-def test_save_chain_missing_service_key_raises():
+def test_save_chain_missing_service_key_returns_false():
     """_client() raises RuntimeError when SUPABASE_SERVICE_KEY is empty."""
     with patch("services.chain_store.settings") as mock_settings:
         mock_settings.SUPABASE_SERVICE_KEY = ""
         mock_settings.SUPABASE_URL = "https://x.supabase.co"
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["save_chain"]).save_chain(
-                "snap-001", _make_registry(1)
-            )
-        )
-    assert result is False   # RuntimeError caught, returns False
+        result = asyncio.run(chain_store_mod.save_chain("snap-001", _make_registry(1)))
+    assert result is False   # RuntimeError caught → False
 
 
 # ---------------------------------------------------------------------------
@@ -142,11 +121,7 @@ def test_load_chain_returns_contract_meta():
     rows = _make_db_rows(3)
     sb = _mock_sb(rows=rows)
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["load_chain"]).load_chain(
-                "snap-001"
-            )
-        )
+        result = asyncio.run(chain_store_mod.load_chain("snap-001"))
     assert result is not None
     assert len(result) == 3
     first_key = list(result.keys())[0]
@@ -157,11 +132,7 @@ def test_load_chain_returns_contract_meta():
 def test_load_chain_empty_table_returns_empty_dict():
     sb = _mock_sb(rows=[])
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["load_chain"]).load_chain(
-                "snap-001"
-            )
-        )
+        result = asyncio.run(chain_store_mod.load_chain("snap-001"))
     assert result == {}
 
 
@@ -169,11 +140,7 @@ def test_load_chain_db_error_returns_none():
     sb = MagicMock()
     sb.table.side_effect = RuntimeError("connection refused")
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["load_chain"]).load_chain(
-                "snap-001"
-            )
-        )
+        result = asyncio.run(chain_store_mod.load_chain("snap-001"))
     assert result is None
 
 
@@ -184,11 +151,7 @@ def test_load_chain_skips_rows_with_empty_occ_symbol():
                  "dte": 10, "open_interest": 100, "tier": 2})
     sb = _mock_sb(rows=rows)
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["load_chain"]).load_chain(
-                "snap-001"
-            )
-        )
+        result = asyncio.run(chain_store_mod.load_chain("snap-001"))
     assert len(result) == 2   # blank occ_symbol row is skipped
 
 
@@ -205,9 +168,5 @@ def test_load_chain_tier_defaults_to_3_when_missing():
     }]
     sb = _mock_sb(rows=rows)
     with patch("services.chain_store._client", return_value=sb):
-        result = asyncio.run(
-            __import__("services.chain_store", fromlist=["load_chain"]).load_chain(
-                "snap-001"
-            )
-        )
+        result = asyncio.run(chain_store_mod.load_chain("snap-001"))
     assert result["SPY   260117C00500000"].tier == 3

@@ -21,6 +21,7 @@ Design notes
 - Non-fatal: all errors are logged as warnings; callers must not crash on
   failure — the in-memory registry is always the source of truth.
 """
+import asyncio
 import logging
 from typing import Optional, TYPE_CHECKING
 
@@ -47,7 +48,7 @@ def _client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# Public async wrappers (thin — sync work is fast enough for executor)
+# Public async wrappers
 # ---------------------------------------------------------------------------
 
 async def save_chain(
@@ -58,8 +59,7 @@ async def save_chain(
     Upsert all ContractMeta rows into options_chain_cache for snapshot_id.
     Returns True on success, False on any error.
     """
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, _sync_save_chain, snapshot_id, registry_dict
     )
@@ -73,8 +73,7 @@ async def load_chain(
     Returns dict[occ_symbol -> ContractMeta], empty dict if nothing cached,
     or None on DB error.
     """
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _sync_load_chain, snapshot_id)
 
 
