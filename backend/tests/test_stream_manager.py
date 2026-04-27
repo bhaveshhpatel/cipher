@@ -74,8 +74,8 @@ def test_stream_manager_multiple_instances_are_independent():
     assert mgr_b._stream is not mgr_a._stream
 
 
-def test_stream_manager_patch_start():
+def test_stream_manager_patch_start_called():
     mgr = StreamManager()
     with patch.object(mgr, "start") as mock_start:
-        mgr.start()
+        asyncio.run(mock_start())
         mock_start.assert_called_once()

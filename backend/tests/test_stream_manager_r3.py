@@ -54,5 +54,5 @@ def test_stream_manager_r3_stop_with_mock_stream():
 def test_stream_manager_r3_patch_start_called():
     mgr = StreamManager()
     with patch.object(mgr, "start") as mock_start:
-        mgr.start()
+        asyncio.run(mock_start())
         mock_start.assert_called_once()
