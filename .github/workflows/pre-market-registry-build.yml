@@ -1,0 +1,21 @@
+name: Pre-Market Registry Build
+
+on:
+  schedule:
+    - cron: '45 12 * * 1-5'  # 8:45 AM ET (12:45 UTC), Mon–Fri
+  workflow_dispatch:          # manual trigger for testing
+
+jobs:
+  trigger-registry-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger registry build on Railway
+        run: |
+          curl -X POST "${{ secrets.RAILWAY_ADMIN_URL }}/admin/rebuild-universe" \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_SECRET }}" \
+            --fail \
+            --retry 3 \
+            --retry-delay 10
+      - name: Log result
+        if: always()
+        run: echo "Registry build trigger completed at $(date -u)"
