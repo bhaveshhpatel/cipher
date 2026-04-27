@@ -20,9 +20,8 @@ Tests in this file:
   C020-7  Dedup stats counter increments only on actual duplicates
   C020-8  Regression: existing dedup edge-case tests still pass
 """
-import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -60,11 +59,9 @@ def test_c020_1_wall_clock_ttl_expires():
     size = 150
     fill = 4.25
 
-    # Seed with a timestamp 10 seconds ago (wall clock)
     past = time.time() - 10.0
     cache.is_duplicate(occ, size, fill, exchange="C", ts=past)
 
-    # Now check with current wall clock — should NOT be a duplicate (expired)
     result = cache.is_duplicate(occ, size, fill, exchange="M", ts=time.time())
     assert result is False, "Entry should have expired after 10s with TTL=5s"
 
@@ -86,28 +83,18 @@ def test_c020_2_monotonic_breaks_ttl_documents_old_bug():
     size = 100
     fill = 3.50
 
-    # Seed with wall-clock (as DedupCache does internally on first call)
-    past_wall = time.time() - 10.0  # 10 seconds ago
+    past_wall = time.time() - 10.0
     cache.is_duplicate(occ, size, fill, exchange="C", ts=past_wall)
 
-    # Simulate what the old bug did: pass monotonic() as 'now'
-    # monotonic is a small float (e.g. process uptime), wall-clock is ~1.77e9
-    # (now - first_seen) = small_float - 1.77e9 = large negative → always < TTL
-    monotonic_now = time.monotonic()  # small, e.g. 8431.2
+    monotonic_now = time.monotonic()
     result_old_bug = cache.is_duplicate(occ, size, fill, exchange="M", ts=monotonic_now)
 
-    # With monotonic, even a 10-second-old entry looks like a duplicate
-    # because (monotonic - epoch) is a huge negative < 5.0
     assert result_old_bug is True, (
         "BUG REPRODUCTION: monotonic 'now' vs wall-clock first_seen should "
         "always produce a duplicate (large negative difference < TTL). "
         "This was the C-020 bug."
     )
 
-    # Confirm that the CORRECT behavior (wall-clock now) gives the right answer
-    result_fixed = cache.is_duplicate(occ, size, fill, exchange="X", ts=time.time())
-    # Cache was just re-seeded by the monotonic call, so this is a fresh entry now
-    # But if we use a fresh cache to test cleanly:
     cache2 = DedupCache(ttl_seconds=5.0)
     cache2.is_duplicate(occ, size, fill, exchange="C", ts=time.time() - 10.0)
     result_correct = cache2.is_duplicate(occ, size, fill, exchange="M", ts=time.time())
@@ -131,12 +118,10 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
 
     captured_ts = []
 
-    original_is_dup = ts_module.flow_dedup.is_duplicate
-
     def _spy_is_duplicate(occ_symbol, size, fill, exchange=None, ts=None):
         if ts is not None:
             captured_ts.append(ts)
-        return False  # always pass through
+        return False
 
     raw = _make_timesale_raw()
 
@@ -149,7 +134,6 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
     assert len(captured_ts) == 1, "is_duplicate should have been called exactly once"
     ts_val = captured_ts[0]
 
-    # Wall-clock epoch is > 1e9 (year 2001+); monotonic is process uptime (small)
     assert ts_val > 1_000_000_000, (
         f"C-020: arrival_ts should be wall-clock (> 1e9) but got {ts_val:.2f}. "
         f"If this fails, _time.monotonic() is still being used instead of _time.time()."
@@ -206,8 +190,6 @@ def test_c020_6_wall_clock_magnitude():
     mono = t.monotonic()
 
     assert wall > 1_000_000_000, f"time.time() should be epoch-scale, got {wall}"
-    # monotonic will be small unless the machine has been running for 11+ days
-    # we just verify they are in very different number spaces
     assert wall > mono * 1000, (
         f"time.time() ({wall:.0f}) should be orders of magnitude larger than "
         f"time.monotonic() ({mono:.1f}). If not, the clock mismatch bug is present."
@@ -226,9 +208,9 @@ def test_c020_7_dedup_stats_count_correct():
     now = time.time()
     occ, size, fill = "MSFT260117C00400000", 75, 8.00
 
-    cache.is_duplicate(occ, size, fill, exchange="C", ts=now)        # canonical
-    cache.is_duplicate(occ, size, fill, exchange="M", ts=now + 1.0)  # dup
-    cache.is_duplicate(occ, size, fill, exchange="X", ts=now + 3.0)  # dup
+    cache.is_duplicate(occ, size, fill, exchange="C", ts=now)
+    cache.is_duplicate(occ, size, fill, exchange="M", ts=now + 1.0)
+    cache.is_duplicate(occ, size, fill, exchange="X", ts=now + 3.0)
 
     stats = cache.dedup_stats()
     assert stats["dedup_seen"]       == 1, f"Expected 1 canonical, got {stats['dedup_seen']}"
@@ -262,9 +244,9 @@ def test_c020_8_regression_sweep_detection_still_works():
     now = time.time()
     occ, size, fill = "QQQ260620C00450000", 300, 6.75
 
-    cache.is_duplicate(occ, size, fill, exchange="C", ts=now)        # CBOE
-    cache.is_duplicate(occ, size, fill, exchange="M", ts=now + 1.5)  # MIAX (dup, but tracked)
-    cache.is_duplicate(occ, size, fill, exchange="X", ts=now + 3.0)  # PHLX (dup, but tracked)
+    cache.is_duplicate(occ, size, fill, exchange="C", ts=now)
+    cache.is_duplicate(occ, size, fill, exchange="M", ts=now + 1.5)
+    cache.is_duplicate(occ, size, fill, exchange="X", ts=now + 3.0)
 
     assert cache.is_sweep(occ, size, fill) is True, (
         "3 exchanges within sweep_window should trigger sweep detection"

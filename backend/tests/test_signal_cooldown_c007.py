@@ -94,7 +94,6 @@ class TestC007CooldownSuppresses:
         for i in range(3):
             acc.ingest(_make_ev(premium=20_000.0, timestamp=base_ts + timedelta(seconds=i * 10)))
 
-        # 4th tick arrives 1 min later — inside 5-min cooldown
         ev4 = _make_ev(premium=20_000.0, timestamp=base_ts + timedelta(minutes=1))
         result = acc.ingest(ev4)
         assert result is None, (
@@ -113,7 +112,6 @@ class TestC007CooldownExpiry:
         for i in range(3):
             acc.ingest(_make_ev(premium=20_000.0, timestamp=base_ts + timedelta(seconds=i * 10)))
 
-        # Tick arriving 6 minutes after last signal — cooldown expired
         ev_late = _make_ev(premium=20_000.0, timestamp=base_ts + timedelta(minutes=6))
         result = acc.ingest(ev_late)
         assert result is not None, "Tick after cooldown should fire signal"
@@ -128,14 +126,12 @@ class TestC007PerEpisodeKey:
         """C007-4: TSLA PUT episode fires independently of TSLA CALL cooldown."""
         acc = _acc(cooldown_minutes=5)
 
-        # Trigger CALL episode
         for i in range(3):
             acc.ingest(_make_ev(
                 contract_type="CALL", premium=20_000.0,
                 timestamp=base_ts + timedelta(seconds=i * 10)
             ))
 
-        # CALL cooldown now active. PUT episode should still fire freely.
         for i in range(2):
             acc.ingest(_make_ev(
                 contract_type="PUT", premium=20_000.0,
@@ -159,7 +155,6 @@ class TestC007SubThreshold:
         """C007-5: even after cooldown expires, sub-threshold ticks must return None."""
         acc = _acc(cooldown_minutes=1)
 
-        # Only 2 ticks — never crosses min_trades=3
         ev1 = _make_ev(premium=20_000.0, timestamp=base_ts)
         ev2 = _make_ev(premium=20_000.0, timestamp=base_ts + timedelta(minutes=10))
 
@@ -185,7 +180,6 @@ class TestC007LastSignalAt:
             f"Expected last_signal_at={ts3}, got {ep.last_signal_at}"
         )
 
-        # Now fire again after cooldown
         ts_late = base_ts + timedelta(minutes=6)
         ep2 = acc.ingest(_make_ev(premium=20_000.0, timestamp=ts_late))
         assert ep2 is not None
@@ -199,13 +193,10 @@ class TestC007WindowPruning:
     def test_c007_7_stale_events_pruned(self):
         """C007-7: events outside window_minutes are pruned before threshold is checked."""
         acc = _acc()
-        # 3 ticks 35 minutes ago — outside 30-min window
         old_ts = base_ts - timedelta(minutes=35)
         for i in range(3):
             acc.ingest(_make_ev(premium=20_000.0, timestamp=old_ts + timedelta(seconds=i)))
 
-        # Now a single fresh tick — stale events pruned, only 1 event in window
-        # trade_count = 1 — should NOT fire
         ev_fresh = _make_ev(premium=20_000.0, timestamp=base_ts)
         result = acc.ingest(ev_fresh)
         assert result is None, (
@@ -233,7 +224,6 @@ class TestC007AlertLevelRegression:
         assert acc.get_alert_level(_ep_with_premium(1_500_000)) == "STRONG_SIGNAL"
         assert acc.get_alert_level(_ep_with_premium(6_000_000)) == "CONVICTION"
 
-        # Accelerating + $1M premium should hit CONVICTION
         ep_accel = MagicMock(spec=RepetitionEpisode)
         ep_accel.total_premium = 1_000_000
         ep_accel.is_accelerating = True

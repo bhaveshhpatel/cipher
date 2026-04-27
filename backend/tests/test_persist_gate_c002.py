@@ -23,8 +23,7 @@ Test IDs:
 
 Run: pytest backend/tests/test_persist_gate_c002.py -v
 """
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import sys, os
 
@@ -139,13 +138,13 @@ class TestC002SubThreshold:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = None   # sub-threshold — no episode
+            mock_acc.ingest_tick.return_value = None
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
         mock_acc.ingest_tick.assert_called_once_with(ev)
-        mock_persist.assert_not_called()   # ← KEY: no DB write for sub-threshold
+        mock_persist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +170,7 @@ class TestC002ThresholdCrossing:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = ep    # cooldown passed — signal fires too
+            mock_acc.get_signal.return_value = ep
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
@@ -202,7 +201,7 @@ class TestC002SubsequentQualifyingTicks:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = None   # cooldown active — bus silent
+            mock_acc.get_signal.return_value = None
             mock_acc.get_alert_level.return_value = "WATCH"
             mock_bus.publish_all = AsyncMock()
 
@@ -269,7 +268,7 @@ class TestC002DedupedNeverPersist:
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist:
 
-            mock_dedup.is_duplicate.return_value = True   # dropped by dedup
+            mock_dedup.is_duplicate.return_value = True
 
             await ts._process_trade(raw)
 
@@ -380,7 +379,7 @@ class TestC002BusRegression:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = ep       # cooldown passed — signal fires
+            mock_acc.get_signal.return_value = ep
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = _capture
 

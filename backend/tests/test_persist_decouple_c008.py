@@ -22,7 +22,6 @@ Test IDs:
 
 Run: pytest backend/tests/test_persist_decouple_c008.py -v
 """
-import asyncio
 import sys, os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -128,14 +127,14 @@ class TestC008PersistDuringCooldown:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = persist_ep   # above threshold
-            mock_acc.get_signal.return_value = None          # cooldown active
+            mock_acc.ingest_tick.return_value = persist_ep
+            mock_acc.get_signal.return_value = None
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
-        mock_persist.assert_awaited_once()   # persist fires
-        mock_bus.publish_all.assert_not_called()  # bus silent
+        mock_persist.assert_awaited_once()
+        mock_bus.publish_all.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +161,7 @@ class TestC008BothFireAfterCooldown:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = persist_ep
-            mock_acc.get_signal.return_value = persist_ep   # cooldown passed
+            mock_acc.get_signal.return_value = persist_ep
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
@@ -193,7 +192,7 @@ class TestC008SubThresholdNeither:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick.return_value = None   # sub-threshold
+            mock_acc.ingest_tick.return_value = None
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
@@ -226,7 +225,7 @@ class TestC008FirstCrossingBothFire:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = persist_ep
-            mock_acc.get_signal.return_value = persist_ep   # first signal
+            mock_acc.get_signal.return_value = persist_ep
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = AsyncMock()
 
@@ -259,8 +258,8 @@ class TestC008IngestShim:
         ts1 = base_ts
         ts2 = base_ts + timedelta(seconds=10)
 
-        assert acc.ingest(_ev(6_000.0, ts1)) is None   # 1 tick, below threshold
-        result = acc.ingest(_ev(6_000.0, ts2))         # 2 ticks, crosses threshold
+        assert acc.ingest(_ev(6_000.0, ts1)) is None
+        result = acc.ingest(_ev(6_000.0, ts2))
         assert result is not None
         assert result.trade_count == 2
 
@@ -289,7 +288,6 @@ class TestC008IngestTickIgnoresCooldown:
         for i in range(3):
             acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10)))
 
-        # Ticks 4 and 5 — within cooldown window — ingest_tick must still return ep
         ep4 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=1)))
         ep5 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=2)))
 
@@ -317,21 +315,17 @@ class TestC008GetSignalCooldown:
             ev.timestamp = ts
             return ev
 
-        # Reach threshold
         ep = None
         for i in range(3):
             ep = acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10)))
 
-        # First signal fires
         sig1 = acc.get_signal(base_ts + timedelta(seconds=20), ep)
         assert sig1 is not None
 
-        # Within cooldown — suppressed
         ep2 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=1)))
         sig2 = acc.get_signal(base_ts + timedelta(minutes=1), ep2)
         assert sig2 is None, "get_signal should return None during cooldown"
 
-        # After cooldown — fires again
         ep3 = acc.ingest_tick(_ev(base_ts + timedelta(minutes=6)))
         sig3 = acc.get_signal(base_ts + timedelta(minutes=6), ep3)
         assert sig3 is not None, "get_signal should fire after cooldown expires"
