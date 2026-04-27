@@ -3,10 +3,14 @@ name: Frontend CI/CD
 on:
   push:
     branches: [main]
-    paths:    ["frontend/**"]
+    paths:
+      - "frontend/**"
+      - "backend/**"   # backend changes also trigger Vercel redeploy
   pull_request:
     branches: [main]
-    paths:    ["frontend/**"]
+    paths:
+      - "frontend/**"
+      - "backend/**"
 
 jobs:
   # ---------------------------------------------------------------------------
