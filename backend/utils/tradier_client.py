@@ -61,6 +61,10 @@ async def get_quote(symbol: str) -> Optional[dict]:
         async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
             resp = await client.get(url, headers=_headers(), params={"symbols": symbol, "greeks": "false"})
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quote(%s) HTTP %d — body: %s",
+                symbol, resp.status_code, resp.text[:300],
+            )
             return None
         data = resp.json()
         quote = data.get("quotes", {}).get("quote")
@@ -87,6 +91,10 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
                 params={"symbols": ",".join(symbols), "greeks": "false"}
             )
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quotes_batch HTTP %d for %d symbols (first: %s) — body: %s",
+                resp.status_code, len(symbols), symbols[0], resp.text[:300],
+            )
             return {}
         data = resp.json()
         quotes_raw = data.get("quotes", {}).get("quote") or []
@@ -108,6 +116,10 @@ async def get_expirations(symbol: str) -> list[str]:
         async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
             resp = await client.get(url, headers=_headers(), params={"symbol": symbol})
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_expirations(%s) HTTP %d — body: %s",
+                symbol, resp.status_code, resp.text[:300],
+            )
             return []
         data = resp.json()
         dates = (data.get("expirations") or {}).get("date") or []
@@ -134,6 +146,10 @@ async def get_option_chain(symbol: str, expiration: str) -> list[dict]:
                     params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
                 )
             if resp.status_code != 200:
+                log.warning(
+                    "[tradier_client] get_option_chain(%s, %s) HTTP %d — body: %s",
+                    symbol, expiration, resp.status_code, resp.text[:300],
+                )
                 return []
             data = resp.json()
             options = (data.get("options") or {}).get("option") or []
