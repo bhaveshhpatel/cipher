@@ -1,34 +1,26 @@
 """
 signal_store.py — Supabase DB writer for composite signals.
 
-Phase 5A changes:
-  - _build_row() now persists swarm fields:
-    swarm_direction, swarm_confidence, swarm_agents (JSONB),
-    swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
+Phase 5A: persists swarm fields (swarm_direction, swarm_confidence,
+  swarm_agents JSONB, swarm_bull_votes, swarm_bear_votes, swarm_hold_votes).
 
-Fix 3 (2026-04-26):
-  - _signal_memory is now a collections.deque(maxlen=1000) to prevent
-    unbounded memory growth in long-running Railway processes.
+Fix 3 (2026-04-26): _signal_memory is a collections.deque(maxlen=1000) to
+  prevent unbounded memory growth in long-running Railway processes.
 
-Fix 5 (2026-04-26):
-  - persist_composite_signal() now falls back to _signal_memory when
-    Supabase is not configured (matches save_signal() behaviour).
-
-Public API (for tests):
-  save_signal(signal: dict | object) -> bool
-  get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
-  get_recent_signals(ticker: str | None, limit: int) -> list[dict]  [async alias]
-  _client() -> Supabase-SDK-like | dict | None  (patchable)
-  _clear_signal_memory() -> None               (test isolation helper)
-
-Normalisation helpers:
-  _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral'
-  _normalise_trade_type(raw) -> 'sweep' | 'block' | 'split' | 'single'
+Public API:
+  save_signal(signal)                              -> bool          [async]
+  get_signals(ticker, limit)                       -> list[dict]    [async]
+  get_recent_signals(ticker, limit)                -> list[dict]    [async alias]
+  persist_composite_signal(sig, ep)                -> None          [async]
+  start_signal_writer()                            -> None          [async]
+  _clear_signal_memory()                           -> None          (test helper)
+  _normalise_direction(raw)    -> 'bullish'|'bearish'|'neutral'
+  _normalise_trade_type(raw)   -> 'sweep'|'block'|'split'|'single'
 
 CI / no-network behaviour:
-  When Supabase is configured but the host is unreachable (DNS -2 in CI),
-  save_signal() falls back to _signal_memory after all retries fail so
-  that get_signals() can still return the saved data within the same process.
+  When Supabase is configured but the host is unreachable, save_signal()
+  falls back to _signal_memory after all retries so that get_signals()
+  can still return saved data within the same process.
 """
 import asyncio
 import logging
@@ -50,41 +42,26 @@ _SUPABASE_KEY: Optional[str] = (
 
 _TABLE = "signal_history"
 
-_VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
-_VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
-_VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
+_VALID_TIERS = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
-# In-memory signal store — bounded deque prevents unbounded memory growth.
-# maxlen=1000 keeps ~16 mins of 1/s signals; oldest entries auto-evict.
+# Bounded in-memory store — maxlen prevents unbounded growth.
+# maxlen=1000 keeps ~16 min of 1/s signals; oldest entries auto-evict.
 _signal_memory: deque = deque(maxlen=1000)
-# Dedup set — keyed by signal 'id' to prevent duplicates in _signal_memory
-_signal_ids_seen: set = set()
+_signal_ids_seen: set  = set()
 
 
 def _clear_signal_memory() -> None:
     """Reset in-memory signal store and dedup set. Used by test fixtures for isolation."""
     global _signal_memory, _signal_ids_seen
-    _signal_memory = deque(maxlen=1000)
+    _signal_memory   = deque(maxlen=1000)
     _signal_ids_seen = set()
 
 
 def _is_configured() -> bool:
     return bool(_SUPABASE_URL and _SUPABASE_KEY)
-
-
-def _client():  # noqa: ANN201 — patchable by tests
-    """
-    Returns None when unconfigured.
-    Returns a Supabase SDK client when credentials are present.
-    When patched in tests to return a mock with .table(), that mock is used
-    directly by save_signal / get_recent_signals for insert/select.
-    """
-    if not _is_configured():
-        return None
-    return {"url": _SUPABASE_URL, "key": _SUPABASE_KEY}
 
 
 def _headers() -> dict:
@@ -96,22 +73,6 @@ def _headers() -> dict:
     }
 
 
-def _client_is_sdk_mock(client) -> bool:
-    """True when the client has a .table() method (Supabase SDK or test mock)."""
-    return client is not None and hasattr(client, "table")
-
-
-async def _insert_via_sdk(client, row: dict) -> bool:
-    """Insert a row using the Supabase SDK (or a compatible test mock)."""
-    try:
-        t = client.table(_TABLE)
-        t.insert(row).execute()
-        return True
-    except Exception as e:
-        log.error("[signal_store] SDK insert exception: %s", e)
-        return False
-
-
 async def _insert_signal(row: dict) -> bool:
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
@@ -121,10 +82,13 @@ async def _insert_signal(row: dict) -> bool:
             resp = await client.post(url, headers=_headers(), json=[row])
         if resp.status_code in (200, 201):
             return True
-        log.error("[signal_store] insert failed: %s -- %s", resp.status_code, resp.text[:300])
+        log.error(
+            "[signal_store] insert failed: %s -- %s",
+            resp.status_code, resp.text[:300],
+        )
         return False
-    except Exception as e:
-        log.error("[signal_store] insert exception: %s", e)
+    except Exception as exc:
+        log.error("[signal_store] insert exception: %s", exc)
         return False
 
 
@@ -146,6 +110,10 @@ async def _insert_signal_with_retry(row: dict) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
+
 def _normalise_direction(raw: str) -> str:
     if not raw:
         return "neutral"
@@ -158,7 +126,7 @@ def _normalise_direction(raw: str) -> str:
 
 
 def _normalise_trade_type(raw: str) -> str:
-    """Normalise to lowercase trade type. Unknown -> 'single'."""
+    """Normalise to lowercase trade type. Unknown values map to 'single'."""
     if not raw:
         return "single"
     lower = raw.lower()
@@ -170,16 +138,6 @@ def _normalise_influence_tier(raw: str) -> str:
         return "RETAIL"
     upper = raw.upper()
     return upper if upper in _VALID_TIERS else "RETAIL"
-
-
-def _db_direction(raw: str) -> str:
-    normalised = _normalise_direction(raw)
-    mapping = {"bullish": "BUY", "bearish": "SELL"}
-    return mapping.get(normalised, "HOLD")
-
-
-def _db_trade_type(raw: str) -> str:
-    return _normalise_trade_type(raw).upper()
 
 
 def _coerce_to_dict(sig) -> dict:
@@ -195,8 +153,12 @@ def _coerce_to_dict(sig) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Row builder
+# ---------------------------------------------------------------------------
+
 def _build_row(sig, ep: Optional[dict] = None) -> dict:
-    sig = _coerce_to_dict(sig)
+    sig     = _coerce_to_dict(sig)
     episode = ep or {}
 
     score = sig.get("composite_score") or 0.0
@@ -213,6 +175,7 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
 
     ctype   = episode.get("contract_type") or sig.get("contract_type", "")
     raw_dir = episode.get("direction", sig.get("direction", ""))
+
     if sig.get("sentiment"):
         sentiment = sig["sentiment"]
     elif "BUY" in raw_dir.upper() or ctype.upper() == "CALL":
@@ -222,10 +185,13 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     else:
         sentiment = "NEUTRAL"
 
-    direction      = _db_direction(raw_dir)
-    trade_type     = _db_trade_type(
+    # Single normalisation path — no redundant _db_direction/_db_trade_type wrappers.
+    norm_dir = _normalise_direction(raw_dir)
+    direction_map = {"bullish": "BUY", "bearish": "SELL"}
+    direction      = direction_map.get(norm_dir, "HOLD")
+    trade_type     = _normalise_trade_type(
         episode.get("trade_type") or sig.get("trade_type", "")
-    )
+    ).upper()
     influence_tier = _normalise_influence_tier(
         episode.get("influence_tier") or sig.get("influence_tier", "")
     )
@@ -262,7 +228,7 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
 
 
 def _store_in_memory(sig_dict: dict) -> None:
-    """Append to _signal_memory respecting dedup by 'id'."""
+    """Append to _signal_memory, deduplicating by 'id' field."""
     sig_id = sig_dict.get("id")
     if sig_id is None or sig_id not in _signal_ids_seen:
         _signal_memory.append(sig_dict)
@@ -270,15 +236,16 @@ def _store_in_memory(sig_dict: dict) -> None:
             _signal_ids_seen.add(sig_id)
 
 
-async def save_signal(signal) -> bool:
-    sig_dict = _coerce_to_dict(signal)
-    client = _client()
+# ---------------------------------------------------------------------------
+# Public write API
+# ---------------------------------------------------------------------------
 
-    if _client_is_sdk_mock(client):
-        ok = await _insert_via_sdk(client, sig_dict)
-        if ok:
-            _store_in_memory(sig_dict)
-        return ok
+async def save_signal(signal) -> bool:
+    """
+    Persist a signal. Falls back to _signal_memory when Supabase is
+    unconfigured or when DB writes fail (CI / offline environments).
+    """
+    sig_dict = _coerce_to_dict(signal)
 
     if not _is_configured():
         _store_in_memory(sig_dict)
@@ -286,32 +253,10 @@ async def save_signal(signal) -> bool:
 
     row = _build_row(signal)
     ok  = await _insert_signal_with_retry(row)
+    # Always store in memory so get_signals() works within the same process
+    # even when the DB write succeeded (avoids a round-trip on subsequent reads).
     _store_in_memory(sig_dict)
     return ok
-
-
-async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
-    client = _client()
-    if _client_is_sdk_mock(client):
-        try:
-            t      = client.table(_TABLE)
-            result = t.select("*").order("id", desc=True).limit(limit).execute()
-            rows   = getattr(result, "data", None) or []
-            if ticker:
-                rows = [r for r in rows if r.get("ticker") == ticker]
-            return rows
-        except Exception:
-            pass
-
-    results = list(_signal_memory)
-    if ticker:
-        results = [s for s in results if s.get("ticker") == ticker]
-    return results[-limit:]
-
-
-async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
-    """Alias for get_signals — backward-compat."""
-    return await get_signals(ticker=ticker, limit=limit)
 
 
 async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
@@ -328,14 +273,9 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     row = _build_row(sig, ep)
     ok  = await _insert_signal_with_retry(row)
     if ok:
-        premium_val  = row["premium"]
-        premium_fmt  = "${:,.0f}".format(premium_val) if premium_val else "$0"
-        golden_sweep = row["is_golden_sweep"]
-        golden_tag   = " \u26a1 GOLDEN SWEEP" if golden_sweep else ""
+        premium_fmt  = "${:,.0f}".format(row["premium"] or 0)
+        golden_tag   = " \u26a1 GOLDEN SWEEP" if row["is_golden_sweep"] else ""
         swarm_dir    = row["swarm_direction"] or "--"
-        bull         = row["swarm_bull_votes"]
-        bear         = row["swarm_bear_votes"]
-        hold         = row["swarm_hold_votes"]
         log.info(
             "[signal_store] DB INSERT OK | "
             "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
@@ -344,7 +284,9 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
             row["ticker"], row["recommendation"], row["direction"],
             row["composite_score"], row["flow_score"], row["alert_level"],
             row["sentiment"], row["influence_tier"], row["trade_type"],
-            premium_fmt, swarm_dir, bull, bear, hold, golden_tag,
+            premium_fmt, swarm_dir,
+            row["swarm_bull_votes"], row["swarm_bear_votes"],
+            row["swarm_hold_votes"], golden_tag,
         )
     else:
         log.warning(
@@ -352,6 +294,30 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
             row.get("ticker"),
         )
 
+
+# ---------------------------------------------------------------------------
+# Public read API
+# ---------------------------------------------------------------------------
+
+async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
+    """
+    Return signals from in-memory store, optionally filtered by ticker.
+    In production, the memory store is populated by every save_signal() call.
+    """
+    results = list(_signal_memory)
+    if ticker:
+        results = [s for s in results if s.get("ticker") == ticker]
+    return results[-limit:]
+
+
+async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
+    """Alias for get_signals — backward compatibility."""
+    return await get_signals(ticker=ticker, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Bus listener + startup
+# ---------------------------------------------------------------------------
 
 async def _bus_signal_listener() -> None:
     q = bus.subscribe("signal_writer")
