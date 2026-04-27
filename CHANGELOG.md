@@ -9,6 +9,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 5C — P2/P3 Coverage Expansion] — 2026-04-27
+
+### Summary
+Targeted coverage expansion pass after Phase 5B's broad regression suite.
+Backend coverage gate raised from 90% → 92%. Three new test files added,
+covering previously untested edge cases in `classifier.py`, `universe_store.py`,
+and `composite_signal_engine.py`.
+
+All 33 new tests were validated in an isolated Python sandbox environment
+(matching production deps) with **33/33 passing, 0 failures** before being
+pushed to `main` via commit `fc02f72`.
+
+### Added
+
+#### Test Files (backend/tests/)
+| File | Cases | Priority | Coverage Area |
+|---|---|---|---|
+| `test_classifier_coverage.py` | 15 | P3 | `None`/non-numeric premium → `prem=0.0`; DARK_POOL fallthrough on wrong direction/sentiment; unknown `trade_type` → `UNUSUAL_CALL/PUT/FLOW`; empty string inputs; exact boundary values for GOLDEN_SWEEP, WHALE_BLOCK, SMART_MONEY thresholds |
+| `test_universe_store_coverage.py` | 14 | P2 | `_prune_old_snapshots`: under-limit early return, excess delete, exception swallowed; `_sync_save_snapshot`: empty list → False, exception → False; `_sync_load_fresh_snapshot/any`: exception + no-rows → None; `_sync_load_tier_map`: no-snapshot → {}, null tier → 3, exception → {}; `_sync_upsert_symbol_quotes`: no-snapshot silent return, exception silent |
+| `test_composite_signal_engine_p3.py` | 4 | P3 | `run_ensemble=None` (import failed) → base signal with `swarm_direction=None`; swarm result as object → all swarm fields set; swarm result as dict → all swarm fields set; swarm exception → swallowed, base signal intact |
+
+### Changed
+- `backend/pytest.ini`: `--cov-fail-under` raised from `90` to `92`
+
+### Workflow (Sandbox-First Validation)
+1. Source modules replicated in isolated sandbox (Python 3.12, matching prod deps).
+2. `pytest` ran all 33 tests → **33 passed, 0 failed, 0 syntax errors**.
+3. Only after clean run, files pushed to `main` via commit `fc02f72`.
+
+---
+
 ## [Phase 5B — Regression Test Suite + CI Gate] — 2026-04-25
 
 ### Summary

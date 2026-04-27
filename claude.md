@@ -1,6 +1,6 @@
 # Cipher — Claude Context File
 
-> Last updated: 2026-04-25 (Phase 5B — Regression Test Suite + CI Gate)
+> Last updated: 2026-04-27 (Phase 5C — P2/P3 Coverage Expansion + Sandbox-Validated Test Push)
 > This file is the authoritative AI-assistant context document for the Cipher codebase.
 > Keep it updated after every phase so future sessions have full project context.
 
@@ -37,7 +37,7 @@ Built with:
 | Database | Supabase (PostgreSQL) |
 | Deploy (BE) | Railway |
 | Deploy (FE) | Vercel |
-| CI/CD | GitHub Actions (regression-gated — see Phase 5B) |
+| CI/CD | GitHub Actions (regression-gated — see Phase 5B/5C) |
 
 ---
 
@@ -91,7 +91,7 @@ Built with:
 - **`signals/midcap_screener.py`** (NEW): mid-cap screener.
 - Migration 004: swarm fields on `signal_history`
 
-### Phase 5B — Regression Test Suite + CI Gate (CURRENT)
+### Phase 5B — Regression Test Suite + CI Gate
 - **Full automated regression test suite** covering the entire backend and frontend codebase.
 - **~380 test cases** across 13+ backend test files and frontend hook tests.
 - **CI hard gate**: backend ≥90% coverage (`--cov-fail-under=90`), frontend ≥75% lines/functions globally.
@@ -125,6 +125,34 @@ Built with:
 - `.github/workflows/backend.yml` — `lint → regression` jobs, dummy env vars, pip cache, coverage XML artifact, PR comment
 - `.github/workflows/frontend.yml` — `typecheck → regression → build → deploy` pipeline
 
+### Phase 5C — P2/P3 Coverage Expansion (CURRENT — 2026-04-27)
+
+#### Context
+After Phase 5B's broad regression suite was locked in, a targeted coverage expansion pass
+was run to push the backend gate from 90% to 92% (`--cov-fail-under=92` updated in `pytest.ini`).
+Three new test files were written, sandbox-validated with 33/33 passing before any push to GitHub.
+
+#### Workflow
+1. Test files were authored by AI assistant.
+2. Source modules (`classifier.py`, `universe_store.py`, `composite_signal_engine.py`) were
+   replicated in an isolated Python sandbox environment.
+3. `pytest` ran all 33 new tests against the replicated source — **0 failures, 0 syntax errors**.
+4. Only after clean sandbox run were files pushed to `main` via commit `fc02f72`.
+
+#### New test files added in Phase 5C:
+
+| File | Cases | Priority | Covers |
+|---|---|---|---|
+| `test_classifier_coverage.py` | 15 | P3 | None/non-numeric premium → `prem=0.0`; DARK_POOL fallthrough on wrong direction; unknown `trade_type` → `UNUSUAL_CALL/PUT/FLOW`; empty string inputs → `FLOW`; exact boundary values for all thresholds |
+| `test_universe_store_coverage.py` | 14 | P2 | `_prune_old_snapshots` under-limit early return + excess delete + exception swallowed; `_sync_save_snapshot` empty list → `False` + exception → `False`; `_sync_load_fresh_snapshot/any` exception + no-rows → `None`; `_sync_load_tier_map` no-snapshot → `{}`; null tier → `3`; exception → `{}`; `_sync_upsert_symbol_quotes` no-snapshot silent return + exception silent |
+| `test_composite_signal_engine_p3.py` | 4 | P3 | `run_ensemble=None` (import failed) → base signal, `swarm_direction=None`; swarm result as object → all swarm fields populated; swarm result as dict → all swarm fields populated; swarm exception → swallowed, base signal returned intact |
+
+#### Config change:
+- `backend/pytest.ini`: `--cov-fail-under` raised from `90` to `92`
+
+#### Commit:
+- `fc02f72` — pushed directly to `main`
+
 ---
 
 ## Test Suite — How to Run
@@ -147,12 +175,12 @@ See `docs/REGRESSION_TESTING.md` for full reference.
 
 ---
 
-## CI/CD Pipeline (Post Phase 5B)
+## CI/CD Pipeline (Post Phase 5C)
 
 ```
 Push to main (backend/**)
   └── lint
-        └── regression (--cov-fail-under=90)
+        └── regression (--cov-fail-under=92)
               └── Railway auto-deploys via native integration
 
 Push to main (frontend/**)
@@ -272,15 +300,15 @@ Connection close codes:
 cipher/
 ├── .github/
 │   └── workflows/
-│       ├── backend.yml        # lint → regression (≥90%) → Railway
+│       ├── backend.yml        # lint → regression (≥92%) → Railway
 │       └── frontend.yml       # typecheck → regression (≥75%) → build → Vercel
 ├── backend/
 │   ├── main.py
 │   ├── config.py
-│   ├── pytest.ini             # ★ Phase 5B: coverage gate config
-│   ├── .coveragerc            # ★ Phase 5B: omit rules
+│   ├── pytest.ini             # ★ Phase 5C: --cov-fail-under raised to 92
+│   ├── .coveragerc            # omit rules
 │   ├── requirements.txt
-│   ├── requirements-dev.txt   # ★ Phase 5B: pytest-cov added
+│   ├── requirements-dev.txt
 │   ├── migrations/            # 001–012
 │   ├── core/
 │   │   ├── auth.py
@@ -290,6 +318,7 @@ cipher/
 │   │   ├── bid_ask_classifier.py
 │   │   └── trade_type_detector.py
 │   ├── services/
+│   │   ├── classifier.py
 │   │   ├── flow_store.py
 │   │   ├── signal_store.py
 │   │   ├── symbols_loader.py
@@ -320,7 +349,7 @@ cipher/
 │   │   ├── simulation.py
 │   │   ├── admin.py
 │   │   └── health.py
-│   └── tests/                 # ★ Phase 5B: ~380 cases across 19+ files
+│   └── tests/                 # ★ Phase 5C: 33 new cases → 22 files total, ~413+ cases
 │       ├── test_auth_router.py
 │       ├── test_admin_router.py
 │       ├── test_config.py
@@ -339,9 +368,12 @@ cipher/
 │       ├── test_flow_store.py
 │       ├── test_universe_store.py
 │       ├── test_4a_tier_engine.py
-│       └── test_health_stream.py
+│       ├── test_health_stream.py
+│       ├── test_classifier_coverage.py       # ★ Phase 5C NEW (15 cases)
+│       ├── test_universe_store_coverage.py   # ★ Phase 5C NEW (14 cases)
+│       └── test_composite_signal_engine_p3.py # ★ Phase 5C NEW (4 cases)
 ├── frontend/
-│   ├── jest.config.ts         # ★ Phase 5B: coverageThreshold enforced
+│   ├── jest.config.ts
 │   ├── __mocks__/
 │   │   ├── styleMock.ts
 │   │   └── fileMock.ts
@@ -352,7 +384,7 @@ cipher/
 │       ├── lib/api.ts
 │       └── types/
 └── docs/
-    ├── REGRESSION_TESTING.md  # ★ Phase 5B: full test suite reference (NEW)
+    ├── REGRESSION_TESTING.md
     ├── ARCHITECTURE.md
     ├── BACKLOG.md
     ├── FIXES.md
@@ -367,14 +399,15 @@ cipher/
 |------|---------|
 | `backend/main.py` | FastAPI app, lifespan startup, all router registration |
 | `backend/config.py` | Pydantic settings — all env vars |
-| `backend/pytest.ini` | pytest config — `asyncio_mode=auto`, `--cov-fail-under=90` |
-| `backend/.coveragerc` | coverage.py omit rules, `fail_under=90` |
+| `backend/pytest.ini` | pytest config — `asyncio_mode=auto`, `--cov-fail-under=92` (raised in 5C) |
+| `backend/.coveragerc` | coverage.py omit rules, `fail_under=92` |
+| `backend/services/classifier.py` | `classify(trade_type, premium, contract_type, sentiment)` → label string |
 | `backend/services/tradier_stream.py` | SSE stream loop, market-hours guard, demo mode, stats |
 | `backend/parsers/options_flow_parser.py` | Tradier tick → `OptionsFlowEvent`, size==0 guard |
 | `backend/parsers/bid_ask_classifier.py` | ABOVE_ASK / AT_ASK / MID / AT_BID / BELOW_BID |
 | `backend/parsers/trade_type_detector.py` | SWEEP / BLOCK / SPLIT / SINGLE |
 | `backend/signals/repetition_accumulator.py` | Groups events into `RepetitionEpisode` |
-| `backend/signals/composite_signal_engine.py` | `build_composite()` — 3-component scoring |
+| `backend/signals/composite_signal_engine.py` | `build_composite()` — 3-component scoring + async swarm |
 | `backend/signals/backtest_validator.py` | Historical win-rate lookup |
 | `backend/simulation/swarm_engine.py` | 12-agent Groq LLM swarm |
 | `backend/simulation/ensemble_runner.py` | Majority-vote aggregator → `EnsembleResult` |
@@ -394,6 +427,27 @@ cipher/
 | `backend/core/auth.py` | JWT decode, `get_current_user` dependency |
 | `frontend/jest.config.ts` | Jest config with `coverageThreshold` per-file and global |
 | `docs/REGRESSION_TESTING.md` | Full regression test suite reference |
+
+---
+
+## classifier.py — Label Reference
+
+`classify(trade_type, premium, contract_type, sentiment) -> str`
+
+| Condition | Label |
+|---|---|
+| sweep + prem ≥ 500k + CALL + bullish | `GOLDEN_SWEEP` |
+| block + prem ≥ 1M | `WHALE_BLOCK` |
+| block + prem ≥ 500k + CALL + bullish | `DARK_POOL_BULL` |
+| block + prem ≥ 500k + PUT + bearish | `DARK_POOL_BEAR` |
+| sweep + CALL | `CALL_SWEEP` |
+| sweep + PUT | `PUT_SWEEP` |
+| block + prem ≥ 100k + bullish | `SMART_MONEY` |
+| unknown type + CALL | `UNUSUAL_CALL` |
+| unknown type + PUT | `UNUSUAL_PUT` |
+| all other / empty | `FLOW` |
+
+> **Note:** `None` / non-numeric premium is coerced to `0.0` — never raises.
 
 ---
 
@@ -423,7 +477,7 @@ cipher/
 ## Supabase Tables
 
 | Table | Writer | Key Used | Notes |
-|-------|--------|----------|-------|
+|-------|--------|------------|-------|
 | `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
 | `flow_events` | `flow_store.py` | SERVICE_KEY | Currently 0 rows — not the live table |
 | `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields |
@@ -543,10 +597,24 @@ Falls back to `0.5` neutral when OI unavailable. Do not treat 0.5 as a signal.
 ### Frontend WS Pong
 Frontend must send `{"type":"pong"}` within 10s of receiving `{"type":"ping"}` or connection closes with code 1001. **Status: not yet confirmed implemented in frontend.**
 
+### Sandbox-First Test Validation (Phase 5C+)
+All new test files MUST be validated in an isolated Python sandbox (matching prod deps) before
+pushing to GitHub. Rule: 0 failures in sandbox → push. Any failure → fix first, never push broken tests.
+
+---
+
+## Test Count History
+
+| Phase | Files | Cases |
+|---|---|---|
+| 5B (launch) | 19 files | ~380 cases |
+| 5C (2026-04-27) | 22 files | ~413 cases |
+
 ---
 
 ## Open / Phase 6 TODO
 
+- Update `backend/pytest.ini` `--cov-fail-under` to `92` if not yet reflected in repo (done in 5C commit fc02f72)
 - Frontend: implement WS pong response
 - Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
 - WebSocket fan-out benchmark with 50+ subscribers
@@ -556,5 +624,5 @@ Frontend must send `{"type":"pong"}` within 10s of receiving `{"type":"ping"}` o
 - Confirm `signals/midcap_screener.py` integrated into signal pipeline
 - Investigate OI field availability per symbol (affects `volume_premium_factor` fallback rate)
 - Add frontend UI component tests (SignalFeed, FlowTable, SimulationPanel, login page)
-- Raise backend `--cov-fail-under` from 90% to 95% once UI tests added
+- Raise backend `--cov-fail-under` from 92% to 95% once UI tests added
 - Raise frontend Jest global threshold from 75% to 85%
