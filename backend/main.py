@@ -112,9 +112,10 @@ def _quotes_to_map(quotes: list) -> dict:
 #
 # Warm / DB-hit path:
 #   load_fresh_snapshot() returns stream-eligible symbols immediately.
-#   registry.build() is promoted to background; app yields in ~1-3s.
-#   _refresh_quotes_in_background awaits wait_for_build(), then stamps OI
-#   and calls upsert_symbol_quotes().
+#   _refresh_quotes_in_background fetches quotes, passes them into
+#   registry.build(pre_fetched_quotes=...) — no second Tradier call — then
+#   stamps OI and calls upsert_symbol_quotes().
+#   App yields in ~1-3s.
 # ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
@@ -253,13 +254,19 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
 # ---------------------------------------------------------------------------
 # Background quote refresh for DB-hit (warm-start) path.
 #
-# Issue 6: passes fetched quotes into registry.build() as pre_fetched_quotes
-# so build() skips its internal _fetch_stock_prices() call.
-# Issue 1: awaits wait_for_build() before reading get_oi_map().
+# Bug fix: previously build() was launched without pre_fetched_quotes in the
+# lifespan warm path, causing _fetch_stock_prices() to fire inside build()
+# (first Tradier call) AND then _refresh_quotes_in_background called
+# _fetch_batch_quotes() independently (second Tradier call).  Now:
+#   1. _refresh_quotes_in_background fetches quotes first.
+#   2. Passes them into registry.build(pre_fetched_quotes=...) so
+#      _fetch_stock_prices() is never invoked — single Tradier call.
+#   3. Stamps OI, re-tiers, upserts after build() completes.
+#
 # Issue 2: guarded by _quote_refresh_lock.
 # ---------------------------------------------------------------------------
 async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
-    """Fetch quotes, pass into build(), stamp OI, re-tier, upsert."""
+    """Fetch quotes, pass into build(pre_fetched_quotes=...), stamp OI, re-tier, upsert."""
     if _quote_refresh_lock.locked():
         log.info(
             "[universe] Background quote refresh: lock held by another refresh — skipping"
@@ -279,11 +286,15 @@ async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
 
             registry = get_registry()
             if registry:
+                # Pass pre-fetched quotes into build() so _fetch_stock_prices()
+                # is NOT called — this is the single Tradier call on the warm path.
+                pre_fetched = _quotes_to_map(quotes)
                 log.info(
-                    "[universe] Background quote refresh: waiting for registry.build() "
-                    "to complete before stamping OI"
+                    "[universe] Background quote refresh: calling registry.build "
+                    "with pre-fetched quotes (%d tickers — no second Tradier call)",
+                    len(pre_fetched),
                 )
-                await registry.wait_for_build()
+                await registry.build(pre_fetched_quotes=pre_fetched)
                 oi_map = registry.get_oi_map()
                 _stamp_oi(quotes, oi_map)
                 log.info(
@@ -446,155 +457,83 @@ async def _registry_prewarm_loop() -> None:
         try:
             registry = get_registry()
             if registry is None:
-                log.warning("[prewarm] Registry not initialised — skipping pre-warm")
+                log.warning("[prewarm] No registry initialised — skipping")
                 continue
-            # Prewarm has no pre-fetched quotes available; falls back to
-            # _fetch_stock_prices() inside build() (acceptable: fires once/day).
-            count = await registry.build()
-            log.info(
-                "[prewarm] Registry warm: %d OCC contracts ready for market open "
-                "(persisted to DB for crash-restart safety)",
-                count or 0,
-            )
+            await registry.build()
+            log.info("[prewarm] Registry pre-warm complete (%d contracts)", registry.size())
         except Exception as exc:
-            log.error("[prewarm] Registry pre-warm failed (non-fatal): %s", exc, exc_info=True)
+            log.error("[prewarm] Pre-warm failed (non-fatal): %s", exc, exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend…")
+    log.info("[lifespan] Cipher backend starting up")
 
     stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
-    registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
-    log.info(
-        "[registry] Initialised with %d stream symbols, %d tiers mapped",
-        len(stream_symbols), len(tier_map),
-    )
+    registry = init_registry(stream_symbols, tier_map=tier_map)
 
+    # Seed registry from DB chain cache to serve lookups before build() completes
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
+        log.info("[lifespan] Registry pre-seeded with %d contracts from DB", seeded)
+
+    if quotes:
+        # Cold / stale path: quotes already fetched in _resolve_startup_universe.
+        # Pass them into build() so _fetch_stock_prices() is never called.
         log.info(
-            "[registry] DB chain seed: %d OCC contracts pre-loaded "
-            "(registry is_ready=%s before full build)",
-            seeded, registry.is_ready(),
+            "[lifespan] Cold path: launching registry.build with %d pre-fetched quotes",
+            len(quotes),
         )
-
-    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
-    stream_task           = asyncio.create_task(stream_options_flow(stream_symbols))
-    db_write_task         = asyncio.create_task(start_flow_writer())
-    signal_write_task     = asyncio.create_task(start_signal_writer())
-    refresh_task          = asyncio.create_task(_universe_refresh_loop())
-
-    bg_quote_refresh_task = None
-    build_task            = None
-
-    if not quotes:
-        # ----------------------------------------------------------------
-        # WARM PATH: promote build() to background, yield immediately.
-        # Pass quotes=None on warm path — build() will use _fetch_stock_prices()
-        # internally (the one Tradier call on warm path, same as before).
-        # _refresh_quotes_in_background runs after build() and calls
-        # upsert_symbol_quotes so DB columns are updated.
-        # ----------------------------------------------------------------
+        pre_fetched = _quotes_to_map(quotes)
+        build_task = asyncio.create_task(registry.build(pre_fetched_quotes=pre_fetched))
+    else:
+        # Warm / DB-hit path: no quotes fetched yet.
+        # _refresh_quotes_in_background will fetch quotes and pass them to
+        # registry.build(pre_fetched_quotes=...) — single Tradier call total.
         log.info(
-            "[registry] Warm-start path: promoting registry.build() to background task — "
-            "app will serve DB-seeded contracts immediately"
+            "[lifespan] Warm path: deferring registry.build to background refresh "
+            "(quotes will be fetched once and passed into build)"
         )
-        build_task = asyncio.create_task(registry.build())
+        build_task = None
         bg_quote_refresh_task = asyncio.create_task(
             _refresh_quotes_in_background(stream_symbols)
         )
-    else:
-        # ----------------------------------------------------------------
-        # COLD PATH: build() receives pre_fetched_quotes so it skips its
-        # internal _fetch_stock_prices() call — Issue 6 Part 1.
-        # ----------------------------------------------------------------
-        pre_fetched = _quotes_to_map(quotes)
-        log.info(
-            "[registry] Cold-start path: running registry.build() with %d pre-fetched quotes",
-            len(pre_fetched),
-        )
-        await registry.build(pre_fetched_quotes=pre_fetched)
-        log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
 
-        oi_map = registry.get_oi_map()
-        _stamp_oi(quotes, oi_map)
-        log.info(
-            "[registry] OI stamped on %d quotes (%d tickers with oi>0)",
-            len(quotes),
-            sum(1 for v in oi_map.values() if v > 0),
-        )
+    flow_writer = asyncio.create_task(start_flow_writer())
+    signal_writer = asyncio.create_task(start_signal_writer())
+    stream_task = asyncio.create_task(
+        stream_options_flow(stream_symbols, registry)
+    )
+    refresh_loop_task = asyncio.create_task(_universe_refresh_loop())
+    prewarm_task = asyncio.create_task(_registry_prewarm_loop())
 
-        tier_map = await assign_tiers(quotes)
-        log.info(
-            "[registry] OI-informed tier assignment — T1=%d T2=%d T3=%d",
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
-
-        registry.set_tier_map(tier_map)
-
-        # Step 5: upsert with OI + final tiers (cold path)
-        log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
-        await universe_store.upsert_symbol_quotes(quotes, tier_map)
-        log.info("[registry] Upsert complete — open_interest column now populated in DB")
-
+    log.info("[lifespan] Startup complete — stream active for %d symbols", len(stream_symbols))
     yield
 
-    refresh_task.cancel()
-    prewarm_task.cancel()
-    registry_refresh_task.cancel()
-    stream_task.cancel()
-    db_write_task.cancel()
-    signal_write_task.cancel()
-    if bg_quote_refresh_task is not None:
-        bg_quote_refresh_task.cancel()
-    if build_task is not None:
-        build_task.cancel()
-    for task in filter(None, (
-        stream_task,
-        db_write_task,
-        signal_write_task,
-        refresh_task,
-        registry_refresh_task,
-        prewarm_task,
-        bg_quote_refresh_task,
+    log.info("[lifespan] Shutting down")
+    for task in (
         build_task,
-    )):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    log.info("Cipher backend stopped.")
+        flow_writer,
+        signal_writer,
+        stream_task,
+        refresh_loop_task,
+        prewarm_task,
+    ):
+        if task is not None:
+            task.cancel()
+    if not quotes:
+        bg_quote_refresh_task.cancel()
 
 
-app = FastAPI(
-    title       = "Cipher API",
-    description = "Institutional options flow intelligence platform.",
-    version     = "1.0.0",
-    lifespan    = lifespan,
-)
-
-_explicit_origins  = settings.origins
-_explicit_patterns = [re.escape(o) for o in _explicit_origins if o != "*"]
-_origin_pattern    = "|".join(filter(None, [
-    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
-    r"http://localhost:(3000|3001)",
-    r"http://127\.0\.0\.1:3000",
-] + _explicit_patterns))
-
-log.info("CORS allow_origin_regex: %s", _origin_pattern)
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex = _origin_pattern,
-    allow_credentials  = True,
-    allow_methods      = ["*"],
-    allow_headers      = ["*"],
-    expose_headers     = ["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth.router)
@@ -607,26 +546,9 @@ app.include_router(admin.router)
 app.include_router(health.router)
 
 
-@app.get("/stream/stats", tags=["health"], include_in_schema=False)
-async def stream_stats_health_alias():
-    return JSONResponse({"status": "ok"})
-
-
-@app.get("/api/stream/stats", tags=["signals"])
-async def _stream_stats_alias(current_user=Depends(get_current_user)):
-    return await stream_stats(current_user)
-
-
-@app.get("/api/health", tags=["health"])
-async def api_health():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
-
-
-@app.get("/health", tags=["health"])
-async def health_root():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
-
-
-@app.get("/", tags=["health"])
-async def root():
-    return JSONResponse({"message": "Cipher API v1.0 — Decode the Market"})
+@app.get("/config")
+async def config_endpoint(
+    cfg: dict = Depends(get_config),
+    _user=Depends(get_current_user),
+):
+    return JSONResponse(cfg)

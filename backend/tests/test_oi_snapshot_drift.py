@@ -1,0 +1,187 @@
+"""
+test_oi_snapshot_drift.py
+
+Regression: SymbolRegistry._oi_snapshot must hold the OI from the PREVIOUS
+build, not the current build.  _apply_delta() compares _oi_snapshot (prev)
+vs _oi_by_ticker (current) to decide whether a ticker's OI has drifted
+beyond the threshold and needs a chain re-fetch.
+
+Bug that was fixed
+------------------
+Previously in build():
+    self._oi_by_ticker = new_oi_by_ticker
+    self._oi_snapshot  = dict(new_oi_by_ticker)   # ← both set to NEW values
+
+This made _oi_snapshot == _oi_by_ticker after every build, so oi_drift in
+_apply_delta was always 0 — meaning OI drift never triggered a chain re-fetch.
+
+Fix: snapshot the OLD _oi_by_ticker BEFORE overwriting it:
+    self._oi_snapshot  = dict(self._oi_by_ticker)  # prev OI preserved
+    self._oi_by_ticker = new_oi_by_ticker
+"""
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+def _make_registry(watchlist=None):
+    from services.symbol_registry import SymbolRegistry
+    return SymbolRegistry(watchlist=watchlist or ["AAPL", "TSLA"])
+
+
+def _make_sq(symbol, price=100.0, volume=1_000_000, avg_vol=900_000, oi=0):
+    sq = MagicMock()
+    sq.symbol = symbol
+    sq.last_price = price
+    sq.volume = volume
+    sq.average_volume = avg_vol
+    sq.open_interest = oi
+    return sq
+
+
+_FAKE_CFG = {
+    "REGISTRY_MIN_OI": 0,
+    "REGISTRY_OI_DELTA_THRESHOLD": 0.20,
+    "REGISTRY_REFRESH_MINS": 60,
+    "REGISTRY_EXPIRY_DAY_REFRESH_MINS": 15,
+}
+
+_FAKE_THRESH = {
+    "t1_atm_pct": 0.20, "t1_max_dte": 90, "t1_min_oi": 0,
+    "t2_atm_pct": 0.15, "t2_max_dte": 60, "t2_min_oi": 0,
+    "t3_atm_pct": 0.10, "t3_max_dte": 30, "t3_min_oi": 0,
+}
+
+
+@pytest.mark.asyncio
+async def test_oi_snapshot_holds_previous_build_oi():
+    """
+    After two builds:
+      Build 1: OI for AAPL = 500
+      Build 2: OI for AAPL = 800
+
+    After build 2:
+      _oi_by_ticker["AAPL"]  should be 800  (current)
+      _oi_snapshot["AAPL"]   should be 500  (previous, for drift detection)
+    """
+    reg = _make_registry(["AAPL"])
+
+    # ------------------------------------------------------------------ build 1
+    oi_build1 = {"AAPL": 500}
+
+    async def fake_build_ticker_b1(ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
+        from services.symbol_registry import ContractMeta
+        registry["AAPL260101C00150000"] = ContractMeta(
+            ticker="AAPL", strike=150.0, expiry="2026-01-01",
+            contract_type="CALL", dte=10, open_interest=500, tier=3
+        )
+        oi_by_ticker["AAPL"] = 500
+        if expiry_cache_out is not None:
+            expiry_cache_out["AAPL"] = {"2026-01-01"}
+
+    with (
+        patch("services.symbol_registry.SymbolRegistry._build_ticker", new=fake_build_ticker_b1),
+        patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+        patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
+        patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
+        patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"AAPL": 3})),
+    ):
+        pf = {"AAPL": _make_sq("AAPL")}
+        await reg.build(pre_fetched_quotes=pf)
+
+    assert reg._oi_by_ticker.get("AAPL") == 500, "_oi_by_ticker should be 500 after build 1"
+    # After build 1 snapshot should be empty dict (pre-build OI was {})
+    assert reg._oi_snapshot.get("AAPL", None) is None, (
+        "_oi_snapshot should hold pre-build-1 OI (none) after first build"
+    )
+
+    # ------------------------------------------------------------------ build 2
+    async def fake_build_ticker_b2(ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
+        from services.symbol_registry import ContractMeta
+        registry["AAPL260101C00150000"] = ContractMeta(
+            ticker="AAPL", strike=150.0, expiry="2026-01-01",
+            contract_type="CALL", dte=10, open_interest=800, tier=3
+        )
+        oi_by_ticker["AAPL"] = 800
+        if expiry_cache_out is not None:
+            expiry_cache_out["AAPL"] = {"2026-01-01"}
+
+    async def fake_apply_delta(prices, tier_params, new_registry, new_oi_by_ticker, new_expiry_cache, oi_delta_thresh):
+        # Simulate a delta build that re-fetches AAPL with new OI=800
+        from services.symbol_registry import ContractMeta
+        new_registry["AAPL260101C00150000"] = ContractMeta(
+            ticker="AAPL", strike=150.0, expiry="2026-01-01",
+            contract_type="CALL", dte=10, open_interest=800, tier=3
+        )
+        new_oi_by_ticker["AAPL"] = 800
+        new_expiry_cache["AAPL"] = {"2026-01-01"}
+        return 0  # 0 tickers reused
+
+    with (
+        patch("services.symbol_registry.SymbolRegistry._apply_delta", new=fake_apply_delta),
+        patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+        patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
+        patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
+        patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"AAPL": 3})),
+    ):
+        pf = {"AAPL": _make_sq("AAPL")}
+        await reg.build(pre_fetched_quotes=pf)
+
+    assert reg._oi_by_ticker.get("AAPL") == 800, "_oi_by_ticker should be 800 after build 2"
+    assert reg._oi_snapshot.get("AAPL") == 500, (
+        "_oi_snapshot should preserve OI from build 1 (500), not build 2 (800)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
+    """
+    Core invariant: after any build N>1, _oi_snapshot != _oi_by_ticker
+    if OI actually changed between builds.
+    """
+    reg = _make_registry(["SPY"])
+
+    async def _run_build(new_oi):
+        async def fake_build_ticker(self_inner, ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
+            from services.symbol_registry import ContractMeta
+            registry[f"{ticker}OCC"] = ContractMeta(
+                ticker=ticker, strike=400.0, expiry="2026-06-01",
+                contract_type="CALL", dte=30, open_interest=new_oi, tier=3
+            )
+            oi_by_ticker[ticker] = new_oi
+            if expiry_cache_out is not None:
+                expiry_cache_out[ticker] = {"2026-06-01"}
+
+        async def fake_apply_delta(prices, tier_params, new_registry, new_oi_by_ticker, new_expiry_cache, oi_delta_thresh):
+            from services.symbol_registry import ContractMeta
+            new_registry["SPYOCC"] = ContractMeta(
+                ticker="SPY", strike=400.0, expiry="2026-06-01",
+                contract_type="CALL", dte=30, open_interest=new_oi, tier=3
+            )
+            new_oi_by_ticker["SPY"] = new_oi
+            new_expiry_cache["SPY"] = {"2026-06-01"}
+            return 0
+
+        is_first = not bool(reg._expiry_cache)
+
+        with (
+            patch("services.symbol_registry.SymbolRegistry._build_ticker", new=fake_build_ticker if is_first else MagicMock()),
+            patch("services.symbol_registry.SymbolRegistry._apply_delta", new=fake_apply_delta if not is_first else MagicMock()),
+            patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+            patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
+            patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
+            patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"SPY": 1})),
+        ):
+            await reg.build(pre_fetched_quotes={"SPY": _make_sq("SPY", price=400.0)})
+
+    await _run_build(new_oi=1000)
+    await _run_build(new_oi=1500)
+
+    assert reg._oi_by_ticker.get("SPY") == 1500
+    assert reg._oi_snapshot.get("SPY") == 1000, (
+        "_oi_snapshot must hold pre-build OI (1000) so drift detection works"
+    )
+    assert reg._oi_snapshot != reg._oi_by_ticker, (
+        "_oi_snapshot and _oi_by_ticker must differ when OI changed between builds"
+    )

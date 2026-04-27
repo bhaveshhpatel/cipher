@@ -69,7 +69,8 @@ class SymbolRegistry:
         self._build_done: asyncio.Event = asyncio.Event()
         # Issue 6 Part 2: delta chain fetch caches
         # _expiry_cache:  ticker -> set of expiry date strings seen on last build
-        # _oi_snapshot:   ticker -> avg OI seen on last build (for drift detection)
+        # _oi_snapshot:   ticker -> avg OI seen on the build BEFORE the current one
+        #                  (used by _apply_delta to detect OI drift between builds)
         self._expiry_cache:  dict[str, set[str]] = {}
         self._oi_snapshot:   dict[str, int]      = {}
 
@@ -274,11 +275,19 @@ class SymbolRegistry:
 
             self._tier_map = live_tier_map
 
-            old_count            = len(self._registry)
+            old_count = len(self._registry)
+
+            # ----------------------------------------------------------
+            # Bug fix: snapshot the CURRENT (pre-update) OI before we
+            # overwrite _oi_by_ticker.  _apply_delta compares
+            # _oi_snapshot (prev build) vs _oi_by_ticker (current build)
+            # to detect drift.  Previously both were set to new_oi_by_ticker
+            # in the same block, so drift was always 0.
+            # ----------------------------------------------------------
+            self._oi_snapshot    = dict(self._oi_by_ticker)   # prev OI preserved
             self._registry       = new_registry
             self._oi_by_ticker   = new_oi_by_ticker
             self._expiry_cache   = new_expiry_cache
-            self._oi_snapshot    = dict(new_oi_by_ticker)
             self._last_build     = datetime.utcnow()
 
             t_counts = {1: 0, 2: 0, 3: 0}
