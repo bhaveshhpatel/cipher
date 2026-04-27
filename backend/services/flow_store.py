@@ -38,7 +38,7 @@ C-003 — Sweep Retroactive Upgrade:
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 import httpx
 
@@ -54,12 +54,24 @@ _SUPABASE_KEY: Optional[str] = (
     or os.environ.get("SUPABASE_SERVICE_KEY")  # legacy fallback
 )
 
-_FLUSH_INTERVAL  = 0.5
-_FLUSH_MAX_ROWS  = 100
-_flow_event_buffer: list[dict] = []
+_FLUSH_INTERVAL = 0.5   # seconds between periodic flushes
+_FLUSH_MAX_ROWS = 100   # immediate flush when buffer reaches this size
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
+
+# asyncio.Lock() guards all mutations to _flow_event_buffer.
+# Must be created inside the event loop — lazy-initialised on first use.
+_buffer_lock: Optional[asyncio.Lock] = None
+_flow_event_buffer: list[dict] = []
+
+
+def _get_lock() -> asyncio.Lock:
+    """Lazy-init the buffer lock inside the running event loop."""
+    global _buffer_lock
+    if _buffer_lock is None:
+        _buffer_lock = asyncio.Lock()
+    return _buffer_lock
 
 
 def _is_configured() -> bool:
@@ -84,10 +96,13 @@ async def _insert_rows(table: str, rows: list[dict]) -> bool:
             resp = await client.post(url, headers=_headers(), json=rows)
         if resp.status_code in (200, 201):
             return True
-        log.error(f"[flow_store] insert into {table} failed: {resp.status_code} -- {resp.text[:300]}")
+        log.error(
+            "[flow_store] insert into %s failed: %s -- %s",
+            table, resp.status_code, resp.text[:300],
+        )
         return False
-    except Exception as e:
-        log.error(f"[flow_store] insert into {table} exception: {e}")
+    except Exception as exc:
+        log.error("[flow_store] insert into %s exception: %s", table, exc)
         return False
 
 
@@ -98,31 +113,42 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
             return True
         if attempt < _RETRY_MAX:
             log.warning(
-                f"[flow_store] insert into {table} failed (attempt {attempt}/{_RETRY_MAX}) "
-                f"-- retrying in {_RETRY_DELAY_S}s"
+                "[flow_store] insert into %s failed (attempt %d/%d) -- retrying in %ss",
+                table, attempt, _RETRY_MAX, _RETRY_DELAY_S,
             )
             await asyncio.sleep(_RETRY_DELAY_S)
     log.error(
-        f"[flow_store] insert into {table} failed after {_RETRY_MAX} attempts "
-        f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
+        "[flow_store] insert into %s failed after %d attempts "
+        "-- %d rows DISCARDED. Check Supabase connectivity.",
+        table, _RETRY_MAX, len(rows),
     )
     return False
 
 
-async def _flush_flow_events():
+async def _flush_flow_events() -> None:
+    """Periodic background flush loop — drains the buffer every _FLUSH_INTERVAL seconds."""
     global _flow_event_buffer
+    lock = _get_lock()
     while True:
         await asyncio.sleep(_FLUSH_INTERVAL)
-        if not _flow_event_buffer:
-            continue
-        batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
-        _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
+        async with lock:
+            if not _flow_event_buffer:
+                continue
+            batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
+            _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
         ok = await _insert_rows_with_retry("flow_events", batch)
         if ok:
-            log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
+            log.info("[flow_store] flushed %d flow_events to DB", len(batch))
 
 
-async def persist_flow_event(ev_dict: dict):
+async def persist_flow_event(ev_dict: dict) -> None:
+    """
+    Buffer a single flow event for DB persistence.
+
+    Appends to the in-memory buffer under a lock. If the buffer reaches
+    _FLUSH_MAX_ROWS an immediate flush is triggered (still under lock to
+    prevent the periodic flush from racing on the same slice).
+    """
     global _flow_event_buffer
 
     if not _is_configured():
@@ -132,51 +158,58 @@ async def persist_flow_event(ev_dict: dict):
         )
         return
 
+    ticker = ev_dict.get("ticker", "UNKNOWN")
     expiry = ev_dict.get("expiry") or None
     strike = ev_dict.get("strike")
-    if strike is None:
-        strike = None
 
-    ticker = ev_dict.get("ticker", "UNKNOWN")
     if not expiry:
-        log.warning(f"[flow_store] {ticker}: expiry is empty -- OCC parse may have failed")
+        log.warning("[flow_store] %s: expiry is empty -- OCC parse may have failed", ticker)
     if strike == 0.0:
-        log.warning(f"[flow_store] {ticker}: strike=0.0 -- verify OCC parse for this symbol")
+        log.warning("[flow_store] %s: strike=0.0 -- verify OCC parse for this symbol", ticker)
 
     row = {
-        "ticker":               ticker,
-        "contract_type":        ev_dict.get("contract_type"),
-        "strike":               strike,
-        "expiry":               expiry,
-        "dte":                  ev_dict.get("dte", 0),
-        "fill_price":           ev_dict.get("fill_price", 0.0),
-        "bid":                  ev_dict.get("bid", 0.0),
-        "ask":                  ev_dict.get("ask", 0.0),
-        "size":                 ev_dict.get("size", 0),
-        "premium":              ev_dict.get("premium", 0.0),
-        "trade_type":           ev_dict.get("trade_type", "UNKNOWN"),
-        "bid_ask_class":        ev_dict.get("bid_ask_class", "MID"),
-        "is_aggressive":        ev_dict.get("is_aggressive", False),
-        "is_golden_sweep":      ev_dict.get("is_golden_sweep", False),
-        "sentiment":            ev_dict.get("sentiment", "NEUTRAL"),
-        "influence_tier":       ev_dict.get("influence_tier", "RETAIL"),
-        "conviction_score":     ev_dict.get("conviction_score", 0.0),
-        "exchange_count":       ev_dict.get("exchange_count", 1),
-        "fill_count":           ev_dict.get("fill_count", 1),
-        "open_interest":        ev_dict.get("open_interest", 0),
-        "iv":                   ev_dict.get("iv", 0.0),
-        "underlying_price":     ev_dict.get("underlying_price", 0.0),
-        "occ_symbol":           ev_dict.get("occ_symbol"),
-        "is_synthetic_quote":   ev_dict.get("is_synthetic_quote", False),
+        "ticker":             ticker,
+        "contract_type":      ev_dict.get("contract_type"),
+        "strike":             strike,
+        "expiry":             expiry,
+        "dte":                ev_dict.get("dte", 0),
+        "fill_price":         ev_dict.get("fill_price", 0.0),
+        "bid":                ev_dict.get("bid", 0.0),
+        "ask":                ev_dict.get("ask", 0.0),
+        "size":               ev_dict.get("size", 0),
+        "premium":            ev_dict.get("premium", 0.0),
+        "trade_type":         ev_dict.get("trade_type", "UNKNOWN"),
+        "bid_ask_class":      ev_dict.get("bid_ask_class", "MID"),
+        "is_aggressive":      ev_dict.get("is_aggressive", False),
+        "is_golden_sweep":    ev_dict.get("is_golden_sweep", False),
+        "sentiment":          ev_dict.get("sentiment", "NEUTRAL"),
+        "influence_tier":     ev_dict.get("influence_tier", "RETAIL"),
+        "conviction_score":   ev_dict.get("conviction_score", 0.0),
+        "exchange_count":     ev_dict.get("exchange_count", 1),
+        "fill_count":         ev_dict.get("fill_count", 1),
+        "open_interest":      ev_dict.get("open_interest", 0),
+        "iv":                 ev_dict.get("iv", 0.0),
+        "underlying_price":   ev_dict.get("underlying_price", 0.0),
+        "occ_symbol":         ev_dict.get("occ_symbol"),
+        "is_synthetic_quote": ev_dict.get("is_synthetic_quote", False),
     }
-    _flow_event_buffer.append(row)
 
-    if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
-        batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
-        _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
-        ok = await _insert_rows_with_retry("flow_events", batch)
+    lock = _get_lock()
+    flush_batch: Optional[list[dict]] = None
+
+    async with lock:
+        _flow_event_buffer.append(row)
+        if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
+            flush_batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
+            _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
+
+    if flush_batch:
+        ok = await _insert_rows_with_retry("flow_events", flush_batch)
         if ok:
-            log.info(f"[flow_store] early flush ({_FLUSH_MAX_ROWS} rows) -- buffer hit max")
+            log.info(
+                "[flow_store] early flush (%d rows) -- buffer hit max",
+                len(flush_batch),
+            )
 
 
 async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
@@ -211,41 +244,32 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         f"&trade_type=neq.SWEEP"
         f"&created_at=gte.now()-interval%2030%20seconds"
     )
-    headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=minimal",
-    }
-    payload = {"trade_type": "SWEEP"}
-
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(url, headers=headers, json=payload)
+            resp = await client.patch(url, headers=_headers(), json={"trade_type": "SWEEP"})
         if resp.status_code in (200, 204):
             log.info(
-                f"[flow_store] sweep upgrade applied: {occ_symbol} "
-                f"fill={fill_price} size={size}"
+                "[flow_store] sweep upgrade applied: %s fill=%s size=%s",
+                occ_symbol, fill_price, size,
             )
             return True
         log.warning(
-            f"[flow_store] sweep upgrade failed: {resp.status_code} -- {resp.text[:200]}"
+            "[flow_store] sweep upgrade failed: %s -- %s",
+            resp.status_code, resp.text[:200],
         )
         return False
-    except Exception as e:
-        log.error(f"[flow_store] upgrade_to_sweep_in_db exception: {e}")
+    except Exception as exc:
+        log.error("[flow_store] upgrade_to_sweep_in_db exception: %s", exc)
         return False
 
 
-async def persist_flow_episode(signal_data: dict):
-    expiry = signal_data.get("expiry") or None
-
+async def persist_flow_episode(signal_data: dict) -> None:
     row = {
         "ticker":          signal_data.get("ticker"),
         "direction":       signal_data.get("direction"),
         "contract_type":   signal_data.get("contract_type"),
         "strike":          signal_data.get("strike"),
-        "expiry":          expiry,
+        "expiry":          signal_data.get("expiry") or None,
         "total_premium":   signal_data.get("total_premium"),
         "trade_count":     signal_data.get("trade_count"),
         "alert_level":     signal_data.get("alert_level"),
@@ -256,12 +280,14 @@ async def persist_flow_episode(signal_data: dict):
     ok = await _insert_rows("flow_episodes", [row])
     if ok:
         log.info(
-            f"[flow_store] flow_episode saved: {row['ticker']} {row['contract_type']} "
-            f"alert={row['alert_level']} prem=${(row['total_premium'] or 0):,.0f}"
+            "[flow_store] flow_episode saved: %s %s alert=%s prem=$%s",
+            row["ticker"], row["contract_type"],
+            row["alert_level"],
+            f"{row['total_premium'] or 0:,.0f}",
         )
 
 
-async def _bus_signal_listener():
+async def _bus_signal_listener() -> None:
     q = bus.subscribe("db_writer")
     log.info("[flow_store] DB writer subscribed to bus -- flow_episodes written on composite_signal only")
     try:
@@ -269,8 +295,7 @@ async def _bus_signal_listener():
             msg = await q.get()
             if not isinstance(msg, dict):
                 continue
-            msg_type = msg.get("type")
-            if msg_type == "composite_signal":
+            if msg.get("type") == "composite_signal":
                 data = msg.get("data", {})
                 sig  = data.get("signal", {})
                 ep   = data.get("episode", {})
@@ -293,7 +318,7 @@ async def _bus_signal_listener():
         raise
 
 
-async def start_flow_writer():
+async def start_flow_writer() -> None:
     if not _is_configured():
         log.warning(
             "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "
@@ -301,8 +326,11 @@ async def start_flow_writer():
             "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
         )
         return
-
-    log.info(f"[flow_store] Starting flow DB writer (flush_interval={_FLUSH_INTERVAL}s, max_rows={_FLUSH_MAX_ROWS}, retry_max={_RETRY_MAX})")
+    log.info(
+        "[flow_store] Starting flow DB writer "
+        "(flush_interval=%ss, max_rows=%d, retry_max=%d)",
+        _FLUSH_INTERVAL, _FLUSH_MAX_ROWS, _RETRY_MAX,
+    )
     await asyncio.gather(
         _bus_signal_listener(),
         _flush_flow_events(),
@@ -310,53 +338,31 @@ async def start_flow_writer():
 
 
 # ---------------------------------------------------------------------------
-# FlowStore — in-memory store for unit / regression tests.
+# In-memory helpers — used by the 6-layer regression test and demo flow path.
+# Deliberately kept minimal: no class, just a module-level deque + helpers.
 # ---------------------------------------------------------------------------
 
-class FlowStore:
-    """In-memory store for options flow events."""
+import collections as _collections
 
-    def __init__(self) -> None:
-        self._flows: List[Any] = []
-        self._stats: Dict[str, Any] = {"total": 0}
-
-    def add_flow(self, flow: Any) -> None:
-        self._flows.append(flow)
-        self._stats["total"] = len(self._flows)
-
-    def get_flows(self) -> List[Any]:
-        return list(self._flows)
-
-    def get_flows_by_symbol(self, symbol: str) -> List[Any]:
-        return [
-            f for f in self._flows
-            if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
-        ]
-
-    def get_stats(self) -> Dict[str, Any]:
-        return dict(self._stats)
-
-    def clear(self) -> None:
-        self._flows.clear()
-        self._stats = {"total": 0}
-
-    def size(self) -> int:
-        return len(self._flows)
-
-
-_store = FlowStore()
+_mem_store: _collections.deque = _collections.deque(maxlen=5_000)
 
 
 async def add_flow(flow: dict) -> None:
-    _store.add_flow(flow)
+    """Append a flow dict to the in-memory store (used by tests and demo path)."""
+    _mem_store.append(flow)
 
 
-async def get_flows(ticker: str) -> List[dict]:
+async def get_flows(ticker: str) -> list[dict]:
+    """Return all in-memory flows for a given ticker."""
     return [
-        f for f in _store.get_flows()
-        if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
+        f for f in _mem_store
+        if (
+            f.get("ticker") if isinstance(f, dict)
+            else getattr(f, "ticker", None)
+        ) == ticker
     ]
 
 
 async def clear_flows() -> None:
-    _store.clear()
+    """Clear the in-memory store. Called by tests for isolation."""
+    _mem_store.clear()
