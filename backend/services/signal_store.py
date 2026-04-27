@@ -31,6 +31,7 @@ Insert path:
   get_signals uses the SDK path (patchable via _client) for read queries.
 """
 import asyncio
+import importlib.util
 import logging
 import os
 from collections import deque
@@ -98,11 +99,8 @@ def _headers() -> dict:
 
 
 def _is_sdk_available() -> bool:
-    try:
-        import supabase  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """Return True when the supabase package is importable, without importing it."""
+    return importlib.util.find_spec("supabase") is not None
 
 
 async def _insert_signal_sdk(row: dict) -> bool:
