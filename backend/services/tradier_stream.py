@@ -11,6 +11,12 @@ Design principles:
   - Demo mode is a supervised fallback task, not an infinite blocking trap
   - Market-hours guard: backs off 60s when US options market is closed
 
+Apex Phase 1 (signal_gate wiring):
+  - signal_gate.check(ev) called after dedup canonical pass, before accumulator.
+  - HARD_REJECT  -> event dropped, gate_rejected counter incremented.
+  - SOFT_REJECT  -> conviction_score penalised (score * (1 - penalty)), event forwarded.
+  - Gate is only active when APEX_MODE=true. Main service is unaffected.
+
 Phase 4 change:
   - _process_trade() now calls build_composite() after accumulator threshold is crossed
     and publishes a 'composite_signal' bus message for signal_store.py to persist.
@@ -178,6 +184,7 @@ from parsers.options_flow_parser import parse_tradier_trade
 from services.flow_store import persist_flow_event, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
+from signals.signal_gate import check as gate_check, GateVerdict
 from utils.dedup import flow_dedup
 
 log = logging.getLogger("tradier_stream")
@@ -210,9 +217,11 @@ _stats = {
     "ticks":             0,
     "classified":        0,
     "deduped":           0,
+    "gate_rejected":     0,   # Apex Phase 1: HARD_REJECT count
+    "gate_soft":         0,   # Apex Phase 1: SOFT_REJECT count (conviction penalised)
     "signals":           0,
     "errors":            0,
-    "composite_errors":  0,   # issue #6: build_composite failures, separate from DB errors
+    "composite_errors":  0,
     "reconnects":        0,
     "mode":              "starting",
     "last_tick_at":      None,
@@ -222,7 +231,6 @@ _stats = {
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
 
 # Guard against double-dispatch of retroactive sweep upgrade tasks (issue #5).
-# Key = (occ_symbol, size, fill_price) stringified; entry added before create_task.
 _sweep_upgrade_dispatched: Set[str] = set()
 
 
@@ -371,8 +379,11 @@ async def _process_trade(raw: dict):
 
       bus.publish_all() called on sig_ep (only when cooldown passes).
 
-      Issue #6: build_composite failures increment composite_errors (not
-      errors) so DB and signal-engine failures are independently observable.
+    Apex Phase 1 — signal_gate:
+      gate_check(ev) runs after dedup, before accumulator.
+      HARD_REJECT -> return immediately, gate_rejected counter++.
+      SOFT_REJECT -> conviction_score *= (1 - penalty), event continues.
+      Gate is APEX_MODE-gated: skipped when APEX_MODE=false.
     """
     _stats["ticks"] += 1
 
@@ -412,8 +423,6 @@ async def _process_trade(raw: dict):
         )
 
         # C-003: retroactive sweep upgrade
-        # _sweep_upgrade_dispatched guards against double create_task when
-        # two concurrent workers both see exch_count == sweep_min (issue #5).
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
             dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
@@ -444,6 +453,27 @@ async def _process_trade(raw: dict):
     _stats["classified"] += 1
     _stats["last_tick_at"] = _time.time()
 
+    # ------------------------------------------------------------------
+    # Apex Phase 1: Signal Gate (APEX_MODE only)
+    # ------------------------------------------------------------------
+    if settings.APEX_MODE:
+        gate_result = gate_check(ev)
+        if gate_result.verdict == GateVerdict.HARD_REJECT:
+            _stats["gate_rejected"] += 1
+            log.debug(
+                f"[gate] HARD_REJECT {ev.ticker} — {gate_result.failed_gate}: {gate_result.reason}"
+            )
+            return
+        if gate_result.verdict == GateVerdict.SOFT_REJECT:
+            _stats["gate_soft"] += 1
+            ev.conviction_score = round(
+                ev.conviction_score * (1.0 - gate_result.score_penalty), 3
+            )
+            log.debug(
+                f"[gate] SOFT_REJECT {ev.ticker} — {gate_result.failed_gate}: {gate_result.reason} "
+                f"| conviction -> {ev.conviction_score}"
+            )
+
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
         f"${ev.strike:.2f} {ev.expiry} dte={ev.dte} "
@@ -459,10 +489,9 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
     # C-008: Decoupled persist tier / signal tier
     # ------------------------------------------------------------------
-    persist_ep = await accumulator.ingest_tick(ev)                       # above threshold? (no cooldown)
-    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)  # cooldown passed?
+    persist_ep = await accumulator.ingest_tick(ev)
+    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)
 
-    # Persist every qualifying tick to flow_events (full backtesting history)
     if not persist_ep:
         return
 
@@ -504,7 +533,6 @@ async def _process_trade(raw: dict):
         )
         return
 
-    # Only publish signal to bus if cooldown gate passes
     if not sig_ep:
         return
 
@@ -522,7 +550,7 @@ async def _process_trade(raw: dict):
     try:
         composite = build_composite(sig_ep, accumulator)
     except Exception as e:
-        _stats["composite_errors"] += 1   # issue #6: separate counter
+        _stats["composite_errors"] += 1
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
@@ -655,7 +683,7 @@ async def _demo_mode_once(symbols: list[str]):
             }
             await bus.publish_all(composite_msg)
 
-            _ = (bid, ask, size, dte)
+            _ = (bid, ask, size, dte, fill)
     except asyncio.CancelledError:
         log.info("Demo mode cancelled — live stream connection established")
         raise

@@ -19,6 +19,7 @@ from routers.smart_signals import stream_stats
 from routers import history
 from routers import admin
 from routers import health          # B-008: stream health router
+from routers import apex_gate       # Apex Phase 1: hard/soft gate config
 from core.auth import get_current_user
 from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, _fetch_batch_quotes
@@ -71,8 +72,9 @@ log = logging.getLogger("main")
 async def get_config() -> dict:
     """Return current runtime config dict. Patchable by tests."""
     return {
-        "app_env":  settings.APP_ENV,
-        "log_level": settings.LOG_LEVEL,
+        "app_env":           settings.APP_ENV,
+        "log_level":         settings.LOG_LEVEL,
+        "ingestion_enabled": settings.INGESTION_ENABLED,
     }
 
 
@@ -329,6 +331,22 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
+    # ── Ingestion kill-switch (Option C) ─────────────────────────────────────
+    # When INGESTION_ENABLED=false (preview/staging), skip all stream + DB
+    # write tasks entirely so preview cannot pollute the shared production
+    # Supabase tables with duplicate flow_events / smart_signals.
+    #
+    # TODO(parallel-schema): Remove this guard once Option A/B parallel schema
+    # isolation is implemented — replace with schema-scoped writes instead.
+    if not settings.INGESTION_ENABLED:
+        log.warning(
+            "[ingestion] INGESTION_ENABLED=false — stream, flow_writer, and "
+            "signal_writer are DISABLED. Preview mode: read-only API only."
+        )
+        yield
+        log.info("Cipher backend stopped (ingestion disabled).")
+        return
+
     stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
@@ -454,6 +472,7 @@ app.include_router(smart_signals.router)
 app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
+app.include_router(apex_gate.router)
 
 # ---------------------------------------------------------------------------
 # Aliases for legacy / health-check paths
