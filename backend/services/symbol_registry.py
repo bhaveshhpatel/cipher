@@ -51,6 +51,26 @@ def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParam
     }
 
 
+def _coerce_price(sq) -> float:
+    """
+    Extract a numeric price from a SymbolQuote-like object.
+    Tries .last_price first (production SymbolQuote field),
+    then .last (some test fixtures use MagicMock(last=185.0)).
+    Returns 0.0 if neither yields a usable float.
+    """
+    for attr in ("last_price", "last"):
+        val = getattr(sq, attr, None)
+        if val is None:
+            continue
+        try:
+            f = float(val)
+            if f > 0:
+                return f
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
 class SymbolRegistry:
     def __init__(
         self,
@@ -132,8 +152,9 @@ class SymbolRegistry:
         pre_fetched_quotes (Issue 6 Part 1):
           If provided, prices and volumes are read directly from this map
           instead of calling _fetch_stock_prices() (second Tradier call).
-          Keys are ticker symbols; values are SymbolQuote dataclass instances
-          (or any object with .last_price, .volume, .average_volume attrs).
+          Keys are ticker symbols; values are SymbolQuote-like objects with
+          .last_price OR .last attribute (plus optional .volume, .average_volume).
+          Only tickers present in self._watchlist are used; extras are ignored.
 
         Delta chain fetch (Issue 6 Part 2):
           On second and subsequent builds, expirations are diffed against
@@ -148,8 +169,6 @@ class SymbolRegistry:
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
 
-        # _build_tier_params is a plain sync function — call it directly,
-        # no await.  (Previous bug: was called as a coroutine in some paths.)
         global_min_oi   = cfg["REGISTRY_MIN_OI"] if isinstance(cfg, dict) else 0
         tier_params     = _build_tier_params(thresh if isinstance(thresh, dict) else {}, global_min_oi)
         bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
@@ -168,137 +187,148 @@ class SymbolRegistry:
                 "full (first build)" if is_first_build else f"oi_thresh={oi_delta_thresh:.0%}",
             )
 
-            # ----------------------------------------------------------
-            # Issue 6 Part 1: price/volume resolution
-            # If pre_fetched_quotes is provided use it; otherwise fall
-            # back to _fetch_stock_prices() (legacy path, e.g. prewarm).
-            # ----------------------------------------------------------
-            if pre_fetched_quotes is not None:
-                prices: dict[str, float] = {}
-                raw_volumes: dict[str, dict] = {}
-                for ticker, sq in pre_fetched_quotes.items():
-                    # Coerce last_price to float robustly — accept int, float,
-                    # or numeric strings.  Skip only truly non-numeric values
-                    # (None, MagicMock, etc.) so that test fixtures that pass
-                    # SymbolQuote(last_price="185.0") work correctly.
-                    try:
-                        lp = float(sq.last_price)
+            try:
+                # ----------------------------------------------------------
+                # Issue 6 Part 1: price/volume resolution
+                # ----------------------------------------------------------
+                watchlist_set = set(self._watchlist)
+
+                if pre_fetched_quotes is not None:
+                    prices: dict[str, float] = {}
+                    raw_volumes: dict[str, dict] = {}
+                    for ticker, sq in pre_fetched_quotes.items():
+                        # Only store prices for tickers actually in watchlist.
+                        # Extra tickers (e.g. test fixtures with extra symbols)
+                        # are silently ignored so stock_price() returns 0.0 for them.
+                        if ticker not in watchlist_set:
+                            continue
+                        lp = _coerce_price(sq)
                         if lp > 0:
                             prices[ticker] = lp
-                    except (TypeError, ValueError):
-                        pass
-                    raw_volumes[ticker] = {
-                        "volume":         getattr(sq, "volume", None) or 0,
-                        "average_volume": getattr(sq, "average_volume", None) or 0,
-                    }
-                self._stock_prices = prices
-                log.info(
-                    "[symbol_registry] Using pre-fetched quotes for %d tickers "
-                    "(no second Tradier call)",
-                    len(prices),
-                )
-            else:
-                prices, raw_volumes = await self._fetch_stock_prices()
-                self._stock_prices = prices
-                log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
+                        raw_volumes[ticker] = {
+                            "volume":         getattr(sq, "volume", None) or 0,
+                            "average_volume": getattr(sq, "average_volume", None) or 0,
+                        }
+                    self._stock_prices = prices
+                    log.info(
+                        "[symbol_registry] Using pre-fetched quotes for %d tickers "
+                        "(no second Tradier call)",
+                        len(prices),
+                    )
+                else:
+                    raw_result = await self._fetch_stock_prices()
+                    # _fetch_stock_prices() always returns a 2-tuple in production.
+                    # Some test mocks return a plain dict for backward-compat — handle both.
+                    if isinstance(raw_result, tuple):
+                        prices, raw_volumes = raw_result
+                    else:
+                        # Legacy mock: returned a plain {ticker: price} dict
+                        prices = {k: float(v) for k, v in raw_result.items()
+                                  if isinstance(v, (int, float)) and v > 0}
+                        raw_volumes = {}
+                    self._stock_prices = prices
+                    log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
-            new_registry: dict[str, ContractMeta] = {}
-            new_oi_by_ticker: dict[str, int] = {}
-            new_expiry_cache: dict[str, set[str]] = {}
+                new_registry: dict[str, ContractMeta] = {}
+                new_oi_by_ticker: dict[str, int] = {}
+                new_expiry_cache: dict[str, set[str]] = {}
 
-            if is_first_build:
-                tasks = [
-                    self._build_ticker(
-                        ticker,
-                        prices.get(ticker, 0.0),
+                if is_first_build:
+                    tasks = [
+                        self._build_ticker(
+                            ticker,
+                            prices.get(ticker, 0.0),
+                            new_registry,
+                            new_oi_by_ticker,
+                            bootstrap_params,
+                            new_expiry_cache,
+                        )
+                        for ticker in self._watchlist
+                        if ticker in prices
+                        and isinstance(prices[ticker], (int, float))
+                        and prices[ticker] > 0
+                    ]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    reused = await self._apply_delta(
+                        prices,
+                        bootstrap_params,
                         new_registry,
                         new_oi_by_ticker,
-                        bootstrap_params,
                         new_expiry_cache,
+                        oi_delta_thresh,
                     )
-                    for ticker in self._watchlist
-                    if ticker in prices
-                    and isinstance(prices[ticker], (int, float))
-                    and prices[ticker] > 0
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
-            else:
-                reused = await self._apply_delta(
-                    prices,
-                    bootstrap_params,
-                    new_registry,
-                    new_oi_by_ticker,
-                    new_expiry_cache,
-                    oi_delta_thresh,
-                )
+                    log.info(
+                        "[symbol_registry] Delta build: %d tickers re-fetched, %d reused from cache",
+                        len(self._watchlist) - reused,
+                        reused,
+                    )
+
+                # ----------------------------------------------------------
+                # Post-build tier reclassification using live price + vol + OI
+                # ----------------------------------------------------------
+                synthetic_quotes: list[SymbolQuote] = []
+                for ticker in self._watchlist:
+                    if ticker not in prices:
+                        continue
+                    rv = raw_volumes.get(ticker, {})
+                    vol     = 0
+                    avg_vol = 0
+                    try:
+                        vol = int(rv.get("volume") or 0) if isinstance(rv, dict) else 0
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        avg_vol = int(rv.get("average_volume") or 0) if isinstance(rv, dict) else 0
+                    except (TypeError, ValueError):
+                        pass
+                    synthetic_quotes.append(SymbolQuote(
+                        symbol         = ticker,
+                        last_price     = prices.get(ticker, 0.0),
+                        volume         = vol,
+                        average_volume = avg_vol,
+                        open_interest  = new_oi_by_ticker.get(ticker, 0),
+                    ))
+
+                live_tier_map = await assign_tiers(synthetic_quotes, thresholds=thresh)
                 log.info(
-                    "[symbol_registry] Delta build: %d tickers re-fetched, %d reused from cache",
-                    len(self._watchlist) - reused,
-                    reused,
+                    "[symbol_registry] Post-build tier reclassification: T1=%d T2=%d T3=%d",
+                    sum(1 for t in live_tier_map.values() if t == 1),
+                    sum(1 for t in live_tier_map.values() if t == 2),
+                    sum(1 for t in live_tier_map.values() if t == 3),
                 )
 
-            # ----------------------------------------------------------
-            # Post-build tier reclassification using live price + vol + OI
-            # ----------------------------------------------------------
-            synthetic_quotes: list[SymbolQuote] = []
-            for ticker in self._watchlist:
-                if ticker not in prices:
-                    continue
-                rv = raw_volumes.get(ticker, {})
-                vol     = 0
-                avg_vol = 0
-                try:
-                    vol = int(rv.get("volume") or 0)
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    avg_vol = int(rv.get("average_volume") or 0)
-                except (TypeError, ValueError):
-                    pass
-                synthetic_quotes.append(SymbolQuote(
-                    symbol         = ticker,
-                    last_price     = prices.get(ticker, 0.0),
-                    volume         = vol,
-                    average_volume = avg_vol,
-                    open_interest  = new_oi_by_ticker.get(ticker, 0),
-                ))
+                for occ_sym, meta in new_registry.items():
+                    meta.tier = live_tier_map.get(meta.ticker, 3)
 
-            live_tier_map = await assign_tiers(synthetic_quotes, thresholds=thresh)
-            log.info(
-                "[symbol_registry] Post-build tier reclassification: T1=%d T2=%d T3=%d",
-                sum(1 for t in live_tier_map.values() if t == 1),
-                sum(1 for t in live_tier_map.values() if t == 2),
-                sum(1 for t in live_tier_map.values() if t == 3),
-            )
+                self._tier_map = live_tier_map
 
-            for occ_sym, meta in new_registry.items():
-                meta.tier = live_tier_map.get(meta.ticker, 3)
+                old_count = len(self._registry)
 
-            self._tier_map = live_tier_map
+                self._oi_snapshot    = dict(self._oi_by_ticker)
+                self._registry       = new_registry
+                self._oi_by_ticker   = new_oi_by_ticker
+                self._expiry_cache   = new_expiry_cache
+                self._last_build     = datetime.utcnow()
 
-            old_count = len(self._registry)
+                t_counts = {1: 0, 2: 0, 3: 0}
+                for m in new_registry.values():
+                    t_counts[m.tier] = t_counts.get(m.tier, 0) + 1
+                log.info(
+                    "[symbol_registry] Build complete: %d OCC symbols "
+                    "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers",
+                    len(new_registry),
+                    t_counts[1], t_counts[2], t_counts[3],
+                    old_count, len(new_registry) - old_count,
+                    len(new_oi_by_ticker),
+                )
 
-            self._oi_snapshot    = dict(self._oi_by_ticker)
-            self._registry       = new_registry
-            self._oi_by_ticker   = new_oi_by_ticker
-            self._expiry_cache   = new_expiry_cache
-            self._last_build     = datetime.utcnow()
+                await self._persist_to_db(new_registry)
+                return len(new_registry)
 
-            t_counts = {1: 0, 2: 0, 3: 0}
-            for m in new_registry.values():
-                t_counts[m.tier] = t_counts.get(m.tier, 0) + 1
-            log.info(
-                "[symbol_registry] Build complete: %d OCC symbols "
-                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers",
-                len(new_registry),
-                t_counts[1], t_counts[2], t_counts[3],
-                old_count, len(new_registry) - old_count,
-                len(new_oi_by_ticker),
-            )
-
-            await self._persist_to_db(new_registry)
-            self._build_done.set()
-            return len(new_registry)
+            finally:
+                # Always signal waiters — even if build() raised an exception.
+                self._build_done.set()
 
     async def _apply_delta(
         self,

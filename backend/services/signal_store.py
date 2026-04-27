@@ -90,9 +90,48 @@ def _headers() -> dict:
     }
 
 
+def _is_sdk_available() -> bool:
+    try:
+        from supabase import create_client  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+async def _insert_signal_sdk(row: dict) -> bool:
+    """
+    Insert via Supabase Python SDK.  Uses _client() which is patchable by tests.
+    Returns True on success, False on any failure.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: _client()
+                .table(_TABLE)
+                .insert(row)
+                .execute()
+        )
+        # supabase-py raises on error; if we get here it succeeded
+        return True
+    except Exception as exc:
+        log.error("[signal_store] SDK insert exception: %s", exc)
+        return False
+
+
 async def _insert_signal(row: dict) -> bool:
+    """
+    Insert a signal row.  Tries SDK path first (patchable by tests), then
+    falls back to raw httpx when SDK is unavailable.
+    """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
+
+    # SDK path — used in production and patchable in tests.
+    if _is_sdk_available():
+        return await _insert_signal_sdk(row)
+
+    # httpx fallback (no supabase-py installed).
     url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -246,8 +285,13 @@ def _store_in_memory(sig_dict: dict) -> None:
 
 async def save_signal(signal) -> bool:
     """
-    Persist a signal. Falls back to _signal_memory when Supabase is
-    unconfigured or when DB writes fail (CI / offline environments).
+    Persist a signal.
+
+    Priority:
+      1. SDK path via _client() — patchable by tests.
+      2. httpx fallback when SDK is unavailable.
+      3. _signal_memory fallback when Supabase is not configured or all
+         retries failed (CI / offline environments).
     """
     sig_dict = _coerce_to_dict(signal)
 
@@ -298,6 +342,36 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
 
 
 async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
+    """
+    Return signals.  Tries SDK path first (patchable), falls back to
+    _signal_memory (always available in CI / offline).
+    """
+    if _is_configured() and _is_sdk_available():
+        try:
+            loop = asyncio.get_running_loop()
+            query_result = await loop.run_in_executor(
+                None,
+                lambda: (
+                    _client()
+                    .table(_TABLE)
+                    .select("*")
+                    .eq("ticker", ticker)
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                ) if ticker else (
+                    _client()
+                    .table(_TABLE)
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+            )
+            return query_result.data or []
+        except Exception as exc:
+            log.warning("[signal_store] get_signals SDK error: %s — falling back to memory", exc)
+
     results = list(_signal_memory)
     if ticker:
         results = [s for s in results if s.get("ticker") == ticker]

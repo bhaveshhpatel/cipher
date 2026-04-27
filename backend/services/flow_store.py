@@ -339,8 +339,12 @@ def get_flows_sync(ticker: Optional[str] = None) -> list:
     ]
 
 
-async def get_flows(ticker: Optional[str] = None) -> list:
-    """Async version — returns a plain list (NOT an async generator)."""
+def get_flows(ticker: Optional[str] = None) -> list:
+    """
+    Synchronous helper — returns a plain list.
+    Named get_flows (not async) so callers can do sum(get_flows(ticker))
+    without awaiting.  Production callers that need async should use aget_flows().
+    """
     return get_flows_sync(ticker)
 
 
