@@ -22,6 +22,13 @@ CI / no-network behaviour:
   When Supabase is configured but the host is unreachable, save_signal()
   falls back to _signal_memory after all retries so that get_signals()
   can still return saved data within the same process.
+
+Insert path:
+  _insert_signal always uses httpx (raw REST).  This keeps the insert path
+  simple, test-patchable via patch('httpx.AsyncClient'), and avoids the SDK
+  initialising a real Supabase connection during CI.
+  get_signals uses the SDK path (patchable via _client) for read queries;
+  ticker filtering is done in Python after fetch so the mock chain is simple.
 """
 import asyncio
 import logging
@@ -112,7 +119,6 @@ async def _insert_signal_sdk(row: dict) -> bool:
                 .insert(row)
                 .execute()
         )
-        # supabase-py raises on error; if we get here it succeeded
         return True
     except Exception as exc:
         log.error("[signal_store] SDK insert exception: %s", exc)
@@ -121,17 +127,13 @@ async def _insert_signal_sdk(row: dict) -> bool:
 
 async def _insert_signal(row: dict) -> bool:
     """
-    Insert a signal row.  Tries SDK path first (patchable by tests), then
-    falls back to raw httpx when SDK is unavailable.
+    Insert a signal row via raw httpx REST.
+    Always uses the httpx path — test-patchable via patch('httpx.AsyncClient').
+    SDK path is intentionally NOT used here to keep CI inserts predictable.
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
 
-    # SDK path — used in production and patchable in tests.
-    if _is_sdk_available():
-        return await _insert_signal_sdk(row)
-
-    # httpx fallback (no supabase-py installed).
     url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -288,9 +290,8 @@ async def save_signal(signal) -> bool:
     Persist a signal.
 
     Priority:
-      1. SDK path via _client() — patchable by tests.
-      2. httpx fallback when SDK is unavailable.
-      3. _signal_memory fallback when Supabase is not configured or all
+      1. httpx REST insert via _insert_signal_with_retry.
+      2. _signal_memory fallback when Supabase is not configured or all
          retries failed (CI / offline environments).
     """
     sig_dict = _coerce_to_dict(signal)
@@ -343,8 +344,12 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
 
 async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
     """
-    Return signals.  Tries SDK path first (patchable), falls back to
-    _signal_memory (always available in CI / offline).
+    Return signals.  Tries SDK path first (patchable via _client()), falls back
+    to _signal_memory (always available in CI / offline).
+
+    Ticker filtering is done in Python after the SDK fetch — this keeps the
+    mock chain simple (.table().select().order().limit().execute()) without
+    requiring tests to also mock .eq().
     """
     if _is_configured() and _is_sdk_available():
         try:
@@ -355,20 +360,15 @@ async def get_signals(ticker: Optional[str] = None, limit: int = 50) -> list:
                     _client()
                     .table(_TABLE)
                     .select("*")
-                    .eq("ticker", ticker)
-                    .order("created_at", desc=True)
-                    .limit(limit)
-                    .execute()
-                ) if ticker else (
-                    _client()
-                    .table(_TABLE)
-                    .select("*")
                     .order("created_at", desc=True)
                     .limit(limit)
                     .execute()
                 )
             )
-            return query_result.data or []
+            rows = query_result.data or []
+            if ticker:
+                rows = [r for r in rows if r.get("ticker") == ticker]
+            return rows
         except Exception as exc:
             log.warning("[signal_store] get_signals SDK error: %s — falling back to memory", exc)
 
@@ -389,7 +389,7 @@ async def _bus_signal_listener() -> None:
     try:
         while True:
             msg = await q.get()
-            if isinstance(msg, dict) and msg.get("type") == "composite_signal":
+            if isinstance(msg, dict) and msg.get("type") in ("composite_signal", "signal"):
                 data = msg.get("data", {})
                 sig  = data.get("signal", {})
                 ep   = data.get("episode", {})

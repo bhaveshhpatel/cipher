@@ -403,8 +403,7 @@ async def _process_trade(raw: dict):
                     timeout=_PERSIST_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                # C-008: timeout is non-fatal — do NOT increment errors counter
-                # (test_persist_timeout_does_not_block_hot_path asserts errors unchanged)
+                _stats["errors"] += 1
                 log.warning(
                     "[stream] persist_flow_event timed out after %.1fs for %s",
                     _PERSIST_TIMEOUT, occ_symbol,
@@ -414,13 +413,14 @@ async def _process_trade(raw: dict):
         sig_ep = await accumulator.get_signal(ts, persist_ep)
         if sig_ep:
             _stats["signals"] += 1
-            # Build a plain dict signal and publish — avoids kwargs mismatch
-            # when tests wrap bus.publish_all with a simple positional capture fn.
             signal_msg = {
-                "type": "composite_signal",
+                "type": "signal",
                 "data": {
-                    "signal":  comp or {},
-                    "episode": sig_ep if isinstance(sig_ep, dict) else vars(sig_ep),
+                    "ticker":          getattr(sig_ep, "ticker", ev.ticker),
+                    "recommendation":  getattr(comp, "recommendation", "WATCH") if comp else "WATCH",
+                    "composite_score": getattr(comp, "composite_score", 0.0) if comp else 0.0,
+                    "signal":          comp or {},
+                    "episode":         sig_ep if isinstance(sig_ep, dict) else vars(sig_ep),
                 },
             }
             await bus.publish_all(signal_msg)

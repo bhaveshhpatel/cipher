@@ -54,6 +54,8 @@ def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParam
 def _coerce_price(sq) -> float:
     """
     Extract a numeric price from a SymbolQuote-like object.
+    Only accepts genuine int/float values — rejects MagicMock auto-attributes
+    that would otherwise coerce to 1.0 via float().
     Tries .last_price first (production SymbolQuote field),
     then .last (some test fixtures use MagicMock(last=185.0)).
     Returns 0.0 if neither yields a usable float.
@@ -61,6 +63,8 @@ def _coerce_price(sq) -> float:
     for attr in ("last_price", "last"):
         val = getattr(sq, attr, None)
         if val is None:
+            continue
+        if not isinstance(val, (int, float)):
             continue
         try:
             f = float(val)
@@ -90,6 +94,8 @@ class SymbolRegistry:
         self._build_done: asyncio.Event = asyncio.Event()
         self._expiry_cache:  dict[str, set[str]] = {}
         self._oi_snapshot:   dict[str, int]      = {}
+        # Populated by _build_ticker; consumed by build() after gather.
+        self._pending_expiry_cache: dict[str, set[str]] = {}
 
     async def wait_for_build(self) -> None:
         """Suspend until build() has completed at least once."""
@@ -197,9 +203,6 @@ class SymbolRegistry:
                     prices: dict[str, float] = {}
                     raw_volumes: dict[str, dict] = {}
                     for ticker, sq in pre_fetched_quotes.items():
-                        # Only store prices for tickers actually in watchlist.
-                        # Extra tickers (e.g. test fixtures with extra symbols)
-                        # are silently ignored so stock_price() returns 0.0 for them.
                         if ticker not in watchlist_set:
                             continue
                         lp = _coerce_price(sq)
@@ -217,12 +220,9 @@ class SymbolRegistry:
                     )
                 else:
                     raw_result = await self._fetch_stock_prices()
-                    # _fetch_stock_prices() always returns a 2-tuple in production.
-                    # Some test mocks return a plain dict for backward-compat — handle both.
                     if isinstance(raw_result, tuple):
                         prices, raw_volumes = raw_result
                     else:
-                        # Legacy mock: returned a plain {ticker: price} dict
                         prices = {k: float(v) for k, v in raw_result.items()
                                   if isinstance(v, (int, float)) and v > 0}
                         raw_volumes = {}
@@ -233,6 +233,9 @@ class SymbolRegistry:
                 new_oi_by_ticker: dict[str, int] = {}
                 new_expiry_cache: dict[str, set[str]] = {}
 
+                # Reset pending expiry cache for this build pass.
+                self._pending_expiry_cache = {}
+
                 if is_first_build:
                     tasks = [
                         self._build_ticker(
@@ -241,7 +244,6 @@ class SymbolRegistry:
                             new_registry,
                             new_oi_by_ticker,
                             bootstrap_params,
-                            new_expiry_cache,
                         )
                         for ticker in self._watchlist
                         if ticker in prices
@@ -249,6 +251,8 @@ class SymbolRegistry:
                         and prices[ticker] > 0
                     ]
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    # Merge expiry data written by _build_ticker into new_expiry_cache.
+                    new_expiry_cache.update(self._pending_expiry_cache)
                 else:
                     reused = await self._apply_delta(
                         prices,
@@ -327,7 +331,6 @@ class SymbolRegistry:
                 return len(new_registry)
 
             finally:
-                # Always signal waiters — even if build() raised an exception.
                 self._build_done.set()
 
     async def _apply_delta(
@@ -383,6 +386,8 @@ class SymbolRegistry:
                 unchanged.append(ticker)
 
         if changed:
+            # Reset pending cache so _build_ticker writes fresh entries.
+            self._pending_expiry_cache = {}
             tasks = [
                 self._build_ticker(
                     ticker,
@@ -390,11 +395,11 @@ class SymbolRegistry:
                     new_registry,
                     new_oi_by_ticker,
                     tier_params,
-                    new_expiry_cache,
                 )
                 for ticker in changed
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+            new_expiry_cache.update(self._pending_expiry_cache)
 
         for ticker in unchanged:
             live_expiries_for_cache = {
@@ -519,13 +524,19 @@ class SymbolRegistry:
 
     async def _build_ticker(
         self,
-        ticker:           str,
-        stock_price:      float,
-        registry:         dict[str, ContractMeta],
-        oi_by_ticker:     dict[str, int],
-        tier_params:      dict[int, _TierParams],
-        expiry_cache_out: Optional[dict[str, set[str]]] = None,
+        ticker:       str,
+        stock_price:  float,
+        registry:     dict[str, ContractMeta],
+        oi_by_ticker: dict[str, int],
+        tier_params:  dict[int, _TierParams],
     ):
+        """
+        Fetch and register all in-window OCC contracts for one ticker.
+
+        Expiry cache output is written to self._pending_expiry_cache[ticker]
+        instead of being passed as a positional argument — this keeps the
+        signature at 5 args (+ self) so test fakes with the same arity work.
+        """
         if stock_price <= 0:
             log.warning("[symbol_registry] %s: no stock price — skipping", ticker)
             return
@@ -594,8 +605,8 @@ class SymbolRegistry:
                 except Exception:
                     continue
 
-        if expiry_cache_out is not None:
-            expiry_cache_out[ticker] = in_window_expiries
+        # Write expiry cache to instance dict (no positional arg needed).
+        self._pending_expiry_cache[ticker] = in_window_expiries
 
         loaded_ois = [
             m.open_interest

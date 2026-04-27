@@ -390,7 +390,7 @@ class FlowStore:
 
     # ---- queries ---------------------------------------------------------
 
-    def get_flows(self, ticker: Optional[str] = None) -> list:
+    async def get_flows(self, ticker: Optional[str] = None) -> list:
         """Return all flows, optionally filtered by ticker."""
         if ticker is None:
             return list(self._store)
@@ -404,7 +404,13 @@ class FlowStore:
 
     def get_flows_by_symbol(self, symbol: str) -> list:
         """Return flows matching the given symbol."""
-        return self.get_flows(ticker=symbol)
+        return [
+            f for f in self._store
+            if (
+                f.get("ticker") if isinstance(f, dict)
+                else getattr(f, "ticker", None)
+            ) == symbol
+        ]
 
     def get_stats(self) -> dict:
         """Return a dict with basic stats for this store instance."""
@@ -419,7 +425,7 @@ class FlowStore:
         self.add_flow(flow)
 
     async def async_get_flows(self, ticker: Optional[str] = None) -> list:
-        return self.get_flows(ticker=ticker)
+        return await self.get_flows(ticker=ticker)
 
     async def async_clear(self) -> None:
         self.clear()

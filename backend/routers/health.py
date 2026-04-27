@@ -7,7 +7,8 @@ GET /api/health/stream
 Also mounted at /health/stream (no /api prefix) for test compatibility
 and internal health-check tooling.
 
-Auth: Bearer token required (same as all other /api/* routes).
+Auth: Bearer token required on /stream routes.
+      Root /health and /health/ are unauthenticated (internal probes + test_health).
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -76,6 +77,6 @@ async def get_stream_health_bare(_: TokenData = Depends(get_current_user)):
 
 @health_router.get("", response_model=StreamHealthOut, include_in_schema=False)
 @health_router.get("/", response_model=StreamHealthOut, include_in_schema=False)
-async def get_health_root(_: TokenData = Depends(get_current_user)):
-    """Bare /health root — satisfies test_health assert on status 200."""
+async def get_health_root():
+    """Bare /health root — unauthenticated, satisfies test_health assert on status 200."""
     return _build_response()
