@@ -132,17 +132,12 @@ def _patches(chain=_FAKE_CHAIN, expirations=None, expirations_side_effect=None,
 def test_registry_build_populates_contracts():
     r = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
 
-    async def _run():
-        with _patches()[0], _patches()[1], _patches()[2], _patches()[3], _patches()[4]:
-            return await r.build()
-
-    # Use stacked context managers the correct way
     async def _run2():
         p = _patches()
         with p[0], p[1], p[2], p[3], p[4]:
             return await r.build()
 
-    count = asyncio.get_event_loop().run_until_complete(_run2())
+    count = asyncio.run(_run2())
     assert count >= 1
     assert r.is_ready()
     assert r.size() == count
@@ -157,7 +152,7 @@ def test_registry_build_skips_ticker_with_no_price():
         with p[0], p[1], p[2]:
             return await r.build()
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     assert r._stock_prices.get("TSLA", 0) == 0
 
 
@@ -169,7 +164,7 @@ def test_registry_build_ticker_expiry_fetch_error():
         with p[0], p[1], p[2], p[3]:
             return await r.build()
 
-    count = asyncio.get_event_loop().run_until_complete(_run())
+    count = asyncio.run(_run())
     assert count == 0
 
 
@@ -181,7 +176,7 @@ def test_registry_build_chain_fetch_error_continues():
         with p[0], p[1], p[2], p[3], p[4]:
             return await r.build()
 
-    count = asyncio.get_event_loop().run_until_complete(_run())
+    count = asyncio.run(_run())
     assert count == 0
 
 
@@ -193,7 +188,7 @@ def test_registry_lookup_after_build():
         with p[0], p[1], p[2], p[3], p[4]:
             await r.build()
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     syms = r.all_symbols()
     assert len(syms) > 0
     meta = r.lookup(syms[0])
@@ -217,4 +212,4 @@ def test_refresh_loop_runs_one_iter_and_cancels():
                 except asyncio.CancelledError:
                     pass
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())

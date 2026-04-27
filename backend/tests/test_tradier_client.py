@@ -6,13 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 
 def test_tradier_client_importable():
-    import utils.tradier_client as _m  # intentional smoke import
+    import utils.tradier_client as _m
     assert _m is not None
 
 
@@ -42,7 +38,7 @@ class TestGetQuote:
         payload = {"quotes": {"quote": {"symbol": "AAPL", "last": 178.5}}}
         with patch("utils.tradier_client.httpx.AsyncClient",
                    return_value=self._mock_client(payload)):
-            result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+            result = asyncio.run(get_quote("AAPL"))
         assert result is not None
 
     def test_get_quote_handles_404(self):
@@ -59,7 +55,7 @@ class TestGetQuote:
             async def get(self, *a, **kw): return resp
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(get_quote("ZZZZZ"))
+            result = asyncio.run(get_quote("ZZZZZ"))
         assert result is None or isinstance(result, dict)
 
     def test_get_quote_handles_network_error(self):
@@ -71,7 +67,7 @@ class TestGetQuote:
             async def get(self, *a, **kw): raise httpx.ConnectError("refused")
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+            result = asyncio.run(get_quote("AAPL"))
         assert result is None
 
 
@@ -97,9 +93,7 @@ class TestGetOptionsChain:
             async def get(self, *a, **kw): return resp
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(
-                get_options_chain("AAPL", "2026-06-20")
-            )
+            result = asyncio.run(get_options_chain("AAPL", "2026-06-20"))
         assert isinstance(result, list)
         assert len(result) >= 1
 
@@ -116,9 +110,7 @@ class TestGetOptionsChain:
             async def get(self, *a, **kw): return resp
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(
-                get_options_chain("AAPL", "2026-06-20")
-            )
+            result = asyncio.run(get_options_chain("AAPL", "2026-06-20"))
         assert result == [] or result is None
 
 
@@ -136,7 +128,7 @@ class TestGetToken:
             async def post(self, *a, **kw): return resp
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(get_token())
+            result = asyncio.run(get_token())
         assert result == "tok_abc"
 
     def test_get_token_returns_none_on_401(self):
@@ -150,7 +142,7 @@ class TestGetToken:
             async def post(self, *a, **kw): return resp
 
         with patch("utils.tradier_client.httpx.AsyncClient", return_value=_C()):
-            result = asyncio.get_event_loop().run_until_complete(get_token())
+            result = asyncio.run(get_token())
         assert result is None
 
     def test_session_semaphore_exists(self):

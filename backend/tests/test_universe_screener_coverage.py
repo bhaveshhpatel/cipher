@@ -35,13 +35,13 @@ def test_nearest_expiry_param_is_future_friday():
     s = _nearest_expiry_param()
     d = date.fromisoformat(s)
     assert d >= date.today()
-    assert d.weekday() == 4  # Friday
+    assert d.weekday() == 4
 
 
 # --- screen_universe: empty ---
 
 def test_screen_universe_empty_returns_empty():
-    result = asyncio.get_event_loop().run_until_complete(screen_universe([]))
+    result = asyncio.run(screen_universe([]))
     assert result.eligible == []
     assert result.ineligible == []
 
@@ -54,9 +54,7 @@ def test_screen_universe_no_key_default_true():
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = True
         ms.priority_symbols                 = []
         ms.UNIVERSE_BATCH_DELAY_MS          = 0
-        result = asyncio.get_event_loop().run_until_complete(
-            screen_universe(["AAPL", "TSLA"])
-        )
+        result = asyncio.run(screen_universe(["AAPL", "TSLA"]))
     assert "AAPL" in result.eligible
     assert "TSLA" in result.eligible
 
@@ -67,9 +65,7 @@ def test_screen_universe_no_key_default_false():
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
         ms.priority_symbols                 = []
         ms.UNIVERSE_BATCH_DELAY_MS          = 0
-        result = asyncio.get_event_loop().run_until_complete(
-            screen_universe(["AAPL", "TSLA"])
-        )
+        result = asyncio.run(screen_universe(["AAPL", "TSLA"]))
     assert "AAPL" in result.ineligible
     assert "TSLA" in result.ineligible
 
@@ -82,9 +78,7 @@ def test_screen_universe_priority_symbols_always_eligible():
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
         ms.priority_symbols                 = ["AAPL"]
         ms.UNIVERSE_BATCH_DELAY_MS          = 0
-        result = asyncio.get_event_loop().run_until_complete(
-            screen_universe(["AAPL", "TSLA"])
-        )
+        result = asyncio.run(screen_universe(["AAPL", "TSLA"]))
     assert "AAPL" in result.eligible
     assert "AAPL" in result.priority
 
@@ -109,7 +103,7 @@ def test_is_stream_eligible_with_oi():
          patch("services.universe_screener.httpx.AsyncClient", return_value=ctx):
         ms.TRADIER_API_KEY                  = "fake"
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
-        result = asyncio.get_event_loop().run_until_complete(_is_stream_eligible("AAPL"))
+        result = asyncio.run(_is_stream_eligible("AAPL"))
     assert result == "AAPL"
 
 
@@ -119,7 +113,7 @@ def test_is_stream_eligible_no_oi_default_false():
          patch("services.universe_screener.httpx.AsyncClient", return_value=ctx):
         ms.TRADIER_API_KEY                  = "fake"
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
-        result = asyncio.get_event_loop().run_until_complete(_is_stream_eligible("XYZ"))
+        result = asyncio.run(_is_stream_eligible("XYZ"))
     assert result is None
 
 
@@ -129,7 +123,7 @@ def test_is_stream_eligible_no_oi_default_true():
          patch("services.universe_screener.httpx.AsyncClient", return_value=ctx):
         ms.TRADIER_API_KEY                  = "fake"
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = True
-        result = asyncio.get_event_loop().run_until_complete(_is_stream_eligible("XYZ"))
+        result = asyncio.run(_is_stream_eligible("XYZ"))
     assert result == "XYZ"
 
 
@@ -139,7 +133,7 @@ def test_is_stream_eligible_non200_default_false():
          patch("services.universe_screener.httpx.AsyncClient", return_value=ctx):
         ms.TRADIER_API_KEY                  = "fake"
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
-        result = asyncio.get_event_loop().run_until_complete(_is_stream_eligible("AAPL"))
+        result = asyncio.run(_is_stream_eligible("AAPL"))
     assert result is None
 
 
@@ -149,7 +143,7 @@ def test_is_stream_eligible_exception_default_true():
                side_effect=RuntimeError("conn err")):
         ms.TRADIER_API_KEY                  = "fake"
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = True
-        result = asyncio.get_event_loop().run_until_complete(_is_stream_eligible("AAPL"))
+        result = asyncio.run(_is_stream_eligible("AAPL"))
     assert result == "AAPL"
 
 
@@ -161,9 +155,7 @@ def test_screen_universe_with_api_key_eligible():
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = False
         ms.priority_symbols                 = []
         ms.UNIVERSE_BATCH_DELAY_MS          = 0
-        result = asyncio.get_event_loop().run_until_complete(
-            screen_universe(["AAPL"])
-        )
+        result = asyncio.run(screen_universe(["AAPL"]))
     assert "AAPL" in result.eligible
 
 
@@ -173,8 +165,6 @@ def test_get_stream_eligible_returns_list():
         ms.UNIVERSE_STREAM_ELIGIBLE_DEFAULT = True
         ms.priority_symbols                 = []
         ms.UNIVERSE_BATCH_DELAY_MS          = 0
-        result = asyncio.get_event_loop().run_until_complete(
-            get_stream_eligible(["AAPL", "TSLA"])
-        )
+        result = asyncio.run(get_stream_eligible(["AAPL", "TSLA"]))
     assert isinstance(result, list)
     assert "AAPL" in result

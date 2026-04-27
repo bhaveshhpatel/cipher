@@ -116,7 +116,7 @@ def _make_resp(status, json_data=None):
 
 def test_insert_signal_no_credentials():
     with patch("services.signal_store._SUPABASE_URL", None):
-        result = asyncio.get_event_loop().run_until_complete(_insert_signal({"ticker": "AAPL"}))
+        result = asyncio.run(_insert_signal({"ticker": "AAPL"}))
     assert result is False
 
 
@@ -128,7 +128,7 @@ def test_insert_signal_200_returns_true():
     with patch("services.signal_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.signal_store._SUPABASE_KEY", "key"), \
          patch("services.signal_store.httpx.AsyncClient", return_value=ctx):
-        result = asyncio.get_event_loop().run_until_complete(_insert_signal({"ticker": "AAPL"}))
+        result = asyncio.run(_insert_signal({"ticker": "AAPL"}))
     assert result is True
 
 
@@ -140,7 +140,7 @@ def test_insert_signal_non201_returns_false():
     with patch("services.signal_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.signal_store._SUPABASE_KEY", "key"), \
          patch("services.signal_store.httpx.AsyncClient", return_value=ctx):
-        result = asyncio.get_event_loop().run_until_complete(_insert_signal({"ticker": "AAPL"}))
+        result = asyncio.run(_insert_signal({"ticker": "AAPL"}))
     assert result is False
 
 
@@ -148,7 +148,7 @@ def test_insert_signal_exception_returns_false():
     with patch("services.signal_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.signal_store._SUPABASE_KEY", "key"), \
          patch("services.signal_store.httpx.AsyncClient", side_effect=Exception("net")):
-        result = asyncio.get_event_loop().run_until_complete(_insert_signal({"ticker": "AAPL"}))
+        result = asyncio.run(_insert_signal({"ticker": "AAPL"}))
     assert result is False
 
 
@@ -156,18 +156,14 @@ def test_insert_signal_exception_returns_false():
 
 def test_retry_succeeds_first_attempt():
     with patch("services.signal_store._insert_signal", new=AsyncMock(return_value=True)):
-        result = asyncio.get_event_loop().run_until_complete(
-            _insert_signal_with_retry({"ticker": "AAPL"})
-        )
+        result = asyncio.run(_insert_signal_with_retry({"ticker": "AAPL"}))
     assert result is True
 
 
 def test_retry_exhausts_returns_false():
     with patch("services.signal_store._insert_signal", new=AsyncMock(return_value=False)), \
          patch("services.signal_store.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(
-            _insert_signal_with_retry({"ticker": "AAPL"})
-        )
+        result = asyncio.run(_insert_signal_with_retry({"ticker": "AAPL"}))
     assert result is False
 
 
@@ -178,9 +174,7 @@ def test_retry_succeeds_on_second_attempt():
         return call_count[0] >= 2
     with patch("services.signal_store._insert_signal", side_effect=_mock_insert), \
          patch("services.signal_store.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(
-            _insert_signal_with_retry({"ticker": "AAPL"})
-        )
+        result = asyncio.run(_insert_signal_with_retry({"ticker": "AAPL"}))
     assert result is True
 
 
@@ -190,9 +184,7 @@ def test_save_signal_sdk_mock_path():
     mock_client = MagicMock()
     mock_client.table.return_value.insert.return_value.execute.return_value = MagicMock()
     with patch("services.signal_store._client", return_value=mock_client):
-        result = asyncio.get_event_loop().run_until_complete(
-            save_signal({"ticker": "AAPL", "composite_score": 0.8})
-        )
+        result = asyncio.run(save_signal({"ticker": "AAPL", "composite_score": 0.8}))
     assert result is True
 
 
@@ -200,20 +192,16 @@ def test_save_signal_sdk_insert_exception():
     mock_client = MagicMock()
     mock_client.table.side_effect = RuntimeError("db error")
     with patch("services.signal_store._client", return_value=mock_client):
-        result = asyncio.get_event_loop().run_until_complete(
-            save_signal({"ticker": "AAPL", "composite_score": 0.8})
-        )
+        result = asyncio.run(save_signal({"ticker": "AAPL", "composite_score": 0.8}))
     assert result is False
 
 
 def test_save_signal_no_credentials_stores_in_memory():
     with patch("services.signal_store._is_configured", return_value=False), \
          patch("services.signal_store._client", return_value=None):
-        result = asyncio.get_event_loop().run_until_complete(
-            save_signal({"id": "sig-1", "ticker": "TSLA"})
-        )
+        result = asyncio.run(save_signal({"id": "sig-1", "ticker": "TSLA"}))
     assert result is True
-    signals = asyncio.get_event_loop().run_until_complete(get_signals())
+    signals = asyncio.run(get_signals())
     assert any(s.get("ticker") == "TSLA" for s in signals)
 
 
@@ -225,7 +213,7 @@ def test_get_signals_sdk_path():
     mock_client = MagicMock()
     mock_client.table.return_value.select.return_value.order.return_value.limit.return_value.execute.return_value = mock_result
     with patch("services.signal_store._client", return_value=mock_client):
-        rows = asyncio.get_event_loop().run_until_complete(get_signals(ticker="AAPL"))
+        rows = asyncio.run(get_signals(ticker="AAPL"))
     assert rows[0]["ticker"] == "AAPL"
 
 
@@ -233,12 +221,12 @@ def test_get_signals_sdk_exception_falls_through_to_memory():
     mock_client = MagicMock()
     mock_client.table.side_effect = RuntimeError("err")
     with patch("services.signal_store._client", return_value=mock_client):
-        rows = asyncio.get_event_loop().run_until_complete(get_signals())
+        rows = asyncio.run(get_signals())
     assert isinstance(rows, list)
 
 
 def test_get_recent_signals_alias():
-    rows = asyncio.get_event_loop().run_until_complete(get_recent_signals())
+    rows = asyncio.run(get_recent_signals())
     assert isinstance(rows, list)
 
 
@@ -246,7 +234,7 @@ def test_get_recent_signals_alias():
 
 def test_persist_composite_signal_not_configured_returns_early():
     with patch("services.signal_store._is_configured", return_value=False):
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             persist_composite_signal({"ticker": "AAPL", "composite_score": 0.9,
                                        "flow_score": 0.9, "recommendation": "BUY",
                                        "backtest_score": 0.8})
@@ -256,7 +244,7 @@ def test_persist_composite_signal_not_configured_returns_early():
 def test_persist_composite_signal_insert_ok():
     with patch("services.signal_store._is_configured", return_value=True), \
          patch("services.signal_store._insert_signal_with_retry", new=AsyncMock(return_value=True)):
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             persist_composite_signal(
                 {"ticker": "AAPL", "composite_score": 0.9, "flow_score": 0.9,
                  "recommendation": "BUY", "backtest_score": 0.8,
@@ -272,7 +260,7 @@ def test_persist_composite_signal_insert_ok():
 def test_persist_composite_signal_insert_fail():
     with patch("services.signal_store._is_configured", return_value=True), \
          patch("services.signal_store._insert_signal_with_retry", new=AsyncMock(return_value=False)):
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             persist_composite_signal(
                 {"ticker": "AAPL", "composite_score": 0.5, "flow_score": 0.5,
                  "recommendation": "HOLD", "backtest_score": 0.5}
@@ -284,7 +272,7 @@ def test_persist_composite_signal_insert_fail():
 
 def test_start_signal_writer_not_configured_returns_early():
     with patch("services.signal_store._is_configured", return_value=False):
-        asyncio.get_event_loop().run_until_complete(start_signal_writer())
+        asyncio.run(start_signal_writer())
 
 
 def test_start_signal_writer_configured_cancels():
@@ -296,7 +284,7 @@ def test_start_signal_writer_configured_cancels():
                 await start_signal_writer()
             except asyncio.CancelledError:
                 pass
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 # --- _bus_signal_listener ---
@@ -332,6 +320,6 @@ def test_bus_signal_listener_processes_composite_signal_and_cancels():
             except asyncio.CancelledError:
                 pass
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     assert len(call_log) == 1
     assert call_log[0]["ticker"] == "AAPL"

@@ -22,10 +22,6 @@ class _Flow:
     reasoning: str = "test"
 
 
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
 def test_normalise_direction_bullish():
     from services.signal_store import _normalise_direction
     assert _normalise_direction("bullish") == "bullish"
@@ -59,14 +55,14 @@ def test_save_signal_calls_supabase_insert():
     t.execute.return_value = MagicMock(data=[{"id": 1}])
     sb.table.return_value  = t
     with patch.object(signal_store, "_client", return_value=sb):
-        _run(signal_store.save_signal(_Flow("AAPL")))
+        asyncio.run(signal_store.save_signal(_Flow("AAPL")))
     assert t.insert.called
 
 
 def test_save_signal_no_supabase_does_not_raise():
     from services import signal_store
     with patch.object(signal_store, "_client", return_value=None):
-        _run(signal_store.save_signal(_Flow("TSLA")))
+        asyncio.run(signal_store.save_signal(_Flow("TSLA")))
 
 
 def test_save_signal_db_exception_does_not_raise():
@@ -74,7 +70,7 @@ def test_save_signal_db_exception_does_not_raise():
     sb = MagicMock()
     sb.table.side_effect = Exception("DB error")
     with patch.object(signal_store, "_client", return_value=sb):
-        _run(signal_store.save_signal(_Flow("SPY")))
+        asyncio.run(signal_store.save_signal(_Flow("SPY")))
 
 
 def test_get_recent_signals_returns_list():
@@ -87,11 +83,11 @@ def test_get_recent_signals_returns_list():
     t.execute.return_value = MagicMock(data=[{"ticker": "AAPL"}])
     sb.table.return_value  = t
     with patch.object(signal_store, "_client", return_value=sb):
-        result = _run(signal_store.get_recent_signals(limit=1))
+        result = asyncio.run(signal_store.get_recent_signals(limit=1))
     assert isinstance(result, list)
 
 
 def test_get_recent_signals_no_supabase_returns_empty():
     from services import signal_store
     with patch.object(signal_store, "_client", return_value=None):
-        assert _run(signal_store.get_recent_signals()) == []
+        assert asyncio.run(signal_store.get_recent_signals()) == []

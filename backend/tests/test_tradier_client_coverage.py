@@ -41,54 +41,54 @@ def _resp(status=200, json_data=None, headers=None):
 def test_get_quote_200_dict():
     r = _resp(200, {"quotes": {"quote": {"symbol": "AAPL", "last": 185.0}}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+        result = asyncio.run(get_quote("AAPL"))
     assert result["symbol"] == "AAPL"
 
 def test_get_quote_200_list():
     r = _resp(200, {"quotes": {"quote": [{"symbol": "AAPL", "last": 185.0}]}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+        result = asyncio.run(get_quote("AAPL"))
     assert result["symbol"] == "AAPL"
 
 def test_get_quote_non200_returns_none():
     r = _resp(500)
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+        result = asyncio.run(get_quote("AAPL"))
     assert result is None
 
 def test_get_quote_exception_returns_none():
     with patch("utils.tradier_client.httpx.AsyncClient", side_effect=Exception("err")):
-        result = asyncio.get_event_loop().run_until_complete(get_quote("AAPL"))
+        result = asyncio.run(get_quote("AAPL"))
     assert result is None
 
 
 # --- get_quotes_batch ---
 
 def test_get_quotes_batch_empty_input():
-    result = asyncio.get_event_loop().run_until_complete(get_quotes_batch([]))
+    result = asyncio.run(get_quotes_batch([]))
     assert result == {}
 
 def test_get_quotes_batch_200_list():
     r = _resp(200, {"quotes": {"quote": [{"symbol": "AAPL", "last": 185.0}]}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quotes_batch(["AAPL"]))
+        result = asyncio.run(get_quotes_batch(["AAPL"]))
     assert "AAPL" in result
 
 def test_get_quotes_batch_200_single_dict():
     r = _resp(200, {"quotes": {"quote": {"symbol": "TSLA", "last": 200.0}}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quotes_batch(["TSLA"]))
+        result = asyncio.run(get_quotes_batch(["TSLA"]))
     assert "TSLA" in result
 
 def test_get_quotes_batch_non200():
     r = _resp(500)
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_quotes_batch(["AAPL"]))
+        result = asyncio.run(get_quotes_batch(["AAPL"]))
     assert result == {}
 
 def test_get_quotes_batch_exception():
     with patch("utils.tradier_client.httpx.AsyncClient", side_effect=Exception("err")):
-        result = asyncio.get_event_loop().run_until_complete(get_quotes_batch(["AAPL"]))
+        result = asyncio.run(get_quotes_batch(["AAPL"]))
     assert result == {}
 
 
@@ -97,24 +97,24 @@ def test_get_quotes_batch_exception():
 def test_get_expirations_200_list():
     r = _resp(200, {"expirations": {"date": ["2026-06-20", "2026-07-18"]}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_expirations("AAPL"))
+        result = asyncio.run(get_expirations("AAPL"))
     assert "2026-06-20" in result
 
 def test_get_expirations_200_single_string():
     r = _resp(200, {"expirations": {"date": "2026-06-20"}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_expirations("AAPL"))
+        result = asyncio.run(get_expirations("AAPL"))
     assert result == ["2026-06-20"]
 
 def test_get_expirations_non200():
     r = _resp(500)
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_expirations("AAPL"))
+        result = asyncio.run(get_expirations("AAPL"))
     assert result == []
 
 def test_get_expirations_exception():
     with patch("utils.tradier_client.httpx.AsyncClient", side_effect=Exception("err")):
-        result = asyncio.get_event_loop().run_until_complete(get_expirations("AAPL"))
+        result = asyncio.run(get_expirations("AAPL"))
     assert result == []
 
 
@@ -123,32 +123,24 @@ def test_get_expirations_exception():
 def test_get_option_chain_200_list():
     r = _resp(200, {"options": {"option": [{"symbol": "AAPL231215C00180000"}]}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(
-            get_option_chain("AAPL", "2026-06-20")
-        )
+        result = asyncio.run(get_option_chain("AAPL", "2026-06-20"))
     assert len(result) == 1
 
 def test_get_option_chain_200_single_dict():
     r = _resp(200, {"options": {"option": {"symbol": "AAPL231215C00180000"}}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(
-            get_option_chain("AAPL", "2026-06-20")
-        )
+        result = asyncio.run(get_option_chain("AAPL", "2026-06-20"))
     assert len(result) == 1
 
 def test_get_option_chain_non200():
     r = _resp(500)
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(
-            get_option_chain("AAPL", "2026-06-20")
-        )
+        result = asyncio.run(get_option_chain("AAPL", "2026-06-20"))
     assert result == []
 
 def test_get_option_chain_exception():
     with patch("utils.tradier_client.httpx.AsyncClient", side_effect=Exception("err")):
-        result = asyncio.get_event_loop().run_until_complete(
-            get_option_chain("AAPL", "2026-06-20")
-        )
+        result = asyncio.run(get_option_chain("AAPL", "2026-06-20"))
     assert result == []
 
 def test_get_options_chain_alias():
@@ -160,20 +152,20 @@ def test_get_options_chain_alias():
 def test_get_session_token_success():
     r = _resp(200, {"stream": {"sessionid": "tok-abc123"}})
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result == "tok-abc123"
 
 def test_get_session_token_missing_sessionid():
     r = _resp(200, {"stream": {}})
     r.text = "{}"
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result is None
 
 def test_get_session_token_401_returns_none():
     r = _resp(401)
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=_async_client_mock(r)):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result is None
 
 def test_get_session_token_429_then_success():
@@ -195,7 +187,7 @@ def test_get_session_token_429_then_success():
 
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=ctx), \
          patch("utils.tradier_client.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result == "tok-xyz"
 
 def test_get_session_token_429_exhausted_returns_none():
@@ -209,7 +201,7 @@ def test_get_session_token_429_exhausted_returns_none():
 
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=ctx), \
          patch("utils.tradier_client.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result is None
 
 def test_get_session_token_timeout_retries_then_none():
@@ -221,7 +213,7 @@ def test_get_session_token_timeout_retries_then_none():
 
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=ctx), \
          patch("utils.tradier_client.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result is None
 
 def test_get_session_token_connect_error_retries_then_none():
@@ -233,7 +225,7 @@ def test_get_session_token_connect_error_retries_then_none():
 
     with patch("utils.tradier_client.httpx.AsyncClient", return_value=ctx), \
          patch("utils.tradier_client.asyncio.sleep", new=AsyncMock()):
-        result = asyncio.get_event_loop().run_until_complete(get_session_token())
+        result = asyncio.run(get_session_token())
     assert result is None
 
 def test_get_token_alias():

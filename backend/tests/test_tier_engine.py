@@ -14,10 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
 
 
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
 # ---------------------------------------------------------------------------
 # Minimal SymbolQuote stub (mirrors services.symbols_loader.SymbolQuote)
 # ---------------------------------------------------------------------------
@@ -108,7 +104,7 @@ class TestTierEngineTE:
             assert result["SPY"]  == 1
             assert result["HOOD"] == 2
             assert result["XYZZ"] == 3
-        run(_run())
+        asyncio.run(_run())
 
     def test_assign_tiers_fallback_on_db_error(self):
         async def _run():
@@ -117,7 +113,7 @@ class TestTierEngineTE:
             with patch.object(tier_engine, '_fetch_thresholds', AsyncMock(side_effect=Exception("DB down"))):
                 result = await tier_engine.assign_tiers(quotes)
             assert result["SPY"] == 3
-        run(_run())
+        asyncio.run(_run())
 
     def test_invalidate_cache_resets_ttl(self):
         import services.tier_engine as te
@@ -270,7 +266,7 @@ class TestAdminTierEndpointsADM:
         text = src.read_text()
         assert "tier-thresholds" in text
         assert "patch" in text.lower() or "router.patch" in text.lower() or "@router.patch" in text
-        _ = ast  # imported for use in ADM-06
+        _ = ast
 
     def test_admin_router_has_get_tier_distribution(self):
         import pathlib

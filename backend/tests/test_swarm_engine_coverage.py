@@ -84,13 +84,10 @@ def test_swarm_engine_no_api_key_run():
         engine = SwarmEngine(n_agents=6)
         assert engine.client is None
 
-    async def _run():
-        return await engine.run("AAPL", [{"ticker": "AAPL", "premium": 100_000,
-                                          "contract_type": "CALL", "strike": 180,
-                                          "expiry": "2026-06-20", "sentiment": "BULLISH",
-                                          "influence_tier": "WHALE", "is_golden_sweep": False}])
-
-    verdicts = asyncio.get_event_loop().run_until_complete(_run())
+    verdicts = asyncio.run(engine.run("AAPL", [{"ticker": "AAPL", "premium": 100_000,
+                                                "contract_type": "CALL", "strike": 180,
+                                                "expiry": "2026-06-20", "sentiment": "BULLISH",
+                                                "influence_tier": "WHALE", "is_golden_sweep": False}]))
     assert len(verdicts) == 6
     assert all(v.direction == "HOLD" for v in verdicts)
     assert all("GROQ_API_KEY" in v.reasoning for v in verdicts)
@@ -101,10 +98,7 @@ def test_swarm_engine_no_client_3_agents():
         mock_settings.SWARM_N_AGENTS = 3
         engine = SwarmEngine(n_agents=3)
 
-    async def _run():
-        return await engine.run("NVDA", [])
-
-    verdicts = asyncio.get_event_loop().run_until_complete(_run())
+    verdicts = asyncio.run(engine.run("NVDA", []))
     assert len(verdicts) == 3
 
 
@@ -130,11 +124,7 @@ def test_run_agent_parses_buy():
     client = _mock_client(
         "VERDICT: BUY\nREASONING: Strong whale flow\nCONFIDENCE: 0.85"
     )
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[0], "AAPL", "flow summary")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[0], "AAPL", "flow summary"))
     assert v.direction  == "BUY"
     assert v.reasoning  == "Strong whale flow"
     assert v.confidence == pytest.approx(0.85)
@@ -144,11 +134,7 @@ def test_run_agent_parses_sell():
     client = _mock_client(
         "VERDICT: SELL\nREASONING: Bearish setup\nCONFIDENCE: 0.7"
     )
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[1], "TSLA", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[1], "TSLA", "flow"))
     assert v.direction == "SELL"
     assert v.confidence == pytest.approx(0.7)
 
@@ -157,53 +143,33 @@ def test_run_agent_parses_hold():
     client = _mock_client(
         "VERDICT: HOLD\nREASONING: Unclear signal\nCONFIDENCE: 0.5"
     )
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[2], "SPY", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[2], "SPY", "flow"))
     assert v.direction == "HOLD"
 
 
 def test_run_agent_invalid_verdict_defaults_hold():
     client = _mock_client("VERDICT: MAYBE\nREASONING: uncertain\nCONFIDENCE: 0.5")
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[0], "QQQ", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[0], "QQQ", "flow"))
     assert v.direction == "HOLD"
 
 
 def test_run_agent_bad_confidence_defaults_half():
     client = _mock_client("VERDICT: BUY\nREASONING: great\nCONFIDENCE: not_a_float")
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[0], "AAPL", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[0], "AAPL", "flow"))
     assert v.confidence == pytest.approx(0.5)
 
 
 def test_run_agent_exception_returns_hold_fallback():
     client = MagicMock()
     client.chat.completions.create = AsyncMock(side_effect=RuntimeError("network err"))
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[0], "AAPL", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[0], "AAPL", "flow"))
     assert v.direction == "HOLD"
     assert "Fallback" in v.reasoning
 
 
 def test_run_agent_clamps_confidence():
     client = _mock_client("VERDICT: BUY\nREASONING: good\nCONFIDENCE: 9.9")
-
-    async def _run():
-        return await _run_agent(client, AGENT_ROLES[0], "AAPL", "flow")
-
-    v = asyncio.get_event_loop().run_until_complete(_run())
+    v = asyncio.run(_run_agent(client, AGENT_ROLES[0], "AAPL", "flow"))
     assert v.confidence == pytest.approx(1.0)
 
 
@@ -222,6 +188,6 @@ def test_swarm_engine_run_with_mocked_client():
                                               "expiry": "2026-06-20", "sentiment": "BULLISH",
                                               "influence_tier": "WHALE", "is_golden_sweep": False}])
 
-    verdicts = asyncio.get_event_loop().run_until_complete(_run())
+    verdicts = asyncio.run(_run())
     assert len(verdicts) == 3
     assert all(v.direction == "BUY" for v in verdicts)
