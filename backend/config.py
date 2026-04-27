@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     REGISTRY_MIN_OI:                  int   = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int   = 15
 
+    # ── Ingestion kill-switch ─────────────────────────────────────────────────
+    # Set INGESTION_ENABLED=false in preview/staging environments to prevent
+    # duplicate writes to shared production Supabase tables.
+    #
+    # TODO(parallel-schema): Remove this flag once Option A/B parallel schema
+    # isolation is in place — writes should be scoped to preview schema instead.
+    INGESTION_ENABLED: bool = os.environ.get("INGESTION_ENABLED", "true").lower() not in ("false", "0", "no")
+
     # ── Computed aliases (plain properties, visible to hasattr) ───────────────
 
     @property
