@@ -66,6 +66,15 @@ Fix (C-019) — Dedup TTL & Sweep Overhaul (Layer 4):
   - _stats now includes "deduped" counter exposed via /health endpoint.
   - DedupCache.dedup_stats() merged into get_stats() for full observability.
 
+Fix (C-020) — Dedup Clock Mismatch:
+  - arrival_ts was set using _time.monotonic() but DedupCache stores first_seen
+    as time.time() (wall-clock). The TTL check (now - first_seen) < 5.0 used
+    monotonic (~8431s) minus wall-clock (~1.77e9) = always a large negative,
+    which is always < 5.0. Result: cache entries NEVER expired via the hot path
+    and every re-print of the same OCC/size/fill was permanently deduped.
+  - Fix: arrival_ts = _time.time() so both sides of the TTL comparison are
+    wall-clock epoch values.
+
 B-008 — Stream Health:
   - _stats gains last_tick_at (float epoch, updated on every classified tick)
     and last_reconnect_at (float epoch, updated on every reconnect attempt).
@@ -330,12 +339,17 @@ async def _process_trade(raw: dict):
       human readability. We read "exch" first, fall back to "exchange".
       This ensures sweep detection works correctly for both paths.
 
-    Layer 4 dedup (C-019):
+    Layer 4 dedup (C-019 + C-020):
       flow_dedup.is_duplicate() is called before any DB write or accumulator
       ingest. Events arriving from slower exchanges (MIAX, PHLX) within 5s of
       the canonical CBOE print are silently dropped. If 3+ distinct exchanges
       report the same trade within 8s, trade_type is upgraded to SWEEP and
       exchange_count is set to the real unique-exchange count.
+
+      C-020: arrival_ts uses _time.time() (wall-clock epoch) so it is in the
+      same numeric space as DedupCache._seen entries (also time.time()). Using
+      _time.monotonic() caused TTL comparisons to always be negative, making
+      cache entries permanent and blocking all re-prints of the same contract.
 
     B-008:
       last_tick_at is updated on every classified (non-deduped) tick so
@@ -362,11 +376,15 @@ async def _process_trade(raw: dict):
         return
 
     # ------------------------------------------------------------------
-    # Layer 4: Deduplication (C-019)
+    # Layer 4: Deduplication (C-019 + C-020)
     # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
-    arrival_ts = _time.monotonic()
+    # C-020: must use time.time() (wall-clock) — DedupCache stores first_seen
+    # as time.time() and the TTL check is (now - first_seen) < ttl.
+    # Using monotonic() here caused (small_float - epoch) to always be a large
+    # negative, so the TTL check was always True and entries never expired.
+    arrival_ts = _time.time()
 
     if flow_dedup.is_duplicate(
         occ_symbol=occ_symbol,
