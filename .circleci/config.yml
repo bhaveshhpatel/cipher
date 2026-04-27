@@ -37,7 +37,7 @@ jobs:
   # -----------------------------------------------------------------------
   lint:
     docker:
-      - image: cimg/python:3.11
+      - image: cimg/python:3.11.9
     steps:
       - checkout
       - run:
@@ -55,7 +55,7 @@ jobs:
   # -----------------------------------------------------------------------
   regression:
     docker:
-      - image: cimg/python:3.11
+      - image: cimg/python:3.11.9
     environment:
       SUPABASE_URL:              https://dummy.supabase.co
       SUPABASE_KEY:              dummy-supabase-key
