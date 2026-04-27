@@ -6,6 +6,14 @@ Phase 5A changes:
     swarm_direction, swarm_confidence, swarm_agents (JSONB),
     swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
 
+Fix 3 (2026-04-26):
+  - _signal_memory is now a collections.deque(maxlen=1000) to prevent
+    unbounded memory growth in long-running Railway processes.
+
+Fix 5 (2026-04-26):
+  - persist_composite_signal() now falls back to _signal_memory when
+    Supabase is not configured (matches save_signal() behaviour).
+
 Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
@@ -25,6 +33,7 @@ CI / no-network behaviour:
 import asyncio
 import logging
 import os
+from collections import deque
 from typing import Optional, List
 
 import httpx
@@ -48,8 +57,9 @@ _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
-# In-memory signal store used when Supabase is unavailable (tests / CI)
-_signal_memory: List[dict] = []
+# In-memory signal store — bounded deque prevents unbounded memory growth.
+# maxlen=1000 keeps ~16 mins of 1/s signals; oldest entries auto-evict.
+_signal_memory: deque = deque(maxlen=1000)
 # Dedup set — keyed by signal 'id' to prevent duplicates in _signal_memory
 _signal_ids_seen: set = set()
 
@@ -57,7 +67,7 @@ _signal_ids_seen: set = set()
 def _clear_signal_memory() -> None:
     """Reset in-memory signal store and dedup set. Used by test fixtures for isolation."""
     global _signal_memory, _signal_ids_seen
-    _signal_memory = []
+    _signal_memory = deque(maxlen=1000)
     _signal_ids_seen = set()
 
 
@@ -112,7 +122,7 @@ async def _insert_signal(row: dict) -> bool:
             resp = await client.post(url, headers=_headers(), json=[row])
         if resp.status_code in (200, 201):
             return True
-        log.error("[signal_store] insert failed: %s \u2014 %s", resp.status_code, resp.text[:300])
+        log.error("[signal_store] insert failed: %s — %s", resp.status_code, resp.text[:300])
         return False
     except Exception as e:
         log.error("[signal_store] insert exception: %s", e)
@@ -350,9 +360,12 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     if not _is_configured():
         log.warning(
             "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set "
-            "-- composite signal for %s DROPPED (not persisted).",
+            "-- composite signal for %s stored in memory (not persisted to DB).",
             sig.get("ticker", "UNKNOWN"),
         )
+        # Fix 5: fall back to in-memory store so signals aren't silently dropped
+        row = _build_row(sig, ep)
+        _store_in_memory(row)
         return
 
     row = _build_row(sig, ep)
@@ -361,13 +374,13 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         premium_val  = row["premium"]
         premium_fmt  = "${:,.0f}".format(premium_val) if premium_val else "$0"
         golden_sweep = row["is_golden_sweep"]
-        golden_tag   = " \u26a1 GOLDEN SWEEP" if golden_sweep else ""
-        swarm_dir    = row["swarm_direction"] or "\u2014"
+        golden_tag   = " ⚡ GOLDEN SWEEP" if golden_sweep else ""
+        swarm_dir    = row["swarm_direction"] or "—"
         bull         = row["swarm_bull_votes"]
         bear         = row["swarm_bear_votes"]
         hold         = row["swarm_hold_votes"]
         log.info(
-            "[signal_store] \u2705 DB INSERT OK | "
+            "[signal_store] ✅ DB INSERT OK | "
             "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
             "sentiment=%s | tier=%s | type=%s | premium=%s | "
             "swarm=%s (%sB/%sBe/%sH)%s",
@@ -378,7 +391,7 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         )
     else:
         log.warning(
-            "[signal_store] \u274c INSERT FAILED \u2014 signal for %s was NOT saved to DB",
+            "[signal_store] ❌ INSERT FAILED — signal for %s was NOT saved to DB",
             row.get("ticker"),
         )
 
