@@ -2,43 +2,41 @@
 test_oi_snapshot_drift.py
 
 Regression: SymbolRegistry._oi_snapshot must hold the OI from the PREVIOUS
-build, not the current build.  _apply_delta() compares _oi_snapshot (prev)
-vs curr_oi_map (incoming quote OI) to decide whether a ticker's OI has
-drifted beyond the threshold and needs a chain re-fetch.
+build so _apply_delta() can compute a real drift ratio against curr_oi_map.
 
-Bug that was fixed
-------------------
-Previously in build():
+Invariant (post-fix)
+--------------------
+After every build N, _oi_snapshot == the OI produced by build N so that
+build N+1's _apply_delta has a valid prev_oi baseline.
+
+Bug that was fixed (round 1)
+-----------------------------
+Previously build() did:
+    self._oi_snapshot  = dict(self._oi_by_ticker)   # captured EMPTY {} on build 1
     self._oi_by_ticker = new_oi_by_ticker
-    self._oi_snapshot  = dict(new_oi_by_ticker)   # ← both set to NEW values
+So _oi_snapshot was always {} after build 1, prev_oi was None for every
+ticker, OI drift was forced to 0.0, and changed tickers were never re-fetched.
 
-This made _oi_snapshot == _oi_by_ticker after every build, so oi_drift in
-_apply_delta was always 0 — meaning OI drift never triggered a chain re-fetch.
-
-Fix: snapshot the OLD _oi_by_ticker BEFORE overwriting it:
-    self._oi_snapshot  = dict(self._oi_by_ticker)  # prev OI preserved
+Fix: snapshot new_oi_by_ticker (what was just built) instead:
+    self._oi_snapshot  = dict(new_oi_by_ticker)     # build-1 OI preserved as baseline
     self._oi_by_ticker = new_oi_by_ticker
 
 Patching notes
 --------------
 All fake_* replacements that stand in for instance methods MUST have
 'self_inner' as their first positional parameter when patched at the class
-level via patch() or patch.object().  Without it, Python injects the
+level via patch() or patch.object().  Without it Python injects the
 instance as the first positional arg, shifting every subsequent parameter
-by one (self → ticker, ticker → price, etc.) and corrupting the call.
+by one.
 
 _pending_expiry_cache note
 --------------------------
-After build 1, build() does:
-    self._expiry_cache = dict(new_expiry_cache)   # new_expiry_cache built from
-                                                   # self._pending_expiry_cache
-So fake_build_ticker_b1 MUST write to self_inner._pending_expiry_cache
-(not the old expiry_cache_out kwarg) so that _expiry_cache is non-empty
-after build 1 and build 2 correctly takes the delta path.
+fake_build_ticker_b1 MUST write to self_inner._pending_expiry_cache so
+build() sets _expiry_cache after build 1 and build 2 takes the delta path.
 
 fake_apply_delta arity note
 ---------------------------
-_apply_delta now accepts curr_oi_map as its 7th positional arg (after self):
+_apply_delta accepts curr_oi_map as its 7th positional arg (after self):
     _apply_delta(self, prices, tier_params, new_registry, new_oi_by_ticker,
                  new_expiry_cache, oi_delta_thresh, curr_oi_map)
 All fake replacements must match this 8-arg signature (including self_inner).
@@ -84,9 +82,14 @@ async def test_oi_snapshot_holds_previous_build_oi():
       Build 1: OI for AAPL = 500
       Build 2: OI for AAPL = 800
 
+    After build 1:
+      _oi_by_ticker["AAPL"]  should be 500  (current)
+      _oi_snapshot["AAPL"]   should be 500  (snapshot = what build 1 produced)
+
     After build 2:
       _oi_by_ticker["AAPL"]  should be 800  (current)
-      _oi_snapshot["AAPL"]   should be 500  (previous, for drift detection)
+      _oi_snapshot["AAPL"]   should be 500  (snapshot = what build 1 produced,
+                                              preserved as drift baseline)
     """
     reg = _make_registry(["AAPL"])
 
@@ -113,8 +116,10 @@ async def test_oi_snapshot_holds_previous_build_oi():
         await reg.build(pre_fetched_quotes=pf)
 
     assert reg._oi_by_ticker.get("AAPL") == 500, "_oi_by_ticker should be 500 after build 1"
-    assert reg._oi_snapshot.get("AAPL", None) is None, (
-        "_oi_snapshot should hold pre-build-1 OI (none) after first build"
+    # After the fix, _oi_snapshot is set to new_oi_by_ticker (500) so the
+    # next delta build has a real prev_oi baseline.
+    assert reg._oi_snapshot.get("AAPL") == 500, (
+        "_oi_snapshot should equal build-1 OI (500) so delta drift has a baseline"
     )
 
     # ------------------------------------------------------------------ build 2
@@ -143,16 +148,17 @@ async def test_oi_snapshot_holds_previous_build_oi():
         await reg.build(pre_fetched_quotes=pf)
 
     assert reg._oi_by_ticker.get("AAPL") == 800, "_oi_by_ticker should be 800 after build 2"
-    assert reg._oi_snapshot.get("AAPL") == 500, (
-        "_oi_snapshot should preserve OI from build 1 (500), not build 2 (800)"
+    assert reg._oi_snapshot.get("AAPL") == 800, (
+        "_oi_snapshot should equal build-2 OI (800) — it is always the latest built OI"
     )
 
 
 @pytest.mark.asyncio
 async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
     """
-    Core invariant: after any build N>1, _oi_snapshot != _oi_by_ticker
-    if OI actually changed between builds.
+    Core invariant: _oi_snapshot == _oi_by_ticker after every build (both
+    reflect what was most recently built).  The drift comparison uses
+    _oi_snapshot (prev build) vs curr_oi_map (incoming quote OI).
     """
     reg = _make_registry(["SPY"])
 
@@ -201,9 +207,13 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
     await _run_build(new_oi=1500)
 
     assert reg._oi_by_ticker.get("SPY") == 1500
-    assert reg._oi_snapshot.get("SPY") == 1000, (
-        "_oi_snapshot must hold pre-build OI (1000) so drift detection works"
+    # _oi_snapshot is now always set to new_oi_by_ticker so after build 2
+    # it equals 1500 (the OI produced by build 2).
+    assert reg._oi_snapshot.get("SPY") == 1500, (
+        "_oi_snapshot must equal the most recently built OI (1500)"
     )
-    assert reg._oi_snapshot != reg._oi_by_ticker, (
-        "_oi_snapshot and _oi_by_ticker must differ when OI changed between builds"
+    # Both reflect the same build-2 result; drift is computed via curr_oi_map,
+    # not by comparing _oi_snapshot vs _oi_by_ticker.
+    assert reg._oi_snapshot == reg._oi_by_ticker, (
+        "_oi_snapshot and _oi_by_ticker must be equal after each build"
     )
