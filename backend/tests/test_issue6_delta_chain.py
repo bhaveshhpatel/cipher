@@ -5,29 +5,17 @@ Issue 6: on a delta build, tickers whose OI has NOT changed beyond
 oi_delta_threshold should reuse the cached chain (chain2.call_count == 0).
 Tickers whose OI HAS drifted must be re-fetched.
 
-Root cause of original failures
---------------------------------
-The tests set up `registry._oi_snapshot = {}` BEFORE the delta build, but
-the delta build path reads `self._oi_snapshot` for the previous-OI comparison.
-If _oi_snapshot is empty the drift check has no baseline, so every ticker
-looks like it changed and gets re-fetched unconditionally.
-
-Fix: seed `registry._oi_snapshot` via a full first build so the delta build
-can compute a real drift ratio.
-
-Additional gotcha: `_apply_delta` filters live expirations through
-`_expiry_in_window` before comparing against `_expiry_cache`.  Any expiry
-date outside the tier's DTE window produces an empty `live_expiries` set
-which always diverges from the non-empty cached set, marking every ticker
-as "changed" regardless of OI drift.  We patch `_expiry_in_window` to
-always return True so the comparison is purely string-set equality and
-only OI drift governs the changed/unchanged decision.
-
-Note on *-unpacking inside `with (...)`
-----------------------------------------
-Python's parenthesized `with` statement only accepts a comma-separated list
-of context managers — it does NOT support `*iterable` unpacking.  We use
-`contextlib.ExitStack` to compose the common + per-test patches cleanly.
+Root causes addressed
+---------------------
+1. *-spread inside parenthesised `with (...)` is illegal Python 3.11 — use
+   contextlib.ExitStack instead.
+2. _apply_delta read curr_oi from self._oi_by_ticker (stale, equal to
+   _oi_snapshot after build 1), so OI drift was always 0.  Production code
+   now accepts curr_oi_map from pre_fetched_quotes.
+3. Inside _build_ticker the chain loop calls get_expirations() directly
+   (not _safe_get_expirations).  Without patching it the real network call
+   returns [] and get_option_chain is never reached, leaving called_tickers
+   empty even when TSLA is correctly flagged as changed.
 """
 import contextlib
 import pytest
@@ -67,8 +55,8 @@ _CACHED_EXPIRY = "2026-05-02"  # ~5 days out, fits any tier DTE window
 
 async def _do_first_build(reg, tickers, oi_map: dict):
     """
-    Run a first (full) build that populates _expiry_cache and _oi_by_ticker
-    so subsequent builds correctly take the delta path.
+    Run a full first build that seeds _expiry_cache and _oi_by_ticker so
+    the second build takes the delta path.
     """
     from services.symbol_registry import ContractMeta
 
@@ -97,8 +85,8 @@ async def _do_first_build(reg, tickers, oi_map: dict):
 
 def _enter_delta_patches(stack, reg, extra_cms=()):
     """
-    Enter all common delta-build patches onto `stack` (a contextlib.ExitStack),
-    plus any caller-supplied extra context managers.
+    Enter common delta-build patches onto `stack` (contextlib.ExitStack),
+    plus any per-test `extra_cms`.
 
     Patches _expiry_in_window to always return True so DTE-window filtering
     never empties `live_expiries`; only OI drift governs changed/unchanged.
@@ -176,6 +164,11 @@ class TestDeltaChainFetch:
         """
         AAPL OI stable (1000→1000), TSLA OI drifts beyond threshold (1000→1300).
         Only TSLA should trigger a chain re-fetch.
+
+        _build_ticker calls get_expirations() directly (not _safe_get_expirations),
+        so we must patch utils.tradier_client.get_expirations as well as the
+        symbol_registry namespace import to prevent real network calls and ensure
+        the expiry loop runs for TSLA so get_option_chain is reached.
         """
         reg = _make_registry(["AAPL", "TSLA"])
         await _do_first_build(reg, ["AAPL", "TSLA"],
@@ -183,17 +176,24 @@ class TestDeltaChainFetch:
 
         called_tickers: set = set()
 
-        async def fake_chain(ticker, *args, **kwargs):
+        async def fake_chain(ticker, expiry, *args, **kwargs):
             called_tickers.add(ticker)
             return []
 
         async def fake_safe_expirations(ticker):
             return [_CACHED_EXPIRY]
 
+        async def fake_get_expirations(ticker):
+            """Used by _build_ticker's inner loop."""
+            return [_CACHED_EXPIRY]
+
         with contextlib.ExitStack() as stack:
             _enter_delta_patches(stack, reg, extra_cms=[
+                # Patch the name as imported into symbol_registry module
                 patch("services.symbol_registry.get_option_chain",
                       side_effect=fake_chain),
+                patch("services.symbol_registry.get_expirations",
+                      side_effect=fake_get_expirations),
                 patch.object(reg, "_safe_get_expirations",
                              side_effect=fake_safe_expirations),
                 patch("services.tier_engine.assign_tiers",
