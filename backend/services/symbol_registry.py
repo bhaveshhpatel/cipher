@@ -66,13 +66,15 @@ class SymbolRegistry:
         self._persisted_snapshot_id: Optional[str] = None
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
-        # Issue 1: signals when build() has completed at least once
         self._build_done: asyncio.Event = asyncio.Event()
+        # Issue 6 Part 2: delta chain fetch caches
+        # _expiry_cache:  ticker -> set of expiry date strings seen on last build
+        # _oi_snapshot:   ticker -> avg OI seen on last build (for drift detection)
+        self._expiry_cache:  dict[str, set[str]] = {}
+        self._oi_snapshot:   dict[str, int]      = {}
 
     # ------------------------------------------------------------------
-    # Public: wait until build() has finished at least once.
-    # _refresh_quotes_in_background calls this before get_oi_map() so it
-    # never reads a stale (empty) OI map on the warm path.
+    # Public: wait until build() has completed at least once.
     # ------------------------------------------------------------------
     async def wait_for_build(self) -> None:
         """Suspend until build() has completed at least once."""
@@ -125,58 +127,130 @@ class SymbolRegistry:
         )
         return len(chain)
 
-    async def build(self) -> int:
+    async def build(
+        self,
+        pre_fetched_quotes: Optional[dict[str, "SymbolQuote"]] = None,
+    ) -> int:
+        """
+        Build the OCC registry.
+
+        pre_fetched_quotes (Issue 6 Part 1):
+          If provided, prices and volumes are read directly from this map
+          instead of calling _fetch_stock_prices() (second Tradier call).
+          Keys are ticker symbols; values are SymbolQuote dataclass instances.
+          Pass the already-fetched quotes from main.py to eliminate the
+          redundant /v1/markets/quotes round-trip on every build cycle.
+
+        Delta chain fetch (Issue 6 Part 2):
+          On second and subsequent builds, expirations are diffed against
+          _expiry_cache.  Only tickers where expiry set changed OR avg OI
+          shifted by > REGISTRY_OI_DELTA_THRESHOLD are re-fetched from
+          Tradier.  Unchanged tickers reuse ContractMeta from the previous
+          registry, cutting warm-path rebuild time from ~6 min to ~30-90s.
+        """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds, assign_tiers
         from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
-        tier_params      = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
-        bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
+        tier_params       = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
+        bootstrap_params  = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
+        oi_delta_thresh   = float(cfg.get("REGISTRY_OI_DELTA_THRESHOLD", 0.20))
+        is_first_build    = not bool(self._expiry_cache)
 
         async with self._build_lock:
             log.info(
                 "[symbol_registry] Building OCC registry for %d tickers "
-                "[T1: atm=+/-%.0f%% dte=%d | T2: atm=+/-%.0f%% dte=%d | T3: atm=+/-%.0f%% dte=%d | min_oi=%d]",
+                "[T1: atm=+/-%.0f%% dte=%d | T2: atm=+/-%.0f%% dte=%d | T3: atm=+/-%.0f%% dte=%d | min_oi=%d | delta=%s]",
                 len(self._watchlist),
                 tier_params[1].atm_pct * 100, tier_params[1].max_dte,
                 tier_params[2].atm_pct * 100, tier_params[2].max_dte,
                 tier_params[3].atm_pct * 100, tier_params[3].max_dte,
                 cfg["REGISTRY_MIN_OI"],
+                "full (first build)" if is_first_build else f"oi_thresh={oi_delta_thresh:.0%}",
             )
+
+            # ----------------------------------------------------------
+            # Issue 6 Part 1: price/volume resolution
+            # If pre_fetched_quotes is provided use it; otherwise fall
+            # back to _fetch_stock_prices() (legacy path, e.g. prewarm).
+            # ----------------------------------------------------------
+            if pre_fetched_quotes is not None:
+                prices: dict[str, float] = {}
+                raw_volumes: dict[str, dict] = {}
+                for ticker, sq in pre_fetched_quotes.items():
+                    if sq.last_price is not None and sq.last_price > 0:
+                        prices[ticker] = sq.last_price
+                    raw_volumes[ticker] = {
+                        "volume":         sq.volume or 0,
+                        "average_volume": sq.average_volume or 0,
+                    }
+                self._stock_prices = prices
+                log.info(
+                    "[symbol_registry] Using pre-fetched quotes for %d tickers "
+                    "(no second Tradier call)",
+                    len(prices),
+                )
+            else:
+                prices, raw_volumes = await self._fetch_stock_prices()
+                self._stock_prices = prices
+                log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
+
             new_registry: dict[str, ContractMeta] = {}
             new_oi_by_ticker: dict[str, int] = {}
+            new_expiry_cache: dict[str, set[str]] = {}
 
-            prices, raw_quotes = await self._fetch_stock_prices()
-            self._stock_prices = prices
-            log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
-
-            tasks = [
-                self._build_ticker(
-                    ticker,
-                    prices.get(ticker, 0.0),
+            # ----------------------------------------------------------
+            # Issue 6 Part 2: delta chain fetch
+            # On first build: full fetch for all tickers.
+            # On subsequent builds: fetch expirations first (cheap), then
+            # decide per-ticker whether to re-fetch chains or reuse cache.
+            # ----------------------------------------------------------
+            if is_first_build:
+                tasks = [
+                    self._build_ticker(
+                        ticker,
+                        prices.get(ticker, 0.0),
+                        new_registry,
+                        new_oi_by_ticker,
+                        bootstrap_params,
+                        new_expiry_cache,
+                    )
+                    for ticker in self._watchlist
+                    if ticker in prices and prices[ticker] > 0
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                reused = await self._apply_delta(
+                    prices,
+                    bootstrap_params,
                     new_registry,
                     new_oi_by_ticker,
-                    bootstrap_params,
+                    new_expiry_cache,
+                    oi_delta_thresh,
                 )
-                for ticker in self._watchlist
-                if ticker in prices and prices[ticker] > 0
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+                log.info(
+                    "[symbol_registry] Delta build: %d tickers re-fetched, %d reused from cache",
+                    len(self._watchlist) - reused,
+                    reused,
+                )
 
-            synthetic_quotes = []
+            # ----------------------------------------------------------
+            # Post-build tier reclassification using live price + vol + OI
+            # ----------------------------------------------------------
+            synthetic_quotes: list[SymbolQuote] = []
             for ticker in self._watchlist:
                 if ticker not in prices:
                     continue
-                q = raw_quotes.get(ticker, {})
+                rv = raw_volumes.get(ticker, {})
                 vol     = 0
                 avg_vol = 0
                 try:
-                    vol = int(q.get("volume") or 0)
+                    vol = int(rv.get("volume") or 0)
                 except (TypeError, ValueError):
                     pass
                 try:
-                    avg_vol = int(q.get("average_volume") or 0)
+                    avg_vol = int(rv.get("average_volume") or 0)
                 except (TypeError, ValueError):
                     pass
                 synthetic_quotes.append(SymbolQuote(
@@ -200,10 +274,12 @@ class SymbolRegistry:
 
             self._tier_map = live_tier_map
 
-            old_count           = len(self._registry)
-            self._registry      = new_registry
-            self._oi_by_ticker  = new_oi_by_ticker
-            self._last_build    = datetime.utcnow()
+            old_count            = len(self._registry)
+            self._registry       = new_registry
+            self._oi_by_ticker   = new_oi_by_ticker
+            self._expiry_cache   = new_expiry_cache
+            self._oi_snapshot    = dict(new_oi_by_ticker)
+            self._last_build     = datetime.utcnow()
 
             t_counts = {1: 0, 2: 0, 3: 0}
             for m in new_registry.values():
@@ -218,12 +294,128 @@ class SymbolRegistry:
             )
 
             await self._persist_to_db(new_registry)
-
-            # Signal waiters (e.g. _refresh_quotes_in_background) that
-            # build() has completed and get_oi_map() is now populated.
             self._build_done.set()
-
             return len(new_registry)
+
+    # ------------------------------------------------------------------
+    # Issue 6 Part 2: delta chain fetch
+    # ------------------------------------------------------------------
+    async def _apply_delta(
+        self,
+        prices:          dict[str, float],
+        tier_params:     dict[int, _TierParams],
+        new_registry:    dict[str, ContractMeta],
+        new_oi_by_ticker: dict[str, int],
+        new_expiry_cache: dict[str, set[str]],
+        oi_delta_thresh:  float,
+    ) -> int:
+        """
+        Diff expiry sets and OI against last build.  Re-fetch chains only
+        for tickers that changed.  Returns number of tickers reused.
+
+        A ticker is considered CHANGED if:
+          - Its expiry set differs from _expiry_cache (new expiry appeared
+            or one rolled off)
+          - Its last avg OI in _oi_snapshot shifted by > oi_delta_thresh
+          - It has no prior cache entry at all
+
+        Unchanged tickers have their ContractMeta objects copied from the
+        previous self._registry into new_registry unchanged.
+        """
+        # Step 1: fetch current expirations for all tickers in parallel
+        # (cheap: 1 request per ticker, no chain data yet)
+        expiry_tasks = {
+            ticker: asyncio.create_task(self._safe_get_expirations(ticker))
+            for ticker in self._watchlist
+            if ticker in prices and prices[ticker] > 0
+        }
+        expiry_results: dict[str, list[str]] = {}
+        for ticker, task in expiry_tasks.items():
+            try:
+                expiry_results[ticker] = await task
+            except Exception:
+                expiry_results[ticker] = []
+
+        # Step 2: classify tickers as changed vs unchanged
+        changed:   list[str] = []
+        unchanged: list[str] = []
+        today = date.today()
+
+        for ticker, expirations in expiry_results.items():
+            # Filter to in-window expirations only (mirror _build_ticker logic)
+            tier   = self._tier_map.get(ticker, 3)
+            params = tier_params.get(tier) or tier_params[3]
+            live_expiries = {
+                e for e in expirations
+                if self._expiry_in_window(e, today, params.max_dte)
+            }
+
+            cached_expiries = self._expiry_cache.get(ticker, None)
+            prev_oi         = self._oi_snapshot.get(ticker, 0)
+            curr_oi         = self._oi_by_ticker.get(ticker, 0)
+            oi_drift = (
+                abs(curr_oi - prev_oi) / max(prev_oi, 1)
+                if prev_oi > 0 else 1.0
+            )
+
+            if (
+                cached_expiries is None
+                or live_expiries != cached_expiries
+                or oi_drift > oi_delta_thresh
+            ):
+                changed.append(ticker)
+            else:
+                unchanged.append(ticker)
+
+        # Step 3: re-fetch chains for changed tickers
+        if changed:
+            tasks = [
+                self._build_ticker(
+                    ticker,
+                    prices.get(ticker, 0.0),
+                    new_registry,
+                    new_oi_by_ticker,
+                    tier_params,
+                    new_expiry_cache,
+                )
+                for ticker in changed
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Step 4: reuse cached ContractMeta for unchanged tickers
+        for ticker in unchanged:
+            live_expiries_for_cache = {
+                e for e in expiry_results.get(ticker, [])
+                if self._expiry_in_window(
+                    e, today,
+                    (tier_params.get(self._tier_map.get(ticker, 3)) or tier_params[3]).max_dte,
+                )
+            }
+            new_expiry_cache[ticker] = live_expiries_for_cache
+            # Copy existing ContractMeta for this ticker into the new registry
+            for occ_sym, meta in self._registry.items():
+                if meta.ticker == ticker:
+                    new_registry[occ_sym] = meta
+            # Carry over OI
+            new_oi_by_ticker[ticker] = self._oi_by_ticker.get(ticker, 0)
+
+        return len(unchanged)
+
+    @staticmethod
+    def _expiry_in_window(expiry_str: str, today: date, max_dte: int) -> bool:
+        try:
+            exp_date = date.fromisoformat(expiry_str)
+            dte = (exp_date - today).days
+            return 0 <= dte <= max_dte
+        except ValueError:
+            return False
+
+    async def _safe_get_expirations(self, ticker: str) -> list[str]:
+        try:
+            return await get_expirations(ticker)
+        except Exception as e:
+            log.warning("[symbol_registry] %s: expiry fetch failed in delta check: %s", ticker, e)
+            return []
 
     async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:
         from services.chain_store import save_chain
@@ -285,9 +477,10 @@ class SymbolRegistry:
 
     async def _fetch_stock_prices(self) -> tuple[dict[str, float], dict[str, dict]]:
         """
-        Fetch stock quotes for all watchlist tickers.
-        Returns (prices dict, raw_quotes dict) so callers can also access
-        volume and average_volume for tier reclassification.
+        Legacy fallback: fetch stock quotes when no pre_fetched_quotes are
+        passed to build() (e.g. prewarm loop, manual registry.build() calls).
+        On normal startup and refresh cycles, main.py passes pre_fetched_quotes
+        so this method is NOT called (Issue 6 Part 1).
         """
         prices: dict[str, float] = {}
         raw_quotes: dict[str, dict] = {}
@@ -312,12 +505,21 @@ class SymbolRegistry:
 
     async def _build_ticker(
         self,
-        ticker:          str,
-        stock_price:     float,
-        registry:        dict[str, ContractMeta],
-        oi_by_ticker:    dict[str, int],
-        tier_params:     dict[int, _TierParams],
+        ticker:           str,
+        stock_price:      float,
+        registry:         dict[str, ContractMeta],
+        oi_by_ticker:     dict[str, int],
+        tier_params:      dict[int, _TierParams],
+        expiry_cache_out: Optional[dict[str, set[str]]] = None,
     ):
+        """
+        Fetch option chain for *ticker* and populate *registry* and *oi_by_ticker*.
+
+        expiry_cache_out (Issue 6 Part 2):
+          If provided, the set of in-window expiry strings for this ticker is
+          written to expiry_cache_out[ticker] so _apply_delta() can use it on
+          the next build cycle to decide whether re-fetching is necessary.
+        """
         if stock_price <= 0:
             log.warning("[symbol_registry] %s: no stock price — skipping", ticker)
             return
@@ -334,6 +536,7 @@ class SymbolRegistry:
         today    = date.today()
         atm_low  = stock_price * (1 - params.atm_pct)
         atm_high = stock_price * (1 + params.atm_pct)
+        in_window_expiries: set[str] = set()
 
         for expiry_str in expirations:
             try:
@@ -343,6 +546,8 @@ class SymbolRegistry:
             dte = (exp_date - today).days
             if dte < 0 or dte > params.max_dte:
                 continue
+
+            in_window_expiries.add(expiry_str)
 
             try:
                 contracts = await get_option_chain(ticker, expiry_str)
@@ -382,6 +587,10 @@ class SymbolRegistry:
                     )
                 except Exception:
                     continue
+
+        # Write expiry cache for delta logic on next build
+        if expiry_cache_out is not None:
+            expiry_cache_out[ticker] = in_window_expiries
 
         loaded_ois = [
             m.open_interest

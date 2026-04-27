@@ -18,6 +18,7 @@ Keys stored (mirrors config.py / symbol_registry defaults):
   REGISTRY_MIN_OI               int    0
   REGISTRY_REFRESH_MINS         int    30
   REGISTRY_EXPIRY_DAY_REFRESH_MINS int 15
+  REGISTRY_OI_DELTA_THRESHOLD   float  0.20   ← Issue 6 Part 2
   UNIVERSE_MIN_PRICE            float  1.0
   UNIVERSE_MIN_VOLUME           int    500000
 """
@@ -43,13 +44,14 @@ _cache: dict[str, Any] = {}
 _cache_ts: float = 0.0
 
 _DEFAULTS: dict[str, Any] = {
-    "REGISTRY_MAX_DTE":               90,
-    "REGISTRY_ATM_RANGE_PCT":         0.15,
-    "REGISTRY_MIN_OI":                0,
-    "REGISTRY_REFRESH_MINS":          30,
-    "REGISTRY_EXPIRY_DAY_REFRESH_MINS": 15,
-    "UNIVERSE_MIN_PRICE":             1.0,
-    "UNIVERSE_MIN_VOLUME":            500_000,
+    "REGISTRY_MAX_DTE":                  90,
+    "REGISTRY_ATM_RANGE_PCT":            0.15,
+    "REGISTRY_MIN_OI":                   0,
+    "REGISTRY_REFRESH_MINS":             30,
+    "REGISTRY_EXPIRY_DAY_REFRESH_MINS":  15,
+    "REGISTRY_OI_DELTA_THRESHOLD":       0.20,   # Issue 6 Part 2: skip chain re-fetch if OI delta < this
+    "UNIVERSE_MIN_PRICE":                1.0,
+    "UNIVERSE_MIN_VOLUME":               500_000,
 }
 
 

@@ -14,7 +14,7 @@ Public API:
   load_any_snapshot()               → list[str] | None
   load_tier_map()                   → dict[str, int]        [4A]
   get_latest_snapshot_timestamp()   → datetime              [Issue 2]
-  save_snapshot(...)                → bool
+  save_snapshot(...)                → bool                  tier_map param added [Issue 6]
   upsert_symbol_quotes(...)         → None
 
 ROOT CAUSE FIX (2026-04-23) C-005:
@@ -41,6 +41,16 @@ Issue 2 fix (2026-04-27):
   most recent snapshot so _universe_refresh_loop() can anchor its first sleep
   to (24h - elapsed) rather than a flat 24h, preventing a redundant
   _fetch_batch_quotes call when the server restarts near the 24h boundary.
+
+Issue 6 fix (2026-04-27):
+  _load_symbols(): add stream_eligible=true filter — loads only ~4,000
+  eligible symbols instead of all 5,267 rows, so warm-start stream_symbols
+  list is correct without a full pipeline run.
+
+  save_snapshot(): accept optional tier_map param and write real tier values
+  per symbol instead of hardcoding tier=3 for all rows.  Preliminary
+  tier_map (price+vol only, no OI) is passed by main.py on the cold path
+  so the snapshot is never entirely T3 from the start.
 """
 import asyncio
 import logging
@@ -60,8 +70,6 @@ _KEEP_SNAPSHOTS  = 7
 _DEFAULT_MAX_AGE = 24   # hours
 _UPSERT_BATCH    = 500  # rows per upsert batch
 
-# Epoch used as the "no snapshot" fallback so the first sleep in
-# _universe_refresh_loop() is effectively 0 (fires immediately on cold start).
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -69,9 +77,6 @@ def _client() -> Client:
     """
     Always use the service role key — it bypasses RLS, which is required
     for all server-side INSERT/UPDATE/DELETE operations.
-
-    NEVER fall back to the anon key (settings.SUPABASE_KEY). The anon key
-    respects RLS and will cause 401/42501 errors on every write.
     """
     service_key = settings.SUPABASE_SERVICE_KEY
     if not service_key:
@@ -98,27 +103,11 @@ async def load_any_snapshot() -> Optional[list[str]]:
 
 
 async def load_tier_map() -> dict[str, int]:
-    """
-    Return dict[symbol -> tier] from the current active snapshot.
-    Used by main.py on warm starts (Step 1 HIT) to seed init_registry()
-    with accurate per-symbol tiers without re-running the full pipeline.
-    Returns empty dict on error or if no active snapshot exists.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_load_tier_map)
 
 
 async def get_latest_snapshot_timestamp() -> datetime:
-    """
-    Return the fetched_at timestamp of the most recent snapshot (any status).
-
-    Used by _universe_refresh_loop() to compute how long ago the last
-    universe refresh ran so the first sleep can be anchored to
-    (REFRESH_INTERVAL - elapsed) instead of a flat REFRESH_INTERVAL.
-
-    Returns the Unix epoch (1970-01-01 UTC) when no snapshots exist so the
-    caller treats it as "never refreshed" and fires immediately.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_get_latest_snapshot_timestamp)
 
@@ -127,10 +116,15 @@ async def save_snapshot(
     symbols: list[str],
     source: str,
     stream_eligible_set: Optional[set[str]] = None,
+    tier_map: Optional[dict[str, int]] = None,
 ) -> bool:
+    """
+    Persist a universe snapshot.  tier_map (if provided) is used to write
+    real per-symbol tier values; defaults to tier=3 for any symbol not in map.
+    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, _sync_save_snapshot, symbols, source, stream_eligible_set
+        None, _sync_save_snapshot, symbols, source, stream_eligible_set, tier_map or {}
     )
 
 
@@ -138,22 +132,6 @@ async def upsert_symbol_quotes(
     quotes: list["SymbolQuote"],
     tier_map: Optional[dict[str, int]] = None,
 ) -> None:
-    """
-    Persist Step 3 quote data (last_price, volume, average_volume,
-    open_interest, tier, stream_eligible) for each symbol into the
-    most recent active snapshot.
-
-    open_interest: avg chain OI per ticker, populated on the quote by
-    main.py from registry.get_oi_map() before this is called (Feature 4A-OI).
-
-    tier_map: dict[symbol -> tier] from tier_engine.assign_tiers().
-    If not provided, all symbols default to tier=3.
-
-    Uses ON CONFLICT (snapshot_id, symbol) DO UPDATE so it is safe to call
-    before or after save_snapshot() — whichever order, the data will be consistent.
-
-    Non-fatal: logs a warning and returns if no active snapshot exists yet.
-    """
     if not quotes:
         return
     loop = asyncio.get_event_loop()
@@ -220,15 +198,8 @@ def _sync_load_any_snapshot() -> Optional[list[str]]:
 
 
 def _sync_load_tier_map() -> dict[str, int]:
-    """
-    Load symbol -> tier mapping from the current active snapshot.
-    Queries options_universe_symbols for the active snapshot_id.
-    Symbols with NULL or missing tier column default to 3.
-    Returns {} on error or missing snapshot.
-    """
     try:
         sb = _client()
-
         snap = (
             sb.table("options_universe_snapshots")
             .select("id")
@@ -241,7 +212,6 @@ def _sync_load_tier_map() -> dict[str, int]:
         if not rows:
             log.info("universe_store.load_tier_map: no active snapshot")
             return {}
-
         snapshot_id = rows[0]["id"]
         result = (
             sb.table("options_universe_symbols")
@@ -268,10 +238,6 @@ def _sync_load_tier_map() -> dict[str, int]:
 
 
 def _sync_get_latest_snapshot_timestamp() -> datetime:
-    """
-    Return the fetched_at of the most-recent snapshot row (any status).
-    Returns _EPOCH when no rows exist.
-    """
     try:
         sb = _client()
         result = (
@@ -286,7 +252,6 @@ def _sync_get_latest_snapshot_timestamp() -> datetime:
             log.info("universe_store.get_latest_snapshot_timestamp: no snapshots — returning epoch")
             return _EPOCH
         raw = rows[0]["fetched_at"]
-        # Supabase returns ISO-8601 strings; parse and ensure tz-aware UTC.
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -300,16 +265,28 @@ def _sync_get_latest_snapshot_timestamp() -> datetime:
 
 
 def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
+    """
+    Load stream-eligible symbols for snapshot_id.
+
+    Issue 6 fix: filter stream_eligible=true so warm starts return only the
+    ~4,000 eligible symbols instead of the full 5,267-row universe list.
+    The full universe is only needed during CBOE+Tradier pipeline runs;
+    for streaming we only care about stream-eligible symbols.
+    """
     try:
         result = (
             sb.table("options_universe_symbols")
             .select("symbol")
             .eq("snapshot_id", snapshot_id)
+            .eq("stream_eligible", True)        # Issue 6: only stream-eligible symbols
             .execute()
         )
         rows    = result.data or []
         symbols = [r["symbol"] for r in rows if r.get("symbol")]
-        log.info("universe_store: loaded %d symbols from snapshot %s", len(symbols), snapshot_id)
+        log.info(
+            "universe_store: loaded %d stream-eligible symbols from snapshot %s",
+            len(symbols), snapshot_id,
+        )
         return symbols if symbols else None
     except Exception as e:
         log.error("universe_store._load_symbols error snapshot=%s: %s", snapshot_id, e, exc_info=True)
@@ -320,17 +297,21 @@ def _sync_save_snapshot(
     symbols: list[str],
     source: str,
     stream_eligible_set: Optional[set[str]] = None,
+    tier_map: dict[str, int] = None,          # Issue 6: write real tiers, not hardcoded 3
 ) -> bool:
     """
     1. Generate snapshot_id locally via uuid4()
     2. Insert snapshot header
-    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag, tier=3 default
+    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag,
+       tier from tier_map (default 3 if symbol not in map)
     4. Deactivate all other snapshots
     5. Prune beyond _KEEP_SNAPSHOTS
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
         return False
+    if tier_map is None:
+        tier_map = {}
     try:
         sb          = _client()
         snapshot_id = str(uuid4())
@@ -356,7 +337,7 @@ def _sync_save_snapshot(
                 "snapshot_id":     snapshot_id,
                 "symbol":          s,
                 "stream_eligible": s in eligible_set,
-                "tier":            3,
+                "tier":            tier_map.get(s, 3),   # Issue 6: real tier, not hardcoded 3
             }
             for s in symbols
         ]
@@ -375,8 +356,8 @@ def _sync_save_snapshot(
         log.info("universe_store: deactivated previous snapshots")
 
         log.info(
-            "universe_store: snapshot SAVED id=%s symbols=%d source=%s",
-            snapshot_id, len(symbols), source,
+            "universe_store: snapshot SAVED id=%s symbols=%d source=%s tier_map_size=%d",
+            snapshot_id, len(symbols), source, len(tier_map),
         )
 
         _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
@@ -388,10 +369,6 @@ def _sync_save_snapshot(
 
 
 def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
-    """
-    Upsert last_price, volume, average_volume, open_interest, tier,
-    stream_eligible for every symbol in the active snapshot.
-    """
     try:
         sb = _client()
 
