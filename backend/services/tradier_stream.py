@@ -94,6 +94,8 @@ Fix (C-003) — Retroactive Sweep Upgrade:
     This issues a PATCH to flow_events retroactively setting trade_type='SWEEP'.
     The count==sweep_min guard prevents repeated UPDATE calls for 4th, 5th
     exchange echoes.
+  - Double-dispatch guard: _sweep_upgrade_dispatched set ensures only one
+    create_task fires even when concurrent workers see count==sweep_min.
 
 Fix (C-007) — Signal Spam:
   - ingest() returned ep on every post-threshold call. 32 workers × N ticks
@@ -123,6 +125,14 @@ B4-001 — start_stream alias:
     point is stream_options_flow(). Added alias at module level so tests and
     any future callers resolve without breaking main.py lifespan usage.
 
+Fix (concurrent safety, issues #1-#5):
+  - ingest_tick() and get_signal() are now async (per-key asyncio.Lock).
+    All call sites in _process_trade updated with await.
+  - persist_flow_event() wrapped in asyncio.wait_for(timeout=2.0) so a
+    slow DB insert cannot stall the event loop for the worker coroutine.
+  - _sweep_upgrade_dispatched: set[str] guards the C-003 retroactive upgrade
+    against double create_task when concurrent workers see count==sweep_min.
+
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
   - Session tokens expire when the stream connection closes — always re-fetch
@@ -146,7 +156,7 @@ import logging
 import random
 import time as _time
 from datetime import datetime, time
-from typing import Optional
+from typing import Optional, Set
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -171,6 +181,7 @@ _BACKOFF_CAP         = 60.0
 _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
+_PERSIST_TIMEOUT     = 2.0   # max seconds to wait for persist_flow_event()
 
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
@@ -197,6 +208,10 @@ _stats = {
 }
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+
+# Guard against double-dispatch of retroactive sweep upgrade tasks (issue #5).
+# Key = (occ_symbol, size, fill_price) stringified; entry added before create_task.
+_sweep_upgrade_dispatched: Set[str] = set()
 
 
 def get_stats() -> dict:
@@ -335,14 +350,14 @@ async def _process_trade(raw: dict):
     Process a raw Tradier stream event (filter=timesale).
 
     C-008 — Decoupled persist/signal tiers:
-      persist_ep = accumulator.ingest_tick(ev)       <- above threshold?
-      sig_ep     = accumulator.get_signal(ts, ep)    <- cooldown passed?
+      persist_ep = await accumulator.ingest_tick(ev)       <- above threshold?
+      sig_ep     = await accumulator.get_signal(ts, ep)    <- cooldown passed?
 
-      persist_flow_event() called on persist_ep (every qualifying tick).
+      persist_flow_event() called on persist_ep (every qualifying tick),
+      wrapped in asyncio.wait_for(timeout=2.0) so a slow DB insert cannot
+      stall the hot path (issue #4).
+
       bus.publish_all() called on sig_ep (only when cooldown passes).
-
-      This ensures flow_events gets the full episode tick history for
-      backtesting, while the bus only fires cooldown-gated signals.
     """
     _stats["ticks"] += 1
 
@@ -382,20 +397,25 @@ async def _process_trade(raw: dict):
         )
 
         # C-003: retroactive sweep upgrade
+        # _sweep_upgrade_dispatched guards against double create_task when
+        # two concurrent workers both see exch_count == sweep_min (issue #5).
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
-            log.info(
-                f"[sweep] threshold just crossed — retroactive upgrade: "
-                f"{occ_symbol} size={ev.size} fill={ev.fill_price} "
-                f"exchanges={exch_count}"
-            )
-            asyncio.create_task(
-                upgrade_to_sweep_in_db(
-                    occ_symbol=occ_symbol,
-                    fill_price=ev.fill_price,
-                    size=ev.size,
+            dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
+            if dispatch_key not in _sweep_upgrade_dispatched:
+                _sweep_upgrade_dispatched.add(dispatch_key)
+                log.info(
+                    f"[sweep] threshold just crossed — retroactive upgrade: "
+                    f"{occ_symbol} size={ev.size} fill={ev.fill_price} "
+                    f"exchanges={exch_count}"
                 )
-            )
+                asyncio.create_task(
+                    upgrade_to_sweep_in_db(
+                        occ_symbol=occ_symbol,
+                        fill_price=ev.fill_price,
+                        size=ev.size,
+                    )
+                )
 
         return
 
@@ -424,39 +444,50 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
     # C-008: Decoupled persist tier / signal tier
     # ------------------------------------------------------------------
-    persist_ep = accumulator.ingest_tick(ev)             # above threshold? (no cooldown)
-    sig_ep     = accumulator.get_signal(ev.timestamp, persist_ep)  # cooldown passed?
+    persist_ep = await accumulator.ingest_tick(ev)                       # above threshold? (no cooldown)
+    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)  # cooldown passed?
 
     # Persist every qualifying tick to flow_events (full backtesting history)
     if not persist_ep:
         return
 
-    await persist_flow_event({
-        "ticker":               ev.ticker,
-        "contract_type":        ev.contract_type,
-        "strike":               ev.strike,
-        "expiry":               ev.expiry,
-        "dte":                  ev.dte,
-        "fill_price":           ev.fill_price,
-        "bid":                  ev.bid,
-        "ask":                  ev.ask,
-        "size":                 ev.size,
-        "premium":              ev.premium,
-        "trade_type":           ev.trade_type,
-        "bid_ask_class":        ev.bid_ask_class,
-        "is_aggressive":        ev.is_aggressive,
-        "is_golden_sweep":      ev.is_golden_sweep,
-        "sentiment":            ev.sentiment,
-        "influence_tier":       ev.influence_tier,
-        "conviction_score":     ev.conviction_score,
-        "exchange_count":       ev.exchange_count,
-        "fill_count":           ev.fill_count,
-        "open_interest":        ev.open_interest,
-        "iv":                   ev.iv,
-        "underlying_price":     ev.underlying_price,
-        "occ_symbol":           occ_symbol,
-        "is_synthetic_quote":   ev.is_synthetic_quote,
-    })
+    try:
+        await asyncio.wait_for(
+            persist_flow_event({
+                "ticker":               ev.ticker,
+                "contract_type":        ev.contract_type,
+                "strike":               ev.strike,
+                "expiry":               ev.expiry,
+                "dte":                  ev.dte,
+                "fill_price":           ev.fill_price,
+                "bid":                  ev.bid,
+                "ask":                  ev.ask,
+                "size":                 ev.size,
+                "premium":              ev.premium,
+                "trade_type":           ev.trade_type,
+                "bid_ask_class":        ev.bid_ask_class,
+                "is_aggressive":        ev.is_aggressive,
+                "is_golden_sweep":      ev.is_golden_sweep,
+                "sentiment":            ev.sentiment,
+                "influence_tier":       ev.influence_tier,
+                "conviction_score":     ev.conviction_score,
+                "exchange_count":       ev.exchange_count,
+                "fill_count":           ev.fill_count,
+                "open_interest":        ev.open_interest,
+                "iv":                   ev.iv,
+                "underlying_price":     ev.underlying_price,
+                "occ_symbol":           occ_symbol,
+                "is_synthetic_quote":   ev.is_synthetic_quote,
+            }),
+            timeout=_PERSIST_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        _stats["errors"] += 1
+        log.warning(
+            f"[stream] persist_flow_event timed out after {_PERSIST_TIMEOUT}s "
+            f"for {ev.ticker} — tick dropped. Check Supabase latency."
+        )
+        return
 
     # Only publish signal to bus if cooldown gate passes
     if not sig_ep:
@@ -476,6 +507,7 @@ async def _process_trade(raw: dict):
     try:
         composite = build_composite(sig_ep, accumulator)
     except Exception as e:
+        _stats["errors"] += 1
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
