@@ -2,6 +2,8 @@
 Tests for tradier_stream._process_trade hot-path fixes:
   - issue #4: persist_flow_event timeout (asyncio.wait_for 2s)
   - issue #5: sweep upgrade double-dispatch guard
+  - issue #6: composite_errors counter incremented on build_composite failure,
+              separate from generic errors counter
   - accumulator async call sites correctly await ingest_tick / get_signal
 """
 import asyncio
@@ -59,6 +61,20 @@ def _make_ev(ticker="AAPL"):
     )
 
 
+def _make_sig_ep(ticker="AAPL"):
+    ep = MagicMock()
+    ep.ticker = ticker
+    ep.contract_type = "CALL"
+    ep.strike = 180.0
+    ep.expiry = "2026-06-20"
+    ep.is_accelerating = False
+    ep.total_premium = 300_000.0
+    ep.trade_count = 5
+    ep.summary_str.return_value = "5x CALL $180.0 exp 2026-06-20"
+    ep.last_signal_at = None
+    return ep
+
+
 # ---------------------------------------------------------------------------
 # Issue #4: persist_flow_event timeout
 # ---------------------------------------------------------------------------
@@ -73,17 +89,10 @@ async def test_persist_timeout_does_not_block_hotpath():
     import services.tradier_stream as ts_mod
 
     ev = _make_ev()
+    mock_ep = _make_sig_ep()
 
     async def slow_persist(_):
-        await asyncio.sleep(10)  # way beyond the 2s timeout
-
-    mock_ep = MagicMock()
-    mock_ep.ticker = "AAPL"
-    mock_ep.contract_type = "CALL"
-    mock_ep.is_accelerating = False
-    mock_ep.total_premium = 200_000.0
-    mock_ep.trade_count = 5
-    mock_ep.summary_str.return_value = "5x CALL $180.0 exp 2026-06-20"
+        await asyncio.sleep(10)
 
     errors_before = ts_mod._stats["errors"]
 
@@ -108,14 +117,7 @@ async def test_persist_success_does_not_increment_errors():
     import services.tradier_stream as ts_mod
 
     ev = _make_ev()
-
-    mock_ep = MagicMock()
-    mock_ep.ticker = "AAPL"
-    mock_ep.contract_type = "CALL"
-    mock_ep.is_accelerating = False
-    mock_ep.total_premium = 200_000.0
-    mock_ep.trade_count = 5
-    mock_ep.summary_str.return_value = "5x CALL $180.0 exp 2026-06-20"
+    mock_ep = _make_sig_ep()
 
     errors_before = ts_mod._stats["errors"]
 
@@ -144,7 +146,6 @@ async def test_sweep_upgrade_dispatched_only_once():
     """
     import services.tradier_stream as ts_mod
 
-    # Clear the dispatch guard so this test is isolated
     ts_mod._sweep_upgrade_dispatched.clear()
 
     ev = _make_ev()
@@ -162,11 +163,82 @@ async def test_sweep_upgrade_dispatched_only_once():
          patch("services.tradier_stream.flow_dedup._sweep_min", 3), \
          patch("services.tradier_stream.upgrade_to_sweep_in_db", side_effect=fake_upgrade):
 
-        # Fire 5 concurrent duplicate events on the same key
         await asyncio.gather(*[ts_mod._process_trade(dict(raw)) for _ in range(5)])
-        # Drain any created tasks
         await asyncio.sleep(0)
 
     assert upgrade_call_count == 1, (
         f"upgrade_to_sweep_in_db should fire exactly once, got {upgrade_call_count}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #6: composite_errors counter
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_composite_error_increments_composite_errors_not_errors():
+    """
+    When build_composite raises, _stats['composite_errors'] must increment
+    and _stats['errors'] must NOT increment — the two counters are independent.
+    """
+    import services.tradier_stream as ts_mod
+
+    ev = _make_ev()
+    persist_ep = _make_sig_ep()
+    sig_ep = _make_sig_ep()
+
+    composite_errors_before = ts_mod._stats["composite_errors"]
+    errors_before = ts_mod._stats["errors"]
+
+    with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+         patch("services.tradier_stream.flow_dedup.is_duplicate", return_value=False), \
+         patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
+         patch("services.tradier_stream.accumulator.ingest_tick", new_callable=AsyncMock, return_value=persist_ep), \
+         patch("services.tradier_stream.accumulator.get_signal", new_callable=AsyncMock, return_value=sig_ep), \
+         patch("services.tradier_stream.accumulator.get_alert_level", return_value="ALERT"), \
+         patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
+         patch("services.tradier_stream.bus.publish_all", new_callable=AsyncMock), \
+         patch("services.tradier_stream.build_composite", side_effect=RuntimeError("bad data")):
+
+        await ts_mod._process_trade(_make_raw_timesale())
+
+    assert ts_mod._stats["composite_errors"] == composite_errors_before + 1
+    assert ts_mod._stats["errors"] == errors_before
+
+
+@pytest.mark.asyncio
+async def test_composite_success_does_not_increment_composite_errors():
+    """
+    A successful build_composite must not touch composite_errors.
+    """
+    import services.tradier_stream as ts_mod
+
+    ev = _make_ev()
+    persist_ep = _make_sig_ep()
+    sig_ep = _make_sig_ep()
+
+    composite_stub = SimpleNamespace(
+        ticker="AAPL",
+        recommendation="BUY",
+        composite_score=0.82,
+        flow_score=0.78,
+        backtest_score=0.71,
+        volume_premium_factor=0.65,
+        reasoning="Strong repeat flow",
+    )
+
+    composite_errors_before = ts_mod._stats["composite_errors"]
+
+    with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+         patch("services.tradier_stream.flow_dedup.is_duplicate", return_value=False), \
+         patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
+         patch("services.tradier_stream.accumulator.ingest_tick", new_callable=AsyncMock, return_value=persist_ep), \
+         patch("services.tradier_stream.accumulator.get_signal", new_callable=AsyncMock, return_value=sig_ep), \
+         patch("services.tradier_stream.accumulator.get_alert_level", return_value="ALERT"), \
+         patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
+         patch("services.tradier_stream.bus.publish_all", new_callable=AsyncMock), \
+         patch("services.tradier_stream.build_composite", return_value=composite_stub):
+
+        await ts_mod._process_trade(_make_raw_timesale())
+
+    assert ts_mod._stats["composite_errors"] == composite_errors_before

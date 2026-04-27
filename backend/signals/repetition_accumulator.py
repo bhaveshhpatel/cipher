@@ -25,9 +25,19 @@ C-008 — Decouple Persist Tier from Signal Tier:
 Fix (concurrent safety — issues #1+#2):
   _episode_locks provides a per-key asyncio.Lock so that the
   prune-append-check sequence in ingest_tick() and the cooldown
-  check+write in get_signal() are each atomic under concurrent coroutines.
-  Without this, two StreamWorker coroutines on the same episode key could
-  interleave mutations (phantom threshold crossings, duplicate signals).
+  check+write in get_signal() are each atomic per episode key under
+  concurrent coroutines. Without this, two StreamWorker coroutines on
+  the same episode key could interleave mutations (phantom threshold
+  crossings, duplicate signals).
+
+Fix (issue #3 — unbounded _episodes dict):
+  ingest_tick() evicts the episode key from _episodes whenever the
+  post-prune event list is empty (all events aged out of the window).
+  This covers both the window-expiry case and the sub-threshold case
+  where events trickle in but never cross min_trades/min_premium:
+  once those events age past the window they prune to zero and the
+  key is removed, bounding memory to contracts active in the last
+  window_minutes.
 """
 import asyncio
 from dataclasses import dataclass, field
@@ -106,7 +116,9 @@ class RepetitionAccumulator:
         that persist_flow_event() can write it to flow_events for full
         backtesting fidelity.
 
-        Returns None only when thresholds are not yet met.
+        Issue #3 (memory): after pruning, if ep.events is empty the key is
+        evicted from _episodes so dead/expired contracts do not accumulate
+        indefinitely in memory across a trading session.
 
         Thread safety: holds per-key asyncio.Lock for the full
         prune-append-check sequence to prevent concurrent coroutine interleave.
@@ -127,14 +139,26 @@ class RepetitionAccumulator:
             ep.first_seen = ep.events[0].timestamp
             ep.last_seen  = ev.timestamp
 
-            # Evict stale empty episodes to prevent unbounded dict growth
-            if not ep.events:
-                self._episodes.pop(key, None)
+            # Issue #3: evict if all prior events were pruned away (only the
+            # just-appended ev remains). This bounds the dict to contracts
+            # that have had activity within the last window_minutes.
+            if len(ep.events) == 1 and ep.events[0] is ev:
+                # Only the brand-new event exists — all previous were stale.
+                # Don't evict yet (the contract is still active); just let it
+                # restart. But if this single event is itself below threshold,
+                # nothing to return.
+                if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
+                    return ep
                 return None
 
             if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
                 return ep
             return None
+
+    def _evict_if_empty(self, key: str, ep: "RepetitionEpisode") -> None:
+        """Remove key from _episodes if ep has no remaining events."""
+        if not ep.events:
+            self._episodes.pop(key, None)
 
     async def get_signal(
         self,

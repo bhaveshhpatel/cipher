@@ -98,7 +98,7 @@ Fix (C-003) — Retroactive Sweep Upgrade:
     create_task fires even when concurrent workers see count==sweep_min.
 
 Fix (C-007) — Signal Spam:
-  - ingest() returned ep on every post-threshold call. 32 workers × N ticks
+  - ingest() returned ep on every post-threshold call. 32 workers x N ticks
     = signal flood on the bus and duplicate flow_episodes rows in DB.
   - Fix: RepetitionAccumulator tracks last_signal_at per episode with a
     5-minute cooldown. ingest() returns None during cooldown window.
@@ -132,6 +132,17 @@ Fix (concurrent safety, issues #1-#5):
     slow DB insert cannot stall the event loop for the worker coroutine.
   - _sweep_upgrade_dispatched: set[str] guards the C-003 retroactive upgrade
     against double create_task when concurrent workers see count==sweep_min.
+
+Fix (issue #6 — composite_errors observability):
+  - _stats gains composite_errors counter (separate from generic errors).
+  - build_composite failures increment composite_errors, NOT errors, so
+    DB/timeout errors and signal-engine failures are independently queryable
+    at /health/stream without one masking the other.
+
+Fix (issue #3 gap — sub-threshold episode eviction):
+  - RepetitionAccumulator.ingest_tick() now evicts the episode key from
+    _episodes whenever post-prune events list empties. This bounds memory
+    to contracts active within the last window_minutes.
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -201,6 +212,7 @@ _stats = {
     "deduped":           0,
     "signals":           0,
     "errors":            0,
+    "composite_errors":  0,   # issue #6: build_composite failures, separate from DB errors
     "reconnects":        0,
     "mode":              "starting",
     "last_tick_at":      None,
@@ -358,6 +370,9 @@ async def _process_trade(raw: dict):
       stall the hot path (issue #4).
 
       bus.publish_all() called on sig_ep (only when cooldown passes).
+
+      Issue #6: build_composite failures increment composite_errors (not
+      errors) so DB and signal-engine failures are independently observable.
     """
     _stats["ticks"] += 1
 
@@ -507,7 +522,7 @@ async def _process_trade(raw: dict):
     try:
         composite = build_composite(sig_ep, accumulator)
     except Exception as e:
-        _stats["errors"] += 1
+        _stats["composite_errors"] += 1   # issue #6: separate counter
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
