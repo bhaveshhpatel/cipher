@@ -18,6 +18,14 @@ _apply_delta was always 0 — meaning OI drift never triggered a chain re-fetch.
 Fix: snapshot the OLD _oi_by_ticker BEFORE overwriting it:
     self._oi_snapshot  = dict(self._oi_by_ticker)  # prev OI preserved
     self._oi_by_ticker = new_oi_by_ticker
+
+Patching notes
+--------------
+All fake_* replacements that stand in for instance methods MUST have
+'self_inner' as their first positional parameter when patched at the class
+level via patch() or patch.object().  Without it, Python injects the
+instance as the first positional arg, shifting every subsequent parameter
+by one (self → ticker, ticker → price, etc.) and corrupting the call.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -68,21 +76,24 @@ async def test_oi_snapshot_holds_previous_build_oi():
     reg = _make_registry(["AAPL"])
 
     # ------------------------------------------------------------------ build 1
-    oi_build1 = {"AAPL": 500}
-
-    async def fake_build_ticker_b1(ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
+    # self_inner is required: patch() replaces the method at class level,
+    # so Python passes the instance as the first positional arg.
+    async def fake_build_ticker_b1(
+        self_inner, ticker, price, registry, oi_by_ticker, tier_params,
+        expiry_cache_out=None,
+    ):
         from services.symbol_registry import ContractMeta
         registry["AAPL260101C00150000"] = ContractMeta(
             ticker="AAPL", strike=150.0, expiry="2026-01-01",
-            contract_type="CALL", dte=10, open_interest=500, tier=3
+            contract_type="CALL", dte=10, open_interest=500, tier=3,
         )
         oi_by_ticker["AAPL"] = 500
         if expiry_cache_out is not None:
             expiry_cache_out["AAPL"] = {"2026-01-01"}
 
     with (
-        patch("services.symbol_registry.SymbolRegistry._build_ticker", new=fake_build_ticker_b1),
-        patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+        patch.object(reg.__class__, "_build_ticker", new=fake_build_ticker_b1),
+        patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
         patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
         patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
         patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"AAPL": 3})),
@@ -91,36 +102,29 @@ async def test_oi_snapshot_holds_previous_build_oi():
         await reg.build(pre_fetched_quotes=pf)
 
     assert reg._oi_by_ticker.get("AAPL") == 500, "_oi_by_ticker should be 500 after build 1"
-    # After build 1 snapshot should be empty dict (pre-build OI was {})
+    # After build 1, snapshot holds pre-build-1 OI = {} (empty)
     assert reg._oi_snapshot.get("AAPL", None) is None, (
         "_oi_snapshot should hold pre-build-1 OI (none) after first build"
     )
 
     # ------------------------------------------------------------------ build 2
-    async def fake_build_ticker_b2(ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
-        from services.symbol_registry import ContractMeta
-        registry["AAPL260101C00150000"] = ContractMeta(
-            ticker="AAPL", strike=150.0, expiry="2026-01-01",
-            contract_type="CALL", dte=10, open_interest=800, tier=3
-        )
-        oi_by_ticker["AAPL"] = 800
-        if expiry_cache_out is not None:
-            expiry_cache_out["AAPL"] = {"2026-01-01"}
-
-    async def fake_apply_delta(prices, tier_params, new_registry, new_oi_by_ticker, new_expiry_cache, oi_delta_thresh):
-        # Simulate a delta build that re-fetches AAPL with new OI=800
+    # self_inner required for same reason as fake_build_ticker_b1.
+    async def fake_apply_delta(
+        self_inner, prices, tier_params, new_registry, new_oi_by_ticker,
+        new_expiry_cache, oi_delta_thresh,
+    ):
         from services.symbol_registry import ContractMeta
         new_registry["AAPL260101C00150000"] = ContractMeta(
             ticker="AAPL", strike=150.0, expiry="2026-01-01",
-            contract_type="CALL", dte=10, open_interest=800, tier=3
+            contract_type="CALL", dte=10, open_interest=800, tier=3,
         )
         new_oi_by_ticker["AAPL"] = 800
         new_expiry_cache["AAPL"] = {"2026-01-01"}
         return 0  # 0 tickers reused
 
     with (
-        patch("services.symbol_registry.SymbolRegistry._apply_delta", new=fake_apply_delta),
-        patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+        patch.object(reg.__class__, "_apply_delta", new=fake_apply_delta),
+        patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
         patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
         patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
         patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"AAPL": 3})),
@@ -142,33 +146,43 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
     """
     reg = _make_registry(["SPY"])
 
-    async def _run_build(new_oi):
-        async def fake_build_ticker(self_inner, ticker, price, registry, oi_by_ticker, tier_params, expiry_cache_out=None):
+    async def _run_build(new_oi: int) -> None:
+        is_first = not bool(reg._expiry_cache)
+
+        # self_inner required on class-level patches
+        async def fake_build_ticker(
+            self_inner, ticker, price, registry, oi_by_ticker, tier_params,
+            expiry_cache_out=None,
+        ):
             from services.symbol_registry import ContractMeta
             registry[f"{ticker}OCC"] = ContractMeta(
                 ticker=ticker, strike=400.0, expiry="2026-06-01",
-                contract_type="CALL", dte=30, open_interest=new_oi, tier=3
+                contract_type="CALL", dte=30, open_interest=new_oi, tier=3,
             )
             oi_by_ticker[ticker] = new_oi
             if expiry_cache_out is not None:
                 expiry_cache_out[ticker] = {"2026-06-01"}
 
-        async def fake_apply_delta(prices, tier_params, new_registry, new_oi_by_ticker, new_expiry_cache, oi_delta_thresh):
+        async def fake_apply_delta(
+            self_inner, prices, tier_params, new_registry, new_oi_by_ticker,
+            new_expiry_cache, oi_delta_thresh,
+        ):
             from services.symbol_registry import ContractMeta
             new_registry["SPYOCC"] = ContractMeta(
                 ticker="SPY", strike=400.0, expiry="2026-06-01",
-                contract_type="CALL", dte=30, open_interest=new_oi, tier=3
+                contract_type="CALL", dte=30, open_interest=new_oi, tier=3,
             )
             new_oi_by_ticker["SPY"] = new_oi
             new_expiry_cache["SPY"] = {"2026-06-01"}
             return 0
 
-        is_first = not bool(reg._expiry_cache)
+        _build_patch = fake_build_ticker if is_first else MagicMock()
+        _delta_patch = MagicMock() if is_first else fake_apply_delta
 
         with (
-            patch("services.symbol_registry.SymbolRegistry._build_ticker", new=fake_build_ticker if is_first else MagicMock()),
-            patch("services.symbol_registry.SymbolRegistry._apply_delta", new=fake_apply_delta if not is_first else MagicMock()),
-            patch("services.symbol_registry.SymbolRegistry._persist_to_db", AsyncMock()),
+            patch.object(reg.__class__, "_build_ticker", new=_build_patch),
+            patch.object(reg.__class__, "_apply_delta", new=_delta_patch),
+            patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
             patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
             patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
             patch("services.tier_engine.assign_tiers", AsyncMock(return_value={"SPY": 1})),

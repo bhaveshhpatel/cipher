@@ -37,16 +37,14 @@ async def test_refresh_quotes_in_background_calls_build_with_pre_fetched():
     _refresh_quotes_in_background must pass quotes into build(pre_fetched_quotes=...)
     so _fetch_stock_prices is never called.
     """
-    from main import _refresh_quotes_in_background, _quote_refresh_lock
+    from main import _refresh_quotes_in_background
 
     quotes = [_make_quote("AAPL"), _make_quote("TSLA")]
+    build_calls = []
 
     mock_registry = MagicMock()
-    mock_registry.build = AsyncMock(return_value=42)
     mock_registry.get_oi_map = MagicMock(return_value={"AAPL": 500, "TSLA": 200})
     mock_registry.set_tier_map = MagicMock()
-
-    build_calls = []
 
     async def capture_build(**kwargs):
         build_calls.append(kwargs)
@@ -72,17 +70,26 @@ async def test_refresh_quotes_in_background_calls_build_with_pre_fetched():
 
 @pytest.mark.asyncio
 async def test_refresh_quotes_in_background_skips_when_lock_held():
-    """If _quote_refresh_lock is already acquired, the refresh is skipped (no duplicate calls)."""
-    from main import _refresh_quotes_in_background, _quote_refresh_lock
+    """
+    If _quote_refresh_lock is already acquired, the refresh is skipped.
+
+    The lock must be patched with a *fresh* asyncio.Lock() so it is bound to
+    the current test's event loop.  The module-level lock in main.py is created
+    at import time on a different loop, so using it directly would raise
+    'Future <Future> attached to a different loop'.
+    """
+    from main import _refresh_quotes_in_background
 
     fetch_called = []
+    fresh_lock = asyncio.Lock()
 
     async def fake_fetch(symbols):
         fetch_called.append(symbols)
         return []
 
-    with patch("main._fetch_batch_quotes", AsyncMock(side_effect=fake_fetch)):
-        async with _quote_refresh_lock:
+    with patch("main._quote_refresh_lock", fresh_lock), \
+         patch("main._fetch_batch_quotes", AsyncMock(side_effect=fake_fetch)):
+        async with fresh_lock:
             await _refresh_quotes_in_background(["AAPL"])
 
     assert len(fetch_called) == 0, "fetch should be skipped when lock is held"
@@ -127,7 +134,8 @@ async def test_refresh_quotes_in_background_empty_quotes_is_noop():
     with (
         patch("main._fetch_batch_quotes", AsyncMock(return_value=[])),
         patch("main.get_registry", return_value=mock_registry),
-        patch("main.universe_store.upsert_symbol_quotes", AsyncMock(side_effect=lambda q, tm: upsert_called.append(1))),
+        patch("main.universe_store.upsert_symbol_quotes",
+              AsyncMock(side_effect=lambda q, tm: upsert_called.append(1))),
     ):
         await _refresh_quotes_in_background(["AAPL"])
 
