@@ -122,51 +122,68 @@ def test_rate_limited_path_returns_response_not_500():
 
 def test_lifespan_spawns_prewarm_task():
     """
-    Lifespan must create a _registry_prewarm_loop task alongside other background tasks.
+    Lifespan must create a _registry_prewarm_loop background task.
 
-    Patches the full dependency chain that the lifespan exercises before it
-    reaches the asyncio.create_task() block:
-      - _resolve_startup_universe   → returns ([], {}, []) so quotes-branch is skipped
-      - init_registry               → returns mock_registry
-      - registry.build / size       → AsyncMock / MagicMock returning sensible values
-      - stream_options_flow         → AsyncMock (prevents real stream coroutine)
-      - start_flow_writer           → AsyncMock
-      - start_signal_writer         → AsyncMock
-      - _universe_refresh_loop      → AsyncMock
-      - universe_store.upsert_symbol_quotes → AsyncMock (safety net)
+    Strategy: drive `lifespan` directly as an async context manager
+    inside asyncio.run() instead of going through TestClient.
+
+    Why not TestClient: `main.app` is a module-level singleton. Once any
+    earlier test causes it to be imported, TestClient runs (and caches)
+    the lifespan on first use. Subsequent TestClient() calls skip the
+    lifespan entirely, so create_task is never called again and
+    created_targets stays [].  Driving the lifespan function directly
+    guarantees the startup body runs inside our patch context.
     """
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
+    import main as main_module
 
     created_targets: list[str] = []
-    original_create_task = asyncio.create_task
 
-    def tracking_create_task(coro, **kwargs):
-        created_targets.append(getattr(coro, "__name__", repr(coro)))
-        task = original_create_task(coro, **kwargs)
-        task.cancel()
-        return task
+    # We need a real event loop so create_task works; we cancel tasks
+    # immediately so they don't block.
+    async def _run_lifespan():
+        real_create_task = asyncio.create_task
 
-    mock_registry = MagicMock()
-    mock_registry.build = AsyncMock(return_value=100)
-    mock_registry.size = MagicMock(return_value=100)
-    mock_registry.get_oi_map = MagicMock(return_value={})
-    mock_registry.refresh_loop = AsyncMock()
-    mock_registry.set_tier_map = MagicMock()
+        def tracking_create_task(coro, **kwargs):
+            name = getattr(coro, "__name__", repr(coro))
+            created_targets.append(name)
+            task = real_create_task(coro, **kwargs)
+            task.cancel()
+            return task
 
-    with patch("main.asyncio.create_task", side_effect=tracking_create_task), \
-         patch("main.init_registry", return_value=mock_registry), \
-         patch("main.assign_tiers", new_callable=AsyncMock, return_value={}), \
-         patch("main._resolve_startup_universe", new_callable=AsyncMock,
-               return_value=([], {}, [])), \
-         patch("main.stream_options_flow", new_callable=AsyncMock), \
-         patch("main.start_flow_writer", new_callable=AsyncMock), \
-         patch("main.start_signal_writer", new_callable=AsyncMock), \
-         patch("main._universe_refresh_loop", new_callable=AsyncMock), \
-         patch("main.universe_store.upsert_symbol_quotes", new_callable=AsyncMock):
-        client = _get_client()
-        client.get("/api/health")
+        mock_registry = MagicMock()
+        mock_registry.build = AsyncMock(return_value=100)
+        mock_registry.size = MagicMock(return_value=100)
+        mock_registry.get_oi_map = MagicMock(return_value={})
+        mock_registry.refresh_loop = AsyncMock()
+        mock_registry.set_tier_map = MagicMock()
+
+        # Patch main module's own names so the lifespan body sees them.
+        with patch.object(main_module, "_resolve_startup_universe",
+                          new_callable=AsyncMock, return_value=([], {}, [])), \
+             patch.object(main_module, "init_registry",
+                          return_value=mock_registry), \
+             patch.object(main_module, "assign_tiers",
+                          new_callable=AsyncMock, return_value={}), \
+             patch.object(main_module, "stream_options_flow",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "start_flow_writer",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "start_signal_writer",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "_universe_refresh_loop",
+                          new_callable=AsyncMock), \
+             patch.object(main_module.asyncio, "create_task",
+                          side_effect=tracking_create_task):
+            # Drive the lifespan startup phase only (yield = server running).
+            # We exit immediately so shutdown tasks are also cancelled cleanly.
+            async with main_module.lifespan(main_module.app):
+                pass  # startup ran; tasks created; we exit right away
+
+    asyncio.run(_run_lifespan())
 
     assert "_registry_prewarm_loop" in created_targets, (
-        f"_registry_prewarm_loop task was not created in lifespan. Tasks found: {created_targets}"
+        f"_registry_prewarm_loop task was not created in lifespan. "
+        f"Tasks found: {created_targets}"
     )
