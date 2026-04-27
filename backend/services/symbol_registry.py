@@ -202,6 +202,7 @@ class SymbolRegistry:
                 if pre_fetched_quotes is not None:
                     prices: dict[str, float] = {}
                     raw_volumes: dict[str, dict] = {}
+                    curr_oi_map: dict[str, int] = {}
                     for ticker, sq in pre_fetched_quotes.items():
                         if ticker not in watchlist_set:
                             continue
@@ -212,6 +213,11 @@ class SymbolRegistry:
                             "volume":         getattr(sq, "volume", None) or 0,
                             "average_volume": getattr(sq, "average_volume", None) or 0,
                         }
+                        # Capture the OI from the incoming quote so _apply_delta
+                        # can compute the correct drift against _oi_snapshot.
+                        raw_oi = getattr(sq, "open_interest", None)
+                        if isinstance(raw_oi, (int, float)) and raw_oi >= 0:
+                            curr_oi_map[ticker] = int(raw_oi)
                     self._stock_prices = prices
                     log.info(
                         "[symbol_registry] Using pre-fetched quotes for %d tickers "
@@ -227,6 +233,7 @@ class SymbolRegistry:
                                   if isinstance(v, (int, float)) and v > 0}
                         raw_volumes = {}
                     self._stock_prices = prices
+                    curr_oi_map = {}  # no incoming OI when using legacy fetch path
                     log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
                 new_registry: dict[str, ContractMeta] = {}
@@ -261,6 +268,7 @@ class SymbolRegistry:
                         new_oi_by_ticker,
                         new_expiry_cache,
                         oi_delta_thresh,
+                        curr_oi_map,
                     )
                     log.info(
                         "[symbol_registry] Delta build: %d tickers re-fetched, %d reused from cache",
@@ -335,13 +343,22 @@ class SymbolRegistry:
 
     async def _apply_delta(
         self,
-        prices:          dict[str, float],
-        tier_params:     dict[int, _TierParams],
-        new_registry:    dict[str, ContractMeta],
+        prices:           dict[str, float],
+        tier_params:      dict[int, _TierParams],
+        new_registry:     dict[str, ContractMeta],
         new_oi_by_ticker: dict[str, int],
         new_expiry_cache: dict[str, set[str]],
         oi_delta_thresh:  float,
+        curr_oi_map:      dict[str, int],
     ) -> int:
+        """
+        Compare live expirations and OI against the previous build's snapshot.
+
+        curr_oi_map: incoming OI values from pre_fetched_quotes (keyed by
+          ticker).  When present, these are used for drift comparison instead
+          of self._oi_by_ticker (which holds the previous build's final values
+          and would always produce zero drift).
+        """
         expiry_tasks = {
             ticker: asyncio.create_task(self._safe_get_expirations(ticker))
             for ticker in self._watchlist
@@ -369,8 +386,12 @@ class SymbolRegistry:
             }
 
             cached_expiries = self._expiry_cache.get(ticker, None)
-            prev_oi         = self._oi_snapshot.get(ticker, 0)
-            curr_oi         = self._oi_by_ticker.get(ticker, 0)
+            prev_oi = self._oi_snapshot.get(ticker, 0)
+            # Use the incoming quote OI (curr_oi_map) so we compare the NEW
+            # value against the PREVIOUS snapshot.  Falling back to
+            # self._oi_by_ticker would always equal prev_oi (same build),
+            # making drift permanently 0 and TSLA never re-fetched.
+            curr_oi = curr_oi_map.get(ticker, self._oi_by_ticker.get(ticker, 0))
             oi_drift = (
                 abs(curr_oi - prev_oi) / max(prev_oi, 1)
                 if prev_oi > 0 else 1.0
