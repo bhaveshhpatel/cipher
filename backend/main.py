@@ -467,6 +467,11 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("[lifespan] Cipher backend starting up")
 
+    # Initialised to None; only assigned on the warm (no-quotes) path.
+    # Must be declared before the if/else so the shutdown block can
+    # reference it unconditionally.
+    bg_quote_refresh_task = None
+
     stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(stream_symbols, tier_map=tier_map)
@@ -520,7 +525,7 @@ async def lifespan(app: FastAPI):
     ):
         if task is not None:
             task.cancel()
-    if not quotes:
+    if bg_quote_refresh_task is not None:
         bg_quote_refresh_task.cancel()
 
 
