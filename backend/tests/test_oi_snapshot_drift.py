@@ -3,8 +3,8 @@ test_oi_snapshot_drift.py
 
 Regression: SymbolRegistry._oi_snapshot must hold the OI from the PREVIOUS
 build, not the current build.  _apply_delta() compares _oi_snapshot (prev)
-vs _oi_by_ticker (current) to decide whether a ticker's OI has drifted
-beyond the threshold and needs a chain re-fetch.
+vs curr_oi_map (incoming quote OI) to decide whether a ticker's OI has
+drifted beyond the threshold and needs a chain re-fetch.
 
 Bug that was fixed
 ------------------
@@ -35,6 +35,13 @@ After build 1, build() does:
 So fake_build_ticker_b1 MUST write to self_inner._pending_expiry_cache
 (not the old expiry_cache_out kwarg) so that _expiry_cache is non-empty
 after build 1 and build 2 correctly takes the delta path.
+
+fake_apply_delta arity note
+---------------------------
+_apply_delta now accepts curr_oi_map as its 7th positional arg (after self):
+    _apply_delta(self, prices, tier_params, new_registry, new_oi_by_ticker,
+                 new_expiry_cache, oi_delta_thresh, curr_oi_map)
+All fake replacements must match this 8-arg signature (including self_inner).
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -84,13 +91,6 @@ async def test_oi_snapshot_holds_previous_build_oi():
     reg = _make_registry(["AAPL"])
 
     # ------------------------------------------------------------------ build 1
-    # self_inner is required: patch() replaces the method at class level,
-    # so Python passes the instance as the first positional arg.
-    #
-    # IMPORTANT: write to self_inner._pending_expiry_cache (not expiry_cache_out)
-    # so that build() picks it up in new_expiry_cache and sets _expiry_cache.
-    # Without a non-empty _expiry_cache after build 1, build 2 will be treated
-    # as a first build and skip _apply_delta entirely.
     async def fake_build_ticker_b1(
         self_inner, ticker, price, registry, oi_by_ticker, tier_params,
     ):
@@ -100,7 +100,6 @@ async def test_oi_snapshot_holds_previous_build_oi():
             contract_type="CALL", dte=10, open_interest=500, tier=3,
         )
         oi_by_ticker["AAPL"] = 500
-        # Populate pending_expiry_cache so build() sets _expiry_cache after build 1
         self_inner._pending_expiry_cache["AAPL"] = {"2026-01-01"}
 
     with (
@@ -114,16 +113,15 @@ async def test_oi_snapshot_holds_previous_build_oi():
         await reg.build(pre_fetched_quotes=pf)
 
     assert reg._oi_by_ticker.get("AAPL") == 500, "_oi_by_ticker should be 500 after build 1"
-    # After build 1, snapshot holds pre-build-1 OI = {} (empty)
     assert reg._oi_snapshot.get("AAPL", None) is None, (
         "_oi_snapshot should hold pre-build-1 OI (none) after first build"
     )
 
     # ------------------------------------------------------------------ build 2
-    # self_inner required for same reason as fake_build_ticker_b1.
+    # curr_oi_map is now the 7th positional arg passed by build() to _apply_delta.
     async def fake_apply_delta(
         self_inner, prices, tier_params, new_registry, new_oi_by_ticker,
-        new_expiry_cache, oi_delta_thresh,
+        new_expiry_cache, oi_delta_thresh, curr_oi_map,
     ):
         from services.symbol_registry import ContractMeta
         new_registry["AAPL260101C00150000"] = ContractMeta(
@@ -161,7 +159,6 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
     async def _run_build(new_oi: int) -> None:
         is_first = not bool(reg._expiry_cache)
 
-        # self_inner required on class-level patches
         async def fake_build_ticker(
             self_inner, ticker, price, registry, oi_by_ticker, tier_params,
         ):
@@ -171,12 +168,12 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
                 contract_type="CALL", dte=30, open_interest=new_oi, tier=3,
             )
             oi_by_ticker[ticker] = new_oi
-            # Populate pending_expiry_cache so _expiry_cache is non-empty after build
             self_inner._pending_expiry_cache[ticker] = {"2026-06-01"}
 
+        # curr_oi_map is now the 7th positional arg (after self_inner).
         async def fake_apply_delta(
             self_inner, prices, tier_params, new_registry, new_oi_by_ticker,
-            new_expiry_cache, oi_delta_thresh,
+            new_expiry_cache, oi_delta_thresh, curr_oi_map,
         ):
             from services.symbol_registry import ContractMeta
             new_registry["SPYOCC"] = ContractMeta(

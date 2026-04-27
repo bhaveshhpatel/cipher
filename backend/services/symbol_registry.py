@@ -355,9 +355,14 @@ class SymbolRegistry:
         Compare live expirations and OI against the previous build's snapshot.
 
         curr_oi_map: incoming OI values from pre_fetched_quotes (keyed by
-          ticker).  When present, these are used for drift comparison instead
-          of self._oi_by_ticker (which holds the previous build's final values
-          and would always produce zero drift).
+          ticker).  These are compared against _oi_snapshot (the OI recorded
+          at the END of the previous build) to compute drift.
+
+        OI drift logic:
+          - If _oi_snapshot has no entry for a ticker (first delta build after
+            a full build that produced 0 OI), treat drift as 0 so the expiry-
+            set comparison governs alone.
+          - Otherwise drift = |curr - prev| / prev.
         """
         expiry_tasks = {
             ticker: asyncio.create_task(self._safe_get_expirations(ticker))
@@ -386,16 +391,14 @@ class SymbolRegistry:
             }
 
             cached_expiries = self._expiry_cache.get(ticker, None)
-            prev_oi = self._oi_snapshot.get(ticker, 0)
-            # Use the incoming quote OI (curr_oi_map) so we compare the NEW
-            # value against the PREVIOUS snapshot.  Falling back to
-            # self._oi_by_ticker would always equal prev_oi (same build),
-            # making drift permanently 0 and TSLA never re-fetched.
-            curr_oi = curr_oi_map.get(ticker, self._oi_by_ticker.get(ticker, 0))
-            oi_drift = (
-                abs(curr_oi - prev_oi) / max(prev_oi, 1)
-                if prev_oi > 0 else 1.0
-            )
+            prev_oi = self._oi_snapshot.get(ticker, None)
+            if prev_oi is None or prev_oi == 0:
+                # No previous OI baseline — skip OI drift check; rely on
+                # expiry-set comparison only.
+                oi_drift = 0.0
+            else:
+                curr_oi = curr_oi_map.get(ticker, self._oi_by_ticker.get(ticker, 0))
+                oi_drift = abs(curr_oi - prev_oi) / prev_oi
 
             if (
                 cached_expiries is None
