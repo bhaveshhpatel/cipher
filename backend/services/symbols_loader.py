@@ -203,6 +203,8 @@ async def _fetch_cboe_symbols() -> list[str]:
 
         symbols: list[str] = []
         reader = csv.reader(io.StringIO(content))
+        # Skip the header row: 'Symbol', 'Company Name', ...
+        next(reader, None)
         for row in reader:
             if len(row) < 2:
                 continue

@@ -70,6 +70,12 @@ _SAFE_FALLBACK_THRESHOLDS: dict = {
     "t3_max_dte":        30,
 }
 
+# Required keys that must be present in any thresholds dict passed to _classify.
+_REQUIRED_THRESH_KEYS = (
+    "t1_min_volume", "t1_min_last_price", "t1_min_oi",
+    "t2_min_volume", "t2_min_last_price", "t2_min_oi",
+)
+
 _cache: dict        = {}
 _cache_ts: float    = 0.0
 _thresh_cache_ts: float = 0.0
@@ -143,21 +149,27 @@ async def _fetch_thresholds(force: bool = False) -> dict:
 
 
 def _classify(quote: "SymbolQuote", thresh: dict) -> int:
+    """Classify a single quote into tier 1/2/3.
+
+    Uses .get() with _DEFAULT_THRESHOLDS fallbacks for every key so that a
+    partial or empty thresh dict (e.g. from a test that patched
+    _fetch_thresholds to return {} without restoring) never raises KeyError.
+    """
     vol   = quote.average_volume or quote.volume or 0
     price = quote.last_price or 0.0
     oi    = quote.open_interest or 0
 
     if (
-        vol   >= thresh["t1_min_volume"]
-        and price >= thresh["t1_min_last_price"]
-        and oi    >= thresh["t1_min_oi"]
+        vol   >= thresh.get("t1_min_volume",     _DEFAULT_THRESHOLDS["t1_min_volume"])
+        and price >= thresh.get("t1_min_last_price", _DEFAULT_THRESHOLDS["t1_min_last_price"])
+        and oi    >= thresh.get("t1_min_oi",         _DEFAULT_THRESHOLDS["t1_min_oi"])
     ):
         return 1
 
     if (
-        vol   >= thresh["t2_min_volume"]
-        and price >= thresh["t2_min_last_price"]
-        and oi    >= thresh["t2_min_oi"]
+        vol   >= thresh.get("t2_min_volume",     _DEFAULT_THRESHOLDS["t2_min_volume"])
+        and price >= thresh.get("t2_min_last_price", _DEFAULT_THRESHOLDS["t2_min_last_price"])
+        and oi    >= thresh.get("t2_min_oi",         _DEFAULT_THRESHOLDS["t2_min_oi"])
     ):
         return 2
 
@@ -172,13 +184,22 @@ async def assign_tiers(
         return {}
 
     if thresholds is not None:
-        thresh = thresholds
+        # Guard: if caller passed a partial/empty dict, fill in defaults.
+        thresh = {**_DEFAULT_THRESHOLDS, **thresholds}
     else:
         try:
             thresh = await _fetch_thresholds()
         except Exception as e:
             log.warning("[tier_engine] threshold fetch failed: %s — using safe fallback (all T3)", e)
             thresh = dict(_SAFE_FALLBACK_THRESHOLDS)
+
+    # Final safety net: ensure all required keys are present.
+    for key in _REQUIRED_THRESH_KEYS:
+        if key not in thresh:
+            log.warning(
+                "[tier_engine] thresh missing key '%s' — patching from defaults", key
+            )
+            thresh[key] = _DEFAULT_THRESHOLDS[key]
 
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}
