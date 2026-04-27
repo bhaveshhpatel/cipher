@@ -1,13 +1,16 @@
 """
-Regression tests for the /health/stream endpoint (B-008 stream health).
+Regression tests for the /api/health/stream endpoint (B-008 stream health).
 
 Covers:
- - GET /health/stream returns HTTP 200
- - Response body contains 'status' key (via 'mode' field in StreamHealthOut)
+ - GET /api/health/stream returns HTTP 200
+ - Response body contains 'mode' key
  - mode value is a non-empty string
  - Endpoint is reachable without extra headers (auth mocked)
  - Multiple consecutive calls all return 200 (idempotency)
  - Degraded mode still returns 200
+
+Fix: router is mounted at prefix /api/health (not /health), so the full
+client path is /api/health/stream. Previous tests hit /health/stream → 404.
 """
 import pytest
 from fastapi import FastAPI
@@ -46,20 +49,20 @@ _HEALTHY_STATS = {
 
 def test_health_returns_200(client):
     with patch("routers.health.get_stats", return_value=_HEALTHY_STATS):
-        resp = client.get("/health/stream")
+        resp = client.get("/api/health/stream")
     assert resp.status_code == 200
 
 
 def test_health_response_has_mode_key(client):
     with patch("routers.health.get_stats", return_value=_HEALTHY_STATS):
-        resp = client.get("/health/stream")
+        resp = client.get("/api/health/stream")
     body = resp.json()
     assert "mode" in body
 
 
 def test_health_mode_is_nonempty_string(client):
     with patch("routers.health.get_stats", return_value=_HEALTHY_STATS):
-        resp = client.get("/health/stream")
+        resp = client.get("/api/health/stream")
     body = resp.json()
     assert isinstance(body["mode"], str)
     assert len(body["mode"]) > 0
@@ -68,7 +71,7 @@ def test_health_mode_is_nonempty_string(client):
 def test_health_requires_no_extra_headers(client):
     """Health check must be reachable without any extra headers (auth is overridden)."""
     with patch("routers.health.get_stats", return_value=_HEALTHY_STATS):
-        resp = client.get("/health/stream")
+        resp = client.get("/api/health/stream")
     assert resp.status_code == 200
 
 
@@ -76,7 +79,7 @@ def test_health_is_idempotent(client):
     """Calling health three times in a row must all return 200."""
     with patch("routers.health.get_stats", return_value=_HEALTHY_STATS):
         for _ in range(3):
-            resp = client.get("/health/stream")
+            resp = client.get("/api/health/stream")
             assert resp.status_code == 200
 
 
@@ -84,6 +87,6 @@ def test_health_degraded_mode_still_returns_200(client):
     """A degraded (but running) service must still return 200, not 5xx."""
     degraded = {**_HEALTHY_STATS, "mode": "reconnecting", "errors": 5}
     with patch("routers.health.get_stats", return_value=degraded):
-        resp = client.get("/health/stream")
+        resp = client.get("/api/health/stream")
     assert resp.status_code == 200
     assert resp.json()["mode"] == "reconnecting"

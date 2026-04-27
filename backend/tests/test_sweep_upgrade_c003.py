@@ -290,7 +290,8 @@ class TestC003CanonicalSweepInline:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = True        # sweep already established
             mock_dedup.get_exchange_count.return_value = 4
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = ep          # cooldown passed
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = AsyncMock()
 
@@ -308,7 +309,7 @@ class TestC003CanonicalSweepInline:
 class TestC003DedupRegressionCheck:
     @pytest.mark.asyncio
     async def test_c003_7_deduped_no_accumulator_no_persist(self):
-        """C003-7: deduped events must still never reach accumulator.ingest or persist_flow_event."""
+        """C003-7: deduped events must still never reach accumulator.ingest_tick or persist_flow_event."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -326,7 +327,7 @@ class TestC003DedupRegressionCheck:
 
             await ts._process_trade(raw)
 
-        mock_acc.ingest.assert_not_called()
+        mock_acc.ingest_tick.assert_not_called()
         mock_persist.assert_not_called()
 
 
@@ -352,7 +353,8 @@ class TestC003QualifyingCanonicalRegression:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = None   # cooldown active — bus silent
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 

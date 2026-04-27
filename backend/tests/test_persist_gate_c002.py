@@ -5,9 +5,11 @@ Fix verified:
   Before fix: persist_flow_event() called before accumulator.ingest().
               Every dedup-passing tick wrote to flow_events, including
               sub-threshold retail noise.
-  After fix:  accumulator.ingest() called first. If ep is None (threshold
+  After fix:  accumulator.ingest_tick() called first. If ep is None (threshold
               not yet crossed), function returns early — no DB write.
               persist_flow_event() only fires for qualifying ticks.
+              Signal (bus) only fires when accumulator.get_signal() passes
+              the C-007 cooldown gate.
 
 Test IDs:
   C002-1  sub-threshold ticks do NOT call persist_flow_event
@@ -15,7 +17,7 @@ Test IDs:
   C002-3  persist is called on every qualifying tick after threshold is crossed
   C002-4  persist receives correct ev fields (ticker, premium, occ_symbol etc.)
   C002-5  deduped events still never reach persist_flow_event
-  C002-6  order guarantee — ingest always called before persist on qualifying tick
+  C002-6  order guarantee — ingest_tick always called before persist on qualifying tick
   C002-7  episode=None early-return path skips persist entirely (no await)
   C002-8  regression — signal and bus.publish_all still fires after threshold
 
@@ -123,7 +125,7 @@ def _make_raw(occ="TSLA  260516C00375000", exchange="C"):
 class TestC002SubThreshold:
     @pytest.mark.asyncio
     async def test_c002_1_no_persist_below_threshold(self):
-        """C002-1: when accumulator.ingest returns None, persist must NOT be called."""
+        """C002-1: when ingest_tick returns None, persist must NOT be called."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -137,12 +139,12 @@ class TestC002SubThreshold:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = None   # sub-threshold — no episode
+            mock_acc.ingest_tick.return_value = None   # sub-threshold — no episode
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
-        mock_acc.ingest.assert_called_once_with(ev)
+        mock_acc.ingest_tick.assert_called_once_with(ev)
         mock_persist.assert_not_called()   # ← KEY: no DB write for sub-threshold
 
 
@@ -152,7 +154,7 @@ class TestC002SubThreshold:
 class TestC002ThresholdCrossing:
     @pytest.mark.asyncio
     async def test_c002_2_persist_on_threshold_crossing(self):
-        """C002-2: when accumulator.ingest returns an episode, persist IS called."""
+        """C002-2: when ingest_tick returns an episode, persist IS called."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -168,7 +170,8 @@ class TestC002ThresholdCrossing:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = ep    # cooldown passed — signal fires too
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
@@ -198,7 +201,8 @@ class TestC002SubsequentQualifyingTicks:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = None   # cooldown active — bus silent
             mock_acc.get_alert_level.return_value = "WATCH"
             mock_bus.publish_all = AsyncMock()
 
@@ -235,7 +239,8 @@ class TestC002PersistPayload:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = ep
             mock_acc.get_alert_level.return_value = "STRONG_SIGNAL"
             mock_bus.publish_all = AsyncMock()
 
@@ -268,17 +273,17 @@ class TestC002DedupedNeverPersist:
 
             await ts._process_trade(raw)
 
-        mock_acc.ingest.assert_not_called()
+        mock_acc.ingest_tick.assert_not_called()
         mock_persist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# C002-6: order guarantee — ingest called before persist
+# C002-6: order guarantee — ingest_tick called before persist
 # ---------------------------------------------------------------------------
 class TestC002OrderGuarantee:
     @pytest.mark.asyncio
     async def test_c002_6_ingest_before_persist(self):
-        """C002-6: accumulator.ingest() must be called strictly before persist_flow_event()."""
+        """C002-6: accumulator.ingest_tick() must be called strictly before persist_flow_event()."""
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -286,8 +291,8 @@ class TestC002OrderGuarantee:
         raw = _make_raw()
         call_order = []
 
-        def _ingest(e):
-            call_order.append("ingest")
+        def _ingest_tick(e):
+            call_order.append("ingest_tick")
             return ep
 
         async def _persist(d):
@@ -302,14 +307,15 @@ class TestC002OrderGuarantee:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.side_effect = _ingest
+            mock_acc.ingest_tick.side_effect = _ingest_tick
+            mock_acc.get_signal.return_value = ep
             mock_acc.get_alert_level.return_value = "WATCH"
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
-        assert call_order == ["ingest", "persist"], (
-            f"Expected ingest before persist, got: {call_order}"
+        assert call_order == ["ingest_tick", "persist"], (
+            f"Expected ingest_tick before persist, got: {call_order}"
         )
 
 
@@ -337,7 +343,7 @@ class TestC002EarlyReturn:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = None
+            mock_acc.ingest_tick.return_value = None
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
@@ -373,7 +379,8 @@ class TestC002BusRegression:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest.return_value = ep
+            mock_acc.ingest_tick.return_value = ep
+            mock_acc.get_signal.return_value = ep       # cooldown passed — signal fires
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = _capture
 

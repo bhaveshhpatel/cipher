@@ -17,7 +17,7 @@ Covers:
   10. Rolling window prunes stale events
   11. Different contracts keyed independently
   12. Same contract accumulated across calls
-  13. Returns episode on every qualifying call (not just first crossing)
+  13. ingest_tick() returns episode on every qualifying call (no cooldown applied)
 
   RepetitionAccumulator.get_alert_level
   14. premium >= 5_000_000 → CONVICTION
@@ -193,13 +193,20 @@ def test_ingest_accumulates_across_calls():
     assert ep.trade_count == 5
 
 
-# 13
+# 13 — C-008: ingest_tick() returns ep on every qualifying call (no cooldown)
 def test_ingest_returns_episode_on_every_qualifying_call():
+    """
+    C-008: ingest_tick() must return ep on EVERY qualifying call regardless of
+    cooldown state. This is the persist-tier gate (not the signal-tier gate).
+    Previously tested via ingest() which now applies C-007 cooldown via get_signal(),
+    so tick 4 within the 5-min cooldown window would return None.
+    Fix: test ingest_tick() directly — that is the correct per-tick persist API.
+    """
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
     for i in range(3):
-        acc.ingest(_mock_event(premium=100_000, timestamp=_ts(i * 10)))
-    ep4 = acc.ingest(_mock_event(premium=100_000, timestamp=_ts(30)))
-    ep5 = acc.ingest(_mock_event(premium=100_000, timestamp=_ts(40)))
+        acc.ingest_tick(_mock_event(premium=100_000, timestamp=_ts(i * 10)))
+    ep4 = acc.ingest_tick(_mock_event(premium=100_000, timestamp=_ts(30)))
+    ep5 = acc.ingest_tick(_mock_event(premium=100_000, timestamp=_ts(40)))
     assert ep4 is not None
     assert ep5 is not None
     assert ep5.trade_count == 5
