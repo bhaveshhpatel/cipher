@@ -1,6 +1,6 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-25 (Feature 4A — TierEngine: dynamic tier assignment, admin thresholds, OI/vol enrichment; B-021 staggered worker startup; B-022 session-token semaphore; B-023 429 retry handling)
+> Last updated: 2026-04-26 (registry prewarm loop, CORS allow_origin_regex, lifespan task inventory, dedup C-019 TTL corrections, health/stats aliases, OI stamp pipeline)
 
 ---
 
@@ -8,7 +8,7 @@
 
 Cipher is an institutional options flow intelligence platform. It monitors live Tradier WebSocket streams across a tier-filtered OCC symbol universe, classifies each trade tick through a 6-layer pipeline, detects repetition patterns, runs a multi-agent AI swarm, and surfaces high-conviction signals to the frontend via WebSocket — persisting all signals to Supabase for historical querying.
 
-At runtime, the active stream worker count is derived from the registry size and Tradier’s ~500-symbol-per-session cap. In practice this is typically 20–40 workers, with cold-start session establishment deliberately spread out to avoid Tradier session-endpoint rate bursts.
+At runtime, the active stream worker count is derived from the registry size and Tradier's ~500-symbol-per-session cap. In practice this is typically 20–40 workers, with cold-start session establishment deliberately spread out to avoid Tradier session-endpoint rate bursts.
 
 ---
 
@@ -25,6 +25,12 @@ At runtime, the active stream worker count is derived from the registry size and
 │  No regex, no API call, no per-tick latency.                     │
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).             │
 │  On expiry days: refreshes every 15 min.                         │
+│                                                                  │
+│  Pre-warm loop (_registry_prewarm_loop in main.py):              │
+│  Fires every weekday at 9:15 AM ET (15 min before market open).  │
+│  Rebuilds the full OCC contract set so workers connect instantly  │
+│  at 9:30 AM with no cold-start contract-load delay.              │
+│  Skipped on weekends. Non-fatal on error.                        │
 │                                                                  │
 │  Per-tier contract filtering:                                    │
 │  Contract universe is shaped by the symbol's tier at build time. │
@@ -45,26 +51,26 @@ At runtime, the active stream worker count is derived from the registry size and
 │  Streams the tier-filtered OCC symbol set produced by Layer 1.   │
 │  Symbol count is dynamic (tier ATM/DTE params drive registry     │
 │  size). Tradier caps each connection at ~500 symbols; workers    │
-│  are spawned as ceil(registry.size() / 500) — typically 20–40.   │
+│  are spawned as ceil(registry.size() / 500) — typically 20–40.  │
 │                                                                  │
 │  Startup protections (2026-04-25):                               │
-│  -  B-021 — Staggered cold start: worker i sleeps i×200ms before  │
-│    its first session-token request (`startup_delay_s`, default   │
-│    0.2s). Worker 0 starts immediately; worker 31 starts ~6.2s    │
+│  - B-021 — Staggered cold start: worker i sleeps i×200ms before  │
+│    its first session-token request (startup_delay_s, default     │
+│    0.2s). Worker 0 starts immediately; worker 31 starts ~6.2s   │
 │    later. Reconnects do NOT re-apply the stagger.                │
-│  -  B-022 — Global token semaphore: session token fetches are     │
+│  - B-022 — Global token semaphore: session token fetches are     │
 │    guarded by a process-wide Semaphore(3), so at most 3 workers  │
 │    call /markets/events/session concurrently.                    │
-│  -  B-023 — Explicit 429 handling: if Tradier returns HTTP 429,   │
-│    the client reads Retry-After, sleeps that duration (default   │
-│    60s if absent), and retries instead of hammering the endpoint.│
+│  - B-023 — Explicit 429 handling: if Tradier returns HTTP 429,   │
+│    the client reads Retry-After (default 10s if absent), sleeps  │
+│    that duration, and retries instead of crashing.               │
 │                                                                  │
-│  Effective cold-start profile: ~32 workers launch over ~6.2s,    │
+│  Effective cold-start profile: ~32 workers launch over ~6.2s,   │
 │  and with only 3 token fetches in flight at a time, startup      │
 │  resolves in ~11 batches instead of a 32-request burst.          │
 │                                                                  │
 │  Each worker has its own session token (stream_worker.py).       │
-│  Auto-reconnects on drop. On refresh: diffs old vs new symbol    │
+│  Auto-reconnects on drop. On refresh: diffs old vs new symbol   │
 │  set, restarts only affected workers — not all of them.          │
 │                                                                  │
 │  FIX (2026-04-24): registry refresh loop now calls               │
@@ -95,13 +101,13 @@ At runtime, the active stream worker count is derived from the registry size and
 │    BATO:  1-4s      (common on large prints)                     │
 │                                                                  │
 │  C-019 fix (2026-04-24) — 5 bugs fixed:                          │
-│  1. TTL: 2s → 5s  — covers worst-case PHLX/MIAX lag              │
-│  2. Sweep window: 5s → 8s  — matches extended TTL                │
-│  3. Eliminated int(ts//2) bucket boundary bug: CBOE at t=1.99s   │
+│  1. TTL: 2s → 5s  — covers worst-case PHLX/MIAX lag             │
+│  2. Sweep window: 5s → 8s  — matches extended TTL               │
+│  3. Eliminated int(ts//2) bucket boundary bug: CBOE at t=1.99s  │
 │     and MIAX at t=2.01s landed in different buckets, both passed │
 │     as canonical. Pure first-seen TTL comparison replaces this.  │
-│  4. Fill key: 2dp → 1dp — absorbs ±$0.01 feed rounding across    │
-│     exchanges without conflating genuinely different fills.       │
+│  4. Fill key: 2dp → 1dp — absorbs ±$0.01 feed rounding across   │
+│     exchanges without conflating genuinely different fills.      │
 │  5. flow_dedup was instantiated but NEVER imported or called     │
 │     in _process_trade() — Layer 4 was completely inert in        │
 │     production. Fixed + exchange field now correctly passed      │
@@ -119,7 +125,7 @@ At runtime, the active stream worker count is derived from the registry size and
 │  Never write one row at a time. Buffer events and flush to       │
 │  Supabase every 500ms OR 100 rows, whichever comes first.        │
 │  Estimated: ~62K filtered rows/day → ~744 batched flushes.       │
-│  Uses SUPABASE_SERVICE_ROLE_KEY (bypasses RLS).                  │
+│  Uses SUPABASE_SERVICE_KEY (bypasses RLS).                       │
 │                                                                  │
 │  FIX (2026-04-24): _FLUSH_INTERVAL was set to 5s instead of      │
 │  500ms. At 62K rows/day that's ~430 rows buffered per flush.     │
@@ -135,21 +141,21 @@ At runtime, the active stream worker count is derived from the registry size and
 │  flow_episodes and signal_history channels.                      │
 │                                                                  │
 │  TierEngine (services/tier_engine.py):                           │
-│    assign_tiers(symbols) → upserts tier (1/2/3) + open_interest  │
-│    + average_volume onto options_universe_symbols.               │
+│    assign_tiers(symbols) → returns tier_map dict[str,int]        │
+│    and upserts tier + open_interest + average_volume onto        │
+│    options_universe_symbols.                                     │
 │    Thresholds loaded from tier_thresholds (is_active=true row)   │
 │    and cached for TIER_THRESHOLD_CACHE_TTL_S (default 300s).     │
 │    Admin whitelist (TIER_ADMIN_WHITELIST env) forces symbols to  │
 │    Tier 1 regardless of metrics.                                 │
-│    Called by universe_store.upsert() after every symbol refresh. │
+│    Called by main.py lifespan after OI stamp and on each         │
+│    background universe refresh.                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Layer 2 Startup Math
-
-The original doc described worker fan-out but skipped the rate-limiting math that now governs startup behavior. With a default 200ms stagger and a Semaphore(3), 32 workers no longer burst the session endpoint at once.
 
 | Item | Value | Notes |
 |------|-------|-------|
@@ -158,28 +164,58 @@ The original doc described worker fan-out but skipped the rate-limiting math tha
 | Last worker initial delay | 6.2s | worker 31 |
 | Max concurrent token fetches | 3 | B-022 semaphore |
 | 32 workers / 3 slots | 11 batches | 10 full + 1 partial |
-| 429 backoff | `Retry-After` header or 60s default | B-023 |
+| 429 backoff | `Retry-After` header or 10s default | B-023 |
 
-This means cold start is intentionally slower but materially safer: the system trades a one-time startup ramp for predictable Tradier session behavior. That is the correct tradeoff because a fast burst that trips 429s or invalidates sessions is worse than an 8–11 second controlled bring-up.
+Cold start is intentionally slower but materially safer. A fast burst that trips 429s or invalidates sessions is worse than an 8–11 second controlled bring-up.
 
 ---
 
-## 6-Layer Gap Fixes (2026-04-24 / 2026-04-25 Audit)
+## Lifespan Task Inventory (`main.py`)
 
-> Three gaps were discovered during a post-implementation audit. All fixed in commit `309192f`.
-> C-019 adds five additional Layer 4 fixes applied after extended OPRA lag analysis.
-> B-021 / B-022 / B-023 add Layer 2 startup hardening after session-endpoint burst testing.
+All tasks are created inside the `lifespan` async context manager and cancelled on shutdown.
 
-| Layer | File | What Was Wrong | Fix |
-|-------|------|----------------|-----|
-| **L2 (2026-04-24)** | `tradier_stream.py` | `registry.refresh_loop()` rebuilt the registry every 30 min but never called `manager.refresh()`. Workers kept streaming stale OCC symbols. | Replaced with `_registry_refresh_with_manager_notify()` which calls `await manager.refresh()` after every rebuild. |
-| **L2 (B-021)** | `services/stream_worker.py` | Cold boot started all workers immediately, producing a synchronized burst of session-token fetches. | Added per-worker stagger: worker `i` waits `i × startup_delay_s` before first token fetch; default `startup_delay_s = 0.2s`. |
-| **L2 (B-022)** | `services/tradier_client.py` | Session token acquisition was unconstrained, so many workers could hit `/markets/events/session` at the same time. | Added a process-wide `asyncio.Semaphore(3)` around session-token fetches; max 3 concurrent requests. |
-| **L2 (B-023)** | `services/tradier_client.py` | HTTP 429 from Tradier was not handled explicitly, so retries risked ignoring provider backoff guidance. | Added explicit 429 branch: read `Retry-After`, sleep that duration (default 60s), then retry up to max attempts. |
-| **L4 (orig)** | `tradier_stream.py` | `DedupCache` (`utils/dedup.py`) was fully built and unit-tested, but **never imported or called** in `_process_trade()`. Every exchange copy of a trade wrote a DB row. 4 exchanges → 4× row count. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. Also wired `is_sweep()` upgrade. |
-| **L4 (C-019)** | `utils/dedup.py` + `tradier_stream.py` | TTL=2s too tight for PHLX/MIAX lag (2–5s). `int(ts//2)` bucket boundary let MIAX duplicate at t=2.01s slip past CBOE canonical at t=1.99s. Fill key at 2dp conflated ±$0.01 feed rounding. `exchange` field never passed to `is_duplicate()` so sweep detection always saw one exchange and never fired. | TTL→5s, sweep window→8s. Pure first-seen TTL (no buckets). Fill key 1dp. `"exch"/"exchange"` fallback in `_process_trade()`. `get_exchange_count()` + `dedup_stats()` added. |
-| **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. At 62K rows/day: ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()` itself. |
-| **L6 (4A)** | `services/tier_engine.py` | `options_universe_symbols` had no tier column — every symbol defaulted to Tier 3 regardless of liquidity. Tier used in `backtest_score` was always 3, degrading signal quality for large-cap / liquid symbols. | Added `tier_engine.py` with dynamic threshold-driven assignment. `tier_thresholds` admin table (migration 011). `universe_store.upsert()` now calls `assign_tiers()` post-refresh. |
+| Task variable | Coroutine | Purpose |
+|---------------|-----------|---------|
+| `registry_refresh_task` | `registry.refresh_loop()` | Rebuilds OCC registry every `REGISTRY_REFRESH_MINS` (default 30 min), notifies `StreamManager` to diff/restart affected workers |
+| `prewarm_task` | `_registry_prewarm_loop()` | Rebuilds OCC registry at 9:15 AM ET every weekday — workers are warm before 9:30 market open |
+| `stream_task` | `stream_options_flow(stream_symbols)` | Main Tradier WebSocket pipeline (all 6 layers) |
+| `db_write_task` | `start_flow_writer()` | Batched Supabase writes — flush every 500ms or 100 rows |
+| `signal_write_task` | `start_signal_writer()` | Persists `CompositeSignal` rows to `signal_history` |
+| `refresh_task` | `_universe_refresh_loop()` | Full universe rebuild every 24 h — reloads symbols, re-runs OI stamp + tier assignment, updates DB snapshot |
+
+### Startup Sequence (blocking)
+
+```
+1. _resolve_startup_universe()      — fresh DB snapshot (max_age 24h) or full CBOE+Tradier load
+2. init_registry(watchlist, tier_map) — Layer 1 init
+3. registry.build()                 — first OCC contract build (blocks lifespan until complete)
+4. _stamp_oi(quotes, oi_map)        — stamps open_interest on quote objects from registry
+5. assign_tiers(quotes)             — OI-informed tier assignment (T1/T2/T3)
+6. registry.set_tier_map(tier_map)  — final tier map wired into registry
+7. universe_store.upsert_symbol_quotes() — open_interest + tier written to DB
+```
+After the blocking sequence, all 6 background tasks are spawned.
+
+---
+
+## CORS Configuration (`main.py`)
+
+`allow_origins=["*"]` is **never used** — it breaks `allow_credentials=True`.
+Instead, `allow_origin_regex` accepts a combined pattern:
+
+```
+https://[a-zA-Z0-9\-]+\.vercel\.app   ← all Vercel production + preview deploys
+http://localhost:(3000|3001)           ← local dev
+http://127\.0\.0\.1:3000              ← local dev alternative
+<escaped explicit origins from CORS_ALLOWED_ORIGINS env var>
+```
+
+The pattern is logged at startup:
+```
+CORS allow_origin_regex: <pattern>
+```
+
+`CORSMiddleware` is configured with `allow_credentials=True`, `allow_methods=["*"]`, `allow_headers=["*"]`, `expose_headers=["*"]`.
 
 ---
 
@@ -190,12 +226,31 @@ This means cold start is intentionally slower but materially safer: the system t
 │                        Railway (Backend)                        │
 │                                                                 │
 │  main.py (FastAPI lifespan)                                     │
+│    │                                                            │
+│    │  BLOCKING STARTUP SEQUENCE                                 │
+│    ├── _resolve_startup_universe()   fresh snapshot or full load │
+│    ├── init_registry()              Layer 1 init                │
+│    ├── registry.build()             first OCC contract build    │
+│    ├── _stamp_oi(quotes, oi_map)    open_interest → quotes      │
+│    ├── assign_tiers(quotes)         OI-informed T1/T2/T3        │
+│    ├── registry.set_tier_map()      wire final tier map         │
+│    └── universe_store.upsert_symbol_quotes()  OI+tier → DB      │
+│                                                                 │
+│    BACKGROUND TASKS (asyncio)                                   │
+│    ├── registry.refresh_loop()      rebuild OCC every 30 min   │
+│    ├── _registry_prewarm_loop()     rebuild at 9:15 AM ET daily │
+│    ├── stream_options_flow()        Tradier WS pipeline         │
+│    ├── start_flow_writer()          batched DB writes (L5)      │
+│    ├── start_signal_writer()        signal_history writes       │
+│    └── _universe_refresh_loop()     full universe refresh 24h   │
+│                                                                 │
+│  Stream Pipeline (per tick)                                     │
 │    ├── SymbolRegistry (Layer 1)  services/symbol_registry.py    │
-│    │     ├── builds tier-filtered OCC registry at startup       │
-│    │     ├── tier_map seeded from universe_store.load_tier_map  │
-│    │     └── per-tier ATM/DTE params from tier_thresholds DB    │
+│    │     ├── O(1) OCC lookup                                    │
+│    │     ├── tier_map from tier_thresholds DB (cached 300s)     │
+│    │     └── ATM/DTE params per tier                            │
 │    ├── StreamManager (Layer 2)   services/stream_manager.py     │
-│    │     └── ceil(registry.size()/500) workers — dynamic count  │
+│    │     └── ceil(registry.size()/500) workers                  │
 │    │           ├── cold-start stagger: i×200ms (B-021)          │
 │    │           ├── get_session_token() semaphore=3 (B-022)      │
 │    │           ├── 429 Retry-After sleep/retry (B-023)          │
@@ -204,12 +259,12 @@ This means cold start is intentionally slower but materially safer: the system t
 │    │           │     ├── size==0 guard → skip                   │
 │    │           │     └── OCC regex {1,10} + synthetic spread    │
 │    │           ├── DedupCache.is_duplicate()  Layer 4  C-019    │
-│    │           │     ├── 5s TTL (occ_symbol, size, fill_1dp)    │
-│    │           │     ├── "exch"/"exchange" fallback for exch    │
+│    │           │     ├── TTL=5s key=(occ_symbol, size, fill_1dp)│
+│    │           │     ├── "exch"/"exchange" fallback             │
 │    │           │     ├── is_sweep() → 3+ exchanges within 8s    │
 │    │           │     └── → trade_type=SWEEP + exchange_count    │
 │    │           ├── RepetitionAccumulator                         │
-│    │           │     └── episode when ≥3 trades / ≥$50K prem    │
+│    │           │     └── episode when ≥3 trades / ≥$50K prem   │
 │    │           ├── build_composite()                             │
 │    │           │     └── flow×0.55 + backtest×0.35 + vol×0.10   │
 │    │           ├── SwarmEngine  (12 Groq agents)  Phase 5A      │
@@ -219,28 +274,6 @@ This means cold start is intentionally slower but materially safer: the system t
 │    │                ├── "signals"       → ws.py → WS clients    │
 │    │                ├── "db_writer"     → flow_store.py (L5)    │
 │    │                └── "signal_writer" → signal_store.py       │
-│    │                                                            │
-│    ├── _registry_refresh_with_manager_notify()  ← FIXED (L2)    │
-│    │     ├── registry.build() → set_tier_map() → manager.refresh│
-│    │     └── runs every REGISTRY_REFRESH_MINS (default 30min)   │
-│    │                                                            │
-│    ├── start_flow_writer()    services/flow_store.py  (L5)      │
-│    │     ├── flush every 500ms OR 100 rows  ← FIXED (L5)        │
-│    │     ├── persist_flow_episode() → flow_episodes             │
-│    │     └── _flush_flow_events()   → flow_events               │
-│    │                                                            │
-│    ├── start_signal_writer()  services/signal_store.py          │
-│    │     ├── persists CompositeSignal + swarm fields            │
-│    │     └── → signal_history (Supabase Realtime L6)            │
-│    │                                                            │
-│    └── TierEngine  services/tier_engine.py  Feature 4A          │
-│          ├── assign_tiers(symbols) — called by universe_store   │
-│          │     upsert() after every symbol refresh              │
-│          ├── _load_thresholds() — queries tier_thresholds       │
-│          │     WHERE is_active=true; cached 300s                │
-│          ├── Admin whitelist (TIER_ADMIN_WHITELIST) → Tier 1    │
-│          └── upserts tier + open_interest + average_volume      │
-│                onto options_universe_symbols                     │
 │                                                                 │
 │  FastAPI Routers                                                │
 │    ├── /api/auth                  auth.py                       │
@@ -251,7 +284,15 @@ This means cold start is intentionally slower but materially safer: the system t
 │    ├── /api/signals/list          smart_signals.py              │
 │    ├── /api/signals/history       history.py                    │
 │    ├── /admin/tier-thresholds     admin.py  (PATCH/GET)         │
-│    └── /admin/tier-distribution   admin.py  (GET)               │
+│    ├── /admin/tier-distribution   admin.py  (GET)               │
+│    └── /health/stream             health.py  (B-008)            │
+│                                                                 │
+│  Health / Alias Endpoints (main.py — not routers)              │
+│    ├── GET /stream/stats     → {status:"ok"}  Railway probe     │
+│    ├── GET /api/stream/stats → stream_stats() (auth required)   │
+│    ├── GET /api/health       → {status:"ok", service:"..."}     │
+│    ├── GET /health           → {status:"ok", service:"..."}     │
+│    └── GET /                 → {message:"Cipher API v1.0 ..."}  │
 └─────────────────────────────────────────────────────────────────┘
                               │
                 Supabase Realtime (Layer 6)
@@ -281,23 +322,23 @@ Tradier stream worker cold start (Layer 2 — StreamManager)
   → worker_index-based startup sleep                 B-021
        ├── worker 0: 0.0s
        ├── worker 1: 0.2s
-       ├── worker 2: 0.4s
        └── ...
   → get_session_token()                             B-022 / B-023
        ├── acquire global Semaphore(3)
        ├── POST /markets/events/session
-       ├── HTTP 429 → read Retry-After → sleep → retry
+       ├── HTTP 429 → read Retry-After (default 10s) → sleep → retry
        └── success → release semaphore
   → connect streaming session
   → parse_tradier_trade()                           Layer 3
        ├── fill_price = tick["last"] or tick.get("price") or mid
        ├── size==0 guard → return None (skip)
        ├── OCC regex {1,10} — ticker/strike/expiry/type
-       ├── synthetic spread when bid=ask=0
+       ├── synthetic spread when bid=ask=0  (is_synthetic_quote=True)
        └── registry enrichment → override with chain metadata
   → DedupCache.is_duplicate()                       Layer 4  C-019
        ├── key: (occ_symbol, size, round(fill, 1))
        ├── TTL: 5s — covers PHLX/MIAX worst-case lag
+       ├── NO time-bucket (int(ts//2) bug eliminated)
        ├── exchange: trade_payload["exch"] or ["exchange"]
        ├── duplicate (same trade, slower exchange) → DROP
        ├── canonical → check is_sweep()
@@ -346,12 +387,16 @@ Tradier stream worker cold start (Layer 2 — StreamManager)
 
 Thresholds are stored in `tier_thresholds` (the `is_active = true` row) and cached for 300 seconds. Admins can update them live via `PATCH /admin/tier-thresholds` without redeployment.
 
+### Admin Whitelist
+
+Symbols in `TIER_ADMIN_WHITELIST` env var (default: SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, AMD, PLTR, COIN) are always assigned Tier 1 regardless of volume thresholds.
+
 ### `options_universe_symbols` — Feature 4A columns
 
 | Column | Type | Default | Notes |
 |--------|------|---------|-------|
 | `tier` | `SMALLINT` | `3` | 1 = liquid, 2 = mid-cap, 3 = standard |
-| `open_interest` | `INT` | `NULL` | Populated by TierEngine from Tradier quotes |
+| `open_interest` | `INT` | `NULL` | Populated by TierEngine from Tradier quotes + OI stamp |
 | `average_volume` | `INT` | `NULL` | Populated by TierEngine from Tradier quotes |
 
 ### Admin endpoints
@@ -361,25 +406,6 @@ Thresholds are stored in `tier_thresholds` (the `is_active = true` row) and cach
 | `/admin/tier-thresholds` | `GET` | Admin JWT | Read active threshold row |
 | `/admin/tier-thresholds` | `PATCH` | Admin JWT | Update thresholds live (no redeploy) |
 | `/admin/tier-distribution` | `GET` | Admin JWT | Count of symbols per tier |
-
-### `tier_thresholds` Table
-
-```sql
-CREATE TABLE tier_thresholds (
-  id                    BIGSERIAL PRIMARY KEY,
-  t1_min_avg_volume     INT NOT NULL DEFAULT 20000000,
-  t1_atm_range_pct      NUMERIC NOT NULL DEFAULT 20.0,
-  t1_max_dte            INT NOT NULL DEFAULT 90,
-  t2_min_avg_volume     INT NOT NULL DEFAULT 2000000,
-  t2_atm_range_pct      NUMERIC NOT NULL DEFAULT 15.0,
-  t2_max_dte            INT NOT NULL DEFAULT 60,
-  t3_min_avg_volume     INT NOT NULL DEFAULT 500000,
-  t3_atm_range_pct      NUMERIC NOT NULL DEFAULT 10.0,
-  t3_max_dte            INT NOT NULL DEFAULT 30,
-  is_active             BOOLEAN NOT NULL DEFAULT false,
-  created_at            TIMESTAMPTZ DEFAULT now()
-);
-```
 
 ---
 
@@ -476,24 +502,40 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 
 ---
 
+## 6-Layer Gap Fixes (2026-04-24 / 2026-04-25 Audit)
+
+| Layer | File | What Was Wrong | Fix |
+|-------|------|----------------|-----|
+| **L2 (2026-04-24)** | `tradier_stream.py` | `registry.refresh_loop()` rebuilt the registry every 30 min but never called `manager.refresh()`. Workers kept streaming stale OCC symbols. | Replaced with `_registry_refresh_with_manager_notify()` which calls `await manager.refresh()` after every rebuild. |
+| **L2 (B-021)** | `services/stream_worker.py` | Cold boot started all workers immediately, producing a synchronized burst of session-token fetches. | Added per-worker stagger: worker `i` waits `i × startup_delay_s` before first token fetch; default `startup_delay_s = 0.2s`. |
+| **L2 (B-022)** | `services/tradier_client.py` | Session token acquisition was unconstrained — many workers could hit `/markets/events/session` simultaneously. | Added a process-wide `asyncio.Semaphore(3)` around session-token fetches; max 3 concurrent requests. |
+| **L2 (B-023)** | `services/tradier_client.py` | HTTP 429 from Tradier was not handled — retries ignored provider backoff. | Added explicit 429 branch: read `Retry-After` (default 10s), sleep, then retry within same semaphore hold. |
+| **L4 (orig)** | `tradier_stream.py` | `DedupCache` fully built and tested but **never imported or called** in `_process_trade()`. Every exchange copy wrote a DB row. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. |
+| **L4 (C-019)** | `utils/dedup.py` + `tradier_stream.py` | TTL=2s too tight for PHLX/MIAX lag. `int(ts//2)` bucket boundary bug. Fill key 2dp conflated ±$0.01 rounding. `exchange` never passed to `is_duplicate()` so sweep never fired. | TTL→5s, sweep window→8s. Pure first-seen TTL (no buckets). Fill key 1dp. `"exch"/"exchange"` fallback. `get_exchange_count()` + `dedup_stats()` added. |
+| **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()`. |
+| **L6 (4A)** | `services/tier_engine.py` | `options_universe_symbols` had no tier column — every symbol defaulted to Tier 3. `backtest_score` tier was always 3. | Added `tier_engine.py` with dynamic threshold-driven assignment. `tier_thresholds` admin table (migration 011). Lifespan calls OI stamp + `assign_tiers()` at startup. |
+| **B-008** | `services/stream_worker.py` | `errors`, `reconnects`, `last_reconnect_at` in `_stats` were never updated — `/health/stream` always returned zeros. | Added `_inc_global_error()` / `_inc_global_reconnect()` helpers writing directly into `tradier_stream._stats` via lazy import. |
+
+---
+
 ## Supabase Tables
 
 | Table | Writer | Key Used | Notes |
 |-------|--------|----------|-------|
-| `flow_episodes` | `flow_store.py` | SERVICE_ROLE_KEY | 82k+ rows, primary flow data |
-| `flow_events` | `flow_store.py` | SERVICE_ROLE_KEY | Batched writes (500ms/100 rows); `expiry` nullable |
-| `signal_history` | `signal_store.py` | SERVICE_ROLE_KEY | Composite signals + swarm fields (Phase 5A) |
-| `options_universe_symbols` | `universe_store.py` + `tier_engine.py` | ANON_KEY / SERVICE_ROLE_KEY | Symbol quotes, stream_eligible, **tier/OI/avg_vol (4A)** |
+| `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
+| `flow_events` | `flow_store.py` | SERVICE_KEY | Batched writes (500ms/100 rows); `expiry` nullable |
+| `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields (Phase 5A) |
+| `options_universe_symbols` | `universe_store.py` + `tier_engine.py` | ANON_KEY / SERVICE_KEY | Symbol quotes, stream_eligible, tier/OI/avg_vol (4A) |
 | `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
-| `tier_thresholds` | admin endpoint | SERVICE_ROLE_KEY | Single active row; cached 300s by TierEngine |
+| `tier_thresholds` | admin endpoint | SERVICE_KEY | Single active row; cached 300s by TierEngine |
 
 ### Supabase Critical Rules
 
-1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
+1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
 2. **Never send `id` fields** — Postgres generates them server-side
 3. **No `.select()` after `.insert()`** in supabase-py v2
 4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
-5. **Env var is `SUPABASE_SERVICE_ROLE_KEY`** (Railway config var name)
+5. **Env var is `SUPABASE_SERVICE_KEY`** in `config.py` — confirm the Railway variable name maps to this
 
 ---
 
@@ -502,86 +544,6 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 | Level | Criteria |
 |-------|----------|
 | `CONVICTION` | premium ≥ $5M, OR (accelerating AND premium ≥ $1M) |
-| `STRONG_SIGNAL` | premium ≥ $1M |
+| `STRONG_SIGNAL` | premium ≥ $1M (non-accelerating) |
 | `ALERT` | premium ≥ $250K |
-| `WATCH` | premium ≥ $50K (minimum threshold) |
-
----
-
-## Universe Pipeline (Startup + 24h Refresh)
-
-| Step | Action | Table |
-|------|--------|-------|
-| 1 | CBOE CSV → ~5,500 raw symbols | — |
-| 2 | Tradier `/expirations` validation → ~5,500 confirmed optionable | — |
-| 3 | Tradier batch quotes (200/batch, 28 parallel) → `stream_eligible` flag | `options_universe_symbols` |
-| 4 | **TierEngine.assign_tiers()** → upserts `tier`, `open_interest`, `average_volume` | `options_universe_symbols` |
-| 5 | Extract `stream_eligible=true` → StreamManager (~1,000–2,000 symbols) | — |
-| 6 | Save snapshot | `options_universe_snapshots` |
-
-**Startup priority:** fresh DB snapshot (< 24h) → Tradier fetch → stale snapshot → `SEED_SYMBOLS`.
-
----
-
-## ID Generation Contract
-
-> **Rule:** `flow_events`, `flow_episodes`, and `signal_history` rows are **never sent with an `id` field**. Postgres generates IDs server-side. Sending a client-generated `id` causes a 400 / schema mismatch error.
-
----
-
-## Environment Variables
-
-| Variable | Used by | Required |
-|----------|---------|----------|
-| `TRADIER_API_KEY` | tradier_stream.py | Yes (live mode) |
-| `TRADIER_BASE_URL` | tradier_stream.py | Yes |
-| `TRADIER_STREAM_URL` | tradier_stream.py | Yes |
-| `TRADIER_ACCOUNT_ID` | trade_executor.py | Yes (paper/live trading) |
-| `SUPABASE_URL` | flow_store, signal_store, universe_store | Yes |
-| `SUPABASE_SERVICE_ROLE_KEY` | flow_store, signal_store, tier_engine | **Yes — service role key** |
-| `SUPABASE_KEY` | universe_store, smart_signals (reads) | Yes (anon key) |
-| `SECRET_KEY` | auth.py | Yes |
-| `ALGORITHM` | auth.py | Yes (default: HS256) |
-| `GROQ_API_KEY` | swarm_engine.py | Yes (swarm; HOLD fallback if absent) |
-| `SWARM_N_AGENTS` | swarm_engine.py | No (default: 6) |
-| `REGISTRY_MAX_DTE` | symbol_registry.py | No (default: 90) |
-| `REGISTRY_REFRESH_MINS` | symbol_registry.py | No (default: 30) |
-| `TIER_ADMIN_WHITELIST` | tier_engine.py | No — comma-separated tickers forced to Tier 1 |
-| `TIER_THRESHOLD_CACHE_TTL_S` | tier_engine.py | No (default: 300) |
-| `STREAM_WORKER_STARTUP_DELAY_S` | stream_worker.py | No (default: 0.2) |
-| `TRADIER_SESSION_MAX_CONCURRENCY` | tradier_client.py | No (default: 3) |
-| `TRADIER_SESSION_429_DEFAULT_SLEEP_S` | tradier_client.py | No (default: 60) |
-
----
-
-## Where to Look for Signals
-
-| What you want | Where to look |
-|--------------|---------------|
-| Raw flow ticks (live) | Railway logs → filter `[flow]` |
-| Signal episodes (live) | Railway logs → filter `[signal]` |
-| Persisted flow episodes | Supabase `flow_episodes` (82k+ rows) |
-| Signal history (paginated) | `GET /api/signals/history?limit=50&min_conviction=0.65` |
-| Paginated signals list | `GET /api/signals/list?page=1&min_conviction=0.65` |
-| WebSocket delivery | Browser devtools → WS frames on `/ws/signals` |
-| Swarm agent reasoning | `signal_history.swarm_agents` JSONB column |
-| Dedup stats (live) | `GET /health` → `dedup_duplicates`, `dedup_sweeps`, `dedup_cache_size` |
-| Tier distribution | `GET /admin/tier-distribution` |
-| Active tier thresholds | `GET /admin/tier-thresholds` |
-| Startup throttle behavior | Railway logs → worker start timestamps + Tradier session fetch logs |
-| 429 backoff events | Railway logs → `[tradier] 429` / `Retry-After` messages |
-
----
-
-## Known Issues / Phase 6 TODO
-
-- ✅ **Feature 4A complete** — TierEngine, tier_thresholds table, migrations 010+011, admin endpoints, 35 tests
-- ✅ **B-021 complete** — cold-start worker stagger prevents synchronized token-fetch burst
-- ✅ **B-022 complete** — global semaphore caps concurrent session requests at 3
-- ✅ **B-023 complete** — explicit 429 handler respects `Retry-After`
-- `signals/midcap_screener.py` — confirm integrated into signal pipeline
-- Wire `TradeExecutor` into simulation router for live paper trade execution
-- Load test `/api/signals/list` and `/api/signals/history` with 50 concurrent authenticated users
-- WebSocket fan-out benchmark with 50+ subscribers
-- Redis integration (`REDIS_URL` in config but unused — candidate for WS pub/sub at scale)
-- Wire `/api/signals/list` tier filter to live `tier` column on `options_universe_symbols`
+| `WATCH` | premium < $250K |
