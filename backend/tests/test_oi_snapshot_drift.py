@@ -27,7 +27,6 @@ level via patch() or patch.object().  Without it, Python injects the
 instance as the first positional arg, shifting every subsequent parameter
 by one (self → ticker, ticker → price, etc.) and corrupting the call.
 """
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

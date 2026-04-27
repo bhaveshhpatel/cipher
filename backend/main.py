@@ -4,7 +4,6 @@ Cipher Backend — FastAPI entry point
 import asyncio
 import json
 import logging
-import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
@@ -15,7 +14,6 @@ from fastapi.responses import JSONResponse
 
 from config import settings
 from routers import auth, flow, simulation, ws, smart_signals
-from routers.smart_signals import stream_stats
 from routers import history
 from routers import admin
 from routers import health
