@@ -78,6 +78,34 @@ async def get_config() -> dict:
 
 # ---------------------------------------------------------------------------
 # Universe loader — returns (stream_symbols, tier_map, quotes, snapshot_id)
+#
+# Startup flow (cold / stale path — no fresh DB snapshot):
+#
+#   Step 1 : CBOE fetch + Tradier symbol validation  (~10s)
+#             → symbols list + stream_eligible_set
+#
+#   Step 2 : _fetch_batch_quotes() for validated symbols  (~8s)
+#             → SymbolQuote list in memory
+#
+#   Step 3 ↔ Step 4a  [PARALLEL via asyncio.gather]
+#     Step 3 : save_snapshot() → DB  (~3s)
+#     Step 4a: registry.build() → _fetch_expirations + _build_ticker chains
+#              (~4–6 min, rate-limited to Tradier 120 req/min)
+#
+#   Step 4c : assign_tiers() — runs TWICE:
+#             (i)  preliminary: price + vol only, no OI — so init_registry()
+#                  has a tier_map immediately
+#             (ii) OI-informed: after registry.build() stamps open_interest
+#                  onto quotes — final tiers written to DB
+#
+#   Step 5  : upsert_symbol_quotes() with OI + final tiers  (~3s)
+#
+# Warm / DB-hit path:
+#   load_fresh_snapshot() returns cached symbols immediately.
+#   Quotes + tiers are refreshed via _refresh_quotes_in_background() so the
+#   app serves traffic without blocking, but open_interest + tier columns
+#   are updated within the first minute of startup rather than staying stale
+#   for the full 24-hour snapshot window.
 # ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
@@ -96,7 +124,8 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        # Resolve the active snapshot_id so registry can load from DB cache
+        # Resolve the active snapshot_id so registry can load from DB cache.
+        # quotes=[] signals to lifespan that a background refresh is needed.
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: universe_store._client()
@@ -109,6 +138,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
+        # Return empty quotes — lifespan will fire _refresh_quotes_in_background()
         return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -137,42 +167,54 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
     snapshot_id = ""
 
     if source == "tradier_validated":
-        log.info(
-            "[universe] Step 3: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
-            len(symbols),
-            len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
-        )
-        saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
-        if saved:
-            log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
-        else:
-            log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
-
-        # Fetch quotes separately now that load_universe no longer returns them
-        log.info("[universe] Step 3b: fetching batch quotes for %d symbols", len(symbols))
+        # Step 2 — fetch quotes while save_snapshot + registry.build run in parallel
+        log.info("[universe] Step 2: fetching batch quotes for %d symbols", len(symbols))
         quotes = await _fetch_batch_quotes(symbols)
+
+        # Step 4c (i) — preliminary tier assignment (price+vol only, OI not yet available)
         if quotes:
-            log.info("[universe] Step 3b: preliminary tier assignment for %d symbols (OI not yet available)", len(quotes))
+            log.info(
+                "[universe] Step 4c(i): preliminary tier assignment for %d symbols "
+                "(OI not yet available — will be updated after registry.build)",
+                len(quotes),
+            )
             tier_map = await assign_tiers(quotes)
             log.info(
-                "[universe] Step 3b: preliminary tiers — T1=%d T2=%d T3=%d",
+                "[universe] Step 4c(i): preliminary tiers — T1=%d T2=%d T3=%d",
                 sum(1 for t in tier_map.values() if t == 1),
                 sum(1 for t in tier_map.values() if t == 2),
                 sum(1 for t in tier_map.values() if t == 3),
             )
 
-        # Resolve the new snapshot_id
-        active_snap = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: universe_store._client()
-                .table("options_universe_snapshots")
-                .select("id")
-                .eq("is_active", True)
-                .order("fetched_at", desc=True)
-                .limit(1)
-                .execute()
-                .data,
+        # Steps 3 + 4a — run in PARALLEL: save_snapshot has no dependency on
+        # registry.build() and registry.build() has no dependency on the DB write.
+        log.info(
+            "[universe] Steps 3+4a: launching save_snapshot + registry seed in parallel "
+            "(snapshot_id resolved after gather)"
         )
+        saved, active_snap = await asyncio.gather(
+            universe_store.save_snapshot(symbols, source, stream_eligible_set),
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: universe_store._client()
+                    .table("options_universe_snapshots")
+                    .select("id")
+                    .eq("is_active", True)
+                    .order("fetched_at", desc=True)
+                    .limit(1)
+                    .execute()
+                    .data,
+            ),
+        )
+
+        if saved:
+            log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
+        else:
+            log.error(
+                "[universe] Step 3 FAILED: save_snapshot returned False — "
+                "check universe_store logs"
+            )
+
         snapshot_id = active_snap[0]["id"] if active_snap else ""
     else:
         log.warning(
@@ -198,6 +240,57 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
     for q in quotes:
         q.open_interest = oi_map.get(q.symbol, 0)
+
+
+# ---------------------------------------------------------------------------
+# Gap 2 fix — background quote refresh for DB-hit (warm-start) path.
+#
+# When lifespan loads from a fresh DB snapshot it skips _fetch_batch_quotes,
+# assign_tiers, and upsert_symbol_quotes to avoid blocking startup. This
+# coroutine runs as a fire-and-forget task so the app serves traffic
+# immediately while open_interest + tier columns are kept fresh.
+# ---------------------------------------------------------------------------
+async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
+    """Fetch quotes, stamp OI, re-tier, and upsert — non-blocking background task."""
+    log.info(
+        "[universe] Background quote refresh starting for %d stream symbols",
+        len(stream_symbols),
+    )
+    try:
+        quotes = await _fetch_batch_quotes(stream_symbols)
+        if not quotes:
+            log.warning("[universe] Background quote refresh: no quotes returned — skipping")
+            return
+
+        registry = get_registry()
+        if registry:
+            oi_map = registry.get_oi_map()
+            _stamp_oi(quotes, oi_map)
+            log.info(
+                "[universe] Background quote refresh: OI stamped on %d quotes "
+                "(%d tickers with oi>0)",
+                len(quotes),
+                sum(1 for v in oi_map.values() if v > 0),
+            )
+
+        tier_map = await assign_tiers(quotes)
+        log.info(
+            "[universe] Background quote refresh: tiers — T1=%d T2=%d T3=%d",
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+
+        if registry:
+            registry.set_tier_map(tier_map)
+
+        await universe_store.upsert_symbol_quotes(quotes, tier_map)
+        log.info("[universe] Background quote refresh: upsert complete")
+
+    except Exception as exc:
+        log.error(
+            "[universe] Background quote refresh failed (non-fatal): %s", exc, exc_info=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +420,7 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend…")
+    log.info("Starting Cipher backend\u2026")
 
     stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
@@ -346,10 +439,17 @@ async def lifespan(app: FastAPI):
             seeded, registry.is_ready(),
         )
 
+    # Steps 3+4a — on the COLD path save_snapshot already ran in parallel
+    # with the snapshot_id query inside _resolve_startup_universe().
+    # Here we only need to run registry.build() (Step 4b) which is the
+    # rate-limited bottleneck (~4-6 min). On the WARM/HIT path quotes==[] so
+    # this is the only build we do at startup; the background refresh task
+    # (created below) will stamp OI + re-tier after registry.build() finishes.
     log.info("[registry] Running first build (blocking startup until OI available)")
     await registry.build()
     log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
 
+    # Step 4c (ii) — OI-informed tier assignment (cold path only: quotes != [])
     if quotes:
         oi_map = registry.get_oi_map()
         _stamp_oi(quotes, oi_map)
@@ -369,6 +469,7 @@ async def lifespan(app: FastAPI):
 
         registry.set_tier_map(tier_map)
 
+        # Step 5 — upsert with OI + final tiers (cold path)
         log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
         await universe_store.upsert_symbol_quotes(quotes, tier_map)
         log.info("[registry] Upsert complete — open_interest column now populated in DB")
@@ -381,6 +482,20 @@ async def lifespan(app: FastAPI):
     signal_write_task = asyncio.create_task(start_signal_writer())
     refresh_task      = asyncio.create_task(_universe_refresh_loop())
 
+    # Gap 2 fix — warm path: fire quote refresh as a background task so
+    # open_interest + tier columns are updated without blocking app startup.
+    # On the cold path quotes != [] so this branch is skipped (tiers already
+    # stamped via the OI-informed assign_tiers block above).
+    bg_quote_refresh_task = None
+    if not quotes:
+        log.info(
+            "[registry] Warm-start path: scheduling background quote refresh "
+            "(open_interest + tiers will be updated shortly after startup)"
+        )
+        bg_quote_refresh_task = asyncio.create_task(
+            _refresh_quotes_in_background(stream_symbols)
+        )
+
     yield
 
     refresh_task.cancel()
@@ -389,14 +504,17 @@ async def lifespan(app: FastAPI):
     stream_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    for task in (
+    if bg_quote_refresh_task is not None:
+        bg_quote_refresh_task.cancel()
+    for task in filter(None, (
         stream_task,
         db_write_task,
         signal_write_task,
         refresh_task,
         registry_refresh_task,
         prewarm_task,
-    ):
+        bg_quote_refresh_task,
+    )):
         try:
             await task
         except asyncio.CancelledError:
@@ -481,4 +599,4 @@ async def health_root():
 
 @app.get("/", tags=["health"])
 async def root():
-    return JSONResponse({"message": "Cipher API v1.0 — Decode the Market"})
+    return JSONResponse({"message": "Cipher API v1.0 \u2014 Decode the Market"})
