@@ -75,6 +75,15 @@ Fix (C-020) — Dedup Clock Mismatch:
   - Fix: arrival_ts = _time.time() so both sides of the TTL comparison are
     wall-clock epoch values.
 
+Fix (C-002) — Persist Gate:
+  - persist_flow_event() was called BEFORE accumulator.ingest(), writing every
+    dedup-passing tick to DB regardless of whether it crossed the episode
+    threshold. Sub-threshold retail noise polluted flow_events and burned write
+    capacity.
+  - Fix: persist_flow_event() is now called AFTER accumulator.ingest(). Only
+    ticks that are part of a qualifying episode (>=3 trades, >=$50K premium)
+    are written to flow_events. Sub-threshold ticks return early with no DB write.
+
 B-008 — Stream Health:
   - _stats gains last_tick_at (float epoch, updated on every classified tick)
     and last_reconnect_at (float epoch, updated on every reconnect attempt).
@@ -351,6 +360,12 @@ async def _process_trade(raw: dict):
       _time.monotonic() caused TTL comparisons to always be negative, making
       cache entries permanent and blocking all re-prints of the same contract.
 
+    C-002 — Persist Gate:
+      persist_flow_event() is called AFTER accumulator.ingest() so that only
+      ticks belonging to a qualifying episode (>=3 trades, >=$50K premium)
+      are written to the flow_events table. Sub-threshold noise returns early
+      with no DB write.
+
     B-008:
       last_tick_at is updated on every classified (non-deduped) tick so
       /health/stream can report stream liveness.
@@ -427,6 +442,15 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
+    # ------------------------------------------------------------------
+    # C-002: Gate DB write on accumulator threshold.
+    # ingest() first — if episode does not qualify, return with no DB write.
+    # Only ticks that are part of a qualifying episode reach persist_flow_event.
+    # ------------------------------------------------------------------
+    ep = accumulator.ingest(ev)
+    if not ep:
+        return
+
     await persist_flow_event({
         "ticker":               ev.ticker,
         "contract_type":        ev.contract_type,
@@ -453,10 +477,6 @@ async def _process_trade(raw: dict):
         "occ_symbol":           occ_symbol,
         "is_synthetic_quote":   ev.is_synthetic_quote,
     })
-
-    ep = accumulator.ingest(ev)
-    if not ep:
-        return
 
     alert_level = accumulator.get_alert_level(ep)
 
