@@ -26,6 +26,15 @@ All fake_* replacements that stand in for instance methods MUST have
 level via patch() or patch.object().  Without it, Python injects the
 instance as the first positional arg, shifting every subsequent parameter
 by one (self → ticker, ticker → price, etc.) and corrupting the call.
+
+_pending_expiry_cache note
+--------------------------
+After build 1, build() does:
+    self._expiry_cache = dict(new_expiry_cache)   # new_expiry_cache built from
+                                                   # self._pending_expiry_cache
+So fake_build_ticker_b1 MUST write to self_inner._pending_expiry_cache
+(not the old expiry_cache_out kwarg) so that _expiry_cache is non-empty
+after build 1 and build 2 correctly takes the delta path.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -77,9 +86,13 @@ async def test_oi_snapshot_holds_previous_build_oi():
     # ------------------------------------------------------------------ build 1
     # self_inner is required: patch() replaces the method at class level,
     # so Python passes the instance as the first positional arg.
+    #
+    # IMPORTANT: write to self_inner._pending_expiry_cache (not expiry_cache_out)
+    # so that build() picks it up in new_expiry_cache and sets _expiry_cache.
+    # Without a non-empty _expiry_cache after build 1, build 2 will be treated
+    # as a first build and skip _apply_delta entirely.
     async def fake_build_ticker_b1(
         self_inner, ticker, price, registry, oi_by_ticker, tier_params,
-        expiry_cache_out=None,
     ):
         from services.symbol_registry import ContractMeta
         registry["AAPL260101C00150000"] = ContractMeta(
@@ -87,8 +100,8 @@ async def test_oi_snapshot_holds_previous_build_oi():
             contract_type="CALL", dte=10, open_interest=500, tier=3,
         )
         oi_by_ticker["AAPL"] = 500
-        if expiry_cache_out is not None:
-            expiry_cache_out["AAPL"] = {"2026-01-01"}
+        # Populate pending_expiry_cache so build() sets _expiry_cache after build 1
+        self_inner._pending_expiry_cache["AAPL"] = {"2026-01-01"}
 
     with (
         patch.object(reg.__class__, "_build_ticker", new=fake_build_ticker_b1),
@@ -151,7 +164,6 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
         # self_inner required on class-level patches
         async def fake_build_ticker(
             self_inner, ticker, price, registry, oi_by_ticker, tier_params,
-            expiry_cache_out=None,
         ):
             from services.symbol_registry import ContractMeta
             registry[f"{ticker}OCC"] = ContractMeta(
@@ -159,8 +171,8 @@ async def test_oi_snapshot_differs_from_oi_by_ticker_after_second_build():
                 contract_type="CALL", dte=30, open_interest=new_oi, tier=3,
             )
             oi_by_ticker[ticker] = new_oi
-            if expiry_cache_out is not None:
-                expiry_cache_out[ticker] = {"2026-06-01"}
+            # Populate pending_expiry_cache so _expiry_cache is non-empty after build
+            self_inner._pending_expiry_cache[ticker] = {"2026-06-01"}
 
         async def fake_apply_delta(
             self_inner, prices, tier_params, new_registry, new_oi_by_ticker,

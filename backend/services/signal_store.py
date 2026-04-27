@@ -24,11 +24,11 @@ CI / no-network behaviour:
   can still return saved data within the same process.
 
 Insert path:
-  _insert_signal always uses httpx (raw REST).  This keeps the insert path
-  simple, test-patchable via patch('httpx.AsyncClient'), and avoids the SDK
-  initialising a real Supabase connection during CI.
-  get_signals uses the SDK path (patchable via _client) for read queries;
-  ticker filtering is done in Python after fetch so the mock chain is simple.
+  save_signal uses _insert_signal_sdk (SDK path) when the SDK is available,
+  falling back to _insert_signal_with_retry (httpx) otherwise.
+  _client() is a thin factory, patchable in tests via:
+      patch('services.signal_store._client', return_value=mock_client)
+  get_signals uses the SDK path (patchable via _client) for read queries.
 """
 import asyncio
 import logging
@@ -112,7 +112,7 @@ async def _insert_signal_sdk(row: dict) -> bool:
     """
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
+        await loop.run_in_executor(
             None,
             lambda: _client()
                 .table(_TABLE)
@@ -289,9 +289,11 @@ async def save_signal(signal) -> bool:
     """
     Persist a signal.
 
-    Priority:
-      1. httpx REST insert via _insert_signal_with_retry.
-      2. _signal_memory fallback when Supabase is not configured or all
+    Insert priority:
+      1. SDK path via _insert_signal_sdk (uses _client(), patchable in tests).
+      2. httpx REST path via _insert_signal_with_retry as fallback when SDK
+         is unavailable.
+      3. _signal_memory fallback when Supabase is not configured or all
          retries failed (CI / offline environments).
     """
     sig_dict = _coerce_to_dict(signal)
@@ -301,7 +303,12 @@ async def save_signal(signal) -> bool:
         return True
 
     row = _build_row(signal)
-    ok  = await _insert_signal_with_retry(row)
+
+    if _is_sdk_available():
+        ok = await _insert_signal_sdk(row)
+    else:
+        ok = await _insert_signal_with_retry(row)
+
     _store_in_memory(sig_dict)
     return ok
 

@@ -540,8 +540,10 @@ class TestInMemoryHelpers:
             fs.add_flow({"ticker": f"T{i}"})
             for i in range(20)
         ])
-        total = sum(
-            len(await fs.get_flows(f"T{i}")) for i in range(20)
-        )
+        # Collect counts per ticker with an explicit loop (not a genexpr with
+        # await, which is a SyntaxError in Python 3.11).
+        total = 0
+        for i in range(20):
+            total += len(await fs.get_flows(f"T{i}"))
         assert total == 20
         await fs.clear_flows()

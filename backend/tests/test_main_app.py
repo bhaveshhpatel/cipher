@@ -2,7 +2,7 @@
 Regression tests for main.py app wiring, lifespan, and middleware.
 
 Covers:
- - /api/health endpoint is mounted and reachable
+ - /health endpoint is mounted and reachable
  - Unknown routes return 404
  - CORS OPTIONS preflight returns acceptable status
  - _stamp_oi helper is callable
@@ -25,7 +25,7 @@ def _get_client():
 
 def test_app_health_endpoint_exists():
     client = _get_client()
-    resp = client.get("/api/health")
+    resp = client.get("/health")
     assert resp.status_code in (200, 503)
 
 
@@ -38,7 +38,7 @@ def test_app_returns_404_for_unknown_path():
 def test_cors_headers_present_on_options():
     client = _get_client()
     resp = client.options(
-        "/api/health",
+        "/health",
         headers={
             "Origin": "http://localhost:3000",
             "Access-Control-Request-Method": "GET",
@@ -109,7 +109,7 @@ def test_lifespan_does_not_crash_on_startup():
          patch("main.assign_tiers", new_callable=AsyncMock, return_value={}), \
          patch("main.get_config", new_callable=AsyncMock, return_value={}):
         client = _get_client()
-        resp = client.get("/api/health")
+        resp = client.get("/health")
         assert resp.status_code in (200, 503)
 
 
