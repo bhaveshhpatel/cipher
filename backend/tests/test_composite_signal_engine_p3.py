@@ -8,7 +8,6 @@ Targets uncovered lines:
   - Swarm result as dict → swarm fields populated
   - Swarm _run raises exception → exception swallowed, base sig returned intact
 """
-import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from signals.composite_signal_engine import (
     build_composite_async,

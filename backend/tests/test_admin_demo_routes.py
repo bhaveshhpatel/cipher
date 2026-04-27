@@ -25,15 +25,15 @@ not bound until the function executes.  We therefore patch the source module
 This is the only reliable approach for function-body lazy imports.
 """
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from core.auth import get_current_user, TokenData
 from routers.admin import router
 
-# Pre-import demo_engine so module is in sys.modules before we patch it
-import services.demo_engine  # noqa: F401
+# Pre-import demo_engine so the module is in sys.modules before we patch it
+import services.demo_engine as _demo_engine_preload  # noqa: F401
 
 
 def _make_app(role: str = "admin") -> FastAPI:

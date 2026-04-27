@@ -115,9 +115,11 @@ async def test_fetch_role_returns_user_when_creds_missing():
 
 @pytest.mark.asyncio
 async def test_fetch_role_no_supabase_call_when_creds_missing():
+    # create_client is imported inside _fetch_role body from supabase,
+    # so we patch the source module "supabase.create_client".
     with patch.object(settings, "SUPABASE_URL", ""), \
          patch.object(settings, "SUPABASE_SERVICE_KEY", ""), \
-         patch("core.auth.create_client") as mock_create:
+         patch("supabase.create_client") as mock_create:
         await _fetch_role("someone@cipher.app")
     mock_create.assert_not_called()
 
@@ -128,7 +130,7 @@ async def test_fetch_role_supabase_exception_returns_user():
     mock_client.table.side_effect = Exception("DB exploded")
     with patch.object(settings, "SUPABASE_URL", "http://fake"), \
          patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"), \
-         patch("core.auth.create_client", return_value=mock_client):
+         patch("supabase.create_client", return_value=mock_client):
         role = await _fetch_role("user@cipher.app")
     assert role == "user"
 
@@ -144,7 +146,7 @@ async def test_fetch_role_no_rows_returns_user():
     mock_client.table.return_value = q
     with patch.object(settings, "SUPABASE_URL", "http://fake"), \
          patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"), \
-         patch("core.auth.create_client", return_value=mock_client):
+         patch("supabase.create_client", return_value=mock_client):
         role = await _fetch_role("user@cipher.app")
     assert role == "user"
 
@@ -161,7 +163,7 @@ async def test_fetch_role_row_missing_role_key_returns_user():
     mock_client.table.return_value = q
     with patch.object(settings, "SUPABASE_URL", "http://fake"), \
          patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"), \
-         patch("core.auth.create_client", return_value=mock_client):
+         patch("supabase.create_client", return_value=mock_client):
         role = await _fetch_role("user@cipher.app")
     assert role == "user"
 
@@ -177,6 +179,6 @@ async def test_fetch_role_returns_correct_role_from_db():
     mock_client.table.return_value = q
     with patch.object(settings, "SUPABASE_URL", "http://fake"), \
          patch.object(settings, "SUPABASE_SERVICE_KEY", "fake-key"), \
-         patch("core.auth.create_client", return_value=mock_client):
+         patch("supabase.create_client", return_value=mock_client):
         role = await _fetch_role("admin@cipher.app")
     assert role == "admin"

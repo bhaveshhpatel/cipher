@@ -11,7 +11,6 @@ Targets uncovered lines:
   - Sweep with PUT and bearish sentiment → PUT_SWEEP
   - Block >= 500k, CALL, neutral (not bullish) → falls through DARK_POOL
 """
-import pytest
 from services.classifier import classify
 
 

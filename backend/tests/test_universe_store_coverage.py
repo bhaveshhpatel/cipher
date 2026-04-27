@@ -17,7 +17,6 @@ Targets uncovered lines:
   - _sync_upsert_symbol_quotes: no active snapshot → logs warning, returns
   - _sync_upsert_symbol_quotes: exception → logs warning, does not raise
 """
-import pytest
 from unittest.mock import MagicMock, patch
 from services.universe_store import (
     _prune_old_snapshots,
