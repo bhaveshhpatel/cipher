@@ -318,16 +318,18 @@ import collections as _collections
 _mem_store: _collections.deque = _collections.deque(maxlen=5_000)
 
 
-async def add_flow(flow: dict) -> None:
-    """Append a flow dict to the in-memory store."""
+async def add_flow(flow) -> None:
+    """Append a flow (dict or dataclass) to the in-memory store."""
     _mem_store.append(flow)
 
 
-def get_flows_sync(ticker: str) -> list[dict]:
+def get_flows_sync(ticker: Optional[str] = None) -> list:
     """
     Synchronous version of get_flows — returns a plain list.
     Used by tests that call sum(get_flows_sync(ticker)) directly.
     """
+    if ticker is None:
+        return list(_mem_store)
     return [
         f for f in _mem_store
         if (
@@ -337,7 +339,7 @@ def get_flows_sync(ticker: str) -> list[dict]:
     ]
 
 
-async def get_flows(ticker: str) -> list[dict]:
+async def get_flows(ticker: Optional[str] = None) -> list:
     """Async version — returns a plain list (NOT an async generator)."""
     return get_flows_sync(ticker)
 
@@ -358,28 +360,62 @@ async def clear_flows() -> None:
 # ---------------------------------------------------------------------------
 # FlowStore — backward-compat class for tests that do:
 #   from services.flow_store import FlowStore
-# Wraps the module-level helpers above.
 # ---------------------------------------------------------------------------
 
 class FlowStore:
     """
-    Thin wrapper around the module-level flow store functions.
-    Provided for backward compatibility with tests that import FlowStore.
-    All methods delegate to the module-level functions.
+    Instance-level wrapper around a private deque.
+    Tests use FlowStore() to get an isolated store per test.
     """
 
-    async def add(self, flow: dict) -> None:
-        await add_flow(flow)
+    def __init__(self):
+        self._store: _collections.deque = _collections.deque(maxlen=5_000)
+        self._stats_dict: dict = {"total": 0}
 
-    def get(self, ticker: str) -> list[dict]:
-        return get_flows_sync(ticker)
+    # ---- mutation --------------------------------------------------------
 
-    async def aget(self, ticker: str):
-        async for f in aget_flows(ticker):
-            yield f
+    def add_flow(self, flow) -> None:
+        """Add a flow (dict or dataclass) to this store instance."""
+        self._store.append(flow)
+        self._stats_dict["total"] = self._stats_dict.get("total", 0) + 1
 
-    async def clear(self) -> None:
-        await clear_flows()
+    def clear(self) -> None:
+        """Reset this store instance."""
+        self._store.clear()
+        self._stats_dict = {"total": 0}
+
+    # ---- queries ---------------------------------------------------------
+
+    def get_flows(self, ticker: Optional[str] = None) -> list:
+        """Return all flows, optionally filtered by ticker."""
+        if ticker is None:
+            return list(self._store)
+        return [
+            f for f in self._store
+            if (
+                f.get("ticker") if isinstance(f, dict)
+                else getattr(f, "ticker", None)
+            ) == ticker
+        ]
+
+    def get_flows_by_symbol(self, symbol: str) -> list:
+        """Return flows matching the given symbol."""
+        return self.get_flows(ticker=symbol)
+
+    def get_stats(self) -> dict:
+        """Return a dict with basic stats for this store instance."""
+        return dict(self._stats_dict)
 
     def __len__(self) -> int:
-        return len(_mem_store)
+        return len(self._store)
+
+    # ---- async compat ----------------------------------------------------
+
+    async def async_add_flow(self, flow) -> None:
+        self.add_flow(flow)
+
+    async def async_get_flows(self, ticker: Optional[str] = None) -> list:
+        return self.get_flows(ticker=ticker)
+
+    async def async_clear(self) -> None:
+        self.clear()

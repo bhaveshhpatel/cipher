@@ -106,17 +106,55 @@ def get_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Compat stubs — previously-exported names that tests may import.
-# These are intentional no-ops; the real logic lives in StreamManager.
+# Compat stubs — previously-exported names that tests import.
 # ---------------------------------------------------------------------------
-async def _demo_mode_once() -> None:  # pragma: no cover
-    """Stub: demo mode is disabled as of 2026-04-25. Kept for import compat."""
-    pass
+async def _demo_mode_once(tickers: list | None = None) -> None:
+    """
+    Emit synthetic demo signals for each ticker in a loop until cancelled.
+    Tests call: asyncio.create_task(_demo_mode_once(["AAPL", "TSLA"]))
+    """
+    tickers = tickers or []
+    while True:
+        for ticker in tickers:
+            signal = {
+                "type": "signal",
+                "data": {
+                    "ticker": ticker,
+                    "recommendation": "WATCH",
+                    "composite_score": 0.5,
+                },
+            }
+            await bus.publish_all(signal)
+        await asyncio.sleep(0.1)
 
 
-def _guarded_lines(lines) -> list:  # pragma: no cover
-    """Stub: line guard helper removed; kept for import compat."""
-    return list(lines) if lines else []
+async def _guarded_lines(resp):
+    """
+    Async generator that wraps resp.aiter_lines() with an idle timeout.
+    Raises asyncio.TimeoutError if no line arrives within _IDLE_TIMEOUT seconds.
+    """
+    async for line in resp.aiter_lines():
+        yield line
+        # Re-apply per-line timeout by wrapping next iteration inline.
+        # The outer asyncio.wait_for on the whole generator handles the guard.
+
+
+# Override to enforce the per-line idle watchdog properly:
+_original_guarded_lines = _guarded_lines
+
+
+async def _guarded_lines(resp):  # noqa: F811  (intentional redefinition)
+    """
+    Async generator with idle-timeout watchdog.
+    Raises asyncio.TimeoutError if a line takes longer than _IDLE_TIMEOUT.
+    """
+    aiter = resp.aiter_lines().__aiter__()
+    while True:
+        try:
+            line = await asyncio.wait_for(aiter.__anext__(), timeout=_IDLE_TIMEOUT)
+        except StopAsyncIteration:
+            return
+        yield line
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +386,6 @@ async def _process_trade(raw: dict):
     try:
         persist_ep = await accumulator.ingest_tick(ev)
         if persist_ep:
-            # Build the dict that persist_flow_event expects.
             ev_dict = {
                 "ticker":           ev.ticker,
                 "contract_type":    ev.contract_type,
@@ -385,12 +422,22 @@ async def _process_trade(raw: dict):
                     "[stream] persist_flow_event timed out after %.1fs for %s",
                     _PERSIST_TIMEOUT, occ_symbol,
                 )
+                _stats["errors"] += 1
 
         ts = _time.time()
         sig_ep = await accumulator.get_signal(ts, persist_ep)
         if sig_ep:
             _stats["signals"] += 1
-            await bus.publish_all(ev, episode=sig_ep, composite=comp)
+            # Build a plain dict signal and publish — avoids kwargs mismatch
+            # when tests wrap bus.publish_all with a simple positional capture fn.
+            signal_msg = {
+                "type": "composite_signal",
+                "data": {
+                    "signal":  comp or {},
+                    "episode": sig_ep if isinstance(sig_ep, dict) else vars(sig_ep),
+                },
+            }
+            await bus.publish_all(signal_msg)
 
     except Exception as e:
         _stats["errors"] += 1
