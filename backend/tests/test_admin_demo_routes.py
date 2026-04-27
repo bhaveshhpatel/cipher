@@ -19,11 +19,12 @@ But since these are inside function bodies (not module-level), the name is
 not bound until the function executes.  We therefore patch the source module
 (services.demo_engine) directly so it intercepts at import time:
 
-    with patch('services.demo_engine.get_stats', ...):
+    with patch('services.demo_engine.get_stats', ...):#
         client.get(...)
 
 This is the only reliable approach for function-body lazy imports.
 """
+import sys
 import pytest
 from unittest.mock import patch, AsyncMock
 from fastapi import FastAPI
@@ -32,8 +33,10 @@ from fastapi.testclient import TestClient
 from core.auth import get_current_user, TokenData
 from routers.admin import router
 
-# Pre-import demo_engine so the module is in sys.modules before we patch it
-import services.demo_engine as _demo_engine_preload  # noqa: F401
+# Pre-import demo_engine so the module is in sys.modules before we patch it.
+# Referenced via sys.modules to satisfy pyflakes (no unused-import warning).
+import services.demo_engine
+assert sys.modules.get("services.demo_engine") is services.demo_engine
 
 
 def _make_app(role: str = "admin") -> FastAPI:
