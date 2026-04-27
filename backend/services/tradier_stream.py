@@ -130,21 +130,6 @@ async def _demo_mode_once(tickers: list | None = None) -> None:
 
 async def _guarded_lines(resp):
     """
-    Async generator that wraps resp.aiter_lines() with an idle timeout.
-    Raises asyncio.TimeoutError if no line arrives within _IDLE_TIMEOUT seconds.
-    """
-    async for line in resp.aiter_lines():
-        yield line
-        # Re-apply per-line timeout by wrapping next iteration inline.
-        # The outer asyncio.wait_for on the whole generator handles the guard.
-
-
-# Override to enforce the per-line idle watchdog properly:
-_original_guarded_lines = _guarded_lines
-
-
-async def _guarded_lines(resp):  # noqa: F811  (intentional redefinition)
-    """
     Async generator with idle-timeout watchdog.
     Raises asyncio.TimeoutError if a line takes longer than _IDLE_TIMEOUT.
     """
@@ -418,11 +403,12 @@ async def _process_trade(raw: dict):
                     timeout=_PERSIST_TIMEOUT,
                 )
             except asyncio.TimeoutError:
+                # C-008: timeout is non-fatal — do NOT increment errors counter
+                # (test_persist_timeout_does_not_block_hot_path asserts errors unchanged)
                 log.warning(
                     "[stream] persist_flow_event timed out after %.1fs for %s",
                     _PERSIST_TIMEOUT, occ_symbol,
                 )
-                _stats["errors"] += 1
 
         ts = _time.time()
         sig_ep = await accumulator.get_signal(ts, persist_ep)

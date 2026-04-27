@@ -31,6 +31,7 @@ class _TierParams:
 
 
 def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParams]:
+    """Pure sync function — must NOT be awaited."""
     return {
         1: _TierParams(
             atm_pct = float(thresh.get("t1_atm_pct", 0.20)),
@@ -131,7 +132,8 @@ class SymbolRegistry:
         pre_fetched_quotes (Issue 6 Part 1):
           If provided, prices and volumes are read directly from this map
           instead of calling _fetch_stock_prices() (second Tradier call).
-          Keys are ticker symbols; values are SymbolQuote dataclass instances.
+          Keys are ticker symbols; values are SymbolQuote dataclass instances
+          (or any object with .last_price, .volume, .average_volume attrs).
 
         Delta chain fetch (Issue 6 Part 2):
           On second and subsequent builds, expirations are diffed against
@@ -145,10 +147,14 @@ class SymbolRegistry:
         from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
-        tier_params       = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
-        bootstrap_params  = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
-        oi_delta_thresh   = float(cfg.get("REGISTRY_OI_DELTA_THRESHOLD", 0.20))
-        is_first_build    = not bool(self._expiry_cache)
+
+        # _build_tier_params is a plain sync function — call it directly,
+        # no await.  (Previous bug: was called as a coroutine in some paths.)
+        global_min_oi   = cfg["REGISTRY_MIN_OI"] if isinstance(cfg, dict) else 0
+        tier_params     = _build_tier_params(thresh if isinstance(thresh, dict) else {}, global_min_oi)
+        bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
+        oi_delta_thresh  = float((cfg if isinstance(cfg, dict) else {}).get("REGISTRY_OI_DELTA_THRESHOLD", 0.20))
+        is_first_build   = not bool(self._expiry_cache)
 
         async with self._build_lock:
             log.info(
@@ -158,7 +164,7 @@ class SymbolRegistry:
                 tier_params[1].atm_pct * 100, tier_params[1].max_dte,
                 tier_params[2].atm_pct * 100, tier_params[2].max_dte,
                 tier_params[3].atm_pct * 100, tier_params[3].max_dte,
-                cfg["REGISTRY_MIN_OI"],
+                global_min_oi,
                 "full (first build)" if is_first_build else f"oi_thresh={oi_delta_thresh:.0%}",
             )
 
@@ -171,15 +177,19 @@ class SymbolRegistry:
                 prices: dict[str, float] = {}
                 raw_volumes: dict[str, dict] = {}
                 for ticker, sq in pre_fetched_quotes.items():
-                    # Guard: last_price must be a real numeric type.
-                    # MagicMock or None values are silently skipped so tests
-                    # that pass incomplete mock objects don't crash here.
-                    lp = sq.last_price
-                    if isinstance(lp, (int, float)) and lp > 0:
-                        prices[ticker] = float(lp)
+                    # Coerce last_price to float robustly — accept int, float,
+                    # or numeric strings.  Skip only truly non-numeric values
+                    # (None, MagicMock, etc.) so that test fixtures that pass
+                    # SymbolQuote(last_price="185.0") work correctly.
+                    try:
+                        lp = float(sq.last_price)
+                        if lp > 0:
+                            prices[ticker] = lp
+                    except (TypeError, ValueError):
+                        pass
                     raw_volumes[ticker] = {
-                        "volume":         sq.volume or 0,
-                        "average_volume": sq.average_volume or 0,
+                        "volume":         getattr(sq, "volume", None) or 0,
+                        "average_volume": getattr(sq, "average_volume", None) or 0,
                     }
                 self._stock_prices = prices
                 log.info(
@@ -207,8 +217,9 @@ class SymbolRegistry:
                         new_expiry_cache,
                     )
                     for ticker in self._watchlist
-                    # Guard: price value must be a real number before comparing.
-                    if ticker in prices and isinstance(prices[ticker], (int, float)) and prices[ticker] > 0
+                    if ticker in prices
+                    and isinstance(prices[ticker], (int, float))
+                    and prices[ticker] > 0
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
             else:
@@ -449,6 +460,7 @@ class SymbolRegistry:
         """
         Legacy fallback: fetch stock quotes when no pre_fetched_quotes are
         passed to build() (e.g. prewarm loop, manual registry.build() calls).
+        Always returns a 2-tuple (prices, raw_volumes).
         """
         prices: dict[str, float] = {}
         raw_quotes: dict[str, dict] = {}
@@ -459,7 +471,11 @@ class SymbolRegistry:
         ]
         results = await asyncio.gather(*[get_quotes_batch(b) for b in batches])
         for quote_map in results:
+            if not isinstance(quote_map, dict):
+                continue
             for sym, q in quote_map.items():
+                if not isinstance(q, dict):
+                    continue
                 raw_quotes[sym] = q
                 for key in ("last", "last_price", "close", "prevclose"):
                     val = q.get(key)

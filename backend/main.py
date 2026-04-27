@@ -62,11 +62,6 @@ def _configure_logging() -> None:
 _configure_logging()
 log = logging.getLogger("main")
 
-# ---------------------------------------------------------------------------
-# Issue 2: module-level lock shared by _refresh_quotes_in_background and
-# _universe_refresh_loop.  Only one _fetch_batch_quotes + upsert call runs
-# at a time.
-# ---------------------------------------------------------------------------
 _quote_refresh_lock: asyncio.Lock = asyncio.Lock()
 
 
@@ -78,43 +73,11 @@ async def get_config() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Helper: build pre_fetched_quotes dict from a SymbolQuote list.
-# SymbolRegistry.build() accepts dict[str, SymbolQuote]; this converts the
-# list form that _fetch_batch_quotes() returns.
-# ---------------------------------------------------------------------------
 def _quotes_to_map(quotes: list) -> dict:
     """Convert list[SymbolQuote] → dict[ticker, SymbolQuote]."""
     return {q.symbol: q for q in quotes if q.symbol}
 
 
-# ---------------------------------------------------------------------------
-# Universe loader — returns (stream_symbols, tier_map, quotes, snapshot_id)
-#
-# Startup flow (cold / stale path — no fresh DB snapshot):
-#
-#   Step 1 : CBOE fetch + Tradier symbol validation  (~10s)
-#             → symbols list + stream_eligible_set
-#
-#   Step 2 : _fetch_batch_quotes() for validated symbols  (~8s)  — ONE call total
-#             → SymbolQuote list in memory
-#             → preliminary tier_map (price+vol, no OI)
-#
-#   Step 3+4a [PARALLEL]:
-#     Step 3 : save_snapshot() with preliminary tier_map → DB
-#     (Step 4a: registry.build() uses pre_fetched_quotes — no second Tradier call)
-#
-#   Step 4c : OI-informed tier assignment after build() stamps OI on quotes
-#
-#   Step 5  : upsert_symbol_quotes() with OI + final tiers (BOTH paths)
-#
-# Warm / DB-hit path:
-#   load_fresh_snapshot() returns stream-eligible symbols immediately.
-#   _refresh_quotes_in_background fetches quotes, passes them into
-#   registry.build(pre_fetched_quotes=...) — no second Tradier call — then
-#   stamps OI and calls upsert_symbol_quotes().
-#   App yields in ~1-3s.
-# ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
@@ -175,7 +138,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         log.info("[universe] Step 2: fetching batch quotes for %d symbols", len(symbols))
         quotes = await _fetch_batch_quotes(symbols)
 
-        # Step 4c (i) — preliminary tier assignment (price+vol only, OI not yet available)
         if quotes:
             log.info(
                 "[universe] Step 4c(i): preliminary tier assignment for %d symbols "
@@ -190,8 +152,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 sum(1 for t in tier_map.values() if t == 3),
             )
 
-        # Steps 3+4a — save_snapshot now receives the preliminary tier_map
-        # so the DB snapshot is never written with all tier=3 rows (Issue 6).
         log.info(
             "[universe] Steps 3+4a: launching save_snapshot (with preliminary tiers) "
             "+ snapshot_id query in parallel"
@@ -199,7 +159,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         saved, active_snap = await asyncio.gather(
             universe_store.save_snapshot(
                 symbols, source, stream_eligible_set,
-                tier_map=tier_map,          # Issue 6: real tiers in snapshot row
+                tier_map=tier_map,
             ),
             asyncio.get_event_loop().run_in_executor(
                 None,
@@ -241,28 +201,11 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
     return stream_symbols, tier_map, quotes, snapshot_id
 
 
-# ---------------------------------------------------------------------------
-# OI stamp helper
-# ---------------------------------------------------------------------------
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
     for q in quotes:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
-# ---------------------------------------------------------------------------
-# Background quote refresh for DB-hit (warm-start) path.
-#
-# Bug fix: previously build() was launched without pre_fetched_quotes in the
-# lifespan warm path, causing _fetch_stock_prices() to fire inside build()
-# (first Tradier call) AND then _refresh_quotes_in_background called
-# _fetch_batch_quotes() independently (second Tradier call).  Now:
-#   1. _refresh_quotes_in_background fetches quotes first.
-#   2. Passes them into registry.build(pre_fetched_quotes=...) so
-#      _fetch_stock_prices() is never invoked — single Tradier call.
-#   3. Stamps OI, re-tiers, upserts after build() completes.
-#
-# Issue 2: guarded by _quote_refresh_lock.
-# ---------------------------------------------------------------------------
 async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
     """Fetch quotes, pass into build(pre_fetched_quotes=...), stamp OI, re-tier, upsert."""
     if _quote_refresh_lock.locked():
@@ -284,8 +227,6 @@ async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
 
             registry = get_registry()
             if registry:
-                # Pass pre-fetched quotes into build() so _fetch_stock_prices()
-                # is NOT called — this is the single Tradier call on the warm path.
                 pre_fetched = _quotes_to_map(quotes)
                 log.info(
                     "[universe] Background quote refresh: calling registry.build "
@@ -322,12 +263,6 @@ async def _refresh_quotes_in_background(stream_symbols: list[str]) -> None:
             )
 
 
-# ---------------------------------------------------------------------------
-# Background 24-hour refresh
-#
-# Issue 2: first sleep anchored to (24h - elapsed since last snapshot).
-# Issue 6: passes fetched quotes into registry.build() as pre_fetched_quotes.
-# ---------------------------------------------------------------------------
 async def _universe_refresh_loop():
     REFRESH_INTERVAL = 24 * 60 * 60
 
@@ -361,7 +296,6 @@ async def _universe_refresh_loop():
                         quotes = await _fetch_batch_quotes(symbols)
                         if quotes:
                             registry = get_registry()
-                            # Issue 6: pass quotes into build() to skip second Tradier call
                             pre_fetched = _quotes_to_map(quotes)
                             if registry:
                                 log.info(
@@ -382,7 +316,7 @@ async def _universe_refresh_loop():
 
                             saved = await universe_store.save_snapshot(
                                 symbols, source, stream_eligible_set,
-                                tier_map=tier_map,  # Issue 6: real tiers
+                                tier_map=tier_map,
                             )
                             await universe_store.upsert_symbol_quotes(quotes, tier_map)
                             log.info(
@@ -414,9 +348,6 @@ async def _universe_refresh_loop():
         await asyncio.sleep(REFRESH_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# Registry pre-warm
-# ---------------------------------------------------------------------------
 _ET = ZoneInfo("America/New_York")
 _PREWARM_TIME = time(9, 15)
 
@@ -467,23 +398,17 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("[lifespan] Cipher backend starting up")
 
-    # Initialised to None; only assigned on the warm (no-quotes) path.
-    # Must be declared before the if/else so the shutdown block can
-    # reference it unconditionally.
     bg_quote_refresh_task = None
 
     stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(stream_symbols, tier_map=tier_map)
 
-    # Seed registry from DB chain cache to serve lookups before build() completes
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
         log.info("[lifespan] Registry pre-seeded with %d contracts from DB", seeded)
 
     if quotes:
-        # Cold / stale path: quotes already fetched in _resolve_startup_universe.
-        # Pass them into build() so _fetch_stock_prices() is never called.
         log.info(
             "[lifespan] Cold path: launching registry.build with %d pre-fetched quotes",
             len(quotes),
@@ -491,9 +416,6 @@ async def lifespan(app: FastAPI):
         pre_fetched = _quotes_to_map(quotes)
         build_task = asyncio.create_task(registry.build(pre_fetched_quotes=pre_fetched))
     else:
-        # Warm / DB-hit path: no quotes fetched yet.
-        # _refresh_quotes_in_background will fetch quotes and pass them to
-        # registry.build(pre_fetched_quotes=...) — single Tradier call total.
         log.info(
             "[lifespan] Warm path: deferring registry.build to background refresh "
             "(quotes will be fetched once and passed into build)"
@@ -546,7 +468,8 @@ app.include_router(ws.router)
 app.include_router(smart_signals.router)
 app.include_router(history.router)
 app.include_router(admin.router)
-app.include_router(health.router)
+app.include_router(health.router)          # /api/health/*
+app.include_router(health.health_router)   # /health/* (test compat + internal probes)
 
 
 @app.get("/config")
