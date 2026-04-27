@@ -9,14 +9,19 @@ Gate execution order (fail-fast — cheapest checks first):
   2. Spread gate           — (ask - bid) / mid <= MAX_SPREAD_PCT
   3. Min premium gate      — individual trade premium >= MIN_TRADE_PREMIUM
   4. Volume > OI gate      — daily volume > open_interest (new-bet filter)
-  5. Aggression gate       — SOFT flag only (pending final decision)
-                             calls -> AT_ASK or ABOVE_ASK
-                             puts  -> AT_BID or BELOW_BID
+  5. Aggression gate       — proportional fill-distance penalty (soft default)
+                             calls -> AT_ASK or ABOVE_ASK (else penalty)
+                             puts  -> AT_BID or BELOW_BID (else penalty)
 
-Note on aggression gate:
-  Currently implemented as GateResult.SOFT_REJECT (reduces score, not dropped).
-  Change AGGRESSION_HARD_REJECT=true in env to flip to hard reject.
-  This allows A/B testing signal volume impact before committing.
+Aggression gate penalty model:
+  Penalty = clamp(fill_distance_pct, 0.05, MAX_AGGRESSION_PENALTY)
+  where fill_distance_pct for a CALL = (fill_price - ask) / ask  (negative
+  means filled below ask — less aggressive). Mirrored for PUTs.
+  If bid/ask/fill_price are unavailable, falls back to FLAT_AGGRESSION_PENALTY.
+
+  Set APEX_AGGRESSION_HARD_REJECT=true to drop non-aggressive fills entirely
+  instead of penalising.  Set APEX_MAX_AGGRESSION_PENALTY to override the 0.40
+  cap (float, 0-1).
 
 Stats counter:
   signal_gate.stats() returns a dict of per-gate rejection counts
@@ -34,14 +39,38 @@ from typing import Optional
 # Configuration (all overridable via env vars)
 # ---------------------------------------------------------------------------
 
-MAX_SPREAD_PCT: float = float(os.getenv("APEX_MAX_SPREAD_PCT", "0.15"))       # 15%
-MIN_TRADE_PREMIUM: float = float(os.getenv("APEX_MIN_TRADE_PREMIUM", "5000")) # $5K
+MAX_SPREAD_PCT: float        = float(os.getenv("APEX_MAX_SPREAD_PCT",          "0.15"))   # 15%
+MIN_TRADE_PREMIUM: float     = float(os.getenv("APEX_MIN_TRADE_PREMIUM",       "5000"))  # $5K
+MAX_AGGRESSION_PENALTY: float = float(os.getenv("APEX_MAX_AGGRESSION_PENALTY", "0.40"))  # 40% cap
+FLAT_AGGRESSION_PENALTY: float = float(os.getenv("APEX_FLAT_AGGRESSION_PENALTY", "0.25")) # fallback
 AGGRESSION_HARD_REJECT: bool = os.getenv("APEX_AGGRESSION_HARD_REJECT", "false").lower() == "true"
+
+# Runtime-mutable flag — updated by /api/apex/gate-config PATCH without restart
+_aggression_hard_reject_override: Optional[bool] = None
 
 # bid_ask classes that count as aggressive for calls
 _CALL_AGGRESSIVE = frozenset({"AT_ASK", "ABOVE_ASK"})
 # bid_ask classes that count as aggressive for puts
-_PUT_AGGRESSIVE = frozenset({"AT_BID", "BELOW_BID"})
+_PUT_AGGRESSIVE  = frozenset({"AT_BID", "BELOW_BID"})
+
+
+def get_aggression_hard_reject() -> bool:
+    """Returns effective hard-reject flag (runtime override takes precedence)."""
+    if _aggression_hard_reject_override is not None:
+        return _aggression_hard_reject_override
+    return AGGRESSION_HARD_REJECT
+
+
+def set_aggression_hard_reject(value: bool) -> None:
+    """Set runtime override for aggression hard-reject (no restart needed)."""
+    global _aggression_hard_reject_override
+    _aggression_hard_reject_override = value
+
+
+def reset_aggression_override() -> None:
+    """Reset override to None so env-var default is used again."""
+    global _aggression_hard_reject_override
+    _aggression_hard_reject_override = None
 
 
 # ---------------------------------------------------------------------------
@@ -56,10 +85,10 @@ class GateVerdict(str, Enum):
 
 @dataclass
 class GateResult:
-    verdict:      GateVerdict
-    failed_gate:  Optional[str] = None   # name of the gate that rejected
-    reason:       Optional[str] = None   # human-readable reason
-    score_penalty: float        = 0.0    # applied to conviction_score on SOFT_REJECT
+    verdict:       GateVerdict
+    failed_gate:   Optional[str] = None   # name of the gate that rejected
+    reason:        Optional[str] = None   # human-readable reason
+    score_penalty: float         = 0.0    # applied to conviction_score on SOFT_REJECT
 
     @property
     def passed(self) -> bool:
@@ -106,6 +135,7 @@ def stats() -> dict:
         "gate_rejected_min_premium": _stats.rejected_min_premium,
         "gate_rejected_vol_oi":      _stats.rejected_vol_oi,
         "gate_flagged_aggression":   _stats.flagged_aggression,
+        "aggression_hard_reject":    get_aggression_hard_reject(),
     }
 
 
@@ -113,6 +143,42 @@ def reset_stats() -> None:
     """Reset all counters — used in tests."""
     global _stats
     _stats = _GateStats()
+
+
+# ---------------------------------------------------------------------------
+# Penalty helper
+# ---------------------------------------------------------------------------
+
+def _compute_aggression_penalty(ev, ctype: str) -> float:
+    """
+    Compute proportional fill-distance penalty.
+
+    For CALLs: how far below the ask did the fill land?
+      distance = (ask - fill) / ask   [positive = filled below ask = less aggressive]
+    For PUTs: how far above the bid?
+      distance = (fill - bid) / bid   [positive = filled above bid = less aggressive]
+
+    Result is clamped to [FLAT_AGGRESSION_PENALTY, MAX_AGGRESSION_PENALTY].
+    Falls back to FLAT_AGGRESSION_PENALTY when price data unavailable.
+    """
+    bid  = float(getattr(ev, "bid",        0) or 0)
+    ask  = float(getattr(ev, "ask",        0) or 0)
+    fill = float(getattr(ev, "fill_price", 0) or 0)
+
+    if fill <= 0 or (ctype == "CALL" and ask <= 0) or (ctype == "PUT" and bid <= 0):
+        return FLAT_AGGRESSION_PENALTY
+
+    if ctype == "CALL":
+        distance = (ask - fill) / ask
+    else:
+        distance = (fill - bid) / bid
+
+    # distance <= 0 means filled AT or above ask (calls) / AT or below bid (puts)
+    # that shouldn't reach here (those are aggressive), but guard anyway
+    if distance <= 0:
+        return FLAT_AGGRESSION_PENALTY
+
+    return min(max(distance, FLAT_AGGRESSION_PENALTY), MAX_AGGRESSION_PENALTY)
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +203,11 @@ def _gate_spread(ev) -> Optional[GateResult]:
     bid = float(getattr(ev, "bid", 0) or 0)
     ask = float(getattr(ev, "ask", 0) or 0)
 
-    # Skip spread check on synthetic quotes — bid/ask are fabricated
     if getattr(ev, "is_synthetic_quote", False):
         return None
 
     if bid <= 0 or ask <= 0:
-        return None  # can't compute — pass through
+        return None
 
     mid = (bid + ask) / 2.0
     if mid <= 0:
@@ -175,18 +240,15 @@ def _gate_min_premium(ev) -> Optional[GateResult]:
 def _gate_volume_oi(ev) -> Optional[GateResult]:
     """
     Gate 4: Daily volume must exceed open interest.
-    Filters recycled OI — ensures this is a NEW directional bet.
     Skip when open_interest == 0 (data not available).
     """
-    oi = int(getattr(ev, "open_interest", 0) or 0)
+    oi     = int(getattr(ev, "open_interest", 0) or 0)
     if oi == 0:
-        return None  # OI not available — pass through
+        return None
 
-    # volume field may not exist on OptionsFlowEvent yet;
-    # fall back to size as proxy (single-trade volume)
     volume = int(getattr(ev, "daily_volume", None) or getattr(ev, "size", 0) or 0)
     if volume == 0:
-        return None  # can't evaluate — pass through
+        return None
 
     if volume <= oi:
         _stats.rejected_vol_oi += 1
@@ -200,32 +262,39 @@ def _gate_volume_oi(ev) -> Optional[GateResult]:
 
 def _gate_aggression(ev) -> Optional[GateResult]:
     """
-    Gate 5: Aggression check.
-    Calls must fill AT_ASK or ABOVE_ASK.
-    Puts must fill AT_BID or BELOW_BID.
+    Gate 5: Aggression check with proportional fill-distance penalty.
 
-    Currently SOFT_REJECT (score penalty) unless APEX_AGGRESSION_HARD_REJECT=true.
-    Returns None (pass) if bid_ask_class is unknown or empty.
+    Calls must fill AT_ASK or ABOVE_ASK.
+    Puts  must fill AT_BID  or BELOW_BID.
+
+    Non-aggressive fills receive a proportional score_penalty based on how
+    far the fill deviated from the aggressive threshold, capped at
+    MAX_AGGRESSION_PENALTY (default 0.40).  Falls back to
+    FLAT_AGGRESSION_PENALTY (0.25) when price data is absent.
+
+    Set APEX_AGGRESSION_HARD_REJECT=true (or toggle via /api/apex/gate-config)
+    to hard-reject instead of penalise.
     """
-    ba_class = (getattr(ev, "bid_ask_class", "") or "").upper()
-    ctype    = (getattr(ev, "contract_type", "") or "").upper()
+    ba_class = (getattr(ev, "bid_ask_class",  "") or "").upper()
+    ctype    = (getattr(ev, "contract_type",  "") or "").upper()
 
     if not ba_class or not ctype:
         return None
 
-    is_aggressive_fill = (
+    is_aggressive = (
         (ctype == "CALL" and ba_class in _CALL_AGGRESSIVE) or
         (ctype == "PUT"  and ba_class in _PUT_AGGRESSIVE)
     )
 
-    if not is_aggressive_fill:
+    if not is_aggressive:
         _stats.flagged_aggression += 1
-        verdict = GateVerdict.HARD_REJECT if AGGRESSION_HARD_REJECT else GateVerdict.SOFT_REJECT
+        penalty = _compute_aggression_penalty(ev, ctype)
+        verdict = GateVerdict.HARD_REJECT if get_aggression_hard_reject() else GateVerdict.SOFT_REJECT
         return GateResult(
             verdict=verdict,
             failed_gate="aggression",
-            reason=f"{ctype} filled at {ba_class!r} — not aggressive",
-            score_penalty=0.25,  # 25% conviction haircut on soft reject
+            reason=f"{ctype} filled at {ba_class!r} — not aggressive (penalty={penalty:.2f})",
+            score_penalty=penalty,
         )
     return None
 
@@ -234,7 +303,6 @@ def _gate_aggression(ev) -> Optional[GateResult]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-# Ordered gate list — cheapest / most discriminating first
 _GATES = [
     _gate_sweep_only,
     _gate_spread,
@@ -255,16 +323,15 @@ def check(ev) -> GateResult:
 
     Call site in tradier_stream._process_trade():
 
-        from signals.signal_gate import check as gate_check, GateVerdict
+        from signals.signal_gate import check as gate_check
 
         result = gate_check(ev)
         if result.hard_rejected:
-            return          # drop
+            return
         if result.soft_rejected:
             ev.conviction_score = round(
                 ev.conviction_score * (1 - result.score_penalty), 3
             )
-        # forward to accumulator
         await accumulator.ingest(ev)
     """
     _stats.total_seen += 1
