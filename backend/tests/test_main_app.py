@@ -156,9 +156,12 @@ def test_lifespan_spawns_prewarm_task():
         mock_registry.get_oi_map = MagicMock(return_value={})
         mock_registry.refresh_loop = AsyncMock()
         mock_registry.set_tier_map = MagicMock()
+        mock_registry.load_from_db = AsyncMock(return_value=0)
+        mock_registry.is_ready = MagicMock(return_value=False)
 
         with patch.object(main_module, "_resolve_startup_universe",
-                          new_callable=AsyncMock, return_value=([], {}, [])), \
+                          new_callable=AsyncMock,
+                          return_value=([], {}, [], "")), \
              patch.object(main_module, "init_registry",
                           return_value=mock_registry), \
              patch.object(main_module, "assign_tiers",
