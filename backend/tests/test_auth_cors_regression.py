@@ -19,28 +19,61 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-# Patch out Supabase & Tradier so tests run fully offline
 import unittest.mock as mock
 
 _MOCK_USER = mock.MagicMock()
 _MOCK_USER.user = mock.MagicMock()
 
+
+async def _async_noop(*_a, **_kw):
+    """Async no-op used to stub out tasks that make real network/DB calls."""
+    import asyncio
+    await asyncio.sleep(0)
+
+
+async def _async_noop_zero(*_a, **_kw):
+    """Async no-op that returns 0 (for build/load_from_db return values)."""
+    import asyncio
+    await asyncio.sleep(0)
+    return 0
+
+
+async def _resolve_startup_universe_stub():
+    """Return a safe empty startup universe so lifespan completes without I/O."""
+    return [], {}, [], ""
+
+
 @pytest.fixture(scope="module")
 def client():
     with (
+        # Auth router helpers
         mock.patch("routers.auth._supabase_admin", return_value=None),
         mock.patch("routers.auth._supabase_client", return_value=None),
-        mock.patch("services.tradier_stream.stream_options_flow", return_value=_async_noop()),
+        # Universe resolution — bypasses all Supabase + Tradier calls in lifespan
+        mock.patch("main._resolve_startup_universe", side_effect=_resolve_startup_universe_stub),
+        # Symbol registry I/O — build() and refresh_loop() make real Tradier calls
+        mock.patch(
+            "services.symbol_registry.SymbolRegistry.build",
+            side_effect=_async_noop_zero,
+        ),
+        mock.patch(
+            "services.symbol_registry.SymbolRegistry.refresh_loop",
+            side_effect=_async_noop,
+        ),
+        mock.patch(
+            "services.symbol_registry.SymbolRegistry.load_from_db",
+            side_effect=_async_noop_zero,
+        ),
+        # Background tasks
+        mock.patch("services.tradier_stream.stream_options_flow", side_effect=_async_noop),
+        mock.patch("main._universe_refresh_loop", side_effect=_async_noop),
+        mock.patch("main._registry_prewarm_loop", side_effect=_async_noop),
+        mock.patch("services.flow_store.start_flow_writer", side_effect=_async_noop),
+        mock.patch("services.signal_store.start_signal_writer", side_effect=_async_noop),
     ):
         from main import app
         with TestClient(app, raise_server_exceptions=True) as c:
             yield c
-
-
-async def _async_noop(*_a, **_kw):
-    """Async no-op used to stub out the Tradier stream task."""
-    import asyncio
-    await asyncio.sleep(0)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -154,7 +187,7 @@ def test_cors_headers_on_register_response(client):
         json={"email": _unique_email(), "password": "Secure123!"},
         headers={"Origin": ORIGIN},
     )
-    # TestClient with allowed_origins=["*"] will echo back the header
+    # TestClient with allowed_origins=[\"*\"] will echo back the header
     assert r.status_code == 201
     # The response body must be valid JSON (not an empty CORS rejection)
     assert r.json().get("message") == "Account created successfully"
