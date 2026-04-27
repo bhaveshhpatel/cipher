@@ -84,6 +84,17 @@ Fix (C-002) — Persist Gate:
     ticks that are part of a qualifying episode (>=3 trades, >=$50K premium)
     are written to flow_events. Sub-threshold ticks return early with no DB write.
 
+Fix (C-003) — Retroactive Sweep Upgrade:
+  - When the canonical print was already written to flow_events as 'BTO',
+    subsequent duplicate ticks from MIAX/PHLX confirming sweep threshold
+    (3+ exchanges) were silently dropped. The DB row stayed as 'BTO' forever.
+  - Fix: on the DUPLICATE path, call get_exchange_count() after dedup returns
+    True. If count == sweep_min_exchanges exactly (threshold just crossed),
+    fire upgrade_to_sweep_in_db() as a background asyncio.create_task().
+    This issues a PATCH to flow_events retroactively setting trade_type='SWEEP'.
+    The count==sweep_min guard prevents repeated UPDATE calls for 4th, 5th
+    exchange echoes.
+
 B-008 — Stream Health:
   - _stats gains last_tick_at (float epoch, updated on every classified tick)
     and last_reconnect_at (float epoch, updated on every reconnect attempt).
@@ -126,7 +137,7 @@ import httpx
 from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
-from services.flow_store import persist_flow_event
+from services.flow_store import persist_flow_event, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
 from utils.dedup import flow_dedup   # C-019: Layer 4 dedup now active
@@ -263,11 +274,8 @@ async def stream_options_flow(symbols: list[str]):
     if not settings.TRADIER_API_KEY:
         log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
         _stats["mode"] = "idle"
-        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
-        # await _demo_mode(symbols)
         return
 
-    # Build OCC symbol registry from ticker watchlist
     from services.symbol_registry import init_registry
     from services.stream_manager import StreamManager
 
@@ -279,8 +287,6 @@ async def stream_options_flow(symbols: list[str]):
     except Exception as e:
         log.error(f"[stream] OCC registry build failed: {e} — stream idle. Use admin panel to start demo engine.")
         _stats["mode"] = "idle"
-        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
-        # await _demo_mode(symbols)
         return
 
     _stats["active_symbols"] = occ_count
@@ -288,23 +294,17 @@ async def stream_options_flow(symbols: list[str]):
     if occ_count == 0:
         log.warning("[stream] OCC registry is empty — stream idle. Use admin panel to start demo engine.")
         _stats["mode"] = "idle"
-        # --- DEMO FALLBACK DISABLED — uncomment to re-enable ---
-        # await _demo_mode(symbols)
         return
 
     log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
     _stats["mode"] = "live"
 
-    # Start background 30-min registry refresh
     asyncio.create_task(registry.refresh_loop())
 
-    # StreamManager handles all parallel workers + queue consumer
     manager = StreamManager(registry=registry, process_fn=_process_trade)
     await manager.run()
 
 
-# B4-001: alias so tests that patch/call tradier_stream.start_stream([...]) resolve
-# correctly. main.py lifespan continues to call stream_options_flow() directly.
 start_stream = stream_options_flow
 
 
@@ -330,49 +330,16 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
-    Tradier wraps every timesale event in an envelope:
-      {"type": "timesale", "timesale": { ...option fields... }}
-
-    The inner payload has:
-      symbol   = full OCC string e.g. "ACGL  260516P00095000"
-      last     = option fill price  (NOTE: field is "last" not "price")
-      bid      = option bid
-      ask      = option ask
-      size     = contract count
-      exch     = exchange code e.g. 'C' (CBOE), 'M' (MIAX), 'Q' (NASDAQ),
-                 'X' (PHLX), 'N' (NYSE), 'B' (BATO)
-      date     = epoch ms timestamp
-
-    Exchange field fallback (C-019):
-      Real Tradier feed uses "exch". Demo engine uses "exchange" for
-      human readability. We read "exch" first, fall back to "exchange".
-      This ensures sweep detection works correctly for both paths.
-
-    Layer 4 dedup (C-019 + C-020):
-      flow_dedup.is_duplicate() is called before any DB write or accumulator
-      ingest. Events arriving from slower exchanges (MIAX, PHLX) within 5s of
-      the canonical CBOE print are silently dropped. If 3+ distinct exchanges
-      report the same trade within 8s, trade_type is upgraded to SWEEP and
-      exchange_count is set to the real unique-exchange count.
-
-      C-020: arrival_ts uses _time.time() (wall-clock epoch) so it is in the
-      same numeric space as DedupCache._seen entries (also time.time()). Using
-      _time.monotonic() caused TTL comparisons to always be negative, making
-      cache entries permanent and blocking all re-prints of the same contract.
-
-    C-002 — Persist Gate:
-      persist_flow_event() is called AFTER accumulator.ingest() so that only
-      ticks belonging to a qualifying episode (>=3 trades, >=$50K premium)
-      are written to the flow_events table. Sub-threshold noise returns early
-      with no DB write.
-
-    B-008:
-      last_tick_at is updated on every classified (non-deduped) tick so
-      /health/stream can report stream liveness.
+    C-003 — Retroactive Sweep Upgrade:
+      On the DUPLICATE path (is_duplicate=True), call get_exchange_count().
+      If the count equals sweep_min_exchanges exactly (default 3), this is
+      the tick that just pushed the exchange count over the sweep threshold
+      for the first time. Fire upgrade_to_sweep_in_db() as a background
+      task so the canonical row already in DB gets patched to trade_type='SWEEP'.
+      The count==3 guard prevents repeated UPDATE calls on 4th+ exchange echoes.
     """
     _stats["ticks"] += 1
 
-    # Unwrap Tradier event envelope
     event_type = raw.get("type", "")
 
     if event_type in _PROCESSABLE_TYPES and event_type in raw:
@@ -380,10 +347,8 @@ async def _process_trade(raw: dict):
         if not isinstance(trade_payload, dict):
             return
     elif event_type in _PROCESSABLE_TYPES:
-        # Flat format — pass through directly
         trade_payload = raw
     else:
-        # Ignore summary, quote, trade (equity) and any other non-timesale events
         return
 
     ev = parse_tradier_trade(trade_payload)
@@ -395,10 +360,6 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
-    # C-020: must use time.time() (wall-clock) — DedupCache stores first_seen
-    # as time.time() and the TTL check is (now - first_seen) < ttl.
-    # Using monotonic() here caused (small_float - epoch) to always be a large
-    # negative, so the TTL check was always True and entries never expired.
     arrival_ts = _time.time()
 
     if flow_dedup.is_duplicate(
@@ -413,9 +374,32 @@ async def _process_trade(raw: dict):
             f"[dedup] dropped duplicate: {occ_symbol} size={ev.size} "
             f"fill={ev.fill_price} exch={exchange}"
         )
+
+        # ------------------------------------------------------------------
+        # C-003: Retroactive sweep upgrade.
+        # Check if THIS duplicate tick is the one that just crossed the sweep
+        # threshold (exchange_count transitions to exactly sweep_min_exchanges).
+        # Fire an async DB UPDATE to patch the canonical row from 'BTO' -> 'SWEEP'.
+        # count > sweep_min on 4th/5th echoes — guard prevents duplicate UPDATEs.
+        # ------------------------------------------------------------------
+        exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
+        if exch_count == flow_dedup._sweep_min:
+            log.info(
+                f"[sweep] threshold just crossed — retroactive upgrade: "
+                f"{occ_symbol} size={ev.size} fill={ev.fill_price} "
+                f"exchanges={exch_count}"
+            )
+            asyncio.create_task(
+                upgrade_to_sweep_in_db(
+                    occ_symbol=occ_symbol,
+                    fill_price=ev.fill_price,
+                    size=ev.size,
+                )
+            )
+
         return
 
-    # Canonical print — check for sweep upgrade
+    # Canonical print — check for sweep upgrade (pattern already established)
     if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
         real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if ev.trade_type != "SWEEP":
@@ -428,7 +412,7 @@ async def _process_trade(raw: dict):
     # ------------------------------------------------------------------
 
     _stats["classified"] += 1
-    _stats["last_tick_at"] = _time.time()   # B-008: record wall-clock time of last classified tick
+    _stats["last_tick_at"] = _time.time()
 
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
@@ -442,11 +426,7 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
-    # ------------------------------------------------------------------
-    # C-002: Gate DB write on accumulator threshold.
-    # ingest() first — if episode does not qualify, return with no DB write.
-    # Only ticks that are part of a qualifying episode reach persist_flow_event.
-    # ------------------------------------------------------------------
+    # C-002: Gate DB write on accumulator threshold
     ep = accumulator.ingest(ev)
     if not ep:
         return
@@ -550,9 +530,6 @@ async def _process_trade(raw: dict):
 
 # ---------------------------------------------------------------------------
 # Demo mode — DISABLED as automatic fallback (2026-04-25)
-# Kept here for future use. To re-enable, uncomment the call sites above
-# in stream_options_flow() and remove the "return" statements that follow.
-# The admin panel (/admin) is the preferred way to run demo data.
 # ---------------------------------------------------------------------------
 async def _demo_mode_once(symbols: list[str]):
     import datetime as dt
@@ -595,7 +572,7 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["ticks"]      += 1
             _stats["classified"] += 1
             _stats["signals"]    += 1
-            _stats["last_tick_at"] = _time.time()  # B-008
+            _stats["last_tick_at"] = _time.time()
             await bus.publish_all(signal)
 
             composite_score = round(rng.uniform(0.40, 0.95), 3)
@@ -627,7 +604,6 @@ async def _demo_mode_once(symbols: list[str]):
             }
             await bus.publish_all(composite_msg)
 
-            # suppress unused variable warnings for demo-only locals
             _ = (bid, ask, size, dte)
     except asyncio.CancelledError:
         log.info("Demo mode cancelled — live stream connection established")

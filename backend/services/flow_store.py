@@ -27,6 +27,13 @@ IMPORTANT — Key selection:
   inserts. The anon/public key (SUPABASE_KEY) respects RLS and will
   cause every insert to fail with a 42501 policy violation. Never use
   the anon key for backend DB writes.
+
+C-003 — Sweep Retroactive Upgrade:
+  upgrade_to_sweep_in_db(occ_symbol, fill_price, size) issues a targeted
+  PATCH (UPDATE) to flow_events setting trade_type='SWEEP' for rows that
+  were written as 'BTO' before the sweep threshold was confirmed. Called
+  from _process_trade() via asyncio.create_task() so it does not block
+  the stream hot path.
 """
 import asyncio
 import logging
@@ -172,6 +179,64 @@ async def persist_flow_event(ev_dict: dict):
             log.info(f"[flow_store] early flush ({_FLUSH_MAX_ROWS} rows) -- buffer hit max")
 
 
+async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
+    """
+    C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
+
+    Called via asyncio.create_task() from _process_trade() when the 3rd
+    unique exchange for a (occ_symbol, size, fill) key arrives as a
+    duplicate tick — meaning the canonical row was already written with
+    trade_type='BTO' before the sweep was confirmed.
+
+    Issues a PATCH (UPDATE) against the Supabase REST API targeting:
+      - occ_symbol  = exact OCC string
+      - fill_price  = exact fill (matches the canonical row)
+      - size        = exact contract count
+      - trade_type  != 'SWEEP'  (idempotent guard — skip already-upgraded rows)
+      - created_at  > NOW() - INTERVAL '30 seconds'  (safety window — avoids
+                    mutating old unrelated rows with same contract params)
+
+    Returns True on success, False on any error. Errors are logged but
+    never propagate — sweep upgrade is best-effort.
+    """
+    if not _is_configured():
+        log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
+        return False
+
+    url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_events"
+        f"?occ_symbol=eq.{occ_symbol}"
+        f"&fill_price=eq.{fill_price}"
+        f"&size=eq.{size}"
+        f"&trade_type=neq.SWEEP"
+        f"&created_at=gte.now()-interval%2030%20seconds"
+    )
+    headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+    payload = {"trade_type": "SWEEP"}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(url, headers=headers, json=payload)
+        if resp.status_code in (200, 204):
+            log.info(
+                f"[flow_store] sweep upgrade applied: {occ_symbol} "
+                f"fill={fill_price} size={size}"
+            )
+            return True
+        log.warning(
+            f"[flow_store] sweep upgrade failed: {resp.status_code} -- {resp.text[:200]}"
+        )
+        return False
+    except Exception as e:
+        log.error(f"[flow_store] upgrade_to_sweep_in_db exception: {e}")
+        return False
+
+
 async def persist_flow_episode(signal_data: dict):
     expiry = signal_data.get("expiry") or None
 
@@ -246,75 +311,47 @@ async def start_flow_writer():
 
 # ---------------------------------------------------------------------------
 # FlowStore — in-memory store for unit / regression tests.
-#
-# The module-level functions above handle production DB persistence via
-# Supabase. FlowStore provides a lightweight synchronous interface for
-# tests that need to add, query, and inspect flow events without any
-# external dependencies.
 # ---------------------------------------------------------------------------
 
 class FlowStore:
-    """In-memory store for options flow events.
-
-    Intended for testing and local introspection only. Not used by the
-    live DB writer path.
-    """
+    """In-memory store for options flow events."""
 
     def __init__(self) -> None:
         self._flows: List[Any] = []
         self._stats: Dict[str, Any] = {"total": 0}
 
     def add_flow(self, flow: Any) -> None:
-        """Append a flow event object or dict to the store."""
         self._flows.append(flow)
         self._stats["total"] = len(self._flows)
 
     def get_flows(self) -> List[Any]:
-        """Return all stored flow events."""
         return list(self._flows)
 
     def get_flows_by_symbol(self, symbol: str) -> List[Any]:
-        """Return flow events whose .symbol attribute matches *symbol*."""
         return [
             f for f in self._flows
             if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
         ]
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return a stats snapshot dict."""
         return dict(self._stats)
 
     def clear(self) -> None:
-        """Remove all stored events and reset stats."""
         self._flows.clear()
         self._stats = {"total": 0}
 
     def size(self) -> int:
-        """Return the number of stored flow events."""
         return len(self._flows)
 
-
-# ---------------------------------------------------------------------------
-# Module-level in-memory async API — used by Layer5/E2E regression tests.
-#
-# Tests call:  await fs.add_flow(...)  /  await fs.get_flows(ticker)  /
-#              await fs.clear_flows()
-# on the module directly (import services.flow_store as fs).
-#
-# This singleton is intentionally separate from the Supabase DB writer path
-# so tests never touch the network.
-# ---------------------------------------------------------------------------
 
 _store = FlowStore()
 
 
 async def add_flow(flow: dict) -> None:
-    """Append *flow* to the module-level in-memory store."""
     _store.add_flow(flow)
 
 
 async def get_flows(ticker: str) -> List[dict]:
-    """Return all in-memory flow events whose 'ticker' key matches *ticker*."""
     return [
         f for f in _store.get_flows()
         if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
@@ -322,5 +359,4 @@ async def get_flows(ticker: str) -> List[dict]:
 
 
 async def clear_flows() -> None:
-    """Clear the module-level in-memory store. Called between tests."""
     _store.clear()
