@@ -1,12 +1,12 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-26 (registry prewarm loop, CORS allow_origin_regex, lifespan task inventory, dedup C-019 TTL corrections, health/stats aliases, OI stamp pipeline)
+> Last updated: 2026-04-27 (SwarmEngine per-tick removal, demo-mode disable, 4-tuple startup universe, DB chain fast-seed, bus channel corrections, flow_store/signal_store accuracy pass)
 
 ---
 
 ## Overview
 
-Cipher is an institutional options flow intelligence platform. It monitors live Tradier WebSocket streams across a tier-filtered OCC symbol universe, classifies each trade tick through a 6-layer pipeline, detects repetition patterns, runs a multi-agent AI swarm, and surfaces high-conviction signals to the frontend via WebSocket — persisting all signals to Supabase for historical querying.
+Cipher is an institutional options flow intelligence platform. It monitors live Tradier WebSocket streams across a tier-filtered OCC symbol universe, classifies each trade tick through a 6-layer pipeline, detects repetition patterns, runs a composite signal engine, and surfaces high-conviction signals to the frontend via WebSocket — persisting all events and signals to Supabase for historical querying.
 
 At runtime, the active stream worker count is derived from the registry size and Tradier's ~500-symbol-per-session cap. In practice this is typically 20–40 workers, with cold-start session establishment deliberately spread out to avoid Tradier session-endpoint rate bursts.
 
@@ -25,6 +25,12 @@ At runtime, the active stream worker count is derived from the registry size and
 │  No regex, no API call, no per-tick latency.                     │
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).             │
 │  On expiry days: refreshes every 15 min.                         │
+│                                                                  │
+│  DB chain fast-seed (lifespan, on DB-hit path):                  │
+│  registry.load_from_db(snapshot_id) pre-loads OCC contracts      │
+│  from the chain_store DB cache before the full build runs.       │
+│  Allows lookup() to work immediately on restart without waiting  │
+│  for a full Tradier chain fetch.                                 │
 │                                                                  │
 │  Pre-warm loop (_registry_prewarm_loop in main.py):              │
 │  Fires every weekday at 9:15 AM ET (15 min before market open).  │
@@ -46,9 +52,20 @@ At runtime, the active stream worker count is derived from the registry size and
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
-│  Layer 2 — Stream Manager  (services/stream_manager.py)          │
+│  Layer 2 — Stream Ingestion                                      │
+│    Entry:   services/tradier_stream.py (stream_options_flow)     │
+│    Workers: services/stream_manager.py + stream_worker.py        │
 │                                                                  │
-│  Streams the tier-filtered OCC symbol set produced by Layer 1.   │
+│  stream_options_flow() (tradier_stream.py):                      │
+│  - Builds the OCC SymbolRegistry (Layer 1) for the watchlist.    │
+│  - Instantiates StreamManager with the registry and hands off    │
+│    _process_trade as the per-event callback.                     │
+│  - Spawns registry.refresh_loop() as a background task.         │
+│  - If TRADIER_API_KEY is unset: enters idle mode. Auto demo      │
+│    fallback is DISABLED as of 2026-04-25 — use admin panel.      │
+│                                                                  │
+│  StreamManager (services/stream_manager.py):                     │
+│  Streams the tier-filtered OCC symbol set from Layer 1.          │
 │  Symbol count is dynamic (tier ATM/DTE params drive registry     │
 │  size). Tradier caps each connection at ~500 symbols; workers    │
 │  are spawned as ceil(registry.size() / 500) — typically 20–40.  │
@@ -86,8 +103,9 @@ At runtime, the active stream worker count is derived from the registry size and
 │  not "price".                                                    │
 │  fill_price = float(tick["last"] or tick.get("price") or mid)    │
 │  Also: size==0 guard, OCC regex expanded to {1,10} chars,        │
-│  synthetic bid/ask spread when bid=ask=0, registry enrichment    │
-│  overrides OCC-parsed fields with pre-validated chain metadata.  │
+│  synthetic bid/ask spread when bid=ask=0 (is_synthetic_quote     │
+│  tagged True), registry enrichment overrides OCC-parsed fields   │
+│  with pre-validated chain metadata.                              │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -117,6 +135,15 @@ At runtime, the active stream worker count is derived from the registry size and
 │  Sweep: 3+ unique exchanges within 8s → trade_type = SWEEP       │
 │  Module-level singleton: flow_dedup (TTL=5s, sweep_win=8s)       │
 │  Observability: dedup_stats() exposed via /health endpoint       │
+│                                                                  │
+│  C-003 — Retroactive sweep upgrade:                              │
+│  On the duplicate path, if exchange_count just reached           │
+│  sweep_min_exchanges (3), asyncio.create_task() fires            │
+│  upgrade_to_sweep_in_db() — a targeted PATCH to flow_events      │
+│  that retroactively sets trade_type='SWEEP' on the canonical     │
+│  row, which was written as 'BTO' before the sweep was confirmed. │
+│  Double-dispatch guard: _sweep_upgrade_dispatched set ensures    │
+│  only one task fires per (occ, size, fill) key.                  │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -125,7 +152,21 @@ At runtime, the active stream worker count is derived from the registry size and
 │  Never write one row at a time. Buffer events and flush to       │
 │  Supabase every 500ms OR 100 rows, whichever comes first.        │
 │  Estimated: ~62K filtered rows/day → ~744 batched flushes.       │
-│  Uses SUPABASE_SERVICE_KEY (bypasses RLS).                       │
+│  Uses SUPABASE_SERVICE_ROLE_KEY (bypasses RLS).                  │
+│  3-attempt retry with 1s delay on any flush failure.            │
+│                                                                  │
+│  flow_events writes (direct buffer path):                        │
+│  persist_flow_event() called from _process_trade() on every      │
+│  qualifying tick (above accumulator threshold). Appends to       │
+│  _flow_event_buffer; early-flushes when buffer hits 100 rows.    │
+│  The background _flush_flow_events() loop drains the buffer      │
+│  every 500ms.                                                    │
+│                                                                  │
+│  flow_episodes writes (bus path):                                │
+│  _bus_signal_listener() subscribes to the "db_writer" channel.   │
+│  On composite_signal messages only — one row per qualifying       │
+│  repetition episode that crossed the signal threshold.           │
+│  Written immediately (no buffering) via _insert_rows().          │
 │                                                                  │
 │  FIX (2026-04-24): _FLUSH_INTERVAL was set to 5s instead of      │
 │  500ms. At 62K rows/day that's ~430 rows buffered per flush.     │
@@ -140,12 +181,20 @@ At runtime, the active stream worker count is derived from the registry size and
 │  INSERT to subscribed frontend clients. Frontend subscribes to   │
 │  flow_episodes and signal_history channels.                      │
 │                                                                  │
+│  signal_history writes (signal_store.py):                        │
+│  _bus_signal_listener() subscribes to the "signal_writer" bus    │
+│  channel. On composite_signal messages, persist_composite_signal  │
+│  builds the full signal_history row (including swarm fields) and │
+│  inserts via REST with 3-attempt retry. In-memory fallback:      │
+│  _signal_memory deque(maxlen=1000) stores signals when Supabase  │
+│  is unreachable, preventing loss during transient outages.       │
+│                                                                  │
 │  TierEngine (services/tier_engine.py):                           │
 │    assign_tiers(symbols) → returns tier_map dict[str,int]        │
 │    and upserts tier + open_interest + average_volume onto        │
 │    options_universe_symbols.                                     │
 │    Thresholds loaded from tier_thresholds (is_active=true row)   │
-│    and cached for TIER_THRESHOLD_CACHE_TTL_S (default 300s).     │
+│    and cached for CACHE_TTL (default 300s).                      │
 │    Admin whitelist (TIER_ADMIN_WHITELIST env) forces symbols to  │
 │    Tier 1 regardless of metrics.                                 │
 │    Called by main.py lifespan after OI stamp and on each         │
@@ -175,24 +224,37 @@ Cold start is intentionally slower but materially safer. A fast burst that trips
 All tasks are created inside the `lifespan` async context manager and cancelled on shutdown.
 
 | Task variable | Coroutine | Purpose |
-|---------------|-----------|---------|
+|---------------|-----------|---------| 
 | `registry_refresh_task` | `registry.refresh_loop()` | Rebuilds OCC registry every `REGISTRY_REFRESH_MINS` (default 30 min), notifies `StreamManager` to diff/restart affected workers |
 | `prewarm_task` | `_registry_prewarm_loop()` | Rebuilds OCC registry at 9:15 AM ET every weekday — workers are warm before 9:30 market open |
 | `stream_task` | `stream_options_flow(stream_symbols)` | Main Tradier WebSocket pipeline (all 6 layers) |
-| `db_write_task` | `start_flow_writer()` | Batched Supabase writes — flush every 500ms or 100 rows |
-| `signal_write_task` | `start_signal_writer()` | Persists `CompositeSignal` rows to `signal_history` |
+| `db_write_task` | `start_flow_writer()` | Batched flow_events writes (500ms/100 rows) + flow_episodes via bus |
+| `signal_write_task` | `start_signal_writer()` | Persists `CompositeSignal` rows to `signal_history` via bus |
 | `refresh_task` | `_universe_refresh_loop()` | Full universe rebuild every 24 h — reloads symbols, re-runs OI stamp + tier assignment, updates DB snapshot |
 
 ### Startup Sequence (blocking)
 
+`_resolve_startup_universe()` returns a **4-tuple**: `(stream_symbols, tier_map, quotes, snapshot_id)`.
+
+**DB-hit path** (fresh snapshot ≤ 24h old):
+- Returns `(symbols, tier_map, [], snapshot_id)` — `quotes` is empty, no OI stamp needed.
+
+**Full-load path** (no fresh snapshot):
+- Calls `load_universe()` (CBOE + Tradier validate + screen) — quotes are NOT returned by `load_universe` itself.
+- Calls `_fetch_batch_quotes(symbols)` separately to obtain quotes for tier assignment.
+- Returns `(stream_symbols, tier_map, quotes, snapshot_id)` — `quotes` is populated.
+
 ```
 1. _resolve_startup_universe()      — fresh DB snapshot (max_age 24h) or full CBOE+Tradier load
 2. init_registry(watchlist, tier_map) — Layer 1 init
-3. registry.build()                 — first OCC contract build (blocks lifespan until complete)
-4. _stamp_oi(quotes, oi_map)        — stamps open_interest on quote objects from registry
-5. assign_tiers(quotes)             — OI-informed tier assignment (T1/T2/T3)
-6. registry.set_tier_map(tier_map)  — final tier map wired into registry
-7. universe_store.upsert_symbol_quotes() — open_interest + tier written to DB
+3. registry.load_from_db(snapshot_id) — fast-seed OCC contracts from DB chain cache (DB-hit path only)
+4. registry.build()                 — first full OCC contract build (blocks lifespan until complete)
+5. _stamp_oi(quotes, oi_map)        — stamps open_interest on quote objects from registry
+                                      (full-load path only; skipped when quotes=[])
+6. assign_tiers(quotes)             — OI-informed tier assignment (T1/T2/T3)
+                                      (full-load path only; skipped when quotes=[])
+7. registry.set_tier_map(tier_map)  — final tier map wired into registry
+8. universe_store.upsert_symbol_quotes() — open_interest + tier written to DB
 ```
 After the blocking sequence, all 6 background tasks are spawned.
 
@@ -228,23 +290,24 @@ CORS allow_origin_regex: <pattern>
 │  main.py (FastAPI lifespan)                                     │
 │    │                                                            │
 │    │  BLOCKING STARTUP SEQUENCE                                 │
-│    ├── _resolve_startup_universe()   fresh snapshot or full load │
-│    ├── init_registry()              Layer 1 init                │
-│    ├── registry.build()             first OCC contract build    │
-│    ├── _stamp_oi(quotes, oi_map)    open_interest → quotes      │
-│    ├── assign_tiers(quotes)         OI-informed T1/T2/T3        │
-│    ├── registry.set_tier_map()      wire final tier map         │
-│    └── universe_store.upsert_symbol_quotes()  OI+tier → DB      │
+│    ├── _resolve_startup_universe()    4-tuple: symbols/tier_map/quotes/snapshot_id  │
+│    ├── init_registry()               Layer 1 init              │
+│    ├── registry.load_from_db()       DB chain fast-seed (DB-hit path only)  │
+│    ├── registry.build()              first OCC contract build  │
+│    ├── _stamp_oi(quotes, oi_map)     open_interest → quotes (full-load only) │
+│    ├── assign_tiers(quotes)          OI-informed T1/T2/T3 (full-load only)  │
+│    ├── registry.set_tier_map()       wire final tier map       │
+│    └── universe_store.upsert_symbol_quotes()  OI+tier → DB     │
 │                                                                 │
 │    BACKGROUND TASKS (asyncio)                                   │
 │    ├── registry.refresh_loop()      rebuild OCC every 30 min   │
-│    ├── _registry_prewarm_loop()     rebuild at 9:15 AM ET daily │
+│    ├── _registry_prewarm_loop()     rebuild at 9:15 AM ET daily│
 │    ├── stream_options_flow()        Tradier WS pipeline         │
 │    ├── start_flow_writer()          batched DB writes (L5)      │
-│    ├── start_signal_writer()        signal_history writes       │
+│    ├── start_signal_writer()        signal_history writes (L6)  │
 │    └── _universe_refresh_loop()     full universe refresh 24h   │
 │                                                                 │
-│  Stream Pipeline (per tick)                                     │
+│  Stream Pipeline (per tick — tradier_stream._process_trade)     │
 │    ├── SymbolRegistry (Layer 1)  services/symbol_registry.py    │
 │    │     ├── O(1) OCC lookup                                    │
 │    │     ├── tier_map from tier_thresholds DB (cached 300s)     │
@@ -253,27 +316,35 @@ CORS allow_origin_regex: <pattern>
 │    │     └── ceil(registry.size()/500) workers                  │
 │    │           ├── cold-start stagger: i×200ms (B-021)          │
 │    │           ├── get_session_token() semaphore=3 (B-022)      │
-│    │           ├── 429 Retry-After sleep/retry (B-023)          │
-│    │           ├── parse_tradier_trade()  Layer 3               │
-│    │           │     ├── fill_price: tick["last"] (not "price") │
-│    │           │     ├── size==0 guard → skip                   │
-│    │           │     └── OCC regex {1,10} + synthetic spread    │
-│    │           ├── DedupCache.is_duplicate()  Layer 4  C-019    │
-│    │           │     ├── TTL=5s key=(occ_symbol, size, fill_1dp)│
-│    │           │     ├── "exch"/"exchange" fallback             │
-│    │           │     ├── is_sweep() → 3+ exchanges within 8s    │
-│    │           │     └── → trade_type=SWEEP + exchange_count    │
-│    │           ├── RepetitionAccumulator                         │
-│    │           │     └── episode when ≥3 trades / ≥$50K prem   │
-│    │           ├── build_composite()                             │
-│    │           │     └── flow×0.55 + backtest×0.35 + vol×0.10   │
-│    │           ├── SwarmEngine  (12 Groq agents)  Phase 5A      │
-│    │           └── bus.publish_all()  core/async_bus.py         │
-│    │                      │                                      │
-│    │              AsyncEventBus (in-memory fan-out)             │
-│    │                ├── "signals"       → ws.py → WS clients    │
-│    │                ├── "db_writer"     → flow_store.py (L5)    │
-│    │                └── "signal_writer" → signal_store.py       │
+│    │           └── 429 Retry-After sleep/retry (B-023)          │
+│    ├── parse_tradier_trade()  Layer 3  (parsers/options_flow_parser.py)  │
+│    │     ├── fill_price: tick["last"] (not "price")             │
+│    │     ├── size==0 guard → skip                               │
+│    │     ├── OCC regex {1,10} + synthetic spread                │
+│    │     └── is_synthetic_quote tagged when bid=ask=0           │
+│    ├── DedupCache.is_duplicate()  Layer 4  C-019 (utils/dedup.py) │
+│    │     ├── TTL=5s key=(occ_symbol, size, fill_1dp)            │
+│    │     ├── "exch"/"exchange" fallback                         │
+│    │     ├── is_sweep() → 3+ exchanges within 8s               │
+│    │     ├── → trade_type=SWEEP + exchange_count                │
+│    │     └── C-003: retroactive upgrade_to_sweep_in_db()        │
+│    ├── RepetitionAccumulator  (signals/repetition_accumulator.py) │
+│    │     ├── ingest_tick() → persist_ep (above threshold?)      │
+│    │     ├── get_signal() → sig_ep (cooldown passed?)           │
+│    │     └── episode when ≥3 trades / ≥$50K premium            │
+│    ├── persist_flow_event()  Layer 5  (services/flow_store.py)  │
+│    │     └── buffered write to flow_events (called on persist_ep)│
+│    └── build_composite()  (signals/composite_signal_engine.py)  │
+│          ├── flow×0.55 + backtest×0.35 + vol×0.10               │
+│          └── bus.publish_all() on sig_ep only (cooldown gate)   │
+│                                                                 │
+│                AsyncEventBus (in-memory fan-out)                │
+│                  core/async_bus.py                              │
+│                  ├── "signals"       → ws.py → WS clients       │
+│                  ├── "db_writer"     → flow_store._bus_signal_listener()  │
+│                  │     └── persist_flow_episode() on composite_signal │
+│                  └── "signal_writer" → signal_store._bus_signal_listener()  │
+│                        └── persist_composite_signal() on composite_signal │
 │                                                                 │
 │  FastAPI Routers                                                │
 │    ├── /api/auth                  auth.py                       │
@@ -315,7 +386,7 @@ CORS allow_origin_regex: <pattern>
 
 ---
 
-## Backend Signal Pipeline — Phase 5A
+## Backend Signal Pipeline — Full Per-Tick Flow
 
 ```text
 Tradier stream worker cold start (Layer 2 — StreamManager)
@@ -328,7 +399,9 @@ Tradier stream worker cold start (Layer 2 — StreamManager)
        ├── POST /markets/events/session
        ├── HTTP 429 → read Retry-After (default 10s) → sleep → retry
        └── success → release semaphore
-  → connect streaming session
+  → connect streaming session (filter=timesale)
+  → _process_trade(raw) in tradier_stream.py
+       ├── unwrap envelope: raw["timesale"] payload
   → parse_tradier_trade()                           Layer 3
        ├── fill_price = tick["last"] or tick.get("price") or mid
        ├── size==0 guard → return None (skip)
@@ -340,30 +413,50 @@ Tradier stream worker cold start (Layer 2 — StreamManager)
        ├── TTL: 5s — covers PHLX/MIAX worst-case lag
        ├── NO time-bucket (int(ts//2) bug eliminated)
        ├── exchange: trade_payload["exch"] or ["exchange"]
-       ├── duplicate (same trade, slower exchange) → DROP
+       ├── arrival_ts: time.time() (wall-clock — C-020 fix)
+       ├── duplicate (same trade, slower exchange):
+       │     _stats["deduped"] += 1
+       │     C-003: if exch_count == sweep_min → create_task(upgrade_to_sweep_in_db())
+       │     return (no persist, no accumulator)
        ├── canonical → check is_sweep()
-       └── 3+ unique exchanges within 8s → trade_type = SWEEP
-  → RepetitionAccumulator.ingest()
-       └── RepetitionEpisode when trades ≥ 3 AND premium ≥ $50K
-  → build_composite(ep, accumulator)
+       └── 3+ unique exchanges within 8s → trade_type = SWEEP + exchange_count
+  → RepetitionAccumulator                           C-007 / C-008
+       ├── persist_ep = await accumulator.ingest_tick(ev)
+       │     above threshold (≥3 trades AND ≥$50K premium)?
+       │     episode evicted when event list empties (memory bounds)
+       └── sig_ep = await accumulator.get_signal(ts, persist_ep)
+             cooldown gate: 5-minute minimum between signals per episode
+  → persist_flow_event()                            Layer 5 (C-008)
+       ├── called on persist_ep (every qualifying tick — no cooldown)
+       ├── appends to _flow_event_buffer
+       ├── early-flush if buffer ≥ 100 rows
+       └── background _flush_flow_events() drains every 500ms (3-retry)
+  → build_composite(sig_ep, accumulator)            (called only when sig_ep is not None)
        ├── compute_flow_score()              × 0.55
        │     premium (capped $10M) + acceleration + trade count
        ├── get_backtest_score()              × 0.35
        │     historical win-rate by ticker/type/DTE/tier
        └── volume_weighted_premium_factor()  × 0.10
              total_premium / (OI × 100), capped 0–1, 0.5 if OI absent
-  → SwarmEngine.run()                                  Phase 5A
-       └── 3/6/9/12 Groq agents → majority vote → EnsembleResult
-  → CompositeSignal { recommendation, composite_score,
-                      swarm_direction, swarm_confidence,
-                      swarm_agents JSONB, bull/bear/hold votes }
-  → bus.publish_all()
-       ├── "signals"       → WebSocket clients (ws.py)
-       ├── "db_writer"     → flow_store.py → flow_episodes + flow_events  (Layer 5)
-       └── "signal_writer" → signal_store.py → signal_history
+  → bus.publish_all()  (only when sig_ep passes cooldown gate)
+       ├── "signal" message      → "signals" channel → ws.py → WebSocket clients
+       └── "composite_signal" message → fan-out:
+             ├── "db_writer" channel → flow_store._bus_signal_listener()
+             │     → persist_flow_episode() → flow_episodes row
+             └── "signal_writer" channel → signal_store._bus_signal_listener()
+                   → persist_composite_signal() → signal_history row
+                     (swarm fields written if present; null when swarm not invoked)
+
+NOTE — SwarmEngine (services/swarm_engine.py):
+  The Groq-backed AI swarm is NOT called automatically per tick.
+  It is available as a standalone service callable from routers or
+  simulation endpoints. signal_history rows have swarm_* fields
+  (direction, confidence, votes, agents JSONB) which are populated
+  only when persist_composite_signal() receives a signal dict that
+  includes swarm results from an explicit swarm run.
 ```
 
-### Composite Score Weights (Phase 3+)
+### Composite Score Weights
 
 | Component | Weight | Source |
 |-----------|--------|--------|
@@ -375,17 +468,29 @@ Tradier stream worker cold start (Layer 2 — StreamManager)
 
 ---
 
+## Demo Mode — DISABLED as Automatic Fallback
+
+As of **2026-04-25**, `_demo_mode()` is no longer invoked automatically when the Tradier API key is missing or the live stream fails. The backend enters **idle mode** and logs a warning. To run synthetic demo signals, use the **admin panel** at `/admin`.
+
+The `_demo_mode_once()` and `_demo_mode()` functions are preserved in `tradier_stream.py` for future use and can be re-enabled by uncommenting the call sites in `stream_options_flow()`.
+
+---
+
 ## TierEngine — Feature 4A
 
 ### Tier Definitions
 
-| Tier | Label | Min Avg Volume | ATM Strike Range | Max DTE |
-|------|-------|---------------|-----------------|---------|
-| 1 | Liquid large-cap | ≥ 20M | ±20% | 90 |
-| 2 | Mid-cap | ≥ 2M | ±15% | 60 |
-| 3 | Standard (default) | ≥ 500K | ±10% | 30 |
+| Tier | Label | Min Avg Volume | Min Last Price | Min OI | ATM Strike Range | Max DTE |
+|------|-------|---------------|---------------|--------|-----------------|---------|
+| 1 | Liquid large-cap | ≥ 20M | ≥ $10.00 | ≥ 1,000 | ±20% | 90 |
+| 2 | Mid-cap | ≥ 2M | ≥ $10.00 | ≥ 500 | ±15% | 60 |
+| 3 | Standard (default) | ≥ 500K | ≥ $1.00 | ≥ 100 | ±10% | 30 |
 
 Thresholds are stored in `tier_thresholds` (the `is_active = true` row) and cached for 300 seconds. Admins can update them live via `PATCH /admin/tier-thresholds` without redeployment.
+
+Two fallback layers in `tier_engine.py`:
+- `_fetch_thresholds()`: network-safe — catches `ConnectError` and returns `_DEFAULT_THRESHOLDS` silently.
+- `assign_tiers()`: if `_fetch_thresholds()` itself raises despite the inner try/except, falls back to `_SAFE_FALLBACK_THRESHOLDS` (T1/T2 min = ∞ → all symbols land T3).
 
 ### Admin Whitelist
 
@@ -402,10 +507,33 @@ Symbols in `TIER_ADMIN_WHITELIST` env var (default: SPY, QQQ, AAPL, TSLA, NVDA, 
 ### Admin endpoints
 
 | Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------|
+|----------|--------|------|---------| 
 | `/admin/tier-thresholds` | `GET` | Admin JWT | Read active threshold row |
 | `/admin/tier-thresholds` | `PATCH` | Admin JWT | Update thresholds live (no redeploy) |
 | `/admin/tier-distribution` | `GET` | Admin JWT | Count of symbols per tier |
+
+---
+
+## Stream Health Observability — `_stats` dict (`tradier_stream.py`)
+
+| Key | Type | Notes |
+|-----|------|-------|
+| `active_symbols` | int | OCC contract count (registry.size() after build) |
+| `ticks` | int | Total raw events received |
+| `classified` | int | Events that passed parse + dedup |
+| `deduped` | int | Events dropped by DedupCache |
+| `signals` | int | Episodes that crossed the signal cooldown gate |
+| `errors` | int | DB timeout / persist failures |
+| `composite_errors` | int | `build_composite()` failures — separate from DB errors |
+| `reconnects` | int | Stream reconnect attempts |
+| `mode` | str | `"starting"` / `"live"` / `"idle"` / `"demo"` |
+| `last_tick_at` | float | Wall-clock epoch of most recent classified tick |
+| `last_reconnect_at` | float | Wall-clock epoch of most recent reconnect |
+| `uptime_seconds` | float | Computed in `get_stats()` from `_stream_start_at` |
+| `dedup_cache_size` | int | From `flow_dedup.dedup_stats()` |
+| `sweep_candidates` | int | From `flow_dedup.dedup_stats()` |
+
+`get_stats()` merges `_stats` with `flow_dedup.dedup_stats()` and exposes at `GET /health/stream`.
 
 ---
 
@@ -423,6 +551,8 @@ Railway terminates idle TCP connections. The WS router runs a full ping/pong loo
 ---
 
 ## AI Swarm — Phase 5A
+
+The swarm engine is available but is **not called automatically** on every signal tick. It can be invoked explicitly from simulation or admin endpoints.
 
 | Setting | Value |
 |---------|-------|
@@ -471,6 +601,8 @@ CREATE TABLE signal_history (
 );
 ```
 
+`swarm_*` fields are nullable — populated only when a swarm run result is present in the `composite_signal` message.
+
 ---
 
 ## Smart Signals Endpoints
@@ -502,19 +634,25 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 
 ---
 
-## 6-Layer Gap Fixes (2026-04-24 / 2026-04-25 Audit)
+## 6-Layer Gap Fixes (Audit Log)
 
 | Layer | File | What Was Wrong | Fix |
 |-------|------|----------------|-----|
 | **L2 (2026-04-24)** | `tradier_stream.py` | `registry.refresh_loop()` rebuilt the registry every 30 min but never called `manager.refresh()`. Workers kept streaming stale OCC symbols. | Replaced with `_registry_refresh_with_manager_notify()` which calls `await manager.refresh()` after every rebuild. |
 | **L2 (B-021)** | `services/stream_worker.py` | Cold boot started all workers immediately, producing a synchronized burst of session-token fetches. | Added per-worker stagger: worker `i` waits `i × startup_delay_s` before first token fetch; default `startup_delay_s = 0.2s`. |
-| **L2 (B-022)** | `services/tradier_client.py` | Session token acquisition was unconstrained — many workers could hit `/markets/events/session` simultaneously. | Added a process-wide `asyncio.Semaphore(3)` around session-token fetches; max 3 concurrent requests. |
-| **L2 (B-023)** | `services/tradier_client.py` | HTTP 429 from Tradier was not handled — retries ignored provider backoff. | Added explicit 429 branch: read `Retry-After` (default 10s), sleep, then retry within same semaphore hold. |
+| **L2 (B-022)** | `services/stream_worker.py` | Session token acquisition was unconstrained — many workers could hit `/markets/events/session` simultaneously. | Added a process-wide `asyncio.Semaphore(3)` around session-token fetches; max 3 concurrent requests. |
+| **L2 (B-023)** | `services/stream_worker.py` | HTTP 429 from Tradier was not handled — retries ignored provider backoff. | Added explicit 429 branch: read `Retry-After` (default 10s), sleep, then retry within same semaphore hold. |
+| **L3 (C-015)** | `parsers/options_flow_parser.py` | Stream sends `"last"` as fill price, not `"price"`. Strike/expiry/bid/ask all parsed incorrectly. | `fill_price = tick["last"] or tick.get("price") or mid`. OCC regex broadened. Synthetic bid/ask when bid=ask=0. |
 | **L4 (orig)** | `tradier_stream.py` | `DedupCache` fully built and tested but **never imported or called** in `_process_trade()`. Every exchange copy wrote a DB row. | Added `from utils.dedup import flow_dedup` + `flow_dedup.is_duplicate()` gate before every `persist_flow_event()` call. |
 | **L4 (C-019)** | `utils/dedup.py` + `tradier_stream.py` | TTL=2s too tight for PHLX/MIAX lag. `int(ts//2)` bucket boundary bug. Fill key 2dp conflated ±$0.01 rounding. `exchange` never passed to `is_duplicate()` so sweep never fired. | TTL→5s, sweep window→8s. Pure first-seen TTL (no buckets). Fill key 1dp. `"exch"/"exchange"` fallback. `get_exchange_count()` + `dedup_stats()` added. |
-| **L5** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()`. |
+| **L4 (C-020)** | `tradier_stream.py` | `arrival_ts` used `time.monotonic()` but `DedupCache` stores `first_seen` as `time.time()`. TTL check `(now - first_seen) < 5.0` always evaluated `monotonic - wall_clock` ≈ large negative → always < 5.0 → cache entries never expired. Every re-print was permanently deduped. | `arrival_ts = _time.time()` — both sides of TTL comparison are now wall-clock epoch. |
+| **L4 (C-003)** | `tradier_stream.py` + `flow_store.py` | Canonical row written as `'BTO'`; subsequent duplicate exchange ticks confirming sweep (3+ exchanges) were dropped. DB row never upgraded to `'SWEEP'`. | On duplicate path: if `exch_count == sweep_min`, fire `create_task(upgrade_to_sweep_in_db())`. PATCH targets rows within 30s window. `_sweep_upgrade_dispatched` set prevents double-dispatch. |
+| **L5 (C-002)** | `tradier_stream.py` | `persist_flow_event()` was called before `accumulator.ingest()`, writing every dedup-passing tick to DB regardless of threshold. Sub-threshold retail noise polluted `flow_events`. | `persist_flow_event()` now called after `accumulator.ingest_tick()`. Only ticks above threshold (part of a qualifying episode) are written. |
+| **L5 (C-008)** | `tradier_stream.py` | With C-007 cooldown active, `ingest()` returned None during cooldown — `persist_flow_event()` was also suppressed. Ticks 4-N never wrote to `flow_events`, creating a backtesting gap. | Decoupled: `ingest_tick()` (persist gate, no cooldown) vs `get_signal()` (signal gate, 5-min cooldown) called independently. |
+| **L5 (flush)** | `flow_store.py` | `_FLUSH_INTERVAL = 5` (5 seconds). Spec says 500ms. ~430 rows buffered between flushes, risking data loss on crash. | `_FLUSH_INTERVAL = 0.5` (500ms) + `_FLUSH_MAX_ROWS = 100` early-flush triggered inside `persist_flow_event()`. |
 | **L6 (4A)** | `services/tier_engine.py` | `options_universe_symbols` had no tier column — every symbol defaulted to Tier 3. `backtest_score` tier was always 3. | Added `tier_engine.py` with dynamic threshold-driven assignment. `tier_thresholds` admin table (migration 011). Lifespan calls OI stamp + `assign_tiers()` at startup. |
 | **B-008** | `services/stream_worker.py` | `errors`, `reconnects`, `last_reconnect_at` in `_stats` were never updated — `/health/stream` always returned zeros. | Added `_inc_global_error()` / `_inc_global_reconnect()` helpers writing directly into `tradier_stream._stats` via lazy import. |
+| **startup** | `main.py` | `_resolve_startup_universe()` returned 3-tuple. Lifespan could not unpack `snapshot_id` for DB chain fast-seed. | Changed to 4-tuple `(stream_symbols, tier_map, quotes, snapshot_id)`. `load_from_db(snapshot_id)` called in lifespan before `registry.build()`. |
 
 ---
 
@@ -522,20 +660,20 @@ Single-ticker composite. Returns `volume_premium_factor`, `swarm_direction`, `sw
 
 | Table | Writer | Key Used | Notes |
 |-------|--------|----------|-------|
-| `flow_episodes` | `flow_store.py` | SERVICE_KEY | 82k+ rows, primary flow data |
-| `flow_events` | `flow_store.py` | SERVICE_KEY | Batched writes (500ms/100 rows); `expiry` nullable |
-| `signal_history` | `signal_store.py` | SERVICE_KEY | Composite signals + swarm fields (Phase 5A) |
+| `flow_episodes` | `flow_store._bus_signal_listener()` | SERVICE_KEY | One row per qualifying repetition episode; written on `composite_signal` bus event |
+| `flow_events` | `flow_store.persist_flow_event()` | SERVICE_KEY | Batched writes (500ms/100 rows, 3-retry); one row per qualifying tick; `expiry` nullable |
+| `signal_history` | `signal_store.persist_composite_signal()` | SERVICE_KEY | Composite signals + swarm fields (Phase 5A); in-memory deque fallback when DB unreachable |
 | `options_universe_symbols` | `universe_store.py` + `tier_engine.py` | ANON_KEY / SERVICE_KEY | Symbol quotes, stream_eligible, tier/OI/avg_vol (4A) |
 | `options_universe_snapshots` | `universe_store.py` | ANON_KEY | Universe snapshots |
 | `tier_thresholds` | admin endpoint | SERVICE_KEY | Single active row; cached 300s by TierEngine |
 
 ### Supabase Critical Rules
 
-1. **Always use `SUPABASE_SERVICE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
+1. **Always use `SUPABASE_SERVICE_ROLE_KEY`** for writes to `flow_episodes`, `flow_events`, `signal_history`, `tier_thresholds` — anon key fails with `42501` (RLS)
 2. **Never send `id` fields** — Postgres generates them server-side
 3. **No `.select()` after `.insert()`** in supabase-py v2
-4. **`flow_events` is empty** — live data is in `flow_episodes` (82k+ rows)
-5. **Env var is `SUPABASE_SERVICE_KEY`** in `config.py` — confirm the Railway variable name maps to this
+4. **`flow_events` is the per-tick table** — `flow_episodes` has one row per episode
+5. **Env var is `SUPABASE_SERVICE_ROLE_KEY`** in `config.py` — confirm the Railway variable name maps to this
 
 ---
 
