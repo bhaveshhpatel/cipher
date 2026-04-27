@@ -11,6 +11,7 @@ Covers:
  - stop() on a non-running manager does not raise
  - Multiple instances are independent
 """
+import asyncio
 import pytest
 from unittest.mock import MagicMock, patch
 from services.stream_manager import StreamManager
@@ -53,7 +54,7 @@ def test_stream_manager_status_has_running_key():
 def test_stream_manager_stop_when_not_running_does_not_raise():
     mgr = StreamManager()
     try:
-        mgr.stop()
+        asyncio.run(mgr.stop())
     except Exception as exc:
         pytest.fail(f"stop() raised unexpectedly: {exc}")
 

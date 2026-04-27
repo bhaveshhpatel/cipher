@@ -10,6 +10,7 @@ Covers:
  - stop() with mocked stream does not raise
  - patch-based start() call verification
 """
+import asyncio
 from unittest.mock import MagicMock, patch
 from services.stream_manager import StreamManager
 
@@ -45,7 +46,7 @@ def test_stream_manager_r3_stop_with_mock_stream():
     mgr = StreamManager()
     mgr._stream = MagicMock()
     try:
-        mgr.stop()
+        asyncio.run(mgr.stop())
     except Exception:
         pass  # stop() may be a no-op without a live stream; must not propagate unhandled
 
