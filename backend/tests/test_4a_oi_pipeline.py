@@ -77,9 +77,13 @@ class TestSymbolRegistryOiMap:
             oi_by_ticker[ticker] = 200
             registry[f"{ticker}250117C00100000"] = MagicMock()
 
+        prices      = {"AAPL": 180.0, "TSLA": 250.0}
+        raw_quotes  = {"AAPL": {"volume": 1000, "average_volume": 500},
+                       "TSLA": {"volume": 2000, "average_volume": 800}}
+
         reg = SymbolRegistry(watchlist=["AAPL", "TSLA"], tier_map={})
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
-                          AsyncMock(return_value={"AAPL": 180.0, "TSLA": 250.0})), \
+                          AsyncMock(return_value=(prices, raw_quotes))), \
              patch.object(SymbolRegistry, "_build_ticker", _fake_build_ticker):
             await reg.build()
 
@@ -93,9 +97,12 @@ class TestSymbolRegistryOiMap:
                                 registry, oi_by_ticker, tier_params):
             oi_by_ticker[ticker] = 0
 
+        prices     = {"HOOD": 15.0}
+        raw_quotes = {"HOOD": {"volume": 500, "average_volume": 300}}
+
         reg = SymbolRegistry(watchlist=["HOOD"], tier_map={})
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
-                          AsyncMock(return_value={"HOOD": 15.0})), \
+                          AsyncMock(return_value=(prices, raw_quotes))), \
              patch.object(SymbolRegistry, "_build_ticker", _no_contracts):
             await reg.build()
 
@@ -109,9 +116,12 @@ class TestSymbolRegistryOiMap:
                               registry, oi_by_ticker, tier_params):
             oi_by_ticker[ticker] = 500
 
+        prices     = {"SPY": 500.0}
+        raw_quotes = {"SPY": {"volume": 10000, "average_volume": 8000}}
+
         reg = SymbolRegistry(watchlist=["SPY"], tier_map={})
         with patch.object(SymbolRegistry, "_fetch_stock_prices",
-                          AsyncMock(return_value={"SPY": 500.0})), \
+                          AsyncMock(return_value=(prices, raw_quotes))), \
              patch.object(SymbolRegistry, "_build_ticker", _fake_build):
             await reg.build()
 

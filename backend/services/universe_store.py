@@ -34,6 +34,11 @@ Feature 4A-OI (2026-04-25):
   open_interest column (migration 010) is now written by upsert_symbol_quotes()
   with the avg chain OI value from registry.get_oi_map(), populated by main.py.
   This column is no longer NULL after the first full startup cycle.
+
+FIX (2026-04-27):
+  _load_symbols() now filters on stream_eligible=True so warm restarts
+  only pass the price/volume-filtered pool to the registry, not the full
+  ~5,270 raw CBOE dump.
 """
 import asyncio
 import logging
@@ -221,6 +226,7 @@ def _sync_load_tier_map() -> dict[str, int]:
             sb.table("options_universe_symbols")
             .select("symbol, tier")
             .eq("snapshot_id", snapshot_id)
+            .eq("stream_eligible", True)
             .execute()
         )
         # FIX: use r.get("tier") instead of r["tier"] so rows missing the
@@ -245,16 +251,23 @@ def _sync_load_tier_map() -> dict[str, int]:
 
 
 def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
+    """Load only stream-eligible symbols from the snapshot.
+
+    Filtering on stream_eligible=True ensures warm restarts pass the
+    price/volume-filtered pool (~1000-2000 symbols) to the registry
+    rather than the full ~5,270 raw CBOE dump.
+    """
     try:
         result = (
             sb.table("options_universe_symbols")
             .select("symbol")
             .eq("snapshot_id", snapshot_id)
+            .eq("stream_eligible", True)   # only load symbols that passed price/volume gate
             .execute()
         )
         rows    = result.data or []
         symbols = [r["symbol"] for r in rows if r.get("symbol")]
-        log.info("universe_store: loaded %d symbols from snapshot %s", len(symbols), snapshot_id)
+        log.info("universe_store: loaded %d stream-eligible symbols from snapshot %s", len(symbols), snapshot_id)
         return symbols if symbols else None
     except Exception as e:
         log.error("universe_store._load_symbols error snapshot=%s: %s", snapshot_id, e, exc_info=True)
