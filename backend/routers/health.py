@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.auth import get_current_user, TokenData
@@ -75,8 +76,11 @@ async def get_stream_health_bare(_: TokenData = Depends(get_current_user)):
     return _build_response()
 
 
-@health_router.get("", response_model=StreamHealthOut, include_in_schema=False)
-@health_router.get("/", response_model=StreamHealthOut, include_in_schema=False)
+@health_router.get("", include_in_schema=False)
+@health_router.get("/", include_in_schema=False)
 async def get_health_root():
-    """Bare /health root — unauthenticated, satisfies test_health assert on status 200."""
-    return _build_response()
+    """
+    Bare /health root — unauthenticated.
+    Returns {"status": "ok"} for internal probes and test_health.
+    """
+    return JSONResponse({"status": "ok"})

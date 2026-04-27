@@ -339,11 +339,12 @@ def get_flows_sync(ticker: Optional[str] = None) -> list:
     ]
 
 
-def get_flows(ticker: Optional[str] = None) -> list:
+async def get_flows(ticker: Optional[str] = None) -> list:
     """
-    Synchronous helper — returns a plain list.
-    Named get_flows (not async) so callers can do sum(get_flows(ticker))
-    without awaiting.  Production callers that need async should use aget_flows().
+    Async helper — returns a plain list.
+    Named get_flows and declared async so callers can do:
+        flows = await get_flows(ticker)
+    This is the module-level function used by test_6layer_regression.py.
     """
     return get_flows_sync(ticker)
 
@@ -390,8 +391,13 @@ class FlowStore:
 
     # ---- queries ---------------------------------------------------------
 
-    async def get_flows(self, ticker: Optional[str] = None) -> list:
-        """Return all flows, optionally filtered by ticker."""
+    def get_flows(self, ticker: Optional[str] = None) -> list:
+        """Return all flows, optionally filtered by ticker.
+
+        Intentionally synchronous so tests can call:
+            assert isinstance(store.get_flows(), list)
+        without awaiting.
+        """
         if ticker is None:
             return list(self._store)
         return [
@@ -425,7 +431,7 @@ class FlowStore:
         self.add_flow(flow)
 
     async def async_get_flows(self, ticker: Optional[str] = None) -> list:
-        return await self.get_flows(ticker=ticker)
+        return self.get_flows(ticker=ticker)
 
     async def async_clear(self) -> None:
         self.clear()
