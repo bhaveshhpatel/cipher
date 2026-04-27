@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from utils.tradier_client import get_expirations, get_option_chain, get_quotes_batch
+from services.symbols_loader import SymbolQuote
 
 log = logging.getLogger("symbol_registry")
 
@@ -150,7 +151,7 @@ class SymbolRegistry:
 
     async def build(
         self,
-        pre_fetched_quotes: Optional[dict[str, "SymbolQuote"]] = None,
+        pre_fetched_quotes: Optional[dict[str, SymbolQuote]] = None,
     ) -> int:
         """
         Build the OCC registry.
@@ -171,7 +172,6 @@ class SymbolRegistry:
         """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds, assign_tiers
-        from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
 

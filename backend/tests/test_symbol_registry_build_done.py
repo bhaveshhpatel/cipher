@@ -161,9 +161,11 @@ async def test_refresh_quotes_waits_for_build_before_oi_map():
 
     We verify this by:
     1. Patching get_registry() to return our registry (event NOT set yet)
-    2. Launching _refresh_quotes_in_background as a task
+    2. Replacing registry.build with a slow coroutine that sets _build_done
+       only after a deliberate delay — this prevents it from completing
+       before our 0.05 s assertion window
     3. Asserting get_oi_map() has NOT been called yet (build not done)
-    4. Setting the event (simulating build() completion)
+    4. Setting the event manually (simulating build() completion)
     5. Asserting get_oi_map() was eventually called
     """
     import main  # noqa: import after patch
@@ -180,8 +182,15 @@ async def test_refresh_quotes_waits_for_build_before_oi_map():
 
     fake_quotes = [MagicMock(symbol="AAPL", open_interest=0, stream_eligible=True)]
 
+    # Slow build: waits for the test to set _build_done manually rather than
+    # completing on its own — ensures wait_for_build() actually suspends.
+    async def _slow_build(*args, **kwargs):
+        await reg._build_done.wait()  # blocks until test sets the event
+        return 0
+
     with (
         patch("main.get_registry",        return_value=reg),
+        patch.object(reg, "build",         side_effect=_slow_build),
         patch("main._fetch_batch_quotes",  new=AsyncMock(return_value=fake_quotes)),
         patch("main.assign_tiers",         new=AsyncMock(return_value={"AAPL": 1})),
         patch("main.universe_store.upsert_symbol_quotes", new=AsyncMock()),

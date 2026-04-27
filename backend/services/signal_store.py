@@ -328,7 +328,7 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     ok  = await _insert_signal_with_retry(row)
     if ok:
         premium_fmt  = "${:,.0f}".format(row["premium"] or 0)
-        golden_tag   = " \u26a1 GOLDEN SWEEP" if row["is_golden_sweep"] else ""
+        golden_tag   = " ⚡ GOLDEN SWEEP" if row["is_golden_sweep"] else ""
         swarm_dir    = row["swarm_direction"] or "--"
         log.info(
             "[signal_store] DB INSERT OK | "

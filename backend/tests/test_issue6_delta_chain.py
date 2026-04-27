@@ -17,6 +17,10 @@ Fix applied here
 Seed `registry._oi_snapshot` with the same OI values used in the first
 build so that the delta build can compute a real drift ratio.  Only then
 can the "below threshold" tests correctly observe chain2.call_count == 0.
+
+The delta path also calls _safe_get_expirations() (which wraps get_expirations).
+We must patch that too so the returned expiry set matches the cached one and
+the ticker is only classified as "changed" when OI drift exceeds the threshold.
 """
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -50,6 +54,10 @@ _FAKE_THRESH = {
     "t3_atm_pct": 0.10, "t3_max_dte": 30, "t3_min_oi": 0,
 }
 
+# A future expiry date that always falls within the T3 30-day DTE window
+# is NOT needed here — we just need it to match the cached set exactly.
+_CACHED_EXPIRY = "2026-12-31"
+
 
 async def _do_first_build(reg, tickers, oi_map: dict):
     """
@@ -63,11 +71,11 @@ async def _do_first_build(reg, tickers, oi_map: dict):
     ):
         oi = oi_map.get(ticker, 1000)
         registry[f"{ticker}_OCC"] = ContractMeta(
-            ticker=ticker, strike=price * 1.05, expiry="2026-12-31",
+            ticker=ticker, strike=price * 1.05, expiry=_CACHED_EXPIRY,
             contract_type="CALL", dte=60, open_interest=oi, tier=3,
         )
         oi_by_ticker[ticker] = oi
-        self_inner._pending_expiry_cache[ticker] = {"2026-12-31"}
+        self_inner._pending_expiry_cache[ticker] = {_CACHED_EXPIRY}
 
     tier_map = {t: 3 for t in tickers}
     with (
@@ -96,12 +104,13 @@ class TestDeltaChainFetch:
 
         # Verify first build set things up correctly
         assert reg._oi_by_ticker.get("T1") == 1000
-        assert reg._expiry_cache.get("T1") == {"2026-12-31"}
+        assert reg._expiry_cache.get("T1") == {_CACHED_EXPIRY}
 
         chain2 = AsyncMock(return_value=[])
 
         with (
             patch("services.symbol_registry.get_option_chain", chain2),
+            patch.object(reg, "_safe_get_expirations", AsyncMock(return_value=[_CACHED_EXPIRY])),
             patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
             patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
             patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
@@ -127,6 +136,7 @@ class TestDeltaChainFetch:
 
         with (
             patch("services.symbol_registry.get_option_chain", chain2),
+            patch.object(reg, "_safe_get_expirations", AsyncMock(return_value=[_CACHED_EXPIRY])),
             patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
             patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
             patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
@@ -154,8 +164,14 @@ class TestDeltaChainFetch:
             called_tickers.add(ticker)
             return []
 
+        # _safe_get_expirations returns the same cached expiry for both tickers
+        # so only the OI drift (not expiry change) determines which is re-fetched.
+        async def fake_safe_expirations(ticker):
+            return [_CACHED_EXPIRY]
+
         with (
             patch("services.symbol_registry.get_option_chain", side_effect=fake_chain),
+            patch.object(reg, "_safe_get_expirations", side_effect=fake_safe_expirations),
             patch.object(reg.__class__, "_persist_to_db", AsyncMock()),
             patch("services.ingestion_config.get_config", AsyncMock(return_value=_FAKE_CFG)),
             patch("services.tier_engine._fetch_thresholds", AsyncMock(return_value=_FAKE_THRESH)),
