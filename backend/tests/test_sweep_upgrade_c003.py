@@ -22,7 +22,7 @@ Test IDs:
 Run: pytest backend/tests/test_sweep_upgrade_c003.py -v
 """
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import sys, os
 
@@ -117,8 +117,8 @@ class TestC003BelowThreshold:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.upgrade_to_sweep_in_db", new_callable=AsyncMock) as mock_upgrade:
 
-            mock_dedup.is_duplicate.return_value = True   # duplicate path
-            mock_dedup.get_exchange_count.return_value = 2  # only 2 exchanges so far
+            mock_dedup.is_duplicate.return_value = True
+            mock_dedup.get_exchange_count.return_value = 2
             mock_dedup._sweep_min = 3
 
             await ts._process_trade(raw)
@@ -136,24 +136,23 @@ class TestC003ThresholdExactly:
         from services import tradier_stream as ts
 
         ev = _make_ev()
-        raw = _make_raw(exchange="M")  # MIAX — 3rd exchange
+        raw = _make_raw(exchange="M")
         tasks_created = []
 
         original_create_task = asyncio.create_task
 
         def _capture_task(coro):
             tasks_created.append(coro)
-            # return a dummy completed task to avoid event loop errors
             async def _noop(): pass
             return original_create_task(_noop())
 
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
-             patch("services.tradier_stream.upgrade_to_sweep_in_db", new_callable=AsyncMock) as mock_upgrade, \
+             patch("services.tradier_stream.upgrade_to_sweep_in_db", new_callable=AsyncMock), \
              patch("services.tradier_stream.asyncio.create_task", side_effect=_capture_task):
 
             mock_dedup.is_duplicate.return_value = True
-            mock_dedup.get_exchange_count.return_value = 3  # exactly at threshold
+            mock_dedup.get_exchange_count.return_value = 3
             mock_dedup._sweep_min = 3
 
             await ts._process_trade(raw)
@@ -173,7 +172,7 @@ class TestC003FourthExchangeNoRepeat:
         from services import tradier_stream as ts
 
         ev = _make_ev()
-        raw = _make_raw(exchange="X")  # PHLX — 4th exchange
+        raw = _make_raw(exchange="X")
         tasks_created = []
 
         def _capture_task(coro):
@@ -187,7 +186,7 @@ class TestC003FourthExchangeNoRepeat:
              patch("services.tradier_stream.asyncio.create_task", side_effect=_capture_task):
 
             mock_dedup.is_duplicate.return_value = True
-            mock_dedup.get_exchange_count.return_value = 4  # already past threshold
+            mock_dedup.get_exchange_count.return_value = 4
             mock_dedup._sweep_min = 3
 
             await ts._process_trade(raw)
@@ -224,7 +223,6 @@ class TestC003UpgradeFnPayload:
             "SUPABASE_URL": "https://test.supabase.co",
             "SUPABASE_SERVICE_ROLE_KEY": "test_key",
         }):
-            # Re-read env after patch
             flow_store._SUPABASE_URL = "https://test.supabase.co"
             flow_store._SUPABASE_KEY = "test_key"
 
@@ -288,10 +286,10 @@ class TestC003CanonicalSweepInline:
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
-            mock_dedup.is_sweep.return_value = True        # sweep already established
+            mock_dedup.is_sweep.return_value = True
             mock_dedup.get_exchange_count.return_value = 4
             mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = ep          # cooldown passed
+            mock_acc.get_signal.return_value = ep
             mock_acc.get_alert_level.return_value = "CONVICTION"
             mock_bus.publish_all = AsyncMock()
 
@@ -322,7 +320,7 @@ class TestC003DedupRegressionCheck:
              patch("services.tradier_stream.asyncio.create_task"):
 
             mock_dedup.is_duplicate.return_value = True
-            mock_dedup.get_exchange_count.return_value = 2  # below threshold, no task either
+            mock_dedup.get_exchange_count.return_value = 2
             mock_dedup._sweep_min = 3
 
             await ts._process_trade(raw)
@@ -354,7 +352,7 @@ class TestC003QualifyingCanonicalRegression:
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick.return_value = ep
-            mock_acc.get_signal.return_value = None   # cooldown active — bus silent
+            mock_acc.get_signal.return_value = None
             mock_acc.get_alert_level.return_value = "ALERT"
             mock_bus.publish_all = AsyncMock()
 
@@ -363,4 +361,4 @@ class TestC003QualifyingCanonicalRegression:
         mock_persist.assert_awaited_once()
         args = mock_persist.call_args[0][0]
         assert args["ticker"] == "AAPL"
-        assert args["trade_type"] == "BTO"  # not yet swept — no prior sweep pattern
+        assert args["trade_type"] == "BTO"
