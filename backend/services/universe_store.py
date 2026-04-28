@@ -13,7 +13,7 @@ Public API:
   load_fresh_snapshot()         → list[str] | None
   load_any_snapshot()           → list[str] | None
   load_tier_map()               → dict[str, int]        [4A]
-  save_snapshot(...)            → str | None  (snapshot_id on success, None on failure)
+  save_snapshot(...)            → bool
   upsert_symbol_quotes(...)     → None
 
 ROOT CAUSE FIX (2026-04-23) C-005:
@@ -67,26 +67,22 @@ FIX RC-1/RC-2 (2026-04-27e):
     len(all symbols), so S-04 and S-05 pass correctly.
   - Non-eligible symbols simply have no row in options_universe_symbols.
 
-FIX DEDUP-001 (2026-04-28):
-  ROOT CAUSE of exponential options_universe_symbols / options_chain_cache
-  growth: every cold-start/redeploy called save_snapshot() which always
-  minted a new uuid4() for snapshot_id. Since upsert uses
-  on_conflict=(snapshot_id, symbol), a new UUID means every row is a fresh
-  INSERT — no conflict, no overwrite. After N deploys there were N×symbols
-  rows in options_universe_symbols and N×contracts rows in
-  options_chain_cache.
+FIX (2026-04-28) SNAPSHOT-REUSE:
+  Root cause of exponential row growth in options_universe_symbols:
+  Every deployment called uuid4() unconditionally, producing a fresh
+  snapshot_id. The upsert on_conflict=(snapshot_id,symbol) never found
+  a conflict because the key was always new — so every restart was a
+  pure INSERT storm, not an idempotent upsert.
 
-  Fix: _sync_save_snapshot now calls _get_active_snapshot_id() first. If a
-  fresh active snapshot exists (fetched within max_age_hours), it is reused
-  as the snapshot_id and only the symbol upsert is re-run (idempotent).
-  A brand-new UUID is only minted when there is genuinely no active fresh
-  snapshot. This makes every restart under the same day idempotent — rows
-  are overwritten, not duplicated.
-
-  save_snapshot() now returns the snapshot_id string (or None on failure)
-  instead of bool. Existing `if saved:` callers still work since bool(str)
-  is truthy. Callers in main.py that need the id should use the returned
-  value directly.
+  Fix: _sync_save_snapshot now checks for an existing active snapshot
+  created within _SNAPSHOT_REUSE_MAX_AGE_H (20h) with the same source.
+  If found, its ID is reused so subsequent upserts truly deduplicate.
+  A brand-new uuid4() is only minted when:
+    - No active snapshot exists, OR
+    - The existing one is older than 20 hours (stale → refresh), OR
+    - The source tag differs (forced full refresh).
+  Also fixes options_chain_cache exponential growth (same root cause —
+  chain rows keyed on snapshot_id also multiplied every restart).
 """
 import asyncio
 import logging
@@ -102,10 +98,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("universe_store")
 
-_KEEP_SNAPSHOTS  = 7
-_DEFAULT_MAX_AGE = 24   # hours
-_UPSERT_BATCH    = 500  # rows per upsert batch
-_PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
+_KEEP_SNAPSHOTS          = 7
+_DEFAULT_MAX_AGE         = 24   # hours
+_UPSERT_BATCH            = 500  # rows per upsert batch
+_PAGE_SIZE               = 1000  # PostgREST default cap — paginate in this chunk size
+_SNAPSHOT_REUSE_MAX_AGE_H = 20  # hours — reuse active snapshot_id within this window
 
 
 def _client() -> Client:
@@ -155,16 +152,10 @@ async def save_snapshot(
     symbols: list[str],
     source: str,
     stream_eligible_set: Optional[set[str]] = None,
-    max_age_hours: int = _DEFAULT_MAX_AGE,
-) -> Optional[str]:
-    """
-    DEDUP-001: returns snapshot_id string on success, None on failure.
-    Reuses the existing active snapshot_id when one exists within
-    max_age_hours instead of always minting a new UUID.
-    """
+) -> bool:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, _sync_save_snapshot, symbols, source, stream_eligible_set, max_age_hours
+        None, _sync_save_snapshot, symbols, source, stream_eligible_set
     )
 
 
@@ -234,39 +225,6 @@ def _paginate_symbols(
             break
         offset += _PAGE_SIZE
     return all_rows
-
-
-# ---------------------------------------------------------------------------
-# DEDUP-001 helper
-# ---------------------------------------------------------------------------
-
-def _get_active_snapshot_id(
-    sb: Client,
-    max_age_hours: int = _DEFAULT_MAX_AGE,
-) -> Optional[str]:
-    """
-    Return the snapshot_id of the current active snapshot if it was
-    fetched within max_age_hours. Returns None if no fresh active
-    snapshot exists (triggers a new UUID to be minted).
-    """
-    try:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-        ).isoformat()
-        resp = (
-            sb.table("options_universe_snapshots")
-            .select("id")
-            .eq("is_active", True)
-            .gte("fetched_at", cutoff)
-            .order("fetched_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = resp.data or []
-        return rows[0]["id"] if rows else None
-    except Exception as exc:
-        log.warning("[universe_store] _get_active_snapshot_id error: %s", exc)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -403,31 +361,88 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
         return None
 
 
+def _get_reusable_snapshot_id(sb: Client, source: str) -> Optional[str]:
+    """
+    Return the ID of the current active snapshot if it was created within
+    _SNAPSHOT_REUSE_MAX_AGE_H hours AND has the same source tag.
+
+    If found, _sync_save_snapshot will upsert into this existing snapshot
+    rather than minting a new uuid4(), making repeated deployments on the
+    same trading day fully idempotent (no duplicate rows).
+
+    Returns None when a brand-new snapshot_id should be generated:
+      - No active snapshot exists
+      - Active snapshot is older than _SNAPSHOT_REUSE_MAX_AGE_H
+      - Source tag differs (e.g. cboe → tradier forced refresh)
+    """
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=_SNAPSHOT_REUSE_MAX_AGE_H)
+        ).isoformat()
+        result = (
+            sb.table("options_universe_snapshots")
+            .select("id, fetched_at, source")
+            .eq("is_active", True)
+            .eq("source", source)
+            .gte("fetched_at", cutoff)
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            sid = rows[0]["id"]
+            log.info(
+                "universe_store: reusing existing snapshot_id=%s (fetched_at=%s, source=%s) "
+                "— upsert will be idempotent, no duplicate rows",
+                sid, rows[0]["fetched_at"], source,
+            )
+            return sid
+        return None
+    except Exception as e:
+        log.warning("universe_store._get_reusable_snapshot_id error (non-fatal): %s", e)
+        return None
+
+
 def _sync_save_snapshot(
     symbols: list[str],
     source: str,
     stream_eligible_set: Optional[set[str]] = None,
-    max_age_hours: int = _DEFAULT_MAX_AGE,
-) -> Optional[str]:
+) -> bool:
     """
-    DEDUP-001 FIX: Reuse the existing active snapshot_id when one exists
-    within max_age_hours. Only mint a new UUID when there is no fresh
-    active snapshot. This makes every restart idempotent — rows are
-    overwritten via upsert, never duplicated.
+    Save or update the options universe snapshot.
 
-    RC-1/RC-2 FIX: Only insert stream_eligible symbols.
+    SNAPSHOT-REUSE FIX (2026-04-28):
+    Before minting a new uuid4(), check _get_reusable_snapshot_id().
+    If an active snapshot with the same source exists and is < 20h old,
+    reuse its ID. This means the upsert on_conflict=(snapshot_id,symbol)
+    will actually find existing rows and UPDATE them instead of always
+    inserting new rows.
 
-    Returns snapshot_id string on success, None on failure.
-    Existing `if saved:` callers still work (bool(str) is truthy).
+    RC-1/RC-2 FIX: Only insert stream_eligible symbols into
+    options_universe_symbols. Previously ALL ~5270 CBOE symbols were
+    inserted regardless of eligibility, causing:
+      - S-04: symbol count inflated to 5252 instead of ~4340
+      - S-05: 913 rows with last_price=NULL (non-eligible rows never
+              touched by upsert_symbol_quotes)
+      - S-12: 2637 tickers with no chain data (non-eligible but stored)
+
+    Now:
+      - eligible_symbols = intersection of symbols and stream_eligible_set
+      - symbol_count in snapshot header = len(eligible_symbols)
+      - Non-eligible symbols have zero rows in options_universe_symbols
+
+    1. Try to reuse existing active snapshot_id (SNAPSHOT-REUSE)
+    2. If no reusable snapshot, generate a new uuid4() and INSERT header
+    3. Upsert ONLY eligible symbols in batches of 500
+    4. Deactivate all other snapshots (only when snapshot_id is new)
+    5. Prune beyond _KEEP_SNAPSHOTS
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
-        return None
+        return False
     try:
         sb = _client()
-
-        # DEDUP-001: reuse existing active snapshot_id if fresh enough
-        existing_id = _get_active_snapshot_id(sb, max_age_hours=max_age_hours)
 
         # RC-1: only persist stream_eligible rows
         eligible_set     = stream_eligible_set if stream_eligible_set is not None else set(symbols)
@@ -441,22 +456,18 @@ def _sync_save_snapshot(
             )
             eligible_symbols = list(symbols)
 
-        if existing_id:
-            snapshot_id = existing_id
+        # SNAPSHOT-REUSE: reuse existing snapshot_id when possible so upserts
+        # are truly idempotent across restarts on the same trading day.
+        reused_id    = _get_reusable_snapshot_id(sb, source)
+        is_new_snap  = reused_id is None
+        snapshot_id  = reused_id if reused_id else str(uuid4())
+
+        if is_new_snap:
             log.info(
-                "universe_store: DEDUP-001 — reusing existing snapshot id=%s "
-                "(eligible=%d symbols, source=%s). Symbol rows will be upserted "
-                "(overwrite, not duplicate).",
-                snapshot_id, len(eligible_symbols), source,
-            )
-        else:
-            snapshot_id = str(uuid4())
-            log.info(
-                "universe_store: inserting NEW snapshot id=%s source=%s "
+                "universe_store: creating NEW snapshot id=%s source=%s "
                 "eligible=%d (of %d total symbols)",
                 snapshot_id, source, len(eligible_symbols), len(symbols),
             )
-            # Insert snapshot header only for new snapshots
             sb.table("options_universe_snapshots").insert({
                 "id":           snapshot_id,
                 "symbol_count": len(eligible_symbols),
@@ -464,47 +475,57 @@ def _sync_save_snapshot(
                 "source":       source,
                 "is_active":    True,
             }).execute()
+        else:
+            log.info(
+                "universe_store: REUSING snapshot id=%s source=%s — "
+                "upserting %d eligible symbols (idempotent)",
+                snapshot_id, source, len(eligible_symbols),
+            )
+            # Update symbol_count in case the eligible set changed slightly
+            sb.table("options_universe_snapshots").update({
+                "symbol_count": len(eligible_symbols),
+            }).eq("id", snapshot_id).execute()
 
-            # Deactivate all other snapshots
+        rows = [
+            {
+                "snapshot_id":     snapshot_id,
+                "symbol":          s,
+                "stream_eligible": True,  # all rows are eligible by construction
+                "tier":            3,
+            }
+            for s in eligible_symbols
+        ]
+        total_batches = (len(rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
+        for i in range(0, len(rows), _UPSERT_BATCH):
+            batch_num = i // _UPSERT_BATCH + 1
+            sb.table("options_universe_symbols").upsert(
+                rows[i : i + _UPSERT_BATCH],
+                on_conflict="snapshot_id,symbol",
+            ).execute()
+            log.info(
+                "universe_store: upserted symbol batch %d/%d (%d symbols)",
+                batch_num, total_batches, len(rows[i : i + _UPSERT_BATCH]),
+            )
+
+        # Only deactivate other snapshots when we created a new one.
+        # When reusing, there's nothing to deactivate.
+        if is_new_snap:
             sb.table("options_universe_snapshots").update({"is_active": False}).neq(
                 "id", snapshot_id
             ).execute()
             log.info("universe_store: deactivated previous snapshots")
 
-            _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
-
-        # Upsert symbol rows — idempotent whether snapshot is new or reused
-        batch_size    = _UPSERT_BATCH
-        rows          = [
-            {
-                "snapshot_id":     snapshot_id,
-                "symbol":          s,
-                "stream_eligible": True,
-                "tier":            3,
-            }
-            for s in eligible_symbols
-        ]
-        total_batches = (len(rows) + batch_size - 1) // batch_size
-        for i in range(0, len(rows), batch_size):
-            batch_num = i // batch_size + 1
-            sb.table("options_universe_symbols").upsert(
-                rows[i : i + batch_size],
-                on_conflict="snapshot_id,symbol",
-            ).execute()
-            log.info(
-                "universe_store: upserted symbol batch %d/%d (%d symbols)",
-                batch_num, total_batches, len(rows[i : i + batch_size]),
-            )
-
         log.info(
-            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s",
-            snapshot_id, len(eligible_symbols), source,
+            "universe_store: snapshot SAVED id=%s new=%s eligible_symbols=%d source=%s",
+            snapshot_id, is_new_snap, len(eligible_symbols), source,
         )
-        return snapshot_id
+
+        _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
+        return True
 
     except Exception as e:
         log.error("universe_store.save_snapshot error: %s", e, exc_info=True)
-        return None
+        return False
 
 
 def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
