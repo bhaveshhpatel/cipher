@@ -25,6 +25,12 @@ Key architectural fixes:
   RC-3 (ingestion_config) — validate_ingestion_config() at startup warns on missing DB rows
   H1   (main)         — _post_build_upsert reuses raw_quotes from build();
                         no duplicate _fetch_batch_quotes call on warm-restart
+  M-1/M-2 (symbol_registry) — _build_complete flag; is_ready() no longer fires
+                        on first DB-seeded contract; stream workers spawn only
+                        after build() fully completes with fresh Tradier data
+  M-3  (main)         — _post_build_upsert split into two guarded phases;
+                        assign_tiers() failure raises so upsert_symbol_quotes()
+                        is skipped and the error is visible in logs/metrics
 """
 import asyncio
 import json
@@ -214,6 +220,25 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
+# ---------------------------------------------------------------------------
+# M-3: post-build upsert with explicit two-phase error handling.
+#
+# Previously the entire function body was wrapped in a single
+# `except Exception: log.error("non-fatal")` block.  The problem:
+#   - If assign_tiers() raised, upsert_symbol_quotes() was silently skipped
+#     and the DB tier columns went stale with no observable signal.
+#   - There was no way to distinguish "tiers failed" from "upsert failed"
+#     in the logs.
+#
+# New behaviour:
+#   Phase 1 — quote assembly (non-fatal, returns early on failure).
+#   Phase 2 — assign_tiers() in its own try/except; on failure the error is
+#     logged at WARNING level and re-raised so the outer _background_build_
+#     and_upsert wrapper sees it and logs at ERROR.  upsert_symbol_quotes()
+#     is NOT called if assign_tiers() failed.
+#   Phase 3 — upsert_symbol_quotes() in its own try/except; failure logged
+#     at ERROR with exc_info so the full traceback appears in Railway logs.
+# ---------------------------------------------------------------------------
 async def _post_build_upsert(
     registry,
     stream_symbols: list[str],
@@ -222,13 +247,16 @@ async def _post_build_upsert(
     """
     H1 fix: when raw_quotes is provided (passed from _background_build_and_upsert
     after build() returns them), build SymbolQuote objects directly from that
-    dict instead of calling _fetch_batch_quotes() again.  The duplicate Tradier
-    batch-quotes call that previously fired on every warm-restart is eliminated.
+    dict instead of calling _fetch_batch_quotes() again.
 
-    When raw_quotes is None (legacy / standalone callers), fall back to
-    fetching quotes from Tradier so behaviour is unchanged for those callers.
+    M-3 fix: split into three explicit phases. assign_tiers() failure is
+    caught, logged, and re-raised so upsert_symbol_quotes() is never called
+    with a stale or empty tier map. Each phase has its own try/except so the
+    log clearly identifies which step failed.
     """
     from services.symbols_loader import SymbolQuote
+
+    # ── Phase 1: assemble quotes ──────────────────────────────────────────
     try:
         if raw_quotes is not None:
             log.info(
@@ -280,7 +308,17 @@ async def _post_build_upsert(
             "[post_build] OI stamped on %d quotes (%d tickers with oi>0)",
             len(quotes), sum(1 for v in oi_map.values() if v > 0),
         )
+    except Exception as exc:
+        log.error(
+            "[post_build] Phase 1 (quote assembly) failed — upsert skipped: %s",
+            exc, exc_info=True,
+        )
+        return
 
+    # ── Phase 2: assign_tiers ─────────────────────────────────────────────
+    # M-3: assign_tiers() failure is re-raised so the caller
+    # (_background_build_and_upsert) logs it at ERROR and upsert is skipped.
+    try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
         log.info(
@@ -289,11 +327,25 @@ async def _post_build_upsert(
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
+    except Exception as exc:
+        # Log here for context then re-raise so the outer wrapper sees it.
+        log.warning(
+            "[post_build] Phase 2 (assign_tiers) FAILED — "
+            "DB tier columns NOT updated, upsert skipped: %s",
+            exc, exc_info=True,
+        )
+        raise  # M-3: propagate so _background_build_and_upsert logs ERROR
 
+    # ── Phase 3: upsert to DB ─────────────────────────────────────────────
+    try:
         await universe_store.upsert_symbol_quotes(quotes, tier_map)
         log.info("[post_build] upsert_symbol_quotes complete — DB columns now populated")
     except Exception as exc:
-        log.error("[post_build] error (non-fatal): %s", exc, exc_info=True)
+        log.error(
+            "[post_build] Phase 3 (upsert_symbol_quotes) FAILED — "
+            "DB columns may be stale: %s",
+            exc, exc_info=True,
+        )
 
 
 async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
@@ -304,7 +356,17 @@ async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> N
     except Exception as exc:
         log.error("[registry] Background build failed: %s", exc, exc_info=True)
         return
-    await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)  # H1: pass raw_quotes
+    # M-3: _post_build_upsert may raise (from Phase 2 assign_tiers failure).
+    # Wrap here so the background task itself does not crash the process,
+    # but log at ERROR so Railway surfaces it clearly.
+    try:
+        await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
+    except Exception as exc:
+        log.error(
+            "[registry] _post_build_upsert raised (tier assignment failed) — "
+            "DB tier columns NOT updated this cycle: %s",
+            exc, exc_info=True,
+        )
 
 
 async def _universe_refresh_loop():
@@ -407,7 +469,7 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend\u2026")
+    log.info("Starting Cipher backend…")
 
     # RC-3: validate ingestion config rows at startup — warns on missing DB keys
     await validate_ingestion_config()
@@ -424,13 +486,13 @@ async def lifespan(app: FastAPI):
         seeded = await registry.load_from_db(snapshot_id)
         log.info(
             "[registry] DB chain seed: %d OCC contracts pre-loaded "
-            "(registry is_ready=%s)",
+            "(is_ready=%s — waiting for build() to complete)",
             seeded, registry.is_ready(),
         )
 
     log.info(
         "[registry] Server starting (is_ready=%s, %d OCC contracts seeded). "
-        "Background build will refresh in the background.",
+        "Stream workers will spawn only after background build() sets _build_complete.",
         registry.is_ready(), registry.size(),
     )
 
