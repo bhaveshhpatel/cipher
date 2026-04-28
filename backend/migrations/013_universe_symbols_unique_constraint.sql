@@ -7,9 +7,10 @@
 --   growth across deployments (Issue 1).
 --
 --   This migration:
---     1. Deduplicates existing rows (keeps the most recently updated row per pair)
---     2. Adds the missing UNIQUE constraint
---     3. Cleans up orphaned options_chain_cache rows tied to pruned snapshot_ids
+--     1. Deduplicates existing rows (keeps the most recently inserted row per pair)
+--     2. Drops the constraint if it already exists (idempotent re-run safety)
+--     3. Adds the missing UNIQUE constraint
+--     4. Cleans up orphaned options_chain_cache rows tied to pruned snapshot_ids
 --
 -- Run once in Supabase SQL Editor or via run_migrations.py
 
@@ -22,13 +23,16 @@ WHERE ctid NOT IN (
   GROUP BY snapshot_id, symbol
 );
 
--- Step 2: Add the unique constraint that PostgREST on_conflict requires.
--- IF NOT EXISTS prevents errors if this migration is accidentally run twice.
+-- Step 2: Drop the constraint first if it already exists (makes this idempotent).
 ALTER TABLE options_universe_symbols
-  ADD CONSTRAINT IF NOT EXISTS options_universe_symbols_snapshot_symbol_key
+  DROP CONSTRAINT IF EXISTS options_universe_symbols_snapshot_symbol_key;
+
+-- Step 3: Add the unique constraint that PostgREST on_conflict requires.
+ALTER TABLE options_universe_symbols
+  ADD CONSTRAINT options_universe_symbols_snapshot_symbol_key
   UNIQUE (snapshot_id, symbol);
 
--- Step 3: Clean up orphaned options_chain_cache rows whose snapshot_id no longer
+-- Step 4: Clean up orphaned options_chain_cache rows whose snapshot_id no longer
 -- exists in options_universe_snapshots. These accumulate every deployment when
 -- new snapshot_ids are created because on_conflict never fired.
 -- Safe to delete: the cache is rebuilt from scratch on each registry build().
