@@ -10,15 +10,25 @@ Threshold logic:
     - cumulative premium >= min_premium
   whichever comes first.
 
-  This means a single large trade (e.g. $500k sweep) persists immediately on
-  the first tick, while small retail prints are gated until min_trades accumulate.
+  This means a single large trade (e.g. $80k+ print) persists immediately on
+  the first tick via the min_premium OR condition, while small retail prints
+  (< $10k, < 3 trades) are gated until the repetition threshold is crossed.
 
-Fix (2026-04-28 Issue 2):
-  Lowered defaults: min_trades=1, min_premium=10_000
-  Previous: min_trades=3, min_premium=50_000
-  Reason: at min_trades=3 every single-print flow event was silently dropped.
-  At min_trades=1 every parsed trade that passes dedup persists immediately.
-  The min_premium=10_000 floor still filters out tiny retail noise (<$10k notional).
+  Whale accumulation via many small lots is captured: each $12k print increments
+  the episode until trade_count=3, then fires — even though each individual print
+  is below the $10k floor (they're not — $12k > $10k fires immediately via OR).
+  True sub-$10k repeated prints need 3 trades before persisting.
+
+Defaults (2026-04-28):
+  min_trades=3  — restored from 1; prevents every single print from persisting
+                  as a raw flow log entry with no repetition signal value.
+  min_premium=$10,000 — kept low so whale accumulation via small lots is captured
+                        and single large institutional prints fire immediately.
+
+The OR logic means:
+  - Single print >= $10k    -> fires on tick 1 (premium OR condition)
+  - Repeated prints < $10k  -> needs 3 ticks (trade_count condition)
+  - Pure retail noise       -> < $10k AND < 3 trades = filtered
 """
 import asyncio
 import logging
@@ -55,14 +65,14 @@ class RepetitionAccumulator:
 
     Args:
         window_minutes:  Episode expires after this many minutes of inactivity.
-        min_trades:      Minimum ticks before episode persists (default: 1).
+        min_trades:      Minimum ticks before episode persists (default: 3).
         min_premium:     Minimum cumulative premium before episode persists (default: $10,000).
     """
 
     def __init__(
         self,
         window_minutes: int = 30,
-        min_trades: int     = 1,
+        min_trades: int     = 3,
         min_premium: float  = 10_000,
     ):
         self.window      = timedelta(minutes=window_minutes)
