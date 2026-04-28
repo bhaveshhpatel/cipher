@@ -40,6 +40,12 @@ Fix (FIRST-TICK 2026-04-28 Issue 2):
   activity immediately after connect, not only at tick 100.
   Also log non-timesale event_types at INFO (not DEBUG) for the first 10
   received so we can confirm the WebSocket is receiving data at all.
+
+Fix (DEDUP-KWARGS 2026-04-28):
+  flow_dedup.is_duplicate() first param is `event_or_occ_symbol`, not `occ_symbol`.
+  Passing occ_symbol= as a keyword arg raised:
+    DedupCache.is_duplicate() got an unexpected keyword argument 'occ_symbol'
+  Fix: pass occ_symbol positionally as the first arg.
 """
 import asyncio
 import logging
@@ -314,7 +320,7 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
-    FLOW-DEBUG: every gate now emits an INFO log so Railway shows exactly
+    FLOW-DEBUG: every gate now emits an INFO log so Railway logs show exactly
     where trades are dropped. A periodic stats summary is logged every
     _STATS_LOG_INTERVAL ticks so throughput is visible even when no trade
     clears all gates.
@@ -329,6 +335,11 @@ async def _process_trade(raw: dict):
       Before checking dispatch_key membership, evict all entries older than
       _SWEEP_DISPATCH_TTL_S. This bounds the dict to at most ~30 min of
       unique OCC|size|fill keys seen during the rolling window.
+
+    DEDUP-KWARGS fix (2026-04-28):
+      DedupCache.is_duplicate() first positional param is `event_or_occ_symbol`.
+      Passing occ_symbol= as a keyword arg raised an unexpected keyword error.
+      Fix: pass occ_symbol as first positional argument.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -393,8 +404,10 @@ async def _process_trade(raw: dict):
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
 
+    # DEDUP-KWARGS fix: pass occ_symbol positionally — first param is
+    # `event_or_occ_symbol`, not `occ_symbol`, so keyword form raised TypeError.
     if flow_dedup.is_duplicate(
-        occ_symbol=occ_symbol,
+        occ_symbol,
         size=ev.size,
         fill=ev.fill_price,
         exchange=exchange,
