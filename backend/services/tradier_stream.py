@@ -23,6 +23,17 @@ Fix (H4) — _sweep_upgrade_dispatched TTL eviction:
 Fix (D-001): stream_options_flow() accepts optional `registry` from lifespan.
 Fix (D-002): refresh_loop() create_task removed from standalone path.
 All prior fix notes preserved below.
+
+Fix (FLOW-DEBUG 2026-04-28):
+  Added INFO-level logging at every gate in _process_trade so Railway logs
+  surface exactly where trades are being dropped:
+    - tick type received (sampled every 100 ticks to avoid log flooding)
+    - dedup dropped (INFO with running count, was DEBUG)
+    - parse_tradier_trade returned None
+    - accumulator.ingest_tick returned None (most common silent drop)
+    - persist_flow_event called
+  _stats now tracks parsed_count, accumulator_gated, parse_failed so
+  /health/stream shows the full funnel.
 """
 import asyncio
 import logging
@@ -64,6 +75,9 @@ _REGISTRY_READY_POLL_S    = 0.5
 # H4: TTL for sweep-upgrade dispatch guard keys (30 min in seconds)
 _SWEEP_DISPATCH_TTL_S = 1800.0
 
+# FLOW-DEBUG: log a tick-funnel summary every N ticks received
+_STATS_LOG_INTERVAL = 100
+
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
@@ -78,8 +92,12 @@ _stream_start_at: float = _time.time()
 _stats = {
     "active_symbols":    0,
     "ticks":             0,
+    "parsed":            0,   # FLOW-DEBUG: parse_tradier_trade returned non-None
+    "parse_failed":      0,   # FLOW-DEBUG: parse_tradier_trade returned None
     "classified":        0,
     "deduped":           0,
+    "accumulator_gated": 0,   # FLOW-DEBUG: ingest_tick returned None (below threshold)
+    "persisted":         0,   # FLOW-DEBUG: persist_flow_event actually called
     "signals":           0,
     "errors":            0,
     "composite_errors":  0,
@@ -248,6 +266,12 @@ async def stream_options_flow(
     _stats["active_symbols"] = registry.size()
     _stats["mode"] = "live"
 
+    log.info(
+        "[stream] LIVE mode — subscribing to %d OCC contracts across %d tickers",
+        registry.size(),
+        len({v.ticker for v in registry._registry.values()}) if hasattr(registry, '_registry') else 0,
+    )
+
     manager = StreamManager(registry=registry, process_fn=_process_trade)
     await manager.run()
 
@@ -277,6 +301,11 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
+    FLOW-DEBUG: every gate now emits an INFO log so Railway shows exactly
+    where trades are dropped. A periodic stats summary is logged every
+    _STATS_LOG_INTERVAL ticks so throughput is visible even when no trade
+    clears all gates.
+
     H4 fix — _sweep_upgrade_dispatched TTL eviction:
       Before checking dispatch_key membership, evict all entries older than
       _SWEEP_DISPATCH_TTL_S. This bounds the dict to at most ~30 min of
@@ -284,20 +313,50 @@ async def _process_trade(raw: dict):
     """
     _stats["ticks"] += 1
 
+    # FLOW-DEBUG: periodic funnel summary
+    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
+        log.info(
+            "[flow-funnel] ticks=%d parsed=%d parse_failed=%d "
+            "deduped=%d classified=%d accumulator_gated=%d persisted=%d signals=%d",
+            _stats["ticks"],
+            _stats["parsed"],
+            _stats["parse_failed"],
+            _stats["deduped"],
+            _stats["classified"],
+            _stats["accumulator_gated"],
+            _stats["persisted"],
+            _stats["signals"],
+        )
+
     event_type = raw.get("type", "")
 
-    if event_type in _PROCESSABLE_TYPES and event_type in raw:
+    # FLOW-DEBUG: log first tick of each new event type seen
+    if event_type not in _PROCESSABLE_TYPES:
+        log.debug("[flow] non-timesale event_type=%r — skipping", event_type)
+        return
+
+    if event_type in raw:
         trade_payload = raw[event_type]
         if not isinstance(trade_payload, dict):
             return
-    elif event_type in _PROCESSABLE_TYPES:
-        trade_payload = raw
     else:
-        return
+        trade_payload = raw
 
     ev = parse_tradier_trade(trade_payload)
     if not ev:
+        _stats["parse_failed"] += 1
+        log.info(
+            "[flow] parse_tradier_trade returned None for symbol=%r "
+            "(size=%s bid=%s ask=%s last=%s) — tick dropped",
+            trade_payload.get("symbol"),
+            trade_payload.get("size"),
+            trade_payload.get("bid"),
+            trade_payload.get("ask"),
+            trade_payload.get("last"),
+        )
         return
+
+    _stats["parsed"] += 1
 
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
@@ -311,9 +370,9 @@ async def _process_trade(raw: dict):
         ts=arrival_ts,
     ):
         _stats["deduped"] += 1
-        log.debug(
-            f"[dedup] dropped duplicate: {occ_symbol} size={ev.size} "
-            f"fill={ev.fill_price} exch={exchange}"
+        log.info(
+            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s",
+            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange,
         )
 
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
@@ -371,7 +430,20 @@ async def _process_trade(raw: dict):
     sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)
 
     if not persist_ep:
+        _stats["accumulator_gated"] += 1
+        log.info(
+            "[accumulator] gated %s %s $%.0f dte=%d prem=$%.0f "
+            "(waiting for min_trades=3 or min_premium threshold)",
+            ev.ticker, ev.contract_type, ev.strike, ev.dte, ev.premium,
+        )
         return
+
+    _stats["persisted"] += 1
+    log.info(
+        "[persist] %s %s $%.0f %s fill=%.2f size=%d prem=$%.0f type=%s",
+        ev.ticker, ev.contract_type, ev.strike, ev.expiry,
+        ev.fill_price, ev.size, ev.premium, ev.trade_type,
+    )
 
     try:
         await asyncio.wait_for(
