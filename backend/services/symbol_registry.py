@@ -17,6 +17,17 @@ FIX C-3 (2026-04-27): assign_tiers() is now called with require_oi=True
   Pre-build tier assignments (main.py Step 3b) default to require_oi=False,
   which skips the OI gate and produces stable T1/T2 counts based on
   volume and price alone.
+
+FIX H1 (2026-04-27): build() now returns a tuple[int, dict[str, dict]]
+  (count, raw_quotes). Callers that only need the count ignore the second
+  element; _background_build_and_upsert passes raw_quotes to
+  _post_build_upsert so it can skip the duplicate _fetch_batch_quotes call.
+
+FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
+  build guard is now `if self._registry:` — the populated registry itself is
+  the correct signal for an incremental refresh. This means scheduled
+  refresh_loop() calls also get incremental DTE-based pruning instead of
+  always doing a full rebuild after the first build().
 """
 import asyncio
 import logging
@@ -85,8 +96,7 @@ class SymbolRegistry:
         self._persisted_snapshot_id: Optional[str] = None
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
-        # P4: track whether the registry was pre-seeded from DB
-        self._seeded_from_db: bool = False
+        # H3: _seeded_from_db removed — self._registry itself is the guard
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -128,7 +138,7 @@ class SymbolRegistry:
             return 0
         self._registry = chain
         self._persisted_snapshot_id = snapshot_id
-        self._seeded_from_db = True  # P4: flag incremental build
+        # H3: no _seeded_from_db flag — populated registry is the signal
         # Rebuild OI map from the loaded chain
         oi_acc: dict[str, list[int]] = {}
         for meta in chain.values():
@@ -143,23 +153,28 @@ class SymbolRegistry:
         )
         return len(chain)
 
-    async def build(self) -> int:
+    async def build(self) -> tuple[int, dict[str, dict]]:
         """
         Build (or incrementally refresh) the OCC registry.
 
-        P4 — Incremental mode:
-          If the registry was pre-seeded from DB (self._seeded_from_db is True),
-          skip tickers whose minimum DTE in the existing registry is > 0.
-          Only re-fetch tickers that have expired contracts today (min_dte == 0)
+        H3 — Incremental mode (fixed):
+          If self._registry is already populated (seeded from DB or from a
+          prior build()), skip tickers whose minimum DTE is > 0.
+          Only re-fetch tickers that have expired contracts (min_dte == 0)
           or are missing from the registry entirely.
-          After the first full build() completes, _seeded_from_db is cleared so
-          subsequent scheduled refreshes always do a full rebuild.
+          The old _seeded_from_db flag has been removed; the registry itself
+          is the authoritative signal.  This means scheduled refresh_loop()
+          calls also benefit from incremental mode — they no longer fall back
+          to a full rebuild after the first build() clears the old flag.
+
+        H1 — Return raw_quotes:
+          Returns tuple[int, dict[str, dict]] so callers can reuse the
+          already-fetched quote data and skip a duplicate Tradier call.
 
         C-3 — require_oi=True for post-build reclassification:
           assign_tiers() is called with require_oi=True so OI gates are
           enforced only after build() has populated oi_by_ticker from
-          chain fetches. This produces stable T1/T2 counts that don't
-          collapse when OI data is not yet available.
+          chain fetches.
         """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds, assign_tiers
@@ -174,7 +189,9 @@ class SymbolRegistry:
 
         async with self._build_lock:
             today = date.today()
-            if self._seeded_from_db and self._registry:
+
+            # H3 fix: use populated registry as the incremental guard
+            if self._registry:
                 min_dte_by_ticker: dict[str, int] = {}
                 for meta in self._registry.values():
                     cur = min_dte_by_ticker.get(meta.ticker, 9999)
@@ -191,8 +208,8 @@ class SymbolRegistry:
                 ]
 
                 log.info(
-                    "[symbol_registry] P4 incremental build: %d tickers to refresh "
-                    "(expired today), %d carried from DB seed (total watchlist=%d)",
+                    "[symbol_registry] H3 incremental build: %d tickers to refresh "
+                    "(expired today), %d carried forward (total watchlist=%d)",
                     len(tickers_to_refresh), len(tickers_to_carry), len(self._watchlist),
                 )
             else:
@@ -288,7 +305,7 @@ class SymbolRegistry:
             self._registry     = new_registry
             self._oi_by_ticker = new_oi_by_ticker
             self._last_build   = datetime.utcnow()
-            self._seeded_from_db = False  # P4: next refresh is always full
+            # H3: no _seeded_from_db = False reset needed — flag is gone
 
             t_counts = {1: 0, 2: 0, 3: 0}
             for m in new_registry.values():
@@ -303,7 +320,7 @@ class SymbolRegistry:
             )
 
             await self._persist_to_db(new_registry)
-            return len(new_registry)
+            return len(new_registry), raw_quotes  # H1: return raw_quotes
 
     async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:
         from services.chain_store import save_chain
