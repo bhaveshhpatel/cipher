@@ -13,9 +13,10 @@ Covers:
  - Rate-limited path still returns a response (not 500)
  - App instance is a FastAPI application
  - Lifespan spawns the registry pre-warm task
+ - Warm-restart (quotes=[]) triggers quote re-fetch + upsert_symbol_quotes
 """
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 
 def _get_client():
@@ -135,7 +136,6 @@ def test_lifespan_spawns_prewarm_task():
     to restore the expected state for the rest of the test session.
     """
     import asyncio
-    from unittest.mock import patch, AsyncMock, MagicMock
     import main as main_module
 
     created_targets: list[str] = []
@@ -190,4 +190,77 @@ def test_lifespan_spawns_prewarm_task():
     assert "_registry_prewarm_loop" in created_targets, (
         f"_registry_prewarm_loop task was not created in lifespan. "
         f"Tasks found: {created_targets}"
+    )
+
+
+def test_lifespan_upserts_quotes_on_warm_restart():
+    """
+    Warm-restart regression: when _resolve_startup_universe returns quotes=[]
+    (HIT path — fresh DB snapshot found), lifespan must re-fetch quotes via
+    _fetch_batch_quotes and call upsert_symbol_quotes exactly once.
+
+    This guards against the bug where last_price / volume / open_interest /
+    average_volume stayed NULL on every restart after the first cold start.
+    """
+    import asyncio
+    import main as main_module
+
+    upsert_call_count = []
+
+    async def _run():
+        mock_registry = MagicMock()
+        mock_registry.build = AsyncMock(return_value=100)
+        mock_registry.size = MagicMock(return_value=100)
+        mock_registry.get_oi_map = MagicMock(return_value={"AAPL": 500})
+        mock_registry.refresh_loop = AsyncMock()
+        mock_registry.set_tier_map = MagicMock()
+        mock_registry.load_from_db = AsyncMock(return_value=0)
+        mock_registry.is_ready = MagicMock(return_value=True)
+
+        fake_quote = MagicMock()
+        fake_quote.symbol = "AAPL"
+        fake_quote.open_interest = 0
+
+        mock_upsert = AsyncMock()
+        upsert_call_count.append(mock_upsert)
+
+        with patch.object(main_module, "_resolve_startup_universe",
+                          new_callable=AsyncMock,
+                          # warm-restart: stream_symbols populated, quotes empty
+                          return_value=(["AAPL"], {"AAPL": 1}, [], "snap-warm-001")), \
+             patch.object(main_module, "init_registry",
+                          return_value=mock_registry), \
+             patch.object(main_module, "_fetch_batch_quotes",
+                          new_callable=AsyncMock,
+                          return_value=[fake_quote]), \
+             patch.object(main_module, "assign_tiers",
+                          new_callable=AsyncMock, return_value={"AAPL": 1}), \
+             patch.object(main_module.universe_store, "upsert_symbol_quotes",
+                          new=mock_upsert), \
+             patch.object(main_module, "stream_options_flow",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "start_flow_writer",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "start_signal_writer",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "_universe_refresh_loop",
+                          new_callable=AsyncMock), \
+             patch.object(main_module, "_registry_prewarm_loop",
+                          new_callable=AsyncMock):
+            async with main_module.lifespan(main_module.app):
+                pass
+
+    try:
+        asyncio.run(_run())
+    finally:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    mock_upsert = upsert_call_count[0]
+    assert mock_upsert.called, (
+        "upsert_symbol_quotes was NOT called on warm-restart — "
+        "last_price/volume/oi columns will stay NULL"
+    )
+    assert mock_upsert.call_count == 1, (
+        f"Expected upsert_symbol_quotes called once, got {mock_upsert.call_count}"
     )

@@ -21,7 +21,7 @@ Updated 2026-04-27d: test_prune_deletes_excess_snapshots now asserts .in_ is
   called twice (symbol rows first, then snapshot headers) after _prune_old_snapshots
   was updated to delete child symbol rows before parent snapshot rows.
 """
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 from services.universe_store import (
     _prune_old_snapshots,
     _sync_save_snapshot,

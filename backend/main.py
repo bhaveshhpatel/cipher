@@ -109,6 +109,8 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
+        # Return empty quotes — lifespan will re-fetch after registry.build()
+        # so OI is available before upsert_symbol_quotes fires.
         return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -349,6 +351,18 @@ async def lifespan(app: FastAPI):
     log.info("[registry] Running first build (blocking startup until OI available)")
     await registry.build()
     log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
+
+    # On warm-restart (HIT path) _resolve_startup_universe returns quotes=[].
+    # Re-fetch now that registry.build() has completed and OI is available.
+    # This ensures last_price/volume/average_volume/open_interest are always
+    # written to options_universe_symbols on every startup, not just cold starts.
+    if not quotes and stream_symbols:
+        log.info(
+            "[registry] Warm-restart: fetching quotes for %d stream symbols "
+            "so upsert_symbol_quotes can populate all columns",
+            len(stream_symbols),
+        )
+        quotes = await _fetch_batch_quotes(stream_symbols)
 
     if quotes:
         oi_map = registry.get_oi_map()
