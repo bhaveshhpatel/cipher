@@ -10,6 +10,23 @@ DB-error safety:
   The two layers are separate:
     - _fetch_thresholds: network-safe, returns defaults silently
     - assign_tiers: if _fetch_thresholds still raises, falls back to safe
+
+C-3 FIX (2026-04-27):
+  T1/T2 counts were fluctuating (e.g. T1: 51→68 in 20 min) because
+  assign_tiers() was called from main.py Step 3b BEFORE build() had
+  populated OI data. open_interest=0 for all symbols failed t1_min_oi
+  and t2_min_oi thresholds, collapsing everything to T3. When the next
+  scheduled refresh ran build() with real OI, T1/T2 jumped back up.
+
+  Fix: added require_oi parameter to assign_tiers() and _classify().
+  - require_oi=False (default): OI gate is skipped entirely; only
+    volume and price determine tier. Safe for pre-build calls where OI
+    is not yet available (main.py Step 3b).
+  - require_oi=True: OI gate is enforced. Used by symbol_registry.build()
+    post-build reclassification where OI is populated from chain data.
+
+  symbol_registry.build() passes require_oi=True to assign_tiers().
+  main.py does not need to change (require_oi defaults to False).
 """
 import logging
 import os
@@ -148,29 +165,38 @@ async def _fetch_thresholds(force: bool = False) -> dict:
     return dict(_DEFAULT_THRESHOLDS)
 
 
-def _classify(quote: "SymbolQuote", thresh: dict) -> int:
+def _classify(quote: "SymbolQuote", thresh: dict, require_oi: bool = False) -> int:
     """Classify a single quote into tier 1/2/3.
 
+    require_oi=False (default): OI gate is skipped. Use when OI data is not
+      yet available (e.g. pre-build call from main.py Step 3b). Only volume
+      and price determine the tier. Prevents T1/T2 count collapse to T3
+      when open_interest=0 due to missing OI data.
+
+    require_oi=True: Full OI gate enforced. Use after build() has populated
+      OI data from chain fetches (symbol_registry post-build reclassification).
+
     Uses .get() with _DEFAULT_THRESHOLDS fallbacks for every key so that a
-    partial or empty thresh dict (e.g. from a test that patched
-    _fetch_thresholds to return {} without restoring) never raises KeyError.
+    partial or empty thresh dict never raises KeyError.
     """
     vol   = quote.average_volume or quote.volume or 0
     price = quote.last_price or 0.0
     oi    = quote.open_interest or 0
 
-    if (
-        vol   >= thresh.get("t1_min_volume",     _DEFAULT_THRESHOLDS["t1_min_volume"])
-        and price >= thresh.get("t1_min_last_price", _DEFAULT_THRESHOLDS["t1_min_last_price"])
-        and oi    >= thresh.get("t1_min_oi",         _DEFAULT_THRESHOLDS["t1_min_oi"])
-    ):
+    t1_vol   = thresh.get("t1_min_volume",     _DEFAULT_THRESHOLDS["t1_min_volume"])
+    t1_price = thresh.get("t1_min_last_price", _DEFAULT_THRESHOLDS["t1_min_last_price"])
+    t1_oi    = thresh.get("t1_min_oi",         _DEFAULT_THRESHOLDS["t1_min_oi"])
+    t2_vol   = thresh.get("t2_min_volume",     _DEFAULT_THRESHOLDS["t2_min_volume"])
+    t2_price = thresh.get("t2_min_last_price", _DEFAULT_THRESHOLDS["t2_min_last_price"])
+    t2_oi    = thresh.get("t2_min_oi",         _DEFAULT_THRESHOLDS["t2_min_oi"])
+
+    t1_oi_pass = (not require_oi) or (oi >= t1_oi)
+    t2_oi_pass = (not require_oi) or (oi >= t2_oi)
+
+    if vol >= t1_vol and price >= t1_price and t1_oi_pass:
         return 1
 
-    if (
-        vol   >= thresh.get("t2_min_volume",     _DEFAULT_THRESHOLDS["t2_min_volume"])
-        and price >= thresh.get("t2_min_last_price", _DEFAULT_THRESHOLDS["t2_min_last_price"])
-        and oi    >= thresh.get("t2_min_oi",         _DEFAULT_THRESHOLDS["t2_min_oi"])
-    ):
+    if vol >= t2_vol and price >= t2_price and t2_oi_pass:
         return 2
 
     return 3
@@ -179,12 +205,20 @@ def _classify(quote: "SymbolQuote", thresh: dict) -> int:
 async def assign_tiers(
     quotes: list["SymbolQuote"],
     thresholds: Optional[dict] = None,
+    require_oi: bool = False,
 ) -> dict[str, int]:
+    """
+    Assign T1/T2/T3 tiers to each quote.
+
+    require_oi=False (default): OI gate skipped in _classify. Safe for
+      pre-build calls (main.py Step 3b) where OI is 0 for all symbols.
+    require_oi=True: OI gate enforced. Pass this from symbol_registry.build()
+      after build() has populated OI via get_oi_map().
+    """
     if not quotes:
         return {}
 
     if thresholds is not None:
-        # Guard: if caller passed a partial/empty dict, fill in defaults.
         thresh = {**_DEFAULT_THRESHOLDS, **thresholds}
     else:
         try:
@@ -193,7 +227,6 @@ async def assign_tiers(
             log.warning("[tier_engine] threshold fetch failed: %s — using safe fallback (all T3)", e)
             thresh = dict(_SAFE_FALLBACK_THRESHOLDS)
 
-    # Final safety net: ensure all required keys are present.
     for key in _REQUIRED_THRESH_KEYS:
         if key not in thresh:
             log.warning(
@@ -204,13 +237,13 @@ async def assign_tiers(
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}
     for q in quotes:
-        t = _classify(q, thresh)
+        t = _classify(q, thresh, require_oi=require_oi)
         result[q.symbol] = t
         t_counts[t] += 1
 
     log.info(
-        "[tier_engine] Tier assignment complete: T1=%d T2=%d T3=%d (total=%d)",
-        t_counts[1], t_counts[2], t_counts[3], len(quotes),
+        "[tier_engine] Tier assignment complete: T1=%d T2=%d T3=%d (total=%d, require_oi=%s)",
+        t_counts[1], t_counts[2], t_counts[3], len(quotes), require_oi,
     )
     return result
 

@@ -10,6 +10,13 @@ FIX P4 (2026-04-27): build() now performs an incremental warm-restart when
   tickers whose minimum DTE in the seeded registry is 0 (contracts expired
   today) are re-fetched; all other tickers are carried forward unchanged.
   Warm-restart chain API calls drop from ~17,360 to ~50–400.
+
+FIX C-3 (2026-04-27): assign_tiers() is now called with require_oi=True
+  in the post-build reclassification step. This ensures OI is enforced in
+  the tier gate only after build() has populated OI data from chain fetches.
+  Pre-build tier assignments (main.py Step 3b) default to require_oi=False,
+  which skips the OI gate and produces stable T1/T2 counts based on
+  volume and price alone.
 """
 import asyncio
 import logging
@@ -147,6 +154,12 @@ class SymbolRegistry:
           or are missing from the registry entirely.
           After the first full build() completes, _seeded_from_db is cleared so
           subsequent scheduled refreshes always do a full rebuild.
+
+        C-3 — require_oi=True for post-build reclassification:
+          assign_tiers() is called with require_oi=True so OI gates are
+          enforced only after build() has populated oi_by_ticker from
+          chain fetches. This produces stable T1/T2 counts that don't
+          collapse when OI data is not yet available.
         """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds, assign_tiers
@@ -160,17 +173,14 @@ class SymbolRegistry:
         sem = asyncio.Semaphore(build_concurrency)
 
         async with self._build_lock:
-            # P4: determine which tickers need (re-)fetching
             today = date.today()
             if self._seeded_from_db and self._registry:
-                # Compute per-ticker minimum DTE from seeded data
                 min_dte_by_ticker: dict[str, int] = {}
                 for meta in self._registry.values():
                     cur = min_dte_by_ticker.get(meta.ticker, 9999)
                     if meta.dte < cur:
                         min_dte_by_ticker[meta.ticker] = meta.dte
 
-                # Tickers to refresh: expired today OR not in registry at all
                 tickers_to_refresh = [
                     t for t in self._watchlist
                     if min_dte_by_ticker.get(t, 0) == 0
@@ -186,7 +196,6 @@ class SymbolRegistry:
                     len(tickers_to_refresh), len(tickers_to_carry), len(self._watchlist),
                 )
             else:
-                # Full build — either first cold start or forced refresh
                 tickers_to_refresh = list(self._watchlist)
                 tickers_to_carry   = []
                 log.info(
@@ -201,7 +210,6 @@ class SymbolRegistry:
                     cfg["REGISTRY_MIN_OI"],
                 )
 
-            # Seed new_registry from carried tickers (P4: avoid re-fetching)
             new_registry: dict[str, ContractMeta] = {
                 occ: meta
                 for occ, meta in self._registry.items()
@@ -213,7 +221,6 @@ class SymbolRegistry:
                 if t in set(tickers_to_carry)
             }
 
-            # Fetch fresh prices for all watchlist tickers (needed for tier reclassification)
             prices, raw_quotes = await self._fetch_stock_prices()
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
@@ -236,7 +243,6 @@ class SymbolRegistry:
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Post-build tier reclassification using live price + volume + OI
             synthetic_quotes = []
             for ticker in self._watchlist:
                 if ticker not in prices:
@@ -259,7 +265,13 @@ class SymbolRegistry:
                     open_interest  = new_oi_by_ticker.get(ticker, 0),
                 ))
 
-            live_tier_map = await assign_tiers(synthetic_quotes, thresholds=thresh)
+            # C-3: require_oi=True — OI gate enforced now that build() has
+            # populated new_oi_by_ticker from chain fetches.
+            live_tier_map = await assign_tiers(
+                synthetic_quotes,
+                thresholds=thresh,
+                require_oi=True,
+            )
             log.info(
                 "[symbol_registry] Post-build tier reclassification: T1=%d T2=%d T3=%d",
                 sum(1 for t in live_tier_map.values() if t == 1),
@@ -408,7 +420,6 @@ class SymbolRegistry:
                 continue
 
             try:
-                # P3: use bulk semaphore (sem=10) instead of streaming sem (sem=2)
                 contracts = await get_option_chain_bulk(ticker, expiry_str)
             except Exception as e:
                 log.warning(
