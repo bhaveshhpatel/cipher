@@ -12,16 +12,12 @@ Each worker:
      with filter=timesale and its 500 OCC symbols
   4. Reads lines -> pushes raw dicts to the shared asyncio.Queue
   5. Reconnects with exponential backoff on any disconnect
-  6. Respects a 30s idle watchdog (Tradier sends bare newlines as keepalives)
+  6. Respects a 15s idle watchdog (Tradier sends bare newlines as keepalives)
   7. Shuts down cleanly on cancellation
 
 B-021 — Staggered startup:
-  StreamManager passes startup_delay_s = idx * 0.200 to each worker.
-  Worker-0 has delay=0 (connects immediately), worker-1 delays 200ms,
-  worker-31 delays 6.2s. After the initial delay the worker runs its
-  normal market-hours guard and reconnect loop with zero extra latency.
-  The startup_delay_s delay only fires once at the start of run();
-  reconnects do NOT re-apply the startup delay.
+  startup_delay_s is now always 0.0 (SINGLE-SESSION fix — only 1 worker).
+  The parameter is kept for API compatibility and test injection.
 
 B-008 — Global stats rollup:
   On every reconnect and on every error, the worker calls
@@ -44,6 +40,14 @@ Fix (S-04) — Extended stats (last_tick_at, session_ticks):
     session_ticks  - count of ticks in the current connection session
   These fields are visible in the /health endpoint worker_detail array
   and allow ops to quickly identify stale/disconnected workers.
+
+Fix SINGLE-SESSION (2026-04-28):
+  Tradier Individual/Developer accounts allow exactly 1 concurrent stream
+  session.  StreamManager now spawns 1 worker with all OCC symbols.
+  Reconnect constants tightened for fast single-connection recovery:
+    _BACKOFF_BASE  5.0 -> 1.0  (faster initial retry)
+    _BACKOFF_CAP  60.0 -> 10.0 (cap at 10s, not 60s)
+    _IDLE_TIMEOUT 30.0 -> 15.0 (detect stale keepalive stream 2x faster)
 """
 import asyncio
 import json
@@ -65,10 +69,13 @@ _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-_IDLE_TIMEOUT          = 30.0
+# SINGLE-SESSION fix: tighter reconnect constants for fast single-connection
+# recovery.  Previously 5.0/60.0/30.0 — too slow when 1 connection is all
+# you have.
+_IDLE_TIMEOUT          = 15.0   # was 30.0 — detect stale stream 2x faster
 _CONNECT_TIMEOUT       = 15.0
-_BACKOFF_BASE          = 5.0
-_BACKOFF_CAP           = 60.0
+_BACKOFF_BASE          = 1.0    # was 5.0  — faster initial retry
+_BACKOFF_CAP           = 10.0   # was 60.0 — cap at 10s not 60s
 # S-03: 5-minute sleep during market-closed periods (replaces hard-coded 60s)
 _MARKET_CLOSED_SLEEP_S = 300.0
 
@@ -110,7 +117,7 @@ class StreamWorker:
         self.worker_id       = worker_id
         self.symbols         = symbols
         self.event_queue     = event_queue
-        self.startup_delay_s = startup_delay_s  # B-021
+        self.startup_delay_s = startup_delay_s  # B-021 (always 0.0 in production)
         self._running        = True
         self._ticks          = 0
         self._errors         = 0
@@ -160,10 +167,10 @@ class StreamWorker:
     async def run(self):
         """Main loop — connect, stream, reconnect on failure."""
 
-        # B-021: One-time startup stagger.
+        # B-021: One-time startup stagger (always 0.0 in production).
         if self.startup_delay_s > 0:
             log.info(
-                f"[worker-{self.worker_id}] B-021 startup stagger: "
+                f"[worker-{self.worker_id}] startup delay: "
                 f"sleeping {self.startup_delay_s:.1f}s before first connect"
             )
             await asyncio.sleep(self.startup_delay_s)
@@ -274,7 +281,7 @@ class StreamWorker:
             await asyncio.sleep(backoff)
 
     async def _guarded_lines(self, resp: httpx.Response):
-        """Line iterator with 30s idle watchdog."""
+        """Line iterator with idle watchdog (_IDLE_TIMEOUT seconds)."""
         aiter = resp.aiter_lines().__aiter__()
         while True:
             try:

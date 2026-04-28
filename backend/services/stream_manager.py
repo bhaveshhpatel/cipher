@@ -18,6 +18,12 @@ FIX (2026-04-28) STREAM-1 — re-subscribe workers after registry refresh:
   against the current registry.all_symbols() set. Workers are replaced
   gracefully: new tasks are created before old ones are cancelled so
   there is no gap in coverage.
+
+FIX (2026-04-28) SINGLE-SESSION — Tradier Individual/Developer accounts
+  allow exactly 1 concurrent stream session.  Setting _CHUNK_SIZE=50_000
+  forces exactly 1 StreamWorker regardless of universe size (up to 50k
+  OCC symbols).  The stagger logic is removed from spawn/respawn paths
+  since it is meaningless for a single worker (startup_delay_s=0.0).
 """
 import asyncio
 import logging
@@ -25,10 +31,10 @@ from typing import Callable, Awaitable, Optional
 
 log = logging.getLogger("stream_manager")
 
-_CHUNK_SIZE  = 500
+# SINGLE-SESSION fix: 1 worker covers the full OCC universe on an
+# Individual/Developer Tradier account (1 concurrent session allowed).
+_CHUNK_SIZE  = 50_000
 _QUEUE_SIZE  = 10_000
-_WORKER_STARTUP_STAGGER_MS: int   = 200
-_WORKER_STARTUP_STAGGER_S:  float = _WORKER_STARTUP_STAGGER_MS / 1000.0
 _STALE_WORKER_THRESHOLD_S: float = 60.0
 
 # STREAM-1: how often to rebuild workers against the refreshed registry
@@ -162,12 +168,12 @@ class StreamManager:
         self._workers = []
         self._tasks   = []
         for idx, chunk in enumerate(chunks):
-            startup_delay = idx * _WORKER_STARTUP_STAGGER_S
+            # SINGLE-SESSION: startup_delay_s always 0 — only 1 worker
             worker = StreamWorker(
                 worker_id       = idx,
                 symbols         = chunk,
                 event_queue     = self._queue,
-                startup_delay_s = startup_delay,
+                startup_delay_s = 0.0,
             )
             self._workers.append(worker)
             task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
@@ -226,7 +232,7 @@ class StreamManager:
         if old_tasks:
             await asyncio.gather(*old_tasks, return_exceptions=True)
 
-        # Spawn fresh workers
+        # Spawn fresh workers (SINGLE-SESSION: no stagger, 1 worker)
         chunks = [
             new_symbols[i:i + _CHUNK_SIZE]
             for i in range(0, len(new_symbols), _CHUNK_SIZE)
@@ -234,12 +240,11 @@ class StreamManager:
         self._workers = []
         self._tasks   = []
         for idx, chunk in enumerate(chunks):
-            startup_delay = idx * _WORKER_STARTUP_STAGGER_S
             worker = StreamWorker(
                 worker_id       = idx,
                 symbols         = chunk,
                 event_queue     = self._queue,
-                startup_delay_s = startup_delay,
+                startup_delay_s = 0.0,
             )
             self._workers.append(worker)
             task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
