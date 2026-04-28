@@ -34,6 +34,15 @@ C-003 — Sweep Retroactive Upgrade:
   were written as 'BTO' before the sweep threshold was confirmed. Called
   from _process_trade() via asyncio.create_task() so it does not block
   the stream hot path.
+
+Fix (ALERT-LEVEL 2026-04-28):
+  _bus_signal_listener was setting alert_level from sig.get("recommendation")
+  which returns BUY/SELL/HOLD from the composite signal — not the
+  CONVICTION/STRONG_SIGNAL/ALERT/WATCH values used by the DB schema.
+  Every flow_episode row was therefore stored with alert_level=WATCH
+  regardless of actual premium size.
+  Fix: read sig.get("alert_level") which is populated from
+  accumulator.get_alert_level(sig_ep) in tradier_stream.py before publish.
 """
 import asyncio
 import logging
@@ -282,7 +291,9 @@ async def _bus_signal_listener():
                     "expiry":          None,
                     "total_premium":   ep.get("total_premium"),
                     "trade_count":     ep.get("trade_count"),
-                    "alert_level":     sig.get("recommendation"),
+                    # ALERT-LEVEL fix: use alert_level (CONVICTION/STRONG_SIGNAL/ALERT/WATCH)
+                    # not recommendation (BUY/SELL/HOLD) from the composite signal.
+                    "alert_level":     sig.get("alert_level"),
                     "is_accelerating": ep.get("is_accelerating", False),
                     "seed_episode":    sig.get("reasoning"),
                     "timestamp":       ep.get("timestamp"),
