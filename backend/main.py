@@ -1,5 +1,17 @@
 """
 Cipher Backend — FastAPI entry point
+
+P2 FIX (2026-04-27): registry.build() is now launched as a background task
+AFTER `yield` so the server starts serving in <2s. The DB-seeded chain
+(P1 fix in chain_store) covers OCC lookups during the brief build window.
+
+Startup sequence:
+  1. _resolve_startup_universe()   — load symbols from DB (<2s)
+  2. init_registry()               — in-memory init (instant)
+  3. registry.load_from_db()       — seed OCC chains from DB (<2s)
+  4. yield                         — SERVER IS LIVE, health probe passes
+  5. registry.build() [background] — incremental or full refresh (~60s warm)
+  6. upsert_symbol_quotes          — after build, populate DB columns
 """
 import asyncio
 import json
@@ -96,7 +108,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        # Resolve the active snapshot_id so registry can load from DB cache
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: universe_store._client()
@@ -109,8 +120,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
-        # Return empty quotes — lifespan will re-fetch after registry.build()
-        # so OI is available before upsert_symbol_quotes fires.
+        # Return empty quotes — lifespan re-fetches after build() completes
         return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -148,13 +158,12 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         if saved:
             log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
         else:
-            log.error("[universe] Step 3 FAILED: save_snapshot returned False — check universe_store logs")
+            log.error("[universe] Step 3 FAILED: save_snapshot returned False")
 
-        # Fetch quotes separately now that load_universe no longer returns them
         log.info("[universe] Step 3b: fetching batch quotes for %d symbols", len(symbols))
         quotes = await _fetch_batch_quotes(symbols)
         if quotes:
-            log.info("[universe] Step 3b: preliminary tier assignment for %d symbols (OI not yet available)", len(quotes))
+            log.info("[universe] Step 3b: preliminary tier assignment for %d symbols", len(quotes))
             tier_map = await assign_tiers(quotes)
             log.info(
                 "[universe] Step 3b: preliminary tiers — T1=%d T2=%d T3=%d",
@@ -163,7 +172,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 sum(1 for t in tier_map.values() if t == 3),
             )
 
-        # Resolve the new snapshot_id
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: universe_store._client()
@@ -203,7 +211,68 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background 24-hour refresh
+# Background post-build task: stamp OI, reclassify tiers, upsert to DB
+# ---------------------------------------------------------------------------
+async def _post_build_upsert(registry, stream_symbols: list[str]) -> None:
+    """
+    Run after registry.build() completes (in background).
+    1. Re-fetch quotes if not available (warm restart path).
+    2. Stamp OI from registry.
+    3. Re-run tier assignment with live OI.
+    4. Upsert to options_universe_symbols.
+    5. Update registry tier map.
+    """
+    try:
+        log.info("[post_build] Fetching quotes for %d symbols", len(stream_symbols))
+        quotes = await _fetch_batch_quotes(stream_symbols)
+        if not quotes:
+            log.warning("[post_build] No quotes returned — skipping upsert")
+            return
+
+        oi_map = registry.get_oi_map()
+        _stamp_oi(quotes, oi_map)
+        log.info(
+            "[post_build] OI stamped on %d quotes (%d tickers with oi>0)",
+            len(quotes), sum(1 for v in oi_map.values() if v > 0),
+        )
+
+        tier_map = await assign_tiers(quotes)
+        registry.set_tier_map(tier_map)
+        log.info(
+            "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+
+        await universe_store.upsert_symbol_quotes(quotes, tier_map)
+        log.info("[post_build] upsert_symbol_quotes complete — DB columns now populated")
+    except Exception as exc:
+        log.error("[post_build] error (non-fatal): %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Background build launcher (P2: non-blocking startup)
+# ---------------------------------------------------------------------------
+async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
+    """
+    Launched as asyncio.create_task() AFTER yield so the server is
+    already live when this runs. Performs:
+      registry.build()  — incremental (P4) or full
+      _post_build_upsert — quotes, OI, tier, DB write
+    """
+    log.info("[registry] Background build starting (server already live)")
+    try:
+        await registry.build()
+        log.info("[registry] Background build complete: %d OCC symbols", registry.size())
+    except Exception as exc:
+        log.error("[registry] Background build failed: %s", exc, exc_info=True)
+        return
+    await _post_build_upsert(registry, stream_symbols)
+
+
+# ---------------------------------------------------------------------------
+# Background 24-hour universe refresh
 # ---------------------------------------------------------------------------
 async def _universe_refresh_loop():
     REFRESH_INTERVAL = 24 * 60 * 60
@@ -213,13 +282,10 @@ async def _universe_refresh_loop():
         try:
             stale = await universe_store.load_any_snapshot()
             symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
-            quotes: list = []
             if source == "tradier_validated":
                 saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
-                tier_map: dict[str, int] = {}
-
-                # Fetch quotes separately
                 quotes = await _fetch_batch_quotes(symbols)
+                tier_map: dict[str, int] = {}
                 if saved and quotes:
                     registry = get_registry()
                     if registry:
@@ -230,10 +296,8 @@ async def _universe_refresh_loop():
                         log.info(
                             "[universe] Background refresh: OI stamped on %d quotes "
                             "(%d tickers with oi>0)",
-                            len(quotes),
-                            sum(1 for v in oi_map.values() if v > 0),
+                            len(quotes), sum(1 for v in oi_map.values() if v > 0),
                         )
-
                     tier_map = await assign_tiers(quotes)
                     await universe_store.upsert_symbol_quotes(quotes, tier_map)
 
@@ -247,16 +311,13 @@ async def _universe_refresh_loop():
                         sum(1 for t in tier_map.values() if t == 2),
                         sum(1 for t in tier_map.values() if t == 3),
                     )
-
                 log.info(
-                    "[universe] Background refresh complete: %d symbols eligible=%s saved=%s",
-                    len(symbols),
-                    len(stream_eligible_set) if stream_eligible_set is not None else "all",
-                    saved,
+                    "[universe] Background refresh complete: %d symbols saved=%s",
+                    len(symbols), saved,
                 )
             else:
                 log.warning(
-                    "[universe] Background refresh could not reach Tradier (source=%s) — keeping current snapshot",
+                    "[universe] Background refresh could not reach Tradier (source=%s)",
                     source,
                 )
         except Exception as e:
@@ -265,27 +326,17 @@ async def _universe_refresh_loop():
 
 # ---------------------------------------------------------------------------
 # Registry pre-warm — rebuilds OCC registry at 9:15 AM ET every weekday
-# so workers connect instantly at 9:30 with no cold-start delay.
 # ---------------------------------------------------------------------------
 _ET = ZoneInfo("America/New_York")
 _PREWARM_TIME = time(9, 15)
 
 
 async def _registry_prewarm_loop() -> None:
-    """Rebuild the OCC registry every weekday at 9:15 AM ET.
-
-    The lifespan already performs one build on startup. This loop handles
-    every subsequent trading day, ensuring the registry is fresh and fully
-    loaded 15 minutes before market open at 9:30 AM.
-
-    After each build, the registry is persisted to DB via chain_store so that
-    a crash/restart between 9:15 and 9:30 can fast-seed from the DB instead
-    of re-fetching all chains from Tradier.
-    """
+    """Rebuild the OCC registry every weekday at 9:15 AM ET."""
     while True:
         now = datetime.now(_ET)
 
-        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        if now.weekday() >= 5:
             log.info("[prewarm] Weekend — sleeping 1h before next check")
             await asyncio.sleep(3600)
             continue
@@ -299,7 +350,6 @@ async def _registry_prewarm_loop() -> None:
 
         if now >= next_prewarm:
             next_prewarm += timedelta(days=1)
-            # Advance past any weekend
             while next_prewarm.weekday() >= 5:
                 next_prewarm += timedelta(days=1)
 
@@ -319,8 +369,7 @@ async def _registry_prewarm_loop() -> None:
                 continue
             count = await registry.build()
             log.info(
-                "[prewarm] Registry warm: %d OCC contracts ready for market open "
-                "(persisted to DB for crash-restart safety)",
+                "[prewarm] Registry warm: %d OCC contracts ready for market open",
                 count or 0,
             )
         except Exception as exc:
@@ -331,7 +380,7 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
-    stream_symbols, tier_map, quotes, snapshot_id = await _resolve_startup_universe()
+    stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
     log.info(
@@ -339,64 +388,39 @@ async def lifespan(app: FastAPI):
         len(stream_symbols), len(tier_map),
     )
 
-    # On HIT path: fast-seed from DB chain cache so lookup() works immediately
+    # Seed OCC chains from DB — P1 fallback ensures this succeeds even when
+    # the active snapshot has no chains (first restart after save_snapshot).
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
         log.info(
             "[registry] DB chain seed: %d OCC contracts pre-loaded "
-            "(registry is_ready=%s before full build)",
+            "(registry is_ready=%s)",
             seeded, registry.is_ready(),
         )
 
-    log.info("[registry] Running first build (blocking startup until OI available)")
-    await registry.build()
-    log.info("[registry] First build complete: %d OCC symbols loaded", registry.size())
-
-    # On warm-restart (HIT path) _resolve_startup_universe returns quotes=[].
-    # Re-fetch now that registry.build() has completed and OI is available.
-    # This ensures last_price/volume/average_volume/open_interest are always
-    # written to options_universe_symbols on every startup, not just cold starts.
-    if not quotes and stream_symbols:
-        log.info(
-            "[registry] Warm-restart: fetching quotes for %d stream symbols "
-            "so upsert_symbol_quotes can populate all columns",
-            len(stream_symbols),
-        )
-        quotes = await _fetch_batch_quotes(stream_symbols)
-
-    if quotes:
-        oi_map = registry.get_oi_map()
-        _stamp_oi(quotes, oi_map)
-        log.info(
-            "[registry] OI stamped on %d quotes (%d tickers with oi>0)",
-            len(quotes),
-            sum(1 for v in oi_map.values() if v > 0),
-        )
-
-        tier_map = await assign_tiers(quotes)
-        log.info(
-            "[registry] OI-informed tier assignment — T1=%d T2=%d T3=%d",
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
-
-        registry.set_tier_map(tier_map)
-
-        log.info("[registry] Upserting %d symbol quotes with OI + final tiers", len(quotes))
-        await universe_store.upsert_symbol_quotes(quotes, tier_map)
-        log.info("[registry] Upsert complete — open_interest column now populated in DB")
+    # P2: yield NOW — server is live with DB-seeded chains.
+    # build() runs in background so Railway health probe passes immediately.
+    log.info(
+        "[registry] Server starting (is_ready=%s, %d OCC contracts seeded). "
+        "Background build will refresh in the background.",
+        registry.is_ready(), registry.size(),
+    )
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
+    stream_task           = asyncio.create_task(stream_options_flow(stream_symbols))
+    db_write_task         = asyncio.create_task(start_flow_writer())
+    signal_write_task     = asyncio.create_task(start_signal_writer())
+    refresh_task          = asyncio.create_task(_universe_refresh_loop())
 
-    stream_task       = asyncio.create_task(stream_options_flow(stream_symbols))
-    db_write_task     = asyncio.create_task(start_flow_writer())
-    signal_write_task = asyncio.create_task(start_signal_writer())
-    refresh_task      = asyncio.create_task(_universe_refresh_loop())
+    # P2: build + upsert runs fully in background after server is live
+    build_task = asyncio.create_task(
+        _background_build_and_upsert(registry, stream_symbols)
+    )
 
     yield
 
+    build_task.cancel()
     refresh_task.cancel()
     prewarm_task.cancel()
     registry_refresh_task.cancel()
@@ -404,6 +428,7 @@ async def lifespan(app: FastAPI):
     db_write_task.cancel()
     signal_write_task.cancel()
     for task in (
+        build_task,
         stream_task,
         db_write_task,
         signal_write_task,
@@ -426,23 +451,12 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# CORS — use allow_origin_regex so all Vercel preview URLs are accepted.
-#
-# Pattern covers:
-#   - https://*.vercel.app          (all Vercel production + preview deploys)
-#   - http://localhost:3000/3001    (local dev)
-#   - http://127.0.0.1:3000        (local dev alternative)
-#   - Any explicit origins from CORS_ALLOWED_ORIGINS env var (escaped + OR'd in)
-#
-# We never use allow_origins=["*"] because that breaks allow_credentials=True.
+# CORS
 # ---------------------------------------------------------------------------
-_explicit_origins = settings.origins  # list[str] from env var
-
-# Build regex alternation from any explicit non-wildcard origins in env
+_explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
 ]
-
 _origin_pattern = "|".join(filter(None, [
     r"https://[a-zA-Z0-9\-]+\.vercel\.app",
     r"http://localhost:(3000|3001)",
@@ -470,21 +484,16 @@ app.include_router(admin.router)
 app.include_router(health.router)
 
 # ---------------------------------------------------------------------------
-# Aliases for legacy / health-check paths
+# Aliases
 # ---------------------------------------------------------------------------
-
-# Railway health check probe is configured to hit /stream/stats (no /api prefix).
-# Return a simple 200 so the probe passes without requiring auth.
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
     return JSONResponse({"status": "ok"})
 
-# /api/stream/stats — authenticated alias kept for backwards compat
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
     return await stream_stats(current_user)
 
-# /api/health — used by test_main_app.test_app_health_endpoint_exists
 @app.get("/api/health", tags=["health"])
 async def api_health():
     return JSONResponse({"status": "ok", "service": "cipher-api"})
