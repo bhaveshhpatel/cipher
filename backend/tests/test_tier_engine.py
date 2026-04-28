@@ -8,6 +8,7 @@ Covers:
   ADM-01 … ADM-06 Admin endpoints: PATCH/GET /tier-thresholds, GET /tier-distribution
 
 All tests are pure-Python / asyncio — no live Supabase, no Tradier, no network.
+Updated 2026-04-27: wire .range() into US mock chain for _paginate_symbols compat.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -196,26 +197,28 @@ class TestUniverseStoreTierMapUS:
         import services.universe_store as us
 
         mock_client = MagicMock()
-        snap_result = MagicMock()
-        snap_result.data = [{"id": "snap-001"}]
-        sym_result  = MagicMock()
-        sym_result.data = [
-            {"symbol": "SPY",  "tier": 1},
-            {"symbol": "HOOD", "tier": 2},
-            {"symbol": "XYZZ", "tier": 3},
-        ]
 
-        def make_chain(result):
+        def _make_chain():
             chain = MagicMock()
-            chain.select.return_value  = chain
-            chain.eq.return_value      = chain
-            chain.order.return_value   = chain
-            chain.limit.return_value   = chain
-            chain.execute.return_value = result
+            for m in ["select", "eq", "order", "limit", "range"]:
+                getattr(chain, m).return_value = chain
             return chain
 
+        snap_chain = _make_chain()
+        snap_chain.execute.return_value = MagicMock(data=[{"id": "snap-001"}])
+
+        sym_chain = _make_chain()
+        sym_chain.execute.side_effect = [
+            # page 1: 3 symbols (< _PAGE_SIZE=1000, loop terminates)
+            MagicMock(data=[
+                {"symbol": "SPY",  "tier": 1},
+                {"symbol": "HOOD", "tier": 2},
+                {"symbol": "XYZZ", "tier": 3},
+            ]),
+        ]
+
         mock_client.table.side_effect = lambda name: (
-            make_chain(snap_result) if "snapshot" in name else make_chain(sym_result)
+            snap_chain if "snapshot" in name else sym_chain
         )
 
         with patch.object(us, '_client', return_value=mock_client):
@@ -230,10 +233,8 @@ class TestUniverseStoreTierMapUS:
         snap_result = MagicMock()
         snap_result.data = []
         chain = MagicMock()
-        chain.select.return_value  = chain
-        chain.eq.return_value      = chain
-        chain.order.return_value   = chain
-        chain.limit.return_value   = chain
+        for m in ["select", "eq", "order", "limit", "range"]:
+            getattr(chain, m).return_value = chain
         chain.execute.return_value = snap_result
         mock_client.table.return_value = chain
 

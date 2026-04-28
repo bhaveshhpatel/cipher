@@ -16,6 +16,7 @@ Targets uncovered lines:
   - _sync_load_tier_map: exception → returns {}
   - _sync_upsert_symbol_quotes: no active snapshot → logs warning, returns
   - _sync_upsert_symbol_quotes: exception → logs warning, does not raise
+Updated 2026-04-27: wire .range() into mock chain for _paginate_symbols compat.
 """
 from unittest.mock import MagicMock, patch
 from services.universe_store import (
@@ -32,7 +33,7 @@ def _mock_sb():
     sb = MagicMock()
     q  = MagicMock()
     for m in ["select", "insert", "update", "upsert", "delete",
-              "eq", "neq", "gte", "order", "limit", "in_"]:
+              "eq", "neq", "gte", "order", "limit", "in_", "range"]:
         getattr(q, m).return_value = q
     q.execute.return_value = MagicMock(data=[])
     sb.table.return_value = q
@@ -121,15 +122,13 @@ def test_load_tier_map_no_active_snapshot_returns_empty():
 
 
 def test_load_tier_map_null_tier_defaults_to_3():
-    sb = MagicMock()
-    q  = MagicMock()
-    for m in ["select", "eq", "order", "limit"]:
-        getattr(q, m).return_value = q
+    sb, q = _mock_sb()  # range() already wired via _mock_sb()
     q.execute.side_effect = [
+        # 1) snapshot header lookup
         MagicMock(data=[{"id": "snap-1"}]),
+        # 2) _paginate_symbols page 1 (< _PAGE_SIZE, loop terminates)
         MagicMock(data=[{"symbol": "AAPL", "tier": None}]),
     ]
-    sb.table.return_value = q
     with patch("services.universe_store._client", return_value=sb):
         result = _sync_load_tier_map()
     assert result["AAPL"] == 3

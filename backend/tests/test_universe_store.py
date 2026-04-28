@@ -5,6 +5,8 @@ DB read/write tests for services/universe_store.py with mocked Supabase.
 Updated to cover stream_eligible_set parameter in save_snapshot.
 Updated 2026-04-24: add TR-01…TR-05 for load_tier_map (Feature 4A).
 Updated 2026-04-25: add US-OI-01…US-OI-04 for open_interest upsert (Feature 4A-OI).
+Updated 2026-04-27: wire .range() into mock chain so _paginate_symbols resolves
+  correctly; add terminating empty-page side_effect entries for all paginated paths.
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -23,6 +25,7 @@ def _make_sb_mock():
     query.in_.return_value     = query
     query.order.return_value   = query
     query.limit.return_value   = query
+    query.range.return_value   = query   # <-- fix: _paginate_symbols calls .range()
     query.insert.return_value  = query
     query.update.return_value  = query
     query.delete.return_value  = query
@@ -53,7 +56,9 @@ class TestLoadFreshSnapshot:
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-001"
         query.execute.side_effect = [
+            # 1) snapshot header lookup
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            # 2) _paginate_symbols page 1 — returns 2 symbols (< _PAGE_SIZE, terminates loop)
             MagicMock(data=[{"symbol": "AAPL"}, {"symbol": "TSLA"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -77,6 +82,7 @@ class TestLoadFreshSnapshot:
         snapshot_id = "snap-uuid-002"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            # _paginate_symbols page 1 — empty → loop terminates, symbols=[]
             MagicMock(data=[]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -93,7 +99,9 @@ class TestLoadAnySnapshot:
         snapshot_id = "snap-uuid-old"
         stale_time  = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
         query.execute.side_effect = [
+            # 1) snapshot header lookup
             MagicMock(data=[{"id": snapshot_id, "fetched_at": stale_time, "source": "tradier_validated"}]),
+            # 2) _paginate_symbols page 1 — returns 2 symbols (< _PAGE_SIZE, terminates)
             MagicMock(data=[{"symbol": "SPY"}, {"symbol": "QQQ"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -237,7 +245,9 @@ class TestLoadTierMap:
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-tier-001"
         query.execute.side_effect = [
+            # 1) snapshot header
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            # 2) _paginate_symbols page 1 (< _PAGE_SIZE, loop terminates)
             MagicMock(data=[{"symbol": "SPY", "tier": 1}, {"symbol": "HOOD", "tier": 2}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -279,6 +289,7 @@ class TestLoadTierMap:
         snapshot_id = "snap-uuid-tier-002"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            # page 1 (< _PAGE_SIZE, terminates)
             MagicMock(data=[{"symbol": "XYZ", "tier": 3}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -297,6 +308,7 @@ class TestLoadTierMap:
         snapshot_id = "snap-uuid-tier-003"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
+            # page 1 (< _PAGE_SIZE, terminates)
             MagicMock(data=[{"symbol": "LEGACY"}]),  # no tier key
         ]
         with patch("services.universe_store._client", return_value=sb):
