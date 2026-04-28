@@ -29,8 +29,18 @@ class Settings(BaseSettings):
     TRADIER_API_KEY:      str = os.environ.get("TRADIER_API_KEY",      "")
     TRADIER_STREAM_TOKEN: str = os.environ.get("TRADIER_STREAM_TOKEN", "")
     TRADIER_ACCOUNT_ID:   str = os.environ.get("TRADIER_ACCOUNT_ID",   "")
+
+    # REST API host — used for quotes, chains, expirations, session token
     TRADIER_BASE_URL: str = os.environ.get(
         "TRADIER_BASE_URL", "https://api.tradier.com"
+    )
+
+    # Streaming host — DIFFERENT from the REST host.
+    # stream_worker.py POSTs to TRADIER_STREAM_URL/v1/markets/events.
+    # This was missing from config, causing workers to AttributeError or
+    # POST to an empty URL on every connect attempt → zero ticks received.
+    TRADIER_STREAM_URL: str = os.environ.get(
+        "TRADIER_STREAM_URL", "https://stream.tradier.com"
     )
 
     # ── AI / LLM ──────────────────────────────────────────────────────────────
