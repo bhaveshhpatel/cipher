@@ -24,6 +24,8 @@ CHANGELOG (key fixes, details in git history):
   B4-001 — stream_options_flow now accepts optional registry kwarg (ignored internally;
              stream builds its own registry) so main.py can pass (symbols, registry)
              without a TypeError.
+  H-004 — _sweep_upgrade_dispatched changed from bare Set to TTL-evicting Dict
+             to prevent memory leak on long-running processes.
 
 Tradier streaming notes:
   - Session token: POST /v1/markets/events/session with Content-Length: 0 (data={})
@@ -41,7 +43,7 @@ import logging
 import random
 import time as _time
 from datetime import datetime, time
-from typing import Optional, Set
+from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -67,6 +69,11 @@ _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
 _PERSIST_TIMEOUT     = 2.0
+
+# H-004: TTL for _sweep_upgrade_dispatched entries (seconds).
+# After this window a (occ, size, fill) triple can trigger one more upgrade
+# dispatch if it is seen again — prevents the dict growing without bound.
+_SWEEP_DISPATCH_TTL  = 3600.0
 
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
@@ -95,7 +102,23 @@ _stats = {
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
 
-_sweep_upgrade_dispatched: Set[str] = set()
+# H-004: dict[dispatch_key, monotonic_timestamp] — entries are evicted when
+# they exceed _SWEEP_DISPATCH_TTL, bounding memory on long-running processes.
+_sweep_upgrade_dispatched: Dict[str, float] = {}
+
+
+def _evict_stale_dispatch_entries() -> None:
+    """
+    Remove _sweep_upgrade_dispatched entries older than _SWEEP_DISPATCH_TTL.
+    Called inline before every membership check so the dict stays bounded.
+    """
+    now = _time.monotonic()
+    stale = [
+        k for k, ts in _sweep_upgrade_dispatched.items()
+        if now - ts > _SWEEP_DISPATCH_TTL
+    ]
+    for k in stale:
+        del _sweep_upgrade_dispatched[k]
 
 
 def get_stats() -> dict:
@@ -321,8 +344,11 @@ async def _process_trade(raw: dict):
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
             dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
+            # H-004: evict stale entries before the membership check so
+            # the dict stays bounded on long-running processes.
+            _evict_stale_dispatch_entries()
             if dispatch_key not in _sweep_upgrade_dispatched:
-                _sweep_upgrade_dispatched.add(dispatch_key)
+                _sweep_upgrade_dispatched[dispatch_key] = _time.monotonic()
                 log.info(
                     "[sweep] threshold just crossed — retroactive upgrade: "
                     "%s size=%d fill=%s exchanges=%d",

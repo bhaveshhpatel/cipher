@@ -499,6 +499,16 @@ class SymbolRegistry:
             )
 
     async def refresh_loop(self):
+        """
+        Scheduled rebuild loop.
+
+        H-1 + H-3 fix: pre-fetch stock quotes once per cycle and pass them
+        directly into build(pre_fetched_quotes=...).  This eliminates the
+        duplicate Tradier round-trip that the old bare `await self.build()`
+        caused, and ensures the delta (incremental P4) path inside build()
+        receives the current OI map needed for accurate drift detection on
+        every cycle — not just on warm restarts.
+        """
         while True:
             from services.ingestion_config import get_config
             cfg = await get_config()
@@ -517,7 +527,24 @@ class SymbolRegistry:
 
             log.info("[symbol_registry] Scheduled refresh (interval=%dmin)", interval_mins)
             try:
-                await self.build()
+                # H-1 + H-3: fetch quotes once, hand them to build() so the
+                # delta path has fresh OI and _fetch_stock_prices() is never
+                # called a second time inside the same cycle.
+                pre_fetched, _ = await self._fetch_stock_prices()
+                # _fetch_stock_prices() returns (prices_dict, raw_volumes_dict).
+                # build() expects a dict[str, SymbolQuote]-compatible map.
+                # SymbolQuote has .last_price; we adapt the raw price dict here.
+                quote_map: dict[str, SymbolQuote] = {
+                    ticker: SymbolQuote(
+                        symbol=ticker,
+                        last_price=price,
+                        volume=0,
+                        average_volume=0,
+                        open_interest=self._oi_by_ticker.get(ticker, 0),
+                    )
+                    for ticker, price in pre_fetched.items()
+                }
+                await self.build(pre_fetched_quotes=quote_map)
             except Exception as e:
                 log.error("[symbol_registry] Refresh failed (non-fatal): %s", e)
 
