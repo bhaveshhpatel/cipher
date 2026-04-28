@@ -45,6 +45,17 @@ FIX (2026-04-27b):
   chunks to bypass Supabase PostgREST's silent 1000-row cap. Previously
   every warm-start was truncated at exactly 1000 symbols regardless of
   how many stream_eligible rows were in the snapshot.
+
+FIX (2026-04-27c):
+  _sync_save_snapshot: changed options_universe_symbols insert → upsert
+  (on_conflict="snapshot_id,symbol") so repeated runs under the same
+  snapshot_id are idempotent and never produce duplicate rows.
+
+FIX (2026-04-27d):
+  _prune_old_snapshots: explicitly DELETE options_universe_symbols rows
+  for pruned snapshot IDs before deleting the snapshot header. Safety net
+  for DBs without a cascading FK — prevents orphaned symbol rows from
+  accumulating across restarts.
 """
 import asyncio
 import logging
@@ -183,7 +194,6 @@ def _paginate_symbols(
         page = result.data or []
         all_rows.extend(page)
         if len(page) < _PAGE_SIZE:
-            # Last page — no more rows
             break
         offset += _PAGE_SIZE
     return all_rows
@@ -331,7 +341,8 @@ def _sync_save_snapshot(
     """
     1. Generate snapshot_id locally via uuid4()
     2. Insert snapshot header
-    3. Bulk-insert symbols in batches of 500 — includes stream_eligible flag, tier=3 default
+    3. Upsert symbols in batches of 500 — on_conflict=(snapshot_id,symbol)
+       so repeated calls are idempotent and never produce duplicate rows.
     4. Deactivate all other snapshots
     5. Prune beyond _KEEP_SNAPSHOTS
     """
@@ -370,9 +381,15 @@ def _sync_save_snapshot(
         total_batches = (len(rows) + batch_size - 1) // batch_size
         for i in range(0, len(rows), batch_size):
             batch_num = i // batch_size + 1
-            sb.table("options_universe_symbols").insert(rows[i : i + batch_size]).execute()
+            # upsert instead of insert — idempotent on (snapshot_id, symbol)
+            # prevents duplicate rows if save_snapshot is called more than once
+            # for the same snapshot (e.g. crash-restart mid-write).
+            sb.table("options_universe_symbols").upsert(
+                rows[i : i + batch_size],
+                on_conflict="snapshot_id,symbol",
+            ).execute()
             log.info(
-                "universe_store: inserted symbol batch %d/%d (%d symbols)",
+                "universe_store: upserted symbol batch %d/%d (%d symbols)",
                 batch_num, total_batches, len(rows[i : i + batch_size]),
             )
 
@@ -468,7 +485,10 @@ def _prune_old_snapshots(sb: Client, keep: int) -> None:
         if len(rows) <= keep:
             return
         ids_to_delete = [r["id"] for r in rows[keep:]]
+        # Delete child symbol rows first — safety net for DBs without cascading FK.
+        # Prevents orphaned options_universe_symbols rows from accumulating.
+        sb.table("options_universe_symbols").delete().in_("snapshot_id", ids_to_delete).execute()
         sb.table("options_universe_snapshots").delete().in_("id", ids_to_delete).execute()
-        log.info("universe_store: pruned %d old snapshots", len(ids_to_delete))
+        log.info("universe_store: pruned %d old snapshots (+ their symbol rows)", len(ids_to_delete))
     except Exception as e:
         log.warning("universe_store._prune_old_snapshots error (non-fatal): %s", e)

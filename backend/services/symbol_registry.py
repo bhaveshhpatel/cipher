@@ -11,6 +11,8 @@ from utils.tradier_client import get_expirations, get_option_chain, get_quotes_b
 
 log = logging.getLogger("symbol_registry")
 
+_DEFAULT_BUILD_CONCURRENCY = 50  # max concurrent ticker builds in build()
+
 
 @dataclass
 class ContractMeta:
@@ -64,7 +66,6 @@ class SymbolRegistry:
         self._build_lock = asyncio.Lock()
         self._oi_by_ticker: dict[str, int] = {}
         self._persisted_snapshot_id: Optional[str] = None
-        # Volume data captured during _fetch_stock_prices for tier reclassification
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
 
@@ -124,11 +125,17 @@ class SymbolRegistry:
         tier_params      = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
         bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
 
+        # Cap concurrent ticker builds to avoid OOM from 1500 simultaneous
+        # chain-fetch bursts each spawning N expiry requests in-flight.
+        build_concurrency = int(cfg.get("REGISTRY_BUILD_CONCURRENCY", _DEFAULT_BUILD_CONCURRENCY))
+        sem = asyncio.Semaphore(build_concurrency)
+
         async with self._build_lock:
             log.info(
-                "[symbol_registry] Building OCC registry for %d tickers "
+                "[symbol_registry] Building OCC registry for %d tickers (concurrency=%d) "
                 "[T1: atm=+/-%.0f%% dte=%d | T2: atm=+/-%.0f%% dte=%d | T3: atm=+/-%.0f%% dte=%d | min_oi=%d]",
                 len(self._watchlist),
+                build_concurrency,
                 tier_params[1].atm_pct * 100, tier_params[1].max_dte,
                 tier_params[2].atm_pct * 100, tier_params[2].max_dte,
                 tier_params[3].atm_pct * 100, tier_params[3].max_dte,
@@ -141,14 +148,18 @@ class SymbolRegistry:
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
+            async def _build_with_sem(ticker):
+                async with sem:
+                    await self._build_ticker(
+                        ticker,
+                        prices.get(ticker, 0.0),
+                        new_registry,
+                        new_oi_by_ticker,
+                        bootstrap_params,
+                    )
+
             tasks = [
-                self._build_ticker(
-                    ticker,
-                    prices.get(ticker, 0.0),
-                    new_registry,
-                    new_oi_by_ticker,
-                    bootstrap_params,
-                )
+                _build_with_sem(ticker)
                 for ticker in self._watchlist
                 if ticker in prices and prices[ticker] > 0
             ]
