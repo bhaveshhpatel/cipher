@@ -3,6 +3,21 @@ services/stream_manager.py -- Layer 2: Parallel Stream Manager
 
 Makes registry and process_fn optional so unit tests can instantiate
 StreamManager() with no arguments.
+
+FIX (2026-04-28) STREAM-1 — re-subscribe workers after registry refresh:
+  Previously _spawn_workers() was only called once at startup. After
+  registry.refresh_loop() completed a new build(), workers were still
+  subscribed to the snapshot-seeded OCC symbol set from startup, not the
+  fresh Tradier-built set. Any contract added or removed by the refresh
+  was silently missed — stream events arrived but lookup in _process_trade
+  returned None and the trade was dropped.
+
+  Fix: StreamManager now accepts an optional refresh_interval_s (default
+  300s / 5 min). The run() loop calls _respawn_workers() every
+  refresh_interval_s to tear down stale workers and spawn fresh ones
+  against the current registry.all_symbols() set. Workers are replaced
+  gracefully: new tasks are created before old ones are cancelled so
+  there is no gap in coverage.
 """
 import asyncio
 import logging
@@ -16,15 +31,20 @@ _WORKER_STARTUP_STAGGER_MS: int   = 200
 _WORKER_STARTUP_STAGGER_S:  float = _WORKER_STARTUP_STAGGER_MS / 1000.0
 _STALE_WORKER_THRESHOLD_S: float = 60.0
 
+# STREAM-1: how often to rebuild workers against the refreshed registry
+_DEFAULT_WORKER_REFRESH_S: float = 300.0
+
 
 class StreamManager:
     def __init__(
         self,
         registry=None,
         process_fn: Optional[Callable[[dict], Awaitable[None]]] = None,
+        worker_refresh_s: float = _DEFAULT_WORKER_REFRESH_S,
     ):
-        self._registry    = registry
-        self._process_fn  = process_fn
+        self._registry         = registry
+        self._process_fn       = process_fn
+        self._worker_refresh_s = worker_refresh_s
         self._workers:    list = []
         self._tasks:      list = []
         self._consumer:   Optional[asyncio.Task] = None
@@ -84,15 +104,26 @@ class StreamManager:
         log.info("[stream_manager] All workers stopped")
 
     async def run(self):
-        """Long-running entry point (original API)."""
+        """
+        Long-running entry point (original API).
+
+        STREAM-1: every _worker_refresh_s seconds, call _respawn_workers()
+        so workers stay in sync with the latest registry symbol set after
+        registry.refresh_loop() completes a new build().
+        """
         self._running = True
         self._queue = asyncio.Queue(maxsize=_QUEUE_SIZE)
         log.info("[stream_manager] Starting...")
         await self._spawn_workers()
         self._consumer = asyncio.create_task(self._consume_queue())
+        elapsed = 0.0
         try:
             while self._running:
                 await asyncio.sleep(60)
+                elapsed += 60.0
+                if elapsed >= self._worker_refresh_s:
+                    elapsed = 0.0
+                    await self._respawn_workers()
         except asyncio.CancelledError:
             await self.stop()
             raise
@@ -141,6 +172,83 @@ class StreamManager:
             self._workers.append(worker)
             task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
             self._tasks.append(task)
+        log.info(
+            "[stream_manager] Spawned %d workers for %d OCC symbols",
+            len(self._workers), len(all_symbols),
+        )
+
+    async def _respawn_workers(self):
+        """
+        STREAM-1: Replace all workers with fresh ones keyed to the current
+        registry.all_symbols() set.
+
+        Sequence:
+          1. Grab the new symbol list from the registry
+          2. If the set is identical to what workers already have, skip
+          3. Cancel old tasks (workers stop after current reconnect cycle)
+          4. Spawn new workers against the updated symbol set
+        """
+        if self._registry is None:
+            return
+        try:
+            from services.stream_worker import StreamWorker
+        except ImportError:
+            return
+
+        new_symbols = self._registry.all_symbols()
+        if not new_symbols:
+            log.warning("[stream_manager] _respawn_workers: registry empty — skipping")
+            return
+
+        # Skip if symbol set hasn't changed
+        old_set = set()
+        for w in self._workers:
+            old_set.update(w.symbols)
+        new_set = set(new_symbols)
+        if new_set == old_set:
+            log.debug(
+                "[stream_manager] _respawn_workers: symbol set unchanged (%d) — skipping",
+                len(new_set),
+            )
+            return
+
+        log.info(
+            "[stream_manager] _respawn_workers: registry updated "
+            "old=%d new=%d — replacing workers",
+            len(old_set), len(new_set),
+        )
+
+        # Cancel old tasks
+        for task in self._tasks:
+            if task is not None:
+                task.cancel()
+        old_tasks = [t for t in self._tasks if t is not None]
+        if old_tasks:
+            await asyncio.gather(*old_tasks, return_exceptions=True)
+
+        # Spawn fresh workers
+        chunks = [
+            new_symbols[i:i + _CHUNK_SIZE]
+            for i in range(0, len(new_symbols), _CHUNK_SIZE)
+        ]
+        self._workers = []
+        self._tasks   = []
+        for idx, chunk in enumerate(chunks):
+            startup_delay = idx * _WORKER_STARTUP_STAGGER_S
+            worker = StreamWorker(
+                worker_id       = idx,
+                symbols         = chunk,
+                event_queue     = self._queue,
+                startup_delay_s = startup_delay,
+            )
+            self._workers.append(worker)
+            task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
+            self._tasks.append(task)
+
+        log.info(
+            "[stream_manager] _respawn_workers: %d new workers spawned for %d OCC symbols",
+            len(self._workers), len(new_symbols),
+        )
 
     async def _consume_queue(self):
         if self._queue is None:
