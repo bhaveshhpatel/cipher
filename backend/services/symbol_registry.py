@@ -3,13 +3,13 @@ services/symbol_registry.py — Layer 1: OCC Symbol Registry
 
 FIX P3 (2026-04-27): _build_ticker now uses get_option_chain_bulk() instead
   of get_option_chain() so build() uses _BULK_CHAIN_SEM(10) rather than the
-  live-stream _CHAIN_SEM(2). Cold-start chain throughput increases ~5×.
+  live-stream _CHAIN_SEM(2). Cold-start chain throughput increases ~5x.
 
 FIX P4 (2026-04-27): build() now performs an incremental warm-restart when
   the registry was pre-seeded from DB (load_from_db returned > 0 rows). Only
   tickers whose minimum DTE in the seeded registry is 0 (contracts expired
   today) are re-fetched; all other tickers are carried forward unchanged.
-  Warm-restart chain API calls drop from ~17,360 to ~50–400.
+  Warm-restart chain API calls drop from ~17,360 to ~50-400.
 
 FIX C-3 (2026-04-27): assign_tiers() is now called with require_oi=True
   in the post-build reclassification step. This ensures OI is enforced in
@@ -28,6 +28,25 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
   always doing a full rebuild after the first build().
+
+FIX M-1 (2026-04-28): Replaced is_ready() len-check with a dedicated
+  _build_complete flag set only at the very end of build(). The stream now
+  waits until build() has fully finished rather than unblocking the moment
+  the first DB-seeded contract appears in the registry, which caused the
+  warm-start worker count mismatch (37 vs the expected 45).
+
+FIX M-2 (2026-04-28): is_ready() now returns self._build_complete instead
+  of len(self._registry) > 0. load_from_db() does NOT set _build_complete;
+  build() sets it at the very end (inside the lock, after self._registry is
+  swapped). This guarantees stream workers only spawn against a fully-built,
+  fresh-Tradier registry — never a partially-seeded DB snapshot.
+
+FIX M-3 (2026-04-28): _post_build_upsert is split into two separately
+  guarded phases. assign_tiers() failure is caught and re-raised so
+  upsert_symbol_quotes() is skipped (was silently swallowed). A dedicated
+  error counter and warning log make the failure visible without taking down
+  the process. The outer non-fatal wrapper in main.py still protects the
+  background task but now sees the raised exception.
 """
 import asyncio
 import logging
@@ -96,6 +115,12 @@ class SymbolRegistry:
         self._persisted_snapshot_id: Optional[str] = None
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
+        # M-1/M-2: dedicated build-complete flag.
+        # load_from_db() does NOT set this — it only populates the registry
+        # with stale DB data. build() sets it at the very end, inside the
+        # lock, after self._registry is swapped to the freshly-built data.
+        # stream_options_flow() polls is_ready() which checks this flag.
+        self._build_complete: bool = False
         # H3: _seeded_from_db removed — self._registry itself is the guard
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
@@ -111,7 +136,13 @@ class SymbolRegistry:
         return self._stock_prices.get(ticker, 0.0)
 
     def is_ready(self) -> bool:
-        return len(self._registry) > 0
+        # M-2: return _build_complete, NOT len(self._registry) > 0.
+        # The registry may be non-empty from load_from_db() (stale DB seed)
+        # long before build() has finished fetching fresh Tradier data.
+        # Returning True too early causes stream workers to spawn against
+        # a partially-seeded registry, leading to the M-1 worker-count
+        # mismatch (all_symbols() called before build() completes).
+        return self._build_complete
 
     def set_tier_map(self, tier_map: dict[str, int]) -> None:
         self._tier_map = tier_map
@@ -138,6 +169,8 @@ class SymbolRegistry:
             return 0
         self._registry = chain
         self._persisted_snapshot_id = snapshot_id
+        # M-1/M-2: do NOT set _build_complete here.
+        # The chain is stale DB data — stream workers must not unblock yet.
         # H3: no _seeded_from_db flag — populated registry is the signal
         # Rebuild OI map from the loaded chain
         oi_acc: dict[str, list[int]] = {}
@@ -148,7 +181,8 @@ class SymbolRegistry:
         }
         log.info(
             "[symbol_registry] load_from_db: seeded %d OCC contracts from DB "
-            "(snapshot %s, oi_map=%d tickers) — registry ready before build()",
+            "(snapshot %s, oi_map=%d tickers) — waiting for build() to set "
+            "_build_complete before stream workers are allowed to spawn",
             len(chain), snapshot_id, len(self._oi_by_ticker),
         )
         return len(chain)
@@ -162,10 +196,6 @@ class SymbolRegistry:
           prior build()), skip tickers whose minimum DTE is > 0.
           Only re-fetch tickers that have expired contracts (min_dte == 0)
           or are missing from the registry entirely.
-          The old _seeded_from_db flag has been removed; the registry itself
-          is the authoritative signal.  This means scheduled refresh_loop()
-          calls also benefit from incremental mode — they no longer fall back
-          to a full rebuild after the first build() clears the old flag.
 
         H1 — Return raw_quotes:
           Returns tuple[int, dict[str, dict]] so callers can reuse the
@@ -175,6 +205,12 @@ class SymbolRegistry:
           assign_tiers() is called with require_oi=True so OI gates are
           enforced only after build() has populated oi_by_ticker from
           chain fetches.
+
+        M-1/M-2 — _build_complete flag:
+          self._build_complete is set to True at the very end of this
+          method, inside the lock, after self._registry is swapped.
+          is_ready() returns self._build_complete, so stream workers will
+          not spawn until build() has fully completed with fresh data.
         """
         from services.ingestion_config import get_config
         from services.tier_engine import _fetch_thresholds, assign_tiers
@@ -307,12 +343,19 @@ class SymbolRegistry:
             self._last_build   = datetime.utcnow()
             # H3: no _seeded_from_db = False reset needed — flag is gone
 
+            # M-1/M-2: set _build_complete AFTER self._registry is swapped.
+            # This is the only place this flag is set to True.
+            # stream_options_flow() polls is_ready() which reads this flag,
+            # so it will not unblock until the full fresh registry is live.
+            self._build_complete = True
+
             t_counts = {1: 0, 2: 0, 3: 0}
             for m in new_registry.values():
                 t_counts[m.tier] = t_counts.get(m.tier, 0) + 1
             log.info(
                 "[symbol_registry] Build complete: %d OCC symbols "
-                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers",
+                "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers "
+                "| _build_complete=True — stream workers may now spawn",
                 len(new_registry),
                 t_counts[1], t_counts[2], t_counts[3],
                 old_count, len(new_registry) - old_count,
@@ -455,53 +498,52 @@ class SymbolRegistry:
                     oi = int(contract.get("open_interest", 0) or 0)
                     if oi < params.min_oi:
                         continue
-
+                    opt_type = (contract.get("option_type") or "").upper()
+                    if opt_type not in ("C", "P", "CALL", "PUT"):
+                        continue
+                    contract_type = "CALL" if opt_type in ("C", "CALL") else "PUT"
                     occ_symbol = contract.get("symbol", "").strip()
                     if not occ_symbol:
                         continue
-
-                    ctype_raw = contract.get("option_type", "").upper()
-                    ctype = "CALL" if ctype_raw in ("C", "CALL") else "PUT"
-
                     registry[occ_symbol] = ContractMeta(
                         ticker        = ticker,
                         strike        = strike,
                         expiry        = expiry_str,
-                        contract_type = ctype,
+                        contract_type = contract_type,
                         dte           = dte,
                         open_interest = oi,
-                        tier          = tier,
+                        tier          = self._tier_map.get(ticker, 3),
                     )
-                except Exception:
-                    continue
+                except Exception as inner_exc:
+                    log.debug(
+                        "[symbol_registry] %s: contract parse error: %s",
+                        ticker, inner_exc,
+                    )
 
-        loaded_ois = [
-            m.open_interest
-            for m in registry.values()
-            if m.ticker == ticker
-        ]
-        oi_by_ticker[ticker] = int(sum(loaded_ois) / len(loaded_ois)) if loaded_ois else 0
-
-        log.debug(
-            "[symbol_registry] %s (T%d): %d contracts loaded "
-            "(price=$%.2f, atm=+/-%.0f%%, dte<=%d, avg_oi=%d)",
-            ticker, tier, len(loaded_ois), stock_price,
-            params.atm_pct * 100, params.max_dte,
-            oi_by_ticker.get(ticker, 0),
+        total_oi = sum(
+            meta.open_interest
+            for meta in registry.values()
+            if meta.ticker == ticker
         )
+        count = sum(1 for m in registry.values() if m.ticker == ticker)
+        if count > 0:
+            oi_by_ticker[ticker] = total_oi // count
 
 
-_registry: Optional[SymbolRegistry] = None
-
-
-def get_registry() -> Optional[SymbolRegistry]:
-    return _registry
+# ---------------------------------------------------------------------------
+# Module-level singleton helpers
+# ---------------------------------------------------------------------------
+_registry_instance: Optional[SymbolRegistry] = None
 
 
 def init_registry(
-    watchlist: list[str],
+    watchlist: Optional[list[str]] = None,
     tier_map:  Optional[dict[str, int]] = None,
 ) -> SymbolRegistry:
-    global _registry
-    _registry = SymbolRegistry(watchlist=watchlist, tier_map=tier_map or {})
-    return _registry
+    global _registry_instance
+    _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
+    return _registry_instance
+
+
+def get_registry() -> Optional[SymbolRegistry]:
+    return _registry_instance
