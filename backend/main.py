@@ -23,6 +23,8 @@ Key architectural fixes:
   D-001 (tradier_stream) — pass registry to stream_options_flow(), no duplicate build
   D-002 (tradier_stream) — remove extra refresh_loop() create_task from stream
   RC-3 (ingestion_config) — validate_ingestion_config() at startup warns on missing DB rows
+  H1   (main)         — _post_build_upsert reuses raw_quotes from build();
+                        no duplicate _fetch_batch_quotes call on warm-restart
 """
 import asyncio
 import json
@@ -31,6 +33,7 @@ import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
+from typing import Optional
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -211,12 +214,64 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
-async def _post_build_upsert(registry, stream_symbols: list[str]) -> None:
+async def _post_build_upsert(
+    registry,
+    stream_symbols: list[str],
+    raw_quotes: Optional[dict[str, dict]] = None,
+) -> None:
+    """
+    H1 fix: when raw_quotes is provided (passed from _background_build_and_upsert
+    after build() returns them), build SymbolQuote objects directly from that
+    dict instead of calling _fetch_batch_quotes() again.  The duplicate Tradier
+    batch-quotes call that previously fired on every warm-restart is eliminated.
+
+    When raw_quotes is None (legacy / standalone callers), fall back to
+    fetching quotes from Tradier so behaviour is unchanged for those callers.
+    """
+    from services.symbols_loader import SymbolQuote
     try:
-        log.info("[post_build] Fetching quotes for %d symbols", len(stream_symbols))
-        quotes = await _fetch_batch_quotes(stream_symbols)
+        if raw_quotes is not None:
+            log.info(
+                "[post_build] Reusing %d raw_quotes from build() — "
+                "skipping duplicate _fetch_batch_quotes call",
+                len(raw_quotes),
+            )
+            oi_map = registry.get_oi_map()
+            quotes = []
+            for sym in stream_symbols:
+                q = raw_quotes.get(sym, {})
+                price = 0.0
+                for key in ("last", "last_price", "close", "prevclose"):
+                    val = q.get(key)
+                    if val:
+                        try:
+                            price = float(val)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+                vol = avg_vol = 0
+                try:
+                    vol = int(q.get("volume") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    avg_vol = int(q.get("average_volume") or 0)
+                except (TypeError, ValueError):
+                    pass
+                if price > 0:
+                    quotes.append(SymbolQuote(
+                        symbol         = sym,
+                        last_price     = price,
+                        volume         = vol,
+                        average_volume = avg_vol,
+                        open_interest  = oi_map.get(sym, 0),
+                    ))
+        else:
+            log.info("[post_build] Fetching quotes for %d symbols", len(stream_symbols))
+            quotes = await _fetch_batch_quotes(stream_symbols)
+
         if not quotes:
-            log.warning("[post_build] No quotes returned — skipping upsert")
+            log.warning("[post_build] No quotes available — skipping upsert")
             return
 
         oi_map = registry.get_oi_map()
@@ -244,12 +299,12 @@ async def _post_build_upsert(registry, stream_symbols: list[str]) -> None:
 async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
     log.info("[registry] Background build starting (server already live)")
     try:
-        await registry.build()
-        log.info("[registry] Background build complete: %d OCC symbols", registry.size())
+        count, raw_quotes = await registry.build()  # H1: unpack tuple
+        log.info("[registry] Background build complete: %d OCC symbols", count)
     except Exception as exc:
         log.error("[registry] Background build failed: %s", exc, exc_info=True)
         return
-    await _post_build_upsert(registry, stream_symbols)
+    await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)  # H1: pass raw_quotes
 
 
 async def _universe_refresh_loop():
@@ -341,10 +396,10 @@ async def _registry_prewarm_loop() -> None:
             if registry is None:
                 log.warning("[prewarm] Registry not initialised — skipping pre-warm")
                 continue
-            count = await registry.build()
+            count, _ = await registry.build()  # H1: unpack tuple
             log.info(
                 "[prewarm] Registry warm: %d OCC contracts ready for market open",
-                count or 0,
+                count,
             )
         except Exception as exc:
             log.error("[prewarm] Registry pre-warm failed (non-fatal): %s", exc, exc_info=True)
@@ -352,7 +407,7 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend…")
+    log.info("Starting Cipher backend\u2026")
 
     # RC-3: validate ingestion config rows at startup — warns on missing DB keys
     await validate_ingestion_config()
