@@ -35,10 +35,16 @@ Feature 4A-OI (2026-04-25):
   with the avg chain OI value from registry.get_oi_map(), populated by main.py.
   This column is no longer NULL after the first full startup cycle.
 
-FIX (2026-04-27):
+FIX (2026-04-27a):
   _load_symbols() now filters on stream_eligible=True so warm restarts
   only pass the price/volume-filtered pool to the registry, not the full
   ~5,270 raw CBOE dump.
+
+FIX (2026-04-27b):
+  _load_symbols() and _sync_load_tier_map() now paginate in _PAGE_SIZE
+  chunks to bypass Supabase PostgREST's silent 1000-row cap. Previously
+  every warm-start was truncated at exactly 1000 symbols regardless of
+  how many stream_eligible rows were in the snapshot.
 """
 import asyncio
 import logging
@@ -57,6 +63,7 @@ log = logging.getLogger("universe_store")
 _KEEP_SNAPSHOTS  = 7
 _DEFAULT_MAX_AGE = 24   # hours
 _UPSERT_BATCH    = 500  # rows per upsert batch
+_PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
 
 
 def _client() -> Client:
@@ -140,6 +147,49 @@ async def upsert_symbol_quotes(
 
 
 # ---------------------------------------------------------------------------
+# Pagination helper
+# ---------------------------------------------------------------------------
+
+def _paginate_symbols(
+    sb: Client,
+    snapshot_id: str,
+    select_cols: str,
+    extra_filters: Optional[dict] = None,
+) -> list[dict]:
+    """
+    Fetch ALL rows from options_universe_symbols for a given snapshot_id,
+    paginating in _PAGE_SIZE chunks to bypass PostgREST's 1000-row default cap.
+
+    extra_filters: dict of {column: value} applied as .eq(col, val) filters.
+    Returns the full list of row dicts.
+    """
+    all_rows: list[dict] = []
+    offset = 0
+    while True:
+        q = (
+            sb.table("options_universe_symbols")
+            .select(select_cols)
+            .eq("snapshot_id", snapshot_id)
+        )
+        if extra_filters:
+            for col, val in extra_filters.items():
+                q = q.eq(col, val)
+        result = (
+            q
+            .order("symbol")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        page = result.data or []
+        all_rows.extend(page)
+        if len(page) < _PAGE_SIZE:
+            # Last page — no more rows
+            break
+        offset += _PAGE_SIZE
+    return all_rows
+
+
+# ---------------------------------------------------------------------------
 # Sync implementations
 # ---------------------------------------------------------------------------
 
@@ -201,7 +251,7 @@ def _sync_load_any_snapshot() -> Optional[list[str]]:
 def _sync_load_tier_map() -> dict[str, int]:
     """
     Load symbol -> tier mapping from the current active snapshot.
-    Queries options_universe_symbols for the active snapshot_id.
+    Paginates in _PAGE_SIZE chunks to bypass Supabase's 1000-row cap.
     Symbols with NULL or missing tier column default to 3.
     Returns {} on error or missing snapshot.
     """
@@ -222,19 +272,16 @@ def _sync_load_tier_map() -> dict[str, int]:
             return {}
 
         snapshot_id = rows[0]["id"]
-        result = (
-            sb.table("options_universe_symbols")
-            .select("symbol, tier")
-            .eq("snapshot_id", snapshot_id)
-            .eq("stream_eligible", True)
-            .execute()
+
+        all_rows = _paginate_symbols(
+            sb, snapshot_id,
+            select_cols="symbol, tier",
+            extra_filters={"stream_eligible": True},
         )
-        # FIX: use r.get("tier") instead of r["tier"] so rows missing the
-        # tier column (pre-migration 010 data) silently default to 3 rather
-        # than raising a KeyError and returning an empty map.
+
         tier_map = {
             r["symbol"]: int(r.get("tier") or 3)
-            for r in (result.data or [])
+            for r in all_rows
             if r.get("symbol")
         }
         log.info(
@@ -251,23 +298,25 @@ def _sync_load_tier_map() -> dict[str, int]:
 
 
 def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
-    """Load only stream-eligible symbols from the snapshot.
+    """
+    Load only stream-eligible symbols from the snapshot, paginating in
+    _PAGE_SIZE chunks to bypass Supabase PostgREST's silent 1000-row cap.
 
     Filtering on stream_eligible=True ensures warm restarts pass the
     price/volume-filtered pool (~1000-2000 symbols) to the registry
     rather than the full ~5,270 raw CBOE dump.
     """
     try:
-        result = (
-            sb.table("options_universe_symbols")
-            .select("symbol")
-            .eq("snapshot_id", snapshot_id)
-            .eq("stream_eligible", True)   # only load symbols that passed price/volume gate
-            .execute()
+        all_rows = _paginate_symbols(
+            sb, snapshot_id,
+            select_cols="symbol",
+            extra_filters={"stream_eligible": True},
         )
-        rows    = result.data or []
-        symbols = [r["symbol"] for r in rows if r.get("symbol")]
-        log.info("universe_store: loaded %d stream-eligible symbols from snapshot %s", len(symbols), snapshot_id)
+        symbols = [r["symbol"] for r in all_rows if r.get("symbol")]
+        log.info(
+            "universe_store: loaded %d stream-eligible symbols from snapshot %s",
+            len(symbols), snapshot_id,
+        )
         return symbols if symbols else None
     except Exception as e:
         log.error("universe_store._load_symbols error snapshot=%s: %s", snapshot_id, e, exc_info=True)
