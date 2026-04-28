@@ -7,6 +7,9 @@ Updated 2026-04-24: add TR-01…TR-05 for load_tier_map (Feature 4A).
 Updated 2026-04-25: add US-OI-01…US-OI-04 for open_interest upsert (Feature 4A-OI).
 Updated 2026-04-27: wire .range() into mock chain so _paginate_symbols resolves
   correctly; add terminating empty-page side_effect entries for all paginated paths.
+Updated 2026-04-27c: update TestSaveSnapshot assertions from .insert() to .upsert()
+  now that _sync_save_snapshot uses upsert(on_conflict=snapshot_id,symbol) for
+  symbol rows to prevent duplicates on repeated cold-start runs.
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -25,7 +28,7 @@ def _make_sb_mock():
     query.in_.return_value     = query
     query.order.return_value   = query
     query.limit.return_value   = query
-    query.range.return_value   = query   # <-- fix: _paginate_symbols calls .range()
+    query.range.return_value   = query
     query.insert.return_value  = query
     query.update.return_value  = query
     query.delete.return_value  = query
@@ -56,9 +59,7 @@ class TestLoadFreshSnapshot:
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-001"
         query.execute.side_effect = [
-            # 1) snapshot header lookup
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
-            # 2) _paginate_symbols page 1 — returns 2 symbols (< _PAGE_SIZE, terminates loop)
             MagicMock(data=[{"symbol": "AAPL"}, {"symbol": "TSLA"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -82,7 +83,6 @@ class TestLoadFreshSnapshot:
         snapshot_id = "snap-uuid-002"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
-            # _paginate_symbols page 1 — empty → loop terminates, symbols=[]
             MagicMock(data=[]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -99,9 +99,7 @@ class TestLoadAnySnapshot:
         snapshot_id = "snap-uuid-old"
         stale_time  = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
         query.execute.side_effect = [
-            # 1) snapshot header lookup
             MagicMock(data=[{"id": snapshot_id, "fetched_at": stale_time, "source": "tradier_validated"}]),
-            # 2) _paginate_symbols page 1 — returns 2 symbols (< _PAGE_SIZE, terminates)
             MagicMock(data=[{"symbol": "SPY"}, {"symbol": "QQQ"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -122,7 +120,7 @@ class TestLoadAnySnapshot:
 
 
 # ---------------------------------------------------------------------------
-# save_snapshot — including stream_eligible_set
+# save_snapshot
 # ---------------------------------------------------------------------------
 class TestSaveSnapshot:
 
@@ -153,7 +151,9 @@ class TestSaveSnapshot:
         eligible_set = {"AAPL"}
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", eligible_set)
-        symbol_batch = query.insert.call_args_list[1].args[0]
+        # Symbol rows are written via upsert (not insert) since the idempotent-write refactor.
+        # upsert call_args_list[0] is the first (and only) symbol batch.
+        symbol_batch = query.upsert.call_args_list[0].args[0]
         by_symbol = {r["symbol"]: r for r in symbol_batch}
         assert by_symbol["AAPL"]["stream_eligible"] is True
         assert by_symbol["TSLA"]["stream_eligible"] is False
@@ -163,7 +163,8 @@ class TestSaveSnapshot:
         query.execute.return_value = MagicMock(data=[])
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["SPY", "QQQ"], "tradier_validated", None)
-        symbol_batch = query.insert.call_args_list[1].args[0]
+        # Symbol rows are written via upsert; first upsert call is the symbol batch.
+        symbol_batch = query.upsert.call_args_list[0].args[0]
         for row in symbol_batch:
             assert row["stream_eligible"] is True
 
@@ -173,6 +174,7 @@ class TestSaveSnapshot:
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(["AAPL"], "tradier_validated", None)
         assert result is True
+        # The snapshot header is still written via .insert() (single dict, not a list).
         first_insert = query.insert.call_args_list[0].args[0]
         assert "id" in first_insert
         assert "-" in first_insert["id"]
@@ -182,8 +184,10 @@ class TestSaveSnapshot:
         query.execute.return_value = MagicMock(data=[])
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", None)
-        snapshot_id  = query.insert.call_args_list[0].args[0]["id"]
-        symbol_batch = query.insert.call_args_list[1].args[0]
+        # Snapshot header written via insert (single dict).
+        snapshot_id = query.insert.call_args_list[0].args[0]["id"]
+        # Symbol rows written via upsert; first upsert call is the symbol batch.
+        symbol_batch = query.upsert.call_args_list[0].args[0]
         for row in symbol_batch:
             assert row["snapshot_id"] == snapshot_id
         neq_calls = [c for c in query.method_calls if c[0] == "neq"]
@@ -200,7 +204,9 @@ class TestSaveSnapshot:
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(big_symbols, "tradier_validated", None)
         assert result is True
-        assert query.insert.call_count == 4
+        # Snapshot header = 1 insert call. Symbol rows = 3 upsert calls (500+500+200).
+        assert query.insert.call_count == 1
+        assert query.upsert.call_count == 3
 
     def test_prunes_when_over_limit(self):
         sb, query   = _make_sb_mock()
@@ -210,6 +216,7 @@ class TestSaveSnapshot:
             MagicMock(data=[]),
             MagicMock(data=[]),
             MagicMock(data=existing),
+            MagicMock(data=[]),
             MagicMock(data=[]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -245,9 +252,7 @@ class TestLoadTierMap:
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-tier-001"
         query.execute.side_effect = [
-            # 1) snapshot header
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
-            # 2) _paginate_symbols page 1 (< _PAGE_SIZE, loop terminates)
             MagicMock(data=[{"symbol": "SPY", "tier": 1}, {"symbol": "HOOD", "tier": 2}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -284,12 +289,10 @@ class TestLoadTierMap:
 
     # TR-04
     def test_tier_column_value_preserved(self):
-        """tier=3 must be stored as int 3, not string '3'."""
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-tier-002"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
-            # page 1 (< _PAGE_SIZE, terminates)
             MagicMock(data=[{"symbol": "XYZ", "tier": 3}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
@@ -303,13 +306,11 @@ class TestLoadTierMap:
 
     # TR-05
     def test_missing_tier_column_defaults_to_3(self):
-        """Rows with no tier key (pre-010 data) must default to tier 3."""
         sb, query = _make_sb_mock()
         snapshot_id = "snap-uuid-tier-003"
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id, "fetched_at": datetime.now(timezone.utc).isoformat()}]),
-            # page 1 (< _PAGE_SIZE, terminates)
-            MagicMock(data=[{"symbol": "LEGACY"}]),  # no tier key
+            MagicMock(data=[{"symbol": "LEGACY"}]),
         ]
         with patch("services.universe_store._client", return_value=sb):
             fn = getattr(universe_store, '_sync_load_tier_map',
@@ -324,17 +325,10 @@ class TestLoadTierMap:
 # upsert_symbol_quotes — open_interest (Feature 4A-OI) — US-OI-01 … US-OI-04
 # ---------------------------------------------------------------------------
 class TestUpsertSymbolQuotesOi:
-    """
-    Feature 4A-OI: _sync_upsert_symbol_quotes() must include open_interest
-    in every upsert row, sourced from quote.open_interest.
-    """
 
     def _run_upsert(self, quotes, tier_map=None):
-        """Run _sync_upsert_symbol_quotes with a mocked active snapshot."""
         sb, query = _make_sb_mock()
         snapshot_id = "snap-oi-test-001"
-        # First execute() call returns the active snapshot id;
-        # subsequent upsert batch execute() calls return empty.
         query.execute.side_effect = [
             MagicMock(data=[{"id": snapshot_id}]),
         ] + [MagicMock(data=[]) for _ in range(10)]
@@ -346,64 +340,41 @@ class TestUpsertSymbolQuotesOi:
 
     # US-OI-01
     def test_open_interest_key_present_in_upsert_row(self):
-        """
-        Every row sent to .upsert() must contain the 'open_interest' key.
-        Regression: before Chunk 1C this key was absent.
-        """
         quotes = [_make_quote("AAPL", open_interest=2000)]
         query  = self._run_upsert(quotes)
-
         upsert_calls = query.upsert.call_args_list
-        assert upsert_calls, "upsert() was never called — snapshot lookup may have failed"
+        assert upsert_calls, "upsert() was never called"
         rows = upsert_calls[0].args[0]
         assert isinstance(rows, list) and len(rows) > 0
-        assert "open_interest" in rows[0], (
-            "'open_interest' key missing from upsert row. "
-            "Chunk 1C (universe_store) may have been reverted."
-        )
+        assert "open_interest" in rows[0]
 
     # US-OI-02
     def test_open_interest_value_sourced_from_quote(self):
-        """The upserted open_interest value must match quote.open_interest exactly."""
         quotes = [
             _make_quote("SPY",  open_interest=5_000),
             _make_quote("HOOD", open_interest=600),
         ]
         query = self._run_upsert(quotes)
-
         rows      = query.upsert.call_args_list[0].args[0]
         by_symbol = {r["symbol"]: r for r in rows}
-
         assert by_symbol["SPY"]["open_interest"]  == 5_000
         assert by_symbol["HOOD"]["open_interest"] == 600
 
     # US-OI-03
     def test_open_interest_none_written_as_none(self):
-        """
-        If quote.open_interest is None (e.g. symbol had no registry entry),
-        None must be written to DB rather than silently omitted or defaulted.
-        """
         quotes = [_make_quote("SPCE", open_interest=None)]
         query  = self._run_upsert(quotes)
-
         rows = query.upsert.call_args_list[0].args[0]
-        assert rows[0]["open_interest"] is None, (
-            "open_interest=None should be written as NULL, not omitted."
-        )
+        assert rows[0]["open_interest"] is None
 
     # US-OI-04
     def test_open_interest_and_tier_both_present_in_same_row(self):
-        """
-        Both open_interest (4A-OI) and tier (4A) must coexist in the same
-        upsert row — neither should overwrite or displace the other.
-        """
         quotes   = [_make_quote("TSLA", open_interest=1_500)]
         tier_map = {"TSLA": 1}
         query    = self._run_upsert(quotes, tier_map)
-
         rows = query.upsert.call_args_list[0].args[0]
         row  = rows[0]
-        assert "open_interest" in row, "open_interest missing from upsert row"
-        assert "tier"           in row, "tier missing from upsert row"
+        assert "open_interest" in row
+        assert "tier"           in row
         assert row["open_interest"] == 1_500
         assert row["tier"]          == 1

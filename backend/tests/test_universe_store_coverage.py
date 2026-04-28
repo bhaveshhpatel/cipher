@@ -17,8 +17,11 @@ Targets uncovered lines:
   - _sync_upsert_symbol_quotes: no active snapshot → logs warning, returns
   - _sync_upsert_symbol_quotes: exception → logs warning, does not raise
 Updated 2026-04-27: wire .range() into mock chain for _paginate_symbols compat.
+Updated 2026-04-27d: test_prune_deletes_excess_snapshots now asserts .in_ is
+  called twice (symbol rows first, then snapshot headers) after _prune_old_snapshots
+  was updated to delete child symbol rows before parent snapshot rows.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 from services.universe_store import (
     _prune_old_snapshots,
     _sync_save_snapshot,
@@ -55,8 +58,13 @@ def test_prune_deletes_excess_snapshots():
     sb, q = _mock_sb()
     rows = [{"id": f"s{i}"} for i in range(10)]
     q.execute.return_value = MagicMock(data=rows)
+    excess_ids = [r["id"] for r in rows[7:]]
     _prune_old_snapshots(sb, keep=7)
-    q.in_.assert_called_once_with("id", [r["id"] for r in rows[7:]])
+    # _prune_old_snapshots now deletes child symbol rows first, then snapshot headers.
+    # in_ is called twice: once for options_universe_symbols, once for options_universe_snapshots.
+    assert q.in_.call_count == 2
+    q.in_.assert_any_call("snapshot_id", excess_ids)
+    q.in_.assert_any_call("id", excess_ids)
 
 
 def test_prune_exception_does_not_raise():
@@ -122,11 +130,9 @@ def test_load_tier_map_no_active_snapshot_returns_empty():
 
 
 def test_load_tier_map_null_tier_defaults_to_3():
-    sb, q = _mock_sb()  # range() already wired via _mock_sb()
+    sb, q = _mock_sb()
     q.execute.side_effect = [
-        # 1) snapshot header lookup
         MagicMock(data=[{"id": "snap-1"}]),
-        # 2) _paginate_symbols page 1 (< _PAGE_SIZE, loop terminates)
         MagicMock(data=[{"symbol": "AAPL", "tier": None}]),
     ]
     with patch("services.universe_store._client", return_value=sb):
