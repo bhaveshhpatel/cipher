@@ -41,12 +41,26 @@ Fix (C-015):
   - _process_trade now accepts both "timesale" and "trade" envelope types.
 
 Architecture change (Layer 1+2):
-  - stream_options_flow() now builds the OCC SymbolRegistry first, then
-    delegates to StreamManager which spawns parallel StreamWorker instances
-    (500 OCC symbols per connection). This ensures Tradier receives full OCC
-    contract strings (e.g. "AAPL  260117C00180000") instead of ticker symbols,
-    which was the root cause of receiving equity events instead of option events.
+  - stream_options_flow() now accepts an optional `registry` parameter so
+    main.py lifespan can pass the already-initialised registry, avoiding
+    a duplicate init_registry() + build() call (fix D-001).
+  - When a registry is provided, stream_options_flow() waits until
+    registry.is_ready() before spawning StreamManager workers, instead
+    of building its own copy from scratch.
   - occ_symbol field now passed through to persist_flow_event() and stored in DB.
+
+Fix D-001 (2026-04-27) — Duplicate build():
+  stream_options_flow() was calling init_registry() + registry.build() every
+  time, creating a SECOND SymbolRegistry instance independent of the one in
+  main.py lifespan. Both builds ran concurrently at startup, doubling chain
+  API calls and producing two separate in-memory registries. Fixed by passing
+  the existing registry from lifespan; stream waits for is_ready().
+
+Fix D-002 (2026-04-27) — Double refresh_loop():
+  stream_options_flow() also spawned asyncio.create_task(registry.refresh_loop()),
+  duplicating the one already launched in main.py lifespan. Both loops competed
+  for _build_lock and doubled scheduled refresh frequency. The create_task call
+  is removed; lifecycle ownership stays in main.py.
 
 Fix (C-018) — Synthetic Quote Tagging:
   - is_synthetic_quote is now forwarded from OptionsFlowEvent through
@@ -192,7 +206,12 @@ _BACKOFF_CAP         = 60.0
 _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
-_PERSIST_TIMEOUT     = 2.0   # max seconds to wait for persist_flow_event()
+_PERSIST_TIMEOUT     = 2.0
+
+# How long to wait for the background build() to complete before
+# streaming starts. We poll every 500ms up to this limit.
+_REGISTRY_READY_TIMEOUT_S = 1800.0  # 30 min (full cold-start upper bound)
+_REGISTRY_READY_POLL_S    = 0.5
 
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
@@ -212,7 +231,7 @@ _stats = {
     "deduped":           0,
     "signals":           0,
     "errors":            0,
-    "composite_errors":  0,   # issue #6: build_composite failures, separate from DB errors
+    "composite_errors":  0,
     "reconnects":        0,
     "mode":              "starting",
     "last_tick_at":      None,
@@ -221,8 +240,6 @@ _stats = {
 
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
 
-# Guard against double-dispatch of retroactive sweep upgrade tasks (issue #5).
-# Key = (occ_symbol, size, fill_price) stringified; entry added before create_task.
 _sweep_upgrade_dispatched: Set[str] = set()
 
 
@@ -298,7 +315,22 @@ async def _get_session_token() -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Main streaming entry point
 # ---------------------------------------------------------------------------
-async def stream_options_flow(symbols: list[str]):
+async def stream_options_flow(
+    symbols: list[str],
+    registry=None,   # D-001: accept pre-built registry from lifespan
+):
+    """
+    Main entry point for the Tradier options stream.
+
+    D-001: When `registry` is provided (passed from main.py lifespan), skip
+    init_registry() and build() entirely. Instead, wait until
+    registry.is_ready() is True (background build complete) before spawning
+    StreamManager workers. This eliminates the duplicate build() that was
+    causing double chain API calls and two independent SymbolRegistry instances.
+
+    When `registry` is None (standalone / test usage), fall back to the
+    original behaviour of building a fresh registry inline.
+    """
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
@@ -307,30 +339,61 @@ async def stream_options_flow(symbols: list[str]):
         _stats["mode"] = "idle"
         return
 
-    from services.symbol_registry import init_registry
     from services.stream_manager import StreamManager
 
-    log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
-    registry = init_registry(watchlist=symbols)
+    if registry is not None:
+        # D-001: registry owned and built by lifespan — just wait for it
+        log.info(
+            "[stream] Registry provided by lifespan (is_ready=%s, %d OCC symbols). "
+            "Waiting for background build to complete before spawning workers...",
+            registry.is_ready(), registry.size(),
+        )
+        waited = 0.0
+        while not registry.is_ready() and waited < _REGISTRY_READY_TIMEOUT_S:
+            await asyncio.sleep(_REGISTRY_READY_POLL_S)
+            waited += _REGISTRY_READY_POLL_S
 
-    try:
-        occ_count = await registry.build()
-    except Exception as e:
-        log.error(f"[stream] OCC registry build failed: {e} — stream idle. Use admin panel to start demo engine.")
-        _stats["mode"] = "idle"
-        return
+        if not registry.is_ready():
+            log.error(
+                "[stream] Registry still not ready after %.0fs — "
+                "stream idle. Use admin panel to start demo engine.",
+                _REGISTRY_READY_TIMEOUT_S,
+            )
+            _stats["mode"] = "idle"
+            return
 
-    _stats["active_symbols"] = occ_count
+        log.info(
+            "[stream] Registry ready: %d OCC contracts (waited=%.1fs) — "
+            "starting stream manager",
+            registry.size(), waited,
+        )
+    else:
+        # Standalone / test path — build our own registry
+        from services.symbol_registry import init_registry as _init_registry
+        log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
+        registry = _init_registry(watchlist=symbols)
+        try:
+            occ_count = await registry.build()
+        except Exception as e:
+            log.error(
+                f"[stream] OCC registry build failed: {e} — "
+                "stream idle. Use admin panel to start demo engine."
+            )
+            _stats["mode"] = "idle"
+            return
 
-    if occ_count == 0:
-        log.warning("[stream] OCC registry is empty — stream idle. Use admin panel to start demo engine.")
-        _stats["mode"] = "idle"
-        return
+        if occ_count == 0:
+            log.warning("[stream] OCC registry is empty — stream idle. Use admin panel to start demo engine.")
+            _stats["mode"] = "idle"
+            return
 
-    log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
+        log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
+        # D-002: only spawn refresh_loop here in standalone mode.
+        # When registry comes from lifespan, lifespan already owns refresh_loop.
+        asyncio.create_task(registry.refresh_loop())
+
+    _stats["active_symbols"] = registry.size()
     _stats["mode"] = "live"
-
-    asyncio.create_task(registry.refresh_loop())
 
     manager = StreamManager(registry=registry, process_fn=_process_trade)
     await manager.run()
@@ -391,9 +454,6 @@ async def _process_trade(raw: dict):
     if not ev:
         return
 
-    # ------------------------------------------------------------------
-    # Layer 4: Deduplication (C-019 + C-020)
-    # ------------------------------------------------------------------
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
@@ -411,9 +471,6 @@ async def _process_trade(raw: dict):
             f"fill={ev.fill_price} exch={exchange}"
         )
 
-        # C-003: retroactive sweep upgrade
-        # _sweep_upgrade_dispatched guards against double create_task when
-        # two concurrent workers both see exch_count == sweep_min (issue #5).
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if exch_count == flow_dedup._sweep_min:
             dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
@@ -434,7 +491,6 @@ async def _process_trade(raw: dict):
 
         return
 
-    # Canonical print — inline sweep upgrade if pattern established
     if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
         real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
         if ev.trade_type != "SWEEP":
@@ -456,13 +512,9 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
-    # ------------------------------------------------------------------
-    # C-008: Decoupled persist tier / signal tier
-    # ------------------------------------------------------------------
-    persist_ep = await accumulator.ingest_tick(ev)                       # above threshold? (no cooldown)
-    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)  # cooldown passed?
+    persist_ep = await accumulator.ingest_tick(ev)
+    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)
 
-    # Persist every qualifying tick to flow_events (full backtesting history)
     if not persist_ep:
         return
 
@@ -504,7 +556,6 @@ async def _process_trade(raw: dict):
         )
         return
 
-    # Only publish signal to bus if cooldown gate passes
     if not sig_ep:
         return
 
@@ -522,7 +573,7 @@ async def _process_trade(raw: dict):
     try:
         composite = build_composite(sig_ep, accumulator)
     except Exception as e:
-        _stats["composite_errors"] += 1   # issue #6: separate counter
+        _stats["composite_errors"] += 1
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 

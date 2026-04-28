@@ -1,17 +1,27 @@
 """
 Cipher Backend — FastAPI entry point
 
-P2 FIX (2026-04-27): registry.build() is now launched as a background task
-AFTER `yield` so the server starts serving in <2s. The DB-seeded chain
-(P1 fix in chain_store) covers OCC lookups during the brief build window.
+Startup sequence (post all fixes):
+  1. _resolve_startup_universe()     — load symbols from DB (<2s)
+  2. init_registry()                 — in-memory init (instant)
+  3. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
+  4. yield                           — SERVER IS LIVE, health probe passes
+  5. Parallel background tasks launched:
+     a. _background_build_and_upsert — incremental/full OCC build (P4)
+     b. registry.refresh_loop()      — scheduled 30-min rebuilds
+     c. _registry_prewarm_loop()     — 9:15 AM ET daily pre-warm
+     d. stream_options_flow()        — waits for is_ready(), then streams
+     e. start_flow_writer()          — DB flush loop
+     f. start_signal_writer()        — signal DB writer
+     g. _universe_refresh_loop()     — 24h universe refresh
 
-Startup sequence:
-  1. _resolve_startup_universe()   — load symbols from DB (<2s)
-  2. init_registry()               — in-memory init (instant)
-  3. registry.load_from_db()       — seed OCC chains from DB (<2s)
-  4. yield                         — SERVER IS LIVE, health probe passes
-  5. registry.build() [background] — incremental or full refresh (~60s warm)
-  6. upsert_symbol_quotes          — after build, populate DB columns
+Key architectural fixes:
+  P1 (chain_store)    — snapshot-agnostic fallback load
+  P2 (lifespan)       — non-blocking startup via background build task
+  P3 (tradier_client) — dedicated bulk semaphore for build()
+  P4 (symbol_registry)— incremental warm-restart build
+  D-001 (tradier_stream) — pass registry to stream_options_flow(), no duplicate build
+  D-002 (tradier_stream) — remove extra refresh_loop() create_task from stream
 """
 import asyncio
 import json
@@ -30,7 +40,7 @@ from routers import auth, flow, simulation, ws, smart_signals
 from routers.smart_signals import stream_stats
 from routers import history
 from routers import admin
-from routers import health          # B-008: stream health router
+from routers import health
 from core.auth import get_current_user
 from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, _fetch_batch_quotes
@@ -77,20 +87,13 @@ _configure_logging()
 log = logging.getLogger("main")
 
 
-# ---------------------------------------------------------------------------
-# get_config — module-level so tests can patch('main.get_config', ...)
-# ---------------------------------------------------------------------------
 async def get_config() -> dict:
-    """Return current runtime config dict. Patchable by tests."""
     return {
-        "app_env":  settings.APP_ENV,
+        "app_env":   settings.APP_ENV,
         "log_level": settings.LOG_LEVEL,
     }
 
 
-# ---------------------------------------------------------------------------
-# Universe loader — returns (stream_symbols, tier_map, quotes, snapshot_id)
-# ---------------------------------------------------------------------------
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
     log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
 
@@ -120,7 +123,6 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
-        # Return empty quotes — lifespan re-fetches after build() completes
         return fresh, tier_map, [], snapshot_id
 
     log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
@@ -202,26 +204,12 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
     return stream_symbols, tier_map, quotes, snapshot_id
 
 
-# ---------------------------------------------------------------------------
-# OI stamp helper
-# ---------------------------------------------------------------------------
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
     for q in quotes:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
-# ---------------------------------------------------------------------------
-# Background post-build task: stamp OI, reclassify tiers, upsert to DB
-# ---------------------------------------------------------------------------
 async def _post_build_upsert(registry, stream_symbols: list[str]) -> None:
-    """
-    Run after registry.build() completes (in background).
-    1. Re-fetch quotes if not available (warm restart path).
-    2. Stamp OI from registry.
-    3. Re-run tier assignment with live OI.
-    4. Upsert to options_universe_symbols.
-    5. Update registry tier map.
-    """
     try:
         log.info("[post_build] Fetching quotes for %d symbols", len(stream_symbols))
         quotes = await _fetch_batch_quotes(stream_symbols)
@@ -251,16 +239,7 @@ async def _post_build_upsert(registry, stream_symbols: list[str]) -> None:
         log.error("[post_build] error (non-fatal): %s", exc, exc_info=True)
 
 
-# ---------------------------------------------------------------------------
-# Background build launcher (P2: non-blocking startup)
-# ---------------------------------------------------------------------------
 async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
-    """
-    Launched as asyncio.create_task() AFTER yield so the server is
-    already live when this runs. Performs:
-      registry.build()  — incremental (P4) or full
-      _post_build_upsert — quotes, OI, tier, DB write
-    """
     log.info("[registry] Background build starting (server already live)")
     try:
         await registry.build()
@@ -271,9 +250,6 @@ async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> N
     await _post_build_upsert(registry, stream_symbols)
 
 
-# ---------------------------------------------------------------------------
-# Background 24-hour universe refresh
-# ---------------------------------------------------------------------------
 async def _universe_refresh_loop():
     REFRESH_INTERVAL = 24 * 60 * 60
     while True:
@@ -324,15 +300,11 @@ async def _universe_refresh_loop():
             log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
 
 
-# ---------------------------------------------------------------------------
-# Registry pre-warm — rebuilds OCC registry at 9:15 AM ET every weekday
-# ---------------------------------------------------------------------------
 _ET = ZoneInfo("America/New_York")
 _PREWARM_TIME = time(9, 15)
 
 
 async def _registry_prewarm_loop() -> None:
-    """Rebuild the OCC registry every weekday at 9:15 AM ET."""
     while True:
         now = datetime.now(_ET)
 
@@ -388,8 +360,6 @@ async def lifespan(app: FastAPI):
         len(stream_symbols), len(tier_map),
     )
 
-    # Seed OCC chains from DB — P1 fallback ensures this succeeds even when
-    # the active snapshot has no chains (first restart after save_snapshot).
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
         log.info(
@@ -398,23 +368,24 @@ async def lifespan(app: FastAPI):
             seeded, registry.is_ready(),
         )
 
-    # P2: yield NOW — server is live with DB-seeded chains.
-    # build() runs in background so Railway health probe passes immediately.
     log.info(
         "[registry] Server starting (is_ready=%s, %d OCC contracts seeded). "
         "Background build will refresh in the background.",
         registry.is_ready(), registry.size(),
     )
 
+    # D-001: pass registry into stream_options_flow so it reuses the same
+    # instance and waits for is_ready() instead of doing its own build().
+    # D-002: refresh_loop is owned here; stream_options_flow no longer spawns it.
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
-    stream_task           = asyncio.create_task(stream_options_flow(stream_symbols))
+    stream_task           = asyncio.create_task(
+        stream_options_flow(stream_symbols, registry=registry)  # D-001
+    )
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
     refresh_task          = asyncio.create_task(_universe_refresh_loop())
-
-    # P2: build + upsert runs fully in background after server is live
-    build_task = asyncio.create_task(
+    build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
 
@@ -450,9 +421,6 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
-# ---------------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------------
 _explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
@@ -483,9 +451,7 @@ app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
 
-# ---------------------------------------------------------------------------
-# Aliases
-# ---------------------------------------------------------------------------
+
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
     return JSONResponse({"status": "ok"})

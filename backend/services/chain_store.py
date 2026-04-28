@@ -12,10 +12,8 @@ save_chain(snapshot_id, registry_dict)  -> bool
 
 load_chain(snapshot_id)                 -> dict[str, ContractMeta] | None
     Load all rows for snapshot_id.
-    If that snapshot has no cached rows, falls back to the most-recent
-    snapshot in options_chain_cache that DOES have rows (P1 fix: the
-    active snapshot never has chains on the first restart after
-    save_snapshot() creates a new UUID — chains live under the old id).
+    Falls back to the most-recent snapshot in options_chain_cache that
+    has rows when snapshot_id has none.
     Returns None on DB error, empty dict if no chains exist anywhere.
 
 Design notes
@@ -26,9 +24,14 @@ Design notes
   failure — the in-memory registry is always the source of truth.
 
 FIX P1 (2026-04-27):
-  load_chain() now falls back to the most-recent snapshot that has chain
-  rows when the requested snapshot_id has none. Prevents the 12-minute
-  full rebuild on every warm restart after a new snapshot UUID is minted.
+  load_chain() falls back to the most-recent snapshot that has chain rows
+  when the requested snapshot_id has none. Prevents the full rebuild on
+  every warm restart after a new snapshot UUID is minted.
+
+FIX D-003 (2026-04-27):
+  _find_latest_cached_snapshot() now uses ORDER BY inserted_at DESC so the
+  most recently written chain is always returned on fallback, rather than
+  an arbitrary row from an unordered scan.
 """
 import asyncio
 import logging
@@ -57,10 +60,6 @@ def _client() -> Client:
     return create_client(settings.SUPABASE_URL, key)
 
 
-# ---------------------------------------------------------------------------
-# Public async wrappers
-# ---------------------------------------------------------------------------
-
 async def save_chain(
     snapshot_id: str,
     registry_dict: "dict[str, ContractMeta]",
@@ -74,21 +73,9 @@ async def save_chain(
 async def load_chain(
     snapshot_id: str,
 ) -> "Optional[dict[str, ContractMeta]]":
-    """
-    Load options_chain_cache rows for snapshot_id.
-    Falls back to the most-recent snapshot that has rows if snapshot_id
-    has none (handles the common case where save_snapshot() created a new
-    UUID but the prior build()'s chains live under the previous id).
-    Returns dict[occ_symbol -> ContractMeta], empty dict if nothing cached,
-    or None on DB error.
-    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _sync_load_chain, snapshot_id)
 
-
-# ---------------------------------------------------------------------------
-# Sync implementations
-# ---------------------------------------------------------------------------
 
 def _sync_save_chain(
     snapshot_id: str,
@@ -138,22 +125,10 @@ def _sync_save_chain(
 def _sync_load_chain(
     snapshot_id: str,
 ) -> "Optional[dict[str, ContractMeta]]":
-    """
-    Load chain for snapshot_id. If that snapshot has no rows, fall back to
-    the most-recent snapshot in options_chain_cache that does have rows.
-
-    This handles the common warm-restart scenario:
-      - save_snapshot() mints a new UUID (active snapshot)
-      - Previous build() persisted chains under the OLD snapshot_id
-      - Active snapshot has 0 chain rows → fall back to old chains
-      - Stale-by-one-snapshot data is still correct for OCC lookups;
-        build() will refresh everything in the background (P2).
-    """
-    from services.symbol_registry import ContractMeta  # local import avoids circular
+    from services.symbol_registry import ContractMeta
     try:
         sb = _client()
 
-        # Attempt 1: load from the requested snapshot_id
         chain = _paginate_chain(sb, snapshot_id)
         if chain:
             log.info(
@@ -162,7 +137,6 @@ def _sync_load_chain(
             )
             return chain
 
-        # Attempt 2 (P1 fallback): find the most-recent snapshot that has rows
         log.info(
             "[chain_store] load_chain: snapshot %s has no rows — "
             "searching for most-recent cached snapshot",
@@ -171,7 +145,7 @@ def _sync_load_chain(
         fallback_snap = _find_latest_cached_snapshot(sb)
         if not fallback_snap:
             log.info("[chain_store] load_chain: no cached chains found in any snapshot")
-            return {}  # empty dict — caller will do full build
+            return {}
 
         chain = _paginate_chain(sb, fallback_snap)
         log.info(
@@ -187,7 +161,6 @@ def _sync_load_chain(
 
 
 def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']":
-    """Paginate all rows for snapshot_id and return occ_symbol -> ContractMeta dict."""
     from services.symbol_registry import ContractMeta
     result: list[dict] = []
     offset = 0
@@ -226,15 +199,16 @@ def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']"
 
 def _find_latest_cached_snapshot(sb: Client) -> Optional[str]:
     """
-    Return the snapshot_id of the most-recent row in options_chain_cache.
-    Uses a single GROUP-BY-style query via Supabase: select distinct
-    snapshot_id ordered by the implicit insert order, limit 1.
+    Return the snapshot_id of the most-recently inserted row in
+    options_chain_cache. ORDER BY inserted_at DESC ensures the freshest
+    chain is always preferred on fallback (D-003 fix: was unordered).
     Returns None if the table is empty.
     """
     try:
         resp = (
             sb.table(_TABLE)
             .select("snapshot_id")
+            .order("inserted_at", desc=True)
             .limit(1)
             .execute()
         )
