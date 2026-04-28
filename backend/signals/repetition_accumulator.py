@@ -10,25 +10,22 @@ Threshold logic:
     - cumulative premium >= min_premium
   whichever comes first.
 
-  This means a single large trade (e.g. $80k+ print) persists immediately on
-  the first tick via the min_premium OR condition, while small retail prints
-  (< $10k, < 3 trades) are gated until the repetition threshold is crossed.
+  Signal re-emission guard (2026-04-28):
+    After an episode first crosses the threshold, it only emits again when
+    total_premium has grown by at least SIGNAL_RETRIGGER_THRESHOLD ($50k) since
+    the last emission. This prevents QQQ/SPY episodes from spamming a new
+    signal_history row on every single tick once threshold is crossed.
 
-  Whale accumulation via many small lots is captured: each $12k print increments
-  the episode until trade_count=3, then fires — even though each individual print
-  is below the $10k floor (they're not — $12k > $10k fires immediately via OR).
-  True sub-$10k repeated prints need 3 trades before persisting.
-
-Defaults (2026-04-28):
-  min_trades=3  — restored from 1; prevents every single print from persisting
-                  as a raw flow log entry with no repetition signal value.
-  min_premium=$10,000 — kept low so whale accumulation via small lots is captured
-                        and single large institutional prints fire immediately.
+Defaults:
+  min_trades=3          — gates sub-$10k prints until 3 repeats
+  min_premium=$10,000   — single large prints fire immediately via OR
+  retrigger=$50,000     — re-signal every $50k of new premium per episode
 
 The OR logic means:
-  - Single print >= $10k    -> fires on tick 1 (premium OR condition)
-  - Repeated prints < $10k  -> needs 3 ticks (trade_count condition)
-  - Pure retail noise       -> < $10k AND < 3 trades = filtered
+  - Single print >= $10k          -> fires on tick 1 (premium OR condition)
+  - Repeated prints < $10k        -> needs 3 ticks (trade_count condition)
+  - Pure retail noise             -> < $10k AND < 3 trades = filtered
+  - Ongoing episode               -> only re-signals every +$50k, not every tick
 """
 import asyncio
 import logging
@@ -38,19 +35,24 @@ from typing import Optional, List
 
 log = logging.getLogger("repetition_accumulator")
 
+# Re-emit a signal for an active episode only after this much new premium
+SIGNAL_RETRIGGER_THRESHOLD: float = 50_000
+
 
 @dataclass
 class RepetitionEpisode:
-    ticker:          str
-    contract_type:   str
-    strike:          float
-    expiry:          str
-    trade_count:     int          = 0
-    total_premium:   float        = 0.0
-    is_accelerating: bool         = False
-    last_seen:       datetime     = field(default_factory=lambda: datetime.now(timezone.utc))
-    timestamps:      list         = field(default_factory=list)
-    events:          List         = field(default_factory=list)
+    ticker:               str
+    contract_type:        str
+    strike:               float
+    expiry:               str
+    trade_count:          int      = 0
+    total_premium:        float    = 0.0
+    is_accelerating:      bool     = False
+    last_seen:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamps:           list     = field(default_factory=list)
+    events:               List     = field(default_factory=list)
+    # Signal re-emission guard — tracks premium at last signal emission
+    last_signaled_premium: float   = 0.0
 
     def summary_str(self) -> str:
         return (
@@ -67,17 +69,20 @@ class RepetitionAccumulator:
         window_minutes:  Episode expires after this many minutes of inactivity.
         min_trades:      Minimum ticks before episode persists (default: 3).
         min_premium:     Minimum cumulative premium before episode persists (default: $10,000).
+        retrigger:       Minimum new premium delta before re-emitting signal (default: $50,000).
     """
 
     def __init__(
         self,
-        window_minutes: int = 30,
-        min_trades: int     = 3,
-        min_premium: float  = 10_000,
+        window_minutes: int   = 30,
+        min_trades:     int   = 3,
+        min_premium:    float = 10_000,
+        retrigger:      float = SIGNAL_RETRIGGER_THRESHOLD,
     ):
         self.window      = timedelta(minutes=window_minutes)
         self.min_trades  = min_trades
         self.min_premium = min_premium
+        self.retrigger   = retrigger
         self._episodes: dict[str, RepetitionEpisode] = {}
         self._lock = asyncio.Lock()
 
@@ -88,8 +93,11 @@ class RepetitionAccumulator:
         """
         Ingest a parsed trade event.
 
-        Returns the RepetitionEpisode if the persist threshold has been crossed
-        (trade_count >= min_trades OR total_premium >= min_premium), else None.
+        Returns the RepetitionEpisode if:
+          1. The persist threshold has been crossed (trade_count >= min_trades
+             OR total_premium >= min_premium), AND
+          2. Either this is the first emission, OR total_premium has grown by
+             at least `retrigger` since the last emission.
         """
         now = datetime.now(timezone.utc)
         key = self._episode_key(ev)
@@ -116,8 +124,19 @@ class RepetitionAccumulator:
             recent = [t for t in ep.timestamps if t >= recent_cutoff]
             ep.is_accelerating = len(recent) >= 2
 
-            # Threshold: persist when min_trades OR min_premium crossed
-            if ep.trade_count >= self.min_trades or ep.total_premium >= self.min_premium:
+            # Gate 1: must cross threshold (min_trades OR min_premium)
+            threshold_crossed = (
+                ep.trade_count >= self.min_trades
+                or ep.total_premium >= self.min_premium
+            )
+            if not threshold_crossed:
+                return None
+
+            # Gate 2: only re-emit if this is the first crossing, or
+            # at least `retrigger` new premium has accumulated since last signal
+            delta = ep.total_premium - ep.last_signaled_premium
+            if ep.last_signaled_premium == 0 or delta >= self.retrigger:
+                ep.last_signaled_premium = ep.total_premium
                 return ep
 
         return None
