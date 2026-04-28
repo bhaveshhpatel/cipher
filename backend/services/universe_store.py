@@ -67,24 +67,16 @@ FIX RC-1/RC-2 (2026-04-27e):
     len(all symbols), so S-04 and S-05 pass correctly.
   - Non-eligible symbols simply have no row in options_universe_symbols.
 
-FIX U-1 (2026-04-28):
-  _sync_save_snapshot was generating a new uuid4() on every deployment.
-  Because the upsert key is (snapshot_id, symbol), a new snapshot_id
-  means every row is always a fresh INSERT — the ON CONFLICT clause
-  never fires. This caused options_universe_symbols to grow by ~1,400
-  rows per restart and options_chain_cache to grow proportionally.
-
-  Fix: before generating a new uuid4(), check for an existing active
-  snapshot that is less than _REUSE_SNAPSHOT_AGE_H hours old AND whose
-  symbol_count is within _REUSE_SYMBOL_DRIFT_PCT of the new eligible
-  count. If found, reuse that snapshot_id — the upsert then correctly
-  overwrites existing rows instead of appending.
-
-  A fresh snapshot_id is only generated when:
-    - No active snapshot exists in the DB
-    - The active snapshot is older than _REUSE_SNAPSHOT_AGE_H hours
-    - The symbol count has drifted by more than _REUSE_SYMBOL_DRIFT_PCT
-      (genuine universe refresh — e.g. nightly CBOE reload)
+FIX DEDUP (2026-04-28):
+  _sync_save_snapshot now reuses the existing active snapshot_id when the
+  snapshot is <24h old AND the new symbol set is within 10% of the existing
+  count. This prevents every deployment from generating a new uuid4()
+  snapshot_id, which caused on_conflict=(snapshot_id,symbol) to never fire
+  (always new key = always INSERT = exponential row growth).
+  New snapshots are only created when genuinely needed:
+    - No active snapshot exists, OR
+    - Active snapshot is >=24h old, OR
+    - Symbol count drifted >10% (major universe change)
 """
 import asyncio
 import logging
@@ -104,10 +96,9 @@ _KEEP_SNAPSHOTS  = 7
 _DEFAULT_MAX_AGE = 24   # hours
 _UPSERT_BATCH    = 500  # rows per upsert batch
 _PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
-
-# U-1: reuse active snapshot when restarting within this window
-_REUSE_SNAPSHOT_AGE_H   = 20    # hours — reuse if snapshot is younger than this
-_REUSE_SYMBOL_DRIFT_PCT = 0.10  # allow up to 10% symbol count change before new snapshot
+# DEDUP fix: reuse existing snapshot if symbol count changed by less than this
+_SNAPSHOT_REUSE_DRIFT_PCT = 0.10  # 10%
+_SNAPSHOT_REUSE_MAX_AGE_H = 24    # hours — only reuse snapshots younger than this
 
 
 def _client() -> Client:
@@ -366,23 +357,27 @@ def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
         return None
 
 
-def _find_reusable_snapshot_id(
+def _get_active_snapshot_for_reuse(
     sb: Client,
-    eligible_count: int,
+    new_eligible_count: int,
 ) -> Optional[str]:
     """
-    U-1: Look for an active snapshot that is young enough and whose
-    symbol_count is close enough to reuse instead of creating a new one.
+    DEDUP fix: return the existing active snapshot_id if it can be reused.
 
-    Returns the snapshot_id string if one qualifies, else None.
+    Conditions for reuse (ALL must be true):
+      1. An active snapshot exists
+      2. It was fetched within the last _SNAPSHOT_REUSE_MAX_AGE_H hours
+      3. Its symbol_count is within _SNAPSHOT_REUSE_DRIFT_PCT of new_eligible_count
+
+    Returns the snapshot_id string to reuse, or None if a new one must be created.
     """
     try:
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=_REUSE_SNAPSHOT_AGE_H)
+            datetime.now(timezone.utc) - timedelta(hours=_SNAPSHOT_REUSE_MAX_AGE_H)
         ).isoformat()
         result = (
             sb.table("options_universe_snapshots")
-            .select("id, symbol_count, fetched_at")
+            .select("id, fetched_at, symbol_count")
             .eq("is_active", True)
             .gte("fetched_at", cutoff)
             .order("fetched_at", desc=True)
@@ -392,27 +387,29 @@ def _find_reusable_snapshot_id(
         rows = result.data or []
         if not rows:
             return None
-        existing_count = rows[0].get("symbol_count") or 0
+        row = rows[0]
+        existing_count = int(row.get("symbol_count") or 0)
         if existing_count == 0:
             return None
-        drift = abs(eligible_count - existing_count) / existing_count
-        if drift <= _REUSE_SYMBOL_DRIFT_PCT:
-            snap_id = rows[0]["id"]
+        drift = abs(new_eligible_count - existing_count) / existing_count
+        if drift <= _SNAPSHOT_REUSE_DRIFT_PCT:
             log.info(
-                "universe_store U-1: reusing active snapshot %s "
-                "(existing_count=%d, new_count=%d, drift=%.1f%%) — "
-                "upsert will overwrite rows instead of appending",
-                snap_id, existing_count, eligible_count, drift * 100,
+                "universe_store: REUSING active snapshot %s "
+                "(existing_count=%d new_count=%d drift=%.1f%% < %.0f%% threshold)",
+                row["id"], existing_count, new_eligible_count,
+                drift * 100, _SNAPSHOT_REUSE_DRIFT_PCT * 100,
             )
-            return snap_id
+            return row["id"]
         log.info(
-            "universe_store U-1: symbol count drifted %.1f%% "
-            "(existing=%d, new=%d) — creating fresh snapshot",
-            drift * 100, existing_count, eligible_count,
+            "universe_store: snapshot drift too large "
+            "(existing=%d new=%d drift=%.1f%%) — creating new snapshot",
+            existing_count, new_eligible_count, drift * 100,
         )
         return None
     except Exception as e:
-        log.warning("universe_store._find_reusable_snapshot_id error (non-fatal): %s", e)
+        log.warning(
+            "universe_store._get_active_snapshot_for_reuse error (non-fatal): %s", e
+        )
         return None
 
 
@@ -425,21 +422,25 @@ def _sync_save_snapshot(
     RC-1/RC-2 FIX: Only insert stream_eligible symbols into
     options_universe_symbols.
 
-    U-1 FIX: Reuse the active snapshot_id when restarting within
-    _REUSE_SNAPSHOT_AGE_H hours AND symbol count is stable (< 10% drift).
-    This prevents options_universe_symbols from growing on every restart.
+    DEDUP FIX (2026-04-28):
+      Before generating a new snapshot_id, check whether the current active
+      snapshot is recent (<24h) and has a similar symbol count (<10% drift).
+      If so, reuse its snapshot_id and upsert into it — on_conflict fires
+      correctly and no new rows are created.
+      New snapshots are only created when: no active snapshot, >24h old,
+      or symbol count drifted >10%.
 
-    1. Determine eligible symbols
-    2. U-1: try to reuse existing active snapshot_id
-    3. If reusing: upsert symbols only (no new snapshot header inserted)
-    4. If new:     insert snapshot header, upsert symbols, deactivate old
+    1. Determine snapshot_id (reuse or new uuid4)
+    2. Insert snapshot header only if creating a new snapshot
+    3. Upsert ONLY eligible symbols in batches of 500
+    4. Deactivate all other snapshots (only when creating new)
     5. Prune beyond _KEEP_SNAPSHOTS
     """
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
         return False
     try:
-        sb = _client()
+        sb          = _client()
 
         # RC-1: only persist stream_eligible rows
         eligible_set     = stream_eligible_set if stream_eligible_set is not None else set(symbols)
@@ -453,20 +454,17 @@ def _sync_save_snapshot(
             )
             eligible_symbols = list(symbols)
 
-        # U-1: attempt to reuse an existing recent active snapshot
-        reuse_id = _find_reusable_snapshot_id(sb, len(eligible_symbols))
-        is_reuse = reuse_id is not None
-        snapshot_id = reuse_id if is_reuse else str(uuid4())
+        # DEDUP fix: try to reuse an existing active snapshot_id
+        reuse_id = _get_active_snapshot_for_reuse(sb, len(eligible_symbols))
+        is_new_snapshot = reuse_id is None
+        snapshot_id = reuse_id if reuse_id else str(uuid4())
 
-        log.info(
-            "universe_store: %s snapshot id=%s source=%s "
-            "eligible=%d (of %d total symbols)",
-            "REUSING" if is_reuse else "inserting new",
-            snapshot_id, source, len(eligible_symbols), len(symbols),
-        )
-
-        if not is_reuse:
-            # Fresh snapshot — insert header and deactivate old ones
+        if is_new_snapshot:
+            log.info(
+                "universe_store: creating NEW snapshot id=%s source=%s "
+                "eligible=%d (of %d total symbols)",
+                snapshot_id, source, len(eligible_symbols), len(symbols),
+            )
             sb.table("options_universe_snapshots").insert({
                 "id":           snapshot_id,
                 "symbol_count": len(eligible_symbols),
@@ -474,21 +472,19 @@ def _sync_save_snapshot(
                 "source":       source,
                 "is_active":    True,
             }).execute()
-
+            # Deactivate previous snapshots only when creating a new one
             sb.table("options_universe_snapshots").update({"is_active": False}).neq(
                 "id", snapshot_id
             ).execute()
             log.info("universe_store: deactivated previous snapshots")
         else:
-            # Reusing — just update the source/fetched_at timestamp so
-            # load_fresh_snapshot() keeps seeing it as "fresh"
-            sb.table("options_universe_snapshots").update({
-                "source":       source,
-                "symbol_count": len(eligible_symbols),
-            }).eq("id", snapshot_id).execute()
+            log.info(
+                "universe_store: UPSERTING into existing snapshot id=%s "
+                "eligible=%d (of %d total symbols)",
+                snapshot_id, len(eligible_symbols), len(symbols),
+            )
 
-        batch_size    = 500
-        rows          = [
+        rows = [
             {
                 "snapshot_id":     snapshot_id,
                 "symbol":          s,
@@ -497,21 +493,21 @@ def _sync_save_snapshot(
             }
             for s in eligible_symbols
         ]
-        total_batches = (len(rows) + batch_size - 1) // batch_size
-        for i in range(0, len(rows), batch_size):
-            batch_num = i // batch_size + 1
+        total_batches = (len(rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
+        for i in range(0, len(rows), _UPSERT_BATCH):
+            batch_num = i // _UPSERT_BATCH + 1
             sb.table("options_universe_symbols").upsert(
-                rows[i : i + batch_size],
+                rows[i : i + _UPSERT_BATCH],
                 on_conflict="snapshot_id,symbol",
             ).execute()
             log.info(
                 "universe_store: upserted symbol batch %d/%d (%d symbols)",
-                batch_num, total_batches, len(rows[i : i + batch_size]),
+                batch_num, total_batches, len(rows[i : i + _UPSERT_BATCH]),
             )
 
         log.info(
-            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s reused=%s",
-            snapshot_id, len(eligible_symbols), source, is_reuse,
+            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s new=%s",
+            snapshot_id, len(eligible_symbols), source, is_new_snapshot,
         )
 
         _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
@@ -597,6 +593,7 @@ def _prune_old_snapshots(sb: Client, keep: int) -> None:
             return
         ids_to_delete = [r["id"] for r in rows[keep:]]
         # Delete child symbol rows first — safety net for DBs without cascading FK.
+        # Prevents orphaned options_universe_symbols rows from accumulating.
         sb.table("options_universe_symbols").delete().in_("snapshot_id", ids_to_delete).execute()
         sb.table("options_universe_snapshots").delete().in_("id", ids_to_delete).execute()
         log.info("universe_store: pruned %d old snapshots (+ their symbol rows)", len(ids_to_delete))
