@@ -1,20 +1,21 @@
 """
 services/stream_worker.py — Layer 2: Single stream connection lifecycle.
 
-FIX STREAM-2 (2026-04-28):
-  Tradier hard limit: 500 symbols per stream POST.
-  Workers now receive a shared_session_token from StreamManager instead
-  of fetching their own. All workers share the same Tradier session,
-  and a shared asyncio.Lock (session_lock) ensures only 1 worker holds
-  an open stream at a time (Tradier 1-concurrent-session rule).
+FIX STREAM-3 (2026-04-28): Remove asyncio.Lock.
+  Tradier "1 concurrent session" means 1 sessionid at a time — NOT 1 open
+  connection at a time. All workers sharing the same sessionid can each hold
+  a simultaneous open POST stream. Removing the lock gives us true parallel
+  coverage of all 31,920 symbols from the moment workers start.
 
-  If the token expires mid-stream (401 response), the worker sets
-  self._token_expired = True and exits cleanly. StreamManager detects
-  this flag in its run() loop and calls _respawn_workers(force_token_refresh=True).
+  Concurrency model:
+    - 64 workers, each with 500 symbols, all connected simultaneously
+    - All use the same shared session token (same Tradier session)
+    - First tick of each worker is logged in full (untruncated) for shape inspection
+    - Per-worker STREAM_STATS line every 30s: ticks, ticks_last_30s, errors, reconnects
 
-Fix (S-03): _MARKET_CLOSED_SLEEP_S=300 (5min) replaces hard-coded 60s.
+Fix (S-03): _MARKET_CLOSED_SLEEP_S=300 (5min).
 Fix (S-04): stats includes last_tick_at, session_ticks.
-B-021: startup_delay_s kept for API compatibility (always 0.0 in production).
+B-021: startup_delay_s kept for API compat (always 0.0 in production).
 B-008: global stats rollup via _global_stats().
 """
 import asyncio
@@ -42,6 +43,7 @@ _CONNECT_TIMEOUT       = 15.0
 _BACKOFF_BASE          = 1.0
 _BACKOFF_CAP           = 10.0
 _MARKET_CLOSED_SLEEP_S = 300.0
+_STATS_INTERVAL_S      = 30.0   # how often each worker logs STREAM_STATS
 
 
 def _is_market_hours() -> bool:
@@ -69,22 +71,25 @@ class StreamWorker:
         event_queue: asyncio.Queue,
         startup_delay_s: float = 0.0,
         shared_session_token: Optional[str] = None,
-        session_lock: Optional[asyncio.Lock] = None,
+        session_lock: Optional[asyncio.Lock] = None,  # kept for API compat, ignored
     ):
         self.worker_id            = worker_id
         self.symbols              = symbols
         self.event_queue          = event_queue
         self.startup_delay_s      = startup_delay_s
-        # STREAM-2: shared session token + lock
         self._shared_token        = shared_session_token
-        self._session_lock        = session_lock
-        self._token_expired       = False   # signals manager to refresh
+        # session_lock intentionally ignored — STREAM-3 removes the lock
+        self._token_expired       = False
         self._running             = True
         self._ticks               = 0
         self._errors              = 0
         self._reconnects          = 0
         self._last_tick_at:  Optional[float] = None
         self._session_ticks: int = 0
+        self._connect_at:    Optional[float] = None
+        # rolling window for ticks/s
+        self._ticks_at_last_stats: int = 0
+        self._last_stats_at: float = _time.monotonic()
 
     def update_symbols(self, new_symbols: list[str]):
         self.symbols = new_symbols
@@ -120,6 +125,29 @@ class StreamWorker:
         except Exception:
             pass
 
+    def _log_stats(self) -> None:
+        """Emit a STREAM_STATS line for this worker — called every _STATS_INTERVAL_S."""
+        now = _time.monotonic()
+        elapsed = now - self._last_stats_at
+        ticks_delta = self._ticks - self._ticks_at_last_stats
+        rate = ticks_delta / elapsed if elapsed > 0 else 0.0
+        uptime = round(now - self._connect_at, 1) if self._connect_at else None
+        log.info(
+            "[worker-%d] STREAM_STATS | symbols=%d ticks=%d ticks_30s=%d "
+            "rate=%.1f/s errors=%d reconnects=%d uptime=%ss last_tick_ago=%s",
+            self.worker_id,
+            len(self.symbols),
+            self._ticks,
+            ticks_delta,
+            rate,
+            self._errors,
+            self._reconnects,
+            uptime,
+            round(_time.time() - self._last_tick_at, 1) if self._last_tick_at else "never",
+        )
+        self._ticks_at_last_stats = self._ticks
+        self._last_stats_at = now
+
     async def run(self):
         """Main loop — connect, stream, reconnect on failure."""
         if self.startup_delay_s > 0:
@@ -134,20 +162,23 @@ class StreamWorker:
 
         while self._running:
             if not _is_market_hours():
+                log.info(
+                    "[worker-%d] Market closed — sleeping %ds",
+                    self.worker_id, int(_MARKET_CLOSED_SLEEP_S),
+                )
                 await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
                 continue
 
-            # STREAM-2: use shared token if provided, else fetch own
-            if self._shared_token:
-                session_token = self._shared_token
-            else:
-                session_token = await get_session_token()
+            session_token = self._shared_token if self._shared_token else await get_session_token()
 
             if not session_token:
                 self._errors += 1
                 self._inc_global_error()
                 backoff = _backoff(min(reconnect_attempt, 7))
-                log.warning(f"[worker-{self.worker_id}] No session token — backing off {backoff:.1f}s")
+                log.warning(
+                    "[worker-%d] No session token — backing off %.1fs",
+                    self.worker_id, backoff,
+                )
                 await asyncio.sleep(backoff)
                 reconnect_attempt += 1
                 continue
@@ -161,98 +192,149 @@ class StreamWorker:
 
             self._session_ticks = 0
             first_line_logged = False
+            stats_task: Optional[asyncio.Task] = None
 
-            # STREAM-2: acquire lock so only 1 worker streams at a time
-            lock = self._session_lock
-            async with (lock if lock else asyncio.Lock()):
-                try:
-                    timeout = httpx.Timeout(
-                        connect=_CONNECT_TIMEOUT, read=None, write=10.0, pool=10.0
-                    )
-                    async with httpx.AsyncClient(timeout=timeout) as client:
-                        async with client.stream(
-                            "POST", url, headers=stream_headers, data=payload
-                        ) as resp:
-                            if resp.status_code == 401:
-                                log.warning(
-                                    f"[worker-{self.worker_id}] 401 — token expired, "
-                                    f"signalling manager"
-                                )
-                                self._token_expired = True
-                                self._errors += 1
-                                self._inc_global_error()
-                                return  # exit cleanly, manager will respawn
+            try:
+                timeout = httpx.Timeout(
+                    connect=_CONNECT_TIMEOUT, read=None, write=10.0, pool=10.0
+                )
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                        "POST", url, headers=stream_headers, data=payload
+                    ) as resp:
 
-                            if resp.status_code != 200:
-                                log.warning(
-                                    f"[worker-{self.worker_id}] HTTP {resp.status_code} — retrying"
-                                )
-                                self._errors += 1
-                                self._inc_global_error()
-                                # fall through to reconnect logic below
-                            else:
-                                log.info(
-                                    f"[worker-{self.worker_id}] Connected — "
-                                    f"streaming {len(self.symbols)} OCC symbols"
-                                )
-                                async for line in self._guarded_lines(resp):
-                                    stripped = line.strip()
-                                    if not stripped:
-                                        continue
-                                    try:
-                                        raw = json.loads(stripped)
-                                    except json.JSONDecodeError:
-                                        continue
+                        if resp.status_code == 401:
+                            log.warning(
+                                "[worker-%d] 401 Unauthorized — token expired, signalling manager",
+                                self.worker_id,
+                            )
+                            self._token_expired = True
+                            self._errors += 1
+                            self._inc_global_error()
+                            return
 
-                                    # Drop API error responses immediately
-                                    if isinstance(raw, dict) and raw.get("error"):
-                                        log.warning(
-                                            f"[worker-{self.worker_id}] "
-                                            f"stream error: {raw['error']}"
-                                        )
-                                        break
+                        if resp.status_code != 200:
+                            log.warning(
+                                "[worker-%d] HTTP %d — backing off",
+                                self.worker_id, resp.status_code,
+                            )
+                            self._errors += 1
+                            self._inc_global_error()
+                        else:
+                            self._connect_at = _time.monotonic()
+                            self._ticks_at_last_stats = self._ticks
+                            self._last_stats_at = _time.monotonic()
 
-                                    if not first_line_logged:
-                                        log.info(
-                                            f"[worker-{self.worker_id}] "
-                                            f"first tick: {stripped[:300]}"
-                                        )
-                                        first_line_logged = True
+                            log.info(
+                                "[worker-%d] Connected — streaming %d OCC symbols "
+                                "(session=%s...)",
+                                self.worker_id,
+                                len(self.symbols),
+                                session_token[:8],
+                            )
 
-                                    self._ticks += 1
-                                    self._session_ticks += 1
-                                    self._last_tick_at = _time.time()
-                                    try:
-                                        self.event_queue.put_nowait(raw)
-                                    except asyncio.QueueFull:
-                                        log.warning(
-                                            f"[worker-{self.worker_id}] Queue full — dropping tick"
-                                        )
+                            # Periodic stats logger for this worker
+                            async def _stats_loop(w=self):
+                                while True:
+                                    await asyncio.sleep(_STATS_INTERVAL_S)
+                                    w._log_stats()
 
-                                log.info(f"[worker-{self.worker_id}] Stream closed cleanly")
+                            stats_task = asyncio.create_task(
+                                _stats_loop(), name=f"stats-{self.worker_id}"
+                            )
 
-                except asyncio.TimeoutError:
-                    self._errors += 1
-                    self._inc_global_error()
-                    log.warning(
-                        f"[worker-{self.worker_id}] Idle {_IDLE_TIMEOUT}s — reconnecting"
-                    )
+                            async for line in self._guarded_lines(resp):
+                                stripped = line.strip()
+                                if not stripped:
+                                    continue
+                                try:
+                                    raw = json.loads(stripped)
+                                except json.JSONDecodeError:
+                                    log.debug(
+                                        "[worker-%d] Non-JSON line: %s",
+                                        self.worker_id, stripped[:200],
+                                    )
+                                    continue
 
-                except asyncio.CancelledError:
-                    log.info(f"[worker-{self.worker_id}] Cancelled — stopping")
-                    return
+                                if isinstance(raw, dict) and raw.get("error"):
+                                    log.warning(
+                                        "[worker-%d] API error on stream: %r — "
+                                        "symbols=%d sessionid=%s...",
+                                        self.worker_id,
+                                        raw["error"],
+                                        len(self.symbols),
+                                        session_token[:8],
+                                    )
+                                    break
 
-                except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
-                    self._errors += 1
-                    self._inc_global_error()
-                    log.warning(f"[worker-{self.worker_id}] Network error: {e}")
+                                if not first_line_logged:
+                                    # Log full first tick untruncated so we can inspect shape
+                                    log.info(
+                                        "[worker-%d] FIRST_TICK type=%s raw=%s",
+                                        self.worker_id,
+                                        raw.get("type", "unknown"),
+                                        json.dumps(raw),
+                                    )
+                                    first_line_logged = True
 
-                except Exception as e:
-                    self._errors += 1
-                    self._inc_global_error()
-                    log.error(f"[worker-{self.worker_id}] Unexpected error: {e}")
+                                self._ticks += 1
+                                self._session_ticks += 1
+                                self._last_tick_at = _time.time()
 
-            # Outside the lock — reconnect backoff
+                                # Increment global tick counter
+                                try:
+                                    gs = _global_stats()
+                                    gs["ticks"] = gs.get("ticks", 0) + 1
+                                except Exception:
+                                    pass
+
+                                try:
+                                    self.event_queue.put_nowait(raw)
+                                except asyncio.QueueFull:
+                                    qsize = self.event_queue.qsize()
+                                    log.warning(
+                                        "[worker-%d] Queue full (size=%d) — dropping tick",
+                                        self.worker_id, qsize,
+                                    )
+
+                            log.info(
+                                "[worker-%d] Stream closed cleanly after %d ticks",
+                                self.worker_id, self._session_ticks,
+                            )
+
+            except asyncio.TimeoutError:
+                self._errors += 1
+                self._inc_global_error()
+                log.warning(
+                    "[worker-%d] Idle timeout (%.0fs) — reconnecting",
+                    self.worker_id, _IDLE_TIMEOUT,
+                )
+
+            except asyncio.CancelledError:
+                log.info("[worker-%d] Cancelled — stopping", self.worker_id)
+                return
+
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
+                self._errors += 1
+                self._inc_global_error()
+                log.warning(
+                    "[worker-%d] Network error (%s): %s",
+                    self.worker_id, type(e).__name__, e,
+                )
+
+            except Exception as e:
+                self._errors += 1
+                self._inc_global_error()
+                log.error(
+                    "[worker-%d] Unexpected error (%s): %s",
+                    self.worker_id, type(e).__name__, e,
+                )
+
+            finally:
+                if stats_task is not None and not stats_task.done():
+                    stats_task.cancel()
+
+            # Reconnect backoff
             self._reconnects += 1
             self._inc_global_reconnect()
             if self._session_ticks > 0:
@@ -261,7 +343,10 @@ class StreamWorker:
                 reconnect_attempt += 1
 
             backoff = _backoff(min(reconnect_attempt, 7))
-            log.info(f"[worker-{self.worker_id}] Reconnecting in {backoff:.1f}s")
+            log.info(
+                "[worker-%d] Reconnecting in %.1fs (attempt=%d session_ticks=%d)",
+                self.worker_id, backoff, reconnect_attempt, self._session_ticks,
+            )
             await asyncio.sleep(backoff)
 
     async def _guarded_lines(self, resp: httpx.Response):
