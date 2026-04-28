@@ -11,15 +11,28 @@ Design:
     (The registry rebuilds every 30 min by default — 60s TTL is fine.)
   - update_config() writes a single key back and invalidates the cache.
   - All DB access uses the service-role key (bypasses RLS).
+  - validate_ingestion_config() is called at startup to warn on missing rows.
 
 Keys stored (mirrors config.py / symbol_registry defaults):
   REGISTRY_MAX_DTE              int    90
   REGISTRY_ATM_RANGE_PCT        float  0.15
-  REGISTRY_MIN_OI               int    0
+  REGISTRY_MIN_OI               int    1     (RC-3: raised from 0 — filters illiquid contracts)
   REGISTRY_REFRESH_MINS         int    30
   REGISTRY_EXPIRY_DAY_REFRESH_MINS int 15
+  REGISTRY_BUILD_CONCURRENCY    int    50    (RC-3: was missing; added to defaults)
   UNIVERSE_MIN_PRICE            float  1.0
   UNIVERSE_MIN_VOLUME           int    500000
+
+RC-3 FIX (2026-04-27):
+  REGISTRY_BUILD_CONCURRENCY was not in _DEFAULTS and had no DB row.
+  Code silently used hardcoded fallback 50 in symbol_registry.py with
+  no observability. Fix:
+    1. Added to _DEFAULTS with value 50.
+    2. Added validate_ingestion_config() — called from main.py lifespan
+       to warn on any expected key missing from the DB at startup.
+    3. REGISTRY_MIN_OI default raised from 0 → 1 to filter zero-OI
+       contracts that inflate registry size with illiquid noise.
+  DB row must be inserted manually (SQL in PR description).
 """
 import logging
 import os
@@ -42,15 +55,21 @@ _CACHE_TTL = 60  # seconds
 _cache: dict[str, Any] = {}
 _cache_ts: float = 0.0
 
+# RC-3: REGISTRY_BUILD_CONCURRENCY added; REGISTRY_MIN_OI raised from 0 → 1
 _DEFAULTS: dict[str, Any] = {
     "REGISTRY_MAX_DTE":               90,
     "REGISTRY_ATM_RANGE_PCT":         0.15,
-    "REGISTRY_MIN_OI":                0,
+    "REGISTRY_MIN_OI":                1,      # was 0; raised to filter zero-OI illiquid contracts
     "REGISTRY_REFRESH_MINS":          30,
     "REGISTRY_EXPIRY_DAY_REFRESH_MINS": 15,
+    "REGISTRY_BUILD_CONCURRENCY":     50,     # RC-3: was missing from _DEFAULTS and DB
     "UNIVERSE_MIN_PRICE":             1.0,
     "UNIVERSE_MIN_VOLUME":            500_000,
 }
+
+# All keys that MUST have a row in the ingestion_config table.
+# validate_ingestion_config() warns at startup for any missing rows.
+_EXPECTED_DB_KEYS: frozenset[str] = frozenset(_DEFAULTS.keys())
 
 
 def _headers() -> dict:
@@ -152,3 +171,45 @@ async def update_config(key: str, value: str, updated_by: str = "admin") -> bool
     except Exception as e:
         log.error(f"[ingestion_config] Update error for {key}: {e}")
     return False
+
+
+async def validate_ingestion_config() -> list[str]:
+    """
+    RC-3: Startup validator — checks that every key in _EXPECTED_DB_KEYS
+    has a corresponding row in the ingestion_config DB table.
+
+    Called from main.py lifespan on startup (non-blocking, non-fatal).
+    Returns list of missing key names. Logs WARNING for each missing key
+    so operators know which knobs are silently using hardcoded defaults.
+
+    If Supabase is not configured, returns [] (nothing to validate).
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return []
+
+    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers=_headers())
+        if resp.status_code != 200:
+            log.warning(
+                "[ingestion_config] validate: DB fetch failed HTTP %d — skipping validation",
+                resp.status_code,
+            )
+            return []
+        db_keys = {row["key"] for row in resp.json() if row.get("key")}
+        missing = sorted(_EXPECTED_DB_KEYS - db_keys)
+        if missing:
+            for key in missing:
+                log.warning(
+                    "[ingestion_config] MISSING DB ROW: key='%s' default=%r "
+                    "— using hardcoded default. Insert row into ingestion_config to enable "
+                    "live tuning without restart.",
+                    key, _DEFAULTS.get(key),
+                )
+        else:
+            log.info("[ingestion_config] All %d expected config keys present in DB", len(_EXPECTED_DB_KEYS))
+        return missing
+    except Exception as e:
+        log.warning("[ingestion_config] validate error (non-fatal): %s", e)
+        return []

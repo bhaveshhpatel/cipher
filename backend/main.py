@@ -22,6 +22,7 @@ Key architectural fixes:
   P4 (symbol_registry)— incremental warm-restart build
   D-001 (tradier_stream) — pass registry to stream_options_flow(), no duplicate build
   D-002 (tradier_stream) — remove extra refresh_loop() create_task from stream
+  RC-3 (ingestion_config) — validate_ingestion_config() at startup warns on missing DB rows
 """
 import asyncio
 import json
@@ -49,6 +50,7 @@ from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
+from services.ingestion_config import validate_ingestion_config
 
 
 class _JsonFormatter(logging.Formatter):
@@ -352,6 +354,9 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend…")
 
+    # RC-3: validate ingestion config rows at startup — warns on missing DB keys
+    await validate_ingestion_config()
+
     stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()
 
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
@@ -374,13 +379,10 @@ async def lifespan(app: FastAPI):
         registry.is_ready(), registry.size(),
     )
 
-    # D-001: pass registry into stream_options_flow so it reuses the same
-    # instance and waits for is_ready() instead of doing its own build().
-    # D-002: refresh_loop is owned here; stream_options_flow no longer spawns it.
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
     stream_task           = asyncio.create_task(
-        stream_options_flow(stream_symbols, registry=registry)  # D-001
+        stream_options_flow(stream_symbols, registry=registry)
     )
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())

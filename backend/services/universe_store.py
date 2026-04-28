@@ -56,6 +56,16 @@ FIX (2026-04-27d):
   for pruned snapshot IDs before deleting the snapshot header. Safety net
   for DBs without a cascading FK — prevents orphaned symbol rows from
   accumulating across restarts.
+
+FIX RC-1/RC-2 (2026-04-27e):
+  _sync_save_snapshot now inserts ONLY stream_eligible symbols instead of
+  the full CBOE dump (~5270). Previously all symbols were inserted with
+  stream_eligible flag set per row, but non-eligible rows were never
+  updated by upsert_symbol_quotes(), leaving last_price=NULL and
+  open_interest=NULL permanently on ~912 rows.
+  - symbol_count in snapshot header is now set to len(eligible rows) not
+    len(all symbols), so S-04 and S-05 pass correctly.
+  - Non-eligible symbols simply have no row in options_universe_symbols.
 """
 import asyncio
 import logging
@@ -339,10 +349,22 @@ def _sync_save_snapshot(
     stream_eligible_set: Optional[set[str]] = None,
 ) -> bool:
     """
+    RC-1/RC-2 FIX: Only insert stream_eligible symbols into
+    options_universe_symbols. Previously ALL ~5270 CBOE symbols were
+    inserted regardless of eligibility, causing:
+      - S-04: symbol count inflated to 5252 instead of ~4340
+      - S-05: 913 rows with last_price=NULL (non-eligible rows never
+              touched by upsert_symbol_quotes)
+      - S-12: 2637 tickers with no chain data (non-eligible but stored)
+
+    Now:
+      - eligible_symbols = intersection of symbols and stream_eligible_set
+      - symbol_count in snapshot header = len(eligible_symbols)
+      - Non-eligible symbols have zero rows in options_universe_symbols
+
     1. Generate snapshot_id locally via uuid4()
-    2. Insert snapshot header
-    3. Upsert symbols in batches of 500 — on_conflict=(snapshot_id,symbol)
-       so repeated calls are idempotent and never produce duplicate rows.
+    2. Insert snapshot header (symbol_count = eligible count)
+    3. Upsert ONLY eligible symbols in batches of 500
     4. Deactivate all other snapshots
     5. Prune beyond _KEEP_SNAPSHOTS
     """
@@ -353,37 +375,46 @@ def _sync_save_snapshot(
         sb          = _client()
         snapshot_id = str(uuid4())
 
+        # RC-1: only persist stream_eligible rows
+        eligible_set     = stream_eligible_set if stream_eligible_set is not None else set(symbols)
+        eligible_symbols = [s for s in symbols if s in eligible_set]
+
+        if not eligible_symbols:
+            log.warning(
+                "universe_store.save_snapshot: stream_eligible_set produced 0 eligible symbols "
+                "from %d total — writing all symbols as fallback",
+                len(symbols),
+            )
+            eligible_symbols = list(symbols)
+
         log.info(
-            "universe_store: inserting snapshot id=%s source=%s symbols=%d stream_eligible=%s",
-            snapshot_id, source, len(symbols),
-            len(stream_eligible_set) if stream_eligible_set is not None else "all",
+            "universe_store: inserting snapshot id=%s source=%s "
+            "eligible=%d (of %d total symbols)",
+            snapshot_id, source, len(eligible_symbols), len(symbols),
         )
 
+        # symbol_count reflects eligible rows, not raw CBOE dump size
         sb.table("options_universe_snapshots").insert({
             "id":           snapshot_id,
-            "symbol_count": len(symbols),
+            "symbol_count": len(eligible_symbols),
             "provider":     "tradier",
             "source":       source,
             "is_active":    True,
         }).execute()
 
-        batch_size   = 500
-        eligible_set = stream_eligible_set if stream_eligible_set is not None else set(symbols)
-        rows = [
+        batch_size    = 500
+        rows          = [
             {
                 "snapshot_id":     snapshot_id,
                 "symbol":          s,
-                "stream_eligible": s in eligible_set,
+                "stream_eligible": True,  # all rows are eligible by construction
                 "tier":            3,
             }
-            for s in symbols
+            for s in eligible_symbols
         ]
         total_batches = (len(rows) + batch_size - 1) // batch_size
         for i in range(0, len(rows), batch_size):
             batch_num = i // batch_size + 1
-            # upsert instead of insert — idempotent on (snapshot_id, symbol)
-            # prevents duplicate rows if save_snapshot is called more than once
-            # for the same snapshot (e.g. crash-restart mid-write).
             sb.table("options_universe_symbols").upsert(
                 rows[i : i + batch_size],
                 on_conflict="snapshot_id,symbol",
@@ -399,8 +430,8 @@ def _sync_save_snapshot(
         log.info("universe_store: deactivated previous snapshots")
 
         log.info(
-            "universe_store: snapshot SAVED id=%s symbols=%d source=%s",
-            snapshot_id, len(symbols), source,
+            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s",
+            snapshot_id, len(eligible_symbols), source,
         )
 
         _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
