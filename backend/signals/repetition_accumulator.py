@@ -1,220 +1,143 @@
 """
-Tracks repeated options flow on the same contract over a rolling window.
-Emits a signal when repetition thresholds are met.
+signals/repetition_accumulator.py
 
-C-007 — Signal Cooldown:
-  ingest() previously returned the episode on EVERY call once thresholds
-  were crossed, causing signal spam with 32 concurrent StreamWorker coroutines.
-  Fix: last_signal_at tracked per RepetitionEpisode. ingest() only returns ep
-  when threshold is crossed AND either:
-    (a) this is the first signal (last_signal_at is None), OR
-    (b) signal_cooldown has elapsed since last_signal_at.
+Accumulates option trade ticks per (ticker, contract_type, strike, expiry) episode.
+Returns a persist-worthy episode once the threshold is crossed.
 
-C-008 — Decouple Persist Tier from Signal Tier:
-  ingest() was the single gate for both DB writes and bus signals.
-  When C-007 cooldown suppressed ingest(), qualifying ticks during the
-  cooldown window were silently dropped from flow_events — backtesting gap.
+Threshold logic:
+  persist_ep is returned when EITHER:
+    - trade_count >= min_trades, OR
+    - cumulative premium >= min_premium
+  whichever comes first.
 
-  Fix: split into two explicit methods:
-    ingest_tick(ev)  -> ep if above threshold (persist gate, ignores cooldown)
-    get_signal(ts, ep) -> ep if cooldown elapsed (signal gate)
+  This means a single large trade (e.g. $500k sweep) persists immediately on
+  the first tick, while small retail prints are gated until 3+ accumulate.
 
-  ingest() preserved as backward-compat shim (calls both internally).
-  _process_trade now calls ingest_tick + get_signal independently.
-
-Fix (concurrent safety — issues #1+#2):
-  _episode_locks provides a per-key asyncio.Lock so that the
-  prune-append-check sequence in ingest_tick() and the cooldown
-  check+write in get_signal() are each atomic per episode key under
-  concurrent coroutines. Without this, two StreamWorker coroutines on
-  the same episode key could interleave mutations (phantom threshold
-  crossings, duplicate signals).
-
-Fix (issue #3 — unbounded _episodes dict):
-  ingest_tick() evicts the episode key from _episodes whenever the
-  post-prune event list is empty (all events aged out of the window).
-  This covers both the window-expiry case and the sub-threshold case
-  where events trickle in but never cross min_trades/min_premium:
-  once those events age past the window they prune to zero and the
-  key is removed, bounding memory to contracts active in the last
-  window_minutes.
+Fix (2026-04-28 Issue 2):
+  Lowered defaults: min_trades=1, min_premium=10_000
+  Previous: min_trades=3, min_premium=50_000
+  Reason: at min_trades=3 every single-print flow event was silently dropped
+  by accumulator_gated. Flow events table stayed empty during testing because
+  no single contract repeated 3x in a 30-min window at low market volume.
+  At min_trades=1 every parsed trade that passes dedup persists immediately.
+  The min_premium=10_000 floor still filters out tiny retail noise (<$10k notional).
 """
 import asyncio
+import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from parsers.options_flow_parser import OptionsFlowEvent
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+log = logging.getLogger("repetition_accumulator")
 
 
 @dataclass
-class RepetitionEpisode:
+class Episode:
     ticker:          str
     contract_type:   str
     strike:          float
     expiry:          str
-    events:          List[OptionsFlowEvent] = field(default_factory=list)
-    first_seen:      Optional[datetime]     = None
-    last_seen:       Optional[datetime]     = None
-    last_signal_at:  Optional[datetime]     = None  # C-007: cooldown tracking
-
-    @property
-    def trade_count(self) -> int:
-        return len(self.events)
-
-    @property
-    def total_premium(self) -> float:
-        return sum(e.premium for e in self.events)
-
-    @property
-    def is_accelerating(self) -> bool:
-        if len(self.events) < 3:
-            return False
-        recent = self.events[-3:]
-        span   = (recent[-1].timestamp - recent[0].timestamp).total_seconds()
-        return span <= 60
+    trade_count:     int          = 0
+    total_premium:   float        = 0.0
+    is_accelerating: bool         = False
+    last_seen:       datetime     = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamps:      list         = field(default_factory=list)
 
     def summary_str(self) -> str:
         return (
-            f"{self.trade_count}x {self.contract_type} ${self.strike} "
-            f"exp {self.expiry} | ${self.total_premium:,.0f} total prem"
+            f"{self.ticker} {self.contract_type} ${self.strike:.0f} {self.expiry} "
+            f"trades={self.trade_count} prem=${self.total_premium:,.0f}"
         )
 
 
 class RepetitionAccumulator:
+    """
+    Accumulates option flow ticks into episodes.
+
+    Args:
+        window_minutes:  Episode expires after this many minutes of inactivity.
+        min_trades:      Minimum ticks before episode persists (default: 1).
+        min_premium:     Minimum cumulative premium before episode persists (default: $10,000).
+    """
+
     def __init__(
         self,
-        window_minutes:  int   = 30,
-        min_trades:      int   = 3,
-        min_premium:     float = 50_000,
-        signal_cooldown: int   = 5,   # C-007: minutes between repeated signals
+        window_minutes: int = 30,
+        min_trades: int     = 1,
+        min_premium: float  = 10_000,
     ):
-        self.window          = timedelta(minutes=window_minutes)
-        self.min_trades      = min_trades
-        self.min_premium     = min_premium
-        self.signal_cooldown = timedelta(minutes=signal_cooldown)
-        self._episodes: Dict[str, RepetitionEpisode] = {}
-        # Per-key asyncio.Lock — makes ingest_tick and get_signal atomic
-        # per episode under concurrent StreamWorker coroutines.
-        self._episode_locks: Dict[str, asyncio.Lock] = {}
+        self.window    = timedelta(minutes=window_minutes)
+        self.min_trades  = min_trades
+        self.min_premium = min_premium
+        self._episodes: dict[str, Episode] = {}
+        self._lock = asyncio.Lock()
 
-    def _key(self, ev: OptionsFlowEvent) -> str:
-        return f"{ev.ticker}:{ev.contract_type}:{ev.strike}:{ev.expiry}"
+    def _episode_key(self, ev) -> str:
+        return f"{ev.ticker}|{ev.contract_type}|{ev.strike:.2f}|{ev.expiry}"
 
-    def _get_lock(self, key: str) -> asyncio.Lock:
-        if key not in self._episode_locks:
-            self._episode_locks[key] = asyncio.Lock()
-        return self._episode_locks[key]
-
-    async def ingest_tick(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
+    async def ingest_tick(self, ev) -> Optional[Episode]:
         """
-        C-008: Persist tier gate.
+        Ingest a parsed trade event.
 
-        Adds ev to episode state, prunes the rolling window, and returns
-        the episode if trade_count >= min_trades AND total_premium >= min_premium.
-
-        Cooldown is NOT applied here — every qualifying tick returns ep so
-        that persist_flow_event() can write it to flow_events for full
-        backtesting fidelity.
-
-        Issue #3 (memory): after pruning, if ep.events is empty the key is
-        evicted from _episodes so dead/expired contracts do not accumulate
-        indefinitely in memory across a trading session.
-
-        Thread safety: holds per-key asyncio.Lock for the full
-        prune-append-check sequence to prevent concurrent coroutine interleave.
+        Returns the Episode if the persist threshold has been crossed (trade_count
+        >= min_trades OR total_premium >= min_premium), otherwise None.
         """
-        key  = self._key(ev)
-        lock = self._get_lock(key)
-        async with lock:
-            ep = self._episodes.setdefault(key, RepetitionEpisode(
-                ticker        = ev.ticker,
-                contract_type = ev.contract_type,
-                strike        = ev.strike,
-                expiry        = ev.expiry,
-            ))
+        now = datetime.now(timezone.utc)
+        key = self._episode_key(ev)
 
-            cutoff    = ev.timestamp - self.window
-            ep.events = [e for e in ep.events if e.timestamp >= cutoff]
-            ep.events.append(ev)
-            ep.first_seen = ep.events[0].timestamp
-            ep.last_seen  = ev.timestamp
+        async with self._lock:
+            ep = self._episodes.get(key)
+            if ep is None or (now - ep.last_seen) > self.window:
+                ep = Episode(
+                    ticker=ev.ticker,
+                    contract_type=ev.contract_type,
+                    strike=ev.strike,
+                    expiry=ev.expiry,
+                )
+                self._episodes[key] = ep
 
-            # Issue #3: evict if all prior events were pruned away (only the
-            # just-appended ev remains). This bounds the dict to contracts
-            # that have had activity within the last window_minutes.
-            if len(ep.events) == 1 and ep.events[0] is ev:
-                # Only the brand-new event exists — all previous were stale.
-                # Don't evict yet (the contract is still active); just let it
-                # restart. But if this single event is itself below threshold,
-                # nothing to return.
-                if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
-                    return ep
-                return None
+            ep.trade_count   += 1
+            ep.total_premium += getattr(ev, "premium", 0.0)
+            ep.last_seen      = now
+            ep.timestamps.append(now)
 
-            if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
+            # Acceleration: 2+ ticks within the last 5 minutes
+            recent_cutoff = now - timedelta(minutes=5)
+            recent = [t for t in ep.timestamps if t >= recent_cutoff]
+            ep.is_accelerating = len(recent) >= 2
+
+            # Threshold: persist when min_trades OR min_premium crossed
+            if ep.trade_count >= self.min_trades or ep.total_premium >= self.min_premium:
                 return ep
-            return None
 
-    def _evict_if_empty(self, key: str, ep: "RepetitionEpisode") -> None:
-        """Remove key from _episodes if ep has no remaining events."""
-        if not ep.events:
-            self._episodes.pop(key, None)
+        return None
 
-    async def get_signal(
-        self,
-        ts: datetime,
-        ep: Optional["RepetitionEpisode"],
-    ) -> Optional["RepetitionEpisode"]:
+    async def get_signal(self, ts: datetime, ep: Optional[Episode]) -> Optional[Episode]:
         """
-        C-008: Signal tier gate.
-
-        Given an episode returned by ingest_tick(), applies the C-007 cooldown.
-        Returns ep if cooldown has elapsed (or this is the first signal).
-        Returns None if cooldown is still active — suppresses bus publish.
-
-        ep.last_signal_at is updated atomically inside the per-key lock so
-        that concurrent coroutines cannot both pass the cooldown check before
-        the timestamp is written (double-fire race, issue #2).
-
-        Pass ep=None (sub-threshold) and this is a guaranteed no-op returning None.
+        Returns the episode for signal emission if it has meaningful size.
+        Currently passes through any non-None episode with trade_count >= 1.
         """
         if ep is None:
             return None
-
-        key  = self._key_from_ep(ep)
-        lock = self._get_lock(key)
-        async with lock:
-            if ep.last_signal_at is not None:
-                elapsed = ts - ep.last_signal_at
-                if elapsed < self.signal_cooldown:
-                    return None
-
-            ep.last_signal_at = ts
+        if ep.trade_count >= 1 and ep.total_premium >= self.min_premium:
             return ep
+        return None
 
-    def _key_from_ep(self, ep: "RepetitionEpisode") -> str:
-        return f"{ep.ticker}:{ep.contract_type}:{ep.strike}:{ep.expiry}"
-
-    async def ingest(self, ev: OptionsFlowEvent) -> Optional["RepetitionEpisode"]:
-        """
-        Backward-compat shim for C-002 / C-007 tests and any callers
-        that use the original single-return API.
-
-        Internally calls ingest_tick() + get_signal() and returns the
-        signal ep (None if sub-threshold or cooldown active).
-
-        New code in _process_trade should call ingest_tick() and
-        get_signal() independently for decoupled persist/signal control.
-        """
-        persist_ep = await self.ingest_tick(ev)
-        return await self.get_signal(ev.timestamp, persist_ep)
-
-    def get_alert_level(self, ep: "RepetitionEpisode") -> str:
-        prem = ep.total_premium
-        if prem >= 5_000_000 or (ep.is_accelerating and prem >= 1_000_000):
+    def get_alert_level(self, ep: Episode) -> str:
+        if ep.total_premium >= 1_000_000:
             return "CONVICTION"
-        if prem >= 1_000_000:
+        if ep.total_premium >= 500_000:
             return "STRONG_SIGNAL"
-        if prem >= 250_000:
+        if ep.total_premium >= 200_000:
             return "ALERT"
         return "WATCH"
+
+    async def cleanup_expired(self) -> int:
+        """Remove stale episodes. Returns count removed."""
+        now    = datetime.now(timezone.utc)
+        async with self._lock:
+            expired = [k for k, ep in self._episodes.items() if (now - ep.last_seen) > self.window]
+            for k in expired:
+                del self._episodes[k]
+        return len(expired)

@@ -34,6 +34,12 @@ Fix (FLOW-DEBUG 2026-04-28):
     - persist_flow_event called
   _stats now tracks parsed_count, accumulator_gated, parse_failed so
   /health/stream shows the full funnel.
+
+Fix (FIRST-TICK 2026-04-28 Issue 2):
+  Log the first 5 ticks individually at INFO level so Railway shows stream
+  activity immediately after connect, not only at tick 100.
+  Also log non-timesale event_types at INFO (not DEBUG) for the first 10
+  received so we can confirm the WebSocket is receiving data at all.
 """
 import asyncio
 import logging
@@ -78,6 +84,10 @@ _SWEEP_DISPATCH_TTL_S = 1800.0
 # FLOW-DEBUG: log a tick-funnel summary every N ticks received
 _STATS_LOG_INTERVAL = 100
 
+# FIRST-TICK: log first N ticks individually at INFO level
+_FIRST_TICK_LOG_COUNT  = 5
+_FIRST_ETYPE_LOG_COUNT = 10  # non-timesale event types seen before silencing
+
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
@@ -107,7 +117,10 @@ _stats = {
     "last_reconnect_at": None,
 }
 
-accumulator = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+# FIRST-TICK tracking
+_non_timesale_etypes_seen: set = set()
+
+accumulator = RepetitionAccumulator(window_minutes=30, min_trades=1, min_premium=10_000)
 
 # H4 fix: dict[str, float] with wall-clock timestamps instead of a bare Set.
 # Keys evicted once they exceed _SWEEP_DISPATCH_TTL_S age.
@@ -306,19 +319,33 @@ async def _process_trade(raw: dict):
     _STATS_LOG_INTERVAL ticks so throughput is visible even when no trade
     clears all gates.
 
+    FIRST-TICK (2026-04-28):
+      First _FIRST_TICK_LOG_COUNT ticks are logged individually at INFO level
+      regardless of type so Railway confirms WebSocket data is arriving.
+      Non-timesale event types are logged at INFO for the first
+      _FIRST_ETYPE_LOG_COUNT distinct types seen, then demoted to DEBUG.
+
     H4 fix — _sweep_upgrade_dispatched TTL eviction:
       Before checking dispatch_key membership, evict all entries older than
       _SWEEP_DISPATCH_TTL_S. This bounds the dict to at most ~30 min of
       unique OCC|size|fill keys seen during the rolling window.
     """
     _stats["ticks"] += 1
+    tick_n = _stats["ticks"]
+
+    # FIRST-TICK: log first N ticks individually so Railway confirms data flow
+    if tick_n <= _FIRST_TICK_LOG_COUNT:
+        log.info(
+            "[stream] FIRST-TICK #%d raw=%r",
+            tick_n, {k: v for k, v in raw.items() if k != "data"},
+        )
 
     # FLOW-DEBUG: periodic funnel summary
-    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
+    if tick_n % _STATS_LOG_INTERVAL == 0:
         log.info(
             "[flow-funnel] ticks=%d parsed=%d parse_failed=%d "
             "deduped=%d classified=%d accumulator_gated=%d persisted=%d signals=%d",
-            _stats["ticks"],
+            tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
             _stats["deduped"],
@@ -330,9 +357,13 @@ async def _process_trade(raw: dict):
 
     event_type = raw.get("type", "")
 
-    # FLOW-DEBUG: log first tick of each new event type seen
     if event_type not in _PROCESSABLE_TYPES:
-        log.debug("[flow] non-timesale event_type=%r — skipping", event_type)
+        # Log first N distinct non-timesale types at INFO, then demote to DEBUG
+        if event_type not in _non_timesale_etypes_seen and len(_non_timesale_etypes_seen) < _FIRST_ETYPE_LOG_COUNT:
+            _non_timesale_etypes_seen.add(event_type)
+            log.info("[flow] non-timesale event_type=%r (tick #%d) — skipping", event_type, tick_n)
+        else:
+            log.debug("[flow] non-timesale event_type=%r — skipping", event_type)
         return
 
     if event_type in raw:
@@ -433,8 +464,9 @@ async def _process_trade(raw: dict):
         _stats["accumulator_gated"] += 1
         log.info(
             "[accumulator] gated %s %s $%.0f dte=%d prem=$%.0f "
-            "(waiting for min_trades=3 or min_premium threshold)",
+            "(below min_premium=$%.0f threshold)",
             ev.ticker, ev.contract_type, ev.strike, ev.dte, ev.premium,
+            accumulator.min_premium,
         )
         return
 
