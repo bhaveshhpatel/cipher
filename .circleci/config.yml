@@ -1,6 +1,6 @@
 # .circleci/config.yml
 # Backend: lint + regression (92% coverage gate) + deploy to Railway
-# Frontend: npm ci + next build (type gate) + jest --ci --coverage + deploy to Vercel
+# Frontend: npm install + next build (type gate) + jest --ci --coverage + deploy to Vercel
 # Vercel git integration should be disabled in Project Settings → Git
 # so only this pipeline can trigger production deploys.
 
@@ -104,6 +104,7 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Job 3: Frontend — type-check + Jest coverage gate
+  # No package-lock.json in repo — uses npm install, cache keyed on package.json.
   # -----------------------------------------------------------------------
   frontend_test:
     docker:
@@ -112,27 +113,27 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - node-v1-{{ checksum "frontend/package-lock.json" }}
+            - node-v1-{{ checksum "frontend/package.json" }}
             - node-v1-
       - run:
           name: Install frontend dependencies
           working_directory: ~/project/frontend
-          command: npm ci
+          command: npm install --prefer-offline
       - save_cache:
-          key: node-v1-{{ checksum "frontend/package-lock.json" }}
+          key: node-v1-{{ checksum "frontend/package.json" }}
           paths:
-            - ~/project/frontend/node_modules
+            - ~/.npm
       - run:
-          name: Type-check + Next.js build
+          name: Type-check
           working_directory: ~/project/frontend
-          # next build will fail on any TypeScript error or import mismatch.
-          # This is the cheapest full type gate before Jest runs.
+          command: npx tsc --noEmit
+      - run:
+          name: Next.js build
+          working_directory: ~/project/frontend
           command: npm run build
       - run:
           name: Jest — CI mode with coverage
           working_directory: ~/project/frontend
-          # Uses the test:ci script: jest --ci --coverage
-          # --ci disables interactive mode and treats snapshot mismatches as failures.
           command: npm run test:ci
       - store_artifacts:
           path: ~/project/frontend/coverage
