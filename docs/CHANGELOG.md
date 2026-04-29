@@ -9,175 +9,240 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Ingestion Pipeline Stability] — 2026-04-28
+
+### Summary
+
+Nine production bugs fixed on the `stable/ingestion-flow-2026-04-28` branch covering:
+alert level mis-routing, dedup TypeError, unbounded memory in sweep dispatch, Gate 2
+re-emission spam, observability gaps, universe snapshot duplication, dual registry
+instantiation, hard-coded worker count, and first-tick log blindness.
+
+### Fixed
+
+#### ALERT-LEVEL — `flow_episodes.alert_level` Always `WATCH`
+- `_bus_signal_listener` was reading `sig.get("recommendation")` (BUY/SELL/HOLD) for the
+  `alert_level` column. Every `flow_episodes` row was persisted as `WATCH`.
+- **Fix:** `composite_signal` message now includes `alert_level` in its `signal` sub-dict.
+  `_bus_signal_listener` reads `sig.get("alert_level")` (CONVICTION/STRONG_SIGNAL/ALERT/WATCH).
+- **Files:** `backend/services/tradier_stream.py`, `backend/services/flow_store.py`
+- **Test:** `test_alert_level_fix.py`
+
+#### DEDUP-KWARGS — `TypeError` on Every Tick (Dedup Production No-op Again)
+- `flow_dedup.is_duplicate()` was called with `occ_symbol=occ_symbol` as a keyword arg.
+  `DedupCache.is_duplicate()` defines it as positional — Python raised `TypeError` on every
+  tick. Caught silently by outer try/except; `_stats["deduped"]` always 0; all exchange
+  copies written to DB.
+- **Fix:** Pass `occ_symbol` as first positional argument.
+- **Files:** `backend/services/tradier_stream.py`
+- **Test:** `test_dedup_kwargs_fix.py`
+
+#### H4 — `_sweep_upgrade_dispatched` Set Never Evicted (Memory Leak)
+- `_sweep_upgrade_dispatched` was `Set[str]` with no eviction. Accumulated indefinitely
+  over the trading day. Also caused missed sweep upgrades for contracts reprinting after
+  30 min (stale key blocked re-dispatch).
+- **Fix:** Changed to `dict[str, float]` (key → timestamp). Keys older than
+  `_SWEEP_DISPATCH_TTL_S = 1800s` evicted before each membership check.
+- **Files:** `backend/services/tradier_stream.py`
+- **Test:** `test_sweep_dispatch_ttl.py`
+
+#### Gate 2 — Accumulator Re-Emission Spam on Active Episodes
+- `ingest_tick()` returned the episode on every tick after Gate 1 was crossed. SPY/QQQ
+  would write a new `signal_history` and `flow_episodes` row on every single tick (10–100/sec).
+- **Fix:** Added `last_signaled_premium` to `RepetitionEpisode`. Gate 2: only re-emit when
+  `total_premium - last_signaled_premium >= SIGNAL_RETRIGGER_THRESHOLD ($50,000)`.
+- **Files:** `backend/signals/repetition_accumulator.py`
+- **Test:** `test_gate2_retrigger.py`
+
+#### FLOW-DEBUG — Silent Drop Gates (No Railway Log Visibility)
+- All tick drop gates logged at DEBUG or were silent. A dead stream looked identical to a
+  healthy one in Railway logs.
+- **Fix:** Parse failures, accumulator gates, and dedup hits upgraded to INFO. First 5 ticks
+  individually logged. Periodic 100-tick funnel summary at INFO.
+- **Files:** `backend/services/tradier_stream.py`
+- **New stats in `/health/stream`:** `parsed_count`, `accumulator_gated`, `parse_failed`
+
+#### U-1 — Snapshot Duplication on Every Railway Restart
+- `universe_store._sync_save_snapshot()` always created a new snapshot UUID on startup.
+  No uniqueness constraint on `options_universe_symbols` — N restarts created N copies.
+- **Fix:** Reuse existing snapshot if < 20h old and symbol count within ±10%.
+  Added `UNIQUE(snapshot_id, symbol)` constraint via migration 013.
+- **Files:** `backend/services/universe_store.py`
+- **Test:** `test_universe_idempotent.py`
+
+#### D-001 / D-002 — Dual `SymbolRegistry` Instances at Startup
+- `main.py` and `stream_options_flow()` each called `init_registry()` + `build()`.
+  Two full Tradier chain fetches, two `refresh_loop()` tasks, doubled cold-start time.
+- **Fix:** `stream_options_flow()` accepts `registry=` parameter. When provided, polls
+  `registry.is_ready()` instead of building. `refresh_loop()` only spawned by lifespan.
+- **Files:** `backend/services/tradier_stream.py`, `backend/main.py`
+- **Test:** `test_registry_shared_instance.py`
+
+#### D-003 — Worker Count Hard-Coded to 32 (Half Universe Unstreamed)
+- 32 workers hard-coded. ~31,920 OCC symbols at 500/worker requires 64. ~16,000 symbols
+  were never streamed, silently.
+- **Fix:** `worker_count = math.ceil(registry.size() / _CHUNK_SIZE)`. Logged at INFO.
+- **Files:** `backend/services/stream_manager.py`
+- **Test:** `test_stream_manager_dynamic_workers.py`
+
+---
+
 ## [Registry Prewarm] — 2026-04-26
 
 ### Summary
-Added `_registry_prewarm_loop()` to `main.py` — a background async task that
-pre-builds the OCC symbol registry at 09:15 ET each trading day, before the
-09:30 market open. This ensures the registry is warm when the first flow ticks
-arrive, eliminating cold-start latency on registry lookups.
+Added `_registry_prewarm_loop()` to `main.py` — a background async task that pre-builds
+the OCC symbol registry at 09:15 ET each trading day, before the 09:30 market open.
+Eliminates cold-start latency on registry lookups at market open.
 
 ### Added
-
-#### `backend/main.py`
-- `_registry_prewarm_loop()` — infinite async loop:
-  - Skips weekends (sleeps 1h and re-checks)
-  - Computes seconds until next 09:15 ET; sleeps that duration
-  - Calls `get_registry().build()` after sleep
-  - Catches all exceptions non-fatally; always continues to next day
-- `prewarm_task = asyncio.create_task(_registry_prewarm_loop())` wired into `lifespan()` startup
-- `prewarm_task` added to the cancel + await cleanup loop in `lifespan()` shutdown
-- New imports: `time`, `timedelta` (added to datetime import), `ZoneInfo` from `zoneinfo`
-
-#### `backend/tests/test_registry_prewarm.py` (NEW)
-| Test | Asserts |
-|---|---|
-| `test_prewarm_skips_weekends` | `sleep(3600)` called, `build()` never called on Saturday |
-| `test_prewarm_sleep_before_915` | Sleep is 895–905s when called at 09:00 AM ET Monday |
-| `test_prewarm_rolls_to_next_weekday_if_past_915` | Sleep ≈83700s when called at 10:00 AM Monday |
-| `test_prewarm_calls_registry_build` | `registry.build()` awaited after sleep completes |
-| `test_prewarm_survives_build_exception` | `RuntimeError` from `build()` does not crash the loop |
-
-#### `backend/tests/test_main_app.py` (UPDATED)
-- Added `test_lifespan_spawns_prewarm_task` — patches `asyncio.create_task` and asserts
-  `_registry_prewarm_loop` appears in the created task coroutines
+- `backend/main.py`: `_registry_prewarm_loop()` — infinite async loop, skips weekends,
+  sleeps until 09:15 ET, calls `get_registry().build()`, survives exceptions non-fatally.
+- `prewarm_task` wired into `lifespan()` startup and shutdown.
+- `backend/tests/test_registry_prewarm.py` (5 tests): weekend skip, timing, build call,
+  exception non-fatal.
+- `test_main_app.py`: `test_lifespan_spawns_prewarm_task` added.
 
 ---
 
 ## [Feature 4A-OI] — 2026-04-25
 
 ### Summary
-Average chain open interest is now computed during `symbol_registry.build()` and
-used as a hard gate for T1/T2 tier classification. Symbols with zero or unavailable
-OI can no longer be promoted to T1 or T2 regardless of volume or price.
+Average chain open interest is now computed during `symbol_registry.build()` and used as a
+hard gate for T1/T2 tier classification. Zero OI blocks T1/T2 promotion regardless of volume
+or price.
 
 ### Added
-- `SymbolRegistry.get_oi_map()` — returns a `{symbol: avg_oi}` copy after `build()`
+- `SymbolRegistry.get_oi_map()` — returns `{symbol: avg_oi}` after `build()`
 - `main._stamp_oi(quotes, oi_map)` — stamps avg chain OI onto `SymbolQuote` objects in-place
-- Two-pass tier assignment in `lifespan()`: preliminary pass (OI=0) → registry build → OI stamp → final re-classification
-- Same two-pass logic in `_universe_refresh_loop()` for background 24h refresh
+- Two-pass tier assignment in `lifespan()` and `_universe_refresh_loop()`
 - 28 new tests across `test_4a_oi_pipeline.py` and related files
 
 ### Changed
-- `tier_engine._classify()`: removed OI grace path — all 3 conditions (vol + price + OI) required for T1/T2
-- `universe_store._sync_upsert_symbol_quotes()`: `open_interest` field now included in every upsert row
-
-### No migration required
-> Migration 010 already added the `open_interest` column.
+- `tier_engine._classify()`: OI grace path removed — all 3 conditions (vol + price + OI)
+  required for T1/T2
+- `universe_store._sync_upsert_symbol_quotes()`: `open_interest` field included in every upsert
 
 ---
 
 ## [Phase 5B — Regression Test Suite + CI Gate] — 2026-04-25
 
 ### Summary
-Comprehensive automated regression test suite built across 5 phases (P1–P5), covering
-the full backend and frontend codebase. GitHub Actions CI now enforces a hard coverage
-gate of 90% (backend) and 75% lines/functions (frontend) on every push and PR.
-Nothing deploys to Railway or Vercel unless all regression tests pass.
+Comprehensive automated regression suite (90%+ backend, 75%+ frontend). GitHub Actions CI
+enforces hard coverage gates on every push and PR. Nothing deploys unless all tests pass.
 
 ### Added
+- 13+ new backend test files covering auth, admin, config, demo, ingestion, ensemble,
+  dedup, swarm, trade executor, simulation, smart signals, main app
+- `backend/pytest.ini`, `backend/.coveragerc`, `backend/requirements-dev.txt`
+- `frontend/jest.config.ts`, `frontend/__mocks__/styleMock.ts` + `fileMock.ts`
+- `.github/workflows/backend.yml`: lint → regression (≥90%) → Railway deploys
+- `.github/workflows/frontend.yml`: typecheck → regression (≥75%) → build → Vercel deploys
+- PR coverage comment via `orgoro/coverage@v3.2`
 
-#### Test Files (backend/tests/)
-| File | Cases | Coverage Area |
-|---|---|---|
-| `test_auth_router.py` | ~15 | JWT register/login/me, expired token, missing header |
-| `test_admin_router.py` | ~12 | Tier-threshold CRUD, admin role guard, 403 on non-admin |
-| `test_config.py` | ~10 | Settings field types, defaults, SUPABASE_SERVICE_KEY presence |
-| `test_demo_engine.py` | ~14 | Demo mode signals, deterministic mock, fallback path |
-| `test_ingestion_config.py` | ~12 | Ingestion toggle, config validation, env overrides |
-| `test_midcap_screener.py` | ~10 | Mid-cap filter thresholds, pass/fail boundaries |
-| `test_ensemble_runner.py` | ~18 | Majority vote, tie-breaking, per-agent name field |
-| `test_dedup.py` | ~22 | 2s TTL dedup, sweep detection (3+ exchanges/5s), singleton |
-| `test_swarm_engine.py` | ~25 | All 12 agent roles, HOLD fallback (no API key), confidence bounds |
-| `test_trade_executor.py` | ~14 | place_option_order (market/limit/error/network), get_positions |
-| `test_simulation_router.py` | ~12 | n_agents/n_runs validation, 422 boundaries, flow_events serialised |
-| `test_smart_signals_router.py` | ~16 | DB hit/miss, live/mock source, filters, _row_to_composite defaults |
-| `test_main_app.py` | ~15 | /health, /root, all 7 routers mounted, _JsonFormatter, _stamp_oi |
+---
 
-#### CI Configuration
-- `backend/pytest.ini` — test discovery, `asyncio_mode=auto`, `--cov-fail-under=90`, XML + HTML + terminal reports
-- `backend/.coveragerc` — omit rules (tests/, migrations/, venv/), `exclude_lines` for pragmas/abstracts/TYPE_CHECKING
-- `backend/requirements-dev.txt` — added `pytest-cov`, `fastapi[all]`
-- `frontend/jest.config.ts` — explicit Jest config with `coverageThreshold` (global 75%, useAuth.ts 90%, useFlow.ts 85%)
-- `frontend/__mocks__/styleMock.ts` + `fileMock.ts` — CSS/asset stubs
-- `.github/workflows/backend.yml` — rebuilt: `lint` → `regression` (sequential); dummy env vars injected; pip cache; coverage XML artifact; PR coverage comment via `orgoro/coverage@v3.2`
-- `.github/workflows/frontend.yml` — rebuilt: `typecheck` → `regression` → `build` → `deploy` (sequential); coverage artifact uploaded
+## [Feature 4A] — 2026-04-25 (c.020 in FIXES)
+
+### Summary
+Dynamic tier classification. `tier_thresholds` DB table, editable via admin API.
+
+### Added
+- `services/tier_engine.py`: `assign_tiers()`, `_classify()`, `_fetch_thresholds()`,
+  `invalidate_thresholds_cache()`, T1 admin whitelist (SPY, QQQ, AAPL, TSLA, NVDA, MSFT,
+  AMZN, META, GOOGL, AMD, PLTR, COIN)
+- `routers/admin.py`: GET/PATCH `/api/admin/tier-thresholds`, GET `/api/admin/tier-distribution`
+- Migrations 010 (`tier` + `open_interest` + `average_volume` on `options_universe_symbols`),
+  011 (`tier_thresholds` table)
+- Tests: TE-01–22 in `test_4a_tier_engine.py`
+
+---
+
+## [Phase 3+5A — Composite Signal Engine + Swarm] — 2026-04-24
+
+### Summary
+Composite scoring pipeline (flow × 0.55 + backtest × 0.35 + vwpf × 0.10).
+BUY/SELL/HOLD recommendation at composite ≥ 0.65. Swarm (12 Groq agents) available via
+async path. `signal_history` and `flow_episodes` persistence added.
+
+### Added
+- `signals/composite_signal_engine.py`: `build_composite()`, `build_composite_async()`,
+  `CompositeSignal` dataclass, `compute_flow_score()`, `volume_weighted_premium_factor()`
+- `signals/backtest_validator.py`: `get_backtest_score()` historical win-rate lookup
+- `signals/repetition_accumulator.py`: Gate 1 (count≥3 OR prem≥$10k), `get_alert_level()`,
+  `RepetitionEpisode`, `is_accelerating`
+- `services/swarm_engine.py`, `simulation/ensemble_runner.py`: 12-agent Groq swarm
+- `services/flow_store.py`: `_bus_signal_listener()` → `flow_episodes` persistence
+- `services/signal_store.py`: `signal_history` persistence, swarm fields
+- `routers/history.py`: `GET /api/signals/history`
+- Migration 003 (`signal_history`), 005 (schema repair), 006–009 (incremental patches)
+
+---
+
+## [C-019 — Dedup + Sweep Overhaul] — 2026-04-24
+
+### Summary
+5 bugs in Layer 4 dedup fixed: TTL too tight, time-bucket boundary gap, fill precision too
+tight, dedup singleton never imported, sweep exchange field never passed.
 
 ### Changed
-- `.github/workflows/backend.yml`: added `regression` job after `lint`
-- `.github/workflows/frontend.yml`: `regression` job inserted before `build`; deploy now blocked until regression passes
-- `backend/requirements-dev.txt`: added `pytest-cov` and `fastapi[all]`
-
-### CI Gate Behaviour
-| Trigger | Gate |
-|---|---|
-| Push to `main` (backend/**) | lint → regression (≥90% coverage) → Railway deploys |
-| Push to `main` (frontend/**) | typecheck → regression (≥75% coverage) → build → Vercel deploys |
-| Pull request (any) | Same gates + PR coverage comment posted automatically |
+- `utils/dedup.py`: TTL 2s → 5s, sweep window 5s → 8s, eliminated `int(ts//2)` bucket,
+  fill key `.2f → .1f`, added `dedup_stats()`, `get_exchange_count()`
+- `tradier_stream.py`: imported `flow_dedup`, wired `is_duplicate()`, sweep upgrade,
+  `_stats["deduped"]`
+- `demo_engine.py`: `exch` primary field, inter-exchange delay 50–300ms
 
 ---
 
-## [Feature 4A] — 2026-04-24
-
-### Summary
-Dynamic tier classification system. Symbols are classified into T1/T2/T3 based on
-runtime thresholds stored in a `tier_thresholds` DB table, editable via the admin API.
+## [C-018 — Synthetic Quote Flag] — 2026-04-24
 
 ### Added
-- `services/tier_engine.py`: `assign_tiers()`, `_classify()`, `_fetch_thresholds()`, `invalidate_thresholds_cache()`
-- `services/symbol_registry.py`: `_TierParams` dataclass, `ContractMeta.tier` field
-- `universe_store.load_tier_map()` / `upsert_symbol_quotes(tier_map=...)`
-- `routers/admin.py`: `GET /api/admin/tier-thresholds`, `PATCH /api/admin/tier-thresholds`, `GET /api/admin/tier-distribution`
-- Migrations 010, 011, 012
-- Tests: TE-01–22 in `test_4a_tier_engine.py`, TR-01–05 in `test_universe_store.py`
+- `is_synthetic_quote: bool` field on `OptionsFlowEvent` + `flow_events` table
+  (migration 009). Set `True` when `bid=0 AND ask=0`. Backtest queries should
+  filter `WHERE is_synthetic_quote = false`.
 
 ---
 
-## [B-019] — 2026-04-23
+## [C-017 — Duplicate flow_episodes Rows] — 2026-04-24
 
-### Summary
-Admin tier-thresholds cache visibility and `updated_at` trigger.
-
-### Added
-- `GET /api/admin/tier-thresholds` returns `cache_age_seconds` and `cache_ttl_seconds`
-- Migration 012: `updated_at` auto-trigger on `tier_thresholds`
-- RLS SELECT policy for `authenticated` role on `tier_thresholds`
+### Fixed
+- `_bus_signal_listener` wrote `flow_episodes` on both `signal` and `composite_signal`
+  events → 2× rows per episode. Now writes only on `composite_signal`.
 
 ---
 
-## [B-008] — 2026-04-20
+## [C-016 — UnboundLocalError After 100-Row Buffer] — 2026-04-24
 
-### Summary
-Stream health monitoring endpoint.
-
-### Added
-- `routers/health.py`: `GET /api/health/stream`
-- `tests/test_health_stream.py`: 8 tests
+### Fixed
+- Missing `global _flow_event_buffer` in `persist_flow_event()` caused
+  `UnboundLocalError` on buffer flush. Every flow event write crashed after 100 rows.
 
 ---
 
-## [C-018] — 2026-04-18
+## [C-015 — filter=trade → filter=timesale] — 2026-04-23
 
-### Summary
-Synthetic quote flag on flow events.
-
-### Added
-- `is_synthetic_quote` boolean column on `flow_events` (migration 009)
+### Fixed
+- Tradier stream `filter=trade` delivers equity ticks. Changed to `filter=timesale`
+  for option contract ticks with OCC symbol and real NBBO.
 
 ---
 
-## [Phase 5B Admin Foundation] — 2026-04-15
+## [C-013 — Stream Envelope Unwrap] — 2026-04-23
 
-### Added
-- `routers/admin.py` skeleton with demo toggle endpoint
-- `core/auth.py` admin role guard
+### Fixed
+- `_process_trade()` now unwraps `raw[event_type]` inner dict before passing to parser.
+
+---
+
+## [C-010 — flow_episodes RLS 401 / Service Role Key] — 2026-04-23
+
+### Fixed
+- `flow_store.py` silent fallback to anon key (`SUPABASE_KEY`) when
+  `SUPABASE_SERVICE_ROLE_KEY` absent. Anon key subject to RLS → 42501 on every insert.
+  Removed fallback. `SUPABASE_SERVICE_ROLE_KEY` required; explicit startup warning if missing.
 
 ---
 
 ## [Phase 4] — 2026-04-10
-
-### Summary
-Signal history persistence and history endpoint.
 
 ### Added
 - `routers/history.py`: `GET /api/signals/history`
