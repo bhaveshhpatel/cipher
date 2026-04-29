@@ -28,6 +28,9 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
   always doing a full rebuild after the first build().
+  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
+  load_chain are now at the top of the file so unittest.mock.patch targets
+  work correctly (patch('services.symbol_registry.get_config') etc.).
 
 FIX M-1 (2026-04-28): Replaced is_ready() len-check with a dedicated
   _build_complete flag set only at the very end of build(). The stream now
@@ -54,6 +57,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
+# Module-level imports so patch('services.symbol_registry.*') targets work
+# in unit tests (H3 fix — lazy imports inside methods are not patchable via
+# the module namespace).
+from services.ingestion_config import get_config
+from services.tier_engine import _fetch_thresholds, assign_tiers
+from services.chain_store import load_chain
 from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quotes_batch
 
 log = logging.getLogger("symbol_registry")
@@ -151,7 +160,6 @@ class SymbolRegistry:
         return dict(self._oi_by_ticker)
 
     async def load_from_db(self, snapshot_id: str) -> int:
-        from services.chain_store import load_chain
         chain = await load_chain(snapshot_id)
         if chain is None:
             log.info(
@@ -212,8 +220,6 @@ class SymbolRegistry:
           is_ready() returns self._build_complete, so stream workers will
           not spawn until build() has fully completed with fresh data.
         """
-        from services.ingestion_config import get_config
-        from services.tier_engine import _fetch_thresholds, assign_tiers
         from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
@@ -310,6 +316,7 @@ class SymbolRegistry:
                     avg_vol = int(q.get("average_volume") or 0)
                 except (TypeError, ValueError):
                     pass
+                from services.symbols_loader import SymbolQuote  # noqa: F811
                 synthetic_quotes.append(SymbolQuote(
                     symbol         = ticker,
                     last_price     = prices.get(ticker, 0.0),
@@ -402,7 +409,6 @@ class SymbolRegistry:
 
     async def refresh_loop(self):
         while True:
-            from services.ingestion_config import get_config
             cfg = await get_config()
 
             today = date.today()
