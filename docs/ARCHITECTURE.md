@@ -1,8 +1,10 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-28 (STREAM-1/2/3 parallel workers, shared session token, snapshot dedup
-> idempotency, accumulator retrigger gate, dense telemetry, alert_level fix, DEDUP-KWARGS fix,
-> H4 sweep-dispatch TTL eviction, options_universe_symbols unique constraint)
+> Last updated: 2026-04-29 (Signal gate _SIGNAL_MIN_TRADES/PREMIUM, Bug 1 alert_level in
+> composite_msg, accumulator deadlock fix + per-key locks + is_accelerating ≥3/60s, alert_level
+> thresholds updated 5M/1M-accel/1M/250k, flow_events created_at+influence_tier column fix,
+> sweep upgrade PostgREST fix, /flow/events + /flow/episodes API endpoints, Flow Events/Episodes
+> dashboard tabs, WS 403 auth-failure stop, pydantic-settings env var fix)
 
 ---
 
@@ -35,6 +37,14 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  Refreshes every REGISTRY_REFRESH_MINS (default 30).             │
 │  On expiry days: refreshes every 15 min.                         │
 │                                                                  │
+│  Chain bulk fetch (H3 fix):                                      │
+│  Uses get_option_chain_bulk() (was get_option_chain).            │
+│  Module-level import ensures patch targets work in tests.        │
+│                                                                  │
+│  build() return type (H1 fix):                                   │
+│  registry.build() returns tuple[int, dict] — (count, tier_map). │
+│  Callers must unpack: count, tier_map = await registry.build().  │
+│                                                                  │
 │  DB chain fast-seed (lifespan, on DB-hit path):                  │
 │  registry.load_from_db(snapshot_id) pre-loads OCC contracts      │
 │  from the chain_store DB cache before the full build runs.       │
@@ -58,6 +68,8 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  into backtest_score (historical win-rate by ticker/type/DTE/    │
 │  tier). Tier map seeded from universe_store.load_tier_map() on   │
 │  warm start; updated via registry.set_tier_map() on refresh.     │
+│  assign_tiers() must be called with require_oi=True to enforce   │
+│  the OI gate (the default require_oi=False skips OI filtering).  │
 │                                                                  │
 │  Build-complete flag:                                            │
 │  registry._build_complete is set True only after registry.build()│
@@ -82,7 +94,7 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  - In lifespan mode, lifespan owns refresh_loop — not spawned    │
 │    here (D-002 fix).                                             │
 │  - Instantiates StreamManager with the registry and hands off    │
-│    _process_trade as the per-event callback.                      │
+│    _process_trade as the per-event callback.                     │
 │                                                                  │
 │  StreamManager (stream_manager.py):                              │
 │  - Fetches ONE shared Tradier session token for all workers.     │
@@ -162,9 +174,11 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  When the 3rd unique exchange for a (occ|size|fill) key arrives  │
 │  as a duplicate tick — meaning the canonical row was already      │
 │  written as trade_type='BTO' — _process_trade() dispatches a     │
-│  background upgrade_to_sweep_in_db() call. Issues a targeted     │
-│  PATCH to flow_events: sets trade_type='SWEEP' for rows          │
-│  matching (occ_symbol, fill_price, size) within the last 30s.   │
+│  background upgrade_to_sweep_in_db() call.                       │
+│  Issues a targeted PATCH to flow_events: sets trade_type='SWEEP' │
+│  for rows matching (occ_symbol, fill_price, size) within the     │
+│  last 30s using a PostgREST-compatible SQL expression filter     │
+│  (fixed 2026-04-29 — prior form was invalid PostgREST syntax).   │
 │                                                                  │
 │  H4 — Sweep dispatch TTL eviction:                               │
 │  _sweep_upgrade_dispatched was a Set that grew forever. Changed  │
@@ -182,54 +196,77 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │    Accumulator: signals/repetition_accumulator.py                │
 │    Persistence:  services/flow_store.py                          │
 │                                                                  │
-│  accumulator.ingest_tick(ev) → RepetitionEpisode | None          │
+│  RepetitionEpisode (updated 2026-04-29):                         │
+│  - trade_count: computed property (len of events list)           │
+│  - total_premium: computed property (sum of event premiums)      │
+│  - is_accelerating: property — True when ≥3 events within 60s   │
+│    (was: ≥2 ticks within 5 minutes)                              │
+│  - New fields: first_seen, last_signal_at, occ_symbol, direction │
+│                                                                  │
+│  RepetitionAccumulator (updated 2026-04-29):                     │
+│  - Per-key asyncio.Lock via _get_lock(key) — eliminates the      │
+│    global lock deadlock (STREAM-3 + accumulator deadlock fix).   │
+│  - _key(ev) and _key_from_ep(ep) helpers for episode keying.     │
+│  - signal_cooldown param: gates re-emission at accumulator level.│
+│  - ingest() shim with cooldown gate (distinct from Gate 2).      │
+│  - get_signal() respects signal_cooldown and last_signal_at.     │
+│  - Window pruning uses event timestamps, not wall clock.         │
+│  - ingest_tick / get_signal / ingest contracts are separated     │
+│    (no nested lock acquisition — deadlock-safe).                 │
 │                                                                  │
 │  Episode key: (ticker, contract_type, strike, expiry)            │
 │  Episode window: 30 minutes of inactivity before reset.          │
-│  Acceleration flag: ≥2 ticks within the last 5 minutes.          │
 │                                                                  │
 │  Gate 1 — Persist threshold (OR logic):                          │
-│    trade_count >= min_trades (default 3), OR                     │
+│    trade_count >= min_trades (default 1), OR                     │
 │    total_premium >= min_premium (default $10,000)                │
 │  Below both thresholds → ingest_tick() returns None → dropped.   │
 │  accumulator_gated stat incremented and logged at INFO.          │
+│  NOTE: Gate 1 is intentionally kept at low thresholds so that    │
+│  flow_events persist for ALL qualifying ticks. Signal bus        │
+│  publish is separately gated (see Signal Gate in Layer 6).       │
 │                                                                  │
-│  Gate 2 — Signal re-emission guard (2026-04-28):                 │
+│  Gate 2 — Signal re-emission guard:                              │
 │  RepetitionEpisode.last_signaled_premium tracks the total_premium │
 │  at the last emission. After Gate 1 is crossed, ingest_tick()    │
 │  only returns the episode again when:                            │
 │    total_premium - last_signaled_premium >= SIGNAL_RETRIGGER     │
 │    (default $50,000)                                             │
-│  Prevents QQQ/SPY episodes from emitting a new signal_history    │
-│  row on every single tick once threshold is crossed.             │
+│  Prevents QQQ/SPY episodes from emitting on every single tick.   │
 │                                                                  │
-│  Concurrency note (STREAM-3):                                    │
-│  64 workers call ingest_tick() concurrently with no global lock. │
-│  The accumulator uses per-episode asyncio locks to isolate       │
-│  concurrent ticks on the same (ticker, strike, expiry, type) key.│
-│  Cross-episode calls are fully parallel (B-029 open: prune race).│
+│  Concurrency note:                                               │
+│  64 workers call ingest_tick() concurrently.                     │
+│  Per-episode asyncio locks isolate concurrent ticks on the same  │
+│  (ticker, strike, expiry, type) key. Cross-episode calls are     │
+│  fully parallel (B-029 open: prune race).                        │
 │                                                                  │
 │  Flow persistence (flow_store.py):                               │
-│  - flow_events table:  one row per classified tick.              │
+│  - flow_events table: one row per classified tick.               │
 │    Written via batched buffer: 500ms timer OR 100-row early flush.│
 │    3 retries with 1s delay on Supabase failure.                  │
 │    SUPABASE_SERVICE_ROLE_KEY only (bypasses RLS).                │
+│    Column note: timestamp field in DB is created_at.             │
+│    Pydantic model (FlowEventRaw) maps created_at → timestamp.    │
+│    Tier field in DB is influence_tier (not tier).                │
 │  - flow_episodes table: one row per qualifying episode.          │
 │    Written immediately on composite_signal bus message.          │
 │    Written by _bus_signal_listener on "db_writer" channel.       │
 │                                                                  │
-│  ALERT-LEVEL fix (2026-04-28):                                   │
+│  ALERT-LEVEL fix (2026-04-28/29):                                │
 │  _bus_signal_listener was reading sig.get("recommendation")      │
 │  (BUY/SELL/HOLD) for alert_level — wrong field.                  │
-│  Fix: reads sig.get("alert_level") which is populated from       │
-│  accumulator.get_alert_level(sig_ep) in tradier_stream.py        │
-│  before the composite_signal bus publish.                        │
+│  Fix: reads sig.get("alert_level") correctly.                    │
+│  Confirmed populated: alert_level is injected into               │
+│  composite_msg["data"]["signal"] in _process_trade() before      │
+│  any bus publish (Bug 1 fix 2026-04-29 — was previously missing  │
+│  from the composite_msg dict entirely).                          │
 │                                                                  │
-│  alert_level values (from accumulator.get_alert_level()):        │
-│    total_premium >= $1,000,000 → CONVICTION                      │
-│    total_premium >= $500,000   → STRONG_SIGNAL                   │
-│    total_premium >= $200,000   → ALERT                           │
-│    total_premium <  $200,000   → WATCH                           │
+│  alert_level values (updated thresholds 2026-04-29):             │
+│    total_premium >= $5,000,000                → CONVICTION       │
+│    total_premium >= $1,000,000 AND accel.     → STRONG_SIGNAL    │
+│    total_premium >= $1,000,000                → ALERT            │
+│    total_premium >= $250,000                  → WATCH            │
+│    (below $250k: gated, not emitted)                             │
 │                                                                  │
 │  flow_events columns written:                                    │
 │    ticker, contract_type, strike, expiry, dte, fill_price,       │
@@ -237,6 +274,7 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │    is_aggressive, is_golden_sweep, sentiment, influence_tier,    │
 │    conviction_score, exchange_count, fill_count, open_interest,  │
 │    iv, underlying_price, occ_symbol, is_synthetic_quote          │
+│    created_at (default now())                                    │
 │  (No id field — Postgres uuid default generates it.)             │
 │                                                                  │
 │  flow_episodes columns written:                                  │
@@ -248,10 +286,21 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 6 — Signal Engine + Delivery                              │
-│    Composite: signals/composite_signal_engine.py                 │
-│    Bus:       core/async_bus.py                                  │
-│    Signal DB: services/signal_store.py                           │
-│    WebSocket: routers/ws.py (or routers/stream.py)               │
+│    Composite:  signals/composite_signal_engine.py                │
+│    Bus:        core/async_bus.py                                 │
+│    Signal DB:  services/signal_store.py                          │
+│    WebSocket:  routers/ws.py (or routers/stream.py)              │
+│    REST API:   routers/flow.py (flow events + episodes)          │
+│    Frontend:   Next.js dashboard (frontend/src/)                 │
+│                                                                  │
+│  Signal Gate (_process_trade — 2026-04-29):                      │
+│  After persist_flow_event() completes, an explicit gate checks:  │
+│    sig_ep.trade_count >= _SIGNAL_MIN_TRADES (3) AND              │
+│    sig_ep.total_premium >  _SIGNAL_MIN_PREMIUM (50,000)          │
+│  If either condition fails → suppressed (debug log) → RETURN.    │
+│  flow_events write is UNAFFECTED — only the signal bus           │
+│  publish is gated. /health/stream signals counter will diverge   │
+│  downward from persisted when this gate activates.               │
 │                                                                  │
 │  Composite score formula:                                        │
 │    composite_score = flow_score    × 0.55                        │
@@ -264,8 +313,8 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │                                                                  │
 │  recommendation from composite_score:                            │
 │    score >= 0.65 AND CALL → BUY                                  │
-│    score >= 0.65 AND PUT  → SELL                                  │
-│    score <  0.65          → HOLD                                  │
+│    score >= 0.65 AND PUT  → SELL                                 │
+│    score <  0.65          → HOLD                                 │
 │                                                                  │
 │  Bus publish sequence (_process_trade):                          │
 │  1. publish_all("signals")        → WebSocket clients (signal)   │
@@ -281,10 +330,12 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  composite_signal published to all channels:                     │
 │    signal:  { ticker, recommendation, composite_score,           │
 │               flow_score, backtest_score,                        │
-│               volume_premium_factor, reasoning }                 │
+│               volume_premium_factor, reasoning, alert_level }    │
 │    episode: { contract_type, direction, influence_tier,          │
 │               total_premium, trade_count, is_accelerating,       │
 │               timestamp }                                        │
+│  NOTE: alert_level is now explicitly included in                 │
+│  composite_msg["data"]["signal"] (Bug 1 fix 2026-04-29).         │
 │                                                                  │
 │  signal_store.py (signal_writer channel):                        │
 │  - Subscribes to "signal_writer" bus channel.                    │
@@ -292,10 +343,39 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  - In-memory deque fallback when DB is unavailable.              │
 │  - Exposed via /api/signals/history endpoint.                    │
 │                                                                  │
+│  REST endpoints (added 2026-04-29):                              │
+│  GET /api/flow/events                                            │
+│    Queries flow_events directly. Filters: ticker, sentiment,     │
+│    contract_type, influence_tier (not tier), aggressive,         │
+│    golden_sweep, limit (default 50).                             │
+│    Returns: FlowEventRaw[] — includes conviction_score, dte,     │
+│    trade_type, iv, underlying_price, occ_symbol.                 │
+│    created_at column mapped → timestamp in FlowEventRaw.         │
+│                                                                  │
+│  GET /api/flow/episodes                                          │
+│    Returns flow_episodes with alert_level HOLD+ and all required │
+│    fields. Filters: ticker, alert_level, direction, contract_type│
+│    Returns: FlowEpisodeOut[] (episode-level aggregation).        │
+│    last_signaled_premium delta field present in response.        │
+│                                                                  │
+│  WebSocket (useSignalStream hook — 2026-04-29):                  │
+│  Detects WS close code 403 and stops the retry loop on auth      │
+│  failure. Prevents infinite reconnect on expired/invalid token.  │
+│                                                                  │
 │  SwarmEngine (services/swarm_engine.py):                         │
 │  - Groq llama-3.3 AI swarm for narrative signal reasoning.       │
 │  - NOT called automatically per tick.                            │
 │  - Explicit invocation only (admin panel or direct API call).    │
+│                                                                  │
+│  Frontend dashboard tabs (updated 2026-04-29):                   │
+│  Tab order: Flow Events → Episodes → Composite → Signals → …     │
+│  Flow Scanner tab removed.                                       │
+│  FlowEventsTab: KPI bar + 5 filters (ticker, sentiment,          │
+│    contract_type, influence_tier, aggressive). 10s auto-refresh. │
+│  FlowEpisodesTab: alert badges + 4 filters (ticker, alert_level, │
+│    direction, contract_type). 30s auto-refresh.                  │
+│  Hooks: useFlowEvents(token, filters?), useFlowEpisodes(token,   │
+│    filters?) — filters as second arg, owner-controlled state.    │
 │                                                                  │
 │  Open — B-026:                                                   │
 │  WebSocket `send()` iterates subscriber list during broadcast.   │
@@ -320,10 +400,11 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 | Sweep window | 8 seconds | DedupCache |
 | Sweep min exchanges | 3 | DedupCache |
 | Sweep dispatch TTL | 1800 seconds (30 min) | _sweep_upgrade_dispatched |
-| Persist gate (Gate 1) | trade_count ≥ 3 OR total_premium ≥ $10k | RepetitionAccumulator |
+| Accumulator Gate 1 | trade_count ≥ 1 OR total_premium ≥ $10k (low — intentional) | RepetitionAccumulator |
+| Signal Gate | trade_count ≥ 3 AND total_premium > $50k (bus publish only) | tradier_stream._process_trade |
 | Signal retrigger (Gate 2) | Δ total_premium ≥ $50k since last emit | RepetitionAccumulator |
 | Episode window | 30 minutes inactivity | RepetitionAccumulator |
-| Acceleration threshold | ≥2 ticks within 5 minutes | RepetitionEpisode |
+| Acceleration threshold | ≥3 events within 60 seconds | RepetitionEpisode.is_accelerating |
 | DB write pattern | 500ms flush OR 100-row early flush | flow_store._flush_flow_events |
 | DB retry | 3 attempts, 1s delay | flow_store._insert_rows_with_retry |
 | Persist timeout | 2 seconds per event | tradier_stream._process_trade |
@@ -334,6 +415,8 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 | Stats log interval | Every 100 ticks | tradier_stream._STATS_LOG_INTERVAL |
 | First-tick log count | First 5 ticks individually | tradier_stream._FIRST_TICK_LOG_COUNT |
 | Demo mode | Admin panel only (disabled as auto-fallback since 2026-04-25) | tradier_stream |
+| Flow events API refresh | 10 seconds | useFlowEvents hook |
+| Flow episodes API refresh | 30 seconds | useFlowEpisodes hook |
 
 ---
 
@@ -349,20 +432,26 @@ Tier assignment is done in `services/tier_engine.py`. The tier map is seeded fro
 `universe_store.load_tier_map()` on warm start and updated on every registry refresh via
 `registry.set_tier_map()`. All tiers fall back to T3 params if unknown.
 
+`assign_tiers()` and `_classify()` enforce the OI gate only when called with `require_oi=True`.
+The default `require_oi=False` skips the OI gate (used for preliminary pass). `build()` calls
+`assign_tiers(require_oi=True)` for the final tier assignment.
+
 ---
 
 ## Alert Levels
 
-| Level | Premium Threshold | Meaning |
+| Level | Threshold | Notes |
 |---|---|---|
-| `CONVICTION` | ≥ $1,000,000 | Institutional-grade repeated positioning |
-| `STRONG_SIGNAL` | ≥ $500,000 | High-conviction multi-fill episode |
-| `ALERT` | ≥ $200,000 | Notable accumulation above noise floor |
-| `WATCH` | < $200,000 | Threshold-crossing but not yet significant |
+| `CONVICTION` | total_premium ≥ $5,000,000 | Institutional-grade repeated positioning |
+| `STRONG_SIGNAL` | total_premium ≥ $1,000,000 AND is_accelerating | High-conviction + accelerating episode |
+| `ALERT` | total_premium ≥ $1,000,000 | High-conviction multi-fill episode |
+| `WATCH` | total_premium ≥ $250,000 | Notable accumulation above noise floor |
+| *(gated)* | total_premium < $250,000 | Not emitted by get_alert_level() |
 
-Computed by `accumulator.get_alert_level(ep)` in `tradier_stream._process_trade()` and injected
-into both the `signal` bus message and the `composite_signal` bus message **before** publish.
-The `flow_store._bus_signal_listener` reads `sig.get("alert_level")` — **not**
+Thresholds updated 2026-04-29 (was $1M/$500k/$200k). Computed by
+`accumulator.get_alert_level(ep)` in `tradier_stream._process_trade()` and injected into both the
+`signal` bus message and `composite_msg["data"]["signal"]` **before** any bus publish.
+`flow_store._bus_signal_listener` reads `sig.get("alert_level")` — **not**
 `sig.get("recommendation")` — to persist the correct value to `flow_episodes.alert_level`.
 
 ---
@@ -393,6 +482,8 @@ conviction_score, exchange_count, fill_count, open_interest,
 iv, underlying_price, occ_symbol, is_synthetic_quote,
 created_at (default now())
 -- id: uuid generated by Postgres
+-- NOTE: DB column is created_at (not timestamp); influence_tier (not tier)
+-- Pydantic FlowEventRaw maps created_at → timestamp for API consumers
 ```
 
 ### flow_episodes
@@ -429,9 +520,9 @@ via `registry.load_from_db(snapshot_id)` before the full `build()` completes.
 2. start_signal_writer()    — subscribe bus "signal_writer"
 3. init_registry()          — create SymbolRegistry with watchlist
 4. universe_store snapshot  — reuse or create (idempotency check)
-5. registry.build()         — async (background task)
+5. registry.build()         — async (background task); returns tuple[int, dict]
    └─ load_from_db()        — fast pre-seed from chain_store cache
-   └─ fetch Tradier chains  — fill missing contracts
+   └─ fetch Tradier chains  — get_option_chain_bulk() for missing contracts
    └─ set _build_complete   — unblocks stream_options_flow()
 6. stream_options_flow(registry=registry)
    └─ polls registry.is_ready() every 500ms (30-min timeout)
@@ -452,7 +543,7 @@ raw Tradier WebSocket event
     │
     ├─ parse_tradier_trade() → None?            → parse_failed++ / LOG INFO / RETURN
     │
-    ├─ flow_dedup.is_duplicate()?               → deduped++
+    ├─ flow_dedup.is_duplicate(occ_symbol, ...)?→ deduped++   [positional, not keyword]
     │     └─ exchange_count == sweep_min?       → upgrade_to_sweep_in_db() [background task]
     │                                           → RETURN
     │
@@ -460,38 +551,62 @@ raw Tradier WebSocket event
     │
     ├─ accumulator.ingest_tick()                → classified++
     │     ├─ Gate 1 not crossed?               → accumulator_gated++ / LOG INFO / RETURN
-    │     └─ Gate 2 not crossed?               → (silent: no return value) → RETURN
+    │     └─ Gate 2 not crossed?               → (no return value) → RETURN
     │
     ├─ persist_flow_event()                     → persisted++ / buffered → flow_events
     │
+    ├─ Signal Gate check:                       → suppressed if below threshold
+    │     sig_ep.trade_count < _SIGNAL_MIN_TRADES (3)?
+    │     OR sig_ep.total_premium ≤ _SIGNAL_MIN_PREMIUM (50,000)?
+    │                                           → LOG DEBUG "signal-gate suppressed" / RETURN
+    │                                             (flow_events already written above)
+    │
     ├─ build_composite()                        → composite score
     │
-    ├─ bus.publish_all(signal)                  → signals++ / WebSocket delivery
+    ├─ alert_level = accumulator.get_alert_level(sig_ep)
     │
-    └─ bus.publish_all(composite_signal)        → flow_episodes + signal_history
+    ├─ assemble composite_msg with alert_level injected into
+    │   composite_msg["data"]["signal"]         → Bug 1 fix ensures no None fallback
+    │
+    ├─ bus.publish_all("signals")               → signals++ / WebSocket delivery
+    │
+    └─ bus.publish_all("composite_signal")      → flow_episodes + signal_history
 ```
 
 ---
 
-## Key Fixes in This Branch
+## Key Fixes
 
 | Fix ID | File | Description |
 |---|---|---|
+| Bug 1 / alert_level-composite | tradier_stream.py | `composite_msg["data"]["signal"]` was missing `alert_level` key. `signal_store._build_row()` always received None, fell through to score-based fallback. Fixed: `alert_level` now injected before any bus publish. |
+| Signal Gate | tradier_stream.py | Explicit gate after `persist_flow_event()`: only fires bus publish when `trade_count ≥ 3 AND total_premium > $50k`. Decouples flow_events volume from signal volume. |
+| Accumulator deadlock | repetition_accumulator.py | Global lock replaced with per-key asyncio.Lock via `_get_lock()`. Separated `ingest_tick`/`get_signal`/`ingest` contracts — no nested lock acquisition. |
+| is_accelerating threshold | repetition_accumulator.py | Changed from ≥2 ticks within 5 minutes to ≥3 events within 60 seconds. |
+| Alert level thresholds | repetition_accumulator.py | Updated to $5M (CONVICTION), $1M+accel (STRONG_SIGNAL), $1M (ALERT), $250k (WATCH). Was $1M/$500k/$200k. |
+| RepetitionEpisode fields | repetition_accumulator.py | Added `occ_symbol`, `direction`, `first_seen`, `last_signal_at`. `trade_count`/`total_premium` now computed properties. |
+| flow_events created_at | flow_store.py / routers/flow.py | DB column is `created_at` not `timestamp`. Was silently returning empty rows (Supabase 400/42703). Pydantic FlowEventRaw maps `created_at → timestamp`. |
+| influence_tier column | flow_store.py | DB column is `influence_tier` not `tier`. Fixed in query SELECT and filter params. |
+| Sweep upgrade PostgREST | flow_store.py | `upgrade_to_sweep_in_db()` PostgREST SQL expression was invalid syntax. Fixed to use compatible filter form. |
+| ALERT-LEVEL bus listener | flow_store.py | `_bus_signal_listener` was reading `recommendation` (BUY/SELL/HOLD) for `alert_level`. Fixed to read `sig.get("alert_level")`. |
+| WS 403 auth stop | frontend/hooks/useSignalStream | Detects close code 403 and stops retry loop on auth failure. Prevents infinite reconnect on expired token. |
+| pydantic-settings env | backend/config.py | Removed `os.environ.get()` wrappers. pydantic-settings reads env vars directly from environment. |
 | DEDUP-KWARGS | tradier_stream.py | `is_duplicate()` first param is positional — keyword form raised `TypeError`. Fixed to pass `occ_symbol` positionally. |
-| ALERT-LEVEL | flow_store.py | `_bus_signal_listener` was reading `recommendation` (BUY/SELL/HOLD) for `alert_level`. Fixed to read `sig.get("alert_level")`. |
-| H4 | tradier_stream.py | `_sweep_upgrade_dispatched` Set grew forever. Changed to `dict[str, float]` with 30-min TTL eviction. |
+| H4 sweep dispatch TTL | tradier_stream.py | `_sweep_upgrade_dispatched` Set grew forever. Changed to `dict[str, float]` with 30-min TTL eviction. |
 | Gate 2 retrigger | repetition_accumulator.py | `last_signaled_premium` on `RepetitionEpisode`. Re-emit only when Δ ≥ $50k. Kills QQQ/SPY signal spam. |
 | U-1 snapshot idempotency | universe_store.py | `_sync_save_snapshot()` reuses existing `snapshot_id` if <20h old and symbol count within ±10%. |
 | Migration 013 | migrations/ | `UNIQUE(snapshot_id, symbol)` on `options_universe_symbols` + chain cache. |
 | C-003 sweep upgrade | flow_store.py | Retroactive `PATCH` to set `trade_type='SWEEP'` on rows already written as BTO. |
-| FLOW-DEBUG | tradier_stream.py | INFO-level gate logging at every drop point. `_stats` tracks `parsed_count`, `accumulator_gated`, `parse_failed`. |
-| FIRST-TICK | tradier_stream.py | First 5 ticks logged individually at INFO. Non-timesale types logged at INFO for first 10 distinct types. |
+| D-003 | stream_manager.py | Worker count changed from hard-coded 32 to `ceil(registry.size() / 500)`. |
+| B-021 | stream_manager.py | Workers staggered at N × 200ms on spawn. |
+| STREAM-1/2/3 | stream_manager.py | Shared session token; single StreamManager with dynamic batching; removed global session lock. |
+| C-020 | utils/dedup.py | Dedup TTL clock changed from `time.time()` to `time.monotonic()`. |
+| H1 | symbol_registry.py | `build()` returns `tuple[int, dict]`. Callers must unpack. |
+| H3 | symbol_registry.py | Module-level imports + `get_option_chain_bulk` replaces `get_option_chain`. |
 | D-001 | tradier_stream.py | `stream_options_flow()` accepts `registry=` from lifespan, skipping duplicate `build()`. |
 | D-002 | tradier_stream.py | `refresh_loop()` only spawned in standalone path; lifespan owns it in production. |
-| D-003 | stream_manager.py | Worker count changed from hard-coded 32 to `ceil(registry.size() / 500)`. At 31,920 symbols → 64 workers; was leaving ~half the OCC universe unstreamed. |
-| B-021 | stream_manager.py | Workers staggered at N × 200ms on spawn. Prevents thundering-herd against Tradier session host at startup. |
-| STREAM-1/2/3 | stream_manager.py | STREAM-1: shared session token (was per-worker). STREAM-2: single StreamManager with dynamic batching. STREAM-3: removed global session lock — all workers now fully concurrent with no coordination overhead. |
-| C-020 | utils/dedup.py | Dedup TTL clock changed from `time.time()` to `time.monotonic()`. Prevents DST/clock-skew TTL misfires. |
+| FLOW-DEBUG | tradier_stream.py | INFO-level gate logging at every drop point. `_stats` tracks `parsed_count`, `accumulator_gated`, `parse_failed`. |
+| FIRST-TICK | tradier_stream.py | First 5 ticks logged individually at INFO. |
 
 ---
 
@@ -501,5 +616,5 @@ raw Tradier WebSocket event
 |----|-----------|-------------|
 | B-026 | routers/ws.py | WebSocket broadcast iterates subscriber list without copy. Concurrent connect/disconnect can mutate the list mid-loop. A failed `send()` to one client may not isolate other subscribers. No regression test. |
 | B-028 | stream_manager.py | `refresh()` called while workers are mid-stagger spawn can race with `_spawn_workers()`. Diff logic may produce duplicate worker tasks. |
-| B-029 | repetition_accumulator.py | Rolling-window `prune()` can evict events concurrently with Gate 2 delta evaluation. Prune mid-evaluation may cause the retrigger to miscalculate `Δ premium`. |
+| B-029 | repetition_accumulator.py | Rolling-window `prune()` can evict events concurrently with Gate 2 delta evaluation. Prune mid-evaluation may cause the retrigger to miscalculate Δ premium. |
 | B-030 | universe_store.py | `save_snapshot()` partial write on DB connection drop is not rolled back. A partial snapshot passes the `load_fresh_snapshot` age check on next restart. |
