@@ -3,10 +3,14 @@ config.py — Application settings loaded from environment variables.
 
 All secrets are read from the environment; no defaults are hardcoded
 except for non-sensitive operational parameters.
+
+pydantic-settings reads env vars automatically at instantiation time.
+DO NOT wrap field defaults in os.environ.get() — that evaluates at
+class-definition time (before the process environment is fully set)
+and always wins over pydantic's own env-var injection.
 """
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -15,52 +19,47 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── Auth ──────────────────────────────────────────────────────────────────
-    SECRET_KEY: str = os.environ.get("SECRET_KEY", "change-me-in-production")
+    SECRET_KEY: str = "change-me-in-production"
     ALGORITHM:  str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 h
 
     # ── Supabase ──────────────────────────────────────────────────────────────
-    SUPABASE_URL:              str = os.environ.get("SUPABASE_URL",              "https://placeholder.supabase.co")
-    SUPABASE_ANON_KEY:         str = os.environ.get("SUPABASE_ANON_KEY",         "")
-    SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-    SUPABASE_SERVICE_KEY:      str = os.environ.get("SUPABASE_SERVICE_KEY",      "")  # legacy alias
+    SUPABASE_URL:              str = "https://placeholder.supabase.co"
+    SUPABASE_ANON_KEY:         str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+    SUPABASE_SERVICE_KEY:      str = ""  # legacy alias
 
     # ── Tradier ───────────────────────────────────────────────────────────────
-    TRADIER_API_KEY:      str = os.environ.get("TRADIER_API_KEY",      "")
-    TRADIER_STREAM_TOKEN: str = os.environ.get("TRADIER_STREAM_TOKEN", "")
-    TRADIER_ACCOUNT_ID:   str = os.environ.get("TRADIER_ACCOUNT_ID",   "")
+    TRADIER_API_KEY:      str = ""
+    TRADIER_STREAM_TOKEN: str = ""
+    TRADIER_ACCOUNT_ID:   str = ""
 
     # REST API host — used for quotes, chains, expirations, session token
-    TRADIER_BASE_URL: str = os.environ.get(
-        "TRADIER_BASE_URL", "https://api.tradier.com"
-    )
+    TRADIER_BASE_URL: str = "https://api.tradier.com"
 
     # Streaming host — DIFFERENT from the REST host.
     # stream_worker.py POSTs to TRADIER_STREAM_URL/v1/markets/events.
-    # This was missing from config, causing workers to AttributeError or
-    # POST to an empty URL on every connect attempt → zero ticks received.
-    TRADIER_STREAM_URL: str = os.environ.get(
-        "TRADIER_STREAM_URL", "https://stream.tradier.com"
-    )
+    TRADIER_STREAM_URL: str = "https://stream.tradier.com"
 
     # ── AI / LLM ──────────────────────────────────────────────────────────────
-    GROQ_API_KEY:   Optional[str] = os.environ.get("GROQ_API_KEY", None) or None
-    SWARM_N_AGENTS: int           = int(os.environ.get("SWARM_N_AGENTS", "6"))
+    GROQ_API_KEY:   Optional[str] = None
+    SWARM_N_AGENTS: int           = 6
 
     # ── Universe / stream eligibility ─────────────────────────────────────────
-    UNIVERSE_MIN_PRICE: float = float(os.environ.get("UNIVERSE_MIN_PRICE", "1.0"))
-    UNIVERSE_MIN_VOLUME: int = int(os.environ.get("UNIVERSE_MIN_VOLUME", "100000"))
-    UNIVERSE_QUOTES_BATCH_SIZE: int = int(os.environ.get("UNIVERSE_QUOTES_BATCH_SIZE", "200"))
-    UNIVERSE_QUOTES_CONCURRENCY: int = int(os.environ.get("UNIVERSE_QUOTES_CONCURRENCY", "28"))
+    UNIVERSE_MIN_PRICE:           float = 1.0
+    UNIVERSE_MIN_VOLUME:          int   = 100_000
+    UNIVERSE_QUOTES_BATCH_SIZE:   int   = 200
+    UNIVERSE_QUOTES_CONCURRENCY:  int   = 28
 
     # ── App ───────────────────────────────────────────────────────────────────
-    APP_ENV:   str = os.environ.get("APP_ENV",   "production")
-    LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
+    APP_ENV:   str = "production"
+    LOG_LEVEL: str = "INFO"
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    CORS_ALLOWED_ORIGINS: str = os.environ.get(
-        "CORS_ALLOWED_ORIGINS",
-        "https://cipher.vercel.app,https://cipher-git-main.vercel.app,http://localhost:3000",
+    CORS_ALLOWED_ORIGINS: str = (
+        "https://cipher.vercel.app,"
+        "https://cipher-git-main.vercel.app,"
+        "http://localhost:3000"
     )
 
     # ── Symbol registry / OI build ────────────────────────────────────────────
