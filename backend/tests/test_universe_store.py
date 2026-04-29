@@ -10,6 +10,12 @@ Updated 2026-04-27: wire .range() into mock chain so _paginate_symbols resolves
 Updated 2026-04-27c: update TestSaveSnapshot assertions from .insert() to .upsert()
   now that _sync_save_snapshot uses upsert(on_conflict=snapshot_id,symbol) for
   symbol rows to prevent duplicates on repeated cold-start runs.
+Updated 2026-04-28 (DEDUP): _sync_save_snapshot now calls
+  _get_active_snapshot_for_reuse before the insert/deactivation path, adding
+  one extra execute() to the call sequence. Tests updated accordingly.
+Updated 2026-04-28 (RC-1): only stream_eligible symbols are written to DB.
+  test_stream_eligible_true_when_in_eligible_set now asserts that non-eligible
+  symbols are absent from the batch (not that they have stream_eligible=False).
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -127,10 +133,11 @@ class TestSaveSnapshot:
     def test_returns_true_on_success(self):
         sb, query = _make_sb_mock()
         query.execute.side_effect = [
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=[{"id": "snap-uuid-new"}]),
+            MagicMock(data=[]),  # _get_active_snapshot_for_reuse -> no reuse
+            MagicMock(data=[]),  # insert snapshot header
+            MagicMock(data=[]),  # update deactivate
+            MagicMock(data=[]),  # upsert symbol batch
+            MagicMock(data=[{"id": "snap-uuid-new"}]),  # _prune_old_snapshots select
         ]
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", None)
@@ -146,17 +153,22 @@ class TestSaveSnapshot:
         assert result is False
 
     def test_stream_eligible_true_when_in_eligible_set(self):
+        """
+        RC-1 fix: only stream_eligible symbols are inserted into the DB.
+        Non-eligible symbols (TSLA) are absent from the upsert batch entirely.
+        """
         sb, query = _make_sb_mock()
+        # First execute() is _get_active_snapshot_for_reuse -> empty = new snapshot
         query.execute.return_value = MagicMock(data=[])
         eligible_set = {"AAPL"}
         with patch("services.universe_store._client", return_value=sb):
             universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", eligible_set)
-        # Symbol rows are written via upsert (not insert) since the idempotent-write refactor.
-        # upsert call_args_list[0] is the first (and only) symbol batch.
+        # Only AAPL is eligible; upsert batch must contain AAPL but NOT TSLA.
         symbol_batch = query.upsert.call_args_list[0].args[0]
         by_symbol = {r["symbol"]: r for r in symbol_batch}
+        assert "AAPL" in by_symbol
         assert by_symbol["AAPL"]["stream_eligible"] is True
-        assert by_symbol["TSLA"]["stream_eligible"] is False
+        assert "TSLA" not in by_symbol  # non-eligible: absent, not flagged False
 
     def test_stream_eligible_all_true_when_no_eligible_set(self):
         sb, query = _make_sb_mock()
@@ -197,9 +209,10 @@ class TestSaveSnapshot:
         sb, query = _make_sb_mock()
         big_symbols = [f"SYM{i}" for i in range(1200)]
         query.execute.side_effect = (
-            [MagicMock(data=[])]
-            + [MagicMock(data=[]) for _ in range(3)]
-            + [MagicMock(data=[]), MagicMock(data=[])]
+            [MagicMock(data=[])]  # _get_active_snapshot_for_reuse
+            + [MagicMock(data=[]) for _ in range(3)]  # insert + deactivate + batch1
+            + [MagicMock(data=[]), MagicMock(data=[])]  # batch2 + batch3
+            + [MagicMock(data=[])]  # _prune select
         )
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(big_symbols, "tradier_validated", None)
@@ -209,15 +222,22 @@ class TestSaveSnapshot:
         assert query.upsert.call_count == 3
 
     def test_prunes_when_over_limit(self):
+        """
+        DEDUP fix: _sync_save_snapshot calls _get_active_snapshot_for_reuse
+        first (1 execute), then insert (1), deactivate (1), upsert batch (1),
+        then _prune_old_snapshots calls select-all (1) + delete symbols (1)
+        + delete snapshots (1). Total = 7 execute() calls.
+        """
         sb, query   = _make_sb_mock()
         existing    = [{"id": f"snap-{i}"} for i in range(9)]
         query.execute.side_effect = [
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=existing),
-            MagicMock(data=[]),
-            MagicMock(data=[]),
+            MagicMock(data=[]),       # _get_active_snapshot_for_reuse -> no reuse
+            MagicMock(data=[]),       # insert snapshot header
+            MagicMock(data=[]),       # update deactivate
+            MagicMock(data=[]),       # upsert symbol batch
+            MagicMock(data=existing), # _prune select all snapshots
+            MagicMock(data=[]),       # delete symbols for pruned ids
+            MagicMock(data=[]),       # delete snapshot headers for pruned ids
         ]
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(["AAPL"], "tradier_validated", None)
@@ -229,10 +249,11 @@ class TestSaveSnapshot:
         sb, query = _make_sb_mock()
         existing  = [{"id": f"snap-{i}"} for i in range(3)]
         query.execute.side_effect = [
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=[]),
-            MagicMock(data=existing),
+            MagicMock(data=[]),      # _get_active_snapshot_for_reuse
+            MagicMock(data=[]),      # insert
+            MagicMock(data=[]),      # deactivate
+            MagicMock(data=[]),      # upsert batch
+            MagicMock(data=existing),  # _prune select
         ]
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(["AAPL"], "tradier_validated", None)
