@@ -4,21 +4,20 @@ test_symbol_registry_zero_price_fallback.py
 Tests for B-ZERO-PRICE fix in services/symbol_registry.py.
 
 Covers:
-  1. build() with ALL prices missing → zero_price_fallback=True, all tickers
+  1. build() with ALL prices missing -> zero_price_fallback=True, all tickers
      still submitted to _build_ticker, registry non-empty after build.
-  2. build() with PARTIAL prices missing → tickers with prices use normal ATM
+  2. build() with PARTIAL prices missing -> tickers with prices use normal ATM
      range; tickers without prices use fallback sentinel.
-  3. _build_ticker with stock_price=0 and zero_price_fallback=True → uses
+  3. _build_ticker with stock_price=0 and zero_price_fallback=True -> uses
      sentinel price + wide ATM, does NOT skip, loads contracts.
   4. _build_ticker with stock_price=0 and zero_price_fallback=False (default)
-     → skips ticker as before (regression guard).
-  5. _build_ticker with valid price → normal ATM range applied, contracts
+     -> skips ticker as before (regression guard).
+  5. _build_ticker with valid price -> normal ATM range applied, contracts
      outside range filtered out.
   6. build() sets _build_complete=True even when all prices missing.
   7. Zero-price fallback: wide ATM range (50%) passes all strikes.
 """
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -45,13 +44,13 @@ def _make_contract(symbol: str, strike: float, opt_type: str = "C") -> dict:
 
 
 def _tier_params_wide() -> dict[int, _TierParams]:
-    """Tier params with wide ATM range — used in most tests."""
+    """Tier params with wide ATM range - used in most tests."""
     p = _TierParams(atm_pct=0.50, max_dte=90, min_oi=0)
     return {1: p, 2: p, 3: p}
 
 
 def _tier_params_narrow() -> dict[int, _TierParams]:
-    """Tier params with narrow ATM range (10%) — used for filter tests."""
+    """Tier params with narrow ATM range (10%) - used for filter tests."""
     p = _TierParams(atm_pct=0.10, max_dte=90, min_oi=0)
     return {1: p, 2: p, 3: p}
 
@@ -69,7 +68,7 @@ ASYNC_THRESH = {
 
 
 # ---------------------------------------------------------------------------
-# Test 1: build() with ALL prices missing → fallback activated, registry built
+# Test 1: build() with ALL prices missing -> fallback activated, registry built
 # ---------------------------------------------------------------------------
 
 class TestBuildZeroPriceAllMissing:
@@ -105,7 +104,7 @@ class TestBuildZeroPriceAllMissing:
         ):
             count, _ = await registry.build()
 
-        assert count > 0, "Registry must not be 0 when all prices missing — fallback should load contracts"
+        assert count > 0, "Registry must not be 0 when all prices missing - fallback should load contracts"
         assert registry.is_ready() is True
         assert registry.size() > 0
 
@@ -132,7 +131,7 @@ class TestBuildZeroPriceAllMissing:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: build() with PARTIAL prices → mixed normal + fallback
+# Test 2: build() with PARTIAL prices -> mixed normal + fallback
 # ---------------------------------------------------------------------------
 
 class TestBuildZeroPricePartialMissing:
@@ -145,15 +144,13 @@ class TestBuildZeroPricePartialMissing:
         registry = SymbolRegistry(watchlist=["AAPL", "TSLA"])
         expiry = "2026-05-16"
 
-        # AAPL price=150, normal ATM ±10% → strikes 135-165 pass
-        # TSLA price=0 → fallback sentinel=1_000_000, range ±50% → all strikes pass
         aapl_contracts = [
             _make_contract("AAPL260516C00150000", 150.0, "C"),
-            _make_contract("AAPL260516C00300000", 300.0, "C"),  # far OTM — should be filtered for AAPL
+            _make_contract("AAPL260516C00300000", 300.0, "C"),  # far OTM - filtered for AAPL
         ]
         tsla_contracts = [
-            _make_contract("TSLA260516C00200000", 200.0, "C"),  # should pass with sentinel
-            _make_contract("TSLA260516C00800000", 800.0, "C"),  # should also pass with sentinel
+            _make_contract("TSLA260516C00200000", 200.0, "C"),  # passes with sentinel
+            _make_contract("TSLA260516C00800000", 800.0, "C"),  # passes with sentinel
         ]
 
         with (
@@ -177,13 +174,13 @@ class TestBuildZeroPricePartialMissing:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: _build_ticker zero_price_fallback=True → loads contracts
+# Test 3: _build_ticker zero_price_fallback=True -> loads contracts
 # ---------------------------------------------------------------------------
 
 class TestBuildTickerZeroPriceFallbackTrue:
     @pytest.mark.asyncio
     async def test_loads_contracts_with_sentinel_price(self):
-        """stock_price=0, zero_price_fallback=True → sentinel used, contracts loaded."""
+        """stock_price=0, zero_price_fallback=True -> sentinel used, contracts loaded."""
         registry = SymbolRegistry(watchlist=["NVDA"])
         registry._tier_map = {"NVDA": 3}
         expiry = "2026-05-16"
@@ -200,7 +197,7 @@ class TestBuildTickerZeroPriceFallbackTrue:
         ):
             await registry._build_ticker(
                 "NVDA",
-                0.0,  # no price
+                0.0,
                 new_registry,
                 new_oi,
                 _tier_params_wide(),
@@ -212,7 +209,7 @@ class TestBuildTickerZeroPriceFallbackTrue:
     @pytest.mark.asyncio
     async def test_strike_filter_uses_wide_atm_pct(self):
         """
-        With sentinel price=1_000_000 and ±50% ATM range, any strike < 1_500_000 passes.
+        With sentinel price=1_000_000 and +-50% ATM range, any strike < 1_500_000 passes.
         Strike=500 should pass; strike=2_000_000 should fail.
         """
         registry = SymbolRegistry(watchlist=["META"])
@@ -243,13 +240,13 @@ class TestBuildTickerZeroPriceFallbackTrue:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: _build_ticker zero_price_fallback=False (default) → skips ticker
+# Test 4: _build_ticker zero_price_fallback=False (default) -> skips ticker
 # ---------------------------------------------------------------------------
 
 class TestBuildTickerZeroPriceFallbackFalse:
     @pytest.mark.asyncio
     async def test_skips_ticker_when_no_fallback(self):
-        """stock_price=0, zero_price_fallback=False → skips, no contracts added (regression guard)."""
+        """stock_price=0, zero_price_fallback=False -> skips, no contracts added (regression guard)."""
         registry = SymbolRegistry(watchlist=["AMD"])
         registry._tier_map = {"AMD": 3}
         new_registry: dict[str, ContractMeta] = {}
@@ -267,26 +264,26 @@ class TestBuildTickerZeroPriceFallbackFalse:
             )
 
         assert len(new_registry) == 0
-        get_exp_mock.assert_not_called()  # should short-circuit before expirations fetch
+        get_exp_mock.assert_not_called()  # short-circuits before expirations fetch
 
 
 # ---------------------------------------------------------------------------
-# Test 5: _build_ticker with valid price → normal ATM filter
+# Test 5: _build_ticker with valid price -> normal ATM filter
 # ---------------------------------------------------------------------------
 
 class TestBuildTickerNormalPrice:
     @pytest.mark.asyncio
     async def test_atm_filter_rejects_far_otm(self):
         """
-        stock_price=100, tier3 atm_pct=10% → only strikes 90-110 pass.
+        stock_price=100, tier3 atm_pct=10% -> only strikes 90-110 pass.
         Strike=200 should be rejected.
         """
         registry = SymbolRegistry(watchlist=["GOOG"])
         registry._tier_map = {"GOOG": 3}
         expiry = "2026-05-16"
         contracts = [
-            _make_contract("GOOG260516C00100000", 100.0, "C"),  # ATM — passes
-            _make_contract("GOOG260516C00200000", 200.0, "C"),  # far OTM — rejected
+            _make_contract("GOOG260516C00100000", 100.0, "C"),  # ATM - passes
+            _make_contract("GOOG260516C00200000", 200.0, "C"),  # far OTM - rejected
         ]
         new_registry: dict[str, ContractMeta] = {}
         new_oi: dict[str, int] = {}
@@ -319,7 +316,6 @@ class TestFallbackConstants:
 
     def test_fallback_sentinel_is_large(self):
         """_FALLBACK_SENTINEL_PRICE must be large enough that real strikes pass ATM filter."""
-        # Any real strike (< ~1_500_000 = sentinel * 1.5) should pass
         assert _FALLBACK_SENTINEL_PRICE >= 1_000_000
         max_real_strike = 5000  # AMZN, GOOGL level
         atm_low = _FALLBACK_SENTINEL_PRICE * (1 - _ZERO_PRICE_ATM_PCT)
