@@ -1,10 +1,17 @@
 """
 Coverage boost for services/symbol_registry.py.
 
-get_config and _fetch_thresholds are imported inside build() / refresh_loop()
-using local imports, so patches must target those source modules directly:
-  - services.ingestion_config.get_config
-  - services.tier_engine._fetch_thresholds
+get_config and _fetch_thresholds are imported at module level in
+services/symbol_registry.py (H3 fix), so patches must target the
+symbol_registry module namespace:
+  - services.symbol_registry.get_config  (via services.ingestion_config)
+  - services.symbol_registry._fetch_thresholds (via services.tier_engine)
+
+FIX (2026-04-28):
+  - Patch target changed from 'services.symbol_registry.get_option_chain'
+    to 'services.symbol_registry.get_option_chain_bulk' (FIX P3).
+  - build() now returns tuple[int, dict], not int.  All callers updated.
+  - _persist_to_db patched to avoid live Supabase calls in tests.
 """
 import asyncio
 from datetime import date, timedelta
@@ -93,6 +100,7 @@ _FAKE_CONFIG = {
     "REGISTRY_MIN_OI": 0,
     "REGISTRY_REFRESH_MINS": 60,
     "REGISTRY_EXPIRY_DAY_REFRESH_MINS": 10,
+    "REGISTRY_BUILD_CONCURRENCY": 4,
 }
 
 _NEAR_EXPIRY = (date.today() + timedelta(days=14)).isoformat()
@@ -102,6 +110,7 @@ _FAKE_CHAIN = [
      "option_type": "C", "open_interest": 1000},
     {"symbol": "AAPL231215P00175000", "strike": 175.0,
      "option_type": "P", "open_interest": 500},
+    # This strike is outside ATM window for price=185, so should be filtered
     {"symbol": "AAPL231215C00999000", "strike": 999.0,
      "option_type": "C", "open_interest": 100},
 ]
@@ -119,11 +128,13 @@ def _patches(chain=_FAKE_CHAIN, expirations=None, expirations_side_effect=None,
         chain_mock.side_effect = chain_side_effect
 
     return [
-        patch("services.ingestion_config.get_config",  new=AsyncMock(return_value=_FAKE_CONFIG)),
-        patch("services.tier_engine._fetch_thresholds", new=AsyncMock(return_value=_FAKE_THRESH)),
-        patch("services.symbol_registry.get_quotes_batch", new=AsyncMock(return_value={"AAPL": {"last": 185.0}})),
-        patch("services.symbol_registry.get_expirations",  new=expiry_mock),
-        patch("services.symbol_registry.get_option_chain", new=chain_mock),
+        patch("services.ingestion_config.get_config",     new=AsyncMock(return_value=_FAKE_CONFIG)),
+        patch("services.tier_engine._fetch_thresholds",   new=AsyncMock(return_value=_FAKE_THRESH)),
+        patch("services.symbol_registry.get_quotes_batch",new=AsyncMock(return_value={"AAPL": {"last": 185.0}})),
+        patch("services.symbol_registry.get_expirations", new=expiry_mock),
+        # FIX: P3 renamed get_option_chain -> get_option_chain_bulk
+        patch("services.symbol_registry.get_option_chain_bulk", new=chain_mock),
+        patch.object(SymbolRegistry, "_persist_to_db",    new=AsyncMock()),
     ]
 
 
@@ -134,10 +145,11 @@ def test_registry_build_populates_contracts():
 
     async def _run2():
         p = _patches()
-        with p[0], p[1], p[2], p[3], p[4]:
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
             return await r.build()
 
-    count = asyncio.run(_run2())
+    # H1: build() returns tuple[int, dict]
+    count, _raw = asyncio.run(_run2())
     assert count >= 1
     assert r.is_ready()
     assert r.size() == count
@@ -161,10 +173,12 @@ def test_registry_build_ticker_expiry_fetch_error():
 
     async def _run():
         p = _patches(expirations_side_effect=RuntimeError("api down"))
-        with p[0], p[1], p[2], p[3]:
+        # Only need first 4 patches (no chain needed — expiry raises first)
+        with p[0], p[1], p[2], p[3], p[5]:
             return await r.build()
 
-    count = asyncio.run(_run())
+    # H1: build() returns tuple[int, dict] — unpack and check count
+    count, _raw = asyncio.run(_run())
     assert count == 0
 
 
@@ -173,10 +187,10 @@ def test_registry_build_chain_fetch_error_continues():
 
     async def _run():
         p = _patches(chain_side_effect=RuntimeError("chain down"))
-        with p[0], p[1], p[2], p[3], p[4]:
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
             return await r.build()
 
-    count = asyncio.run(_run())
+    count, _raw = asyncio.run(_run())
     assert count == 0
 
 
@@ -185,7 +199,7 @@ def test_registry_lookup_after_build():
 
     async def _run():
         p = _patches()
-        with p[0], p[1], p[2], p[3], p[4]:
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
             await r.build()
 
     asyncio.run(_run())
@@ -205,7 +219,7 @@ def test_refresh_loop_runs_one_iter_and_cancels():
 
     async def _run():
         p = _patches()
-        with p[0], p[1], p[2], p[3], p[4]:
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
             with patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
                 try:
                     await r.refresh_loop()
