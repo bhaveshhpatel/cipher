@@ -131,13 +131,13 @@ class TestSymbolRegistryOiMap:
 
 
 # ---------------------------------------------------------------------------
-# 2. tier_engine._classify: OI grace path removed
+# 2. tier_engine._classify: OI grace path removed (require_oi=True enforced)
 # ---------------------------------------------------------------------------
 
 class TestClassifyNoGrace:
     def _classify(self, quote, thresh):
         from services.tier_engine import _classify
-        return _classify(quote, thresh)
+        return _classify(quote, thresh, require_oi=True)
 
     def test_t1_all_three_conditions_met(self):
         q = _Quote("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=2_000)
@@ -230,7 +230,7 @@ class TestOiDrivenTierIntegration:
         _stamp_oi(quotes, {"AAPL": 0})
         with patch("services.tier_engine._fetch_thresholds",
                    new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+            tiers = await assign_tiers(quotes, require_oi=True)
         assert tiers["AAPL"] == 3
 
     @pytest.mark.asyncio
@@ -241,7 +241,7 @@ class TestOiDrivenTierIntegration:
         _stamp_oi(quotes, {"AAPL": 2000})
         with patch("services.tier_engine._fetch_thresholds",
                    new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+            tiers = await assign_tiers(quotes, require_oi=True)
         assert tiers["AAPL"] == 1
 
     @pytest.mark.asyncio
@@ -256,7 +256,7 @@ class TestOiDrivenTierIntegration:
         _stamp_oi(quotes, {"SPY": 5_000, "HOOD": 600, "SPCE": 50})
         with patch("services.tier_engine._fetch_thresholds",
                    new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+            tiers = await assign_tiers(quotes, require_oi=True)
         assert tiers["SPY"] == 1
         assert tiers["HOOD"] == 2
         assert tiers["SPCE"] == 3
@@ -268,10 +268,10 @@ class TestOiDrivenTierIntegration:
         quotes = [_Quote("NVDA", last_price=900.0, average_volume=25_000_000)]
         with patch("services.tier_engine._fetch_thresholds",
                    new=AsyncMock(return_value=_make_thresh())):
-            prelim_tiers = await assign_tiers(quotes)
+            prelim_tiers = await assign_tiers(quotes, require_oi=True)
         _stamp_oi(quotes, {"NVDA": 3_000})
         with patch("services.tier_engine._fetch_thresholds",
                    new=AsyncMock(return_value=_make_thresh())):
-            final_tiers = await assign_tiers(quotes)
+            final_tiers = await assign_tiers(quotes, require_oi=True)
         assert prelim_tiers["NVDA"] == 3
         assert final_tiers["NVDA"]  == 1
