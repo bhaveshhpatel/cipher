@@ -23,6 +23,12 @@ Tests:
   12. symbol_count_not_total_cboe_size  — symbol_count != len(all_symbols) when subset eligible
   13. batch_split_correct               — 600 symbols split into 2 batches of 500/100
   14. exception_returns_false           — DB exception returns False gracefully
+
+Note (2026-04-28 DEDUP fix): _sync_save_snapshot now calls
+  _get_active_snapshot_for_reuse() before inserting. This calls .gte() on the
+  Supabase query chain. _make_sb_mock() must wire .gte.return_value = table_mock
+  so the chain stays on the mock object and execute() returns data=[] (no reuse),
+  ensuring the insert + deactivation path is always exercised in these tests.
 """
 from unittest.mock import MagicMock, patch
 
@@ -39,10 +45,11 @@ def _make_sb_mock():
     table_mock.select.return_value = table_mock
     table_mock.eq.return_value = table_mock
     table_mock.neq.return_value = table_mock
+    table_mock.gte.return_value = table_mock   # DEDUP fix: must be wired
     table_mock.order.return_value = table_mock
     table_mock.limit.return_value = table_mock
     table_mock.in_.return_value = table_mock
-    table_mock.execute.return_value = MagicMock(data=[])
+    table_mock.execute.return_value = MagicMock(data=[])  # -> empty rows -> no reuse
     return sb
 
 
@@ -172,6 +179,11 @@ def test_upsert_idempotent_on_conflict(mock_client, mock_prune):
 @patch("services.universe_store._prune_old_snapshots")
 @patch("services.universe_store._client")
 def test_snapshot_deactivation_called(mock_client, mock_prune):
+    """
+    DEDUP fix: _get_active_snapshot_for_reuse calls .gte() which is now wired
+    in _make_sb_mock() to return table_mock. execute() returns data=[] so
+    reuse_id=None and is_new_snapshot=True, triggering the deactivation UPDATE.
+    """
     sb = _make_sb_mock()
     mock_client.return_value = sb
 
