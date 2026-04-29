@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { api, FlowEpisode } from "@/lib/api";
 
 export interface FlowEpisodesFilters {
@@ -11,16 +11,16 @@ export interface FlowEpisodesFilters {
   offset?:        number;
 }
 
-export function useFlowEpisodes(token: string | null) {
+export function useFlowEpisodes(
+  token:   string | null,
+  filters: FlowEpisodesFilters = {},
+) {
   const [episodes, setEpisodes] = useState<FlowEpisode[]>([]);
   const [loading,  setLoading]  = useState(false);
   const [error,    setError]    = useState<string | null>(null);
 
-  const filtersRef = useRef<FlowEpisodesFilters>({});
-
-  const fetch = useCallback(async (filters: FlowEpisodesFilters = {}) => {
+  const fetch = useCallback(async () => {
     if (!token) return;
-    filtersRef.current = filters;
     setLoading(true);
     setError(null);
     try {
@@ -32,15 +32,16 @@ export function useFlowEpisodes(token: string | null) {
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, JSON.stringify(filters)]);
 
-  // 30-second auto-refresh
+  // 30-second auto-refresh; re-triggers when token or filters change
   useEffect(() => {
     if (!token) return;
-    fetch(filtersRef.current);
-    const iv = setInterval(() => fetch(filtersRef.current), 30_000);
+    fetch();
+    const iv = setInterval(fetch, 30_000);
     return () => clearInterval(iv);
-  }, [token, fetch]);
+  }, [fetch, token]);
 
   return { episodes, loading, error, fetch };
 }

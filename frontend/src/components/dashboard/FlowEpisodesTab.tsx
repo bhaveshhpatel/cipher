@@ -4,10 +4,10 @@ import type { FlowEpisode } from "@/lib/api";
 import type { FlowEpisodesFilters } from "@/hooks/useFlowEpisodes";
 
 interface Props {
-  episodes: FlowEpisode[];
-  loading:  boolean;
-  error:    string | null;
-  onFilter: (f: FlowEpisodesFilters) => void;
+  episodes:         FlowEpisode[];
+  loading:          boolean;
+  error:            string | null;
+  onFiltersChange:  (f: FlowEpisodesFilters) => void;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -28,17 +28,15 @@ const fmtTime = (ts: string) => {
   try { return new Date(ts).toLocaleTimeString(); } catch { return ts; }
 };
 
-/** Alert level → badge style */
 const alertBadgeStyle = (level: string): React.CSSProperties => {
   switch (level) {
-    case "STRONG": return { background: "var(--orange)",  color: "#fff" };
-    case "ALERT":  return { background: "var(--gold)",    color: "#1a0f00" };
-    case "HOLD":   return { background: "var(--blue)",    color: "#fff" };
-    default:       return { background: "var(--surface-2)", color: "var(--muted)", border: "1px solid var(--border)" }; // WATCH
+    case "STRONG": return { background: "var(--orange)",    color: "#fff" };
+    case "ALERT":  return { background: "var(--gold)",      color: "#1a0f00" };
+    case "HOLD":   return { background: "var(--blue)",      color: "#fff" };
+    default:       return { background: "var(--surface-2)", color: "var(--muted)", border: "1px solid var(--border)" };
   }
 };
 
-/** Direction → badge class */
 const dirBadge = (d: string) =>
   d === "BULLISH" ? "badge badge-green" : d === "BEARISH" ? "badge badge-red" : "badge badge-muted";
 
@@ -79,7 +77,7 @@ function EmptyState() {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
+export function FlowEpisodesTab({ episodes, loading, error, onFiltersChange }: Props) {
   const [direction,    setDirection]    = useState("ALL");
   const [contractType, setContractType] = useState("ALL");
   const [alertLevel,   setAlertLevel]   = useState("ALL");
@@ -95,10 +93,8 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
     if (d  !== "ALL") f.direction     = d;
     if (ct !== "ALL") f.contract_type = ct;
     if (al !== "ALL") f.alert_level   = al;
-    // "accelerating" is a client-side filter — sort by delta premium desc
-    // We pass the base filters to the hook; acceleration sort is done locally
-    void ac; // used only for local sort (see sorted below)
-    onFilter(f);
+    void ac; // acceleration is a client-side sort, not a server filter
+    onFiltersChange(f);
   };
 
   const handleDir  = (v: string) => { setDirection(v);    applyFilters(v); };
@@ -110,7 +106,6 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
     applyFilters(direction, contractType, alertLevel, next);
   };
 
-  // Client-side: sort by (total_premium - last_signaled_premium) desc when accelerating toggle is on
   const sorted = accelerating
     ? [...episodes].sort((a, b) =>
         (b.total_premium - b.last_signaled_premium) - (a.total_premium - a.last_signaled_premium)
@@ -122,7 +117,6 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
 
       {/* Filter bar */}
       <div className="flex items-center gap-2 flex-wrap">
-        {/* Direction */}
         {["ALL", "BULLISH", "BEARISH"].map(d => (
           <button
             key={d}
@@ -140,7 +134,6 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Contract Type */}
         {["ALL", "CALL", "PUT"].map(ct => (
           <button
             key={ct}
@@ -158,7 +151,6 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Alert Level */}
         {["ALL", "STRONG", "ALERT", "HOLD", "WATCH"].map(al => (
           <button
             key={al}
@@ -178,7 +170,6 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Accelerating toggle */}
         <button
           onClick={handleAcc}
           className="px-3 py-1.5 rounded-md text-xs font-semibold transition-all"

@@ -9,6 +9,8 @@ import { useFlowEvents } from "@/hooks/useFlowEvents";
 import { useFlowEpisodes } from "@/hooks/useFlowEpisodes";
 import { api } from "@/lib/api";
 import type { StreamStats, CompositeSignal } from "@/lib/api";
+import type { FlowEventsFilters } from "@/hooks/useFlowEvents";
+import type { FlowEpisodesFilters } from "@/hooks/useFlowEpisodes";
 
 import { CipherLogo } from "@/components/CipherLogo";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -50,9 +52,12 @@ export default function DashboardPage() {
   const { result: simResult, loading: simLoading, error: simError, progress, run: runSim } = useSimulation(token);
   const { signals, connected } = useSignalStream(token);
 
-  // Chunk-2 hooks
-  const { events: flowEventRows, loading: feLoading, error: feError, fetch: fetchFlowEvents } = useFlowEvents(token);
-  const { episodes, loading: epLoading, error: epError, fetch: fetchFlowEpisodes } = useFlowEpisodes(token);
+  // Two-arg hook wiring — parent owns filter state, hook auto-refetches on change
+  const [flowEventsFilters,   setFlowEventsFilters]   = useState<FlowEventsFilters>({});
+  const [flowEpisodesFilters, setFlowEpisodesFilters] = useState<FlowEpisodesFilters>({});
+
+  const { events: flowEventRows, loading: feLoading, error: feError }     = useFlowEvents(token,  flowEventsFilters);
+  const { episodes,              loading: epLoading, error: epError }     = useFlowEpisodes(token, flowEpisodesFilters);
 
   const [flowTicker,      setFlowTicker]      = useState("");
   const [compositeTicker, setCompositeTicker] = useState("");
@@ -62,7 +67,7 @@ export default function DashboardPage() {
   const [compositeLoading, setCompositeLoading] = useState(false);
   const [flowCountdown,    setFlowCountdown]    = useState(FLOW_REFRESH_MS / 1000);
 
-  // Auth guard — wait for ready before redirecting to avoid flicker loop
+  // Auth guard
   useEffect(() => {
     if (!ready) return;
     if (!isAuthenticated) router.replace("/");
@@ -124,7 +129,6 @@ export default function DashboardPage() {
     }
   };
 
-  // Don't render until auth is resolved
   if (!ready || !isAuthenticated) return null;
 
   return (
@@ -308,42 +312,38 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* ── Chunk 2: Flow Events tab ── */}
+        {/* ── Flow Events tab ── */}
         {tab === "flow_events" && token && (
           <div className="flex flex-col gap-4">
-            <div className="flex items-start justify-between gap-4 flex-wrap">
-              <div>
-                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Flow Events</h1>
-                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
-                  Raw per-trade rows from live stream · 10s auto-refresh
-                </p>
-              </div>
+            <div>
+              <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Flow Events</h1>
+              <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                Raw per-trade rows from live stream · 10s auto-refresh
+              </p>
             </div>
             <FlowEventsTab
               events={flowEventRows}
               loading={feLoading}
               error={feError}
-              onFilter={fetchFlowEvents}
+              onFiltersChange={setFlowEventsFilters}
             />
           </div>
         )}
 
-        {/* ── Chunk 2: Episodes tab ── */}
+        {/* ── Episodes tab ── */}
         {tab === "flow_episodes" && token && (
           <div className="flex flex-col gap-4">
-            <div className="flex items-start justify-between gap-4 flex-wrap">
-              <div>
-                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Repetition Episodes</h1>
-                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
-                  Aggregated repetition clusters · 30s auto-refresh
-                </p>
-              </div>
+            <div>
+              <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Repetition Episodes</h1>
+              <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                Aggregated repetition clusters · 30s auto-refresh
+              </p>
             </div>
             <FlowEpisodesTab
               episodes={episodes}
               loading={epLoading}
               error={epError}
-              onFilter={fetchFlowEpisodes}
+              onFiltersChange={setFlowEpisodesFilters}
             />
           </div>
         )}

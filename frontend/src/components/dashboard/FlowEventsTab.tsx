@@ -4,10 +4,10 @@ import type { FlowEventRaw } from "@/lib/api";
 import type { FlowEventsFilters } from "@/hooks/useFlowEvents";
 
 interface Props {
-  events:  FlowEventRaw[];
-  loading: boolean;
-  error:   string | null;
-  onFilter: (f: FlowEventsFilters) => void;
+  events:           FlowEventRaw[];
+  loading:          boolean;
+  error:            string | null;
+  onFiltersChange:  (f: FlowEventsFilters) => void;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ function EmptyState() {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
+export function FlowEventsTab({ events, loading, error, onFiltersChange }: Props) {
   const [sentiment,    setSentiment]    = useState("ALL");
   const [contractType, setContractType] = useState("ALL");
   const [tier,         setTier]         = useState("ALL");
@@ -79,9 +79,9 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
   const [goldenSweep,  setGoldenSweep]  = useState(false);
 
   const applyFilters = (
-    s = sentiment,
+    s  = sentiment,
     ct = contractType,
-    t = tier,
+    t  = tier,
     ag = aggressive,
     gs = goldenSweep,
   ) => {
@@ -91,7 +91,7 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
     if (t  !== "ALL") f.tier          = t;
     if (ag)           f.aggressive    = true;
     if (gs)           f.golden_sweep  = true;
-    onFilter(f);
+    onFiltersChange(f);
   };
 
   const handleSentiment = (v: string) => { setSentiment(v);    applyFilters(v); };
@@ -109,8 +109,8 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
   };
 
   // KPI stats
-  const totalPremium   = events.reduce((s, e) => s + e.premium, 0);
-  const uniqueTickers  = new Set(events.map(e => e.ticker)).size;
+  const totalPremium  = events.reduce((s, e) => s + e.premium, 0);
+  const uniqueTickers = new Set(events.map(e => e.ticker)).size;
 
   return (
     <div className="flex flex-col gap-4">
@@ -119,9 +119,9 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
       {events.length > 0 && (
         <div className="grid grid-cols-3 gap-3">
           {[
-            { label: "Total Premium",  value: fmt$(totalPremium),    accent: "var(--amber)" },
-            { label: "Trade Count",    value: events.length,          accent: "var(--text)"  },
-            { label: "Unique Tickers", value: uniqueTickers,          accent: "var(--teal)"  },
+            { label: "Total Premium",  value: fmt$(totalPremium), accent: "var(--amber)" },
+            { label: "Trade Count",    value: events.length,       accent: "var(--text)"  },
+            { label: "Unique Tickers", value: uniqueTickers,       accent: "var(--teal)"  },
           ].map(({ label, value, accent }) => (
             <div key={label} className="card px-4 py-3 flex flex-col gap-0.5">
               <span className="text-2xs font-bold uppercase tracking-widest" style={{ color: "var(--faint)" }}>{label}</span>
@@ -133,7 +133,6 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
 
       {/* Filter bar */}
       <div className="flex items-center gap-2 flex-wrap">
-        {/* Sentiment */}
         {["ALL", "BULLISH", "BEARISH", "NEUTRAL"].map(s => (
           <button
             key={s}
@@ -151,7 +150,6 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Contract Type */}
         {["ALL", "CALL", "PUT"].map(ct => (
           <button
             key={ct}
@@ -169,7 +167,6 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Tier */}
         {["ALL", "T1", "T2", "T3"].map(t => (
           <button
             key={t}
@@ -187,7 +184,6 @@ export function FlowEventsTab({ events, loading, error, onFilter }: Props) {
 
         <div className="w-px h-5 mx-1" style={{ background: "var(--border)" }} />
 
-        {/* Toggles */}
         <button
           onClick={handleAgg}
           className="px-3 py-1.5 rounded-md text-xs font-semibold transition-all"

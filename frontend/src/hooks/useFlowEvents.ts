@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { api, FlowEventRaw } from "@/lib/api";
 
 export interface FlowEventsFilters {
@@ -13,17 +13,16 @@ export interface FlowEventsFilters {
   offset?:        number;
 }
 
-export function useFlowEvents(token: string | null) {
+export function useFlowEvents(
+  token:   string | null,
+  filters: FlowEventsFilters = {},
+) {
   const [events,  setEvents]  = useState<FlowEventRaw[]>([]);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState<string | null>(null);
 
-  // Keep a ref to the latest filters so the interval closure always uses fresh values
-  const filtersRef = useRef<FlowEventsFilters>({});
-
-  const fetch = useCallback(async (filters: FlowEventsFilters = {}) => {
+  const fetch = useCallback(async () => {
     if (!token) return;
-    filtersRef.current = filters;
     setLoading(true);
     setError(null);
     try {
@@ -35,15 +34,16 @@ export function useFlowEvents(token: string | null) {
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, JSON.stringify(filters)]);
 
-  // 10-second auto-refresh
+  // 10-second auto-refresh; re-triggers when token or filters change
   useEffect(() => {
     if (!token) return;
-    fetch(filtersRef.current);
-    const iv = setInterval(() => fetch(filtersRef.current), 10_000);
+    fetch();
+    const iv = setInterval(fetch, 10_000);
     return () => clearInterval(iv);
-  }, [token, fetch]);
+  }, [fetch, token]);
 
   return { events, loading, error, fetch };
 }
