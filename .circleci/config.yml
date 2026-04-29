@@ -104,6 +104,8 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Job 3: Frontend tests (jest --ci, 75% coverage threshold)
+  # No package-lock.json present — uses npm install (not npm ci).
+  # Cache keyed on package.json checksum.
   # -----------------------------------------------------------------------
   frontend_test:
     docker:
@@ -112,14 +114,14 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - npm-v1-{{ checksum "frontend/package-lock.json" }}
+            - npm-v1-{{ checksum "frontend/package.json" }}
             - npm-v1-
       - run:
           name: Install frontend dependencies
           working_directory: ~/project/frontend
-          command: npm ci
+          command: npm install --prefer-offline
       - save_cache:
-          key: npm-v1-{{ checksum "frontend/package-lock.json" }}
+          key: npm-v1-{{ checksum "frontend/package.json" }}
           paths:
             - ~/.npm
       - run:
