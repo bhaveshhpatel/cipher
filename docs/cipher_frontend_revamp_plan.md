@@ -87,7 +87,7 @@ Replace the horizontal tab bar with a **collapsible left sidebar**:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ ≡  CIPHER           [Pulse ●]   [SPY 521.40 ▲]  [VIX]  │  ← Top Header
+│ ≡  CIPHER           [● LIVE]  [Symbols: 4,279]  [OPEN]  │  ← Top Header
 ├──────┬──────────────────────────────────────────────────┤
 │  ⟁   │                                                  │
 │  ◎   │   Main Content Area (active tab panel)           │
@@ -111,8 +111,9 @@ Replace the horizontal tab bar with a **collapsible left sidebar**:
 
 A slim banner below the header showing:
 ```
-Market: OPEN  |  SPY 521.40 ▲0.32%  |  QQQ 441.20 ▼0.18%  |  VIX 18.42  |  Stream: ● LIVE  |  Symbols: 4,279
+Market: OPEN  |  Stream: ● LIVE  |  Active Symbols: 4,279  |  Signals Today: 142
 ```
+> ⚠️ **Scope constraint:** SPY / QQQ / VIX index price fields are intentionally excluded. They require a new external market data API dependency (Polygon, Yahoo Finance, etc.) which is out of scope at this time. These fields can be added in a future story once an index-quote source is integrated into the backend. All four fields above are sourced exclusively from existing endpoints.
 - Color-coded: green = market open, red = closed/pre-market, amber = pre/after-hours
 - Stream pill pulses green when ticks are arriving (CSS animation)
 - Collapses to a single icon row on mobile
@@ -439,7 +440,7 @@ Centralize all design tokens in `globals.css` under `:root` and `[data-theme="da
 
 - [ ] **P2-1** `components/layout/AppSidebar.tsx` — collapsible sidebar (56px icon / 200px expanded), with nav items, badge support, admin link conditional on `isAdmin`
 - [ ] **P2-2** `components/layout/AppHeader.tsx` — top bar: logo, market pulse pill, theme toggle, user email, sign out — replaces current header
-- [ ] **P2-3** `components/layout/MarketPulseBar.tsx` — slim banner: market status (OPEN/CLOSED/PRE), SPY/QQQ/VIX prices (static initially, hook-driven later), stream pulse dot, active symbol count
+- [ ] **P2-3** `components/layout/MarketPulseBar.tsx` — slim banner: market status (OPEN/CLOSED/PRE/AFTER, derived from ET clock only), stream mode pulse dot, active symbol count, signals-today count — all from existing endpoints. ⚠️ No SPY/QQQ/VIX fields — deferred until a market data source is integrated
 - [ ] **P2-4** `components/layout/MobileBottomNav.tsx` — 5-item bottom tab bar for viewport < 768px, replaces sidebar on mobile, badge count support
 - [ ] **P2-5** `components/layout/AdminHeader.tsx` — admin top bar: breadcrumb (Admin > Control Panel), back-to-dashboard button, user email
 - [ ] **P2-6** Refactor `app/dashboard/page.tsx` to use new layout: `<AppHeader>` + `<AppSidebar>` + `<MarketPulseBar>` + URL-driven tab routing (`?tab=`)
@@ -660,20 +661,32 @@ Centralize all design tokens in `globals.css` under `:root` and `[data-theme="da
 ### STORY-007 | Layout: MarketPulseBar
 **Phase:** P2
 **Description:** A slim contextual banner below the header showing market status, key index levels, stream health, and active symbol count.
+**⚠️ Data Scope:** Fields are limited strictly to data already available from existing endpoints. SPY/QQQ/VIX index prices are explicitly excluded — they would require a new external market data API dependency which is out of scope. These can be added in a future story.
+
+**Data Sources:**
+- Market status → `useMarketStatus` hook (pure ET clock computation, zero API calls)
+- Stream mode → `/api/health/stream` → `mode` field (already used by admin StreamHealthCard)
+- Active Symbols → `/api/signals/stream/stats` → `active_symbols` (already in `StreamStats`)
+- Signals Today → `/api/signals/stream/stats` → `signals` (already in `StreamStats`)
+
 **Acceptance Criteria:**
 - Market status pill: OPEN (green), CLOSED (muted), PRE-MARKET (amber), AFTER-HOURS (amber)
-- Status derived from `useMarketStatus` hook (computed from ET time, no API)
+- Status derived from `useMarketStatus` hook (computed from ET time, no API call)
 - Stream mode pill: LIVE (green pulse), DEMO (cyan), RECONNECTING (amber), STOPPED (muted)
-- Symbol count: pulled from `stats.active_symbols` via prop
+- Active Symbols count: pulled from `stats.active_symbols` via prop
+- Signals Today count: pulled from `stats.signals` via prop
+- No SPY/QQQ/VIX fields — zero new external API dependencies introduced
 - Collapses to icon-only row on mobile (< 640px)
 - Height: 32px desktop, 28px mobile
 - Does not block content — positioned as a flow element below header, not sticky
 
 **Test Requirements:**
 - Renders correct market status based on mocked `useMarketStatus`
-- Stream mode pill renders correct variant for each mode
+- Stream mode pill renders correct variant for each mode (LIVE, DEMO, RECONNECTING, STOPPED)
+- Active Symbols renders correctly with null/undefined fallback to "—"
+- Signals Today renders correctly with null/undefined fallback to "—"
+- No external API calls made by this component (assert fetch not called)
 - Mobile: icon-only layout applied at sm breakpoint (mock `window.innerWidth`)
-- Symbol count renders correctly with null/undefined fallback to "—"
 - Snapshot tests for all market status states
 - 100% coverage
 
