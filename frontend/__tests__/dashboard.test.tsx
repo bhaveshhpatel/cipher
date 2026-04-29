@@ -8,7 +8,7 @@
  *   - Authenticated user: dashboard renders without redirect
  *   - Authenticated user: email is displayed in the header
  *   - Authenticated user: Sign out button is present and calls logout()
- *   - Tab navigation: all 5 tab labels are rendered
+ *   - Tab navigation: all tab labels are rendered
  */
 import React from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
@@ -48,10 +48,20 @@ jest.mock("@/hooks/useSignalStream", () => ({
   useSignalStream: () => ({ signals: [], connected: false }),
 }));
 
+jest.mock("@/hooks/useFlowEvents", () => ({
+  useFlowEvents: () => ({ events: [], loading: false, error: null, fetch: jest.fn() }),
+}));
+
+jest.mock("@/hooks/useFlowEpisodes", () => ({
+  useFlowEpisodes: () => ({ episodes: [], loading: false, error: null, fetch: jest.fn() }),
+}));
+
 jest.mock("@/lib/api", () => ({
   api: {
-    getStats:     jest.fn().mockResolvedValue({ stats: null }),
-    getComposite: jest.fn().mockResolvedValue(null),
+    getStats:       jest.fn().mockResolvedValue({ stats: null }),
+    getComposite:   jest.fn().mockResolvedValue(null),
+    getFlowEvents:  jest.fn().mockResolvedValue({ events: [] }),
+    getFlowEpisodes: jest.fn().mockResolvedValue({ episodes: [] }),
   },
 }));
 
@@ -64,6 +74,8 @@ jest.mock("@/components/dashboard/SignalFeed",   () => ({ SignalFeed: () => <div
 jest.mock("@/components/dashboard/SimulationPanel", () => ({ SimulationPanel: () => <div data-testid="sim-panel" /> }));
 jest.mock("@/components/dashboard/CompositeCard",() => ({ CompositeCard: () => <div data-testid="composite-card" /> }));
 jest.mock("@/components/dashboard/SignalHistory",() => ({ SignalHistory: () => <div data-testid="signal-history" /> }));
+jest.mock("@/components/dashboard/FlowEventsTab",() => ({ FlowEventsTab: () => <div data-testid="flow-events-tab" /> }));
+jest.mock("@/components/dashboard/FlowEpisodesTab",() => ({ FlowEpisodesTab: () => <div data-testid="flow-episodes-tab" /> }));
 
 import DashboardPage from "../src/app/dashboard/page";
 
@@ -98,7 +110,8 @@ describe("DashboardPage", () => {
 
   it("[AUTH GUARD] does NOT redirect when authenticated", async () => {
     render(<DashboardPage />);
-    await waitFor(() => expect(screen.queryByTestId("flow-table")).toBeInTheDocument());
+    // Default tab is Flow Events — scoped to testid on the tab component
+    await waitFor(() => expect(screen.queryByTestId("flow-events-tab")).toBeInTheDocument());
     expect(mockReplace).not.toHaveBeenCalled();
   });
 
@@ -123,20 +136,22 @@ describe("DashboardPage", () => {
 
   // ── tab navigation ──────────────────────────────────────────────────────────
 
-  it("renders all 5 tab labels", async () => {
+  it("renders all tab labels", async () => {
     render(<DashboardPage />);
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /flow scanner/i })).toBeInTheDocument();
+      // Scope all tab checks to role="button" to avoid collisions with page headings
+      expect(screen.getByRole("button", { name: /flow events/i })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /live signals/i })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /ai simulation/i })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /composite/i })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /signal history/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /episodes/i })).toBeInTheDocument();
     });
   });
 
-  it("shows FlowTable by default (flow tab is active)", async () => {
+  it("shows FlowEventsTab by default (flow events tab is active)", async () => {
     render(<DashboardPage />);
-    await waitFor(() => expect(screen.getByTestId("flow-table")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument());
   });
 
   it("switches to SignalFeed when Live Signals tab is clicked", async () => {

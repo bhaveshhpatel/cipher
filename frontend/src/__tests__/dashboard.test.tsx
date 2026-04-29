@@ -134,84 +134,92 @@ describe("Auth guard", () => {
 
 // ─── Tab nav renders all 7 tabs ─────────────────────────────────────────────────────────────
 describe("Tab navigation — all 7 tabs exist", () => {
+  // Labels as they actually appear in the rendered nav buttons
   const TAB_LABELS = [
-    "Flow Scanner",
+    "Flow Events",
     "Live Signals",
     "AI Simulation",
     "Composite",
     "Signal History",
-    "Flow Events",
     "Episodes",
   ];
 
   TAB_LABELS.forEach(label => {
     test(`renders tab button: ${label}`, () => {
       render(<DashboardPage />);
-      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: new RegExp(label, "i") })).toBeInTheDocument();
     });
+  });
+
+  // "Flow Events" tab label also appears in the page <h1>, so scope to button role
+  test("renders tab button: Flow Events (scoped to nav button)", () => {
+    render(<DashboardPage />);
+    const buttons = screen.getAllByRole("button", { name: /flow events/i });
+    expect(buttons.length).toBeGreaterThanOrEqual(1);
   });
 });
 
 // ─── Tab switching ────────────────────────────────────────────────────────────────────
 describe("Tab switching", () => {
-  test("default tab is Flow Scanner — FlowTable is visible", () => {
+  test("default tab is Flow Events — FlowEventsTab is visible", () => {
     render(<DashboardPage />);
-    expect(screen.getByTestId("flow-table")).toBeInTheDocument();
+    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
   });
 
   test("clicking Live Signals renders SignalFeed", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Live Signals"));
+    fireEvent.click(screen.getByRole("button", { name: /live signals/i }));
     expect(screen.getByTestId("signal-feed")).toBeInTheDocument();
   });
 
   test("clicking AI Simulation renders SimulationPanel", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("AI Simulation"));
+    fireEvent.click(screen.getByRole("button", { name: /ai simulation/i }));
     expect(screen.getByTestId("simulation-panel")).toBeInTheDocument();
   });
 
   test("clicking Composite renders CompositeCard", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Composite"));
+    fireEvent.click(screen.getByRole("button", { name: /^composite$/i }));
     expect(screen.getByTestId("composite-card")).toBeInTheDocument();
   });
 
   test("clicking Signal History renders SignalHistory", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Signal History"));
+    fireEvent.click(screen.getByRole("button", { name: /signal history/i }));
     expect(screen.getByTestId("signal-history")).toBeInTheDocument();
   });
 
-  test("clicking Flow Events renders FlowEventsTab", () => {
+  test("clicking Flow Events tab renders FlowEventsTab", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Flow Events"));
+    // Use role scoping to avoid collision with the <h1> that also reads "Flow Events"
+    fireEvent.click(screen.getByRole("button", { name: /flow events/i }));
     expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
   });
 
   test("clicking Episodes renders FlowEpisodesTab", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Episodes"));
+    fireEvent.click(screen.getByRole("button", { name: /episodes/i }));
     expect(screen.getByTestId("flow-episodes-tab")).toBeInTheDocument();
   });
 
   test("only one tab panel is visible at a time", () => {
     render(<DashboardPage />);
-    // Default: flow
-    expect(screen.getByTestId("flow-table")).toBeInTheDocument();
+    // Default: Flow Events tab
+    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
     expect(screen.queryByTestId("signal-feed")).not.toBeInTheDocument();
-    // Switch
-    fireEvent.click(screen.getByText("Live Signals"));
-    expect(screen.queryByTestId("flow-table")).not.toBeInTheDocument();
+    // Switch to Live Signals
+    fireEvent.click(screen.getByRole("button", { name: /live signals/i }));
+    expect(screen.queryByTestId("flow-events-tab")).not.toBeInTheDocument();
     expect(screen.getByTestId("signal-feed")).toBeInTheDocument();
   });
 
-  test("can switch back to Flow Scanner after visiting another tab", () => {
+  test("can switch back to Flow Events after visiting another tab", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByText("Episodes"));
+    fireEvent.click(screen.getByRole("button", { name: /episodes/i }));
     expect(screen.getByTestId("flow-episodes-tab")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Flow Scanner"));
-    expect(screen.getByTestId("flow-table")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /flow events/i }));
+    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
   });
 });
 
