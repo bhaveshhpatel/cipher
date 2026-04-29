@@ -5,27 +5,23 @@ Accumulates option trade ticks per (ticker, contract_type, strike, expiry) episo
 Returns a persist-worthy episode once the threshold is crossed.
 
 Threshold logic:
-  persist_ep is returned when EITHER:
-    - trade_count >= min_trades, OR
-    - cumulative premium >= min_premium
-  whichever comes first.
+  Fires when trade_count >= min_trades AND total_premium >= min_premium.
 
-  Signal re-emission guard (2026-04-28):
-    After an episode first crosses the threshold, it only emits again when
-    total_premium has grown by at least SIGNAL_RETRIGGER_THRESHOLD ($50k) since
-    the last emission. This prevents QQQ/SPY episodes from spamming a new
-    signal_history row on every single tick once threshold is crossed.
+Signal cooldown guard (C-007):
+  After an episode first crosses the threshold it only re-emits once
+  `signal_cooldown` minutes have elapsed since the last emission.
 
 Defaults:
-  min_trades=3          — gates sub-$10k prints until 3 repeats
-  min_premium=$10,000   — single large prints fire immediately via OR
-  retrigger=$50,000     — re-signal every $50k of new premium per episode
+  min_trades=3
+  min_premium=50_000
+  signal_cooldown=5  (minutes)
 
-The OR logic means:
-  - Single print >= $10k          -> fires on tick 1 (premium OR condition)
-  - Repeated prints < $10k        -> needs 3 ticks (trade_count condition)
-  - Pure retail noise             -> < $10k AND < 3 trades = filtered
-  - Ongoing episode               -> only re-signals every +$50k, not every tick
+Alert levels:
+  >= 5_000_000                            -> CONVICTION
+  is_accelerating AND >= 1_000_000        -> CONVICTION
+  >= 1_000_000                            -> STRONG_SIGNAL
+  >= 250_000                              -> ALERT
+  else                                    -> WATCH
 """
 import asyncio
 import logging
@@ -35,24 +31,42 @@ from typing import Optional, List
 
 log = logging.getLogger("repetition_accumulator")
 
-# Re-emit a signal for an active episode only after this much new premium
-SIGNAL_RETRIGGER_THRESHOLD: float = 50_000
-
 
 @dataclass
 class RepetitionEpisode:
-    ticker:               str
-    contract_type:        str
-    strike:               float
-    expiry:               str
-    trade_count:          int      = 0
-    total_premium:        float    = 0.0
-    is_accelerating:      bool     = False
-    last_seen:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    timestamps:           list     = field(default_factory=list)
-    events:               List     = field(default_factory=list)
-    # Signal re-emission guard — tracks premium at last signal emission
-    last_signaled_premium: float   = 0.0
+    ticker:         str
+    contract_type:  str
+    strike:         float
+    expiry:         str
+    events:         List   = field(default_factory=list)
+    first_seen:     Optional[datetime] = None
+    last_seen:      Optional[datetime] = None
+    last_signal_at: Optional[datetime] = None
+
+    # ------------------------------------------------------------------ #
+    # Computed properties (derived from self.events)                       #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def trade_count(self) -> int:
+        return len(self.events)
+
+    @property
+    def total_premium(self) -> float:
+        return sum(getattr(e, "premium", 0.0) for e in self.events)
+
+    @property
+    def is_accelerating(self) -> bool:
+        """True when the last 3 events all occurred within a 60-second span."""
+        if len(self.events) < 3:
+            return False
+        last3 = self.events[-3:]
+        try:
+            ts = [e.timestamp for e in last3]
+            span = (max(ts) - min(ts)).total_seconds()
+            return span <= 60
+        except Exception:
+            return False
 
     def summary_str(self) -> str:
         return (
@@ -66,45 +80,70 @@ class RepetitionAccumulator:
     Accumulates option flow ticks into episodes.
 
     Args:
-        window_minutes:  Episode expires after this many minutes of inactivity.
-        min_trades:      Minimum ticks before episode persists (default: 3).
-        min_premium:     Minimum cumulative premium before episode persists (default: $10,000).
-        retrigger:       Minimum new premium delta before re-emitting signal (default: $50,000).
+        window_minutes:  Rolling window — events older than this are pruned.
+        min_trades:      Minimum number of ticks required.
+        min_premium:     Minimum cumulative premium required.
+        signal_cooldown: Minutes to suppress re-signals after first emission.
     """
 
     def __init__(
         self,
-        window_minutes: int   = 30,
-        min_trades:     int   = 3,
-        min_premium:    float = 10_000,
-        retrigger:      float = SIGNAL_RETRIGGER_THRESHOLD,
+        window_minutes:  int   = 30,
+        min_trades:      int   = 3,
+        min_premium:     float = 50_000,
+        signal_cooldown: int   = 0,
+        retrigger:       float = 50_000,  # kept for backward-compat, unused internally
     ):
-        self.window      = timedelta(minutes=window_minutes)
-        self.min_trades  = min_trades
-        self.min_premium = min_premium
-        self.retrigger   = retrigger
-        self._episodes: dict[str, RepetitionEpisode] = {}
-        self._lock = asyncio.Lock()
+        self.window          = timedelta(minutes=window_minutes)
+        self.min_trades      = min_trades
+        self.min_premium     = min_premium
+        self.signal_cooldown = timedelta(minutes=signal_cooldown)
 
-    def _episode_key(self, ev) -> str:
+        self._episodes: dict = {}
+        self._locks:    dict = {}
+        self._global_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------ #
+    # Key helpers                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _key(self, ev) -> str:
         return f"{ev.ticker}|{ev.contract_type}|{ev.strike:.2f}|{ev.expiry}"
+
+    # backward-compat alias used in many tests
+    def _episode_key(self, ev) -> str:
+        return self._key(ev)
+
+    def _key_from_ep(self, ep: RepetitionEpisode) -> str:
+        return f"{ep.ticker}|{ep.contract_type}|{ep.strike:.2f}|{ep.expiry}"
+
+    # ------------------------------------------------------------------ #
+    # Per-key asyncio.Lock (concurrent safety — issue #1)                 #
+    # ------------------------------------------------------------------ #
+
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    # ------------------------------------------------------------------ #
+    # Core ingest                                                          #
+    # ------------------------------------------------------------------ #
 
     async def ingest_tick(self, ev) -> Optional[RepetitionEpisode]:
         """
-        Ingest a parsed trade event.
-
-        Returns the RepetitionEpisode if:
-          1. The persist threshold has been crossed (trade_count >= min_trades
-             OR total_premium >= min_premium), AND
-          2. Either this is the first emission, OR total_premium has grown by
-             at least `retrigger` since the last emission.
+        Ingest a parsed trade event. Returns the episode once both thresholds
+        are met (trade_count >= min_trades AND total_premium >= min_premium).
+        Does NOT apply signal_cooldown — callers wanting cooldown should use
+        ingest() or get_signal().
         """
-        now = datetime.now(timezone.utc)
-        key = self._episode_key(ev)
+        key  = self._key(ev)
+        lock = self._get_lock(key)
 
-        async with self._lock:
+        async with lock:
             ep = self._episodes.get(key)
-            if ep is None or (now - ep.last_seen) > self.window:
+
+            if ep is None:
                 ep = RepetitionEpisode(
                     ticker=ev.ticker,
                     contract_type=ev.contract_type,
@@ -113,58 +152,106 @@ class RepetitionAccumulator:
                 )
                 self._episodes[key] = ep
 
-            ep.trade_count   += 1
-            ep.total_premium += getattr(ev, "premium", 0.0)
-            ep.last_seen      = now
-            ep.timestamps.append(now)
+            # Prune stale events from the rolling window
+            ev_ts = getattr(ev, "timestamp", None) or datetime.now(timezone.utc)
+            cutoff = ev_ts - self.window
+            ep.events = [e for e in ep.events if getattr(e, "timestamp", ev_ts) >= cutoff]
+
             ep.events.append(ev)
+            ep.last_seen  = ev_ts
+            if ep.first_seen is None:
+                ep.first_seen = ev_ts
 
-            # Acceleration: 2+ ticks within the last 5 minutes
-            recent_cutoff = now - timedelta(minutes=5)
-            recent = [t for t in ep.timestamps if t >= recent_cutoff]
-            ep.is_accelerating = len(recent) >= 2
-
-            # Gate 1: must cross threshold (min_trades OR min_premium)
-            threshold_crossed = (
-                ep.trade_count >= self.min_trades
-                or ep.total_premium >= self.min_premium
-            )
-            if not threshold_crossed:
+            # Evict completely empty episode after pruning (edge case)
+            if ep.trade_count == 0:
+                del self._episodes[key]
                 return None
 
-            # Gate 2: only re-emit if this is the first crossing, or
-            # at least `retrigger` new premium has accumulated since last signal
-            delta = ep.total_premium - ep.last_signaled_premium
-            if ep.last_signaled_premium == 0 or delta >= self.retrigger:
-                ep.last_signaled_premium = ep.total_premium
+            # Check thresholds
+            if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
                 return ep
 
         return None
 
-    async def get_signal(self, ts: datetime, ep: Optional[RepetitionEpisode]) -> Optional[RepetitionEpisode]:
+    async def ingest(self, ev) -> Optional[RepetitionEpisode]:
         """
-        Returns the episode for signal emission if it has meaningful size.
+        Backward-compat entry point that respects signal_cooldown.
+        Returns the episode on first threshold crossing OR after cooldown elapses.
+        """
+        ep = await self.ingest_tick(ev)
+        if ep is None:
+            return None
+        ev_ts = getattr(ev, "timestamp", None) or datetime.now(timezone.utc)
+        return await self.get_signal(ev_ts, ep)
+
+    # ------------------------------------------------------------------ #
+    # Cooldown gate (concurrent safety — issue #2)                        #
+    # ------------------------------------------------------------------ #
+
+    async def get_signal(
+        self,
+        ts: datetime,
+        ep: Optional[RepetitionEpisode],
+    ) -> Optional[RepetitionEpisode]:
+        """
+        Atomically check the cooldown and emit the episode if eligible.
+
+        Returns ep if:
+          - ep is not None
+          - no cooldown configured (signal_cooldown == 0), OR
+          - last_signal_at is None (first emission), OR
+          - enough time has elapsed since last_signal_at
         """
         if ep is None:
             return None
-        if ep.trade_count >= 1 and ep.total_premium >= self.min_premium:
-            return ep
+
+        key  = self._key_from_ep(ep)
+        lock = self._get_lock(key)
+
+        async with lock:
+            if self.signal_cooldown.total_seconds() == 0:
+                ep.last_signal_at = ts
+                return ep
+
+            if ep.last_signal_at is None:
+                ep.last_signal_at = ts
+                return ep
+
+            elapsed = (ts - ep.last_signal_at).total_seconds()
+            if elapsed >= self.signal_cooldown.total_seconds():
+                ep.last_signal_at = ts
+                return ep
+
         return None
 
+    # ------------------------------------------------------------------ #
+    # Alert level                                                          #
+    # ------------------------------------------------------------------ #
+
     def get_alert_level(self, ep: RepetitionEpisode) -> str:
-        if ep.total_premium >= 1_000_000:
+        prem = ep.total_premium
+        if prem >= 5_000_000:
             return "CONVICTION"
-        if ep.total_premium >= 500_000:
+        if ep.is_accelerating and prem >= 1_000_000:
+            return "CONVICTION"
+        if prem >= 1_000_000:
             return "STRONG_SIGNAL"
-        if ep.total_premium >= 200_000:
+        if prem >= 250_000:
             return "ALERT"
         return "WATCH"
+
+    # ------------------------------------------------------------------ #
+    # Maintenance                                                          #
+    # ------------------------------------------------------------------ #
 
     async def cleanup_expired(self) -> int:
         """Remove stale episodes. Returns count removed."""
         now = datetime.now(timezone.utc)
-        async with self._lock:
-            expired = [k for k, ep in self._episodes.items() if (now - ep.last_seen) > self.window]
+        async with self._global_lock:
+            expired = [
+                k for k, ep in self._episodes.items()
+                if ep.last_seen and (now - ep.last_seen) > self.window
+            ]
             for k in expired:
                 del self._episodes[k]
         return len(expired)
