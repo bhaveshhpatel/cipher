@@ -180,7 +180,8 @@ describe("Tab switching", () => {
 
   test("clicking Composite renders CompositeCard", () => {
     render(<DashboardPage />);
-    fireEvent.click(screen.getByRole("button", { name: /^composite$/i }));
+    // Tab buttons include icon prefixes (e.g. "◈ Composite"), so avoid strict ^composite$ anchors
+    fireEvent.click(screen.getByRole("button", { name: /composite/i }));
     expect(screen.getByTestId("composite-card")).toBeInTheDocument();
   });
 
