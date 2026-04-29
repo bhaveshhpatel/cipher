@@ -39,6 +39,13 @@ log = logging.getLogger("repetition_accumulator")
 SIGNAL_RETRIGGER_THRESHOLD: float = 50_000
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Ensure a datetime is UTC-aware. Attaches UTC if naive (treats as UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 @dataclass
 class RepetitionEpisode:
     ticker:               str
@@ -91,21 +98,23 @@ class RepetitionEpisode:
 
     @property
     def is_accelerating(self) -> bool:
-        """Recomputes from timestamps so directly-constructed episodes work."""
+        """Recomputes from timestamps so directly-constructed episodes work.
+
+        Normalises all timestamps to UTC-aware before comparison so that
+        tests using datetime.utcnow() (naive) don't crash with TypeError.
+        """
         if self._is_accelerating:
             return True
-        if len(self.timestamps) >= 2:
-            now = datetime.now(timezone.utc)
-            cutoff = now - timedelta(minutes=5)
-            recent = [t for t in self.timestamps if t >= cutoff]
-            return len(recent) >= 2
-        # Fall back to event timestamps if available
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=5)
+        if len(self.timestamps) >= 2:
+            recent = [t for t in self.timestamps if _to_utc(t) >= cutoff]
+            return len(recent) >= 2
+        # Fall back to event timestamps if available
         recent = 0
         for ev in self.events:
             ts = getattr(ev, "timestamp", None) or getattr(ev, "ts", None)
-            if ts is not None and ts >= cutoff:
+            if ts is not None and _to_utc(ts) >= cutoff:
                 recent += 1
         return recent >= 2
 
@@ -155,7 +164,11 @@ class RepetitionAccumulator:
     def _key(self, ev) -> str:
         return self._episode_key(ev)
 
-    async def ingest_tick(self, ev) -> Optional[RepetitionEpisode]:
+    def _key_from_ep(self, ep: "RepetitionEpisode") -> str:
+        """Derive the episode dict key from a RepetitionEpisode object."""
+        return f"{ep.ticker}|{ep.contract_type}|{ep.strike:.2f}|{ep.expiry}"
+
+    async def ingest_tick(self, ev) -> Optional["RepetitionEpisode"]:
         """
         Ingest a parsed trade event.
 
@@ -170,7 +183,7 @@ class RepetitionAccumulator:
 
         async with self._lock:
             ep = self._episodes.get(key)
-            if ep is None or (now - ep.last_seen) > self.window:
+            if ep is None or (now - _to_utc(ep.last_seen)) > self.window:
                 ep = RepetitionEpisode(
                     ticker=ev.ticker,
                     contract_type=ev.contract_type,
@@ -187,7 +200,7 @@ class RepetitionAccumulator:
 
             # Acceleration: 2+ ticks within the last 5 minutes
             recent_cutoff = now - timedelta(minutes=5)
-            recent = [t for t in ep.timestamps if t >= recent_cutoff]
+            recent = [t for t in ep.timestamps if _to_utc(t) >= recent_cutoff]
             ep._is_accelerating = len(recent) >= 2
 
             # Gate 1: must cross threshold (min_trades OR min_premium)
@@ -208,10 +221,10 @@ class RepetitionAccumulator:
         return None
 
     # Alias: tests call acc.ingest(ev)
-    async def ingest(self, ev) -> Optional[RepetitionEpisode]:
+    async def ingest(self, ev) -> Optional["RepetitionEpisode"]:
         return await self.ingest_tick(ev)
 
-    async def get_signal(self, ts: datetime, ep: Optional[RepetitionEpisode]) -> Optional[RepetitionEpisode]:
+    async def get_signal(self, ts: datetime, ep: Optional["RepetitionEpisode"]) -> Optional["RepetitionEpisode"]:
         """
         Returns the episode for signal emission if it has meaningful size.
         """
@@ -221,7 +234,7 @@ class RepetitionAccumulator:
             return ep
         return None
 
-    def get_alert_level(self, ep: RepetitionEpisode) -> str:
+    def get_alert_level(self, ep: "RepetitionEpisode") -> str:
         prem = ep.total_premium
         if prem >= 1_000_000:
             return "CONVICTION"
@@ -235,7 +248,8 @@ class RepetitionAccumulator:
         """Remove stale episodes. Returns count removed."""
         now = datetime.now(timezone.utc)
         async with self._lock:
-            expired = [k for k, ep in self._episodes.items() if (now - ep.last_seen) > self.window]
+            expired = [k for k, ep in self._episodes.items()
+                       if (now - _to_utc(ep.last_seen)) > self.window]
             for k in expired:
                 del self._episodes[k]
         return len(expired)

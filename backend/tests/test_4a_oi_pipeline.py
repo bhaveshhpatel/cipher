@@ -224,13 +224,15 @@ class TestStampOi:
 class TestOiDrivenTierIntegration:
     @pytest.mark.asyncio
     async def test_oi_drives_t1_demotion_to_t3(self):
+        """
+        OI=0 must demote AAPL from T1 to T3.
+        Pass thresholds explicitly so assign_tiers uses require_oi=True.
+        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
         quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000)]
         _stamp_oi(quotes, {"AAPL": 0})
-        with patch("services.tier_engine._fetch_thresholds",
-                   new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+        tiers = await assign_tiers(quotes, thresholds=_make_thresh())
         assert tiers["AAPL"] == 3
 
     @pytest.mark.asyncio
@@ -239,9 +241,7 @@ class TestOiDrivenTierIntegration:
         from main import _stamp_oi
         quotes = [_Quote("AAPL", last_price=180.0, average_volume=30_000_000)]
         _stamp_oi(quotes, {"AAPL": 2000})
-        with patch("services.tier_engine._fetch_thresholds",
-                   new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+        tiers = await assign_tiers(quotes, thresholds=_make_thresh())
         assert tiers["AAPL"] == 1
 
     @pytest.mark.asyncio
@@ -254,24 +254,25 @@ class TestOiDrivenTierIntegration:
             _Quote("SPCE", last_price=2.0,   average_volume=200_000),
         ]
         _stamp_oi(quotes, {"SPY": 5_000, "HOOD": 600, "SPCE": 50})
-        with patch("services.tier_engine._fetch_thresholds",
-                   new=AsyncMock(return_value=_make_thresh())):
-            tiers = await assign_tiers(quotes)
+        tiers = await assign_tiers(quotes, thresholds=_make_thresh())
         assert tiers["SPY"] == 1
         assert tiers["HOOD"] == 2
         assert tiers["SPCE"] == 3
 
     @pytest.mark.asyncio
     async def test_preliminary_vs_final_tier_diff(self):
+        """
+        Preliminary call (no thresholds, require_oi=True explicitly) with OI=0
+        should give T3. After stamping OI=3000, final call gives T1.
+        """
         from services.tier_engine import assign_tiers
         from main import _stamp_oi
         quotes = [_Quote("NVDA", last_price=900.0, average_volume=25_000_000)]
-        with patch("services.tier_engine._fetch_thresholds",
-                   new=AsyncMock(return_value=_make_thresh())):
-            prelim_tiers = await assign_tiers(quotes)
+        # Preliminary: NVDA has no OI yet (default=0), enforce OI gate
+        prelim_tiers = await assign_tiers(quotes, require_oi=True,
+                                          thresholds=_make_thresh())
+        # Final: stamp real OI and reclassify
         _stamp_oi(quotes, {"NVDA": 3_000})
-        with patch("services.tier_engine._fetch_thresholds",
-                   new=AsyncMock(return_value=_make_thresh())):
-            final_tiers = await assign_tiers(quotes)
+        final_tiers = await assign_tiers(quotes, thresholds=_make_thresh())
         assert prelim_tiers["NVDA"] == 3
         assert final_tiers["NVDA"]  == 1

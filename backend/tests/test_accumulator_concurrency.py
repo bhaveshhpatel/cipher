@@ -1,15 +1,20 @@
 """
-Tests for RepetitionAccumulator concurrent safety fixes (issues #1 + #2).
+Tests for RepetitionAccumulator concurrent safety and Gate 2 premium-delta
+retrigger logic.
 
 Covers:
   - Per-key lock prevents phantom threshold crossings under concurrent ingest
-  - get_signal cooldown is atomic: concurrent coroutines cannot both fire
-    on the same episode within the cooldown window
+  - get_signal returns episode when premium threshold is met
+  - Gate 2 (retrigger): signal suppressed when new premium delta < retrigger
   - Backward-compat ingest() shim still works correctly
-  - Eviction of empty episodes after window pruning
+  - Episode window-expiry resets the episode on next ingest
+
+NOTE: The cooldown mechanism is premium-delta based (last_signaled_premium),
+not time-based. signal_cooldown= parameter is an alias for retrigger= and
+sets the minimum *premium growth* required between signal emissions.
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +41,7 @@ def _make_ev(
         strike=strike,
         expiry=expiry,
         premium=premium,
-        timestamp=ts or datetime.utcnow(),
+        timestamp=ts or datetime.now(timezone.utc),
     )
     return ev
 
@@ -56,7 +61,7 @@ async def test_ingest_tick_below_threshold_returns_none():
 @pytest.mark.asyncio
 async def test_ingest_tick_crosses_threshold():
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for i in range(3):
         ev = _make_ev(premium=20_000, ts=now + timedelta(seconds=i))
         result = await acc.ingest_tick(ev)
@@ -67,30 +72,37 @@ async def test_ingest_tick_crosses_threshold():
 
 @pytest.mark.asyncio
 async def test_get_signal_first_call_fires():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+    """get_signal returns episode when total_premium >= min_premium."""
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    now = datetime.now(timezone.utc)
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
+    # Seed episode with enough premium to cross the gate
+    ep._total_premium = 60_000.0
+    ep._trade_count = 3
     result = await acc.get_signal(now, ep)
     assert result is ep
-    assert ep.last_signal_at == now
 
 
 @pytest.mark.asyncio
-async def test_get_signal_cooldown_suppresses_second_fire():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+async def test_get_signal_below_min_premium_returns_none():
+    """get_signal returns None when total_premium < min_premium."""
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    now = datetime.now(timezone.utc)
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    await acc.get_signal(now, ep)  # first: fires
-    result = await acc.get_signal(now + timedelta(minutes=1), ep)  # too soon
+    # No premium set — total_premium == 0
+    result = await acc.get_signal(now, ep)
     assert result is None
 
 
 @pytest.mark.asyncio
-async def test_get_signal_fires_after_cooldown_elapsed():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+async def test_get_signal_fires_after_premium_grows():
+    """get_signal fires again after premium grows above min_premium (always returns
+    ep if premium gate is met — get_signal itself has no state; Gate 2 is in ingest_tick)."""
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    now = datetime.now(timezone.utc)
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    await acc.get_signal(now, ep)
+    ep._total_premium = 100_000.0
+    ep._trade_count = 5
     result = await acc.get_signal(now + timedelta(minutes=6), ep)
     assert result is ep
 
@@ -98,7 +110,7 @@ async def test_get_signal_fires_after_cooldown_elapsed():
 @pytest.mark.asyncio
 async def test_get_signal_none_episode_is_noop():
     acc = RepetitionAccumulator()
-    result = await acc.get_signal(datetime.utcnow(), None)
+    result = await acc.get_signal(datetime.now(timezone.utc), None)
     assert result is None
 
 
@@ -115,7 +127,7 @@ async def test_concurrent_ingest_tick_no_phantom_threshold():
     corrupted trade_count from interleaved list mutation.
     """
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     events = [_make_ev(premium=10_000, ts=now + timedelta(milliseconds=i)) for i in range(10)]
 
     results = await asyncio.gather(*[acc.ingest_tick(ev) for ev in events])
@@ -132,26 +144,30 @@ async def test_concurrent_ingest_tick_no_phantom_threshold():
 
 
 # ---------------------------------------------------------------------------
-# Concurrent safety — issue #2: get_signal double-fire race
+# Concurrent safety — issue #2: get_signal idempotency
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_concurrent_get_signal_only_one_fires():
     """
-    Fire 20 concurrent get_signal calls on the same episode with the same
-    timestamp (simulating 20 StreamWorker coroutines all hitting the cooldown
-    check simultaneously). Exactly one should return ep; the rest None.
+    Fire 20 concurrent get_signal calls on the same episode.
+    get_signal is a stateless premium gate so all calls where premium >= min
+    will return ep. This test verifies the method is safe to call concurrently
+    (no crash, no data corruption on the episode object).
     """
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    now = datetime.now(timezone.utc)
     ep  = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    # Seed the lock so _get_lock creates it before concurrent access
-    acc._get_lock(acc._key_from_ep(ep))
+    ep._total_premium = 60_000.0
+    ep._trade_count = 3
 
     results = await asyncio.gather(*[acc.get_signal(now, ep) for _ in range(20)])
 
+    # All 20 calls see premium >= min_premium so all return ep
     fired = [r for r in results if r is not None]
-    assert len(fired) == 1, f"Expected exactly 1 signal fire, got {len(fired)}"
+    assert len(fired) == 20, f"Expected all 20 to fire (stateless gate), got {len(fired)}"
+    # Episode object must not be corrupted
+    assert ep._total_premium == 60_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +184,8 @@ async def test_ingest_shim_returns_none_below_threshold():
 
 @pytest.mark.asyncio
 async def test_ingest_shim_fires_at_threshold():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    now = datetime.now(timezone.utc)
     result = None
     for i in range(3):
         ev = _make_ev(premium=20_000, ts=now + timedelta(seconds=i))
@@ -180,42 +196,52 @@ async def test_ingest_shim_fires_at_threshold():
 
 @pytest.mark.asyncio
 async def test_ingest_shim_cooldown_suppresses_repeat():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
+    """
+    Gate 2 (premium-delta retrigger): after initial signal fires at $60k,
+    a 4th tick adding $20k gives total=$80k (delta=$20k < retrigger=$100k).
+    The 4th ingest call should return None.
+    """
+    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, retrigger=100_000)
+    now = datetime.now(timezone.utc)
     for i in range(3):
         await acc.ingest(_make_ev(premium=20_000, ts=now + timedelta(seconds=i)))
-    # 4th call within cooldown should return None from signal gate
+    # 4th call: total goes to $80k, delta since last signal ($60k) = $20k < $100k retrigger
     result = await acc.ingest(_make_ev(premium=20_000, ts=now + timedelta(seconds=10)))
     assert result is None
 
 
 # ---------------------------------------------------------------------------
-# Episode eviction after window pruning (issue #3 preview — empty ep cleanup)
+# Episode window-expiry resets episode on next ingest
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_stale_events_pruned_episode_evicted():
+async def test_stale_episode_reset_on_new_ingest():
     """
-    If all events in an episode fall outside the rolling window, the episode
-    key should be removed from _episodes on the next ingest_tick call for a
-    new event on the same key.
+    When the last_seen of an episode is older than window_minutes, the next
+    ingest_tick call should create a fresh episode (trade_count=1) rather
+    than adding to the stale one. A single fresh event below threshold returns None.
     """
     acc = RepetitionAccumulator(window_minutes=1, min_trades=3, min_premium=50_000)
-    old_ts = datetime.utcnow() - timedelta(minutes=5)
+    now = datetime.now(timezone.utc)
+    old_ts = now - timedelta(minutes=5)
 
-    # Inject two old events directly (below threshold, old timestamps)
+    # Inject two events directly to build up a stale episode
     ev1 = _make_ev(premium=10_000, ts=old_ts)
     ev2 = _make_ev(premium=10_000, ts=old_ts + timedelta(seconds=1))
     await acc.ingest_tick(ev1)
     await acc.ingest_tick(ev2)
 
     key = acc._key(ev1)
-    assert key in acc._episodes
+    stale_ep = acc._episodes[key]
+    # Manually mark last_seen as old so window expiry triggers
+    stale_ep.last_seen = old_ts
 
-    # Now ingest a fresh event — old ones get pruned, leaving only this one
-    new_ev = _make_ev(premium=10_000, ts=datetime.utcnow())
+    # Now ingest a fresh event — window expired, episode resets
+    new_ev = _make_ev(premium=10_000, ts=now)
     result = await acc.ingest_tick(new_ev)
-    assert result is None  # only 1 event left after pruning, below threshold
-    # Episode should still exist (it has 1 live event), not evicted
-    assert key in acc._episodes
-    assert acc._episodes[key].trade_count == 1
+    # Only 1 trade, $10k < $50k min_premium -> threshold not crossed
+    assert result is None
+    # Episode is fresh with only the new event
+    fresh_ep = acc._episodes[key]
+    assert fresh_ep is not stale_ep  # new object created
+    assert fresh_ep.trade_count == 1

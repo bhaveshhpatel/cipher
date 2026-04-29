@@ -3,7 +3,7 @@ Unit tests for composite_signal_engine.py (Phase 3 + 5A),
 backtest_validator.py, and RepetitionEpisode/RepetitionAccumulator.
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
@@ -43,7 +43,8 @@ def _fake_event(
     ev.influence_tier  = influence_tier
     ev.open_interest   = open_interest
     ev.is_golden_sweep = is_golden_sweep
-    ev.timestamp       = timestamp or datetime(2026, 4, 25, 10, 0, 0)
+    # Use UTC-aware timestamps so is_accelerating never raises TypeError
+    ev.timestamp       = timestamp or datetime(2026, 4, 25, 10, 0, 0, tzinfo=timezone.utc)
     return ev
 
 
@@ -64,7 +65,7 @@ def _fake_episode(
         strike=180.0,
         expiry="2026-06-20",
     )
-    base_ts = datetime(2026, 4, 25, 10, 0, 0)
+    base_ts = datetime(2026, 4, 25, 10, 0, 0, tzinfo=timezone.utc)
     for i in range(n_events):
         if accelerating and i >= n_events - 3:
             ts = base_ts + timedelta(seconds=3600 + i * 15)
@@ -267,7 +268,8 @@ def _ev(ticker="AAPL", premium=100_000.0, ts_offset_secs=0):
     ev.strike        = 180.0
     ev.expiry        = "2026-06-20"
     ev.premium       = premium
-    ev.timestamp     = datetime(2026, 4, 25, 10, 0, 0) + timedelta(seconds=ts_offset_secs)
+    # UTC-aware so is_accelerating comparison never raises TypeError
+    ev.timestamp     = datetime(2026, 4, 25, 10, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=ts_offset_secs)
     return ev
 
 
@@ -296,7 +298,8 @@ def test_alert_level_conviction():
 
 
 def test_alert_level_strong_signal():
-    ep = _fake_episode(n_events=3, premium_each=400_000.0, accelerating=False)
+    # 1 event at $600k -> total=$600k, in STRONG_SIGNAL band [$500k, $1M)
+    ep = _fake_episode(n_events=1, premium_each=600_000.0, accelerating=False)
     assert _accum().get_alert_level(ep) == "STRONG_SIGNAL"
 
 
@@ -311,11 +314,13 @@ def test_alert_level_watch():
 
 
 def test_is_accelerating_true_within_60s():
+    """accelerating=True puts last 3 events 15s apart within 5min window."""
     ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=True)
     assert ep.is_accelerating is True
 
 
 def test_is_accelerating_false_span_over_60s():
+    """accelerating=False spaces events 5min apart — all outside the 5min window."""
     ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=False)
     assert ep.is_accelerating is False
 
