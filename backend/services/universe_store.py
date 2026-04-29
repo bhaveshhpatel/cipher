@@ -77,6 +77,23 @@ FIX DEDUP (2026-04-28):
     - No active snapshot exists, OR
     - Active snapshot is >=24h old, OR
     - Symbol count drifted >10% (major universe change)
+
+FIX DEDUP-2 (2026-04-29):
+  _SNAPSHOT_REUSE_DRIFT_PCT raised from 0.10 → 0.30 and _KEEP_SNAPSHOTS
+  reduced from 7 → 3.
+
+  Root cause: natural CBOE universe variation of 10-15% per restart
+  (observed: 3762 → 4259 → 4336 symbols across restarts on 2026-04-29)
+  exceeded the 10% guard on nearly every restart. Each restart created a
+  fresh uuid4() snapshot_id, making on_conflict=(snapshot_id,symbol) a
+  no-op (always new key = always INSERT). With keep=7 the prune gate only
+  fired after 8+ snapshots, so 6 duplicate rows for every symbol accumulated
+  in options_universe_symbols (6 AAPL rows confirmed in production).
+
+  Fix:
+    - 30% drift threshold comfortably absorbs daily CBOE universe swings
+    - keep=3 means at most 3 snapshots can accumulate before hard pruning
+  DB cleaned: all 6 inactive snapshots + their symbol rows deleted.
 """
 import asyncio
 import logging
@@ -92,12 +109,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("universe_store")
 
-_KEEP_SNAPSHOTS  = 7
+_KEEP_SNAPSHOTS  = 3    # reduced from 7 — prune fires sooner as safety net
 _DEFAULT_MAX_AGE = 24   # hours
 _UPSERT_BATCH    = 500  # rows per upsert batch
 _PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
-# DEDUP fix: reuse existing snapshot if symbol count changed by less than this
-_SNAPSHOT_REUSE_DRIFT_PCT = 0.10  # 10%
+# DEDUP-2 fix: bumped from 0.10 → 0.30 to absorb natural CBOE universe variation
+_SNAPSHOT_REUSE_DRIFT_PCT = 0.30  # 30%
 _SNAPSHOT_REUSE_MAX_AGE_H = 24    # hours — only reuse snapshots younger than this
 
 
@@ -424,11 +441,11 @@ def _sync_save_snapshot(
 
     DEDUP FIX (2026-04-28):
       Before generating a new snapshot_id, check whether the current active
-      snapshot is recent (<24h) and has a similar symbol count (<10% drift).
+      snapshot is recent (<24h) and has a similar symbol count (<30% drift).
       If so, reuse its snapshot_id and upsert into it — on_conflict fires
       correctly and no new rows are created.
       New snapshots are only created when: no active snapshot, >24h old,
-      or symbol count drifted >10%.
+      or symbol count drifted >30%.
 
     1. Determine snapshot_id (reuse or new uuid4)
     2. Insert snapshot header only if creating a new snapshot

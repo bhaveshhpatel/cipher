@@ -16,6 +16,8 @@ Updated 2026-04-28 (DEDUP): _sync_save_snapshot now calls
 Updated 2026-04-28 (RC-1): only stream_eligible symbols are written to DB.
   test_stream_eligible_true_when_in_eligible_set now asserts that non-eligible
   symbols are absent from the batch (not that they have stream_eligible=False).
+Updated 2026-04-29 (DEDUP-2): _SNAPSHOT_REUSE_DRIFT_PCT bumped to 0.30, _KEEP_SNAPSHOTS=3.
+  Added TestSnapshotDeduplicationDriftThreshold regression suite.
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -246,6 +248,9 @@ class TestSaveSnapshot:
         assert len(delete_calls) >= 1
 
     def test_no_prune_when_within_limit(self):
+        """
+        _KEEP_SNAPSHOTS=3: prune select returns 3 rows → 3 <= 3 → no delete.
+        """
         sb, query = _make_sb_mock()
         existing  = [{"id": f"snap-{i}"} for i in range(3)]
         query.execute.side_effect = [
@@ -399,3 +404,119 @@ class TestUpsertSymbolQuotesOi:
         assert "tier"           in row
         assert row["open_interest"] == 1_500
         assert row["tier"]          == 1
+
+
+# ---------------------------------------------------------------------------
+# Snapshot deduplication drift threshold — DEDUP-2 regression
+# ---------------------------------------------------------------------------
+class TestSnapshotDeduplicationDriftThreshold:
+    """
+    Regression suite for DEDUP-2 fix (2026-04-29).
+
+    Root cause: _SNAPSHOT_REUSE_DRIFT_PCT=0.10 was too tight. Natural CBOE
+    universe variation of 10-15% per restart (e.g. 3762 → 4259 → 4336 in one
+    day) caused a new uuid4() snapshot on every restart, making
+    on_conflict=(snapshot_id,symbol) a no-op → always INSERT → 6 duplicate
+    AAPL rows accumulated in options_universe_symbols across 6 restarts.
+
+    Fix: threshold raised to 0.30 (30%). These tests pin that behaviour.
+    """
+
+    def test_reuses_snapshot_when_drift_within_30pct(self):
+        """
+        Existing count=1000, new count=1200 → 20% drift < 30% → reuse,
+        no INSERT on options_universe_snapshots.
+        """
+        sb, query = _make_sb_mock()
+        recent = datetime.now(timezone.utc).isoformat()
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": "existing-snap", "symbol_count": 1000, "fetched_at": recent}]),
+            MagicMock(data=[]),   # upsert symbol batch
+            MagicMock(data=[{"id": "existing-snap"}]),  # prune select (1 ≤ 3)
+        ]
+        symbols = [f"SYM{i}" for i in range(1200)]
+        with patch("services.universe_store._client", return_value=sb):
+            result = universe_store._sync_save_snapshot(symbols, "tradier_validated", None)
+        assert result is True
+        assert query.insert.call_count == 0, (
+            "Must NOT create a new snapshot when drift=20% is within 30% threshold"
+        )
+
+    def test_creates_new_snapshot_when_drift_exceeds_30pct(self):
+        """
+        Existing count=1000, new count=1400 → 40% drift > 30% → new snapshot,
+        INSERT fires once.
+        """
+        sb, query = _make_sb_mock()
+        recent = datetime.now(timezone.utc).isoformat()
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": "old-snap", "symbol_count": 1000, "fetched_at": recent}]),
+            MagicMock(data=[]),   # insert new snapshot header
+            MagicMock(data=[]),   # deactivate old
+            MagicMock(data=[]),   # upsert symbol batch
+            MagicMock(data=[{"id": "old-snap"}, {"id": "snap-new"}]),  # prune select (2 ≤ 3)
+        ]
+        symbols = [f"SYM{i}" for i in range(1400)]
+        with patch("services.universe_store._client", return_value=sb):
+            result = universe_store._sync_save_snapshot(symbols, "tradier_validated", None)
+        assert result is True
+        assert query.insert.call_count == 1, (
+            "Must create a new snapshot when drift=40% exceeds 30% threshold"
+        )
+
+    def test_no_new_snapshot_on_typical_daily_drift(self):
+        """
+        Existing count=4000, new count=4250 → 6.25% drift — mirrors the
+        production pattern that caused 6 duplicate AAPL rows. Must reuse.
+        """
+        sb, query = _make_sb_mock()
+        recent = datetime.now(timezone.utc).isoformat()
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": "prod-snap", "symbol_count": 4000, "fetched_at": recent}]),
+            MagicMock(data=[]),   # upsert symbol batch
+            MagicMock(data=[{"id": "prod-snap"}]),  # prune select (1 ≤ 3)
+        ]
+        symbols = [f"SYM{i}" for i in range(4250)]
+        with patch("services.universe_store._client", return_value=sb):
+            result = universe_store._sync_save_snapshot(symbols, "tradier_validated", None)
+        assert result is True
+        assert query.insert.call_count == 0, (
+            "Must NOT create a new snapshot for a 6.25% drift — this is the "
+            "exact production pattern that caused duplicate rows"
+        )
+
+    def test_creates_new_snapshot_when_no_active_exists(self):
+        """Cold start: no active snapshot → always creates new one."""
+        sb, query = _make_sb_mock()
+        query.execute.side_effect = [
+            MagicMock(data=[]),   # reuse check → no active snapshot
+            MagicMock(data=[]),   # insert
+            MagicMock(data=[]),   # deactivate
+            MagicMock(data=[]),   # upsert
+            MagicMock(data=[{"id": "brand-new"}]),  # prune select
+        ]
+        with patch("services.universe_store._client", return_value=sb):
+            result = universe_store._sync_save_snapshot(["AAPL", "TSLA"], "tradier_validated", None)
+        assert result is True
+        assert query.insert.call_count == 1
+
+    def test_creates_new_snapshot_when_existing_symbol_count_is_zero(self):
+        """
+        Active snapshot exists but symbol_count=0 (e.g. corrupted row) →
+        should not reuse (division by zero guard), must create new snapshot.
+        """
+        sb, query = _make_sb_mock()
+        recent = datetime.now(timezone.utc).isoformat()
+        query.execute.side_effect = [
+            MagicMock(data=[{"id": "bad-snap", "symbol_count": 0, "fetched_at": recent}]),
+            MagicMock(data=[]),   # insert
+            MagicMock(data=[]),   # deactivate
+            MagicMock(data=[]),   # upsert
+            MagicMock(data=[{"id": "bad-snap"}, {"id": "new-snap"}]),  # prune select
+        ]
+        with patch("services.universe_store._client", return_value=sb):
+            result = universe_store._sync_save_snapshot(["AAPL"], "tradier_validated", None)
+        assert result is True
+        assert query.insert.call_count == 1, (
+            "Must create new snapshot when existing symbol_count=0 (division-by-zero guard)"
+        )
