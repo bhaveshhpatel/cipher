@@ -589,7 +589,6 @@ async def test_persist_flow_event_not_configured_drops_event():
     import services.flow_store as fs
     with patch("services.flow_store._SUPABASE_URL", None), \
          patch("services.flow_store._SUPABASE_KEY", None):
-        # Should not raise
         await fs.persist_flow_event({"ticker": "AAPL"})
 
 
@@ -612,9 +611,7 @@ async def test_persist_flow_event_adds_to_buffer():
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"):
         await fs.persist_flow_event(ev)
-    # Buffer should have grown
     assert len(fs._flow_event_buffer) > len(orig_buffer)
-    # Clean up
     fs._flow_event_buffer.clear()
 
 
@@ -633,22 +630,19 @@ async def test_persist_flow_event_early_flush_on_max_rows():
         "iv": 0.22, "underlying_price": 442.0, "occ_symbol": "SPY240517P00440000",
         "is_synthetic_quote": False,
     }
-    # Pre-fill buffer to just below max
     fs._flow_event_buffer = [{"ticker": "DUMMY"}] * (fs._FLUSH_MAX_ROWS - 1)
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
          patch("services.flow_store._insert_rows_with_retry", new_callable=AsyncMock, return_value=True):
         await fs.persist_flow_event(ev)
-    # Buffer should have been flushed
     assert len(fs._flow_event_buffer) < fs._FLUSH_MAX_ROWS
     fs._flow_event_buffer.clear()
 
 
 @pytest.mark.asyncio
 async def test_persist_flow_event_warns_on_zero_strike():
-    """strike=0.0 triggers a warning log but does not crash."""
+    """strike=0.0 does not crash persist_flow_event."""
     import services.flow_store as fs
-    import logging
     ev = {
         "ticker": "TSLA", "contract_type": "CALL", "strike": 0.0,
         "expiry": "2026-06-20", "dte": 30, "fill_price": 1.0,
@@ -662,7 +656,7 @@ async def test_persist_flow_event_warns_on_zero_strike():
     }
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"):
-        await fs.persist_flow_event(ev)  # must not raise
+        await fs.persist_flow_event(ev)
     fs._flow_event_buffer.clear()
 
 
@@ -693,8 +687,8 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
         "data": {
             "signal": {
                 "ticker": "AAPL",
-                "recommendation": "BUY",      # old wrong field
-                "alert_level": "CONVICTION",  # correct field
+                "recommendation": "BUY",
+                "alert_level": "CONVICTION",
                 "reasoning": "3 sweeps above $1M",
             },
             "episode": {
@@ -708,16 +702,13 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
         },
     }
 
-    # Patch persist_flow_episode and bus so we control the message
     test_bus = AsyncBus()
-    q = test_bus.subscribe("test_listener")
+    test_bus.subscribe("test_listener")  # subscribe without capturing queue
 
     with patch("services.flow_store.persist_flow_episode", side_effect=fake_persist), \
          patch("services.flow_store.bus", test_bus):
-        # Start listener in background
         listener_task = asyncio.create_task(fs._bus_signal_listener())
         await asyncio.sleep(0.05)
-        # Publish the composite_signal
         await test_bus.publish_all(composite_msg)
         await asyncio.sleep(0.1)
         listener_task.cancel()
@@ -728,7 +719,6 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
 
     assert len(captured_episodes) == 1
     ep = captured_episodes[0]
-    # KEY ASSERTION: must be 'CONVICTION', not 'BUY'
     assert ep["alert_level"] == "CONVICTION", (
         f"ALERT-LEVEL bug still present: alert_level={ep['alert_level']!r} "
         "(expected 'CONVICTION', got recommendation value)"
@@ -752,11 +742,8 @@ async def test_bus_signal_listener_ignores_non_composite_message():
         captured_episodes.append(signal_data)
 
     non_composite_msg = {
-        "type": "signal",  # raw signal — should be ignored by db_writer
-        "data": {
-            "ticker": "TSLA",
-            "recommendation": "SELL",
-        },
+        "type": "signal",
+        "data": {"ticker": "TSLA", "recommendation": "SELL"},
     }
 
     test_bus = AsyncBus()
@@ -810,16 +797,12 @@ def test_dedup_cache_is_duplicate_accepts_positional_occ_symbol():
     """
     DEDUP-KWARGS regression: DedupCache.is_duplicate() first param must
     accept a positional call (not keyword 'occ_symbol=...').
-    Passing as keyword should raise TypeError (proves the param name changed
-    or the call-site fix is correct).
     """
     from utils.dedup import DedupCache
     import inspect
     sig = inspect.signature(DedupCache.is_duplicate)
     params = list(sig.parameters.keys())
-    # First real param (after self) is the occ_symbol / event_or_occ_symbol
     first_param = params[1]  # params[0] = 'self'
-    # Confirm it can be called positionally (no keyword-only marker)
     param_kind = sig.parameters[first_param].kind
     assert param_kind in (
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -835,7 +818,6 @@ def test_dedup_cache_positional_call_does_not_raise():
     from utils.dedup import DedupCache
     cache = DedupCache()
     try:
-        # Positional call — the fix from DEDUP-KWARGS
         cache.is_duplicate("AAPL240620C00180000", size=100, fill_price=2.35, exchange="CBOE")
     except TypeError as e:
         pytest.fail(f"DEDUP-KWARGS bug: positional call raised TypeError: {e}")
@@ -876,14 +858,11 @@ def test_sweep_upgrade_dispatched_evicts_stale_keys():
     import time
     TTL = 1800.0
     dispatched: dict = {}
-    # Add a stale key (2 hours old)
     stale_key = "AAPL240620C00180000|100|2.35"
     dispatched[stale_key] = time.time() - 7200.0
-    # Add a fresh key
     fresh_key = "SPY240620P00440000|50|1.10"
     dispatched[fresh_key] = time.time() - 60.0
 
-    # Eviction logic (mirrors H4 fix)
     now = time.time()
     stale = [k for k, ts_val in dispatched.items() if now - ts_val > TTL]
     for k in stale:
@@ -911,8 +890,7 @@ def test_repetition_accumulator_has_last_signaled_premium():
             direction="BULLISH",
         )
         assert hasattr(ep, "last_signaled_premium"), (
-            "Gate-2 bug: RepetitionEpisode missing 'last_signaled_premium' field. "
-            "Gate-2 retrigger will not function."
+            "Gate-2 bug: RepetitionEpisode missing 'last_signaled_premium' field."
         )
         assert ep.last_signaled_premium == 0.0, (
             f"Expected initial last_signaled_premium=0.0, got {ep.last_signaled_premium}"
@@ -927,10 +905,9 @@ def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
     should NOT cause re-emission (ingest_tick returns None).
     """
     try:
-        from signals.repetition_accumulator import RepetitionAccumulator, RepetitionEpisode
+        from signals.repetition_accumulator import RepetitionAccumulator
         acc = RepetitionAccumulator()
 
-        # Prime episode past Gate 1 (trade_count >= 3)
         base_tick = {
             "occ_symbol": "AAPL240620C00180000",
             "ticker": "AAPL",
@@ -945,18 +922,13 @@ def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
 
         results = []
         for i in range(5):
-            tick = {**base_tick, "premium": 15_000.0}
-            result = acc.ingest_tick(tick)
+            result = acc.ingest_tick({**base_tick, "premium": 15_000.0})
             results.append(result)
 
-        # After first emission (last_signaled_premium set), a tiny tick should be blocked
-        small_tick = {**base_tick, "premium": 100.0}  # well below $50k delta
+        small_tick = {**base_tick, "premium": 100.0}
         result = acc.ingest_tick(small_tick)
-        # If Gate-2 is working, this should be None (blocked)
-        # We only assert if we got at least one non-None (Gate 1 crossed)
         first_emission = next((r for r in results if r is not None), None)
         if first_emission is not None:
-            # Gate-2 should block tiny ticks after first emission
             assert result is None, (
                 "Gate-2 bug: tiny tick ($100 premium) caused re-emission "
                 "despite delta < $50k threshold"
@@ -986,7 +958,6 @@ def test_gate2_retrigger_fires_on_large_delta():
             "exchange": "CBOE",
         }
 
-        # Get past Gate 1
         first_ep = None
         for _ in range(5):
             r = acc.ingest_tick(base_tick)
@@ -996,7 +967,6 @@ def test_gate2_retrigger_fires_on_large_delta():
         if first_ep is None:
             pytest.skip("Gate 1 not crossed — cannot test Gate-2 retrigger")
 
-        # Now send a large tick that pushes delta >= $50k
         large_tick = {**base_tick, "premium": 60_000.0}
         result = acc.ingest_tick(large_tick)
         assert result is not None, (
@@ -1055,5 +1025,4 @@ async def test_start_flow_writer_exits_early_when_not_configured():
     """start_flow_writer returns immediately (no task) when not configured."""
     import services.flow_store as fs
     with patch("services.flow_store._SUPABASE_URL", None):
-        # Should return without hanging
         await asyncio.wait_for(fs.start_flow_writer(), timeout=1.0)
