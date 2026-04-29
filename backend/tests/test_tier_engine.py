@@ -44,7 +44,7 @@ class TestTierEngineTE:
             "t3_min_volume":    500_000, "t3_min_last_price":  1.0, "t3_min_oi":  100,
         }
         q = _SQ("SPY", last_price=500.0, volume=80_000_000, average_volume=80_000_000, open_interest=50_000)
-        assert _classify(q, thresh) == 1
+        assert _classify(q, thresh, require_oi=True) == 1
 
     def test_t2_mid_volume(self):
         from services.tier_engine import _classify
@@ -54,7 +54,7 @@ class TestTierEngineTE:
             "t3_min_volume":    500_000, "t3_min_last_price":  1.0, "t3_min_oi":  100,
         }
         q = _SQ("HOOD", last_price=15.0, volume=5_000_000, average_volume=5_000_000, open_interest=800)
-        assert _classify(q, thresh) == 2
+        assert _classify(q, thresh, require_oi=True) == 2
 
     def test_t3_low_volume(self):
         from services.tier_engine import _classify
@@ -64,7 +64,7 @@ class TestTierEngineTE:
             "t3_min_volume":    500_000, "t3_min_last_price":  1.0, "t3_min_oi":  100,
         }
         q = _SQ("XYZZ", last_price=3.0, volume=600_000, average_volume=600_000, open_interest=150)
-        assert _classify(q, thresh) == 3
+        assert _classify(q, thresh, require_oi=True) == 3
 
     def test_price_gate_drops_to_t3(self):
         from services.tier_engine import _classify
@@ -74,7 +74,7 @@ class TestTierEngineTE:
             "t3_min_volume":    500_000, "t3_min_last_price":  1.0, "t3_min_oi":  100,
         }
         q = _SQ("CLOV", last_price=4.0, volume=3_000_000, average_volume=3_000_000, open_interest=300)
-        assert _classify(q, thresh) == 3
+        assert _classify(q, thresh, require_oi=True) == 3
 
     def test_oi_gate_drops_t1_to_t2(self):
         from services.tier_engine import _classify
@@ -83,8 +83,9 @@ class TestTierEngineTE:
             "t2_min_volume":  2_000_000, "t2_min_last_price": 10.0, "t2_min_oi":  500,
             "t3_min_volume":    500_000, "t3_min_last_price":  1.0, "t3_min_oi":  100,
         }
+        # OI=500 is at T2 threshold but below T1 (1000) → should land T2 with require_oi=True
         q = _SQ("BIGVOL", last_price=25.0, volume=30_000_000, average_volume=30_000_000, open_interest=500)
-        assert _classify(q, thresh) == 2
+        assert _classify(q, thresh, require_oi=True) == 2
 
     def test_assign_tiers_returns_dict(self):
         async def _run():
@@ -100,7 +101,7 @@ class TestTierEngineTE:
                 _SQ("XYZZ",  3.0,   600_000,    600_000,    150),
             ]
             with patch.object(tier_engine, '_fetch_thresholds', AsyncMock(return_value=dummy_thresh)):
-                result = await tier_engine.assign_tiers(quotes)
+                result = await tier_engine.assign_tiers(quotes, require_oi=True)
             assert isinstance(result, dict)
             assert result["SPY"]  == 1
             assert result["HOOD"] == 2
