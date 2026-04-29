@@ -17,6 +17,13 @@ const fmt$ = (n: number) =>
   : n >= 1_000   ? `$${(n / 1_000).toFixed(1)}K`
   : `$${n.toFixed(0)}`;
 
+/** Format a signed delta: -$20.0K or +$50.0K */
+const fmtDelta = (delta: number) => {
+  const abs = Math.abs(delta);
+  const formatted = fmt$(abs);
+  return delta >= 0 ? `+${formatted}` : `-${formatted}`;
+};
+
 const fmtDuration = (secs: number) => {
   if (secs < 60) return `${secs}s`;
   const m = Math.floor(secs / 60);
@@ -266,7 +273,7 @@ export function FlowEpisodesTab({ episodes, loading, error, onFilter }: Props) {
                         {fmt$(ep.total_premium)}
                       </td>
                       <td className="px-3 py-3 font-mono text-sm tabular" style={{ color: delta >= 0 ? "var(--green)" : "var(--red)" }}>
-                        {delta >= 0 ? "+" : ""}{fmt$(delta)}
+                        {fmtDelta(delta)}
                       </td>
                       <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
                         {fmtDuration(ep.duration_seconds)}

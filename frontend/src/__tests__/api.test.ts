@@ -25,6 +25,19 @@
  *   - Includes limit and offset params
  *   - Sends Authorization header
  *
+ *   api.getFlowEvents:
+ *   - Calls /api/flow/events
+ *   - Includes ticker/sentiment/contract_type/tier params when provided
+ *   - Includes aggressive/golden_sweep flags
+ *   - Includes limit and offset params
+ *   - Sends Authorization header
+ *
+ *   api.getFlowEpisodes:
+ *   - Calls /api/flow/episodes
+ *   - Includes direction/contract_type/alert_level/ticker params when provided
+ *   - Includes limit and offset params
+ *   - Sends Authorization header
+ *
  *   api.runSimulation:
  *   - Calls /api/simulation/run with POST + JSON body
  *   - Body includes ticker, flow_events, n_agents, n_runs
@@ -193,6 +206,150 @@ test('api.getFlow sends Authorization header', async () => {
   const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
   const headers = opts.headers as Record<string, string>;
   expect(headers['Authorization']).toBe(`Bearer ${TOKEN}`);
+});
+
+
+// ── api.getFlowEvents ─────────────────────────────────────────────────────────
+
+const _eventsOk = () => _ok({ events: [], total: 0, limit: 100, offset: 0 });
+
+test('api.getFlowEvents calls /api/flow/events', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN);
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('/api/flow/events');
+});
+
+test('api.getFlowEvents sends Authorization header', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN);
+  const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+  const headers = opts.headers as Record<string, string>;
+  expect(headers['Authorization']).toBe(`Bearer ${TOKEN}`);
+});
+
+test('api.getFlowEvents with ticker param includes ticker in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { ticker: 'NVDA' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('ticker=NVDA');
+});
+
+test('api.getFlowEvents with sentiment param includes sentiment in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { sentiment: 'BULLISH' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('sentiment=BULLISH');
+});
+
+test('api.getFlowEvents with contract_type param includes contract_type in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { contract_type: 'CALL' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('contract_type=CALL');
+});
+
+test('api.getFlowEvents with tier param includes tier in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { tier: 'T1' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('tier=T1');
+});
+
+test('api.getFlowEvents with aggressive=true includes aggressive in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { aggressive: true });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('aggressive=true');
+});
+
+test('api.getFlowEvents with golden_sweep=true includes golden_sweep in URL', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { golden_sweep: true });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('golden_sweep=true');
+});
+
+test('api.getFlowEvents with limit and offset forwards both', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { limit: 50, offset: 100 });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('limit=50');
+  expect(url).toContain('offset=100');
+});
+
+test('api.getFlowEvents with no params omits all optional query params', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, {});
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).not.toContain('ticker=');
+  expect(url).not.toContain('sentiment=');
+  expect(url).not.toContain('aggressive=');
+});
+
+
+// ── api.getFlowEpisodes ───────────────────────────────────────────────────────
+
+const _episodesOk = () => _ok({ episodes: [], total: 0, limit: 100, offset: 0 });
+
+test('api.getFlowEpisodes calls /api/flow/episodes', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN);
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('/api/flow/episodes');
+});
+
+test('api.getFlowEpisodes sends Authorization header', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN);
+  const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+  const headers = opts.headers as Record<string, string>;
+  expect(headers['Authorization']).toBe(`Bearer ${TOKEN}`);
+});
+
+test('api.getFlowEpisodes with ticker param includes ticker in URL', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { ticker: 'SPY' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('ticker=SPY');
+});
+
+test('api.getFlowEpisodes with direction param includes direction in URL', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { direction: 'BULLISH' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('direction=BULLISH');
+});
+
+test('api.getFlowEpisodes with contract_type param includes contract_type in URL', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { contract_type: 'PUT' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('contract_type=PUT');
+});
+
+test('api.getFlowEpisodes with alert_level param includes alert_level in URL', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { alert_level: 'STRONG' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('alert_level=STRONG');
+});
+
+test('api.getFlowEpisodes with limit and offset forwards both', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { limit: 25, offset: 50 });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('limit=25');
+  expect(url).toContain('offset=50');
+});
+
+test('api.getFlowEpisodes with no params omits all optional query params', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, {});
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).not.toContain('ticker=');
+  expect(url).not.toContain('direction=');
+  expect(url).not.toContain('alert_level=');
 });
 
 

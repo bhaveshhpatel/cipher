@@ -116,8 +116,9 @@ test('KPI bar rendered when events present', () => {
 test('Total Premium sums all event premiums', () => {
   const events = [makeEvent({ premium: 100_000 }), makeEvent({ id: 2, ticker: 'SPY', premium: 200_000 })];
   render(<FlowEventsTab events={events} loading={false} error={null} onFilter={noop} />);
-  // $300K
-  expect(screen.getByText('$300.0K')).toBeInTheDocument();
+  // $300K — appears in the KPI bar span (text-2xl)
+  const kpiSpan = document.querySelector('.text-2xl');
+  expect(kpiSpan?.textContent).toBe('$300.0K');
 });
 
 test('Unique Tickers counts distinct tickers', () => {
@@ -158,22 +159,33 @@ test('PUT contract_type has badge-red class', () => {
 
 test('BULLISH sentiment renders badge-green', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BULLISH' })]} loading={false} error={null} onFilter={noop} />);
-  expect(screen.getByText('BULLISH')).toBeInTheDocument();
+  // Both a filter button and a table badge contain 'BULLISH' — find the badge
+  const badge = screen.getAllByText('BULLISH').find(el => el.classList.contains('badge-green'));
+  expect(badge).toBeDefined();
+  expect(badge).toBeInTheDocument();
 });
 
 test('BEARISH sentiment renders badge-red', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BEARISH', contract_type: 'PUT' })]} loading={false} error={null} onFilter={noop} />);
-  expect(screen.getByText('BEARISH')).toBeInTheDocument();
+  const badge = screen.getAllByText('BEARISH').find(el => el.classList.contains('badge-red'));
+  expect(badge).toBeDefined();
+  expect(badge).toBeInTheDocument();
 });
 
 test('premium formatted as $K', () => {
   render(<FlowEventsTab events={[makeEvent({ premium: 75_500 })]} loading={false} error={null} onFilter={noop} />);
-  expect(screen.getByText('$75.5K')).toBeInTheDocument();
+  // $75.5K appears in both KPI bar and table row — find the table cell
+  const matches = screen.getAllByText('$75.5K');
+  // At least one match; table cell has class tabular
+  const tableCell = matches.find(el => el.tagName === 'TD');
+  expect(tableCell).toBeDefined();
 });
 
 test('premium formatted as $M', () => {
   render(<FlowEventsTab events={[makeEvent({ premium: 1_250_000 })]} loading={false} error={null} onFilter={noop} />);
-  expect(screen.getByText('$1.25M')).toBeInTheDocument();
+  const matches = screen.getAllByText('$1.25M');
+  const tableCell = matches.find(el => el.tagName === 'TD');
+  expect(tableCell).toBeDefined();
 });
 
 test('is_aggressive renders lightning flag', () => {
