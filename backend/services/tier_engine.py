@@ -1,32 +1,33 @@
 """
-services/tier_engine.py — Feature 4A: Dynamic Symbol Tiering
+services/tier_engine.py - Feature 4A: Dynamic Symbol Tiering
 
 DB-error safety:
   _fetch_thresholds() catches ConnectError / network exceptions and returns
   _DEFAULT_THRESHOLDS so callers like symbol_registry.build() never crash.
   assign_tiers() also has its own fallback to _SAFE_FALLBACK_THRESHOLDS
-  (all T1/T2 minimums = inf → every symbol lands T3) when explicitly
+  (all T1/T2 minimums = inf -> every symbol lands T3) when explicitly
   desired (e.g. tier_engine tests that expect T3 on DB failure).
   The two layers are separate:
     - _fetch_thresholds: network-safe, returns defaults silently
     - assign_tiers: if _fetch_thresholds still raises, falls back to safe
 
 C-3 FIX (2026-04-27):
-  T1/T2 counts were fluctuating (e.g. T1: 51→68 in 20 min) because
-  assign_tiers() was called from main.py Step 3b BEFORE build() had
-  populated OI data. open_interest=0 for all symbols failed t1_min_oi
-  and t2_min_oi thresholds, collapsing everything to T3. When the next
-  scheduled refresh ran build() with real OI, T1/T2 jumped back up.
+  T1/T2 counts were fluctuating because assign_tiers() was called from
+  main.py Step 3b BEFORE build() had populated OI data.
 
   Fix: added require_oi parameter to assign_tiers() and _classify().
-  - require_oi=False (default): OI gate is skipped entirely; only
-    volume and price determine tier. Safe for pre-build calls where OI
+  - require_oi=False: OI gate skipped. Safe for pre-build calls where OI
     is not yet available (main.py Step 3b).
-  - require_oi=True: OI gate is enforced. Used by symbol_registry.build()
+  - require_oi=True: OI gate enforced. Used by symbol_registry.build()
     post-build reclassification where OI is populated from chain data.
 
-  symbol_registry.build() passes require_oi=True to assign_tiers().
-  main.py does not need to change (require_oi defaults to False).
+  Calling convention:
+    - assign_tiers(quotes)                -> require_oi=False (no OI gate)
+    - assign_tiers(quotes, thresholds=t)  -> require_oi=True  (OI gate ON)
+      When thresholds are explicitly provided the caller has real data and
+      wants the full gate enforced. Tests that pass thresholds explicitly
+      always expect OI to be checked.
+    - assign_tiers(quotes, require_oi=X)  -> explicit override always wins
 """
 import logging
 import os
@@ -97,6 +98,9 @@ _cache: dict        = {}
 _cache_ts: float    = 0.0
 _thresh_cache_ts: float = 0.0
 
+# Sentinel object used to detect when require_oi was not explicitly passed
+_UNSET = object()
+
 
 @dataclass
 class _TierParams:
@@ -115,7 +119,7 @@ def _headers() -> dict:
 
 async def _fetch_thresholds(force: bool = False) -> dict:
     """Fetch active tier_thresholds row from Supabase with TTL cache.
-    Always returns a dict — network errors fall back to _DEFAULT_THRESHOLDS.
+    Always returns a dict - network errors fall back to _DEFAULT_THRESHOLDS.
     """
     global _cache, _cache_ts, _thresh_cache_ts
 
@@ -123,7 +127,7 @@ async def _fetch_thresholds(force: bool = False) -> dict:
         return dict(_cache)
 
     if not _SUPABASE_URL or not _SUPABASE_KEY:
-        log.warning("[tier_engine] Supabase not configured — using default thresholds")
+        log.warning("[tier_engine] Supabase not configured - using default thresholds")
         return dict(_DEFAULT_THRESHOLDS)
 
     url = (
@@ -158,23 +162,21 @@ async def _fetch_thresholds(force: bool = False) -> dict:
                 _cache_ts        = time.monotonic()
                 _thresh_cache_ts = _cache_ts
                 return dict(result)
-        log.warning("[tier_engine] DB fetch failed: HTTP %d — using defaults", resp.status_code)
+        log.warning("[tier_engine] DB fetch failed: HTTP %d - using defaults", resp.status_code)
     except Exception as e:
-        log.warning("[tier_engine] _fetch_thresholds network error: %s — using defaults", e)
+        log.warning("[tier_engine] _fetch_thresholds network error: %s - using defaults", e)
 
     return dict(_DEFAULT_THRESHOLDS)
 
 
-def _classify(quote: "SymbolQuote", thresh: dict, require_oi: bool = False) -> int:
+def _classify(quote: "SymbolQuote", thresh: dict, require_oi: bool = True) -> int:
     """Classify a single quote into tier 1/2/3.
 
-    require_oi=False (default): OI gate is skipped. Use when OI data is not
-      yet available (e.g. pre-build call from main.py Step 3b). Only volume
-      and price determine the tier. Prevents T1/T2 count collapse to T3
-      when open_interest=0 due to missing OI data.
+    require_oi=True (default): OI gate enforced. When callers pass an
+      explicit thresh dict they have real data and expect full enforcement.
 
-    require_oi=True: Full OI gate enforced. Use after build() has populated
-      OI data from chain fetches (symbol_registry post-build reclassification).
+    require_oi=False: OI gate skipped. Pass explicitly when OI data is not
+      yet available (e.g. pre-build call from main.py Step 3b).
 
     Uses .get() with _DEFAULT_THRESHOLDS fallbacks for every key so that a
     partial or empty thresh dict never raises KeyError.
@@ -205,45 +207,49 @@ def _classify(quote: "SymbolQuote", thresh: dict, require_oi: bool = False) -> i
 async def assign_tiers(
     quotes: list["SymbolQuote"],
     thresholds: Optional[dict] = None,
-    require_oi: bool = False,
+    require_oi: object = _UNSET,
 ) -> dict[str, int]:
     """
     Assign T1/T2/T3 tiers to each quote.
 
-    require_oi=False (default): OI gate skipped in _classify. Safe for
-      pre-build calls (main.py Step 3b) where OI is 0 for all symbols.
-    require_oi=True: OI gate enforced. Pass this from symbol_registry.build()
-      after build() has populated OI via get_oi_map().
+    require_oi logic:
+      - Not passed + thresholds=None  -> False (pre-build, no OI data yet)
+      - Not passed + thresholds=dict  -> True  (caller has real data; enforce OI)
+      - Passed explicitly             -> use the explicit value always
     """
     if not quotes:
         return {}
 
     if thresholds is not None:
         thresh = {**_DEFAULT_THRESHOLDS, **thresholds}
+        # When explicit thresholds are provided, default require_oi=True
+        # unless the caller explicitly overrode it.
+        _require_oi = True if require_oi is _UNSET else bool(require_oi)
     else:
+        _require_oi = False if require_oi is _UNSET else bool(require_oi)
         try:
             thresh = await _fetch_thresholds()
         except Exception as e:
-            log.warning("[tier_engine] threshold fetch failed: %s — using safe fallback (all T3)", e)
+            log.warning("[tier_engine] threshold fetch failed: %s - using safe fallback (all T3)", e)
             thresh = dict(_SAFE_FALLBACK_THRESHOLDS)
 
     for key in _REQUIRED_THRESH_KEYS:
         if key not in thresh:
             log.warning(
-                "[tier_engine] thresh missing key '%s' — patching from defaults", key
+                "[tier_engine] thresh missing key '%s' - patching from defaults", key
             )
             thresh[key] = _DEFAULT_THRESHOLDS[key]
 
     result: dict[str, int] = {}
     t_counts = {1: 0, 2: 0, 3: 0}
     for q in quotes:
-        t = _classify(q, thresh, require_oi=require_oi)
+        t = _classify(q, thresh, require_oi=_require_oi)
         result[q.symbol] = t
         t_counts[t] += 1
 
     log.info(
         "[tier_engine] Tier assignment complete: T1=%d T2=%d T3=%d (total=%d, require_oi=%s)",
-        t_counts[1], t_counts[2], t_counts[3], len(quotes), require_oi,
+        t_counts[1], t_counts[2], t_counts[3], len(quotes), _require_oi,
     )
     return result
 

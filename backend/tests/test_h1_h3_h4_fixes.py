@@ -1,9 +1,9 @@
 """
 Tests for H1, H3, and H4 fixes.
 
-H1 — build() returns tuple[int, dict]; _post_build_upsert reuses raw_quotes
-H3 — incremental build guard uses self._registry (not _seeded_from_db)
-H4 — _sweep_upgrade_dispatched dict evicts entries older than TTL
+H1 - build() returns tuple[int, dict]; _post_build_upsert reuses raw_quotes
+H3 - incremental build guard uses self._registry (not _seeded_from_db)
+H4 - _sweep_upgrade_dispatched dict evicts entries older than TTL
 """
 import asyncio
 import time as _time
@@ -11,11 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.11+: asyncio.get_event_loop() raises RuntimeError when no
+    # current loop exists in the main thread. Use asyncio.run() instead.
+    return asyncio.run(coro)
 
 
 # ===========================================================================
-# H1 Tests — build() returns tuple; _post_build_upsert skips duplicate fetch
+# H1 Tests - build() returns tuple; _post_build_upsert skips duplicate fetch
 # ===========================================================================
 
 class TestH1BuildReturnsTuple:
@@ -162,7 +164,7 @@ class TestH1PostBuildUpsertRawQuotes:
 
 
 # ===========================================================================
-# H3 Tests — incremental guard uses self._registry, not _seeded_from_db
+# H3 Tests - incremental guard uses self._registry, not _seeded_from_db
 # ===========================================================================
 
 class TestH3IncrementalGuard:
@@ -301,7 +303,7 @@ class TestH3IncrementalGuard:
 
 
 # ===========================================================================
-# H4 Tests — _sweep_upgrade_dispatched TTL eviction
+# H4 Tests - _sweep_upgrade_dispatched TTL eviction
 # ===========================================================================
 
 class TestH4SweepDispatchTTL:
@@ -351,7 +353,7 @@ class TestH4SweepDispatchTTL:
         assert len(task_created) >= 1, "New dispatch should fire after stale key was evicted"
 
     def test_fresh_key_not_evicted(self):
-        """A key within TTL must NOT be evicted — no second dispatch."""
+        """A key within TTL must NOT be evicted - no second dispatch."""
         import services.tradier_stream as ts
         self._reset_module_state()
 
