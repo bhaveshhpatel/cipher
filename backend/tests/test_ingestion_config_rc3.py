@@ -14,7 +14,6 @@ test_ingestion_config_rc3.py
   9. validate_ingestion_config() returns [] when Supabase not configured
 """
 import pytest
-import importlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 

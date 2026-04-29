@@ -154,7 +154,6 @@ def _sync_load_chain(
     snapshot_id: str,
     max_age_hours: int = _DEFAULT_MAX_AGE_HOURS,
 ) -> "Optional[dict[str, ContractMeta]]":
-    from services.symbol_registry import ContractMeta  # noqa: F401 — used in _paginate_chain
     try:
         sb = _client()
 

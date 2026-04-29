@@ -28,7 +28,7 @@ Tests:
     12. find_snapshot_db_error_returns_none — exception → None gracefully
 """
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import services.chain_store as cs
 from services.symbol_registry import ContractMeta

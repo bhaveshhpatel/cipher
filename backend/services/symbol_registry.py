@@ -230,8 +230,6 @@ class SymbolRegistry:
         sem = asyncio.Semaphore(build_concurrency)
 
         async with self._build_lock:
-            today = date.today()
-
             # H3 fix: use populated registry as the incremental guard
             if self._registry:
                 min_dte_by_ticker: dict[str, int] = {}
@@ -316,7 +314,6 @@ class SymbolRegistry:
                     avg_vol = int(q.get("average_volume") or 0)
                 except (TypeError, ValueError):
                     pass
-                from services.symbols_loader import SymbolQuote  # noqa: F811
                 synthetic_quotes.append(SymbolQuote(
                     symbol         = ticker,
                     last_price     = prices.get(ticker, 0.0),
@@ -348,12 +345,8 @@ class SymbolRegistry:
             self._registry     = new_registry
             self._oi_by_ticker = new_oi_by_ticker
             self._last_build   = datetime.utcnow()
-            # H3: no _seeded_from_db = False reset needed — flag is gone
 
             # M-1/M-2: set _build_complete AFTER self._registry is swapped.
-            # This is the only place this flag is set to True.
-            # stream_options_flow() polls is_ready() which reads this flag,
-            # so it will not unblock until the full fresh registry is live.
             self._build_complete = True
 
             t_counts = {1: 0, 2: 0, 3: 0}

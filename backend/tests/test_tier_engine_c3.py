@@ -22,7 +22,6 @@ Tests:
   10. classify_require_oi_true_direct        — _classify direct unit test, require_oi=True
 """
 import asyncio
-import pytest
 from unittest.mock import patch
 
 from services.tier_engine import _classify, assign_tiers, _DEFAULT_THRESHOLDS

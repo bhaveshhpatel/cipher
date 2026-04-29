@@ -24,8 +24,7 @@ Tests:
   13. batch_split_correct               — 600 symbols split into 2 batches of 500/100
   14. exception_returns_false           — DB exception returns False gracefully
 """
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 
 def _make_sb_mock():
