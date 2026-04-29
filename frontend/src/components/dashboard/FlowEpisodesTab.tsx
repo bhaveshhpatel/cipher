@@ -12,10 +12,12 @@ interface Props {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-const fmt$ = (n: number) =>
-  n >= 1_000_000 ? `$${(n / 1_000_000).toFixed(2)}M`
-  : n >= 1_000   ? `$${(n / 1_000).toFixed(1)}K`
-  : `$${n.toFixed(0)}`;
+const fmt$ = (n: number) => {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `$${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000)     return `$${(abs / 1_000).toFixed(1)}K`;
+  return `$${abs.toFixed(0)}`;
+};
 
 const fmtDuration = (secs: number) => {
   if (secs < 60) return `${secs}s`;
@@ -225,6 +227,7 @@ export function FlowEpisodesTab({ episodes, loading, error, onFiltersChange }: P
               ) : (
                 sorted.map((ep) => {
                   const delta = ep.total_premium - ep.last_signaled_premium;
+                  const deltaStr = (delta >= 0 ? "+" : "-") + fmt$(delta);
                   return (
                     <tr
                       key={ep.id}
@@ -257,7 +260,7 @@ export function FlowEpisodesTab({ episodes, loading, error, onFiltersChange }: P
                         {fmt$(ep.total_premium)}
                       </td>
                       <td className="px-3 py-3 font-mono text-sm tabular" style={{ color: delta >= 0 ? "var(--green)" : "var(--red)" }}>
-                        {delta >= 0 ? "+" : ""}{fmt$(delta)}
+                        {deltaStr}
                       </td>
                       <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
                         {fmtDuration(ep.duration_seconds)}

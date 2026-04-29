@@ -116,8 +116,8 @@ test('KPI bar rendered when events present', () => {
 test('Total Premium sums all event premiums', () => {
   const events = [makeEvent({ premium: 100_000 }), makeEvent({ id: 2, ticker: 'SPY', premium: 200_000 })];
   render(<FlowEventsTab events={events} loading={false} error={null} onFiltersChange={noop} />);
-  // $300K
-  expect(screen.getByText('$300.0K')).toBeInTheDocument();
+  // $300K appears in KPI bar
+  expect(screen.getAllByText('$300.0K').length).toBeGreaterThan(0);
 });
 
 test('Unique Tickers counts distinct tickers', () => {
@@ -127,7 +127,6 @@ test('Unique Tickers counts distinct tickers', () => {
     makeEvent({ id: 3, ticker: 'SPY' }),
   ];
   render(<FlowEventsTab events={events} loading={false} error={null} onFiltersChange={noop} />);
-  // 2 unique tickers — the "2" should appear in the KPI
   const kpiValues = screen.getAllByText('2');
   expect(kpiValues.length).toBeGreaterThan(0);
 });
@@ -158,22 +157,26 @@ test('PUT contract_type has badge-red class', () => {
 
 test('BULLISH sentiment renders badge-green', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BULLISH' })]} loading={false} error={null} onFiltersChange={noop} />);
-  expect(screen.getByText('BULLISH')).toBeInTheDocument();
+  // Filter bar + row both contain BULLISH; find the badge span in the row
+  const badge = screen.getAllByText('BULLISH').find(el => el.classList.contains('badge-green'));
+  expect(badge).toBeDefined();
 });
 
 test('BEARISH sentiment renders badge-red', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BEARISH', contract_type: 'PUT' })]} loading={false} error={null} onFiltersChange={noop} />);
-  expect(screen.getByText('BEARISH')).toBeInTheDocument();
+  const badge = screen.getAllByText('BEARISH').find(el => el.classList.contains('badge-red'));
+  expect(badge).toBeDefined();
 });
 
 test('premium formatted as $K', () => {
   render(<FlowEventsTab events={[makeEvent({ premium: 75_500 })]} loading={false} error={null} onFiltersChange={noop} />);
-  expect(screen.getByText('$75.5K')).toBeInTheDocument();
+  // Appears in both KPI bar and table row
+  expect(screen.getAllByText('$75.5K').length).toBeGreaterThan(0);
 });
 
 test('premium formatted as $M', () => {
   render(<FlowEventsTab events={[makeEvent({ premium: 1_250_000 })]} loading={false} error={null} onFiltersChange={noop} />);
-  expect(screen.getByText('$1.25M')).toBeInTheDocument();
+  expect(screen.getAllByText('$1.25M').length).toBeGreaterThan(0);
 });
 
 test('is_aggressive renders lightning flag', () => {
