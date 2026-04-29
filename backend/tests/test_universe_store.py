@@ -18,6 +18,11 @@ Updated 2026-04-28 (RC-1): only stream_eligible symbols are written to DB.
   symbols are absent from the batch (not that they have stream_eligible=False).
 Updated 2026-04-29 (DEDUP-2): _SNAPSHOT_REUSE_DRIFT_PCT bumped to 0.30, _KEEP_SNAPSHOTS=3.
   Added TestSnapshotDeduplicationDriftThreshold regression suite.
+Updated 2026-04-29 (DEDUP-2 fix): corrected batch execute() mock counts in
+  TestSnapshotDeduplicationDriftThreshold. Batch size=500 means large symbol
+  lists require multiple execute() slots: 1200→3 batches, 1400→3 batches,
+  4250→9 batches. Previous mocks only provided 1 batch slot → StopIteration
+  on batch N+1 → except block → False returned → assert False is True.
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -420,18 +425,34 @@ class TestSnapshotDeduplicationDriftThreshold:
     AAPL rows accumulated in options_universe_symbols across 6 restarts.
 
     Fix: threshold raised to 0.30 (30%). These tests pin that behaviour.
+
+    IMPORTANT — batch size is 500. execute() side_effect lists must include one
+    slot per batch call or StopIteration will be raised inside the loop, caught
+    by the except block, and the function returns False instead of True.
+      1200 symbols → ceil(1200/500) = 3 batches  (reuse path: no insert/deactivate)
+      1400 symbols → ceil(1400/500) = 3 batches  (new snapshot: insert + deactivate)
+      4250 symbols → ceil(4250/500) = 9 batches  (reuse path: no insert/deactivate)
     """
 
     def test_reuses_snapshot_when_drift_within_30pct(self):
         """
         Existing count=1000, new count=1200 → 20% drift < 30% → reuse,
         no INSERT on options_universe_snapshots.
+
+        execute() sequence (reuse path, 1200 symbols → 3 batches):
+          [0] _get_active_snapshot_for_reuse → existing snapshot returned
+          [1] upsert batch 1/3 (500 symbols)
+          [2] upsert batch 2/3 (500 symbols)
+          [3] upsert batch 3/3 (200 symbols)
+          [4] _prune_old_snapshots select
         """
         sb, query = _make_sb_mock()
         recent = datetime.now(timezone.utc).isoformat()
         query.execute.side_effect = [
             MagicMock(data=[{"id": "existing-snap", "symbol_count": 1000, "fetched_at": recent}]),
-            MagicMock(data=[]),   # upsert symbol batch
+            MagicMock(data=[]),   # upsert batch 1/3
+            MagicMock(data=[]),   # upsert batch 2/3
+            MagicMock(data=[]),   # upsert batch 3/3
             MagicMock(data=[{"id": "existing-snap"}]),  # prune select (1 ≤ 3)
         ]
         symbols = [f"SYM{i}" for i in range(1200)]
@@ -446,6 +467,15 @@ class TestSnapshotDeduplicationDriftThreshold:
         """
         Existing count=1000, new count=1400 → 40% drift > 30% → new snapshot,
         INSERT fires once.
+
+        execute() sequence (new snapshot path, 1400 symbols → 3 batches):
+          [0] _get_active_snapshot_for_reuse → existing returned (drift check)
+          [1] insert new snapshot header
+          [2] deactivate old snapshot
+          [3] upsert batch 1/3 (500 symbols)
+          [4] upsert batch 2/3 (500 symbols)
+          [5] upsert batch 3/3 (400 symbols)
+          [6] _prune_old_snapshots select
         """
         sb, query = _make_sb_mock()
         recent = datetime.now(timezone.utc).isoformat()
@@ -453,7 +483,9 @@ class TestSnapshotDeduplicationDriftThreshold:
             MagicMock(data=[{"id": "old-snap", "symbol_count": 1000, "fetched_at": recent}]),
             MagicMock(data=[]),   # insert new snapshot header
             MagicMock(data=[]),   # deactivate old
-            MagicMock(data=[]),   # upsert symbol batch
+            MagicMock(data=[]),   # upsert batch 1/3
+            MagicMock(data=[]),   # upsert batch 2/3
+            MagicMock(data=[]),   # upsert batch 3/3
             MagicMock(data=[{"id": "old-snap"}, {"id": "snap-new"}]),  # prune select (2 ≤ 3)
         ]
         symbols = [f"SYM{i}" for i in range(1400)]
@@ -468,15 +500,24 @@ class TestSnapshotDeduplicationDriftThreshold:
         """
         Existing count=4000, new count=4250 → 6.25% drift — mirrors the
         production pattern that caused 6 duplicate AAPL rows. Must reuse.
+
+        execute() sequence (reuse path, 4250 symbols → 9 batches):
+          [0]   _get_active_snapshot_for_reuse → existing snapshot returned
+          [1-9] upsert batches 1–9 (500×8 + 250)
+          [10]  _prune_old_snapshots select
         """
         sb, query = _make_sb_mock()
         recent = datetime.now(timezone.utc).isoformat()
-        query.execute.side_effect = [
-            MagicMock(data=[{"id": "prod-snap", "symbol_count": 4000, "fetched_at": recent}]),
-            MagicMock(data=[]),   # upsert symbol batch
-            MagicMock(data=[{"id": "prod-snap"}]),  # prune select (1 ≤ 3)
-        ]
-        symbols = [f"SYM{i}" for i in range(4250)]
+        import math
+        batch_size  = 500
+        n_symbols   = 4250
+        n_batches   = math.ceil(n_symbols / batch_size)  # 9
+        query.execute.side_effect = (
+            [MagicMock(data=[{"id": "prod-snap", "symbol_count": 4000, "fetched_at": recent}])]
+            + [MagicMock(data=[]) for _ in range(n_batches)]   # 9 upsert batches
+            + [MagicMock(data=[{"id": "prod-snap"}])]          # prune select (1 ≤ 3)
+        )
+        symbols = [f"SYM{i}" for i in range(n_symbols)]
         with patch("services.universe_store._client", return_value=sb):
             result = universe_store._sync_save_snapshot(symbols, "tradier_validated", None)
         assert result is True
