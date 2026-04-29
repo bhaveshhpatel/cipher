@@ -9,6 +9,7 @@ Endpoints:
 BUG FIX (2026-04-24): Fixed to query flow_episodes (the populated table).
 BUG FIX (2026-04-26): Malformed rows (missing expiry) skipped in /scan.
 FEAT  (2026-04-28): Added /events + /episodes endpoints (Chunk 1).
+BUG FIX (2026-04-29): Renamed tier -> influence_tier in flow_events select + filter.
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -84,7 +85,7 @@ class FlowEventRaw(BaseModel):
     bid:             Optional[float] = None
     ask:             Optional[float] = None
     fill_price:      Optional[float] = None
-    tier:            Optional[str]   = None
+    influence_tier:  Optional[str]   = None
     is_aggressive:   bool
     is_golden_sweep: bool
     timestamp:       Optional[str]   = None
@@ -223,7 +224,7 @@ async def _query_flow_events(
     url = f"{url_base}/rest/v1/flow_events"
     params: dict = {
         "select": "id,ticker,strike,expiry,contract_type,sentiment,premium,size,"
-                  "bid,ask,fill_price,tier,is_aggressive,is_golden_sweep,timestamp",
+                  "bid,ask,fill_price,influence_tier,is_aggressive,is_golden_sweep,timestamp",
         "order":  "timestamp.desc",
         "limit":  str(limit),
         "offset": str(offset),
@@ -236,7 +237,7 @@ async def _query_flow_events(
     if contract_type:
         params["contract_type"] = f"eq.{contract_type.upper()}"
     if tier:
-        params["tier"] = f"eq.{tier.upper()}"
+        params["influence_tier"] = f"eq.{tier.upper()}"
     if aggressive is not None:
         params["is_aggressive"] = f"eq.{str(aggressive).lower()}"
     if golden_sweep is not None:
@@ -434,7 +435,7 @@ async def get_flow_events(
                 bid             = float(r["bid"]) if r.get("bid") is not None else None,
                 ask             = float(r["ask"]) if r.get("ask") is not None else None,
                 fill_price      = float(r["fill_price"]) if r.get("fill_price") is not None else None,
-                tier            = r.get("tier") or None,
+                influence_tier  = r.get("influence_tier") or None,
                 is_aggressive   = bool(r.get("is_aggressive", False)),
                 is_golden_sweep = bool(r.get("is_golden_sweep", False)),
                 timestamp       = r.get("timestamp") or None,
