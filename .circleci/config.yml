@@ -1,8 +1,8 @@
 # .circleci/config.yml
-# Mirrors .github/workflows/backend.yml
-# Jobs: lint (pyflakes) + regression tests with 92% coverage gate +
-#        frontend_test (jest --ci, 75% coverage threshold).
-# On main branch only: deploys to Railway after all jobs pass.
+# Backend: lint + regression (92% coverage gate) + deploy to Railway
+# Frontend: npm ci + next build (type gate) + jest --ci --coverage + deploy to Vercel
+# Vercel git integration should be disabled in Project Settings → Git
+# so only this pipeline can trigger production deploys.
 
 version: 2.1
 
@@ -103,9 +103,7 @@ jobs:
           destination: coverage.json
 
   # -----------------------------------------------------------------------
-  # Job 3: Frontend tests (jest --ci, 75% coverage threshold)
-  # No package-lock.json present — uses npm install (not npm ci).
-  # Cache keyed on package.json checksum.
+  # Job 3: Frontend — type-check + Jest coverage gate
   # -----------------------------------------------------------------------
   frontend_test:
     docker:
@@ -114,32 +112,36 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - npm-v1-{{ checksum "frontend/package.json" }}
-            - npm-v1-
+            - node-v1-{{ checksum "frontend/package-lock.json" }}
+            - node-v1-
       - run:
           name: Install frontend dependencies
           working_directory: ~/project/frontend
-          command: npm install --prefer-offline
+          command: npm ci
       - save_cache:
-          key: npm-v1-{{ checksum "frontend/package.json" }}
+          key: node-v1-{{ checksum "frontend/package-lock.json" }}
           paths:
-            - ~/.npm
+            - ~/project/frontend/node_modules
       - run:
-          name: Type check
+          name: Type-check + Next.js build
           working_directory: ~/project/frontend
-          command: npx tsc --noEmit
+          # next build will fail on any TypeScript error or import mismatch.
+          # This is the cheapest full type gate before Jest runs.
+          command: npm run build
       - run:
-          name: Run jest with coverage
+          name: Jest — CI mode with coverage
           working_directory: ~/project/frontend
-          command: npx jest --ci --coverage --coverageReporters=text --coverageReporters=json-summary
+          # Uses the test:ci script: jest --ci --coverage
+          # --ci disables interactive mode and treats snapshot mismatches as failures.
+          command: npm run test:ci
       - store_artifacts:
           path: ~/project/frontend/coverage
           destination: frontend-coverage
 
   # -----------------------------------------------------------------------
-  # Job 4: Deploy to Railway (main branch only, after all jobs pass)
+  # Job 4: Deploy backend to Railway (main only, after lint + regression)
   # -----------------------------------------------------------------------
-  deploy:
+  deploy_backend:
     docker:
       - image: cimg/node:lts
     steps:
@@ -150,7 +152,44 @@ jobs:
       - run:
           name: Deploy backend to Railway
           command: railway up --service cipher
-          # RAILWAY_TOKEN is set in CircleCI Project Settings → Environment Variables
+          # RAILWAY_TOKEN must be set in CircleCI Project Settings → Environment Variables
+
+  # -----------------------------------------------------------------------
+  # Job 5: Deploy frontend to Vercel (main only, after frontend_test passes)
+  # Requires VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID in CircleCI env vars.
+  # Vercel git integration must be disabled so only this job triggers prod deploys.
+  # -----------------------------------------------------------------------
+  deploy_frontend:
+    docker:
+      - image: cimg/node:lts
+    steps:
+      - checkout
+      - run:
+          name: Install Vercel CLI
+          command: npm install -g vercel
+      - run:
+          name: Pull Vercel project settings + env
+          working_directory: ~/project
+          command: |
+            vercel pull \
+              --yes \
+              --environment=production \
+              --token=$VERCEL_TOKEN
+      - run:
+          name: Build project via Vercel
+          working_directory: ~/project
+          command: |
+            vercel build \
+              --prod \
+              --token=$VERCEL_TOKEN
+      - run:
+          name: Deploy prebuilt output to Vercel production
+          working_directory: ~/project
+          command: |
+            vercel deploy \
+              --prebuilt \
+              --prod \
+              --token=$VERCEL_TOKEN
 
 # -----------------------------------------------------------------------
 # Workflows
@@ -158,12 +197,13 @@ jobs:
 workflows:
   ci_cd:
     jobs:
+
+      # ── Backend jobs ────────────────────────────────────────────────
       - lint:
           filters:
             branches:
               only:
                 - main
-                - /stable\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
@@ -173,25 +213,30 @@ workflows:
             branches:
               only:
                 - main
-                - /stable\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
 
+      - deploy_backend:
+          requires:
+            - lint
+            - regression
+          filters:
+            branches:
+              only: main
+
+      # ── Frontend jobs ───────────────────────────────────────────────
       - frontend_test:
           filters:
             branches:
               only:
                 - main
-                - /stable\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
 
-      - deploy:
+      - deploy_frontend:
           requires:
-            - lint
-            - regression
             - frontend_test
           filters:
             branches:
