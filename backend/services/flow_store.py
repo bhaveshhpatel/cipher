@@ -35,19 +35,21 @@ C-003 — Sweep Retroactive Upgrade:
   from _process_trade() via asyncio.create_task() so it does not block
   the stream hot path.
 
-Fix (ALERT-LEVEL 2026-04-28):
-  _bus_signal_listener was setting alert_level from sig.get("recommendation")
-  which returns BUY/SELL/HOLD from the composite signal — not the
-  CONVICTION/STRONG_SIGNAL/ALERT/WATCH values used by the DB schema.
-  Every flow_episode row was therefore stored with alert_level=WATCH
-  regardless of actual premium size.
-  Fix: read sig.get("alert_level") which is populated from
-  accumulator.get_alert_level(sig_ep) in tradier_stream.py before publish.
+Bug fixes applied:
+  1. ALERT-LEVEL (2026-04-29): _bus_signal_listener was reading
+     sig.get("alert_level") but the published signal dict uses key "alert".
+     Fixed to try both keys with fallback to "WATCH".
+  2. SWEEP-SQL (2026-04-29): upgrade_to_sweep_in_db was embedding the raw
+     SQL expression "now()-interval 30 seconds" as a literal string in the
+     PostgREST filter URL. PostgREST does not evaluate SQL expressions in
+     filter values. Fixed to pre-compute a UTC ISO timestamp in Python.
 """
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -192,33 +194,27 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
     """
     C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
 
-    Called via asyncio.create_task() from _process_trade() when the 3rd
-    unique exchange for a (occ_symbol, size, fill) key arrives as a
-    duplicate tick — meaning the canonical row was already written with
-    trade_type='BTO' before the sweep was confirmed.
-
-    Issues a PATCH (UPDATE) against the Supabase REST API targeting:
-      - occ_symbol  = exact OCC string
-      - fill_price  = exact fill (matches the canonical row)
-      - size        = exact contract count
-      - trade_type  != 'SWEEP'  (idempotent guard — skip already-upgraded rows)
-      - created_at  > NOW() - INTERVAL '30 seconds'  (safety window — avoids
-                    mutating old unrelated rows with same contract params)
-
-    Returns True on success, False on any error. Errors are logged but
-    never propagate — sweep upgrade is best-effort.
+    Fix (2026-04-29): The previous implementation embedded the raw SQL
+    expression "now()-interval 30 seconds" directly in the PostgREST
+    filter URL. PostgREST treats filter values as literals, not SQL, so
+    the expression was passed verbatim and Postgres rejected it with
+    error code 22007 (invalid_datetime_format). Fixed by pre-computing
+    the cutoff timestamp in Python and formatting it as ISO 8601.
     """
     if not _is_configured():
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
         return False
 
+    # Pre-compute the cutoff in Python — PostgREST cannot evaluate SQL expressions
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+
     url = (
         f"{_SUPABASE_URL}/rest/v1/flow_events"
-        f"?occ_symbol=eq.{occ_symbol}"
+        f"?occ_symbol=eq.{quote(occ_symbol)}"
         f"&fill_price=eq.{fill_price}"
         f"&size=eq.{size}"
         f"&trade_type=neq.SWEEP"
-        f"&created_at=gte.now()-interval%2030%20seconds"
+        f"&created_at=gte.{quote(cutoff)}"
     )
     headers = {
         "apikey":        _SUPABASE_KEY,
@@ -283,6 +279,15 @@ async def _bus_signal_listener():
                 data = msg.get("data", {})
                 sig  = data.get("signal", {})
                 ep   = data.get("episode", {})
+
+                # Bug fix: the published signal dict uses key "alert", not "alert_level".
+                # Try both; fall back to "WATCH" so the NOT NULL constraint is always satisfied.
+                alert_level = (
+                    sig.get("alert_level")
+                    or sig.get("alert")
+                    or "WATCH"
+                )
+
                 await persist_flow_episode({
                     "ticker":          sig.get("ticker"),
                     "direction":       ep.get("direction"),
@@ -291,9 +296,7 @@ async def _bus_signal_listener():
                     "expiry":          None,
                     "total_premium":   ep.get("total_premium"),
                     "trade_count":     ep.get("trade_count"),
-                    # ALERT-LEVEL fix: use alert_level (CONVICTION/STRONG_SIGNAL/ALERT/WATCH)
-                    # not recommendation (BUY/SELL/HOLD) from the composite signal.
-                    "alert_level":     sig.get("alert_level"),
+                    "alert_level":     alert_level,
                     "is_accelerating": ep.get("is_accelerating", False),
                     "seed_episode":    sig.get("reasoning"),
                     "timestamp":       ep.get("timestamp"),
