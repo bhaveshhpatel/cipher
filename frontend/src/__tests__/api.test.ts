@@ -25,6 +25,21 @@
  *   - Includes limit and offset params
  *   - Sends Authorization header
  *
+ *   api.getFlowEvents:
+ *   - Calls /api/flow/events
+ *   - Sends Authorization header
+ *   - Forwards ticker, sentiment, contract_type, tier params
+ *   - Forwards aggressive and golden_sweep as string booleans
+ *   - Forwards limit and offset as strings
+ *   - Omits params not provided
+ *
+ *   api.getFlowEpisodes:
+ *   - Calls /api/flow/episodes
+ *   - Sends Authorization header
+ *   - Forwards ticker, direction, contract_type, alert_level params
+ *   - Forwards limit and offset as strings
+ *   - Omits params not provided
+ *
  *   api.runSimulation:
  *   - Calls /api/simulation/run with POST + JSON body
  *   - Body includes ticker, flow_events, n_agents, n_runs
@@ -39,7 +54,7 @@
  *   - Sends Authorization header
  *
  *   api.getSignalHistory:
- *   - No params → only limit/offset not included if undefined
+ *   - No params -> only limit/offset not included if undefined
  *   - ticker param forwarded
  *   - direction param forwarded
  *   - tier param forwarded
@@ -51,7 +66,7 @@
 
 import { api } from '../lib/api';
 
-// ── global fetch mock ─────────────────────────────────────────────────────────
+// -- global fetch mock --------------------------------------------------------
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch;
@@ -84,7 +99,7 @@ afterEach(() => {
 });
 
 
-// ── req() helper ──────────────────────────────────────────────────────────────
+// -- req() helper -------------------------------------------------------------
 
 test('successful 200 returns parsed JSON', async () => {
   mockFetch.mockReturnValue(_ok({ access_token: 'abc' }));
@@ -118,7 +133,7 @@ test('timeout AbortError throws timed out message', async () => {
 });
 
 
-// ── api.login ─────────────────────────────────────────────────────────────────
+// -- api.login ----------------------------------------------------------------
 
 test('api.login calls /api/auth/token with POST', async () => {
   mockFetch.mockReturnValue(_ok({ access_token: 'tok' }));
@@ -149,7 +164,7 @@ test('api.login uses application/x-www-form-urlencoded content type', async () =
 });
 
 
-// ── api.register ──────────────────────────────────────────────────────────────
+// -- api.register -------------------------------------------------------------
 
 test('api.register calls /api/auth/register with POST + JSON', async () => {
   mockFetch.mockReturnValue(_ok({ message: 'User created' }));
@@ -163,7 +178,7 @@ test('api.register calls /api/auth/register with POST + JSON', async () => {
 });
 
 
-// ── api.getFlow ───────────────────────────────────────────────────────────────
+// -- api.getFlow --------------------------------------------------------------
 
 test('api.getFlow includes ticker param when provided', async () => {
   mockFetch.mockReturnValue(_ok({ events: [], total: 0, limit: 100, offset: 0, ticker: 'AAPL' }));
@@ -196,7 +211,160 @@ test('api.getFlow sends Authorization header', async () => {
 });
 
 
-// ── api.runSimulation ─────────────────────────────────────────────────────────
+// -- api.getFlowEvents --------------------------------------------------------
+
+const _eventsOk = () => _ok({ events: [], total: 0, limit: 50, offset: 0 });
+
+test('api.getFlowEvents calls /api/flow/events', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN);
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('/api/flow/events');
+});
+
+test('api.getFlowEvents sends Authorization header', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN);
+  const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+  const headers = opts.headers as Record<string, string>;
+  expect(headers['Authorization']).toBe(`Bearer ${TOKEN}`);
+});
+
+test('api.getFlowEvents forwards ticker param', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { ticker: 'SPY' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('ticker=SPY');
+});
+
+test('api.getFlowEvents forwards sentiment param', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { sentiment: 'BULLISH' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('sentiment=BULLISH');
+});
+
+test('api.getFlowEvents forwards contract_type param', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { contract_type: 'CALL' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('contract_type=CALL');
+});
+
+test('api.getFlowEvents forwards tier param', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { tier: 'T1' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('tier=T1');
+});
+
+test('api.getFlowEvents forwards aggressive=true as string', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { aggressive: true });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('aggressive=true');
+});
+
+test('api.getFlowEvents forwards aggressive=false as string', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { aggressive: false });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('aggressive=false');
+});
+
+test('api.getFlowEvents forwards golden_sweep=true as string', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { golden_sweep: true });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('golden_sweep=true');
+});
+
+test('api.getFlowEvents forwards limit and offset as strings', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, { limit: 20, offset: 40 });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('limit=20');
+  expect(url).toContain('offset=40');
+});
+
+test('api.getFlowEvents omits params not provided', async () => {
+  mockFetch.mockReturnValue(_eventsOk());
+  await api.getFlowEvents(TOKEN, {});
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).not.toContain('ticker=');
+  expect(url).not.toContain('sentiment=');
+  expect(url).not.toContain('contract_type=');
+  expect(url).not.toContain('tier=');
+});
+
+
+// -- api.getFlowEpisodes ------------------------------------------------------
+
+const _episodesOk = () => _ok({ episodes: [], total: 0, limit: 50, offset: 0 });
+
+test('api.getFlowEpisodes calls /api/flow/episodes', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN);
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('/api/flow/episodes');
+});
+
+test('api.getFlowEpisodes sends Authorization header', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN);
+  const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+  const headers = opts.headers as Record<string, string>;
+  expect(headers['Authorization']).toBe(`Bearer ${TOKEN}`);
+});
+
+test('api.getFlowEpisodes forwards ticker param', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { ticker: 'AAPL' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('ticker=AAPL');
+});
+
+test('api.getFlowEpisodes forwards direction param', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { direction: 'BULLISH' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('direction=BULLISH');
+});
+
+test('api.getFlowEpisodes forwards contract_type param', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { contract_type: 'PUT' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('contract_type=PUT');
+});
+
+test('api.getFlowEpisodes forwards alert_level param', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { alert_level: 'STRONG' });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('alert_level=STRONG');
+});
+
+test('api.getFlowEpisodes forwards limit and offset as strings', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, { limit: 10, offset: 20 });
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).toContain('limit=10');
+  expect(url).toContain('offset=20');
+});
+
+test('api.getFlowEpisodes omits params not provided', async () => {
+  mockFetch.mockReturnValue(_episodesOk());
+  await api.getFlowEpisodes(TOKEN, {});
+  const [url] = mockFetch.mock.calls[0] as [string];
+  expect(url).not.toContain('ticker=');
+  expect(url).not.toContain('direction=');
+  expect(url).not.toContain('contract_type=');
+  expect(url).not.toContain('alert_level=');
+});
+
+
+// -- api.runSimulation --------------------------------------------------------
 
 test('api.runSimulation calls /api/simulation/run with POST + JSON body', async () => {
   const fake: import('../lib/api').SimulationResult = {
@@ -225,7 +393,7 @@ test('api.runSimulation sends Authorization header', async () => {
 });
 
 
-// ── api.getComposite ──────────────────────────────────────────────────────────
+// -- api.getComposite ---------------------------------------------------------
 
 test('api.getComposite calls correct URL with ticker', async () => {
   mockFetch.mockReturnValue(_ok({ ticker: 'NVDA', recommendation: 'BUY',
@@ -245,7 +413,7 @@ test('api.getComposite sends Authorization header', async () => {
 });
 
 
-// ── api.getStats ──────────────────────────────────────────────────────────────
+// -- api.getStats -------------------------------------------------------------
 
 test('api.getStats calls /api/signals/stream/stats', async () => {
   mockFetch.mockReturnValue(_ok({ stats: { active_symbols: 5, ticks: 100,
@@ -264,7 +432,7 @@ test('api.getStats sends Authorization header', async () => {
 });
 
 
-// ── api.getSignalHistory ──────────────────────────────────────────────────────
+// -- api.getSignalHistory -----------------------------------------------------
 
 const _historyOk = () => _ok({ signals: [], total: 0, limit: 50, offset: 0 });
 
