@@ -10,6 +10,9 @@ BUG FIX (2026-04-24): Fixed to query flow_episodes (the populated table).
 BUG FIX (2026-04-26): Malformed rows (missing expiry) skipped in /scan.
 FEAT  (2026-04-28): Added /events + /episodes endpoints (Chunk 1).
 BUG FIX (2026-04-29): Renamed tier -> influence_tier in flow_events select + filter.
+BUG FIX (2026-04-29): Replace nonexistent 'timestamp' col with 'created_at' in
+                      flow_events query (Supabase 42703). Expand select to include
+                      conviction_score, dte, trade_type, iv, underlying_price, occ_symbol.
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -74,21 +77,27 @@ class FlowResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class FlowEventRaw(BaseModel):
-    id:              Optional[str]   = None
-    ticker:          str
-    strike:          Optional[float] = None
-    expiry:          Optional[str]   = None
-    contract_type:   str
-    sentiment:       str
-    premium:         float
-    size:            int
-    bid:             Optional[float] = None
-    ask:             Optional[float] = None
-    fill_price:      Optional[float] = None
-    influence_tier:  Optional[str]   = None
-    is_aggressive:   bool
-    is_golden_sweep: bool
-    timestamp:       Optional[str]   = None
+    id:               Optional[str]   = None
+    ticker:           str
+    strike:           Optional[float] = None
+    expiry:           Optional[str]   = None
+    dte:              Optional[int]   = None
+    contract_type:    str
+    trade_type:       Optional[str]   = None
+    sentiment:        str
+    premium:          float
+    size:             int
+    bid:              Optional[float] = None
+    ask:              Optional[float] = None
+    fill_price:       Optional[float] = None
+    influence_tier:   Optional[str]   = None
+    conviction_score: Optional[float] = None
+    is_aggressive:    bool
+    is_golden_sweep:  bool
+    iv:               Optional[float] = None
+    underlying_price: Optional[float] = None
+    occ_symbol:       Optional[str]   = None
+    timestamp:        Optional[str]   = None  # mapped from created_at
 
 
 class FlowEventsResponse(BaseModel):
@@ -223,9 +232,11 @@ async def _query_flow_events(
 
     url = f"{url_base}/rest/v1/flow_events"
     params: dict = {
-        "select": "id,ticker,strike,expiry,contract_type,sentiment,premium,size,"
-                  "bid,ask,fill_price,influence_tier,is_aggressive,is_golden_sweep,timestamp",
-        "order":  "timestamp.desc",
+        # 'timestamp' does not exist — the column is 'created_at'
+        "select": "id,ticker,strike,expiry,dte,contract_type,trade_type,sentiment,"
+                  "premium,size,bid,ask,fill_price,influence_tier,conviction_score,"
+                  "is_aggressive,is_golden_sweep,iv,underlying_price,occ_symbol,created_at",
+        "order":  "created_at.desc",
         "limit":  str(limit),
         "offset": str(offset),
     }
@@ -424,21 +435,27 @@ async def get_flow_events(
     for r in rows:
         try:
             events.append(FlowEventRaw(
-                id              = str(r.get("id") or "") or None,
-                ticker          = r.get("ticker") or "",
-                strike          = float(r["strike"]) if r.get("strike") is not None else None,
-                expiry          = r.get("expiry") or None,
-                contract_type   = r.get("contract_type") or "CALL",
-                sentiment       = r.get("sentiment") or "NEUTRAL",
-                premium         = float(r.get("premium") or 0),
-                size            = int(r.get("size") or 0),
-                bid             = float(r["bid"]) if r.get("bid") is not None else None,
-                ask             = float(r["ask"]) if r.get("ask") is not None else None,
-                fill_price      = float(r["fill_price"]) if r.get("fill_price") is not None else None,
-                influence_tier  = r.get("influence_tier") or None,
-                is_aggressive   = bool(r.get("is_aggressive", False)),
-                is_golden_sweep = bool(r.get("is_golden_sweep", False)),
-                timestamp       = r.get("timestamp") or None,
+                id               = str(r.get("id") or "") or None,
+                ticker           = r.get("ticker") or "",
+                strike           = float(r["strike"]) if r.get("strike") is not None else None,
+                expiry           = r.get("expiry") or None,
+                dte              = int(r["dte"]) if r.get("dte") is not None else None,
+                contract_type    = r.get("contract_type") or "CALL",
+                trade_type       = r.get("trade_type") or None,
+                sentiment        = r.get("sentiment") or "NEUTRAL",
+                premium          = float(r.get("premium") or 0),
+                size             = int(r.get("size") or 0),
+                bid              = float(r["bid"]) if r.get("bid") is not None else None,
+                ask              = float(r["ask"]) if r.get("ask") is not None else None,
+                fill_price       = float(r["fill_price"]) if r.get("fill_price") is not None else None,
+                influence_tier   = r.get("influence_tier") or None,
+                conviction_score = float(r["conviction_score"]) if r.get("conviction_score") is not None else None,
+                is_aggressive    = bool(r.get("is_aggressive", False)),
+                is_golden_sweep  = bool(r.get("is_golden_sweep", False)),
+                iv               = float(r["iv"]) if r.get("iv") is not None else None,
+                underlying_price = float(r["underlying_price"]) if r.get("underlying_price") is not None else None,
+                occ_symbol       = r.get("occ_symbol") or None,
+                timestamp        = r.get("created_at") or None,
             ))
         except Exception as e:
             log.warning(f"[flow/events] row parse error: {e} — row={r}")
