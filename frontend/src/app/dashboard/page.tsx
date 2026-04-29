@@ -5,6 +5,8 @@ import { useAuth } from "@/hooks/useAuth";
 import { useFlow } from "@/hooks/useFlow";
 import { useSimulation } from "@/hooks/useSimulation";
 import { useSignalStream } from "@/hooks/useSignalStream";
+import { useFlowEvents } from "@/hooks/useFlowEvents";
+import { useFlowEpisodes } from "@/hooks/useFlowEpisodes";
 import { api } from "@/lib/api";
 import type { StreamStats, CompositeSignal } from "@/lib/api";
 
@@ -16,15 +18,26 @@ import { SignalFeed } from "@/components/dashboard/SignalFeed";
 import { SimulationPanel } from "@/components/dashboard/SimulationPanel";
 import { CompositeCard } from "@/components/dashboard/CompositeCard";
 import { SignalHistory } from "@/components/dashboard/SignalHistory";
+import { FlowEventsTab } from "@/components/dashboard/FlowEventsTab";
+import { FlowEpisodesTab } from "@/components/dashboard/FlowEpisodesTab";
 
-type Tab = "flow" | "signals" | "simulation" | "composite" | "history";
+type Tab =
+  | "flow"
+  | "signals"
+  | "simulation"
+  | "composite"
+  | "history"
+  | "flow_events"
+  | "flow_episodes";
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "flow",       label: "Flow Scanner",  icon: "⟁" },
-  { id: "signals",    label: "Live Signals",   icon: "◉" },
-  { id: "simulation", label: "AI Simulation",  icon: "⬡" },
-  { id: "composite",  label: "Composite",      icon: "◈" },
-  { id: "history",    label: "Signal History", icon: "🕐" },
+  { id: "flow",          label: "Flow Scanner",  icon: "⟁" },
+  { id: "signals",       label: "Live Signals",   icon: "◉" },
+  { id: "simulation",    label: "AI Simulation",  icon: "⬡" },
+  { id: "composite",     label: "Composite",      icon: "◈" },
+  { id: "history",       label: "Signal History", icon: "🕐" },
+  { id: "flow_events",   label: "Flow Events",    icon: "⟁" },
+  { id: "flow_episodes", label: "Episodes",       icon: "◎" },
 ];
 
 const FLOW_REFRESH_MS  = 30_000;
@@ -36,6 +49,10 @@ export default function DashboardPage() {
   const { events, loading: flowLoading, error: flowError, fetch: fetchFlow } = useFlow(token);
   const { result: simResult, loading: simLoading, error: simError, progress, run: runSim } = useSimulation(token);
   const { signals, connected } = useSignalStream(token);
+
+  // Chunk-2 hooks
+  const { events: flowEventRows, loading: feLoading, error: feError, fetch: fetchFlowEvents } = useFlowEvents(token);
+  const { episodes, loading: epLoading, error: epError, fetch: fetchFlowEpisodes } = useFlowEpisodes(token);
 
   const [flowTicker,      setFlowTicker]      = useState("");
   const [compositeTicker, setCompositeTicker] = useState("");
@@ -288,6 +305,46 @@ export default function DashboardPage() {
               <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>Persisted composite signals · flow × 0.55 + backtest × 0.35 + volume-premium × 0.10</p>
             </div>
             <SignalHistory token={token} />
+          </div>
+        )}
+
+        {/* ── Chunk 2: Flow Events tab ── */}
+        {tab === "flow_events" && token && (
+          <div className="flex flex-col gap-4">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Flow Events</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                  Raw per-trade rows from live stream · 10s auto-refresh
+                </p>
+              </div>
+            </div>
+            <FlowEventsTab
+              events={flowEventRows}
+              loading={feLoading}
+              error={feError}
+              onFilter={fetchFlowEvents}
+            />
+          </div>
+        )}
+
+        {/* ── Chunk 2: Episodes tab ── */}
+        {tab === "flow_episodes" && token && (
+          <div className="flex flex-col gap-4">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h1 className="text-xl font-bold" style={{ color: "var(--text)" }}>Repetition Episodes</h1>
+                <p className="text-sm mt-0.5 font-mono" style={{ color: "var(--muted)" }}>
+                  Aggregated repetition clusters · 30s auto-refresh
+                </p>
+              </div>
+            </div>
+            <FlowEpisodesTab
+              episodes={episodes}
+              loading={epLoading}
+              error={epError}
+              onFilter={fetchFlowEpisodes}
+            />
           </div>
         )}
 
