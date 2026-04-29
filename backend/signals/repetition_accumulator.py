@@ -11,10 +11,16 @@ Signal cooldown guard (C-007):
   After an episode first crosses the threshold it only re-emits once
   `signal_cooldown` minutes have elapsed since the last emission.
 
+Gate-2 retrigger guard:
+  After the first emission, a subsequent tick only re-emits when
+  (total_premium - last_signaled_premium) >= retrigger_delta.
+  This prevents spam on tiny ticks after the first signal fires.
+
 Defaults:
   min_trades=3
   min_premium=50_000
   signal_cooldown=5  (minutes)
+  retrigger_delta=50_000
 
 Alert levels:
   >= 5_000_000                            -> CONVICTION
@@ -34,10 +40,15 @@ log = logging.getLogger("repetition_accumulator")
 
 @dataclass
 class RepetitionEpisode:
-    ticker:         str
-    contract_type:  str
-    strike:         float
-    expiry:         str
+    ticker:                str
+    contract_type:         str
+    strike:                float = 0.0
+    expiry:                str   = ""
+    # Gate-2 tracking fields
+    occ_symbol:            Optional[str]  = None
+    direction:             Optional[str]  = None
+    last_signaled_premium: float          = 0.0
+    # Event accumulation
     events:         List   = field(default_factory=list)
     first_seen:     Optional[datetime] = None
     last_seen:      Optional[datetime] = None
@@ -80,10 +91,12 @@ class RepetitionAccumulator:
     Accumulates option flow ticks into episodes.
 
     Args:
-        window_minutes:  Rolling window — events older than this are pruned.
-        min_trades:      Minimum number of ticks required.
-        min_premium:     Minimum cumulative premium required.
-        signal_cooldown: Minutes to suppress re-signals after first emission.
+        window_minutes:   Rolling window — events older than this are pruned.
+        min_trades:       Minimum number of ticks required.
+        min_premium:      Minimum cumulative premium required.
+        signal_cooldown:  Minutes to suppress re-signals after first emission.
+        retrigger_delta:  Dollar amount of new premium required to re-emit
+                          after the first signal (Gate-2). Defaults to 50_000.
     """
 
     def __init__(
@@ -92,12 +105,14 @@ class RepetitionAccumulator:
         min_trades:      int   = 3,
         min_premium:     float = 50_000,
         signal_cooldown: int   = 0,
-        retrigger:       float = 50_000,  # kept for backward-compat, unused internally
+        retrigger:       float = 50_000,  # backward-compat alias
+        retrigger_delta: float = 50_000,  # canonical Gate-2 threshold
     ):
         self.window          = timedelta(minutes=window_minutes)
         self.min_trades      = min_trades
         self.min_premium     = min_premium
         self.signal_cooldown = timedelta(minutes=signal_cooldown)
+        self.retrigger_delta = retrigger_delta if retrigger_delta != 50_000 else retrigger
 
         self._episodes: dict = {}
         self._locks:    dict = {}
@@ -108,7 +123,18 @@ class RepetitionAccumulator:
     # ------------------------------------------------------------------ #
 
     def _key(self, ev) -> str:
-        return f"{ev.ticker}|{ev.contract_type}|{ev.strike:.2f}|{ev.expiry}"
+        # Support both dict-style and attribute-style events
+        if isinstance(ev, dict):
+            ticker = ev.get("ticker", "")
+            ctype  = ev.get("contract_type", "")
+            strike = ev.get("strike", 0.0)
+            expiry = ev.get("expiry", "")
+        else:
+            ticker = getattr(ev, "ticker", "")
+            ctype  = getattr(ev, "contract_type", "")
+            strike = getattr(ev, "strike", 0.0)
+            expiry = getattr(ev, "expiry", "")
+        return f"{ticker}|{ctype}|{float(strike):.2f}|{expiry}"
 
     # backward-compat alias used in many tests
     def _episode_key(self, ev) -> str:
@@ -127,15 +153,26 @@ class RepetitionAccumulator:
         return self._locks[key]
 
     # ------------------------------------------------------------------ #
+    # Event attribute helpers (dict or object)                            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _ev_attr(ev, attr: str, default=None):
+        if isinstance(ev, dict):
+            return ev.get(attr, default)
+        return getattr(ev, attr, default)
+
+    # ------------------------------------------------------------------ #
     # Core ingest                                                          #
     # ------------------------------------------------------------------ #
 
     async def ingest_tick(self, ev) -> Optional[RepetitionEpisode]:
         """
-        Ingest a parsed trade event. Returns the episode once both thresholds
-        are met (trade_count >= min_trades AND total_premium >= min_premium).
-        Does NOT apply signal_cooldown — callers wanting cooldown should use
-        ingest() or get_signal().
+        Ingest a parsed trade event. Returns the episode once both Gate-1
+        thresholds are met (trade_count >= min_trades AND total_premium >= min_premium).
+
+        Gate-2 retrigger guard: after the first emission, only re-emits when
+        (total_premium - last_signaled_premium) >= retrigger_delta.
         """
         key  = self._key(ev)
         lock = self._get_lock(key)
@@ -144,20 +181,47 @@ class RepetitionAccumulator:
             ep = self._episodes.get(key)
 
             if ep is None:
+                ticker = self._ev_attr(ev, "ticker", "")
+                ctype  = self._ev_attr(ev, "contract_type", "")
+                strike = float(self._ev_attr(ev, "strike", 0.0) or 0.0)
+                expiry = self._ev_attr(ev, "expiry", "") or ""
+                occ    = self._ev_attr(ev, "occ_symbol")
+                dirn   = self._ev_attr(ev, "direction") or self._ev_attr(ev, "sentiment")
                 ep = RepetitionEpisode(
-                    ticker=ev.ticker,
-                    contract_type=ev.contract_type,
-                    strike=ev.strike,
-                    expiry=ev.expiry,
+                    ticker=ticker,
+                    contract_type=ctype,
+                    strike=strike,
+                    expiry=expiry,
+                    occ_symbol=occ,
+                    direction=dirn,
                 )
                 self._episodes[key] = ep
 
             # Prune stale events from the rolling window
-            ev_ts = getattr(ev, "timestamp", None) or datetime.now(timezone.utc)
+            ev_ts = self._ev_attr(ev, "timestamp") or datetime.now(timezone.utc)
+            if isinstance(ev_ts, (int, float)):
+                from datetime import timezone as _tz
+                from datetime import datetime as _dt
+                ev_ts = _dt.fromtimestamp(ev_ts, tz=_tz.utc)
             cutoff = ev_ts - self.window
-            ep.events = [e for e in ep.events if getattr(e, "timestamp", ev_ts) >= cutoff]
 
-            ep.events.append(ev)
+            # Build a fake event wrapper if ev is a dict so events list stays homogeneous
+            class _DictWrapper:
+                def __init__(self, d):
+                    self._d = d
+                    self.premium   = d.get("premium", 0.0)
+                    self.timestamp = d.get("timestamp") or datetime.now(timezone.utc)
+                def __getattr__(self, name):
+                    return self._d.get(name)
+
+            ev_wrapped = _DictWrapper(ev) if isinstance(ev, dict) else ev
+
+            ep.events = [
+                e for e in ep.events
+                if getattr(e, "timestamp", ev_ts) >= cutoff
+            ]
+
+            ep.events.append(ev_wrapped)
             ep.last_seen  = ev_ts
             if ep.first_seen is None:
                 ep.first_seen = ev_ts
@@ -167,9 +231,18 @@ class RepetitionAccumulator:
                 del self._episodes[key]
                 return None
 
-            # Check thresholds
-            if ep.trade_count >= self.min_trades and ep.total_premium >= self.min_premium:
-                return ep
+            # Gate-1: minimum trades + premium threshold
+            if ep.trade_count < self.min_trades or ep.total_premium < self.min_premium:
+                return None
+
+            # Gate-2: retrigger delta guard
+            delta = ep.total_premium - ep.last_signaled_premium
+            if ep.last_signaled_premium > 0 and delta < self.retrigger_delta:
+                return None
+
+            # Emit — stamp the signaled premium watermark
+            ep.last_signaled_premium = ep.total_premium
+            return ep
 
         return None
 
@@ -181,7 +254,7 @@ class RepetitionAccumulator:
         ep = await self.ingest_tick(ev)
         if ep is None:
             return None
-        ev_ts = getattr(ev, "timestamp", None) or datetime.now(timezone.utc)
+        ev_ts = self._ev_attr(ev, "timestamp") or datetime.now(timezone.utc)
         return await self.get_signal(ev_ts, ep)
 
     # ------------------------------------------------------------------ #

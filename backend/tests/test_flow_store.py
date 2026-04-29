@@ -703,7 +703,11 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
     }
 
     test_bus = AsyncBus()
-    test_bus.subscribe("test_listener")  # subscribe without capturing queue
+    # AsyncBus is callback-based — subscribe requires a handler.
+    # We register a no-op handler here just to confirm subscribe works;
+    # _bus_signal_listener is wired via the patched bus, not this subscription.
+    async def _noop(msg): pass
+    test_bus.subscribe("test_listener", _noop)
 
     with patch("services.flow_store.persist_flow_episode", side_effect=fake_persist), \
          patch("services.flow_store.bus", test_bus):
@@ -814,11 +818,16 @@ def test_dedup_cache_is_duplicate_accepts_positional_occ_symbol():
 
 
 def test_dedup_cache_positional_call_does_not_raise():
-    """Calling is_duplicate positionally must not raise TypeError."""
+    """Calling is_duplicate positionally must not raise TypeError.
+
+    NOTE: The second positional param is 'size' (int) and the third is 'fill' (float).
+    fill_price is not a valid kwarg; the correct kwarg name is 'fill'.
+    """
     from utils.dedup import DedupCache
     cache = DedupCache()
     try:
-        cache.is_duplicate("AAPL240620C00180000", size=100, fill_price=2.35, exchange="CBOE")
+        # Correct kwargs: size=, fill= (NOT fill_price=)
+        cache.is_duplicate("AAPL240620C00180000", size=100, fill=2.35, exchange="CBOE")
     except TypeError as e:
         pytest.fail(f"DEDUP-KWARGS bug: positional call raised TypeError: {e}")
 
@@ -899,7 +908,8 @@ def test_repetition_accumulator_has_last_signaled_premium():
         pytest.skip("RepetitionEpisode not importable — skipping Gate-2 structural test")
 
 
-def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
+@pytest.mark.asyncio
+async def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
     """
     Gate-2: after first signal emission, ticks with < $50k new premium
     should NOT cause re-emission (ingest_tick returns None).
@@ -922,11 +932,11 @@ def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
 
         results = []
         for i in range(5):
-            result = acc.ingest_tick({**base_tick, "premium": 15_000.0})
+            result = await acc.ingest_tick({**base_tick, "premium": 15_000.0})
             results.append(result)
 
         small_tick = {**base_tick, "premium": 100.0}
-        result = acc.ingest_tick(small_tick)
+        result = await acc.ingest_tick(small_tick)
         first_emission = next((r for r in results if r is not None), None)
         if first_emission is not None:
             assert result is None, (
@@ -937,7 +947,8 @@ def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
         pytest.skip("RepetitionAccumulator not importable — skipping Gate-2 functional test")
 
 
-def test_gate2_retrigger_fires_on_large_delta():
+@pytest.mark.asyncio
+async def test_gate2_retrigger_fires_on_large_delta():
     """
     Gate-2: after first emission, a tick that pushes total_premium >= $50k above
     last_signaled_premium should re-emit (return episode).
@@ -960,7 +971,7 @@ def test_gate2_retrigger_fires_on_large_delta():
 
         first_ep = None
         for _ in range(5):
-            r = acc.ingest_tick(base_tick)
+            r = await acc.ingest_tick(base_tick)
             if r is not None:
                 first_ep = r
 
@@ -968,7 +979,7 @@ def test_gate2_retrigger_fires_on_large_delta():
             pytest.skip("Gate 1 not crossed — cannot test Gate-2 retrigger")
 
         large_tick = {**base_tick, "premium": 60_000.0}
-        result = acc.ingest_tick(large_tick)
+        result = await acc.ingest_tick(large_tick)
         assert result is not None, (
             "Gate-2 bug: large tick ($60k delta) should re-emit episode but returned None"
         )
