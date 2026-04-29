@@ -196,8 +196,10 @@ def test_lifespan_spawns_prewarm_task():
 def test_lifespan_upserts_quotes_on_warm_restart():
     """
     Warm-restart regression: when _resolve_startup_universe returns quotes=[]
-    (HIT path — fresh DB snapshot found), lifespan must re-fetch quotes via
-    _fetch_batch_quotes and call upsert_symbol_quotes exactly once.
+    (HIT path — fresh DB snapshot found), lifespan launches
+    _background_build_and_upsert which calls _post_build_upsert, which in
+    turn calls upsert_symbol_quotes.  This test drives that entire chain to
+    completion and asserts upsert_symbol_quotes is called exactly once.
 
     This guards against the bug where last_price / volume / open_interest /
     average_volume stayed NULL on every restart after the first cold start.
@@ -205,34 +207,27 @@ def test_lifespan_upserts_quotes_on_warm_restart():
     import asyncio
     import main as main_module
 
-    upsert_call_count = []
+    mock_upsert = AsyncMock()
 
     async def _run():
         mock_registry = MagicMock()
-        mock_registry.build = AsyncMock(return_value=100)
-        mock_registry.size = MagicMock(return_value=100)
+        # build() must return a tuple[int, dict] as per the H1 contract.
+        fake_raw = {"AAPL": {"last": 185.0, "volume": 1_000_000, "average_volume": 5_000_000}}
+        mock_registry.build = AsyncMock(return_value=(1, fake_raw))
+        mock_registry.size = MagicMock(return_value=1)
         mock_registry.get_oi_map = MagicMock(return_value={"AAPL": 500})
         mock_registry.refresh_loop = AsyncMock()
         mock_registry.set_tier_map = MagicMock()
         mock_registry.load_from_db = AsyncMock(return_value=0)
         mock_registry.is_ready = MagicMock(return_value=True)
-
-        fake_quote = MagicMock()
-        fake_quote.symbol = "AAPL"
-        fake_quote.open_interest = 0
-
-        mock_upsert = AsyncMock()
-        upsert_call_count.append(mock_upsert)
+        mock_registry.all_symbols = MagicMock(return_value=["AAPL"])
 
         with patch.object(main_module, "_resolve_startup_universe",
                           new_callable=AsyncMock,
-                          # warm-restart: stream_symbols populated, quotes empty
+                          # warm-restart HIT: stream_symbols populated, quotes=[]
                           return_value=(["AAPL"], {"AAPL": 1}, [], "snap-warm-001")), \
              patch.object(main_module, "init_registry",
                           return_value=mock_registry), \
-             patch.object(main_module, "_fetch_batch_quotes",
-                          new_callable=AsyncMock,
-                          return_value=[fake_quote]), \
              patch.object(main_module, "assign_tiers",
                           new_callable=AsyncMock, return_value={"AAPL": 1}), \
              patch.object(main_module.universe_store, "upsert_symbol_quotes",
@@ -248,7 +243,10 @@ def test_lifespan_upserts_quotes_on_warm_restart():
              patch.object(main_module, "_registry_prewarm_loop",
                           new_callable=AsyncMock):
             async with main_module.lifespan(main_module.app):
-                pass
+                # Allow the background build task to run to completion
+                # before the lifespan context exits and cancels tasks.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
 
     try:
         asyncio.run(_run())
@@ -256,7 +254,6 @@ def test_lifespan_upserts_quotes_on_warm_restart():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    mock_upsert = upsert_call_count[0]
     assert mock_upsert.called, (
         "upsert_symbol_quotes was NOT called on warm-restart — "
         "last_price/volume/oi columns will stay NULL"
