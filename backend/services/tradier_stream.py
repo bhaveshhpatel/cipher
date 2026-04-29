@@ -46,6 +46,23 @@ Fix (DEDUP-KWARGS 2026-04-28):
   Passing occ_symbol= as a keyword arg raised:
     DedupCache.is_duplicate() got an unexpected keyword argument 'occ_symbol'
   Fix: pass occ_symbol positionally as the first arg.
+
+Fix (BUG-1 2026-04-29):
+  composite_signal bus message was missing alert_level in signal dict.
+  signal_store._build_row() reads sig.get("alert_level") — always got None
+  because the key was never included, causing every composite signal to fall
+  through to score-based alert level logic and ignoring premium-tier
+  classification (CONVICTION / STRONG_SIGNAL / ALERT / WATCH) entirely.
+  Fix: add "alert_level": alert_level to composite_msg["data"]["signal"].
+
+Fix (SIGNAL-GATE 2026-04-29):
+  accumulator was instantiated with min_trades=1 / min_premium=10_000 so
+  every persisted trade also fired a signal (persisted == signals == 7,072).
+  Decision (2026-04-28): continue accumulating at the low persist threshold
+  for flow_events writes, but only publish to the signal bus when the episode
+  has trade_count >= 3 AND total_premium > 50_000.
+  Fix: explicit gate check in _process_trade after sig_ep cooldown passes,
+  before alert_level / composite / bus publish. Persist path unchanged.
 """
 import asyncio
 import logging
@@ -99,6 +116,15 @@ _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
+
+# ---------------------------------------------------------------------------
+# Signal gate thresholds (2026-04-28 decision):
+#   Persist to flow_events at low threshold (min_trades=1 / min_premium=10_000).
+#   Only publish to signal bus when episode has >= _SIGNAL_MIN_TRADES trades
+#   AND total_premium > _SIGNAL_MIN_PREMIUM.
+# ---------------------------------------------------------------------------
+_SIGNAL_MIN_TRADES  = 3
+_SIGNAL_MIN_PREMIUM = 50_000
 
 # ---------------------------------------------------------------------------
 # Global stats
@@ -340,6 +366,17 @@ async def _process_trade(raw: dict):
       DedupCache.is_duplicate() first positional param is `event_or_occ_symbol`.
       Passing occ_symbol= as a keyword arg raised an unexpected keyword error.
       Fix: pass occ_symbol as first positional argument.
+
+    BUG-1 fix (2026-04-29):
+      alert_level is now included in composite_msg["data"]["signal"] so
+      signal_store._build_row() receives the correct premium-tier classification.
+
+    SIGNAL-GATE fix (2026-04-29):
+      After persist_flow_event, an explicit gate ensures signals are only
+      published to the bus when the episode has >= _SIGNAL_MIN_TRADES trades
+      AND total_premium > _SIGNAL_MIN_PREMIUM ($50K). Persist path is
+      unaffected — all trades above the low accumulator threshold still write
+      to flow_events.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -531,6 +568,17 @@ async def _process_trade(raw: dict):
     if not sig_ep:
         return
 
+    # SIGNAL-GATE (2026-04-29): only fire signal when episode qualifies.
+    # Persist already happened above — flow_events always written at low threshold.
+    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _SIGNAL_MIN_PREMIUM:
+        log.debug(
+            "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
+            sig_ep.ticker, sig_ep.contract_type,
+            sig_ep.trade_count, _SIGNAL_MIN_TRADES,
+            sig_ep.total_premium, _SIGNAL_MIN_PREMIUM,
+        )
+        return
+
     alert_level = accumulator.get_alert_level(sig_ep)
 
     log.info(
@@ -587,6 +635,7 @@ async def _process_trade(raw: dict):
                     "backtest_score":        composite.backtest_score,
                     "volume_premium_factor": composite.volume_premium_factor,
                     "reasoning":             composite.reasoning,
+                    "alert_level":           alert_level,   # BUG-1 fix (2026-04-29)
                 },
                 "episode": {
                     "contract_type":   sig_ep.contract_type,
@@ -664,6 +713,7 @@ async def _demo_mode_once(symbols: list[str]):
                         "backtest_score":        round(rng.uniform(0.4, 0.85), 3),
                         "volume_premium_factor": round(rng.uniform(0.3, 0.8), 3),
                         "reasoning":             f"Demo synthetic signal for {ticker}",
+                        "alert_level":           rng.choices(levels, weights=[5, 15, 30, 50])[0],
                     },
                     "episode": {
                         "contract_type":   ctype,
