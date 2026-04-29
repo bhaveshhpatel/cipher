@@ -18,8 +18,6 @@ import time
 from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 import main as main_module
 from services.symbol_registry import ContractMeta, SymbolRegistry
 
@@ -113,16 +111,20 @@ class TestH1PostBuildUpsertRawQuotes:
         r = MagicMock()
         r.size.return_value = size
         r.all_symbols.return_value = ["AAPL"]
+        r.get_oi_map.return_value = {}
+        r.set_tier_map = MagicMock()
         return r
 
     def test_no_fetch_batch_quotes_when_raw_quotes_provided(self):
+        # Source calls universe_store.upsert_symbol_quotes, not main.upsert_symbol_quotes.
+        # Patch the object on main.universe_store so the import reference is intercepted.
         mock_upsert = AsyncMock()
         mock_assign = AsyncMock(return_value={"AAPL": 1})
         raw = {"AAPL": {"last": 185.0, "volume": 1000, "average_volume": 5000}}
 
-        with patch("main.upsert_symbol_quotes", mock_upsert), \
-             patch("main.assign_tiers", mock_assign), \
-             patch("main.get_quotes_batch", new=AsyncMock()) as mock_fetch:
+        with patch.object(main_module.universe_store, "upsert_symbol_quotes", mock_upsert), \
+             patch.object(main_module, "assign_tiers", mock_assign), \
+             patch.object(main_module, "_fetch_batch_quotes", new=AsyncMock()) as mock_fetch:
             _run(main_module._post_build_upsert(
                 self._fake_registry(), ["AAPL"], raw_quotes=raw
             ))
@@ -132,12 +134,14 @@ class TestH1PostBuildUpsertRawQuotes:
     def test_fetches_quotes_when_raw_quotes_is_none(self):
         mock_upsert = AsyncMock()
         mock_assign = AsyncMock(return_value={"AAPL": 1})
-        fetched = {"AAPL": {"last": 185.0, "volume": 1000, "average_volume": 5000}}
+        from services.symbols_loader import SymbolQuote
+        fetched = [SymbolQuote(symbol="AAPL", last_price=185.0, volume=1000,
+                               average_volume=5000, open_interest=0)]
         mock_fetch = AsyncMock(return_value=fetched)
 
-        with patch("main.upsert_symbol_quotes", mock_upsert), \
-             patch("main.assign_tiers", mock_assign), \
-             patch("main.get_quotes_batch", mock_fetch):
+        with patch.object(main_module.universe_store, "upsert_symbol_quotes", mock_upsert), \
+             patch.object(main_module, "assign_tiers", mock_assign), \
+             patch.object(main_module, "_fetch_batch_quotes", mock_fetch):
             _run(main_module._post_build_upsert(
                 self._fake_registry(), ["AAPL"], raw_quotes=None
             ))
@@ -148,8 +152,8 @@ class TestH1PostBuildUpsertRawQuotes:
         mock_upsert = AsyncMock()
         mock_assign = AsyncMock(return_value={})
 
-        with patch("main.upsert_symbol_quotes", mock_upsert), \
-             patch("main.assign_tiers", mock_assign):
+        with patch.object(main_module.universe_store, "upsert_symbol_quotes", mock_upsert), \
+             patch.object(main_module, "assign_tiers", mock_assign):
             _run(main_module._post_build_upsert(
                 self._fake_registry(size=0), [], raw_quotes={}
             ))
@@ -162,12 +166,15 @@ class TestH1PostBuildUpsertRawQuotes:
         mock_registry.all_symbols.return_value = ["AAPL"]
         mock_post = AsyncMock()
 
-        with patch("main._post_build_upsert", mock_post):
+        with patch.object(main_module, "_post_build_upsert", mock_post):
             _run(main_module._background_build_and_upsert(mock_registry, ["AAPL"]))
 
         assert mock_post.called
         _, kwargs = mock_post.call_args
-        raw = kwargs.get("raw_quotes") or mock_post.call_args[0][2] if len(mock_post.call_args[0]) > 2 else kwargs.get("raw_quotes")
+        raw = kwargs.get("raw_quotes") or (
+            mock_post.call_args[0][2] if len(mock_post.call_args[0]) > 2
+            else kwargs.get("raw_quotes")
+        )
         assert raw is not None
 
 
@@ -251,6 +258,7 @@ class TestH3IncrementalGuard:
     def test_load_from_db_does_not_set_seeded_flag(self):
         """
         load_from_db() must NOT set _build_complete; only build() sets it.
+        Patch chain_store._client so no real Supabase connection is attempted.
         """
         r = SymbolRegistry(watchlist=["AAPL"], tier_map={})
         future_date = (date.today() + timedelta(days=30)).isoformat()
@@ -261,7 +269,10 @@ class TestH3IncrementalGuard:
             )
         }
 
-        with patch("services.chain_store.load_chain", new=AsyncMock(return_value=chain)):
+        # Patch both chain_store.load_chain (async wrapper) AND chain_store._client
+        # so the sync _sync_load_chain path never tries to connect to Supabase.
+        with patch("services.chain_store.load_chain", new=AsyncMock(return_value=chain)), \
+             patch("services.chain_store._client", side_effect=RuntimeError("patched")):
             _run(r.load_from_db("snap-001"))
 
         assert r._registry  # registry populated
@@ -297,12 +308,10 @@ class TestH4SweepDispatchTTL:
         TTL = 5  # seconds, must match main.py _SWEEP_DEDUPE_TTL or test logic
 
         async def run_test():
-            # We test the eviction logic directly via main module's dedup cache
             cache = {}
             stale_ts = time.monotonic() - (TTL + 1)
             cache["OLD_KEY"] = stale_ts
 
-            # Simulate eviction: remove keys older than TTL
             now = time.monotonic()
             to_evict = [k for k, ts in cache.items() if now - ts > TTL]
             for k in to_evict:
