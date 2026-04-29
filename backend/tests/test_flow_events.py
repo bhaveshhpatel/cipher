@@ -70,23 +70,34 @@ def _patch_httpx(rows, status=200, content_range=""):
     return patch("routers.flow.httpx.AsyncClient", return_value=mock_client)
 
 
-_SAMPLE_ROW = {
+# _SAMPLE_ROW uses actual flow_events DB column names.
+# - 'influence_tier'  (not 'tier'  — that was the old name)
+# - 'created_at'      (not 'timestamp' — that column does not exist in DB)
+f_SAMPLE_ROW = {
     "id": "abc123",
     "ticker": "AAPL",
     "strike": 180.0,
     "expiry": "2026-05-16",
+    "dte": 17,
     "contract_type": "CALL",
+    "trade_type": "SWEEP",
     "sentiment": "BULLISH",
     "premium": 15000.0,
     "size": 100,
     "bid": 1.45,
     "ask": 1.50,
     "fill_price": 1.47,
-    "tier": "T1",
+    "influence_tier": "T1",
+    "conviction_score": 0.88,
     "is_aggressive": True,
     "is_golden_sweep": False,
-    "timestamp": "2026-04-28T15:00:00Z",
+    "iv": 0.42,
+    "underlying_price": 178.50,
+    "occ_symbol": "AAPL260516C00180000",
+    "created_at": "2026-04-28T15:00:00Z",
 }
+
+_SAMPLE_ROW = f_SAMPLE_ROW
 
 
 # ---------------------------------------------------------------------------
@@ -106,16 +117,21 @@ def test_events_happy_path(auth_client, monkeypatch):
     assert e["ticker"] == "AAPL"
     assert e["strike"] == 180.0
     assert e["contract_type"] == "CALL"
+    assert e["trade_type"] == "SWEEP"
     assert e["sentiment"] == "BULLISH"
     assert e["premium"] == 15000.0
     assert e["size"] == 100
     assert e["bid"] == 1.45
     assert e["ask"] == 1.50
     assert e["fill_price"] == 1.47
-    assert e["tier"] == "T1"
+    assert e["influence_tier"] == "T1"   # renamed from 'tier'
+    assert e["conviction_score"] == 0.88
     assert e["is_aggressive"] is True
     assert e["is_golden_sweep"] is False
-    assert e["timestamp"] == "2026-04-28T15:00:00Z"
+    assert e["iv"] == 0.42
+    assert e["underlying_price"] == 178.50
+    assert e["occ_symbol"] == "AAPL260516C00180000"
+    assert e["timestamp"] == "2026-04-28T15:00:00Z"  # mapped from created_at
 
 
 def test_events_default_limit_is_50(auth_client, monkeypatch):
@@ -153,9 +169,10 @@ def test_events_ticker_filter_uppercased(auth_client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("param,value,expected_key,expected_val", [
-    ("sentiment",     "bullish",  "sentiment",     "eq.BULLISH"),
-    ("contract_type", "put",      "contract_type", "eq.PUT"),
-    ("tier",          "t2",       "tier",           "eq.T2"),
+    ("sentiment",     "bullish",  "sentiment",      "eq.BULLISH"),
+    ("contract_type", "put",      "contract_type",  "eq.PUT"),
+    # URL query param is '?tier=', but the Supabase filter key is 'influence_tier'
+    ("tier",          "t2",       "influence_tier",  "eq.T2"),
 ])
 def test_events_string_filters(auth_client, monkeypatch, param, value, expected_key, expected_val):
     monkeypatch.setenv("SUPABASE_URL", "http://fake")
@@ -213,16 +230,18 @@ def test_events_combined_filters_in_response(auth_client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_events_null_optional_fields_handled(auth_client, monkeypatch):
-    """Row with null bid/ask/fill_price/expiry/tier returns without error."""
+    """Row with null bid/ask/fill_price/expiry/influence_tier returns without error."""
     monkeypatch.setenv("SUPABASE_URL", "http://fake")
     monkeypatch.setenv("SUPABASE_KEY", "fake-key")
     sparse_row = {
         "id": "x1", "ticker": "TSLA", "strike": None, "expiry": None,
-        "contract_type": "PUT", "sentiment": "BEARISH",
-        "premium": 5000.0, "size": 50,
+        "dte": None, "contract_type": "PUT", "trade_type": None,
+        "sentiment": "BEARISH", "premium": 5000.0, "size": 50,
         "bid": None, "ask": None, "fill_price": None,
-        "tier": None, "is_aggressive": False, "is_golden_sweep": False,
-        "timestamp": None,
+        "influence_tier": None, "conviction_score": None,
+        "is_aggressive": False, "is_golden_sweep": False,
+        "iv": None, "underlying_price": None, "occ_symbol": None,
+        "created_at": None,
     }
     with _patch_httpx([sparse_row]):
         resp = auth_client.get("/api/flow/events")
@@ -231,7 +250,8 @@ def test_events_null_optional_fields_handled(auth_client, monkeypatch):
     assert e["bid"] is None
     assert e["ask"] is None
     assert e["fill_price"] is None
-    assert e["tier"] is None
+    assert e["influence_tier"] is None   # renamed from 'tier'
+    assert e["timestamp"] is None
 
 
 def test_events_row_parse_error_skipped(auth_client, monkeypatch):
