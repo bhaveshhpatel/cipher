@@ -1,7 +1,8 @@
 # .circleci/config.yml
 # Mirrors .github/workflows/backend.yml
-# Two jobs: lint (pyflakes) + regression tests with 92% coverage gate.
-# On main branch only: deploys to Railway after tests pass.
+# Jobs: lint (pyflakes) + regression tests with 92% coverage gate +
+#        frontend_test (jest --ci, 75% coverage threshold).
+# On main branch only: deploys to Railway after all jobs pass.
 
 version: 2.1
 
@@ -102,7 +103,39 @@ jobs:
           destination: coverage.json
 
   # -----------------------------------------------------------------------
-  # Job 3: Deploy to Railway (main branch only, after tests pass)
+  # Job 3: Frontend tests (jest --ci, 75% coverage threshold)
+  # -----------------------------------------------------------------------
+  frontend_test:
+    docker:
+      - image: cimg/node:lts
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "frontend/package-lock.json" }}
+            - npm-v1-
+      - run:
+          name: Install frontend dependencies
+          working_directory: ~/project/frontend
+          command: npm ci
+      - save_cache:
+          key: npm-v1-{{ checksum "frontend/package-lock.json" }}
+          paths:
+            - ~/.npm
+      - run:
+          name: Type check
+          working_directory: ~/project/frontend
+          command: npx tsc --noEmit
+      - run:
+          name: Run jest with coverage
+          working_directory: ~/project/frontend
+          command: npx jest --ci --coverage --coverageReporters=text --coverageReporters=json-summary
+      - store_artifacts:
+          path: ~/project/frontend/coverage
+          destination: frontend-coverage
+
+  # -----------------------------------------------------------------------
+  # Job 4: Deploy to Railway (main branch only, after all jobs pass)
   # -----------------------------------------------------------------------
   deploy:
     docker:
@@ -128,6 +161,7 @@ workflows:
             branches:
               only:
                 - main
+                - /stable\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
@@ -137,6 +171,17 @@ workflows:
             branches:
               only:
                 - main
+                - /stable\/.*/
+                - /refactor\/.*/
+                - /feature\/.*/
+                - /fix\/.*/
+
+      - frontend_test:
+          filters:
+            branches:
+              only:
+                - main
+                - /stable\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
@@ -145,6 +190,7 @@ workflows:
           requires:
             - lint
             - regression
+            - frontend_test
           filters:
             branches:
               only: main
