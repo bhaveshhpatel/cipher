@@ -19,6 +19,7 @@ from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import main as main_module
+from services import chain_store as chain_store_mod
 from services.symbol_registry import ContractMeta, SymbolRegistry
 
 
@@ -258,7 +259,11 @@ class TestH3IncrementalGuard:
     def test_load_from_db_does_not_set_seeded_flag(self):
         """
         load_from_db() must NOT set _build_complete; only build() sets it.
-        Patch chain_store._client so no real Supabase connection is attempted.
+
+        SymbolRegistry.load_from_db() calls `await chain_store.load_chain(snapshot_id)`
+        where `chain_store` is the module imported at the top of symbol_registry.py.
+        We must patch `load_chain` on that exact module reference so the async
+        call is intercepted before Python ever runs _sync_load_chain / _client().
         """
         r = SymbolRegistry(watchlist=["AAPL"], tier_map={})
         future_date = (date.today() + timedelta(days=30)).isoformat()
@@ -269,13 +274,14 @@ class TestH3IncrementalGuard:
             )
         }
 
-        # Patch both chain_store.load_chain (async wrapper) AND chain_store._client
-        # so the sync _sync_load_chain path never tries to connect to Supabase.
-        with patch("services.chain_store.load_chain", new=AsyncMock(return_value=chain)), \
-             patch("services.chain_store._client", side_effect=RuntimeError("patched")):
+        # Patch load_chain on the chain_store module object that symbol_registry
+        # already holds a reference to (same object as services.chain_store).
+        # Using patch.object guarantees we replace the attribute on the module
+        # instance rather than going through a dotted string lookup.
+        with patch.object(chain_store_mod, "load_chain", new=AsyncMock(return_value=chain)):
             _run(r.load_from_db("snap-001"))
 
-        assert r._registry  # registry populated
+        assert r._registry, "registry should be populated after load_from_db"
         assert not r._build_complete  # build_complete must NOT be set
         assert not r.is_ready()       # is_ready() must still return False
 
