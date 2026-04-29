@@ -57,28 +57,28 @@ class TestAssignTiers:
     def test_spy_tier1(self):
         from services.tier_engine import assign_tiers
         q = _SQ("SPY", last_price=502.0, average_volume=80_000_000, open_interest=50000)
-        result = run(assign_tiers([q], thresholds=_thresh()))
+        result = run(assign_tiers([q], thresholds=_thresh(), require_oi=True))
         assert result["SPY"] == 1
 
     def test_hood_tier2(self):
         from services.tier_engine import assign_tiers
         q = _SQ("HOOD", last_price=25.0, average_volume=5_000_000, open_interest=800)
-        result = run(assign_tiers([q], thresholds=_thresh()))
+        result = run(assign_tiers([q], thresholds=_thresh(), require_oi=True))
         assert result["HOOD"] == 2
 
     def test_low_volume_tier3(self):
         from services.tier_engine import assign_tiers
         q = _SQ("XYZ", last_price=5.0, average_volume=600_000, open_interest=150)
-        assert run(assign_tiers([q], thresholds=_thresh()))["XYZ"] == 3
+        assert run(assign_tiers([q], thresholds=_thresh(), require_oi=True))["XYZ"] == 3
 
     def test_below_t3_minimum_still_tier3(self):
         from services.tier_engine import assign_tiers
         q = _SQ("PENNY", last_price=0.5, average_volume=100_000, open_interest=10)
-        assert run(assign_tiers([q], thresholds=_thresh()))["PENNY"] == 3
+        assert run(assign_tiers([q], thresholds=_thresh(), require_oi=True))["PENNY"] == 3
 
     def test_empty_quotes_returns_empty_dict(self):
         from services.tier_engine import assign_tiers
-        assert run(assign_tiers([], thresholds=_thresh())) == {}
+        assert run(assign_tiers([], thresholds=_thresh(), require_oi=True)) == {}
 
     def test_multiple_symbols_classified_independently(self):
         from services.tier_engine import assign_tiers
@@ -87,19 +87,19 @@ class TestAssignTiers:
             _SQ("HOOD", last_price=25.0,  average_volume=5_000_000,  open_interest=800),
             _SQ("XYZ",  last_price=5.0,   average_volume=600_000,    open_interest=150),
         ]
-        result = run(assign_tiers(quotes, thresholds=_thresh()))
+        result = run(assign_tiers(quotes, thresholds=_thresh(), require_oi=True))
         assert result["SPY"] == 1 and result["HOOD"] == 2 and result["XYZ"] == 3
 
     def test_tier1_boundary_exactly_at_threshold(self):
         from services.tier_engine import assign_tiers
         q = _SQ("EDGE", last_price=10.0, average_volume=20_000_000, open_interest=1000)
-        assert run(assign_tiers([q], thresholds=_thresh()))["EDGE"] == 1
+        assert run(assign_tiers([q], thresholds=_thresh(), require_oi=True))["EDGE"] == 1
 
     def test_missing_oi_defaults_to_tier3(self):
         from services.tier_engine import assign_tiers
-        # open_interest=0 (default) means OI gate fails — falls to T3
+        # open_interest=0 (default) — OI gate enforced → falls to T3
         q = _SQ("BARE", last_price=50.0, average_volume=30_000_000, open_interest=0)
-        assert run(assign_tiers([q], thresholds=_thresh()))["BARE"] == 3
+        assert run(assign_tiers([q], thresholds=_thresh(), require_oi=True))["BARE"] == 3
 
 
 # ===========================================================================
@@ -260,19 +260,19 @@ class TestOiGracePathRemoved:
     def test_oi_zero_t1_vol_price_yields_t3_not_t1(self):
         from services.tier_engine import _classify
         q = _SQ("AAPL", last_price=150.0, average_volume=25_000_000, open_interest=0)
-        assert _classify(q, _thresh()) == 3
+        assert _classify(q, _thresh(), require_oi=True) == 3
 
     def test_oi_zero_t2_vol_price_yields_t3_not_t2(self):
         from services.tier_engine import _classify
         q = _SQ("HOOD", last_price=15.0, average_volume=3_000_000, open_interest=0)
-        assert _classify(q, _thresh()) == 3
+        assert _classify(q, _thresh(), require_oi=True) == 3
 
     def test_real_oi_at_t1_threshold_promotes_to_t1(self):
         from services.tier_engine import _classify
         q = _SQ("NVDA", last_price=900.0, average_volume=25_000_000, open_interest=1_000)
-        assert _classify(q, _thresh()) == 1
+        assert _classify(q, _thresh(), require_oi=True) == 1
 
     def test_real_oi_one_below_t1_threshold_stays_t2(self):
         from services.tier_engine import _classify
         q = _SQ("NVDA", last_price=900.0, average_volume=25_000_000, open_interest=999)
-        assert _classify(q, _thresh()) == 2
+        assert _classify(q, _thresh(), require_oi=True) == 2
