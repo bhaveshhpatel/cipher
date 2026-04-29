@@ -12,6 +12,57 @@ export interface FlowEvent {
   premium: number; trade_type: string; sentiment: string; influence_tier: string;
   conviction_score: number; is_golden_sweep: boolean; timestamp: string;
 }
+
+/** Raw per-trade row from flow_events table (GET /api/flow/events) */
+export interface FlowEventRaw {
+  id: number;
+  ticker: string;
+  strike: number;
+  expiry: string;
+  contract_type: string;
+  sentiment: string;
+  premium: number;
+  size: number;
+  bid: number;
+  ask: number;
+  fill_price: number;
+  tier: string;
+  is_aggressive: boolean;
+  is_golden_sweep: boolean;
+  timestamp: string;
+  session_date: string;
+}
+
+/** Aggregated repetition episode from flow_episodes table (GET /api/flow/episodes) */
+export interface FlowEpisode {
+  id: number;
+  ticker: string;
+  direction: string;
+  contract_type: string;
+  alert_level: string;
+  trade_count: number;
+  total_premium: number;
+  last_signaled_premium: number;
+  duration_seconds: number;
+  started_at: string;
+  updated_at: string;
+  session_date: string;
+}
+
+export interface FlowEventsResponse {
+  events: FlowEventRaw[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface FlowEpisodesResponse {
+  episodes: FlowEpisode[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface SimulationResult {
   ticker: string; direction: string; confidence: number;
   bull_votes: number; bear_votes: number; hold_votes: number;
@@ -98,6 +149,56 @@ export const api = {
       `/api/flow/scan?${qs.toString()}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
+  },
+
+  getFlowEvents: (
+    token: string,
+    params: {
+      ticker?:         string;
+      sentiment?:      string;
+      contract_type?:  string;
+      tier?:           string;
+      aggressive?:     boolean;
+      golden_sweep?:   boolean;
+      limit?:          number;
+      offset?:         number;
+    } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.ticker)                           qs.set("ticker",         params.ticker);
+    if (params.sentiment)                        qs.set("sentiment",      params.sentiment);
+    if (params.contract_type)                    qs.set("contract_type",  params.contract_type);
+    if (params.tier)                             qs.set("tier",           params.tier);
+    if (params.aggressive !== undefined)         qs.set("aggressive",     String(params.aggressive));
+    if (params.golden_sweep !== undefined)       qs.set("golden_sweep",   String(params.golden_sweep));
+    if (params.limit !== undefined)              qs.set("limit",          String(params.limit));
+    if (params.offset !== undefined)             qs.set("offset",         String(params.offset));
+    return req<FlowEventsResponse>(`/api/flow/events?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  },
+
+  getFlowEpisodes: (
+    token: string,
+    params: {
+      ticker?:        string;
+      direction?:     string;
+      contract_type?: string;
+      alert_level?:   string;
+      limit?:         number;
+      offset?:        number;
+    } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.ticker)                           qs.set("ticker",        params.ticker);
+    if (params.direction)                        qs.set("direction",     params.direction);
+    if (params.contract_type)                    qs.set("contract_type", params.contract_type);
+    if (params.alert_level)                      qs.set("alert_level",   params.alert_level);
+    if (params.limit !== undefined)              qs.set("limit",         String(params.limit));
+    if (params.offset !== undefined)             qs.set("offset",        String(params.offset));
+    return req<FlowEpisodesResponse>(`/api/flow/episodes?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
   },
 
   runSimulation: (ticker: string, events: FlowEvent[], nAgents: number, nRuns: number, token: string) =>
