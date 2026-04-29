@@ -72,8 +72,10 @@ class TestSymbolRegistryOiMap:
     async def test_oi_map_populated_after_build(self):
         from services.symbol_registry import SymbolRegistry
 
+        # zero_price_fallback kwarg forwarded by build() - must be accepted
         async def _fake_build_ticker(self_inner, ticker, stock_price,
-                                     registry, oi_by_ticker, tier_params):
+                                     registry, oi_by_ticker, tier_params,
+                                     zero_price_fallback=False):
             oi_by_ticker[ticker] = 200
             registry[f"{ticker}250117C00100000"] = MagicMock()
 
@@ -94,7 +96,8 @@ class TestSymbolRegistryOiMap:
         from services.symbol_registry import SymbolRegistry
 
         async def _no_contracts(self_inner, ticker, stock_price,
-                                registry, oi_by_ticker, tier_params):
+                                registry, oi_by_ticker, tier_params,
+                                zero_price_fallback=False):
             oi_by_ticker[ticker] = 0
 
         prices     = {"HOOD": 15.0}
@@ -113,7 +116,8 @@ class TestSymbolRegistryOiMap:
         from services.symbol_registry import SymbolRegistry
 
         async def _fake_build(self_inner, ticker, stock_price,
-                              registry, oi_by_ticker, tier_params):
+                              registry, oi_by_ticker, tier_params,
+                              zero_price_fallback=False):
             oi_by_ticker[ticker] = 500
 
         prices     = {"SPY": 500.0}

@@ -24,7 +24,7 @@ FIX H1 (2026-04-27): build() now returns a tuple[int, dict[str, dict]]
   _post_build_upsert so it can skip the duplicate _fetch_batch_quotes call.
 
 FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
-  build guard is now `if self._registry:` — the populated registry itself is
+  build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
   always doing a full rebuild after the first build().
@@ -42,7 +42,7 @@ FIX M-2 (2026-04-28): is_ready() now returns self._build_complete instead
   of len(self._registry) > 0. load_from_db() does NOT set _build_complete;
   build() sets it at the very end (inside the lock, after self._registry is
   swapped). This guarantees stream workers only spawn against a fully-built,
-  fresh-Tradier registry — never a partially-seeded DB snapshot.
+  fresh-Tradier registry - never a partially-seeded DB snapshot.
 
 FIX M-3 (2026-04-28): _post_build_upsert is split into two separately
   guarded phases. assign_tiers() failure is caught and re-raised so
@@ -54,15 +54,14 @@ FIX M-3 (2026-04-28): _post_build_upsert is split into two separately
 FIX B-ZERO-PRICE (2026-04-29): When _fetch_stock_prices() returns 0 prices,
   build() previously filtered every ticker out of the _build_with_sem tasks
   (the `if ticker in prices and prices[ticker] > 0` guard silently dropped
-  all work) and completed with 0 OCC contracts — leaving StreamManager with
-  an empty registry and no workers spawned. New behaviour:
-  - If ALL prices are missing: log at ERROR, use _ZERO_PRICE_ATM_PCT (0.50)
-    as a wide fallback ATM range so chain fetches still run.
+  all work) and completed with 0 OCC contracts. New behaviour:
+  - If ALL prices are missing: log at ERROR, set zero_price_fallback=True so
+    chain fetches still run with ATM filtering bypassed entirely.
   - If SOME prices are missing (partial fetch): tickers with no price fall
-    back to the wide range inside _build_ticker (WARNING per ticker) rather
-    than being silently skipped.
-  - _build_ticker guard updated: stock_price <= 0 now uses fallback_atm_pct
-    instead of returning immediately.
+    back to bypass mode inside _build_ticker (WARNING per ticker).
+  - _build_ticker guard updated: stock_price <= 0 + zero_price_fallback=True
+    bypasses the ATM filter (atm_low=0, atm_high=inf) rather than returning.
+    DTE gating via tier params still applies normally.
 """
 import asyncio
 import logging
@@ -71,7 +70,7 @@ from datetime import date, datetime
 from typing import Optional
 
 # Module-level imports so patch('services.symbol_registry.*') targets work
-# in unit tests (H3 fix — lazy imports inside methods are not patchable via
+# in unit tests (H3 fix - lazy imports inside methods are not patchable via
 # the module namespace).
 from services.ingestion_config import get_config
 from services.tier_engine import _fetch_thresholds, assign_tiers
@@ -81,16 +80,6 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 log = logging.getLogger("symbol_registry")
 
 _DEFAULT_BUILD_CONCURRENCY = 50
-
-# B-ZERO-PRICE fallback: when Tradier returns no stock prices we use this
-# ATM percentage so that virtually every strike in the chain passes the
-# ATM filter and contracts are still loaded. DTE gating via tier params
-# still applies normally.
-_ZERO_PRICE_ATM_PCT = 0.50  # ±50% of whatever price we eventually get / fallback
-
-# Sentinel price used inside _build_ticker when no real price is available.
-# Wide enough that ATM filter passes all strikes in a normal chain.
-_FALLBACK_SENTINEL_PRICE = 1_000_000.0  # strike < 1_000_000 * 1.5 always true
 
 
 @dataclass
@@ -148,12 +137,12 @@ class SymbolRegistry:
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
         # M-1/M-2: dedicated build-complete flag.
-        # load_from_db() does NOT set this — it only populates the registry
+        # load_from_db() does NOT set this - it only populates the registry
         # with stale DB data. build() sets it at the very end, inside the
         # lock, after self._registry is swapped to the freshly-built data.
         # stream_options_flow() polls is_ready() which checks this flag.
         self._build_complete: bool = False
-        # H3: _seeded_from_db removed — self._registry itself is the guard
+        # H3: _seeded_from_db removed - self._registry itself is the guard
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -186,7 +175,7 @@ class SymbolRegistry:
         chain = await load_chain(snapshot_id)
         if chain is None:
             log.info(
-                "[symbol_registry] load_from_db: DB error for snapshot %s — "
+                "[symbol_registry] load_from_db: DB error for snapshot %s - "
                 "skipping pre-seed, full build() will populate registry",
                 snapshot_id,
             )
@@ -194,15 +183,15 @@ class SymbolRegistry:
         if not chain:
             log.info(
                 "[symbol_registry] load_from_db: no cached chain for snapshot %s "
-                "(including fallback) — will do full build from Tradier",
+                "(including fallback) - will do full build from Tradier",
                 snapshot_id,
             )
             return 0
         self._registry = chain
         self._persisted_snapshot_id = snapshot_id
         # M-1/M-2: do NOT set _build_complete here.
-        # The chain is stale DB data — stream workers must not unblock yet.
-        # H3: no _seeded_from_db flag — populated registry is the signal
+        # The chain is stale DB data - stream workers must not unblock yet.
+        # H3: no _seeded_from_db flag - populated registry is the signal
         # Rebuild OI map from the loaded chain
         oi_acc: dict[str, list[int]] = {}
         for meta in chain.values():
@@ -212,7 +201,7 @@ class SymbolRegistry:
         }
         log.info(
             "[symbol_registry] load_from_db: seeded %d OCC contracts from DB "
-            "(snapshot %s, oi_map=%d tickers) — waiting for build() to set "
+            "(snapshot %s, oi_map=%d tickers) - waiting for build() to set "
             "_build_complete before stream workers are allowed to spawn",
             len(chain), snapshot_id, len(self._oi_by_ticker),
         )
@@ -222,33 +211,33 @@ class SymbolRegistry:
         """
         Build (or incrementally refresh) the OCC registry.
 
-        H3 — Incremental mode (fixed):
+        H3 - Incremental mode (fixed):
           If self._registry is already populated (seeded from DB or from a
           prior build()), skip tickers whose minimum DTE is > 0.
           Only re-fetch tickers that have expired contracts (min_dte == 0)
           or are missing from the registry entirely.
 
-        H1 — Return raw_quotes:
+        H1 - Return raw_quotes:
           Returns tuple[int, dict[str, dict]] so callers can reuse the
           already-fetched quote data and skip a duplicate Tradier call.
 
-        C-3 — require_oi=True for post-build reclassification:
+        C-3 - require_oi=True for post-build reclassification:
           assign_tiers() is called with require_oi=True so OI gates are
           enforced only after build() has populated oi_by_ticker from
           chain fetches.
 
-        M-1/M-2 — _build_complete flag:
+        M-1/M-2 - _build_complete flag:
           self._build_complete is set to True at the very end of this
           method, inside the lock, after self._registry is swapped.
           is_ready() returns self._build_complete, so stream workers will
           not spawn until build() has fully completed with fresh data.
 
-        B-ZERO-PRICE — zero-price fallback:
+        B-ZERO-PRICE - zero-price fallback:
           If _fetch_stock_prices() returns 0 prices for all tickers, build()
-          now logs at ERROR and proceeds with a wide ATM fallback
-          (_ZERO_PRICE_ATM_PCT = 0.50) so chain fetches still run instead
-          of silently completing with 0 contracts.
-          Tickers with missing individual prices use the same fallback inside
+          now logs at ERROR and proceeds with zero_price_fallback=True so
+          _build_ticker bypasses ATM filtering entirely (atm_low=0,
+          atm_high=inf). Chain fetches still run and contracts still load.
+          Tickers with missing individual prices use the same bypass inside
           _build_ticker (WARNING per ticker) rather than being skipped.
         """
         from services.symbols_loader import SymbolQuote
@@ -313,27 +302,23 @@ class SymbolRegistry:
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
-            # B-ZERO-PRICE: if ALL prices are missing, log ERROR and use a
-            # wide ATM fallback so chain fetches still run. Completing with
-            # 0 contracts leaves the StreamManager empty and no workers spawn.
+            # B-ZERO-PRICE: if ALL prices are missing, log ERROR and activate
+            # fallback so _build_ticker bypasses ATM filtering entirely.
+            # Completing with 0 contracts leaves StreamManager empty with no
+            # workers spawned - that is always worse than loading all contracts.
             zero_price_fallback = False
             if tickers_to_refresh and not prices:
                 log.error(
                     "[symbol_registry] B-ZERO-PRICE: _fetch_stock_prices() returned 0 prices "
-                    "for %d tickers — Tradier quote API may be down or rate-limited. "
-                    "Falling back to wide ATM range (%.0f%%) so chain fetches still run. "
-                    "Contracts will be loaded without ATM filtering.",
+                    "for %d tickers - Tradier quote API may be down or rate-limited. "
+                    "Falling back: ATM filter bypassed so chain fetches still run.",
                     len(tickers_to_refresh),
-                    _ZERO_PRICE_ATM_PCT * 100,
                 )
                 zero_price_fallback = True
 
             if tickers_to_refresh:
                 async def _build_with_sem(ticker):
                     async with sem:
-                        # B-ZERO-PRICE: pass fallback sentinel price when real
-                        # price is missing so _build_ticker uses wide ATM range
-                        # instead of silently returning on stock_price <= 0.
                         ticker_price = prices.get(ticker, 0.0)
                         await self._build_ticker(
                             ticker,
@@ -344,9 +329,9 @@ class SymbolRegistry:
                             zero_price_fallback=zero_price_fallback,
                         )
 
-                # B-ZERO-PRICE: removed `if ticker in prices and prices[ticker] > 0`
-                # guard — all tickers now go through regardless of price availability.
-                # _build_ticker handles the missing-price case via zero_price_fallback.
+                # B-ZERO-PRICE: no `if ticker in prices` guard - all tickers
+                # go through unconditionally; _build_ticker handles missing
+                # prices via zero_price_fallback.
                 tasks = [
                     _build_with_sem(ticker)
                     for ticker in tickers_to_refresh
@@ -375,7 +360,7 @@ class SymbolRegistry:
                     open_interest  = new_oi_by_ticker.get(ticker, 0),
                 ))
 
-            # C-3: require_oi=True — OI gate enforced now that build() has
+            # C-3: require_oi=True - OI gate enforced now that build() has
             # populated new_oi_by_ticker from chain fetches.
             live_tier_map = await assign_tiers(
                 synthetic_quotes,
@@ -409,7 +394,7 @@ class SymbolRegistry:
             if zero_price_fallback:
                 log.warning(
                     "[symbol_registry] Build complete (ZERO-PRICE FALLBACK): %d OCC symbols "
-                    "(T1=%d T2=%d T3=%d) — contracts loaded without ATM price filtering. "
+                    "(T1=%d T2=%d T3=%d) - contracts loaded without ATM price filtering. "
                     "Next refresh will re-apply ATM filtering once prices are available.",
                     len(new_registry),
                     t_counts[1], t_counts[2], t_counts[3],
@@ -418,7 +403,7 @@ class SymbolRegistry:
                 log.info(
                     "[symbol_registry] Build complete: %d OCC symbols "
                     "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers "
-                    "| _build_complete=True — stream workers may now spawn",
+                    "| _build_complete=True - stream workers may now spawn",
                     len(new_registry),
                     t_counts[1], t_counts[2], t_counts[3],
                     old_count, len(new_registry) - old_count,
@@ -446,7 +431,7 @@ class SymbolRegistry:
             )
             if not snap_rows:
                 log.warning(
-                    "[symbol_registry] _persist_to_db: no active snapshot — chain not persisted"
+                    "[symbol_registry] _persist_to_db: no active snapshot - chain not persisted"
                 )
                 return
             snapshot_id = snap_rows[0]["id"]
@@ -519,31 +504,25 @@ class SymbolRegistry:
         """
         Build OCC contracts for a single ticker.
 
-        B-ZERO-PRICE: when stock_price <= 0 and zero_price_fallback=True,
-        use a sentinel price with _ZERO_PRICE_ATM_PCT wide range so virtually
-        every strike passes the ATM filter. Log WARNING (not skip).
-        When zero_price_fallback=False (normal), skip the ticker as before.
+        B-ZERO-PRICE: when stock_price <= 0:
+          - zero_price_fallback=True  -> bypass ATM filter entirely
+            (atm_low=0, atm_high=inf). DTE gating still applies.
+            Log WARNING and continue; do NOT skip.
+          - zero_price_fallback=False -> skip as before (regression guard).
         """
         if stock_price <= 0:
             if zero_price_fallback:
                 log.warning(
-                    "[symbol_registry] %s: no stock price — using wide ATM fallback "
-                    "(sentinel=%.0f, pct=%.0f%%) to avoid skipping contracts",
-                    ticker, _FALLBACK_SENTINEL_PRICE, _ZERO_PRICE_ATM_PCT * 100,
+                    "[symbol_registry] %s: no stock price - bypassing ATM filter "
+                    "(zero-price fallback active)",
+                    ticker,
                 )
-                stock_price = _FALLBACK_SENTINEL_PRICE
-                effective_atm_pct = _ZERO_PRICE_ATM_PCT
             else:
-                log.warning("[symbol_registry] %s: no stock price — skipping", ticker)
+                log.warning("[symbol_registry] %s: no stock price - skipping", ticker)
                 return
-        else:
-            effective_atm_pct = None  # use tier-derived atm_pct below
 
         tier   = self._tier_map.get(ticker, 3)
         params = tier_params.get(tier) or tier_params[3]
-
-        # Use fallback pct if set, otherwise normal tier pct
-        atm_pct = effective_atm_pct if effective_atm_pct is not None else params.atm_pct
 
         try:
             expirations = await get_expirations(ticker)
@@ -551,9 +530,17 @@ class SymbolRegistry:
             log.warning("[symbol_registry] %s: expirations fetch failed: %s", ticker, e)
             return
 
-        today    = date.today()
-        atm_low  = stock_price * (1 - atm_pct)
-        atm_high = stock_price * (1 + atm_pct)
+        today = date.today()
+
+        # B-ZERO-PRICE: bypass ATM filter when no price is available.
+        # Using atm_low=0 / atm_high=inf means every positive strike passes.
+        # DTE filtering via params.max_dte still applies normally.
+        if stock_price > 0:
+            atm_low  = stock_price * (1 - params.atm_pct)
+            atm_high = stock_price * (1 + params.atm_pct)
+        else:
+            atm_low  = 0.0
+            atm_high = float("inf")
 
         for expiry_str in expirations:
             try:
