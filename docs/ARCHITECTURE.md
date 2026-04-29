@@ -16,7 +16,8 @@ querying.
 
 At runtime the active worker count is `ceil(registry.size() / 500)` — typically 60–70 workers for
 a full universe of ~31,920 OCC symbols. All workers share a single Tradier session token and stream
-in parallel, each covering ≤500 symbols simultaneously.
+in parallel, each covering ≤500 symbols simultaneously. Workers are staggered at 200ms intervals
+on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 
 ---
 
@@ -63,7 +64,7 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  finishes. stream_options_flow() waits on this flag (M-1/M-2)    │
 │  before handing symbols to StreamManager, ensuring no worker     │
 │  connects before the OCC contract set is fully ready.            │
-└───────────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┴──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 2 — Stream Ingestion                                      │
@@ -81,12 +82,17 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  - In lifespan mode, lifespan owns refresh_loop — not spawned    │
 │    here (D-002 fix).                                             │
 │  - Instantiates StreamManager with the registry and hands off    │
-│    _process_trade as the per-event callback.                     │
+│    _process_trade as the per-event callback.                      │
 │                                                                  │
 │  StreamManager (stream_manager.py):                              │
 │  - Fetches ONE shared Tradier session token for all workers.     │
 │  - Splits OCC symbols into ≤500-symbol batches.                  │
+│  - Worker count: ceil(registry.size() / 500) (D-003).            │
+│    ~31,920 symbols → 64 workers; ~15,000 symbols → 30 workers.  │
 │  - Spawns one asyncio task per batch (STREAM-1/2/3...).          │
+│  - Worker N is delayed N × 200ms before connecting (B-021).      │
+│    Stagger prevents thundering-herd on the Tradier session host.  │
+│    At 64 workers the last worker connects at T+12.8s.            │
 │  - No lock between workers — all tasks run fully concurrently.   │
 │  - Emits STREAM_STATS log every 30s per worker.                  │
 │  - Emits STREAM_HEALTH manager-level log every 30s.              │
@@ -103,7 +109,7 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  - DISABLED as automatic fallback since 2026-04-25.              │
 │  - Admin panel only — explicit invocation via /admin endpoint.   │
 │  - Synthetic signal generator preserved as _demo_mode_once().    │
-└───────────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┴──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 3 — Trade Parsing  (parsers/options_flow_parser.py)       │
@@ -128,7 +134,7 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  - is_synthetic_quote: bid=0 AND ask=0 (no live market data).    │
 │  - DTE: calendar days from today to expiry.                      │
 │  - Returns None if symbol is unparseable, size=0, or fill=0.    │
-└───────────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┴──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 4 — Deduplication  (utils/dedup.py — DedupCache)          │
@@ -149,6 +155,8 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  - TTL: 5 seconds (entries expire 5s after first seen).          │
 │  - Sweep window: 8 seconds (wider than TTL for multi-leg fills). │
 │  - Eviction sweep runs on every is_duplicate() call.             │
+│  - Clock source: time.monotonic() — not wall clock (C-020).      │
+│    Prevents TTL misfires on DST transitions or system clock skew.│
 │                                                                  │
 │  C-003 — Sweep Retroactive Upgrade:                              │
 │  When the 3rd unique exchange for a (occ|size|fill) key arrives  │
@@ -167,7 +175,7 @@ in parallel, each covering ≤500 symbols simultaneously.
 │                                                                  │
 │  Stats exposed on /health/stream:                                │
 │    dedup_hits, dedup_total, sweep_upgrades, active_keys          │
-└───────────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┴──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 5 — Repetition Accumulator + Flow Persistence             │
@@ -194,6 +202,12 @@ in parallel, each covering ≤500 symbols simultaneously.
 │    (default $50,000)                                             │
 │  Prevents QQQ/SPY episodes from emitting a new signal_history    │
 │  row on every single tick once threshold is crossed.             │
+│                                                                  │
+│  Concurrency note (STREAM-3):                                    │
+│  64 workers call ingest_tick() concurrently with no global lock. │
+│  The accumulator uses per-episode asyncio locks to isolate       │
+│  concurrent ticks on the same (ticker, strike, expiry, type) key.│
+│  Cross-episode calls are fully parallel (B-029 open: prune race).│
 │                                                                  │
 │  Flow persistence (flow_store.py):                               │
 │  - flow_events table:  one row per classified tick.              │
@@ -230,7 +244,7 @@ in parallel, each covering ≤500 symbols simultaneously.
 │    total_premium, trade_count, alert_level, is_accelerating,     │
 │    seed_episode, signal_ts                                       │
 │  (No id field — bigserial generated.)                            │
-└───────────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┴──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
 │  Layer 6 — Signal Engine + Delivery                              │
@@ -282,6 +296,12 @@ in parallel, each covering ≤500 symbols simultaneously.
 │  - Groq llama-3.3 AI swarm for narrative signal reasoning.       │
 │  - NOT called automatically per tick.                            │
 │  - Explicit invocation only (admin panel or direct API call).    │
+│                                                                  │
+│  Open — B-026:                                                   │
+│  WebSocket `send()` iterates subscriber list during broadcast.   │
+│  A failed send to one client does not currently isolate other    │
+│  subscribers. Under concurrent connects/disconnects, list        │
+│  mutation mid-loop is possible. No regression test exists yet.   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -292,9 +312,11 @@ in parallel, each covering ≤500 symbols simultaneously.
 | Parameter | Value | Source |
 |---|---|---|
 | Session token model | 1 shared token across all workers | StreamManager |
+| Worker count | `ceil(registry.size() / 500)` — dynamic (D-003) | StreamManager |
+| Worker stagger delay | N × 200ms (B-021); 64 workers → T+12.8s last connect | StreamManager |
 | Tradier batch limit | ≤500 symbols per POST | StreamWorker |
 | Dedup key | `(occ_symbol, size, round(fill, 1))` | DedupCache |
-| Dedup TTL | 5 seconds | DedupCache |
+| Dedup TTL | 5 seconds (monotonic clock — C-020) | DedupCache |
 | Sweep window | 8 seconds | DedupCache |
 | Sweep min exchanges | 3 | DedupCache |
 | Sweep dispatch TTL | 1800 seconds (30 min) | _sweep_upgrade_dispatched |
@@ -414,6 +436,7 @@ via `registry.load_from_db(snapshot_id)` before the full `build()` completes.
 6. stream_options_flow(registry=registry)
    └─ polls registry.is_ready() every 500ms (30-min timeout)
    └─ StreamManager.run()   — spawns STREAM-1/2/3... workers
+       └─ worker N waits N × 200ms before first connect (B-021)
 7. registry.refresh_loop()  — background refresh task (lifespan-owned)
 8. _registry_prewarm_loop() — 9:15 AM ET pre-warm task
 ```
@@ -465,4 +488,18 @@ raw Tradier WebSocket event
 | FIRST-TICK | tradier_stream.py | First 5 ticks logged individually at INFO. Non-timesale types logged at INFO for first 10 distinct types. |
 | D-001 | tradier_stream.py | `stream_options_flow()` accepts `registry=` from lifespan, skipping duplicate `build()`. |
 | D-002 | tradier_stream.py | `refresh_loop()` only spawned in standalone path; lifespan owns it in production. |
-| STREAM-1/2/3 | stream_manager.py | Shared session token, no lock, full parallel workers. |
+| D-003 | stream_manager.py | Worker count changed from hard-coded 32 to `ceil(registry.size() / 500)`. At 31,920 symbols → 64 workers; was leaving ~half the OCC universe unstreamed. |
+| B-021 | stream_manager.py | Workers staggered at N × 200ms on spawn. Prevents thundering-herd against Tradier session host at startup. |
+| STREAM-1/2/3 | stream_manager.py | STREAM-1: shared session token (was per-worker). STREAM-2: single StreamManager with dynamic batching. STREAM-3: removed global session lock — all workers now fully concurrent with no coordination overhead. |
+| C-020 | utils/dedup.py | Dedup TTL clock changed from `time.time()` to `time.monotonic()`. Prevents DST/clock-skew TTL misfires. |
+
+---
+
+## Open Issues
+
+| ID | Component | Description |
+|----|-----------|-------------|
+| B-026 | routers/ws.py | WebSocket broadcast iterates subscriber list without copy. Concurrent connect/disconnect can mutate the list mid-loop. A failed `send()` to one client may not isolate other subscribers. No regression test. |
+| B-028 | stream_manager.py | `refresh()` called while workers are mid-stagger spawn can race with `_spawn_workers()`. Diff logic may produce duplicate worker tasks. |
+| B-029 | repetition_accumulator.py | Rolling-window `prune()` can evict events concurrently with Gate 2 delta evaluation. Prune mid-evaluation may cause the retrigger to miscalculate `Δ premium`. |
+| B-030 | universe_store.py | `save_snapshot()` partial write on DB connection drop is not rolled back. A partial snapshot passes the `load_fresh_snapshot` age check on next restart. |
