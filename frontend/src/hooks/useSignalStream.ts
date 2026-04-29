@@ -8,6 +8,10 @@ export interface WsSignal {
   conviction_score?: number;
 }
 
+// WS close codes that indicate an auth failure — never retry these.
+// 4001 = custom server auth rejection; 1008 = policy violation (RFC 6455)
+const AUTH_FAILURE_CODES = new Set([4001, 1008]);
+
 /**
  * Derives the WebSocket URL from env vars or current page origin.
  *
@@ -37,9 +41,13 @@ function getWsUrl(token: string): string | null {
   }
 }
 
-export function useSignalStream(token: string | null) {
-  const [signals,   setSignals]   = useState<WsSignal[]>([]);
-  const [connected, setConnected] = useState(false);
+export function useSignalStream(
+  token: string | null,
+  onAuthFailure?: () => void,
+) {
+  const [signals,      setSignals]      = useState<WsSignal[]>([]);
+  const [connected,    setConnected]    = useState(false);
+  const [authFailed,   setAuthFailed]   = useState(false);
   const wsRef        = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -53,19 +61,49 @@ export function useSignalStream(token: string | null) {
     }
 
     let active = true;
+    let authFailureSeen = false;
 
     const connect = () => {
-      if (!active) return;
+      if (!active || authFailureSeen) return;
       try {
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen  = () => { if (active) setConnected(true); };
-        ws.onclose = () => {
+
+        ws.onclose = (evt) => {
           setConnected(false);
+
+          // WS 403 arrives as HTTP 403 before the upgrade, which the browser
+          // maps to a normal close event with code 1006 (abnormal closure) and
+          // an empty reason. Our backend also sends code 4001 on explicit auth
+          // rejection. Treat both as terminal — do NOT retry, notify caller.
+          const isAuthClose =
+            AUTH_FAILURE_CODES.has(evt.code) ||
+            // 1006 = abnormal close with no server close frame — this is how
+            // browsers report a pre-upgrade HTTP 403 on a WebSocket connect.
+            (evt.code === 1006 && !evt.wasClean);
+
+          if (isAuthClose) {
+            authFailureSeen = true;
+            setAuthFailed(true);
+            console.warn(
+              `[useSignalStream] Auth failure (code=${evt.code}) — clearing token and stopping retry.`,
+            );
+            // Clear stored token so next page load hits the login screen.
+            localStorage.removeItem("cipher_token");
+            localStorage.removeItem("cipher_email");
+            localStorage.removeItem("cipher_role");
+            onAuthFailure?.();
+            return; // do not schedule reconnect
+          }
+
+          // Transient close — reconnect after 3s
           if (active) reconnectRef.current = setTimeout(connect, 3000);
         };
+
         ws.onerror = () => setConnected(false);
+
         ws.onmessage = (e) => {
           try {
             const m = JSON.parse(e.data as string);
@@ -95,8 +133,8 @@ export function useSignalStream(token: string | null) {
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [token]);
+  }, [token, onAuthFailure]);
 
   const clear = useCallback(() => setSignals([]), []);
-  return { signals, connected, clear };
+  return { signals, connected, authFailed, clear };
 }
