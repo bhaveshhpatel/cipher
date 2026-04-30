@@ -13,6 +13,10 @@ BUG FIX (2026-04-29): Renamed tier -> influence_tier in flow_events select + fil
 BUG FIX (2026-04-29): Replace nonexistent 'timestamp' col with 'created_at' in
                       flow_events query (Supabase 42703). Expand select to include
                       conviction_score, dte, trade_type, iv, underlying_price, occ_symbol.
+BUG FIX (2026-04-30): FlowEventOut.expiry/strike made Optional — flow_episodes rows are
+                      aggregated episodes, not individual contracts. strike/expiry are
+                      legitimately null for multi-contract or synthetic episodes. Removed
+                      _is_malformed() guard from /scan so these rows are no longer dropped.
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -53,15 +57,17 @@ _ALERT_TO_TIER = {
 class FlowEventOut(BaseModel):
     ticker:           str
     contract_type:    str
-    strike:           float
-    expiry:           str
+    # strike and expiry are nullable on aggregated episode rows (multi-contract
+    # episodes, synthetic flow). Do NOT filter these rows out.
+    strike:           Optional[float] = None
+    expiry:           Optional[str]   = None
     premium:          float
     trade_type:       str
     sentiment:        str
     influence_tier:   str
     conviction_score: float
     is_golden_sweep:  bool
-    timestamp:        Optional[str] = None
+    timestamp:        Optional[str]   = None
 
 
 class FlowResponse(BaseModel):
@@ -149,8 +155,8 @@ def _headers() -> dict:
 def _is_malformed(r: dict) -> bool:
     """
     Return True if the row is too incomplete to be useful.
-    A row is malformed when expiry is empty/null — expiry is a required
-    field in FlowEventOut and cannot be defaulted.
+    Only used for per-contract rows (flow_events). Do NOT apply to
+    flow_episodes rows — strike/expiry are nullable there by design.
     """
     expiry = (r.get("expiry") or "").strip()
     return not expiry
@@ -366,9 +372,9 @@ async def scan_flow(
 
     events = []
     for r in rows:
-        if _is_malformed(r):
-            log.warning(f"[flow] skipping malformed row (no expiry): {r}")
-            continue
+        # NOTE: do NOT call _is_malformed() here — flow_episodes rows are
+        # aggregated episodes where strike/expiry are nullable by design.
+        # _is_malformed() is only appropriate for per-contract flow_events rows.
         try:
             raw_direction  = r.get("direction", "NEUTRAL") or "NEUTRAL"
             raw_alert      = r.get("alert_level", "LOW") or "LOW"
@@ -380,11 +386,12 @@ async def scan_flow(
             conviction_map = {"CRITICAL": 0.92, "HIGH": 0.75, "MEDIUM": 0.55, "LOW": 0.35}
             conviction = conviction_map.get(raw_alert.upper(), 0.5)
 
+            strike_raw = r.get("strike")
             events.append(FlowEventOut(
                 ticker           = r.get("ticker", ""),
                 contract_type    = r.get("contract_type") or "CALL",
-                strike           = float(r.get("strike") or 0),
-                expiry           = r.get("expiry") or "",
+                strike           = float(strike_raw) if strike_raw is not None else None,
+                expiry           = r.get("expiry") or None,
                 premium          = float(r.get("total_premium") or 0),
                 trade_type       = "SWEEP" if is_accel else "BLOCK",
                 sentiment        = sentiment,
