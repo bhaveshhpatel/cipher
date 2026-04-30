@@ -14,7 +14,8 @@ Covers:
   - conviction_score mapping from alert_level (CRITICAL→0.92)
   - is_accelerating=True → is_golden_sweep=True, trade_type='SWEEP'
   - is_accelerating=False → is_golden_sweep=False, trade_type='BLOCK'
-  - Malformed row is skipped, rest of response is still returned
+  - Row with a parse error is skipped; rest of response still returned
+  - Null-expiry / null-strike episode row IS included (valid aggregated episode)
   - Unknown direction/alert values fall back to NEUTRAL / RETAIL
 """
 import pytest
@@ -245,10 +246,31 @@ def test_flow_is_accelerating_false_sets_block_type():
     assert ev["trade_type"] == "BLOCK"
 
 
-# ── malformed row is skipped ───────────────────────────────────────────────────
+# ── parse-error row is skipped (except path) ──────────────────────────────────────
 
-def test_flow_scan_malformed_row_is_skipped():
-    bad_row  = {"id": 99}  # missing all required fields
+def test_flow_scan_parse_error_row_is_skipped():
+    """
+    A row whose fields cause a hard parse error (strike='NOT_A_FLOAT' triggers
+    float() ValueError) must be skipped via the except handler while the valid
+    row that follows is still returned.
+
+    Note: a row with null expiry/strike is NOT a parse error — those are valid
+    aggregated episode rows (see test_flow_scan_null_expiry_row_is_included).
+    """
+    bad_row = {
+        "id":            99,
+        "ticker":        "BAD",
+        "direction":     "BULLISH",
+        "contract_type": "CALL",
+        "strike":        "NOT_A_FLOAT",  # will raise ValueError in float()
+        "expiry":        "2026-06-20",
+        "total_premium": 100_000.0,
+        "trade_count":   5,
+        "alert_level":   "LOW",
+        "is_accelerating": False,
+        "signal_ts":     None,
+        "created_at":    "2026-04-30T10:00:00Z",
+    }
     good_row = _sample_row(ticker="SPY")
     with _mock_user(), _mock_query([bad_row, good_row], total=2):
         resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
@@ -256,3 +278,38 @@ def test_flow_scan_malformed_row_is_skipped():
     events = resp.json()["events"]
     assert len(events) == 1
     assert events[0]["ticker"] == "SPY"
+
+
+# ── null-expiry / null-strike episode rows are included ───────────────────────────
+
+def test_flow_scan_null_expiry_row_is_included():
+    """
+    flow_episodes rows legitimately have null expiry/strike when the episode
+    spans multiple contracts or is synthetic (e.g. SPY REPEAT_SELL episodes).
+    These rows must NOT be dropped — FlowEventOut.expiry/strike are Optional.
+    """
+    null_expiry_row = {
+        "id":            357290,
+        "ticker":        "SPY",
+        "direction":     "REPEAT_SELL",
+        "contract_type": "PUT",
+        "strike":        None,
+        "expiry":        None,
+        "total_premium": 259_857.0,
+        "trade_count":   125,
+        "alert_level":   "ALERT",
+        "is_accelerating": True,
+        "signal_ts":     "2026-04-29T20:14:48Z",
+        "created_at":    "2026-04-29T20:15:17Z",
+    }
+    with _mock_user(), _mock_query([null_expiry_row], total=1):
+        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["ticker"] == "SPY"
+    assert ev["expiry"] is None
+    assert ev["strike"] is None
+    assert ev["premium"] == 259_857.0
+    assert ev["is_golden_sweep"] is True
