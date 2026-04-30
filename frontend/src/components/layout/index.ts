@@ -1,8 +1,11 @@
-export { DashboardShell } from "./DashboardShell";
-export type { DashboardShellProps } from "./DashboardShell";
+export { AppHeader }         from "./AppHeader";
+export type { AppHeaderProps }      from "./AppHeader";
 
-export { TopBar } from "./TopBar";
-export type { TopBarProps } from "./TopBar";
+export { SidebarNav }        from "./SidebarNav";
+export type { SidebarNavProps }     from "./SidebarNav";
 
-export { TabBar } from "./TabBar";
-export type { TabBarProps } from "./TabBar";
+export { MobileTabBar }      from "./MobileTabBar";
+export type { MobileTabBarProps }   from "./MobileTabBar";
+
+export { DashboardLayout }   from "./DashboardLayout";
+export type { DashboardLayoutProps } from "./DashboardLayout";
