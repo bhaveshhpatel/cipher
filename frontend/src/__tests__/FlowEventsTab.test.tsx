@@ -36,12 +36,20 @@
  *   - Clicking Golden Sweep toggle calls onFiltersChange with golden_sweep=true
  *   - Clicking ALL sentiment resets sentiment filter
  *   - Multiple filters combine correctly
+ *
+ *   Virtualization (P6):
+ *   - Scroll container renders with data-testid="flow-events-scroll"
+ *   - Scroll container absent during loading (skeleton bypasses virtualizer)
+ *   - Each virtual row carries data-index attribute
+ *   - No data-index rows rendered when events=[]
  */
 
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { FlowEventsTab } from '../components/dashboard/FlowEventsTab';
 import type { FlowEventRaw } from '../lib/api';
+
+// @tanstack/react-virtual is auto-mocked via frontend/__mocks__/@tanstack/react-virtual.ts
 
 const makeEvent = (overrides: Partial<FlowEventRaw> = {}): FlowEventRaw => ({
   id: 1,
@@ -116,7 +124,6 @@ test('KPI bar rendered when events present', () => {
 test('Total Premium sums all event premiums', () => {
   const events = [makeEvent({ premium: 100_000 }), makeEvent({ id: 2, ticker: 'SPY', premium: 200_000 })];
   render(<FlowEventsTab events={events} loading={false} error={null} onFiltersChange={noop} />);
-  // $300K appears in KPI bar
   expect(screen.getAllByText('$300.0K').length).toBeGreaterThan(0);
 });
 
@@ -157,7 +164,6 @@ test('PUT contract_type has badge-red class', () => {
 
 test('BULLISH sentiment renders badge-green', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BULLISH' })]} loading={false} error={null} onFiltersChange={noop} />);
-  // Filter bar + row both contain BULLISH; find the badge span in the row
   const badge = screen.getAllByText('BULLISH').find(el => el.classList.contains('badge-green'));
   expect(badge).toBeDefined();
 });
@@ -170,7 +176,6 @@ test('BEARISH sentiment renders badge-red', () => {
 
 test('premium formatted as $K', () => {
   render(<FlowEventsTab events={[makeEvent({ premium: 75_500 })]} loading={false} error={null} onFiltersChange={noop} />);
-  // Appears in both KPI bar and table row
   expect(screen.getAllByText('$75.5K').length).toBeGreaterThan(0);
 });
 
@@ -249,4 +254,34 @@ test('combining T2 + CALL calls onFiltersChange with both', () => {
   fireEvent.click(callBtns[0]);
   const lastCall = noop.mock.calls[noop.mock.calls.length - 1][0];
   expect(lastCall).toMatchObject({ tier: 'T2', contract_type: 'CALL' });
+});
+
+// ── virtualization (P6) ───────────────────────────────────────────────────────
+
+test('scroll container renders with correct testid when events present', () => {
+  render(<FlowEventsTab events={[makeEvent()]} loading={false} error={null} onFiltersChange={noop} />);
+  expect(screen.getByTestId('flow-events-scroll')).toBeInTheDocument();
+});
+
+test('scroll container present during loading (wraps skeleton)', () => {
+  render(<FlowEventsTab events={[]} loading={true} error={null} onFiltersChange={noop} />);
+  expect(screen.getByTestId('flow-events-scroll')).toBeInTheDocument();
+});
+
+test('virtual rows carry data-index attribute', () => {
+  const events = [makeEvent({ id: 1 }), makeEvent({ id: 2, ticker: 'SPY' }), makeEvent({ id: 3, ticker: 'TSLA' })];
+  const { container } = render(
+    <FlowEventsTab events={events} loading={false} error={null} onFiltersChange={noop} />
+  );
+  const indexedRows = container.querySelectorAll('tr[data-index]');
+  expect(indexedRows.length).toBe(events.length);
+  expect(indexedRows[0].getAttribute('data-index')).toBe('0');
+  expect(indexedRows[2].getAttribute('data-index')).toBe('2');
+});
+
+test('no data-index rows rendered when events is empty', () => {
+  const { container } = render(
+    <FlowEventsTab events={[]} loading={false} error={null} onFiltersChange={noop} />
+  );
+  expect(container.querySelectorAll('tr[data-index]').length).toBe(0);
 });

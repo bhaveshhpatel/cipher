@@ -1,5 +1,6 @@
 "use client";
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useVirtualizer }  from "@tanstack/react-virtual";
 import type { FlowEventRaw } from "@/lib/api";
 import type { FlowEventsFilters } from "@/hooks/useFlowEvents";
 
@@ -9,6 +10,10 @@ interface Props {
   error:            string | null;
   onFiltersChange:  (f: FlowEventsFilters) => void;
 }
+
+// ── constants ─────────────────────────────────────────────────────────────────
+
+const ROW_HEIGHT = 45; // px — drives both virtualizer estimate and explicit row height
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,6 +83,25 @@ export function FlowEventsTab({ events, loading, error, onFiltersChange }: Props
   const [aggressive,   setAggressive]   = useState(false);
   const [goldenSweep,  setGoldenSweep]  = useState(false);
 
+  // ── scroll ref for virtualizer ──────────────────────────────────────────────
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const rowVirtualizer = useVirtualizer({
+    count:            events.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize:     () => ROW_HEIGHT,
+    overscan:         10,
+  });
+
+  const virtualItems  = rowVirtualizer.getVirtualItems();
+  const totalSize     = rowVirtualizer.getTotalSize();
+  const paddingTop    = virtualItems.length > 0 ? virtualItems[0].start : 0;
+  const paddingBottom = virtualItems.length > 0
+    ? totalSize - virtualItems[virtualItems.length - 1].end
+    : 0;
+
+  // ── filters ─────────────────────────────────────────────────────────────────
+
   const applyFilters = (
     s  = sentiment,
     ct = contractType,
@@ -108,7 +132,7 @@ export function FlowEventsTab({ events, loading, error, onFiltersChange }: Props
     applyFilters(sentiment, contractType, tier, aggressive, next);
   };
 
-  // KPI stats
+  // ── KPI stats ────────────────────────────────────────────────────────────────
   const totalPremium  = events.reduce((s, e) => s + e.premium, 0);
   const uniqueTickers = new Set(events.map(e => e.ticker)).size;
 
@@ -208,104 +232,130 @@ export function FlowEventsTab({ events, loading, error, onFiltersChange }: Props
         </button>
       </div>
 
-      {/* Table */}
+      {/* Table — height-capped scroll container drives the virtualizer */}
       <div className="card overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[820px]">
-            <thead>
-              <tr>
-                {[
-                  "Time", "Ticker", "Contract", "Type", "Sentiment",
-                  "Premium", "Size", "Bid / Ask / Fill", "Tier", "Flags",
-                ].map(h => (
-                  <th
-                    key={h}
-                    className="px-3 py-3 text-left whitespace-nowrap"
-                    style={{
-                      color:         "var(--faint)",
-                      fontSize:      "0.7rem",
-                      fontWeight:    700,
-                      letterSpacing: "0.07em",
-                      textTransform: "uppercase",
-                      background:    "var(--surface-2)",
-                      borderBottom:  "1px solid var(--border)",
-                    }}
-                  >
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <SkeletonRows />
-              ) : error ? (
+        <div
+          ref={scrollRef}
+          data-testid="flow-events-scroll"
+          style={{ maxHeight: "calc(100vh - 300px)", overflowY: "auto" }}
+        >
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[820px]">
+              <thead>
                 <tr>
-                  <td colSpan={10} className="px-4 py-10 text-center text-sm" style={{ color: "var(--red)" }}>
-                    ⚠ {error}
-                  </td>
+                  {[
+                    "Time", "Ticker", "Contract", "Type", "Sentiment",
+                    "Premium", "Size", "Bid / Ask / Fill", "Tier", "Flags",
+                  ].map(h => (
+                    <th
+                      key={h}
+                      className="px-3 py-3 text-left whitespace-nowrap"
+                      style={{
+                        color:         "var(--faint)",
+                        fontSize:      "0.7rem",
+                        fontWeight:    700,
+                        letterSpacing: "0.07em",
+                        textTransform: "uppercase",
+                        background:    "var(--surface-2)",
+                        borderBottom:  "1px solid var(--border)",
+                      }}
+                    >
+                      {h}
+                    </th>
+                  ))}
                 </tr>
-              ) : events.length === 0 ? (
-                <tr><td colSpan={10}><EmptyState /></td></tr>
-              ) : (
-                events.map((e) => (
-                  <tr
-                    key={e.id}
-                    className="border-b transition-colors hover:bg-[var(--surface-2)] animate-fade-up"
-                    style={{ borderColor: "var(--border)" }}
-                  >
-                    <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--faint)" }}>
-                      {fmtTime(e.timestamp)}
-                    </td>
-                    <td className="px-3 py-3 font-mono font-bold text-sm" style={{ color: "var(--amber)" }}>
-                      {e.ticker}
-                    </td>
-                    <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
-                      ${e.strike.toFixed(0)} {e.expiry}
-                    </td>
-                    <td className="px-3 py-3">
-                      <span className={e.contract_type === "CALL" ? "badge badge-green" : "badge badge-red"}>
-                        {e.contract_type}
-                      </span>
-                    </td>
-                    <td className="px-3 py-3">
-                      <span className={sentimentBadge(e.sentiment)}>{e.sentiment}</span>
-                    </td>
-                    <td className="px-3 py-3 font-mono font-semibold text-sm tabular text-right" style={{ color: "var(--amber)" }}>
-                      {fmt$(e.premium)}
-                    </td>
-                    <td className="px-3 py-3 font-mono text-xs tabular text-right" style={{ color: "var(--text)" }}>
-                      {e.size.toLocaleString()}
-                    </td>
-                    <td className="px-3 py-3 font-mono text-xs tabular" style={{ color: "var(--muted)" }}>
-                      {e.bid.toFixed(2)} / {e.ask.toFixed(2)} / <span style={{ color: "var(--text)" }}>{e.fill_price.toFixed(2)}</span>
-                    </td>
-                    <td className="px-3 py-3">
-                      <span className={tierBadge(e.tier)}>{e.tier}</span>
-                    </td>
-                    <td className="px-3 py-3">
-                      <div className="flex items-center gap-1.5">
-                        {e.is_aggressive && (
-                          <span
-                            className="text-xs px-1.5 py-0.5 rounded font-bold"
-                            style={{ background: "var(--orange)", color: "#fff" }}
-                            title="Aggressive fill"
-                          >⚡</span>
-                        )}
-                        {e.is_golden_sweep && (
-                          <span
-                            className="text-xs px-1.5 py-0.5 rounded font-bold"
-                            style={{ background: "var(--gold)", color: "#1a0f00" }}
-                            title="Golden Sweep"
-                          >★</span>
-                        )}
-                      </div>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <SkeletonRows />
+                ) : error ? (
+                  <tr>
+                    <td colSpan={10} className="px-4 py-10 text-center text-sm" style={{ color: "var(--red)" }}>
+                      ⚠ {error}
                     </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+                ) : events.length === 0 ? (
+                  <tr><td colSpan={10}><EmptyState /></td></tr>
+                ) : (
+                  <>
+                    {/* top spacer — keeps scroll thumb proportional */}
+                    {paddingTop > 0 && (
+                      <tr aria-hidden="true">
+                        <td colSpan={10} style={{ height: paddingTop, padding: 0 }} />
+                      </tr>
+                    )}
+
+                    {virtualItems.map(vRow => {
+                      const e = events[vRow.index];
+                      return (
+                        <tr
+                          key={e.id}
+                          data-index={vRow.index}
+                          style={{ height: ROW_HEIGHT }}
+                          className="border-b transition-colors hover:bg-[var(--surface-2)] animate-fade-up"
+                        >
+                          <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--faint)" }}>
+                            {fmtTime(e.timestamp)}
+                          </td>
+                          <td className="px-3 py-3 font-mono font-bold text-sm" style={{ color: "var(--amber)" }}>
+                            {e.ticker}
+                          </td>
+                          <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
+                            ${e.strike.toFixed(0)} {e.expiry}
+                          </td>
+                          <td className="px-3 py-3">
+                            <span className={e.contract_type === "CALL" ? "badge badge-green" : "badge badge-red"}>
+                              {e.contract_type}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3">
+                            <span className={sentimentBadge(e.sentiment)}>{e.sentiment}</span>
+                          </td>
+                          <td className="px-3 py-3 font-mono font-semibold text-sm tabular text-right" style={{ color: "var(--amber)" }}>
+                            {fmt$(e.premium)}
+                          </td>
+                          <td className="px-3 py-3 font-mono text-xs tabular text-right" style={{ color: "var(--text)" }}>
+                            {e.size.toLocaleString()}
+                          </td>
+                          <td className="px-3 py-3 font-mono text-xs tabular" style={{ color: "var(--muted)" }}>
+                            {e.bid.toFixed(2)} / {e.ask.toFixed(2)} / <span style={{ color: "var(--text)" }}>{e.fill_price.toFixed(2)}</span>
+                          </td>
+                          <td className="px-3 py-3">
+                            <span className={tierBadge(e.tier)}>{e.tier}</span>
+                          </td>
+                          <td className="px-3 py-3">
+                            <div className="flex items-center gap-1.5">
+                              {e.is_aggressive && (
+                                <span
+                                  className="text-xs px-1.5 py-0.5 rounded font-bold"
+                                  style={{ background: "var(--orange)", color: "#fff" }}
+                                  title="Aggressive fill"
+                                >⚡</span>
+                              )}
+                              {e.is_golden_sweep && (
+                                <span
+                                  className="text-xs px-1.5 py-0.5 rounded font-bold"
+                                  style={{ background: "var(--gold)", color: "#1a0f00" }}
+                                  title="Golden Sweep"
+                                >★</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+
+                    {/* bottom spacer */}
+                    {paddingBottom > 0 && (
+                      <tr aria-hidden="true">
+                        <td colSpan={10} style={{ height: paddingBottom, padding: 0 }} />
+                      </tr>
+                    )}
+                  </>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>

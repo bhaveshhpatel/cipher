@@ -1,10 +1,12 @@
 "use client";
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { AppHeader } from "./AppHeader";
-import { SidebarNav } from "./SidebarNav";
+import { AppHeader }    from "./AppHeader";
+import { SidebarNav }   from "./SidebarNav";
 import { MobileTabBar } from "./MobileTabBar";
 import type { DashboardTab, StreamStats } from "@/types";
+
+const SIDEBAR_KEY = "cipher:sidebar-collapsed";
 
 export interface DashboardLayoutProps {
   email:       string | null;
@@ -25,7 +27,19 @@ export function DashboardLayout({
   signalCount,
   children,
 }: DashboardLayoutProps) {
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // ── sidebar collapse — persisted to localStorage ──────────────────────────
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem(SIDEBAR_KEY) === "true";
+  });
+
+  const handleToggle = () => {
+    setSidebarCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem(SIDEBAR_KEY, String(next));
+      return next;
+    });
+  };
 
   return (
     <div
@@ -49,7 +63,7 @@ export function DashboardLayout({
           onTabChange={onTabChange}
           signalCount={signalCount}
           collapsed={sidebarCollapsed}
-          onToggle={() => setSidebarCollapsed(c => !c)}
+          onToggle={handleToggle}
         />
 
         <main
