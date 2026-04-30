@@ -2,13 +2,12 @@
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/hooks/useAuth";
-import { useFlow } from "@/hooks/useFlow";
 import { useSimulation } from "@/hooks/useSimulation";
 import { useSignalStream } from "@/hooks/useSignalStream";
 import { useFlowEvents } from "@/hooks/useFlowEvents";
 import { useFlowEpisodes } from "@/hooks/useFlowEpisodes";
 import { api } from "@/lib/api";
-import type { StreamStats, CompositeSignal } from "@/lib/api";
+import type { StreamStats, CompositeSignal, FlowEvent } from "@/lib/api";
 import type { FlowEventsFilters } from "@/hooks/useFlowEvents";
 import type { FlowEpisodesFilters } from "@/hooks/useFlowEpisodes";
 
@@ -46,24 +45,28 @@ const STATS_REFRESH_MS = 15_000;
 export default function DashboardPage() {
   const router = useRouter();
   const { token, email, isAuthenticated, ready, logout } = useAuth();
-  const { events, loading: flowLoading, error: flowError, fetch: fetchFlow } = useFlow(token);
   const { result: simResult, loading: simLoading, error: simError, progress, run: runSim } = useSimulation(token);
   const { signals, connected } = useSignalStream(token);
+
+  // Flow scan state (used by simulation tab — imperative fetch pattern)
+  const [events,      setEvents]      = useState<FlowEvent[]>([]);
+  const [flowLoading, setFlowLoading] = useState(false);
+  const [flowError,   setFlowError]   = useState<string | null>(null);
 
   // Two-arg hook wiring — parent owns filter state, hook auto-refetches on change
   const [flowEventsFilters,   setFlowEventsFilters]   = useState<FlowEventsFilters>({});
   const [flowEpisodesFilters, setFlowEpisodesFilters] = useState<FlowEpisodesFilters>({});
 
-  const { events: flowEventRows, loading: feLoading, error: feError }     = useFlowEvents(token,  flowEventsFilters);
-  const { episodes,              loading: epLoading, error: epError }     = useFlowEpisodes(token, flowEpisodesFilters);
+  const { events: flowEventRows, loading: feLoading, error: feError }  = useFlowEvents(token,  flowEventsFilters);
+  const { episodes,              loading: epLoading, error: epError }  = useFlowEpisodes(token, flowEpisodesFilters);
 
   const [flowTicker,      setFlowTicker]      = useState("");
   const [compositeTicker, setCompositeTicker] = useState("");
-  const [tab,              setTab]              = useState<Tab>("flow_events");
-  const [stats,            setStats]            = useState<StreamStats | null>(null);
-  const [composite,        setComposite]        = useState<CompositeSignal | null>(null);
+  const [tab,             setTab]             = useState<Tab>("flow_events");
+  const [stats,           setStats]           = useState<StreamStats | null>(null);
+  const [composite,       setComposite]       = useState<CompositeSignal | null>(null);
   const [compositeLoading, setCompositeLoading] = useState(false);
-  const [flowCountdown,    setFlowCountdown]    = useState(FLOW_REFRESH_MS / 1000);
+  const [flowCountdown,   setFlowCountdown]   = useState(FLOW_REFRESH_MS / 1000);
 
   // Auth guard
   useEffect(() => {
@@ -71,10 +74,20 @@ export default function DashboardPage() {
     if (!isAuthenticated) router.replace("/");
   }, [ready, isAuthenticated, router]);
 
-  const doFetchFlow = useCallback((ticker: string) => {
-    fetchFlow(ticker);
+  const doFetchFlow = useCallback(async (ticker: string) => {
+    if (!token) return;
+    setFlowLoading(true);
+    setFlowError(null);
     setFlowCountdown(FLOW_REFRESH_MS / 1000);
-  }, [fetchFlow]);
+    try {
+      const d = await api.getFlow(ticker, token);
+      setEvents(d.events);
+    } catch (e) {
+      setFlowError(e instanceof Error ? e.message : "Failed to load flow");
+    } finally {
+      setFlowLoading(false);
+    }
+  }, [token]);
 
   useEffect(() => {
     if (token) doFetchFlow("");
