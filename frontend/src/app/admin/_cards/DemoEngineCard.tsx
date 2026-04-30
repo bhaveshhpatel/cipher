@@ -1,14 +1,10 @@
 "use client";
+import { type DemoStatus } from "@/hooks/useAdminDemo";
 import { A, AdminCard, CardHeader, ErrorBanner, Stat, StatusPill } from "./_shared";
 
-export interface DemoStatus {
-  demo: {
-    ticks_emitted:     number;
-    signals_generated: number;
-    last_ticker:       string | null;
-    started_at:        string | null;
-  };
-}
+// DemoStatus is the canonical type from useAdminDemo:
+// { demo: DemoStats; admin: string; role: string }
+// The card only reads demo.*, so the extra admin/role fields are ignored.
 
 interface Props {
   status:    DemoStatus | null;
