@@ -15,21 +15,27 @@ STREAM-3 (2026-04-28):
   Remove asyncio.Lock. All workers connect in parallel simultaneously.
   Tradier "1 concurrent session" = 1 sessionid at a time, NOT 1 open
   connection. Workers sharing the same sessionid each hold their own open
-  POST stream concurrently — all 31,920 symbols covered from T+0.
+  POST stream concurrently -- all 31,920 symbols covered from T+0.
 
 STREAM-4 (2026-04-30):
   Add asyncio.wait_for(timeout=10s) around get_session_token() to prevent
   silent infinite hang when Tradier session endpoint is unresponsive.
 
 STREAM-5 (2026-04-30):
-  Increase retry delay from 2s → 15s so rapid container restarts self-heal
+  Increase retry delay from 2s -> 15s so rapid container restarts self-heal
   after Tradier's quota releases. Explicit 400 Quota Violation handling with
   20s backoff (Tradier session TTL is ~10-15s after connection drop).
+
+STREAM-6 (2026-04-30):
+  Raise _STALL_THRESHOLD_S 60s -> 300s to match the new 120s _IDLE_TIMEOUT
+  in stream_worker.py. With 64 workers x 500 symbols at ~0.6 ticks/s total,
+  each worker expects ~1 tick per 110s. The old 60s threshold produced
+  stalled=63 in every STREAM_HEALTH report even when all workers were healthy.
 
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
-  - 64 workers × 500 symbols = 31,920 OCC symbols, all streaming in parallel
+  - 64 workers x 500 symbols = 31,920 OCC symbols, all streaming in parallel
   - 50ms staggered startup to avoid thundering-herd on Tradier endpoint
   - asyncio.Queue(maxsize=50_000) feeds a single _consume_queue() task
   - Manager logs STREAM_HEALTH every 30s: aggregate ticks, active workers,
@@ -51,7 +57,7 @@ _QUEUE_SIZE              = 50_000     # handle burst from 64 parallel workers
 _WORKER_SPAWN_DELAY_S    = 0.05       # 50ms stagger between worker starts
 _HEALTH_LOG_INTERVAL_S   = 30.0       # manager-level aggregate log interval
 _DEFAULT_WORKER_REFRESH_S: float = 300.0
-_STALL_THRESHOLD_S       = 60.0       # worker is "stalled" if no tick in this many seconds
+_STALL_THRESHOLD_S       = 300.0      # STREAM-6: raised from 60s; matches 120s idle timeout with headroom
 _SESSION_TOKEN_TIMEOUT_S = 10.0       # hard timeout for each get_session_token() attempt (STREAM-4)
 _SESSION_RETRY_DELAY_S   = 15.0       # delay between retry attempts (STREAM-5)
 _SESSION_QUOTA_BACKOFF_S = 20.0       # extra backoff on 400 Quota Violation (STREAM-5)
@@ -121,7 +127,7 @@ class StreamManager:
         await asyncio.gather(*[t for t in all_tasks if t is not None], return_exceptions=True)
         self._tasks.clear()
         self._workers.clear()
-        log.info("[stream_manager] All workers stopped — Tradier connections closed")
+        log.info("[stream_manager] All workers stopped -- Tradier connections closed")
 
     async def run(self):
         """
@@ -130,7 +136,7 @@ class StreamManager:
         """
         self._running = True
         self._queue = asyncio.Queue(maxsize=_QUEUE_SIZE)
-        log.info("[stream_manager] Starting — chunk_size=%d queue_size=%d",
+        log.info("[stream_manager] Starting -- chunk_size=%d queue_size=%d",
                  _CHUNK_SIZE, _QUEUE_SIZE)
         await self._spawn_workers()
         self._consumer    = asyncio.create_task(self._consume_queue(),   name="stream-consumer")
@@ -141,7 +147,7 @@ class StreamManager:
                 await asyncio.sleep(60)
                 elapsed += 60.0
                 if self._any_token_expired():
-                    log.warning("[stream_manager] Token expired detected — refreshing session + respawning")
+                    log.warning("[stream_manager] Token expired detected -- refreshing session + respawning")
                     await self._respawn_workers(force_token_refresh=True)
                     elapsed = 0.0
                 elif elapsed >= self._worker_refresh_s:
@@ -250,7 +256,7 @@ class StreamManager:
                 is_quota = "400" in err_str and "Quota" in err_str
                 if is_quota:
                     log.warning(
-                        "[stream_manager] Session token 400 Quota Violation (attempt %d/3) — "
+                        "[stream_manager] Session token 400 Quota Violation (attempt %d/3) -- "
                         "old session still registered on Tradier, backing off %.0fs",
                         attempt, _SESSION_QUOTA_BACKOFF_S,
                     )
@@ -273,7 +279,7 @@ class StreamManager:
             if attempt < 3:
                 delay = _SESSION_QUOTA_BACKOFF_S if is_quota else _SESSION_RETRY_DELAY_S
                 log.info(
-                    "[stream_manager] Waiting %.0fs before retry (attempt %d/3)…",
+                    "[stream_manager] Waiting %.0fs before retry (attempt %d/3)...",
                     delay, attempt + 1,
                 )
                 await asyncio.sleep(delay)
@@ -297,7 +303,7 @@ class StreamManager:
 
         self._session_token = await self._fetch_session_token()
         if not self._session_token:
-            log.error("[stream_manager] Aborting spawn — no session token")
+            log.error("[stream_manager] Aborting spawn -- no session token")
             return
 
         chunks = [
@@ -331,7 +337,7 @@ class StreamManager:
             self._tasks.append(task)
 
         log.info(
-            "[stream_manager] %d workers spawned — all streaming in parallel",
+            "[stream_manager] %d workers spawned -- all streaming in parallel",
             len(self._workers),
         )
 
@@ -346,7 +352,7 @@ class StreamManager:
 
         new_symbols = self._registry.all_symbols()
         if not new_symbols:
-            log.warning("[stream_manager] _respawn_workers: registry empty — skipping")
+            log.warning("[stream_manager] _respawn_workers: registry empty -- skipping")
             return
 
         old_set = {s for w in self._workers for s in w.symbols}
@@ -355,14 +361,14 @@ class StreamManager:
 
         if not symbols_changed and not force_token_refresh:
             log.debug(
-                "[stream_manager] _respawn_workers: symbol set unchanged (%d) — skipping",
+                "[stream_manager] _respawn_workers: symbol set unchanged (%d) -- skipping",
                 len(new_set),
             )
             return
 
         log.info(
             "[stream_manager] _respawn_workers: old_symbols=%d new_symbols=%d "
-            "force_token_refresh=%s — cancelling %d workers",
+            "force_token_refresh=%s -- cancelling %d workers",
             len(old_set), len(new_set), force_token_refresh, len(self._tasks),
         )
 
@@ -378,7 +384,7 @@ class StreamManager:
         # Always refresh token on respawn
         self._session_token = await self._fetch_session_token()
         if not self._session_token:
-            log.error("[stream_manager] _respawn_workers: no session token — aborting")
+            log.error("[stream_manager] _respawn_workers: no session token -- aborting")
             return
 
         chunks = [
@@ -414,7 +420,7 @@ class StreamManager:
         if self._queue is None:
             return
         log.info(
-            "[stream_manager] Queue consumer started — maxsize=%d", _QUEUE_SIZE
+            "[stream_manager] Queue consumer started -- maxsize=%d", _QUEUE_SIZE
         )
         processed = 0
         try:
@@ -430,6 +436,6 @@ class StreamManager:
                     self._queue.task_done()
         except asyncio.CancelledError:
             log.info(
-                "[stream_manager] Queue consumer stopped — total_processed=%d", processed
+                "[stream_manager] Queue consumer stopped -- total_processed=%d", processed
             )
             raise
