@@ -1,22 +1,30 @@
 import '@testing-library/jest-dom';
 
+// Must run first so jest-fetch-mock injects its fetch/Response globals
+// before any polyfill logic reads them.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require('jest-fetch-mock').enableMocks();
+
 /**
  * Polyfill Response.json static method.
  *
- * jsdom does not implement Response.json (a WHATWG Fetch spec addition).
- * NextResponse.json() calls it internally, so without this polyfill
- * the proxy route handler test fails with "Response.json is not a function".
+ * The WHATWG static Response.json() is absent in:
+ *   - Node environments (proxy.test.ts uses @jest-environment node)
+ *   - older jsdom builds
+ *
+ * NextResponse.json() delegates to it internally, causing
+ * "Response.json is not a function" in the proxy 503 test.
+ *
+ * Guard with typeof so this is a no-op in environments where
+ * Response itself is undefined (avoids ReferenceError).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-if (!(Response as any).json) {
+if (typeof globalThis.Response !== 'undefined' && !(globalThis.Response as any).json) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (Response as any).json = (data: unknown, init?: ResponseInit) =>
-    new Response(JSON.stringify(data), {
+  (globalThis.Response as any).json = (data: unknown, init?: ResponseInit) =>
+    new globalThis.Response(JSON.stringify(data), {
       status: 200,
       ...init,
       headers: { 'Content-Type': 'application/json' },
     });
 }
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-require('jest-fetch-mock').enableMocks();
