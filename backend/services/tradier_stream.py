@@ -66,7 +66,7 @@ Fix (SIGNAL-GATE 2026-04-29):
 
 Fix (SIG-DEBOUNCE 2026-04-30):
   Once an episode crossed _SIGNAL_MIN_TRADES / _SIGNAL_MIN_PREMIUM, EVERY
-  subsequent persisted trade was re-emitting a signal (persisted=71,866 →
+  subsequent persisted trade was re-emitting a signal (persisted=71,866 ->
   signals=50,494 at market open). The SIGNAL-GATE only prevented the very
   first crossing; after that, get_signal() returned a sig_ep on every tick.
 
@@ -84,8 +84,24 @@ Fix (SIG-DEBOUNCE-LOG 2026-04-30):
   [signal] log line used $%,.0f — the comma thousands-separator is only valid
   in f-string / str.format() style. Python logging uses msg % args internally,
   so %,.0f raises ValueError: unsupported format character ','.
-  Fix: changed $%,.0f → $%.0f in the %-style format string.
+  Fix: changed $%,.0f -> $%.0f in the %-style format string.
   Comma separator retained in f-string reason= output (unaffected).
+
+Fix (EPISODE-FIX 2026-04-30):
+  flow_episodes row count was identical to signal_history because both tables
+  were written from the same composite_signal bus event, which only fires after
+  Signal Gate AND SIG-DEBOUNCE both pass. SIG-DEBOUNCE is a WebSocket /
+  signal_history anti-spam guard, not an episode persistence gate.
+
+  Additionally, _bus_signal_listener always wrote strike=None / expiry=None
+  because composite_msg["data"]["episode"] never included those fields.
+
+  Fix: persist_flow_episode() called directly in _process_trade() after the
+  Signal Gate check and BEFORE the SIG-DEBOUNCE check, using sig_ep fields
+  directly (which carry correct strike / expiry). direction is computed at
+  that point so it is in scope for both the episode write and the later bus
+  publish. The flow_episodes write in _bus_signal_listener is removed —
+  the "db_writer" channel is retained but is now a no-op for future use.
 """
 import asyncio
 import logging
@@ -100,7 +116,7 @@ import httpx
 from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
-from services.flow_store import persist_flow_event, upgrade_to_sweep_in_db
+from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
 from signals.composite_signal_engine import build_composite
 from utils.dedup import flow_dedup
@@ -157,7 +173,7 @@ _SIGNAL_MIN_PREMIUM = 50_000
 #
 #   _SIGNAL_DELTA_PREM / _SIGNAL_DELTA_PCT are OR-ed: whichever is larger
 #   for the current episode premium level acts as the effective delta floor.
-#     - Small episodes ($50k–$250k):  $25k absolute is the binding constraint
+#     - Small episodes ($50k-$250k):  $25k absolute is the binding constraint
 #     - Large episodes ($500k+):      20% relative is the binding constraint
 #
 #   _SIGNAL_EMIT_TTL_S: evict tracker entries after 2h so episodes that
@@ -408,10 +424,10 @@ def _should_emit_signal(
     Return (should_emit, reason_str) for the given episode key.
 
     Rules (in priority order):
-      1. No prior emit for this key → emit (initial crossing).
-      2. alert_level changed since last emit → emit (escalation / de-escalation).
-      3. Debounce window elapsed AND premium delta >= threshold → emit (growth update).
-      4. Otherwise → suppress.
+      1. No prior emit for this key -> emit (initial crossing).
+      2. alert_level changed since last emit -> emit (escalation / de-escalation).
+      3. Debounce window elapsed AND premium delta >= threshold -> emit (growth update).
+      4. Otherwise -> suppress.
     """
     last = _signal_last_emit.get(emit_key)
 
@@ -449,6 +465,11 @@ async def _process_trade(raw: dict):
         b) >= 30s elapsed AND total_premium grew >= max($25k, 20% of last prem)
       Suppressed signals counted in _stats["sig_debounced"].
       _signal_last_emit entries evicted after 2h (TTL).
+
+    EPISODE-FIX (2026-04-30):
+      persist_flow_episode() is called directly after the Signal Gate and BEFORE
+      the SIG-DEBOUNCE check. flow_episodes records every Signal Gate crossing;
+      SIG-DEBOUNCE only gates the WebSocket bus publish and signal_history.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -652,6 +673,33 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(sig_ep)
 
+    # EPISODE-FIX (2026-04-30): compute direction here so it is available for
+    # both persist_flow_episode (below) and the bus publish (after debounce).
+    if sig_ep.contract_type == "CALL":
+        direction = "REPEAT_BUY"
+    elif sig_ep.contract_type == "PUT":
+        direction = "REPEAT_SELL"
+    else:
+        direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+
+    # EPISODE-FIX (2026-04-30): persist flow_episode BEFORE the debounce gate.
+    # flow_episodes records every Signal Gate crossing. SIG-DEBOUNCE only applies
+    # to the WebSocket bus publish and signal_history — not episode persistence.
+    # Fire-and-forget so the stream hot path is not blocked.
+    asyncio.create_task(persist_flow_episode({
+        "ticker":          sig_ep.ticker,
+        "direction":       direction,
+        "contract_type":   sig_ep.contract_type,
+        "strike":          sig_ep.strike,
+        "expiry":          sig_ep.expiry,
+        "total_premium":   sig_ep.total_premium,
+        "trade_count":     sig_ep.trade_count,
+        "alert_level":     alert_level,
+        "is_accelerating": sig_ep.is_accelerating,
+        "seed_episode":    sig_ep.summary_str(),
+        "timestamp":       ev.timestamp.isoformat(),
+    }))
+
     # SIG-DEBOUNCE: per-episode emit gate — suppress if nothing meaningful changed
     now_ts   = _time.time()
     emit_key = f"{sig_ep.ticker}|{sig_ep.contract_type}|{sig_ep.strike}|{sig_ep.expiry}"
@@ -699,12 +747,7 @@ async def _process_trade(raw: dict):
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
-    if sig_ep.contract_type == "CALL":
-        direction = "REPEAT_BUY"
-    elif sig_ep.contract_type == "PUT":
-        direction = "REPEAT_SELL"
-    else:
-        direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+    # direction already computed above (EPISODE-FIX 2026-04-30)
 
     signal = {
         "type": "signal",

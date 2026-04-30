@@ -12,8 +12,10 @@ Usage — call once at startup from main.py lifespan:
 
 Tables written:
   - flow_events   : one row per classified tick (batched every 500ms or 100 rows)
-  - flow_episodes : one row per repetition episode that crossed threshold
-                    (written immediately on every qualifying composite_signal)
+  - flow_episodes : one row per Signal Gate crossing, written directly from
+                    _process_trade() in tradier_stream.py BEFORE the SIG-DEBOUNCE
+                    check. This decouples episode persistence from the debounce
+                    gate (which is only for WebSocket / signal_history anti-spam).
 
 NOTE: Neither table receives an `id` field — Postgres generates it
       (uuid default for flow_events, bigserial for flow_episodes).
@@ -43,6 +45,15 @@ Bug fixes applied:
      SQL expression "now()-interval 30 seconds" as a literal string in the
      PostgREST filter URL. PostgREST does not evaluate SQL expressions in
      filter values. Fixed to pre-compute a UTC ISO timestamp in Python.
+  3. EPISODE-FIX (2026-04-30): flow_episodes were only written when the
+     composite_signal bus event fired (after Signal Gate AND SIG-DEBOUNCE).
+     This caused flow_episodes row count to equal signal_history row count.
+     Additionally, _bus_signal_listener always wrote strike=None/expiry=None
+     because composite_msg never included those fields.
+     Fix: persist_flow_episode() is now called directly from _process_trade()
+     after Signal Gate, before SIG-DEBOUNCE. _bus_signal_listener no longer
+     writes flow_episodes — it is retained but acts as a no-op consumer of
+     the db_writer channel for future use.
 """
 import asyncio
 import logging
@@ -243,6 +254,17 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
 
 
 async def persist_flow_episode(signal_data: dict):
+    """
+    Write one row to flow_episodes.
+
+    Called directly from _process_trade() in tradier_stream.py after the
+    Signal Gate check and BEFORE the SIG-DEBOUNCE check. This ensures
+    flow_episodes records every qualifying Signal Gate crossing, not just
+    the subset that also clears the debounce gate.
+
+    strike and expiry are populated from sig_ep fields (not from the
+    composite_msg bus payload which never included them).
+    """
     expiry = signal_data.get("expiry") or None
 
     row = {
@@ -262,45 +284,23 @@ async def persist_flow_episode(signal_data: dict):
     if ok:
         log.info(
             f"[flow_store] flow_episode saved: {row['ticker']} {row['contract_type']} "
+            f"strike={row['strike']} expiry={row['expiry']} "
             f"alert={row['alert_level']} prem=${(row['total_premium'] or 0):,.0f}"
         )
 
 
 async def _bus_signal_listener():
+    """
+    EPISODE-FIX (2026-04-30): flow_episodes are now written directly from
+    _process_trade() before the SIG-DEBOUNCE gate. This listener is retained
+    to consume the db_writer channel (preventing queue build-up) but no longer
+    writes any rows itself.
+    """
     q = bus.subscribe("db_writer")
-    log.info("[flow_store] DB writer subscribed to bus -- flow_episodes written on composite_signal only")
+    log.info("[flow_store] DB writer subscribed to bus (flow_episodes written directly from stream, not here)")
     try:
         while True:
-            msg = await q.get()
-            if not isinstance(msg, dict):
-                continue
-            msg_type = msg.get("type")
-            if msg_type == "composite_signal":
-                data = msg.get("data", {})
-                sig  = data.get("signal", {})
-                ep   = data.get("episode", {})
-
-                # Bug fix: the published signal dict uses key "alert", not "alert_level".
-                # Try both; fall back to "WATCH" so the NOT NULL constraint is always satisfied.
-                alert_level = (
-                    sig.get("alert_level")
-                    or sig.get("alert")
-                    or "WATCH"
-                )
-
-                await persist_flow_episode({
-                    "ticker":          sig.get("ticker"),
-                    "direction":       ep.get("direction"),
-                    "contract_type":   ep.get("contract_type"),
-                    "strike":          None,
-                    "expiry":          None,
-                    "total_premium":   ep.get("total_premium"),
-                    "trade_count":     ep.get("trade_count"),
-                    "alert_level":     alert_level,
-                    "is_accelerating": ep.get("is_accelerating", False),
-                    "seed_episode":    sig.get("reasoning"),
-                    "timestamp":       ep.get("timestamp"),
-                })
+            await q.get()  # drain the channel — no-op consumer
     except asyncio.CancelledError:
         bus.unsubscribe("db_writer", q)
         log.info("[flow_store] DB writer unsubscribed from bus")
