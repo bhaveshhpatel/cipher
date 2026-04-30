@@ -33,7 +33,10 @@ const defaultProps = {
   signalCount: 0,
 };
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  localStorage.clear(); // prevent sidebar collapsed-state bleed between tests
+});
 
 describe('DashboardLayout', () => {
   it('renders all layout regions', () => {
