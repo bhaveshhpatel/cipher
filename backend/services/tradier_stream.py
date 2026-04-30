@@ -63,6 +63,22 @@ Fix (SIGNAL-GATE 2026-04-29):
   has trade_count >= 3 AND total_premium > 50_000.
   Fix: explicit gate check in _process_trade after sig_ep cooldown passes,
   before alert_level / composite / bus publish. Persist path unchanged.
+
+Fix (SIG-DEBOUNCE 2026-04-30):
+  Once an episode crossed _SIGNAL_MIN_TRADES / _SIGNAL_MIN_PREMIUM, EVERY
+  subsequent persisted trade was re-emitting a signal (persisted=71,866 →
+  signals=50,494 at market open). The SIGNAL-GATE only prevented the very
+  first crossing; after that, get_signal() returned a sig_ep on every tick.
+
+  Fix: per-episode emit tracker _signal_last_emit dict[str, dict] keyed by
+  "ticker|contract_type|strike|expiry". A signal is emitted only when:
+    1. First time this episode key is seen (initial crossing), OR
+    2. alert_level escalated since the last emit, OR
+    3. ≥ _SIGNAL_DEBOUNCE_S elapsed since last emit AND
+       total_premium grew by ≥ max(_SIGNAL_DELTA_PREM, last_prem * _SIGNAL_DELTA_PCT)
+
+  Entries are evicted after _SIGNAL_EMIT_TTL_S (7200s / 2h) to prevent
+  unbounded memory growth across the trading day.
 """
 import asyncio
 import logging
@@ -118,13 +134,32 @@ _MARKET_CLOSE = time(16, 0)
 _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
-# Signal gate thresholds (2026-04-28 decision):
+# Signal gate thresholds (SIGNAL-GATE 2026-04-29):
 #   Persist to flow_events at low threshold (min_trades=1 / min_premium=10_000).
 #   Only publish to signal bus when episode has >= _SIGNAL_MIN_TRADES trades
 #   AND total_premium > _SIGNAL_MIN_PREMIUM.
 # ---------------------------------------------------------------------------
 _SIGNAL_MIN_TRADES  = 3
 _SIGNAL_MIN_PREMIUM = 50_000
+
+# ---------------------------------------------------------------------------
+# Per-episode signal debounce (SIG-DEBOUNCE 2026-04-30):
+#   After initial crossing, re-emit only when:
+#     a) alert_level changed, OR
+#     b) ≥ _SIGNAL_DEBOUNCE_S elapsed AND premium grew by ≥ threshold
+#
+#   _SIGNAL_DELTA_PREM / _SIGNAL_DELTA_PCT are OR-ed: whichever is larger
+#   for the current episode premium level acts as the effective delta floor.
+#     - Small episodes ($50k–$250k):  $25k absolute is the binding constraint
+#     - Large episodes ($500k+):      20% relative is the binding constraint
+#
+#   _SIGNAL_EMIT_TTL_S: evict tracker entries after 2h so episodes that
+#   go cold don't prevent fresh signals if the same contract re-activates.
+# ---------------------------------------------------------------------------
+_SIGNAL_DEBOUNCE_S  = 30.0        # minimum seconds between re-emits
+_SIGNAL_DELTA_PREM  = 25_000.0    # minimum absolute premium growth to re-emit
+_SIGNAL_DELTA_PCT   = 0.20        # minimum % growth to re-emit (whichever is larger)
+_SIGNAL_EMIT_TTL_S  = 7_200.0     # evict tracker entries after 2h
 
 # ---------------------------------------------------------------------------
 # Global stats
@@ -141,6 +176,7 @@ _stats = {
     "accumulator_gated": 0,   # FLOW-DEBUG: ingest_tick returned None (below threshold)
     "persisted":         0,   # FLOW-DEBUG: persist_flow_event actually called
     "signals":           0,
+    "sig_debounced":     0,   # SIG-DEBOUNCE: signals suppressed by debounce gate
     "errors":            0,
     "composite_errors":  0,
     "reconnects":        0,
@@ -155,8 +191,12 @@ _non_timesale_etypes_seen: set = set()
 accumulator = RepetitionAccumulator(window_minutes=30, min_trades=1, min_premium=10_000)
 
 # H4 fix: dict[str, float] with wall-clock timestamps instead of a bare Set.
-# Keys evicted once they exceed _SWEEP_DISPATCH_TTL_S age.
 _sweep_upgrade_dispatched: dict[str, float] = {}
+
+# SIG-DEBOUNCE: per-episode last-emit tracker.
+# key  = "ticker|contract_type|strike|expiry"
+# value = {"alert_level": str, "premium": float, "ts": float}
+_signal_last_emit: dict[str, dict] = {}
 
 
 def get_stats() -> dict:
@@ -305,7 +345,6 @@ async def stream_options_flow(
 
         log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
         # D-002: only spawn refresh_loop here in standalone mode.
-        # When registry comes from lifespan, lifespan already owns refresh_loop.
         asyncio.create_task(registry.refresh_loop())
 
     _stats["active_symbols"] = registry.size()
@@ -340,43 +379,69 @@ async def _guarded_lines(resp: httpx.Response):
 
 
 # ---------------------------------------------------------------------------
+# SIG-DEBOUNCE helpers
+# ---------------------------------------------------------------------------
+def _evict_signal_emit_cache(now: float) -> None:
+    """Remove entries from _signal_last_emit older than _SIGNAL_EMIT_TTL_S."""
+    stale = [
+        k for k, v in _signal_last_emit.items()
+        if now - v["ts"] > _SIGNAL_EMIT_TTL_S
+    ]
+    for k in stale:
+        del _signal_last_emit[k]
+
+
+def _should_emit_signal(
+    emit_key: str,
+    alert_level: str,
+    total_premium: float,
+    now: float,
+) -> tuple[bool, str]:
+    """
+    Return (should_emit, reason_str) for the given episode key.
+
+    Rules (in priority order):
+      1. No prior emit for this key → emit (initial crossing).
+      2. alert_level changed since last emit → emit (escalation / de-escalation).
+      3. Debounce window elapsed AND premium delta ≥ threshold → emit (growth update).
+      4. Otherwise → suppress.
+    """
+    last = _signal_last_emit.get(emit_key)
+
+    if last is None:
+        return True, "initial_crossing"
+
+    if last["alert_level"] != alert_level:
+        return True, f"alert_escalation:{last['alert_level']}->{alert_level}"
+
+    elapsed = now - last["ts"]
+    if elapsed >= _SIGNAL_DEBOUNCE_S:
+        delta      = total_premium - last["premium"]
+        pct_floor  = last["premium"] * _SIGNAL_DELTA_PCT
+        threshold  = max(_SIGNAL_DELTA_PREM, pct_floor)
+        if delta >= threshold:
+            return True, f"premium_growth:+${delta:,.0f} (>= ${threshold:,.0f})"
+
+    return False, (
+        f"debounced: elapsed={elapsed:.1f}s "
+        f"delta=${total_premium - last['premium']:,.0f} "
+        f"alert={alert_level}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trade processor
 # ---------------------------------------------------------------------------
 async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
-    FLOW-DEBUG: every gate now emits an INFO log so Railway logs show exactly
-    where trades are dropped. A periodic stats summary is logged every
-    _STATS_LOG_INTERVAL ticks so throughput is visible even when no trade
-    clears all gates.
-
-    FIRST-TICK (2026-04-28):
-      First _FIRST_TICK_LOG_COUNT ticks are logged individually at INFO level
-      regardless of type so Railway confirms WebSocket data is arriving.
-      Non-timesale event types are logged at INFO for the first
-      _FIRST_ETYPE_LOG_COUNT distinct types seen, then demoted to DEBUG.
-
-    H4 fix — _sweep_upgrade_dispatched TTL eviction:
-      Before checking dispatch_key membership, evict all entries older than
-      _SWEEP_DISPATCH_TTL_S. This bounds the dict to at most ~30 min of
-      unique OCC|size|fill keys seen during the rolling window.
-
-    DEDUP-KWARGS fix (2026-04-28):
-      DedupCache.is_duplicate() first positional param is `event_or_occ_symbol`.
-      Passing occ_symbol= as a keyword arg raised an unexpected keyword error.
-      Fix: pass occ_symbol as first positional argument.
-
-    BUG-1 fix (2026-04-29):
-      alert_level is now included in composite_msg["data"]["signal"] so
-      signal_store._build_row() receives the correct premium-tier classification.
-
-    SIGNAL-GATE fix (2026-04-29):
-      After persist_flow_event, an explicit gate ensures signals are only
-      published to the bus when the episode has >= _SIGNAL_MIN_TRADES trades
-      AND total_premium > _SIGNAL_MIN_PREMIUM ($50K). Persist path is
-      unaffected — all trades above the low accumulator threshold still write
-      to flow_events.
+    SIG-DEBOUNCE (2026-04-30):
+      After initial signal threshold crossing, re-emit only when:
+        a) alert_level changed since last emit for this episode, OR
+        b) >= 30s elapsed AND total_premium grew >= max($25k, 20% of last prem)
+      Suppressed signals counted in _stats["sig_debounced"].
+      _signal_last_emit entries evicted after 2h (TTL).
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -392,7 +457,8 @@ async def _process_trade(raw: dict):
     if tick_n % _STATS_LOG_INTERVAL == 0:
         log.info(
             "[flow-funnel] ticks=%d parsed=%d parse_failed=%d "
-            "deduped=%d classified=%d accumulator_gated=%d persisted=%d signals=%d",
+            "deduped=%d classified=%d accumulator_gated=%d "
+            "persisted=%d signals=%d sig_debounced=%d",
             tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
@@ -401,12 +467,12 @@ async def _process_trade(raw: dict):
             _stats["accumulator_gated"],
             _stats["persisted"],
             _stats["signals"],
+            _stats["sig_debounced"],
         )
 
     event_type = raw.get("type", "")
 
     if event_type not in _PROCESSABLE_TYPES:
-        # Log first N distinct non-timesale types at INFO, then demote to DEBUG
         if event_type not in _non_timesale_etypes_seen and len(_non_timesale_etypes_seen) < _FIRST_ETYPE_LOG_COUNT:
             _non_timesale_etypes_seen.add(event_type)
             log.info("[flow] non-timesale event_type=%r (tick #%d) — skipping", event_type, tick_n)
@@ -441,8 +507,7 @@ async def _process_trade(raw: dict):
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
 
-    # DEDUP-KWARGS fix: pass occ_symbol positionally — first param is
-    # `event_or_occ_symbol`, not `occ_symbol`, so keyword form raised TypeError.
+    # DEDUP-KWARGS fix
     if flow_dedup.is_duplicate(
         occ_symbol,
         size=ev.size,
@@ -470,7 +535,7 @@ async def _process_trade(raw: dict):
                 del _sweep_upgrade_dispatched[k]
 
             if dispatch_key not in _sweep_upgrade_dispatched:
-                _sweep_upgrade_dispatched[dispatch_key] = now  # H4: store timestamp
+                _sweep_upgrade_dispatched[dispatch_key] = now
                 log.info(
                     f"[sweep] threshold just crossed — retroactive upgrade: "
                     f"{occ_symbol} size={ev.size} fill={ev.fill_price} "
@@ -568,8 +633,7 @@ async def _process_trade(raw: dict):
     if not sig_ep:
         return
 
-    # SIGNAL-GATE (2026-04-29): only fire signal when episode qualifies.
-    # Persist already happened above — flow_events always written at low threshold.
+    # SIGNAL-GATE: episode must clear minimum volume before any signal fires
     if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _SIGNAL_MIN_PREMIUM:
         log.debug(
             "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
@@ -581,13 +645,43 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(sig_ep)
 
+    # SIG-DEBOUNCE: per-episode emit gate — suppress if nothing meaningful changed
+    now_ts   = _time.time()
+    emit_key = f"{sig_ep.ticker}|{sig_ep.contract_type}|{sig_ep.strike}|{sig_ep.expiry}"
+
+    # Evict stale entries every time we reach this point (amortised cleanup)
+    _evict_signal_emit_cache(now_ts)
+
+    should_emit, reason = _should_emit_signal(
+        emit_key, alert_level, sig_ep.total_premium, now_ts
+    )
+
+    if not should_emit:
+        _stats["sig_debounced"] += 1
+        log.debug(
+            "[signal-debounce] suppressed %s %s $%.0f %s — %s",
+            sig_ep.ticker, sig_ep.contract_type, sig_ep.strike, sig_ep.expiry,
+            reason,
+        )
+        return
+
+    # Update tracker before publishing
+    _signal_last_emit[emit_key] = {
+        "alert_level": alert_level,
+        "premium":     sig_ep.total_premium,
+        "ts":          now_ts,
+    }
+
     log.info(
-        f"[signal] {sig_ep.ticker} {sig_ep.contract_type} "
-        f"| alert={alert_level} "
-        f"| trades={sig_ep.trade_count} "
-        f"| total_prem=${sig_ep.total_premium:,.0f} "
-        f"| accel={sig_ep.is_accelerating} "
-        f"| {sig_ep.summary_str()}"
+        "[signal] %s %s | alert=%s | trades=%d | total_prem=$%,.0f "
+        "| accel=%s | reason=%s | %s",
+        sig_ep.ticker, sig_ep.contract_type,
+        alert_level,
+        sig_ep.trade_count,
+        sig_ep.total_premium,
+        sig_ep.is_accelerating,
+        reason,
+        sig_ep.summary_str(),
     )
 
     try:
@@ -635,7 +729,7 @@ async def _process_trade(raw: dict):
                     "backtest_score":        composite.backtest_score,
                     "volume_premium_factor": composite.volume_premium_factor,
                     "reasoning":             composite.reasoning,
-                    "alert_level":           alert_level,   # BUG-1 fix (2026-04-29)
+                    "alert_level":           alert_level,   # BUG-1 fix
                 },
                 "episode": {
                     "contract_type":   sig_ep.contract_type,
