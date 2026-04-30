@@ -94,6 +94,25 @@ FIX DEDUP-2 (2026-04-29):
     - 30% drift threshold comfortably absorbs daily CBOE universe swings
     - keep=3 means at most 3 snapshots can accumulate before hard pruning
   DB cleaned: all 6 inactive snapshots + their symbol rows deleted.
+
+FIX STREAM-ELIGIBLE (2026-04-30):
+  _sync_upsert_symbol_quotes no longer writes stream_eligible.
+
+  Root cause: SymbolQuote objects built from registry.build() raw_quotes
+  (the warm-restart path via _post_build_upsert in main.py) always have
+  stream_eligible=False because build() never sets the flag — it defaults
+  to False in the dataclass. On every warm restart (Step 1 HIT, snapshot
+  reused via DEDUP logic), upsert_symbol_quotes() was silently overwriting
+  stream_eligible=True → False for ALL symbols, causing _load_symbols()
+  (which filters stream_eligible=True) to return 0 or very few symbols on
+  the next restart. This is why high-volume symbols like UPST and SOFI
+  appeared as stream_eligible=false despite passing all thresholds.
+
+  stream_eligible is set exclusively by the full pipeline path:
+    _sync_save_snapshot (cold start / 24h refresh via _universe_refresh_loop)
+  upsert_symbol_quotes() updates price/volume/OI/tier only — it must never
+  touch stream_eligible. The ON CONFLICT DO UPDATE clause leaves the existing
+  stream_eligible value untouched on every warm-restart upsert cycle.
 """
 import asyncio
 import logging
@@ -177,9 +196,17 @@ async def upsert_symbol_quotes(
     tier_map: Optional[dict[str, int]] = None,
 ) -> None:
     """
-    Persist Step 3 quote data (last_price, volume, average_volume,
-    open_interest, tier, stream_eligible) for each symbol into the
-    most recent active snapshot.
+    Persist quote data (last_price, volume, average_volume, open_interest, tier)
+    for each symbol into the most recent active snapshot.
+
+    NOTE: stream_eligible is intentionally NOT updated here.
+    stream_eligible is set exclusively by the full pipeline path
+    (_sync_save_snapshot, called during cold start or the 24h
+    _universe_refresh_loop). SymbolQuote objects produced by
+    registry.build() / _post_build_upsert on warm restarts always have
+    stream_eligible=False (dataclass default) because build() never
+    evaluates eligibility. Writing that default would silently downgrade
+    every symbol on every warm restart.
 
     open_interest: avg chain OI per ticker, populated on the quote by
     main.py from registry.get_oi_map() before this is called (Feature 4A-OI).
@@ -537,8 +564,14 @@ def _sync_save_snapshot(
 
 def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
     """
-    Upsert last_price, volume, average_volume, open_interest, tier,
-    stream_eligible for every symbol in the active snapshot.
+    Upsert last_price, volume, average_volume, open_interest, tier
+    for every symbol in the active snapshot.
+
+    stream_eligible is intentionally NOT included in the upsert payload.
+    See upsert_symbol_quotes() docstring for the full rationale.
+    TL;DR: build() raw_quotes never set stream_eligible (defaults False),
+    so including it here would silently wipe True → False on every warm restart.
+    stream_eligible is owned exclusively by _sync_save_snapshot().
     """
     try:
         sb = _client()
@@ -567,14 +600,14 @@ def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
 
         upsert_rows = [
             {
-                "snapshot_id":     snapshot_id,
-                "symbol":          q.symbol,
-                "last_price":      q.last_price,
-                "volume":          q.volume,
-                "average_volume":  q.average_volume,
-                "open_interest":   q.open_interest,
-                "stream_eligible": q.stream_eligible,
-                "tier":            tier_map.get(q.symbol, 3),
+                "snapshot_id":    snapshot_id,
+                "symbol":         q.symbol,
+                "last_price":     q.last_price,
+                "volume":         q.volume,
+                "average_volume": q.average_volume,
+                "open_interest":  q.open_interest,
+                "tier":           tier_map.get(q.symbol, 3),
+                # stream_eligible intentionally omitted — owned by _sync_save_snapshot
             }
             for q in quotes
         ]
