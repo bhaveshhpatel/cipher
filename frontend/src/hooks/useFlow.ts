@@ -4,6 +4,12 @@
  * Fetches /api/proxy/flow/events with optional symbol + page filters.
  * Returns FlowEventRaw[] (raw per-trade rows with id, tier, fill_price, etc.)
  * Exposes helpers: loadMore, refresh, isEmpty, hasMore.
+ *
+ * Endpoint note: this hook fetches /api/proxy/flow/events which the proxy
+ * layer forwards to the backend's /api/flow/events (FlowEventsResponse shape).
+ * This is intentionally distinct from the legacy /api/flow/scan endpoint
+ * used by api.getFlow() — that endpoint returns aggregated FlowEvent[] rows
+ * and is retained only for the simulation tab's imperative fetch pattern.
  */
 import useSWRInfinite from "swr/infinite";
 import type { FlowEventsResponse, FlowEventRaw } from "@/types";

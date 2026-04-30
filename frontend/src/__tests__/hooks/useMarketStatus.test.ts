@@ -1,5 +1,5 @@
 import React from 'react';
-import { renderHook, waitFor } from "@testing-library/react";
+import { renderHook, waitFor, act } from "@testing-library/react";
 import { SWRConfig } from "swr";
 import { useMarketStatus } from "@/hooks";
 
@@ -30,7 +30,7 @@ describe("useMarketStatus", () => {
     expect(result.current.status).toBe("closed");
   });
 
-  it("exposes nextChange and session", async () => {
+  it("exposes nextChange and session from response", async () => {
     fetchMock.mockResponseOnce(JSON.stringify(openResponse));
     const { result } = renderHook(() => useMarketStatus(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
@@ -38,16 +38,34 @@ describe("useMarketStatus", () => {
     expect(result.current.session).toBe(openResponse.session);
   });
 
-  it("sets error on fetch failure", async () => {
+  it("sets error on fetch rejection (network failure)", async () => {
     fetchMock.mockRejectOnce(new Error("503"));
     const { result } = renderHook(() => useMarketStatus(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.error).not.toBeNull());
   });
 
+  // Covers the !res.ok branch inside fetcher (lines 22-24 of useMarketStatus.ts)
+  it("sets error and message when fetch returns HTTP error status", async () => {
+    fetchMock.mockResponseOnce("Service Unavailable", { status: 503 });
+    const { result } = renderHook(() => useMarketStatus(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+    expect(result.current.error?.message).toContain("503");
+  });
+
   it("starts with isLoading=true before first fetch resolves", () => {
     fetchMock.mockResponseOnce(JSON.stringify(openResponse));
     const { result } = renderHook(() => useMarketStatus(), { wrapper: Wrapper });
-    // Synchronous snapshot — SWR has not yet resolved
     expect(result.current.isLoading).toBe(true);
+  });
+
+  // Covers the refresh: () => mutate() return value (line 61 of useMarketStatus.ts)
+  it("refresh triggers revalidation", async () => {
+    fetchMock.mockResponseOnce(JSON.stringify(openResponse));
+    fetchMock.mockResponseOnce(JSON.stringify(openResponse));
+    const { result } = renderHook(() => useMarketStatus(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    const before = fetchMock.mock.calls.length;
+    act(() => { result.current.refresh(); });
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(before));
   });
 });
