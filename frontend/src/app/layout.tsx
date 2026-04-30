@@ -1,12 +1,11 @@
 "use client";
-// NOTE: This is a client layout so we can read system preference for dark mode on first load.
+// NOTE: Client layout so we can read system preference for dark mode on first load.
 // The <html> tag gets the "dark" class based on localStorage + system preference.
-// We use a small inline script to prevent flash of wrong theme.
+// Small inline script prevents flash-of-wrong-theme (FOUT).
 
-import type { Metadata } from "next";
 import "./globals.css";
+import { Toaster } from "react-hot-toast";
 
-// Inline script prevents flash-of-wrong-theme (FOUT) on load
 const themeScript = `
 (function(){
   try {
@@ -35,7 +34,30 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
-      <body>{children}</body>
+      <body>
+        {children}
+        <Toaster
+          position="bottom-right"
+          toastOptions={{
+            duration: 3500,
+            style: {
+              background: "var(--surface)",
+              color:      "var(--text)",
+              border:     "1px solid var(--border)",
+              borderRadius: "var(--radius-md)",
+              fontSize:   "0.8125rem",
+              fontFamily: "Inter, system-ui, sans-serif",
+              boxShadow:  "var(--shadow-modal)",
+            },
+            success: {
+              iconTheme: { primary: "var(--green)",  secondary: "var(--surface)" },
+            },
+            error: {
+              iconTheme: { primary: "var(--red)",    secondary: "var(--surface)" },
+            },
+          }}
+        />
+      </body>
     </html>
   );
 }
