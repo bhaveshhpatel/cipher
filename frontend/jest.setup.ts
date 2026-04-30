@@ -1,3 +1,4 @@
 import '@testing-library/jest-dom';
-import fetchMock from 'jest-fetch-mock';
-fetchMock.enableMocks();
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require('jest-fetch-mock').enableMocks();
