@@ -74,11 +74,18 @@ Fix (SIG-DEBOUNCE 2026-04-30):
   "ticker|contract_type|strike|expiry". A signal is emitted only when:
     1. First time this episode key is seen (initial crossing), OR
     2. alert_level escalated since the last emit, OR
-    3. ≥ _SIGNAL_DEBOUNCE_S elapsed since last emit AND
-       total_premium grew by ≥ max(_SIGNAL_DELTA_PREM, last_prem * _SIGNAL_DELTA_PCT)
+    3. >= _SIGNAL_DEBOUNCE_S elapsed since last emit AND
+       total_premium grew by >= max(_SIGNAL_DELTA_PREM, last_prem * _SIGNAL_DELTA_PCT)
 
   Entries are evicted after _SIGNAL_EMIT_TTL_S (7200s / 2h) to prevent
   unbounded memory growth across the trading day.
+
+Fix (SIG-DEBOUNCE-LOG 2026-04-30):
+  [signal] log line used $%,.0f — the comma thousands-separator is only valid
+  in f-string / str.format() style. Python logging uses msg % args internally,
+  so %,.0f raises ValueError: unsupported format character ','.
+  Fix: changed $%,.0f → $%.0f in the %-style format string.
+  Comma separator retained in f-string reason= output (unaffected).
 """
 import asyncio
 import logging
@@ -146,7 +153,7 @@ _SIGNAL_MIN_PREMIUM = 50_000
 # Per-episode signal debounce (SIG-DEBOUNCE 2026-04-30):
 #   After initial crossing, re-emit only when:
 #     a) alert_level changed, OR
-#     b) ≥ _SIGNAL_DEBOUNCE_S elapsed AND premium grew by ≥ threshold
+#     b) >= _SIGNAL_DEBOUNCE_S elapsed AND premium grew by >= threshold
 #
 #   _SIGNAL_DELTA_PREM / _SIGNAL_DELTA_PCT are OR-ed: whichever is larger
 #   for the current episode premium level acts as the effective delta floor.
@@ -403,7 +410,7 @@ def _should_emit_signal(
     Rules (in priority order):
       1. No prior emit for this key → emit (initial crossing).
       2. alert_level changed since last emit → emit (escalation / de-escalation).
-      3. Debounce window elapsed AND premium delta ≥ threshold → emit (growth update).
+      3. Debounce window elapsed AND premium delta >= threshold → emit (growth update).
       4. Otherwise → suppress.
     """
     last = _signal_last_emit.get(emit_key)
@@ -672,8 +679,9 @@ async def _process_trade(raw: dict):
         "ts":          now_ts,
     }
 
+    # SIG-DEBOUNCE-LOG fix: use %.0f not %,.0f — comma is invalid in %-style format strings
     log.info(
-        "[signal] %s %s | alert=%s | trades=%d | total_prem=$%,.0f "
+        "[signal] %s %s | alert=%s | trades=%d | total_prem=$%.0f "
         "| accel=%s | reason=%s | %s",
         sig_ep.ticker, sig_ep.contract_type,
         alert_level,
