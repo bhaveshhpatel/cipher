@@ -130,7 +130,7 @@ export function TierThresholdsCard({ token }: { token: string | null }) {
                   const dirty   = draft !== current;
                   const errMsg  = errors[field] ?? "";
                   return (
-                    <div key={field} className="flex items-center gap-2">
+                    <div key={field} data-testid={`field-${field as string}`} className="flex items-center gap-2">
                       <span className="text-xs font-mono w-36 shrink-0" style={{ color: A.muted }}>
                         {label}
                       </span>

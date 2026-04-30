@@ -73,7 +73,7 @@ export function IngestionConfigCard({ token }: { token: string | null }) {
         const dirty  = draft !== row.value;
         const errMsg = errors[row.key] ?? "";
         return (
-          <div key={row.key} className="mb-3">
+          <div key={row.key} data-testid={`row-${row.key}`} className="mb-3">
             <div className="flex items-center gap-2">
               <span className="text-xs font-mono w-48 shrink-0" style={{ color: A.muted }}>
                 {row.key}
