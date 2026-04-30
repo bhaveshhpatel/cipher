@@ -1,16 +1,15 @@
 /**
  * useFlow — SWR hook for paginated flow events.
  *
- * Fetches /api/flow/events with optional symbol + page filters.
- * Exposes helpers: loadMore, refresh, isEmpty.
+ * Fetches /api/proxy/flow/events with optional symbol + page filters.
+ * Returns FlowEventRaw[] (raw per-trade rows with id, tier, fill_price, etc.)
+ * Exposes helpers: loadMore, refresh, isEmpty, hasMore.
  */
-import useSWR from "swr";
 import useSWRInfinite from "swr/infinite";
-import type { FlowEvent, PaginatedResponse } from "@/types";
+import type { FlowEventsResponse, FlowEventRaw } from "@/types";
 
 const FLOW_PAGE_SIZE = 50;
 
-// ── Fetcher ────────────────────────────────────────────
 async function fetcher<T>(url: string): Promise<T> {
   const token = typeof window !== "undefined"
     ? localStorage.getItem("cipher_token")
@@ -29,51 +28,49 @@ async function fetcher<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-// ── Types ─────────────────────────────────────────────
 export interface UseFlowOptions {
-  symbol?:      string;
-  pageSize?:    number;
+  symbol?:          string;
+  pageSize?:        number;
   /** Poll interval in ms. 0 = no polling. */
   refreshInterval?: number;
-  paused?:      boolean;
+  paused?:          boolean;
 }
 
 export interface UseFlowReturn {
-  events:      FlowEvent[];
-  isLoading:   boolean;
+  events:       FlowEventRaw[];
+  isLoading:    boolean;
   isValidating: boolean;
-  error:       Error | null;
-  isEmpty:     boolean;
-  hasMore:     boolean;
-  loadMore:    () => void;
-  refresh:     () => void;
-  page:        number;
+  error:        Error | null;
+  isEmpty:      boolean;
+  hasMore:      boolean;
+  loadMore:     () => void;
+  refresh:      () => void;
+  page:         number;
 }
 
-// ── Hook ──────────────────────────────────────────────
 export function useFlow({
   symbol,
   pageSize        = FLOW_PAGE_SIZE,
   refreshInterval = 0,
   paused          = false,
 }: UseFlowOptions = {}): UseFlowReturn {
-  const getKey = (pageIndex: number, prev: PaginatedResponse<FlowEvent> | null) => {
+  const getKey = (pageIndex: number, prev: FlowEventsResponse | null) => {
     if (paused) return null;
-    if (prev && prev.events.length < pageSize) return null; // no more pages
-    const params = new URLSearchParams({ page: String(pageIndex + 1), limit: String(pageSize) });
-    if (symbol) params.set("symbol", symbol.toUpperCase());
+    if (prev && prev.events.length < pageSize) return null;
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(pageIndex * pageSize) });
+    if (symbol) params.set("ticker", symbol.toUpperCase());
     return `/api/proxy/flow/events?${params}`;
   };
 
   const { data, error, isLoading, isValidating, setSize, size, mutate } =
-    useSWRInfinite<PaginatedResponse<FlowEvent>>(getKey, fetcher, {
+    useSWRInfinite<FlowEventsResponse>(getKey, fetcher, {
       refreshInterval,
-      revalidateOnFocus:  false,
+      revalidateOnFocus:     false,
       revalidateOnReconnect: true,
-      keepPreviousData:   true,
+      keepPreviousData:      true,
     });
 
-  const events  = data ? data.flatMap(p => p.events) : [];
+  const events   = data ? data.flatMap(p => p.events) : [];
   const lastPage = data?.[data.length - 1];
   const hasMore  = lastPage ? lastPage.events.length >= pageSize : false;
 

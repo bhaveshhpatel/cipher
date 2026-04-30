@@ -19,6 +19,24 @@ export type {
   SignalHistoryResponse,
 } from "@/lib/api";
 
+// ── Generic paginated wrapper ──
+export interface PaginatedResponse<T> {
+  events: T[];
+  total:  number;
+  limit:  number;
+  offset: number;
+}
+
+// ── Alert ──
+export interface Alert {
+  id:         string;
+  symbol:     string;
+  condition:  string;
+  threshold:  number;
+  active:     boolean;
+  created_at: string;
+}
+
 // ── Dashboard navigation ──
 export const DASHBOARD_TABS = [
   "flow_events",

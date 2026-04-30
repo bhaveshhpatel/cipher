@@ -1,7 +1,16 @@
 import { renderHook, waitFor } from "@testing-library/react";
 import { useComposite } from "@/hooks";
 
-const mockSignal = { symbol: "SPY", verdict: "BUY", tier: 1, score: 0.87 };
+// CompositeSignal shape from @/lib/api:
+// { ticker, recommendation, composite_score, flow_score, backtest_score, reasoning }
+const mockSignal = {
+  ticker: "SPY",
+  recommendation: "BUY",
+  composite_score: 0.87,
+  flow_score: 0.80,
+  backtest_score: 0.90,
+  reasoning: "Strong bullish flow",
+};
 
 beforeEach(() => fetchMock.resetMocks());
 
@@ -10,7 +19,7 @@ describe("useComposite", () => {
     fetchMock.mockResponseOnce(JSON.stringify(mockSignal));
     const { result } = renderHook(() => useComposite({ symbol: "SPY" }));
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.signal?.verdict).toBe("BUY");
+    expect(result.current.signal?.recommendation).toBe("BUY");
   });
 
   it("signal=null on initial load", () => {
