@@ -3,7 +3,7 @@
  * Mocks useActivityLog so no real fetch occurs.
  */
 import React from "react";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, within, fireEvent } from "@testing-library/react";
 
 jest.mock("@/hooks/useActivityLog");
 
@@ -45,7 +45,7 @@ describe("ActivityLogCard — states", () => {
     expect(screen.getByText(/Audit trail/)).toBeInTheDocument();
   });
 
-  it("shows Loading\u2026 while loading", () => {
+  it("shows Loading… while loading", () => {
     mockUseActivityLog.mockReturnValue({ ...EMPTY_STATE, loading: true });
     render(<ActivityLogCard token="tok" />);
     expect(screen.getByText("Loading…")).toBeInTheDocument();
@@ -65,9 +65,12 @@ describe("ActivityLogCard — states", () => {
   it("renders table rows for each item", () => {
     mockUseActivityLog.mockReturnValue({ ...EMPTY_STATE, items: FAKE_ITEMS, total: 2, count: 2 });
     render(<ActivityLogCard token="tok" />);
-    expect(screen.getByText("tier_thresholds.update")).toBeInTheDocument();
-    expect(screen.getByText("demo.start")).toBeInTheDocument();
-    expect(screen.getAllByText("admin@cipher.io").length).toBe(2);
+    // action strings also appear in <select> options, so use getAllByText
+    expect(screen.getAllByText("tier_thresholds.update").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("demo.start").length).toBeGreaterThanOrEqual(1);
+    // email appears once per row in the table body
+    const tbody = screen.getByRole("table").querySelector("tbody")!;
+    expect(within(tbody).getAllByText("admin@cipher.io").length).toBe(2);
   });
 
   it("renders '—' for empty detail and null ip_address", () => {
