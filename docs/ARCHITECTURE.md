@@ -1,10 +1,15 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-04-29 (Signal gate _SIGNAL_MIN_TRADES/PREMIUM, Bug 1 alert_level in
-> composite_msg, accumulator deadlock fix + per-key locks + is_accelerating ≥3/60s, alert_level
-> thresholds updated 5M/1M-accel/1M/250k, flow_events created_at+influence_tier column fix,
-> sweep upgrade PostgREST fix, /flow/events + /flow/episodes API endpoints, Flow Events/Episodes
-> dashboard tabs, WS 403 auth-failure stop, pydantic-settings env var fix)
+> Last updated: 2026-04-30 (STREAM-ELIGIBLE fix — upsert_symbol_quotes no longer writes
+> stream_eligible, preventing warm-restart wipeout of eligible symbols; DEDUP-2 —
+> _SNAPSHOT_REUSE_DRIFT_PCT raised 10% → 30%, _KEEP_SNAPSHOTS reduced 7 → 3;
+> startup universe data-fetch path documented — Tradier batch quotes called only on cold
+> start / 24h refresh, never on warm restart; Signal gate _SIGNAL_MIN_TRADES/PREMIUM,
+> Bug 1 alert_level in composite_msg, accumulator deadlock fix + per-key locks +
+> is_accelerating ≥3/60s, alert_level thresholds updated 5M/1M-accel/1M/250k,
+> flow_events created_at+influence_tier column fix, sweep upgrade PostgREST fix,
+> /flow/events + /flow/episodes API endpoints, Flow Events/Episodes dashboard tabs,
+> WS 403 auth-failure stop, pydantic-settings env var fix)
 
 ---
 
@@ -20,6 +25,42 @@ At runtime the active worker count is `ceil(registry.size() / 500)` — typicall
 a full universe of ~31,920 OCC symbols. All workers share a single Tradier session token and stream
 in parallel, each covering ≤500 symbols simultaneously. Workers are staggered at 200ms intervals
 on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
+
+---
+
+## Startup Universe Data-Fetch Strategy
+
+This is the most critical architectural decision for understanding when Tradier is called.
+
+### Warm Restart (Step 1 HIT — the common case)
+
+`_resolve_startup_universe()` calls `universe_store.load_fresh_snapshot(max_age=24h)`.
+If a DB snapshot younger than 24h exists:
+- Symbols are loaded directly from `options_universe_symbols` (filtered `stream_eligible=True`).
+- **Tradier `/v1/markets/quotes` is NOT called** for stock-level batch quotes.
+- `_background_build_and_upsert` runs after server is live, calls `registry.build()` which
+  fetches OCC chain data from Tradier (options chains only, not stock quotes).
+- `_post_build_upsert` then runs, assembling `SymbolQuote` objects from `raw_quotes` already
+  returned by `build()` — **no duplicate batch quote call** (H1 fix).
+- `upsert_symbol_quotes()` is called to persist updated price/volume/OI/tier data.
+- `stream_eligible` is **NOT written** by `upsert_symbol_quotes()` (STREAM-ELIGIBLE fix).
+
+### Cold Start / 24h Refresh (Step 1 MISS)
+
+When no fresh snapshot exists (first deploy, or snapshot is >24h old):
+- Full pipeline runs: CBOE universe fetch → `load_universe()` → Tradier eligibility validation
+  (`_fetch_batch_quotes()`) → `save_snapshot()` → `upsert_symbol_quotes()`.
+- `stream_eligible=True` is written to DB by `_sync_save_snapshot()` **only on this path**.
+- `_universe_refresh_loop` repeats this full cycle every 24h in the background.
+
+### Why This Matters
+
+`stream_eligible` is a **write-once-per-24h** flag set exclusively by `_sync_save_snapshot()`.
+It must never be overwritten by the warm-restart upsert cycle, because `SymbolQuote` objects
+assembled from OCC `raw_quotes` always default `stream_eligible=False` (STREAM-ELIGIBLE fix,
+2026-04-30). Before this fix, every warm restart silently wiped `stream_eligible=True` → `False`
+for all symbols, causing `_load_symbols()` (which filters `stream_eligible=True`) to return 0 or
+very few symbols on the next restart.
 
 ---
 
@@ -42,8 +83,18 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  Module-level import ensures patch targets work in tests.        │
 │                                                                  │
 │  build() return type (H1 fix):                                   │
-│  registry.build() returns tuple[int, dict] — (count, tier_map). │
-│  Callers must unpack: count, tier_map = await registry.build().  │
+│  registry.build() returns tuple[int, dict[str, dict]] —          │
+│  (count, raw_quotes). raw_quotes is the stock-level quote map    │
+│  from _fetch_stock_prices() (Tradier /v1/markets/quotes).        │
+│  Callers must unpack: count, raw_quotes = await registry.build() │
+│  _background_build_and_upsert passes raw_quotes to               │
+│  _post_build_upsert to avoid a duplicate batch quote call.       │
+│                                                                  │
+│  raw_quotes content:                                             │
+│  dict[ticker → raw Tradier quote dict] from get_quotes_batch().  │
+│  Contains: last, close, prevclose, volume, average_volume, etc.  │
+│  This is stock-level daily data — NOT options chain data.        │
+│  OI comes from chain fetches (_build_ticker), not raw_quotes.    │
 │                                                                  │
 │  DB chain fast-seed (lifespan, on DB-hit path):                  │
 │  registry.load_from_db(snapshot_id) pre-loads OCC contracts      │
@@ -133,7 +184,7 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 │  - OCC symbol regex: extract ticker, expiry, contract_type,      │
 │    strike from standard 21-char OCC format.                      │
 │    Fallback: occ_positional parse for non-standard symbols.      │
-│  - Compute premium = fill_price × size × 100.                    │
+│  - Compute premium = fill_price × size × 100.                   │
 │  - Classify bid_ask_class: BID / ASK / MID based on position.   │
 │  - Classify is_aggressive: fill at or through ask.               │
 │  - Classify trade_type: BTO / STO / SWEEP (post-dedup upgrade).  │
@@ -412,6 +463,10 @@ on spawn to avoid thundering-herd against the Tradier session endpoint (B-021).
 | Backoff | 5s base, 60s cap, jitter | tradier_stream._backoff |
 | Registry refresh | 30 min (15 min on expiry days) | SymbolRegistry |
 | Pre-warm time | 9:15 AM ET weekdays | main._registry_prewarm_loop |
+| Universe refresh | Every 24 hours | main._universe_refresh_loop |
+| Snapshot reuse age | < 24 hours (DEDUP-2) | universe_store._SNAPSHOT_REUSE_MAX_AGE_H |
+| Snapshot reuse drift | ≤ 30% symbol count change (DEDUP-2; was 10%) | universe_store._SNAPSHOT_REUSE_DRIFT_PCT |
+| Snapshots retained | 3 (DEDUP-2; was 7) | universe_store._KEEP_SNAPSHOTS |
 | Stats log interval | Every 100 ticks | tradier_stream._STATS_LOG_INTERVAL |
 | First-tick log count | First 5 ticks individually | tradier_stream._FIRST_TICK_LOG_COUNT |
 | Demo mode | Admin panel only (disabled as auto-fallback since 2026-04-25) | tradier_stream |
@@ -502,10 +557,26 @@ Composite signal history. Written by signal_store on "signal_writer" channel.
 
 ### options_universe_symbols
 OCC symbol universe snapshot with tier assignments.
-Migration 013 added `UNIQUE(snapshot_id, symbol)` to prevent duplicate rows on restart.
-`universe_store._sync_save_snapshot()` reuses an existing active `snapshot_id` if:
-- Snapshot is < 20 hours old, AND
-- Symbol count is within ±10% of the current count.
+
+```sql
+snapshot_id, symbol, stream_eligible, tier,
+last_price, volume, average_volume, open_interest
+-- UNIQUE(snapshot_id, symbol) — migration 013
+```
+
+**stream_eligible ownership:** This column is written exclusively by `_sync_save_snapshot()`
+during the full pipeline (cold start or 24h `_universe_refresh_loop`). It is **never** written
+by `_sync_upsert_symbol_quotes()` (STREAM-ELIGIBLE fix, 2026-04-30). Writing it from the
+warm-restart upsert path would silently wipe `True → False` for all symbols every restart,
+because `SymbolQuote` objects from `registry.build()` always default `stream_eligible=False`.
+
+**Snapshot reuse logic (DEDUP-2):** `_sync_save_snapshot()` reuses the existing active
+`snapshot_id` when:
+- Snapshot is < 24 hours old, **AND**
+- Symbol count drift is ≤ 30% of existing count (raised from 10% — absorbs natural CBOE
+  universe variation of 10–15% per restart).
+New snapshots are created only when none of the above hold. At most 3 snapshots are retained
+before hard pruning (reduced from 7 — prune fires sooner as safety net).
 
 ### chain_store (DB cache)
 OCC contract metadata cached from Tradier chain fetches. Pre-seeds the registry on warm restart
@@ -516,20 +587,43 @@ via `registry.load_from_db(snapshot_id)` before the full `build()` completes.
 ## Startup Sequence (main.py lifespan)
 
 ```text
-1. start_flow_writer()      — subscribe bus "db_writer", start flush loop
-2. start_signal_writer()    — subscribe bus "signal_writer"
-3. init_registry()          — create SymbolRegistry with watchlist
-4. universe_store snapshot  — reuse or create (idempotency check)
-5. registry.build()         — async (background task); returns tuple[int, dict]
-   └─ load_from_db()        — fast pre-seed from chain_store cache
-   └─ fetch Tradier chains  — get_option_chain_bulk() for missing contracts
-   └─ set _build_complete   — unblocks stream_options_flow()
-6. stream_options_flow(registry=registry)
-   └─ polls registry.is_ready() every 500ms (30-min timeout)
-   └─ StreamManager.run()   — spawns STREAM-1/2/3... workers
-       └─ worker N waits N × 200ms before first connect (B-021)
-7. registry.refresh_loop()  — background refresh task (lifespan-owned)
-8. _registry_prewarm_loop() — 9:15 AM ET pre-warm task
+1. validate_ingestion_config()     — RC-3: warn on missing DB ingestion config rows
+
+2. _resolve_startup_universe()
+   ├─ Step 1: load_fresh_snapshot(max_age=24h)
+   │    HIT  → load symbols + tier_map from DB (NO Tradier call)
+   │            → return (symbols, tier_map, [], snapshot_id)
+   │    MISS → Step 2: load_any_snapshot() as stale safety net
+   │         → Step 2b: load_universe() → CBOE + Tradier validation
+   │               source == "tradier_validated":
+   │                 → save_snapshot()         — persist eligible symbols to DB
+   │                 → _fetch_batch_quotes()   — Tradier stock quotes (batch)
+   │                 → assign_tiers()          — preliminary tier assignment
+   │               → return (symbols, tier_map, quotes, snapshot_id)
+
+3. init_registry(watchlist, tier_map)  — in-memory init (instant)
+
+4. registry.load_from_db(snapshot_id)  — seed OCC chains from DB (P1 fallback)
+   └─ does NOT set _build_complete — stream workers still blocked
+
+5. SERVER IS LIVE — health probe passes (yield)
+
+6. Parallel background tasks launched:
+   a. _background_build_and_upsert   — calls registry.build() (incremental/full OCC)
+      └─ build() returns (count, raw_quotes)
+      └─ _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
+           Phase 1: assemble SymbolQuote from raw_quotes (no extra Tradier call — H1)
+           Phase 2: assign_tiers(require_oi=True) → update registry tier_map
+           Phase 3: upsert_symbol_quotes() → persist price/volume/OI/tier to DB
+                    NOTE: stream_eligible NOT written here (STREAM-ELIGIBLE fix)
+      └─ registry._build_complete = True → stream workers unblock
+
+   b. registry.refresh_loop()         — scheduled 30-min rebuilds
+   c. _registry_prewarm_loop()        — 9:15 AM ET daily pre-warm
+   d. stream_options_flow()           — polls is_ready() then streams
+   e. start_flow_writer()             — DB flush loop
+   f. start_signal_writer()           — signal DB writer
+   g. _universe_refresh_loop()        — 24h full universe refresh
 ```
 
 ---
@@ -579,6 +673,8 @@ raw Tradier WebSocket event
 
 | Fix ID | File | Description |
 |---|---|---|
+| STREAM-ELIGIBLE | universe_store.py | `_sync_upsert_symbol_quotes()` no longer writes `stream_eligible`. SymbolQuote objects from `registry.build()` always default `stream_eligible=False`, silently wiping all eligible symbols on every warm restart. `stream_eligible` is now owned exclusively by `_sync_save_snapshot()`. (2026-04-30) |
+| DEDUP-2 | universe_store.py | `_SNAPSHOT_REUSE_DRIFT_PCT` raised 10% → 30% to absorb natural CBOE universe variation (10–15% per restart). `_KEEP_SNAPSHOTS` reduced 7 → 3 so hard pruning fires sooner. Prevents exponential row accumulation when every restart exceeded the 10% drift guard. (2026-04-29) |
 | Bug 1 / alert_level-composite | tradier_stream.py | `composite_msg["data"]["signal"]` was missing `alert_level` key. `signal_store._build_row()` always received None, fell through to score-based fallback. Fixed: `alert_level` now injected before any bus publish. |
 | Signal Gate | tradier_stream.py | Explicit gate after `persist_flow_event()`: only fires bus publish when `trade_count ≥ 3 AND total_premium > $50k`. Decouples flow_events volume from signal volume. |
 | Accumulator deadlock | repetition_accumulator.py | Global lock replaced with per-key asyncio.Lock via `_get_lock()`. Separated `ingest_tick`/`get_signal`/`ingest` contracts — no nested lock acquisition. |
@@ -594,17 +690,22 @@ raw Tradier WebSocket event
 | DEDUP-KWARGS | tradier_stream.py | `is_duplicate()` first param is positional — keyword form raised `TypeError`. Fixed to pass `occ_symbol` positionally. |
 | H4 sweep dispatch TTL | tradier_stream.py | `_sweep_upgrade_dispatched` Set grew forever. Changed to `dict[str, float]` with 30-min TTL eviction. |
 | Gate 2 retrigger | repetition_accumulator.py | `last_signaled_premium` on `RepetitionEpisode`. Re-emit only when Δ ≥ $50k. Kills QQQ/SPY signal spam. |
-| U-1 snapshot idempotency | universe_store.py | `_sync_save_snapshot()` reuses existing `snapshot_id` if <20h old and symbol count within ±10%. |
+| DEDUP (U-1) | universe_store.py | `_sync_save_snapshot()` reuses existing `snapshot_id` if <24h old and symbol count within ±30% (DEDUP-2). |
 | Migration 013 | migrations/ | `UNIQUE(snapshot_id, symbol)` on `options_universe_symbols` + chain cache. |
 | C-003 sweep upgrade | flow_store.py | Retroactive `PATCH` to set `trade_type='SWEEP'` on rows already written as BTO. |
 | D-003 | stream_manager.py | Worker count changed from hard-coded 32 to `ceil(registry.size() / 500)`. |
 | B-021 | stream_manager.py | Workers staggered at N × 200ms on spawn. |
 | STREAM-1/2/3 | stream_manager.py | Shared session token; single StreamManager with dynamic batching; removed global session lock. |
 | C-020 | utils/dedup.py | Dedup TTL clock changed from `time.time()` to `time.monotonic()`. |
-| H1 | symbol_registry.py | `build()` returns `tuple[int, dict]`. Callers must unpack. |
-| H3 | symbol_registry.py | Module-level imports + `get_option_chain_bulk` replaces `get_option_chain`. |
+| H1 | symbol_registry.py | `build()` returns `tuple[int, dict[str, dict]]` — (count, raw_quotes). Callers unpack; `_post_build_upsert` reuses raw_quotes, skipping duplicate Tradier call. |
+| H3 | symbol_registry.py | Module-level imports + `get_option_chain_bulk` replaces `get_option_chain`. Incremental warm-restart build: only re-fetches tickers with expired contracts (min_dte == 0). |
+| B-ZERO-PRICE | symbol_registry.py | If `_fetch_stock_prices()` returns 0 prices, `build()` activates `zero_price_fallback=True`: ATM filter bypassed so chain fetches still run. Was silently building 0 OCC contracts. |
 | D-001 | tradier_stream.py | `stream_options_flow()` accepts `registry=` from lifespan, skipping duplicate `build()`. |
 | D-002 | tradier_stream.py | `refresh_loop()` only spawned in standalone path; lifespan owns it in production. |
+| M-1/M-2 | symbol_registry.py / main.py | `_build_complete` flag: `is_ready()` returns `_build_complete` not `len(registry) > 0`. Stream workers spawn only after `build()` fully completes with fresh Tradier data. |
+| M-3 | main.py | `_post_build_upsert` split into three explicit phases. `assign_tiers()` failure is caught and re-raised; `upsert_symbol_quotes()` is skipped if tiers fail. |
+| STREAM-5 | main.py | Graceful shutdown: `stream_task` cancelled and awaited FIRST so Tradier HTTP connections close cleanly before process exits, freeing session quota for next container start. |
+| RC-3 | main.py | `validate_ingestion_config()` at startup warns on missing DB rows. |
 | FLOW-DEBUG | tradier_stream.py | INFO-level gate logging at every drop point. `_stats` tracks `parsed_count`, `accumulator_gated`, `parse_failed`. |
 | FIRST-TICK | tradier_stream.py | First 5 ticks logged individually at INFO. |
 
