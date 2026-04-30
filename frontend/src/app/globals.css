@@ -7,7 +7,7 @@
 
 /* ─── Design Tokens ─────────────────────────────────────── */
 :root {
-  /* Light mode (default) */
+  /* ── Surface & text ── */
   --bg:          #f4f6fa;
   --surface:     #ffffff;
   --surface-2:   #f9fafc;
@@ -17,7 +17,7 @@
   --muted:       #4b5563;
   --faint:       #9ca3af;
 
-  /* Brand */
+  /* ── Brand ── */
   --amber:       #e8a020;
   --amber-light: #f5c04a;
   --teal:        #0a9b8c;
@@ -25,87 +25,10 @@
   --red:         #dc3545;
   --green:       #1a9e5a;
   --blue:        #1a6ef5;
-
-  /* Extended brand */
   --orange:      #f97316;
-  --gold:        #d4af37;
-  --cyan:        #22d3ee;
-  --indigo:      #818cf8;
-  --purple:      #a855f7;
+  --gold:        #d4a017;
 
-  /* Tier colors — left-border accents for flow rows */
-  --tier-1:        #22d3ee;
-  --tier-2:        #818cf8;
-  --tier-3:        #fbbf24;
-  --tier-1-dim:    rgba(34,211,238,0.10);
-  --tier-2-dim:    rgba(129,140,248,0.10);
-  --tier-3-dim:    rgba(251,191,36,0.10);
-  --tier-1-border: rgba(34,211,238,0.35);
-  --tier-2-border: rgba(129,140,248,0.35);
-  --tier-3-border: rgba(251,191,36,0.35);
-
-  /* Verdict colors */
-  --verdict-buy:      #1a9e5a;
-  --verdict-sell:     #dc3545;
-  --verdict-hold:     #6b7280;
-  --verdict-buy-dim:  rgba(26,158,90,0.12);
-  --verdict-sell-dim: rgba(220,53,69,0.12);
-  --verdict-hold-dim: rgba(107,114,128,0.12);
-
-  /* Shadow tokens */
-  --shadow-card:     0 1px 3px rgba(0,0,0,0.05), 0 4px 12px rgba(0,0,0,0.04);
-  --shadow-elevated: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.08);
-  --shadow-sidebar:  2px 0 12px rgba(0,0,0,0.06);
-  --shadow-modal:    0 20px 60px rgba(0,0,0,0.15), 0 4px 16px rgba(0,0,0,0.10);
-
-  /* Animation */
-  --duration-fast: 150ms;
-  --duration-base: 200ms;
-  --duration-slow: 300ms;
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-
-  /* Spacing / radius */
-  --radius-sm:   0.25rem;
-  --radius-md:   0.5rem;
-  --radius-lg:   0.75rem;
-  --radius-xl:   1rem;
-
-  /* Transitions */
-  --t: 180ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.dark {
-  --bg:          #0d1117;
-  --surface:     #161b27;
-  --surface-2:   #1e2535;
-  --border:      #2a3347;
-  --border-2:    #354160;
-  --text:        #e8edf5;
-  --muted:       #8899b4;
-  --faint:       #4a5568;
-
-  /* Extended brand — slightly brighter in dark mode */
-  --orange:      #fb923c;
-  --gold:        #d4af37;
-  --cyan:        #22d3ee;
-  --indigo:      #818cf8;
-  --purple:      #c084fc;
-
-  /* Verdict colors — brighter for dark bg */
-  --verdict-buy:  #4ade80;
-  --verdict-sell: #f87171;
-  --verdict-hold: #94a3b8;
-
-  /* Shadow tokens — heavier in dark mode */
-  --shadow-card:     0 1px 3px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25);
-  --shadow-elevated: 0 8px 32px rgba(0,0,0,0.4), 0 2px 8px rgba(0,0,0,0.3);
-  --shadow-sidebar:  2px 0 12px rgba(0,0,0,0.3);
-  --shadow-modal:    0 20px 60px rgba(0,0,0,0.5), 0 4px 16px rgba(0,0,0,0.4);
-}
-
-/* ─── Admin palette — always dark regardless of theme ────── */
-/* Applied via data-admin="true" on the admin layout wrapper   */
-[data-admin="true"] {
+  /* ── Admin / dark-theme palette (used by admin page regardless of theme) ── */
   --admin-bg:           #080c14;
   --admin-surface:      #0e1422;
   --admin-surface-2:    #131927;
@@ -123,12 +46,68 @@
   --admin-amber:        #fbbf24;
   --admin-amber-dim:    rgba(251,191,36,0.10);
   --admin-amber-border: rgba(251,191,36,0.25);
-  --admin-green:        #4ade80;
+  --admin-green:        rgb(74,222,128);
   --admin-green-dim:    rgba(74,222,128,0.10);
   --admin-green-border: rgba(74,222,128,0.25);
   --admin-red:          #f87171;
   --admin-red-dim:      rgba(248,113,113,0.10);
   --admin-red-border:   rgba(248,113,113,0.25);
+
+  /* ── Tier colors ── */
+  --tier-1-color:  #22d3ee;
+  --tier-1-dim:    rgba(34,211,238,0.12);
+  --tier-1-border: rgba(34,211,238,0.35);
+  --tier-2-color:  #818cf8;
+  --tier-2-dim:    rgba(129,140,248,0.12);
+  --tier-2-border: rgba(129,140,248,0.35);
+  --tier-3-color:  #fbbf24;
+  --tier-3-dim:    rgba(251,191,36,0.10);
+  --tier-3-border: rgba(251,191,36,0.30);
+
+  /* ── Verdict colors ── */
+  --verdict-buy:   #1a9e5a;
+  --verdict-sell:  #dc3545;
+  --verdict-hold:  #e8a020;
+
+  /* ── Market status ── */
+  --market-open:   #1a9e5a;
+  --market-closed: #9ca3af;
+  --market-pre:    #e8a020;
+  --market-after:  #e8a020;
+
+  /* ── Spacing / radius ── */
+  --radius-sm:   0.25rem;
+  --radius-md:   0.5rem;
+  --radius-lg:   0.75rem;
+  --radius-xl:   1rem;
+
+  /* ── Shadow ── */
+  --shadow-card:   0 1px 3px rgba(0,0,0,0.05), 0 4px 12px rgba(0,0,0,0.04);
+  --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.09);
+  --shadow-modal:  0 20px 60px rgba(0,0,0,0.25);
+
+  /* ── Sidebar ── */
+  --sidebar-width-collapsed: 56px;
+  --sidebar-width-expanded:  200px;
+
+  /* ── Transitions ── */
+  --t:           180ms cubic-bezier(0.16, 1, 0.3, 1);
+  --t-slow:      320ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dark {
+  --bg:          #0d1117;
+  --surface:     #161b27;
+  --surface-2:   #1e2535;
+  --border:      #2a3347;
+  --border-2:    #354160;
+  --text:        #e8edf5;
+  --muted:       #8899b4;
+  --faint:       #4a5568;
+
+  --shadow-card:       0 1px 3px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25);
+  --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.35);
+  --shadow-modal:      0 20px 60px rgba(0,0,0,0.55);
 }
 
 /* ─── Reset ─────────────────────────────────────────────── */
@@ -205,6 +184,14 @@ p, li { text-wrap: pretty; max-width: 72ch; }
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes scaleUp {
+  from { opacity: 0; transform: scale(0.95) translateY(4px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
 @keyframes pulseDot {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: 0.35; transform: scale(0.75); }
@@ -213,29 +200,21 @@ p, li { text-wrap: pretty; max-width: 72ch; }
   from { opacity: 0; transform: translateX(-6px); }
   to   { opacity: 1; transform: translateX(0); }
 }
-@keyframes modalIn {
-  from { opacity: 0; transform: scale(0.96) translateY(4px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
-}
-@keyframes modalOut {
-  from { opacity: 1; transform: scale(1) translateY(0); }
-  to   { opacity: 0; transform: scale(0.96) translateY(4px); }
-}
-@keyframes backdropIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
-@keyframes countUp {
-  from { opacity: 0; transform: translateY(4px); }
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+@keyframes spinDot {
+  to { transform: rotate(360deg); }
+}
 
-.animate-fade-up    { animation: fadeUp    0.3s  cubic-bezier(0.16,1,0.3,1); }
-.animate-slide-in   { animation: slideIn   0.25s cubic-bezier(0.16,1,0.3,1); }
-.animate-modal-in   { animation: modalIn   0.2s  cubic-bezier(0.16,1,0.3,1) both; }
-.animate-modal-out  { animation: modalOut  0.15s cubic-bezier(0.16,1,0.3,1) both; }
-.animate-backdrop   { animation: backdropIn 0.2s ease both; }
-.pulse-dot          { animation: pulseDot   2s   ease-in-out infinite; }
+.animate-fade-up    { animation: fadeUp   0.3s cubic-bezier(0.16,1,0.3,1); }
+.animate-fade-in    { animation: fadeIn   0.2s ease-out; }
+.animate-scale-up   { animation: scaleUp  0.25s cubic-bezier(0.16,1,0.3,1); }
+.animate-slide-in   { animation: slideIn  0.25s cubic-bezier(0.16,1,0.3,1); }
+.animate-slide-up   { animation: slideUp  0.3s cubic-bezier(0.16,1,0.3,1); }
+.animate-spin-dot   { animation: spinDot  0.7s linear infinite; }
+.pulse-dot          { animation: pulseDot 2s ease-in-out infinite; }
 
 /* ─── Tabular numbers for prices/scores ──────────────────── */
 .tabular { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
@@ -248,8 +227,7 @@ p, li { text-wrap: pretty; max-width: 72ch; }
   box-shadow: var(--shadow-card);
   transition: box-shadow var(--t), border-color var(--t);
 }
-.card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.09); }
-.dark .card { box-shadow: var(--shadow-card); }
+.card:hover { box-shadow: var(--shadow-card-hover); }
 
 /* ─── Utility: badge ─────────────────────────────────────── */
 .badge {
@@ -269,8 +247,12 @@ p, li { text-wrap: pretty; max-width: 72ch; }
 .badge-green  { background: rgba(26,158,90,0.12);   color: var(--green);  border: 1px solid rgba(26,158,90,0.25); }
 .badge-blue   { background: rgba(26,110,245,0.12);  color: var(--blue);   border: 1px solid rgba(26,110,245,0.25); }
 .badge-muted  { background: var(--surface-2);       color: var(--muted);  border: 1px solid var(--border); }
-.badge-cyan   { background: rgba(34,211,238,0.12);  color: var(--cyan);   border: 1px solid rgba(34,211,238,0.25); }
-.badge-indigo { background: rgba(129,140,248,0.12); color: var(--indigo); border: 1px solid rgba(129,140,248,0.25); }
+.badge-tier-1 { background: var(--tier-1-dim);      color: var(--tier-1-color); border: 1px solid var(--tier-1-border); }
+.badge-tier-2 { background: var(--tier-2-dim);      color: var(--tier-2-color); border: 1px solid var(--tier-2-border); }
+.badge-tier-3 { background: var(--tier-3-dim);      color: var(--tier-3-color); border: 1px solid var(--tier-3-border); }
+.badge-buy    { background: rgba(26,158,90,0.12);   color: var(--verdict-buy);  border: 1px solid rgba(26,158,90,0.3); }
+.badge-sell   { background: rgba(220,53,69,0.12);   color: var(--verdict-sell); border: 1px solid rgba(220,53,69,0.3); }
+.badge-hold   { background: rgba(232,160,32,0.12);  color: var(--verdict-hold); border: 1px solid rgba(232,160,32,0.3); }
 
 /* ─── Utility: btn ───────────────────────────────────────── */
 .btn {
@@ -306,7 +288,7 @@ p, li { text-wrap: pretty; max-width: 72ch; }
   color: var(--red);
   border-color: rgba(220,53,69,0.3);
 }
-.btn-destructive:hover:not(:disabled) { background: var(--red); color: #fff; }
+.btn-destructive:hover:not(:disabled) { background: rgba(220,53,69,0.2); }
 
 /* ─── Reduce motion ──────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
