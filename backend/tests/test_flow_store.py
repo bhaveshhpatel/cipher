@@ -8,7 +8,10 @@ Covers:
   - upgrade_to_sweep_in_db (C-003): success, failure, not-configured, exception
   - _insert_rows / _insert_rows_with_retry: retry exhaustion path
   - _flush_flow_events: background flush loop
-  - _bus_signal_listener: ALERT-LEVEL bug fix — reads alert_level not recommendation
+  - _bus_signal_listener: EPISODE-FIX — now a no-op drainer; episode writes moved
+    to _process_trade() in tradier_stream.py before the SIG-DEBOUNCE gate.
+  - _process_trade: EPISODE-FIX regression — persist_flow_episode called after
+    Signal Gate even when SIG-DEBOUNCE suppresses the bus publish.
   - module-level add_flow / get_flows / clear_flows async helpers
 """
 import asyncio
@@ -644,18 +647,21 @@ async def test_persist_flow_event_warns_on_zero_strike():
 
 
 # ---------------------------------------------------------------------------
-# BUG (ALERT-LEVEL) — _bus_signal_listener reads alert_level not recommendation
+# _bus_signal_listener — EPISODE-FIX (2026-04-30)
 #
-# The module-level `bus` singleton is AsyncEventBus (queue-based).
-# _bus_signal_listener calls bus.subscribe("db_writer") -> asyncio.Queue.
-# Tests must patch with an AsyncEventBus instance, NOT AsyncBus.
+# After EPISODE-FIX, _bus_signal_listener is a no-op drainer. Episode writes
+# moved to _process_trade() in tradier_stream.py (before SIG-DEBOUNCE gate).
+# The tests below verify the no-op behavior and that the drainer does not
+# call persist_flow_episode regardless of message type.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_bus_signal_listener_uses_alert_level_not_recommendation():
+async def test_bus_signal_listener_is_noop_drainer():
     """
-    ALERT-LEVEL regression: _bus_signal_listener must persist alert_level
-    from sig.get('alert_level'), NOT sig.get('recommendation').
+    EPISODE-FIX regression: _bus_signal_listener is now a no-op drainer.
+    Even when a composite_signal message is published, persist_flow_episode
+    must NOT be called from here — episodes are written directly from
+    _process_trade() before the SIG-DEBOUNCE gate.
     """
     import services.flow_store as fs
     from core.async_bus import AsyncEventBus
@@ -685,7 +691,6 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
         },
     }
 
-    # Use AsyncEventBus (queue-based) — matches _bus_signal_listener's subscribe() API
     test_bus = AsyncEventBus()
 
     with patch("services.flow_store.persist_flow_episode", side_effect=fake_persist), \
@@ -700,13 +705,11 @@ async def test_bus_signal_listener_uses_alert_level_not_recommendation():
         except asyncio.CancelledError:
             pass
 
-    assert len(captured_episodes) == 1
-    ep = captured_episodes[0]
-    assert ep["alert_level"] == "CONVICTION", (
-        f"ALERT-LEVEL bug: alert_level={ep['alert_level']!r}, expected 'CONVICTION'"
+    # EPISODE-FIX: listener is a no-op drain — must NOT write episodes
+    assert len(captured_episodes) == 0, (
+        "EPISODE-FIX: _bus_signal_listener must not call persist_flow_episode. "
+        "Episode persistence moved to _process_trade() before SIG-DEBOUNCE."
     )
-    assert ep["ticker"] == "AAPL"
-    assert ep["total_premium"] == 1_200_000.0
 
 
 @pytest.mark.asyncio
@@ -761,6 +764,191 @@ async def test_bus_signal_listener_ignores_non_dict_message():
             pass
 
     assert len(captured_episodes) == 0
+
+
+# ---------------------------------------------------------------------------
+# EPISODE-FIX regression — _process_trade calls persist_flow_episode
+#
+# Verifies that:
+#   1. persist_flow_episode is called after Signal Gate even when SIG-DEBOUNCE
+#      suppresses the bus publish (decoupling confirmed).
+#   2. alert_level, strike, and expiry are populated from sig_ep directly
+#      (fixes both the ALERT-LEVEL bug and the historic strike/expiry=None bug).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_process_trade_persists_episode_before_debounce():
+    """
+    EPISODE-FIX: persist_flow_episode must be called after Signal Gate
+    even when SIG-DEBOUNCE suppresses the bus publish (should_emit=False).
+    Also verifies alert_level / strike / expiry come from sig_ep, not the
+    composite_msg payload (which previously always had strike=None).
+    """
+    import services.tradier_stream as ts
+
+    ev = MagicMock()
+    ev.ticker = "AAPL"
+    ev.contract_type = "CALL"
+    ev.strike = 185.0
+    ev.expiry = "2026-07-18"
+    ev.dte = 79
+    ev.fill_price = 3.10
+    ev.bid = 3.05
+    ev.ask = 3.15
+    ev.size = 200
+    ev.premium = 62_000.0
+    ev.trade_type = "BTO"
+    ev.bid_ask_class = "ASK"
+    ev.is_aggressive = True
+    ev.is_golden_sweep = False
+    ev.sentiment = "BULLISH"
+    ev.influence_tier = "WHALE"
+    ev.conviction_score = 0.85
+    ev.exchange_count = 1
+    ev.fill_count = 1
+    ev.open_interest = 8000
+    ev.iv = 0.40
+    ev.underlying_price = 180.0
+    ev.is_synthetic_quote = False
+    ev.timestamp.isoformat.return_value = "2026-04-30T10:00:00Z"
+
+    sig_ep = MagicMock()
+    sig_ep.ticker = "AAPL"
+    sig_ep.contract_type = "CALL"
+    sig_ep.strike = 185.0
+    sig_ep.expiry = "2026-07-18"
+    sig_ep.total_premium = 186_000.0
+    sig_ep.trade_count = 3           # >= _SIGNAL_MIN_TRADES (3)
+    sig_ep.is_accelerating = False
+    sig_ep.summary_str.return_value = "AAPL CALL 3x $186k"
+
+    persisted_episodes = []
+
+    async def fake_persist_episode(data):
+        persisted_episodes.append(data.copy())
+
+    raw = {"type": "timesale", "timesale": {"symbol": "AAPL260718C00185000"}}
+
+    with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+         patch("services.tradier_stream.flow_dedup.is_duplicate", return_value=False), \
+         patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
+         patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="CONVICTION"), \
+         patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
+         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
+        await ts._process_trade(raw)
+        await asyncio.sleep(0.05)  # allow create_task coroutine to execute
+
+    assert len(persisted_episodes) == 1, (
+        "EPISODE-FIX: persist_flow_episode must fire after Signal Gate even "
+        "when SIG-DEBOUNCE returns should_emit=False"
+    )
+    ep = persisted_episodes[0]
+    assert ep["alert_level"] == "CONVICTION", (
+        f"ALERT-LEVEL regression: expected 'CONVICTION', got {ep['alert_level']!r}"
+    )
+    assert ep["strike"] == 185.0, (
+        f"strike should come from sig_ep, got {ep['strike']!r}"
+    )
+    assert ep["expiry"] == "2026-07-18", (
+        f"expiry should come from sig_ep, got {ep['expiry']!r}"
+    )
+    assert ep["ticker"] == "AAPL"
+    assert ep["total_premium"] == 186_000.0
+
+
+@pytest.mark.asyncio
+async def test_process_trade_episode_direction_call_is_repeat_buy():
+    """direction for CALL episodes must be REPEAT_BUY."""
+    import services.tradier_stream as ts
+
+    ev = MagicMock()
+    ev.ticker = "NVDA"; ev.contract_type = "CALL"; ev.strike = 900.0
+    ev.expiry = "2026-06-20"; ev.dte = 51; ev.fill_price = 5.0
+    ev.bid = 4.9; ev.ask = 5.1; ev.size = 50; ev.premium = 25_000.0
+    ev.trade_type = "BTO"; ev.bid_ask_class = "ASK"; ev.is_aggressive = True
+    ev.is_golden_sweep = False; ev.sentiment = "BULLISH"; ev.influence_tier = "WHALE"
+    ev.conviction_score = 0.9; ev.exchange_count = 1; ev.fill_count = 1
+    ev.open_interest = 3000; ev.iv = 0.55; ev.underlying_price = 880.0
+    ev.is_synthetic_quote = False
+    ev.timestamp.isoformat.return_value = "2026-04-30T10:00:00Z"
+
+    sig_ep = MagicMock()
+    sig_ep.ticker = "NVDA"; sig_ep.contract_type = "CALL"
+    sig_ep.strike = 900.0; sig_ep.expiry = "2026-06-20"
+    sig_ep.total_premium = 75_000.0; sig_ep.trade_count = 3
+    sig_ep.is_accelerating = False
+    sig_ep.summary_str.return_value = "NVDA CALL 3x $75k"
+
+    persisted_episodes = []
+
+    async def fake_persist_episode(data):
+        persisted_episodes.append(data.copy())
+
+    raw = {"type": "timesale", "timesale": {"symbol": "NVDA260620C00900000"}}
+
+    with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+         patch("services.tradier_stream.flow_dedup.is_duplicate", return_value=False), \
+         patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
+         patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="STRONG_SIGNAL"), \
+         patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
+         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
+        await ts._process_trade(raw)
+        await asyncio.sleep(0.05)
+
+    assert len(persisted_episodes) == 1
+    assert persisted_episodes[0]["direction"] == "REPEAT_BUY"
+
+
+@pytest.mark.asyncio
+async def test_process_trade_episode_direction_put_is_repeat_sell():
+    """direction for PUT episodes must be REPEAT_SELL."""
+    import services.tradier_stream as ts
+
+    ev = MagicMock()
+    ev.ticker = "SPY"; ev.contract_type = "PUT"; ev.strike = 500.0
+    ev.expiry = "2026-05-17"; ev.dte = 17; ev.fill_price = 2.0
+    ev.bid = 1.95; ev.ask = 2.05; ev.size = 100; ev.premium = 20_000.0
+    ev.trade_type = "BTO"; ev.bid_ask_class = "BID"; ev.is_aggressive = False
+    ev.is_golden_sweep = False; ev.sentiment = "BEARISH"; ev.influence_tier = "INSTITUTIONAL"
+    ev.conviction_score = 0.7; ev.exchange_count = 1; ev.fill_count = 1
+    ev.open_interest = 10000; ev.iv = 0.20; ev.underlying_price = 503.0
+    ev.is_synthetic_quote = False
+    ev.timestamp.isoformat.return_value = "2026-04-30T10:00:00Z"
+
+    sig_ep = MagicMock()
+    sig_ep.ticker = "SPY"; sig_ep.contract_type = "PUT"
+    sig_ep.strike = 500.0; sig_ep.expiry = "2026-05-17"
+    sig_ep.total_premium = 60_000.0; sig_ep.trade_count = 4
+    sig_ep.is_accelerating = True
+    sig_ep.summary_str.return_value = "SPY PUT 4x $60k"
+
+    persisted_episodes = []
+
+    async def fake_persist_episode(data):
+        persisted_episodes.append(data.copy())
+
+    raw = {"type": "timesale", "timesale": {"symbol": "SPY260517P00500000"}}
+
+    with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+         patch("services.tradier_stream.flow_dedup.is_duplicate", return_value=False), \
+         patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
+         patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="ALERT"), \
+         patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
+         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
+        await ts._process_trade(raw)
+        await asyncio.sleep(0.05)
+
+    assert len(persisted_episodes) == 1
+    assert persisted_episodes[0]["direction"] == "REPEAT_SELL"
 
 
 # ---------------------------------------------------------------------------
