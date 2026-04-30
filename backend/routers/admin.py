@@ -15,16 +15,18 @@ Endpoints:
   PATCH /api/admin/tier-thresholds       — update T1/T2/T3 threshold columns  [4A / B-019]
   GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A / B-020]
   POST  /api/admin/registry/prewarm      — trigger registry.build() on demand (background task)
+  GET   /api/admin/activity-log          — paginated admin audit log  [STORY-BE-001]
 """
 import asyncio
 import logging
 import time
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from typing import Any
 from core.auth import get_current_user, TokenData
 from config import settings
 import services.tier_engine as te
+from services.activity_log import log_action, fetch_logs
 
 log = logging.getLogger("admin")
 
@@ -41,6 +43,10 @@ _ALLOWED_TIER_COLUMNS = {
     "t3_min_volume", "t3_min_last_price", "t3_min_oi", "t3_atm_pct", "t3_max_dte",
 }
 _TIER_THRESHOLD_COLUMNS = _ALLOWED_TIER_COLUMNS  # alias
+
+
+def _get_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
 
 
 def _require_admin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
@@ -64,18 +70,26 @@ async def demo_status(admin: TokenData = Depends(_require_admin)):
 
 
 @router.post("/demo/on")
-async def demo_on(admin: TokenData = Depends(_require_admin)):
+async def demo_on(
+    request: Request,
+    admin: TokenData = Depends(_require_admin),
+):
     from services.demo_engine import start_demo
     result = await start_demo()
     log.info(f"[admin] Demo engine started by {admin.email}")
+    await log_action(admin.email, "demo.start", {}, _get_ip(request))
     return result
 
 
 @router.post("/demo/off")
-async def demo_off(admin: TokenData = Depends(_require_admin)):
+async def demo_off(
+    request: Request,
+    admin: TokenData = Depends(_require_admin),
+):
     from services.demo_engine import stop_demo
     result = await stop_demo()
     log.info(f"[admin] Demo engine stopped by {admin.email}")
+    await log_action(admin.email, "demo.stop", {}, _get_ip(request))
     return result
 
 
@@ -97,14 +111,21 @@ async def get_ingestion_config(admin: TokenData = Depends(_require_admin)):
 
 @router.patch("/ingestion/config")
 async def update_ingestion_config(
-    body:  IngestionConfigUpdate,
-    admin: TokenData = Depends(_require_admin),
+    body:    IngestionConfigUpdate,
+    request: Request,
+    admin:   TokenData = Depends(_require_admin),
 ):
     from services.ingestion_config import update_config
     ok = await update_config(body.key, body.value, updated_by=admin.email)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Failed to update config key '{body.key}'")
     log.info(f"[admin] Ingestion config updated: {body.key}={body.value} by {admin.email}")
+    await log_action(
+        admin.email,
+        "ingestion_config.update",
+        {"key": body.key, "value": body.value},
+        _get_ip(request),
+    )
     return {"ok": True, "key": body.key, "value": body.value}
 
 
@@ -162,8 +183,9 @@ class TierThresholdUpdate(BaseModel):
 
 @router.patch("/tier-thresholds")
 async def update_tier_thresholds(
-    body:  TierThresholdUpdate,
-    admin: TokenData = Depends(_require_admin),
+    body:    TierThresholdUpdate,
+    request: Request,
+    admin:   TokenData = Depends(_require_admin),
 ):
     unknown = set(body.updates.keys()) - _ALLOWED_TIER_COLUMNS
     if unknown:
@@ -211,6 +233,12 @@ async def update_tier_thresholds(
     log.info(
         "[admin] tier_thresholds updated by %s: %s",
         admin.email, body.updates,
+    )
+    await log_action(
+        admin.email,
+        "tier_thresholds.update",
+        {"updates": body.updates},
+        _get_ip(request),
     )
     return {
         "ok":      True,
@@ -312,6 +340,7 @@ async def _run_prewarm(triggered_by: str) -> None:
 @router.post("/registry/prewarm", status_code=202)
 async def registry_prewarm(
     background_tasks: BackgroundTasks,
+    request: Request,
     admin: TokenData = Depends(_require_admin),
 ):
     """
@@ -323,9 +352,53 @@ async def registry_prewarm(
     """
     log.info("[admin] Registry pre-warm requested by %s", admin.email)
     background_tasks.add_task(_run_prewarm, admin.email)
+    await log_action(admin.email, "registry.prewarm", {}, _get_ip(request))
     return {
         "ok":      True,
         "status":  "accepted",
         "message": "Registry build started in background. Watch logs for '[prewarm] Manual pre-warm complete'.",
         "triggered_by": admin.email,
+    }
+
+
+# ---------------------------------------------------------------------------
+# STORY-BE-001: Admin activity log — GET /api/admin/activity-log
+# ---------------------------------------------------------------------------
+
+@router.get("/activity-log")
+async def get_activity_log(
+    limit:       int           = Query(50,   ge=1,  le=200, description="Max rows to return (1-200)"),
+    offset:      int           = Query(0,    ge=0,          description="Pagination offset"),
+    action:      str | None    = Query(None,                description="Filter by exact action string"),
+    admin_email: str | None    = Query(None,                description="Filter by admin email"),
+    admin:       TokenData     = Depends(_require_admin),
+):
+    """
+    Return a paginated list of admin actions, newest first.
+
+    Query params:
+      - limit       (int, 1-200, default 50)
+      - offset      (int, default 0)
+      - action      (str, optional) — exact match e.g. "tier_thresholds.update"
+      - admin_email (str, optional) — filter to a specific admin
+
+    Known action strings:
+      demo.start | demo.stop | ingestion_config.update |
+      tier_thresholds.update | registry.prewarm
+    """
+    rows = await fetch_logs(
+        limit=limit,
+        offset=offset,
+        action_filter=action,
+        email_filter=admin_email,
+    )
+    log.info(
+        "[admin] activity-log fetched by %s (limit=%d offset=%d action=%s email=%s count=%d)",
+        admin.email, limit, offset, action, admin_email, len(rows),
+    )
+    return {
+        "limit":  limit,
+        "offset": offset,
+        "count":  len(rows),
+        "items":  rows,
     }
