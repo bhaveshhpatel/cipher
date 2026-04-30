@@ -29,7 +29,7 @@ import type { SignalHistoryItem } from '@/lib/api';
 const mockUseSignalHistory = useSignalHistory as jest.Mock;
 
 const makeItem = (overrides: Partial<SignalHistoryItem> = {}): SignalHistoryItem => ({
-  id:              '1',
+  id:              1,
   ticker:          'AAPL',
   recommendation:  'BUY',
   composite_score: 0.82,
@@ -85,9 +85,9 @@ test('renders table row with ticker and recommendation', () => {
 
 test('renders multiple rows', () => {
   const items = [
-    makeItem({ id: '1', ticker: 'AAPL', recommendation: 'BUY'  }),
-    makeItem({ id: '2', ticker: 'SPY',  recommendation: 'SELL' }),
-    makeItem({ id: '3', ticker: 'NVDA', recommendation: 'HOLD' }),
+    makeItem({ id: 1, ticker: 'AAPL', recommendation: 'BUY'  }),
+    makeItem({ id: 2, ticker: 'SPY',  recommendation: 'SELL' }),
+    makeItem({ id: 3, ticker: 'NVDA', recommendation: 'HOLD' }),
   ];
   mockUseSignalHistory.mockReturnValue({ ...baseMock, items, total: 3, fetch: jest.fn(), setPage: jest.fn() });
   render(<SignalHistory token={null} />);
