@@ -1,12 +1,11 @@
 "use client";
-// NOTE: This is a client layout so we can read system preference for dark mode on first load.
+// NOTE: Client layout — reads system preference for dark mode on first load.
 // The <html> tag gets the "dark" class based on localStorage + system preference.
-// We use a small inline script to prevent flash of wrong theme.
+// Inline script prevents flash of wrong theme.
 
-import type { Metadata } from "next";
 import "./globals.css";
+import { ToastProvider } from "@/context/ToastContext";
 
-// Inline script prevents flash-of-wrong-theme (FOUT) on load
 const themeScript = `
 (function(){
   try {
@@ -35,7 +34,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
-      <body>{children}</body>
+      <body>
+        <ToastProvider>{children}</ToastProvider>
+      </body>
     </html>
   );
 }
