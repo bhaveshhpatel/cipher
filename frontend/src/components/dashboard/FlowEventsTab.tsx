@@ -291,7 +291,7 @@ export function FlowEventsTab({ events, loading, error, onFiltersChange }: Props
                         <tr
                           key={e.id}
                           data-index={vRow.index}
-                          style={{ height: ROW_HEIGHT }}
+                          style={{ height: ROW_HEIGHT, borderColor: "var(--border)" }}
                           className="border-b transition-colors hover:bg-[var(--surface-2)] animate-fade-up"
                         >
                           <td className="px-3 py-3 font-mono text-xs" style={{ color: "var(--faint)" }}>
