@@ -21,6 +21,7 @@ export function AppHeader({ email, stats, onLogout }: AppHeaderProps) {
       className="sticky top-0 z-40 flex items-center justify-between px-4 md:px-6 h-14"
       style={{ background: "var(--surface)", borderBottom: "1px solid var(--border)" }}
     >
+      {/* Left: logo + wordmark + market status chip */}
       <div className="flex items-center gap-3">
         <CipherLogo size={28} />
         <span
@@ -29,12 +30,15 @@ export function AppHeader({ email, stats, onLogout }: AppHeaderProps) {
         >
           CIPHER
         </span>
+        {!statusLoading && status && (
+          <span className="hidden sm:flex">
+            <MarketStatusChip status={status} />
+          </span>
+        )}
       </div>
 
+      {/* Right: stream stats + email + theme + sign-out */}
       <div className="flex items-center gap-3">
-        {!statusLoading && status && (
-          <MarketStatusChip status={status} />
-        )}
         {stats && <StreamStatsBar stats={stats} />}
         <span
           className="text-xs font-mono hidden sm:block"
