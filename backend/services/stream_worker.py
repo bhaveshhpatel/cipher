@@ -20,6 +20,13 @@ STREAM-3 (2026-04-28):
 
 B-021: startup_delay_s for staggered startup (50ms × worker_id).
 B-008: global stats rollup via _global_stats().
+
+STREAM-6 (2026-04-30):
+  Increase _IDLE_TIMEOUT 30s → 120s. With 64 workers × 500 symbols at
+  ~0.6 ticks/s total, each worker statistically receives a tick every ~110s.
+  The 30s timeout was causing constant false-stall reconnects on quiet symbol
+  sets, producing stalled=63 in STREAM_HEALTH and hammering Tradier with
+  unnecessary reconnect churn.
 """
 import asyncio
 import json
@@ -41,13 +48,13 @@ _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-_IDLE_TIMEOUT          = 30.0    # seconds before declaring stream stalled
+_IDLE_TIMEOUT          = 120.0   # STREAM-6: raised from 30s; ~110s expected tick interval per worker
 _CONNECT_TIMEOUT       = 15.0
 _BACKOFF_BASE          = 1.0
 _BACKOFF_CAP           = 10.0
 _MARKET_CLOSED_SLEEP_S = 300.0
 _STATS_INTERVAL_S      = 30.0    # per-worker STREAM_STATS log frequency
-_STALL_LOG_INTERVAL_S  = 30.0    # how often to log a STALL warning mid-stream
+_STALL_LOG_INTERVAL_S  = 60.0    # how often to log a STALL warning mid-stream (raised from 30s)
 
 
 def _is_market_hours() -> bool:
@@ -412,6 +419,8 @@ class StreamWorker:
         """
         Async line iterator with idle watchdog.
         Logs a STALL warning if no line arrives within _IDLE_TIMEOUT seconds.
+        STREAM-6: _IDLE_TIMEOUT raised to 120s — quiet workers on low-volume
+        symbol sets were reconnecting every 30s unnecessarily.
         """
         aiter = resp.aiter_lines().__aiter__()
         stall_logged = False
