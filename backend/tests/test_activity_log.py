@@ -5,10 +5,10 @@ Covers:
   1. services/activity_log.log_action()  — happy path + DB failure swallowed silently
   2. services/activity_log.fetch_logs()  — delegates filters + pagination correctly
   3. GET /api/admin/activity-log         — 403 for non-admin, 200 + shape, pagination params,
-                                           action filter, admin_email filter, DB error → 200 empty
+                                           action filter, admin_email filter, DB error → 500
 """
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 
@@ -171,8 +171,6 @@ class TestGetActivityLogEndpoint:
 
     def test_fetch_error_returns_500(self, admin_client):
         """If fetch_logs raises unexpectedly, FastAPI returns 500."""
-        async def _boom(**_):
-            raise RuntimeError("DB down")
         with patch("routers.admin.fetch_logs", side_effect=RuntimeError("DB down")):
             r = admin_client.get("/api/admin/activity-log")
         assert r.status_code == 500
