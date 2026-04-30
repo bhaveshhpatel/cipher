@@ -17,6 +17,10 @@ STREAM-3 (2026-04-28):
   connection. Workers sharing the same sessionid each hold their own open
   POST stream concurrently — all 31,920 symbols covered from T+0.
 
+STREAM-4 (2026-04-30):
+  Add asyncio.wait_for(timeout=10s) around get_session_token() to prevent
+  silent infinite hang when Tradier session endpoint is unresponsive.
+
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
@@ -43,6 +47,7 @@ _WORKER_SPAWN_DELAY_S   = 0.05       # 50ms stagger between worker starts
 _HEALTH_LOG_INTERVAL_S  = 30.0       # manager-level aggregate log interval
 _DEFAULT_WORKER_REFRESH_S: float = 300.0
 _STALL_THRESHOLD_S      = 60.0       # worker is "stalled" if no tick in this many seconds
+_SESSION_TOKEN_TIMEOUT_S = 10.0      # hard timeout for each get_session_token() attempt
 
 
 class StreamManager:
@@ -215,9 +220,23 @@ class StreamManager:
         return any(getattr(w, "_token_expired", False) for w in self._workers)
 
     async def _fetch_session_token(self) -> Optional[str]:
-        """Fetch a fresh session token with up to 3 retries."""
+        """Fetch a fresh session token with up to 3 retries, 10s timeout each."""
         for attempt in range(1, 4):
-            token = await get_session_token()
+            try:
+                token = await asyncio.wait_for(
+                    get_session_token(), timeout=_SESSION_TOKEN_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[stream_manager] Session token fetch timed out after %.0fs (attempt %d/3)",
+                    _SESSION_TOKEN_TIMEOUT_S, attempt,
+                )
+                token = None
+            except Exception as e:
+                log.warning(
+                    "[stream_manager] Session token fetch error (attempt %d/3): %s", attempt, e
+                )
+                token = None
             if token:
                 log.info("[stream_manager] Session token acquired (attempt %d)", attempt)
                 return token
