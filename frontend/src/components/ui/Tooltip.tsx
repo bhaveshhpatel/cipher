@@ -1,5 +1,5 @@
 "use client";
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useId } from "react";
 import { clsx } from "clsx";
 
 export type TooltipPlacement = "top" | "bottom" | "left" | "right";
@@ -26,8 +26,9 @@ export function Tooltip({
   className,
   children,
 }: TooltipProps) {
+  const id                    = useId();
   const [visible, setVisible] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timer                 = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const show = useCallback(() => {
     timer.current = setTimeout(() => setVisible(true), delay);
@@ -47,12 +48,14 @@ export function Tooltip({
         onMouseLeave={hide}
         onFocus={show}
         onBlur={hide}
+        aria-describedby={visible ? id : undefined}
         className="inline-flex"
       >
         {children}
       </span>
       {visible && (
         <span
+          id={id}
           role="tooltip"
           className={clsx(
             "absolute z-50 pointer-events-none",

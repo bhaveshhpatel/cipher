@@ -38,7 +38,6 @@ describe("Badge", () => {
 
   it("renders dot when dot=true", () => {
     const { container } = render(<Badge dot>X</Badge>);
-    // dot is a <span> sibling inside the badge
     expect(container.querySelector("span > span")).toBeInTheDocument();
   });
 
@@ -105,6 +104,16 @@ describe("Button", () => {
   it("applies destructive variant class", () => {
     const { container } = render(<Button variant="destructive">Del</Button>);
     expect(container.firstChild).toHaveClass("btn-destructive");
+  });
+
+  it("applies sm size class", () => {
+    const { container } = render(<Button size="sm">X</Button>);
+    expect(container.firstChild).toHaveClass("h-7");
+  });
+
+  it("applies lg size class", () => {
+    const { container } = render(<Button size="lg">X</Button>);
+    expect(container.firstChild).toHaveClass("h-11");
   });
 });
 
@@ -319,6 +328,32 @@ describe("Tooltip", () => {
     expect(screen.getByRole("tooltip")).toBeInTheDocument();
     fireEvent.mouseLeave(trigger);
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("sets aria-describedby on trigger when visible", () => {
+    render(
+      <Tooltip content="Tip text" delay={0}>
+        <button>Hover me</button>
+      </Tooltip>,
+    );
+    const trigger = screen.getByText("Hover me").closest("span")!;
+    fireEvent.mouseEnter(trigger);
+    act(() => jest.advanceTimersByTime(0));
+    const tooltipId = screen.getByRole("tooltip").id;
+    expect(trigger).toHaveAttribute("aria-describedby", tooltipId);
+  });
+
+  it("removes aria-describedby when hidden", () => {
+    render(
+      <Tooltip content="Tip text" delay={0}>
+        <button>Hover me</button>
+      </Tooltip>,
+    );
+    const trigger = screen.getByText("Hover me").closest("span")!;
+    fireEvent.mouseEnter(trigger);
+    act(() => jest.advanceTimersByTime(0));
+    fireEvent.mouseLeave(trigger);
+    expect(trigger).not.toHaveAttribute("aria-describedby");
   });
 });
 
