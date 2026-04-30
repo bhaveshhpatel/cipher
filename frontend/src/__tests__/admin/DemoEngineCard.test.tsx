@@ -6,12 +6,28 @@ import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { DemoEngineCard } from "../../app/admin/_cards/DemoEngineCard";
 
+// Full DemoStatus shape (admin + role + demo.running required by useAdminDemo type)
 const MOCK_STATUS = {
+  admin: "admin@cipher.io",
+  role:  "admin",
   demo: {
+    running:           false,
     ticks_emitted:     42,
     signals_generated: 7,
     last_ticker:       "AAPL",
     started_at:        "2026-04-30T06:00:00Z",
+  },
+};
+
+const NULL_DEMO_STATUS = {
+  admin: "admin@cipher.io",
+  role:  "admin",
+  demo: {
+    running:           false,
+    ticks_emitted:     0,
+    signals_generated: 0,
+    last_ticker:       null as null,
+    started_at:        null as null,
   },
 };
 
@@ -45,8 +61,7 @@ describe("DemoEngineCard", () => {
   });
 
   it("shows '—' for null last_ticker and started_at", () => {
-    const s = { demo: { ticks_emitted: 0, signals_generated: 0, last_ticker: null, started_at: null } };
-    render(<DemoEngineCard status={s} isRunning={false} loading={false} error={null} toggle={jest.fn()} />);
+    render(<DemoEngineCard status={NULL_DEMO_STATUS} isRunning={false} loading={false} error={null} toggle={jest.fn()} />);
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(2);
   });
 
