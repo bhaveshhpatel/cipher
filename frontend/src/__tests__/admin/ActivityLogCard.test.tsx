@@ -4,16 +4,15 @@
  */
 import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
-import { vi, describe, it, expect, beforeEach } from "vitest";
 
-const mockUseActivityLog = vi.fn();
-vi.mock("@/hooks/useActivityLog", () => ({
-  useActivityLog: (...a: unknown[]) => mockUseActivityLog(...a),
-}));
+jest.mock("@/hooks/useActivityLog");
 
+import { useActivityLog } from "@/hooks/useActivityLog";
 import { ActivityLogCard } from "../../app/admin/_cards/ActivityLogCard";
 
-const EMPTY_STATE = { items: [], total: 0, count: 0, loading: false, error: null, refresh: vi.fn() };
+const mockUseActivityLog = useActivityLog as jest.Mock;
+
+const EMPTY_STATE = { items: [], total: 0, count: 0, loading: false, error: null, refresh: jest.fn() };
 
 const FAKE_ITEMS = [
   {
@@ -35,7 +34,7 @@ const FAKE_ITEMS = [
 ];
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  jest.clearAllMocks();
   mockUseActivityLog.mockReturnValue(EMPTY_STATE);
 });
 
@@ -46,7 +45,7 @@ describe("ActivityLogCard — states", () => {
     expect(screen.getByText(/Audit trail/)).toBeInTheDocument();
   });
 
-  it("shows Loading… while loading", () => {
+  it("shows Loading\u2026 while loading", () => {
     mockUseActivityLog.mockReturnValue({ ...EMPTY_STATE, loading: true });
     render(<ActivityLogCard token="tok" />);
     expect(screen.getByText("Loading…")).toBeInTheDocument();
@@ -96,18 +95,18 @@ describe("ActivityLogCard — filters", () => {
     expect(screen.getByText(/Clear/)).toBeInTheDocument();
   });
 
-  it("Clear button resets all filters and calls hook with nulls", () => {
+  it("Clear resets filters — hook called with nulls", () => {
     render(<ActivityLogCard token="tok" />);
     fireEvent.change(screen.getByPlaceholderText("Filter by email"), { target: { value: "a@b.com" } });
     fireEvent.click(screen.getByText(/Clear/));
-    const lastCall = mockUseActivityLog.mock.calls.at(-1)![0];
+    const lastCall = mockUseActivityLog.mock.calls[mockUseActivityLog.mock.calls.length - 1][0];
     expect(lastCall.adminEmail).toBeNull();
   });
 
   it("action filter change passes action to hook", () => {
     render(<ActivityLogCard token="tok" />);
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "demo.start" } });
-    const lastCall = mockUseActivityLog.mock.calls.at(-1)![0];
+    const lastCall = mockUseActivityLog.mock.calls[mockUseActivityLog.mock.calls.length - 1][0];
     expect(lastCall.action).toBe("demo.start");
   });
 

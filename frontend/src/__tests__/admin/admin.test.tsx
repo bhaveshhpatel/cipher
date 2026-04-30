@@ -4,38 +4,41 @@
  */
 import React from "react";
 import { render, screen } from "@testing-library/react";
-import { vi, describe, it, expect, beforeEach } from "vitest";
 
-// ── Mocks ─────────────────────────────────────────────────
-const mockReplace = vi.fn();
-const mockPush    = vi.fn();
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ replace: mockReplace, push: mockPush }),
-}));
+// ── next/navigation ───────────────────────────────────────
+jest.mock("next/navigation", () => ({ useRouter: jest.fn() }));
 
-const mockUseAuth     = vi.fn();
-const mockUseAdminDemo = vi.fn();
-vi.mock("@/hooks/useAuth",      () => ({ useAuth:      (...a: unknown[]) => mockUseAuth(...a) }));
-vi.mock("@/hooks/useAdminDemo", () => ({ useAdminDemo: (...a: unknown[]) => mockUseAdminDemo(...a) }));
+// ── Card stubs (paths relative to this test file) ──────────────
+jest.mock("../../app/admin/_cards/DemoEngineCard",       () => ({ DemoEngineCard:       () => <div data-testid="card-demo" /> }));
+jest.mock("../../app/admin/_cards/StreamHealthCard",     () => ({ StreamHealthCard:     () => <div data-testid="card-stream" /> }));
+jest.mock("../../app/admin/_cards/TierThresholdsCard",   () => ({ TierThresholdsCard:   () => <div data-testid="card-tier-thresh" /> }));
+jest.mock("../../app/admin/_cards/IngestionConfigCard",  () => ({ IngestionConfigCard:  () => <div data-testid="card-ingestion" /> }));
+jest.mock("../../app/admin/_cards/HowItWorksCard",       () => ({ HowItWorksCard:       () => <div data-testid="card-how" /> }));
+jest.mock("../../app/admin/_cards/TierDistributionCard", () => ({ TierDistributionCard: () => <div data-testid="card-tier-dist" /> }));
+jest.mock("../../app/admin/_cards/ActivityLogCard",      () => ({ ActivityLogCard:      () => <div data-testid="card-activity" /> }));
 
-// Stub all cards so page renders fast
-vi.mock("../_cards/DemoEngineCard",      () => ({ DemoEngineCard:      () => <div data-testid="card-demo" /> }));
-vi.mock("../_cards/StreamHealthCard",    () => ({ StreamHealthCard:    () => <div data-testid="card-stream" /> }));
-vi.mock("../_cards/TierThresholdsCard",  () => ({ TierThresholdsCard:  () => <div data-testid="card-tier-thresh" /> }));
-vi.mock("../_cards/IngestionConfigCard", () => ({ IngestionConfigCard: () => <div data-testid="card-ingestion" /> }));
-vi.mock("../_cards/HowItWorksCard",      () => ({ HowItWorksCard:      () => <div data-testid="card-how" /> }));
-vi.mock("../_cards/TierDistributionCard",() => ({ TierDistributionCard:() => <div data-testid="card-tier-dist" /> }));
-vi.mock("../_cards/ActivityLogCard",     () => ({ ActivityLogCard:     () => <div data-testid="card-activity" /> }));
+// ── Hook auto-mocks ─────────────────────────────────────
+jest.mock("@/hooks/useAuth");
+jest.mock("@/hooks/useAdminDemo");
 
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/hooks/useAuth";
+import { useAdminDemo } from "@/hooks/useAdminDemo";
 import AdminPage from "../../app/admin/page";
 
-const DEMO_DEFAULTS = {
-  status: null, isRunning: false, loading: false, error: null, toggle: vi.fn(),
-};
+const mockUseRouter    = useRouter    as jest.Mock;
+const mockUseAuth      = useAuth      as jest.Mock;
+const mockUseAdminDemo = useAdminDemo as jest.Mock;
+
+const mockReplace = jest.fn();
+const mockPush    = jest.fn();
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  mockUseAdminDemo.mockReturnValue(DEMO_DEFAULTS);
+  jest.clearAllMocks();
+  mockUseRouter.mockReturnValue({ replace: mockReplace, push: mockPush });
+  mockUseAdminDemo.mockReturnValue({
+    status: null, isRunning: false, loading: false, error: null, toggle: jest.fn(),
+  });
 });
 
 describe("AdminPage — auth guards", () => {
@@ -57,7 +60,7 @@ describe("AdminPage — auth guards", () => {
     expect(mockReplace).toHaveBeenCalledWith("/dashboard");
   });
 
-  it("renders null when isAdmin is false even after ready", () => {
+  it("returns null when isAdmin is false even after ready", () => {
     mockUseAuth.mockReturnValue({ token: "tok", email: "u@x.com", isAdmin: false, isAuthenticated: true, ready: true });
     const { container } = render(<AdminPage />);
     expect(container.querySelector("[data-testid='card-demo']")).toBeNull();
