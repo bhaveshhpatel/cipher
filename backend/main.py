@@ -31,6 +31,10 @@ Key architectural fixes:
   M-3  (main)         — _post_build_upsert split into two guarded phases;
                         assign_tiers() failure raises so upsert_symbol_quotes()
                         is skipped and the error is visible in logs/metrics
+  STREAM-5 (main)     — graceful shutdown: stream_task cancelled and awaited
+                        FIRST so Tradier HTTP connections close cleanly before
+                        the process exits, freeing session quota for the next
+                        container start immediately.
 """
 import asyncio
 import json
@@ -328,7 +332,6 @@ async def _post_build_upsert(
             sum(1 for t in tier_map.values() if t == 3),
         )
     except Exception as exc:
-        # Log here for context then re-raise so the outer wrapper sees it.
         log.warning(
             "[post_build] Phase 2 (assign_tiers) FAILED — "
             "DB tier columns NOT updated, upsert skipped: %s",
@@ -510,16 +513,27 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # STREAM-5: Cancel stream_task FIRST and await it so all Tradier HTTP
+    # streaming connections are closed cleanly before the process exits.
+    # This frees Tradier's session quota immediately, preventing the
+    # 400 Quota Violation on the next container start.
+    log.info("[shutdown] Closing Tradier stream connections first…")
+    stream_task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    log.info("[shutdown] Stream task stopped — Tradier session quota released")
+
+    # Cancel remaining tasks
     build_task.cancel()
     refresh_task.cancel()
     prewarm_task.cancel()
     registry_refresh_task.cancel()
-    stream_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
     for task in (
         build_task,
-        stream_task,
         db_write_task,
         signal_write_task,
         refresh_task,

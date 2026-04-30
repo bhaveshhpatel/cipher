@@ -21,6 +21,11 @@ STREAM-4 (2026-04-30):
   Add asyncio.wait_for(timeout=10s) around get_session_token() to prevent
   silent infinite hang when Tradier session endpoint is unresponsive.
 
+STREAM-5 (2026-04-30):
+  Increase retry delay from 2s → 15s so rapid container restarts self-heal
+  after Tradier's quota releases. Explicit 400 Quota Violation handling with
+  20s backoff (Tradier session TTL is ~10-15s after connection drop).
+
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
@@ -41,13 +46,15 @@ from utils.tradier_client import get_session_token
 
 log = logging.getLogger("stream_manager")
 
-_CHUNK_SIZE             = 500        # Tradier hard limit: 500 symbols per POST
-_QUEUE_SIZE             = 50_000     # handle burst from 64 parallel workers
-_WORKER_SPAWN_DELAY_S   = 0.05       # 50ms stagger between worker starts
-_HEALTH_LOG_INTERVAL_S  = 30.0       # manager-level aggregate log interval
+_CHUNK_SIZE              = 500        # Tradier hard limit: 500 symbols per POST
+_QUEUE_SIZE              = 50_000     # handle burst from 64 parallel workers
+_WORKER_SPAWN_DELAY_S    = 0.05       # 50ms stagger between worker starts
+_HEALTH_LOG_INTERVAL_S   = 30.0       # manager-level aggregate log interval
 _DEFAULT_WORKER_REFRESH_S: float = 300.0
-_STALL_THRESHOLD_S      = 60.0       # worker is "stalled" if no tick in this many seconds
-_SESSION_TOKEN_TIMEOUT_S = 10.0      # hard timeout for each get_session_token() attempt
+_STALL_THRESHOLD_S       = 60.0       # worker is "stalled" if no tick in this many seconds
+_SESSION_TOKEN_TIMEOUT_S = 10.0       # hard timeout for each get_session_token() attempt (STREAM-4)
+_SESSION_RETRY_DELAY_S   = 15.0       # delay between retry attempts (STREAM-5)
+_SESSION_QUOTA_BACKOFF_S = 20.0       # extra backoff on 400 Quota Violation (STREAM-5)
 
 
 class StreamManager:
@@ -114,7 +121,7 @@ class StreamManager:
         await asyncio.gather(*[t for t in all_tasks if t is not None], return_exceptions=True)
         self._tasks.clear()
         self._workers.clear()
-        log.info("[stream_manager] All workers stopped")
+        log.info("[stream_manager] All workers stopped — Tradier connections closed")
 
     async def run(self):
         """
@@ -220,7 +227,12 @@ class StreamManager:
         return any(getattr(w, "_token_expired", False) for w in self._workers)
 
     async def _fetch_session_token(self) -> Optional[str]:
-        """Fetch a fresh session token with up to 3 retries, 10s timeout each."""
+        """
+        Fetch a fresh session token with up to 3 retries.
+        STREAM-4: 10s hard timeout per attempt via asyncio.wait_for.
+        STREAM-5: 15s base retry delay; 20s extra backoff on 400 Quota Violation
+                  so rapid restarts self-heal after Tradier releases the old session.
+        """
         for attempt in range(1, 4):
             try:
                 token = await asyncio.wait_for(
@@ -232,18 +244,40 @@ class StreamManager:
                     _SESSION_TOKEN_TIMEOUT_S, attempt,
                 )
                 token = None
+                is_quota = False
             except Exception as e:
-                log.warning(
-                    "[stream_manager] Session token fetch error (attempt %d/3): %s", attempt, e
-                )
+                err_str = str(e)
+                is_quota = "400" in err_str and "Quota" in err_str
+                if is_quota:
+                    log.warning(
+                        "[stream_manager] Session token 400 Quota Violation (attempt %d/3) — "
+                        "old session still registered on Tradier, backing off %.0fs",
+                        attempt, _SESSION_QUOTA_BACKOFF_S,
+                    )
+                else:
+                    log.warning(
+                        "[stream_manager] Session token fetch error (attempt %d/3): %s",
+                        attempt, e,
+                    )
                 token = None
+            else:
+                is_quota = False
+
             if token:
                 log.info("[stream_manager] Session token acquired (attempt %d)", attempt)
                 return token
+
             log.warning(
                 "[stream_manager] Session token fetch failed (attempt %d/3)", attempt
             )
-            await asyncio.sleep(2.0)
+            if attempt < 3:
+                delay = _SESSION_QUOTA_BACKOFF_S if is_quota else _SESSION_RETRY_DELAY_S
+                log.info(
+                    "[stream_manager] Waiting %.0fs before retry (attempt %d/3)…",
+                    delay, attempt + 1,
+                )
+                await asyncio.sleep(delay)
+
         log.error("[stream_manager] Could not acquire session token after 3 attempts")
         return None
 
