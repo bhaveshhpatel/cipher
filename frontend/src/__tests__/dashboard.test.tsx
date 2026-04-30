@@ -12,6 +12,13 @@
  *   so both navs are present in the DOM simultaneously. Every tab button and
  *   badge span therefore appears twice. We scope all tab/badge queries to
  *   data-testid="sidebar-nav" via `within()` to avoid "Found multiple elements".
+ *
+ * NOTE on tab visibility strategy:
+ *   DashboardPage uses a visited-set + CSS-hide pattern. Once a tab is first
+ *   visited its component stays mounted (so filter/ticker/sim state persists).
+ *   Inactive tabs are wrapped in a <div style="display:none"> rather than
+ *   being unmounted. Tests must assert display:none / no display:none rather
+ *   than presence/absence in the DOM.
  */
 
 import React from "react";
@@ -96,6 +103,41 @@ beforeEach(() => {
   setupMocks();
 });
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────────
+/**
+ * Returns the closest ancestor wrapper div that DashboardPage injects for
+ * CSS-hide tab management. We check its style.display to distinguish
+ * "active" (no display override) from "hidden" (display:none).
+ */
+function getTabWrapper(el: HTMLElement): HTMLElement {
+  // DashboardPage wraps each tab in a plain <div key={t}> one level above
+  // the component root. Walk up until we reach it.
+  let node: HTMLElement | null = el;
+  while (node && node.parentElement && node.parentElement.getAttribute("data-testid") !== "dashboard-content") {
+    const parent = node.parentElement;
+    // The wrapper div has no attributes — it's a bare <div style?>
+    if (parent && !parent.hasAttribute("data-testid") && !parent.hasAttribute("class")) {
+      return parent as HTMLElement;
+    }
+    node = parent as HTMLElement;
+  }
+  // Fallback: return the element's direct parent
+  return el.parentElement as HTMLElement ?? el;
+}
+
+function isTabVisible(testId: string): boolean {
+  const el = screen.getByTestId(testId);
+  // Walk up to the CSS-hide wrapper div
+  let node: HTMLElement | null = el.parentElement;
+  while (node) {
+    if (node.style && node.style.display === "none") return false;
+    // Stop at the DashboardLayout children boundary (arbitrary depth limit)
+    if (node === document.body) break;
+    node = node.parentElement;
+  }
+  return true;
+}
+
 // ─── Auth guard ───────────────────────────────────────────────────────────────────
 describe("Auth guard", () => {
   test("returns null while auth is not ready (prevents flicker)", () => {
@@ -130,8 +172,6 @@ describe("Tab navigation — all tabs exist", () => {
   TAB_LABELS.forEach(label => {
     test(`renders tab button: ${label}`, () => {
       render(<DashboardPage />);
-      // Scope to sidebar-nav: both SidebarNav and MobileTabBar are in the DOM
-      // simultaneously in jsdom, so getByRole would find 2 buttons otherwise.
       const sidebar = screen.getByTestId("sidebar-nav");
       expect(within(sidebar).getByRole("button", { name: new RegExp(label, "i") })).toBeInTheDocument();
     });
@@ -150,6 +190,7 @@ describe("Tab switching", () => {
   test("default tab is Flow Events — FlowEventsTab is visible", () => {
     render(<DashboardPage />);
     expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-events-tab")).toBe(true);
   });
 
   test("clicking Live Signals renders SignalFeed", () => {
@@ -157,6 +198,7 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /live signals/i }));
     expect(screen.getByTestId("signal-feed")).toBeInTheDocument();
+    expect(isTabVisible("signal-feed")).toBe(true);
   });
 
   test("clicking AI Simulation renders SimulationPanel", () => {
@@ -164,6 +206,7 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /ai simulation/i }));
     expect(screen.getByTestId("simulation-panel")).toBeInTheDocument();
+    expect(isTabVisible("simulation-panel")).toBe(true);
   });
 
   test("clicking Composite renders CompositeCard", () => {
@@ -171,6 +214,7 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /composite/i }));
     expect(screen.getByTestId("composite-card")).toBeInTheDocument();
+    expect(isTabVisible("composite-card")).toBe(true);
   });
 
   test("clicking Signal History renders SignalHistory", () => {
@@ -178,6 +222,7 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /signal history/i }));
     expect(screen.getByTestId("signal-history")).toBeInTheDocument();
+    expect(isTabVisible("signal-history")).toBe(true);
   });
 
   test("clicking Flow Events tab renders FlowEventsTab", () => {
@@ -185,6 +230,7 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /flow events/i }));
     expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-events-tab")).toBe(true);
   });
 
   test("clicking Episodes renders FlowEpisodesTab", () => {
@@ -192,27 +238,60 @@ describe("Tab switching", () => {
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /episodes/i }));
     expect(screen.getByTestId("flow-episodes-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-episodes-tab")).toBe(true);
   });
 
-  test("only one tab panel is visible at a time", () => {
+  /**
+   * CSS-hide tab visibility:
+   * After switching tabs the previously-active tab stays in the DOM
+   * (so its state is preserved) but its wrapper is set to display:none.
+   * We verify:
+   *   1. The old tab is still in the DOM (mounted, state intact)
+   *   2. Its wrapper has display:none (not user-visible)
+   *   3. The new tab is visible (no display:none ancestor)
+   */
+  test("only one tab panel is visible at a time (CSS-hide, not unmount)", () => {
     render(<DashboardPage />);
     const sidebar = screen.getByTestId("sidebar-nav");
-    // Default: Flow Events
-    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
-    expect(screen.queryByTestId("signal-feed")).not.toBeInTheDocument();
+
+    // Default: Flow Events active
+    expect(isTabVisible("flow-events-tab")).toBe(true);
+
     // Switch to Live Signals
     fireEvent.click(within(sidebar).getByRole("button", { name: /live signals/i }));
-    expect(screen.queryByTestId("flow-events-tab")).not.toBeInTheDocument();
+
+    // flow-events-tab stays in DOM but is now hidden
+    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-events-tab")).toBe(false);
+
+    // signal-feed is now visible
     expect(screen.getByTestId("signal-feed")).toBeInTheDocument();
+    expect(isTabVisible("signal-feed")).toBe(true);
   });
 
   test("can switch back to Flow Events after visiting another tab", () => {
     render(<DashboardPage />);
     const sidebar = screen.getByTestId("sidebar-nav");
     fireEvent.click(within(sidebar).getByRole("button", { name: /episodes/i }));
-    expect(screen.getByTestId("flow-episodes-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-episodes-tab")).toBe(true);
+    expect(isTabVisible("flow-events-tab")).toBe(false);
     fireEvent.click(within(sidebar).getByRole("button", { name: /flow events/i }));
-    expect(screen.getByTestId("flow-events-tab")).toBeInTheDocument();
+    expect(isTabVisible("flow-events-tab")).toBe(true);
+    expect(isTabVisible("flow-episodes-tab")).toBe(false);
+  });
+
+  /**
+   * Tabs not yet visited must not be in the DOM at all (lazy mount).
+   * This validates the visited-set guards against unnecessary hook calls on load.
+   */
+  test("unvisited tabs are not mounted on initial render", () => {
+    render(<DashboardPage />);
+    // Only flow_events is in visited on mount — these shouldn't exist yet
+    expect(screen.queryByTestId("signal-feed")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("simulation-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("composite-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("signal-history")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("flow-episodes-tab")).not.toBeInTheDocument();
   });
 });
 
@@ -227,7 +306,6 @@ describe("Live Signals badge", () => {
   test("badge shows count when signals exist", () => {
     setupMocks({ signals: { signals: Array(5).fill({ id: "s1" }), connected: true } });
     render(<DashboardPage />);
-    // Scope to sidebar-nav: badge spans appear in both SidebarNav and MobileTabBar
     const sidebar = screen.getByTestId("sidebar-nav");
     expect(within(sidebar).getByText("5")).toBeInTheDocument();
   });
