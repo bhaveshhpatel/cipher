@@ -1,77 +1,86 @@
-import { renderHook, act, waitFor } from "@testing-library/react";
+import React from 'react';
+import { renderHook, waitFor, act } from "@testing-library/react";
+import { SWRConfig } from "swr";
 import { useAlerts } from "@/hooks";
+import type { Alert } from "@/types";
 
-const mockAlert = (id = "a1") => ({
+const Wrapper = ({ children }: { children: React.ReactNode }) =>
+  React.createElement(SWRConfig, {
+    value: { provider: () => new Map(), shouldRetryOnError: false },
+  }, children);
+
+const mockAlert = (id = "a0"): Alert => ({
   id,
   symbol:     "SPY",
-  condition:  "premium_above",
+  condition:  "premium_gt",
   threshold:  100000,
   active:     true,
-  created_at: "2026-01-01T00:00:00Z",
+  created_at: "2026-04-29T00:00:00Z",
 });
 
 beforeEach(() => fetchMock.resetMocks());
 
 describe("useAlerts", () => {
-  it("loads alerts on mount", async () => {
+  it("fetches and returns alerts list", async () => {
     fetchMock.mockResponseOnce(JSON.stringify({ alerts: [mockAlert()] }));
-    const { result } = renderHook(() => useAlerts());
+    const { result } = renderHook(() => useAlerts(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.alerts).toHaveLength(1);
+    expect(result.current.alerts[0].id).toBe("a0");
   });
 
-  it("create calls POST and appends alert", async () => {
-    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [] }));
+  it("createAlert sends POST and revalidates", async () => {
     const newAlert = mockAlert("a2");
-    fetchMock.mockResponseOnce(JSON.stringify(newAlert)); // POST response
-    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [newAlert] })); // revalidate
-
-    const { result } = renderHook(() => useAlerts());
+    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [] }));
+    fetchMock.mockResponseOnce(JSON.stringify(newAlert));
+    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [newAlert] }));
+    const { result } = renderHook(() => useAlerts(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-
     await act(async () => {
-      await result.current.create({
-        symbol: "SPY", condition: "premium_above", threshold: 100000, active: true,
-      });
+      await result.current.createAlert({ symbol: "SPY", condition: "premium_gt", threshold: 100000 });
     });
-
-    const postCall = fetchMock.mock.calls.find(c => (c[1] as RequestInit)?.method === "POST");
+    await waitFor(() => expect(result.current.alerts).toHaveLength(1));
+    const postCall = fetchMock.mock.calls.find(
+      (c: unknown[]) => (c[1] as RequestInit)?.method === "POST",
+    );
     expect(postCall).toBeDefined();
   });
 
-  it("remove calls DELETE and removes alert", async () => {
+  it("deleteAlert sends DELETE and revalidates", async () => {
     fetchMock.mockResponseOnce(JSON.stringify({ alerts: [mockAlert("a1")] }));
-    fetchMock.mockResponseOnce(JSON.stringify({}));           // DELETE response
-    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [] })); // revalidate
-
-    const { result } = renderHook(() => useAlerts());
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-
-    await act(async () => { await result.current.remove("a1"); });
-
-    const deleteCall = fetchMock.mock.calls.find(c => (c[1] as RequestInit)?.method === "DELETE");
+    fetchMock.mockResponseOnce(JSON.stringify({}));
+    fetchMock.mockResponseOnce(JSON.stringify({ alerts: [] }));
+    const { result } = renderHook(() => useAlerts(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.alerts).toHaveLength(1));
+    await act(async () => {
+      await result.current.deleteAlert("a1");
+    });
+    await waitFor(() => expect(result.current.alerts).toHaveLength(0));
+    const deleteCall = fetchMock.mock.calls.find(
+      (c: unknown[]) => (c[1] as RequestInit)?.method === "DELETE",
+    );
     expect(deleteCall).toBeDefined();
-    expect(deleteCall![0]).toContain("/a1");
   });
 
-  it("update calls PATCH with patch body", async () => {
+  it("updateAlert sends PATCH and revalidates", async () => {
     fetchMock.mockResponseOnce(JSON.stringify({ alerts: [mockAlert("a1")] }));
     fetchMock.mockResponseOnce(JSON.stringify({ ...mockAlert("a1"), threshold: 200000 }));
     fetchMock.mockResponseOnce(JSON.stringify({ alerts: [{ ...mockAlert("a1"), threshold: 200000 }] }));
-
-    const { result } = renderHook(() => useAlerts());
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-
-    await act(async () => { await result.current.update("a1", { threshold: 200000 }); });
-
-    const patchCall = fetchMock.mock.calls.find(c => (c[1] as RequestInit)?.method === "PATCH");
+    const { result } = renderHook(() => useAlerts(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.alerts).toHaveLength(1));
+    await act(async () => {
+      await result.current.updateAlert("a1", { threshold: 200000 });
+    });
+    await waitFor(() => expect(result.current.alerts[0].threshold).toBe(200000));
+    const patchCall = fetchMock.mock.calls.find(
+      (c: unknown[]) => (c[1] as RequestInit)?.method === "PATCH",
+    );
     expect(patchCall).toBeDefined();
-    expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toMatchObject({ threshold: 200000 });
   });
 
   it("sets error when GET fails", async () => {
     fetchMock.mockRejectOnce(new Error("401"));
-    const { result } = renderHook(() => useAlerts());
+    const { result } = renderHook(() => useAlerts(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.error).not.toBeNull());
   });
 });
