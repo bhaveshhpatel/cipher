@@ -55,6 +55,24 @@ describe("CompositePage", () => {
     expect(screen.getByTestId("composite-card")).toBeInTheDocument();
   });
 
+  it("shows error banner when getComposite rejects", async () => {
+    mockGetComposite.mockRejectedValue(new Error("fetch failed"));
+    render(<CompositePage token="tok" />);
+    fireEvent.change(screen.getByTestId("ticker-input"), { target: { value: "SPY" } });
+    fireEvent.click(screen.getByTestId("ticker-submit"));
+    await waitFor(() => expect(screen.getByTestId("composite-error")).toHaveTextContent("fetch failed"));
+  });
+
+  it("clears error on handleClear", async () => {
+    mockGetComposite.mockRejectedValue(new Error("oops"));
+    render(<CompositePage token="tok" />);
+    fireEvent.change(screen.getByTestId("ticker-input"), { target: { value: "SPY" } });
+    fireEvent.click(screen.getByTestId("ticker-submit"));
+    await waitFor(() => screen.getByTestId("composite-error"));
+    fireEvent.click(screen.getByTestId("ticker-clear"));
+    await waitFor(() => expect(screen.queryByTestId("composite-error")).not.toBeInTheDocument());
+  });
+
   it("clears ticker when clear button clicked", async () => {
     render(<CompositePage token="tok" />);
     fireEvent.change(screen.getByTestId("ticker-input"), { target: { value: "SPY" } });

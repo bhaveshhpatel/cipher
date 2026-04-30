@@ -10,16 +10,19 @@ export function CompositePage({ token }: Props) {
   const [composite,        setComposite]        = useState<CompositeSignal | null>(null);
   const [compositeTicker,  setCompositeTicker]  = useState("");
   const [compositeLoading, setCompositeLoading] = useState(false);
+  const [compositeError,   setCompositeError]   = useState<string | null>(null);
 
   const handleScan = async (t: string) => {
     if (!token || !t) return;
     setCompositeTicker(t);
     setCompositeLoading(true);
+    setCompositeError(null);
     try {
       const c = await api.getComposite(t, token);
       setComposite(c);
-    } catch {
+    } catch (e) {
       setComposite(null);
+      setCompositeError(e instanceof Error ? e.message : "Failed to load composite");
     } finally {
       setCompositeLoading(false);
     }
@@ -28,6 +31,7 @@ export function CompositePage({ token }: Props) {
   const handleClear = () => {
     setComposite(null);
     setCompositeTicker("");
+    setCompositeError(null);
   };
 
   return (
@@ -49,7 +53,17 @@ export function CompositePage({ token }: Props) {
         />
       </div>
 
-      {!compositeTicker && !composite && (
+      {compositeError && (
+        <div
+          data-testid="composite-error"
+          className="px-4 py-3 rounded-lg text-sm font-mono"
+          style={{ background: "rgba(220,53,69,0.07)", color: "var(--red)", border: "1px solid rgba(220,53,69,0.2)" }}
+        >
+          ⚠ {compositeError}
+        </div>
+      )}
+
+      {!compositeTicker && !composite && !compositeError && (
         <div className="card flex flex-col items-center justify-center py-20 gap-3">
           <span className="text-4xl" style={{ color: "var(--faint)" }}>◈</span>
           <p className="text-base font-semibold" style={{ color: "var(--muted)" }}>
