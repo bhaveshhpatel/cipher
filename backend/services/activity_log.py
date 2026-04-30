@@ -2,11 +2,15 @@
 services/activity_log.py  [STORY-BE-001]
 
 Two public coroutines:
-  log_action()  — fire-and-forget insert into admin_activity_log.
-                  Never raises; failures are logged at WARNING level only,
-                  so a DB hiccup never breaks the calling admin route.
+  log_action()  — insert one audit row into admin_activity_log.
+                  Errors are swallowed at WARNING level so no admin route
+                  ever fails due to a logging hiccup.
+                  The insert *is* awaited before the response returns
+                  (safe trade-off for low-frequency admin routes).
 
   fetch_logs()  — paginated read used by GET /api/admin/activity-log.
+                  Returns (rows, total) so callers know the full result-set
+                  size without a separate COUNT query.
 """
 import asyncio
 import logging
@@ -36,13 +40,20 @@ def _query(
     offset: int,
     action_filter: str | None,
     email_filter: str | None,
-) -> list[dict]:
+    since: str | None,
+    before: str | None,
+) -> tuple[list[dict], int]:
+    """
+    Return (rows, total_matching_rows).
+    Uses PostgREST count='exact' so the client can paginate without a
+    separate COUNT(*) round-trip.
+    """
     from supabase import create_client
     from config import settings
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     q = (
         sb.table("admin_activity_log")
-        .select("*")
+        .select("*", count="exact")
         .order("created_at", desc=True)
         .range(offset, offset + limit - 1)
     )
@@ -50,7 +61,12 @@ def _query(
         q = q.eq("action", action_filter)
     if email_filter:
         q = q.eq("admin_email", email_filter)
-    return q.execute().data or []
+    if since:
+        q = q.gte("created_at", since)
+    if before:
+        q = q.lte("created_at", before)
+    result = q.execute()
+    return result.data or [], result.count or 0
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +79,13 @@ async def log_action(
     detail: dict[str, Any] | None = None,
     ip: str | None = None,
 ) -> None:
-    """Persist one audit row.  Never raises — failures are silently swallowed."""
+    """
+    Persist one audit row.  Errors are swallowed at WARNING level — the
+    insert is awaited before the response returns but will never propagate
+    an exception to the caller.
+    """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _insert, email, action, detail or {}, ip)
         log.debug("[activity_log] logged action=%s by %s", action, email)
     except Exception as exc:
@@ -77,7 +97,14 @@ async def fetch_logs(
     offset: int = 0,
     action_filter: str | None = None,
     email_filter: str | None = None,
-) -> list[dict]:
-    """Return paginated activity log rows, newest first."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _query, limit, offset, action_filter, email_filter)
+    since: str | None = None,
+    before: str | None = None,
+) -> tuple[list[dict], int]:
+    """
+    Return (rows, total) — rows are the current page, total is the full
+    matching row count across all pages.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _query, limit, offset, action_filter, email_filter, since, before
+    )

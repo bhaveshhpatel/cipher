@@ -315,9 +315,6 @@ async def get_tier_distribution(admin: TokenData = Depends(_require_admin)):
 
 # ---------------------------------------------------------------------------
 # Registry pre-warm — on-demand trigger
-# Mirrors exactly what _registry_prewarm_loop() does at 9:15 AM ET.
-# Fires registry.build() in a FastAPI BackgroundTask so this endpoint
-# returns 202 immediately without blocking the event loop.
 # ---------------------------------------------------------------------------
 
 async def _run_prewarm(triggered_by: str) -> None:
@@ -345,10 +342,7 @@ async def registry_prewarm(
 ):
     """
     Trigger an immediate OCC registry build in the background.
-
-    Equivalent to what the scheduled 9:15 AM ET pre-warm does.
     Returns 202 Accepted immediately; build runs asynchronously.
-    Check Railway logs for '[prewarm] Manual pre-warm complete' to confirm.
     """
     log.info("[admin] Registry pre-warm requested by %s", admin.email)
     background_tasks.add_task(_run_prewarm, admin.email)
@@ -367,38 +361,49 @@ async def registry_prewarm(
 
 @router.get("/activity-log")
 async def get_activity_log(
-    limit:       int           = Query(50,   ge=1,  le=200, description="Max rows to return (1-200)"),
-    offset:      int           = Query(0,    ge=0,          description="Pagination offset"),
-    action:      str | None    = Query(None,                description="Filter by exact action string"),
-    admin_email: str | None    = Query(None,                description="Filter by admin email"),
-    admin:       TokenData     = Depends(_require_admin),
+    limit:       int        = Query(50,   ge=1, le=200,
+                                   description="Max rows per page (1–200, default 50)"),
+    offset:      int        = Query(0,    ge=0,
+                                   description="Pagination offset"),
+    action:      str | None = Query(None,
+                                   description="Exact action filter e.g. 'tier_thresholds.update'"),
+    admin_email: str | None = Query(None,
+                                   description="Filter by admin email"),
+    since:       str | None = Query(None,
+                                   description="ISO 8601 lower bound (inclusive) e.g. '2026-04-30T00:00:00Z'"),
+    before:      str | None = Query(None,
+                                   description="ISO 8601 upper bound (inclusive) e.g. '2026-04-30T23:59:59Z'"),
+    admin:       TokenData  = Depends(_require_admin),
 ):
     """
     Return a paginated list of admin actions, newest first.
 
-    Query params:
-      - limit       (int, 1-200, default 50)
-      - offset      (int, default 0)
-      - action      (str, optional) — exact match e.g. "tier_thresholds.update"
-      - admin_email (str, optional) — filter to a specific admin
+    Filters (all optional, combinable):
+      action      — exact match on action string
+      admin_email — exact match on admin email
+      since       — ISO 8601 timestamp lower bound (gte)
+      before      — ISO 8601 timestamp upper bound (lte)
 
     Known action strings:
       demo.start | demo.stop | ingestion_config.update |
       tier_thresholds.update | registry.prewarm
     """
-    rows = await fetch_logs(
+    rows, total = await fetch_logs(
         limit=limit,
         offset=offset,
         action_filter=action,
         email_filter=admin_email,
+        since=since,
+        before=before,
     )
     log.info(
-        "[admin] activity-log fetched by %s (limit=%d offset=%d action=%s email=%s count=%d)",
-        admin.email, limit, offset, action, admin_email, len(rows),
+        "[admin] activity-log fetched by %s (limit=%d offset=%d action=%s email=%s since=%s before=%s count=%d total=%d)",
+        admin.email, limit, offset, action, admin_email, since, before, len(rows), total,
     )
     return {
         "limit":  limit,
         "offset": offset,
+        "total":  total,
         "count":  len(rows),
         "items":  rows,
     }
