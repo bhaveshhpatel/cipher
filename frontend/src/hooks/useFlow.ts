@@ -68,6 +68,10 @@ export function useFlow({
       revalidateOnFocus:     false,
       revalidateOnReconnect: true,
       keepPreviousData:      true,
+      // Prevents SWR from re-fetching page 1 when loadMore increments size.
+      // Without this, the page-1 re-fetch consumes the page-2 mock in tests
+      // and causes stale-data issues in production infinite-scroll feeds.
+      revalidateFirstPage:   false,
     });
 
   const events   = data ? data.flatMap(p => p.events) : [];
