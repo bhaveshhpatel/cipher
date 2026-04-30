@@ -9,9 +9,15 @@
  *   - Authenticated user: email is displayed in the header
  *   - Authenticated user: Sign out button is present and calls logout()
  *   - Tab navigation: all tab labels are rendered
+ *
+ * NOTE on scoping tab queries to sidebar-nav:
+ *   DashboardLayout renders both SidebarNav (desktop) and MobileTabBar (mobile).
+ *   Each tab therefore appears twice in the DOM. We scope all tab-button queries
+ *   to data-testid="sidebar-nav" via `within()` so the assertions are explicit
+ *   and unambiguous regardless of which nav surface is visible in jsdom.
  */
 import React from "react";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 // ── mock next/navigation ──────────────────────────────────────────────────────
 const mockPush    = jest.fn();
@@ -58,23 +64,23 @@ jest.mock("@/hooks/useFlowEpisodes", () => ({
 
 jest.mock("@/lib/api", () => ({
   api: {
-    getStats:       jest.fn().mockResolvedValue({ stats: null }),
-    getComposite:   jest.fn().mockResolvedValue(null),
-    getFlowEvents:  jest.fn().mockResolvedValue({ events: [] }),
+    getStats:        jest.fn().mockResolvedValue({ stats: null }),
+    getComposite:    jest.fn().mockResolvedValue(null),
+    getFlowEvents:   jest.fn().mockResolvedValue({ events: [] }),
     getFlowEpisodes: jest.fn().mockResolvedValue({ episodes: [] }),
   },
 }));
 
 // ── mock all dashboard sub-components to avoid deep render trees ──────────────
-jest.mock("@/components/CipherLogo",             () => ({ CipherLogo: () => <span>LOGO</span> }));
-jest.mock("@/components/ThemeToggle",            () => ({ ThemeToggle: () => <button>Theme</button> }));
+jest.mock("@/components/CipherLogo",               () => ({ CipherLogo: () => <span>LOGO</span> }));
+jest.mock("@/components/ThemeToggle",              () => ({ ThemeToggle: () => <button>Theme</button> }));
 jest.mock("@/components/dashboard/StreamStatsBar", () => ({ StreamStatsBar: () => null }));
-jest.mock("@/components/dashboard/FlowTable",    () => ({ FlowTable: () => <div data-testid="flow-table" /> }));
-jest.mock("@/components/dashboard/SignalFeed",   () => ({ SignalFeed: () => <div data-testid="signal-feed" /> }));
-jest.mock("@/components/dashboard/SimulationPanel", () => ({ SimulationPanel: () => <div data-testid="sim-panel" /> }));
-jest.mock("@/components/dashboard/CompositeCard",() => ({ CompositeCard: () => <div data-testid="composite-card" /> }));
-jest.mock("@/components/dashboard/SignalHistory",() => ({ SignalHistory: () => <div data-testid="signal-history" /> }));
-jest.mock("@/components/dashboard/FlowEventsTab",() => ({ FlowEventsTab: () => <div data-testid="flow-events-tab" /> }));
+jest.mock("@/components/dashboard/FlowTable",      () => ({ FlowTable: () => <div data-testid="flow-table" /> }));
+jest.mock("@/components/dashboard/SignalFeed",     () => ({ SignalFeed: () => <div data-testid="signal-feed" /> }));
+jest.mock("@/components/dashboard/SimulationPanel",() => ({ SimulationPanel: () => <div data-testid="sim-panel" /> }));
+jest.mock("@/components/dashboard/CompositeCard",  () => ({ CompositeCard: () => <div data-testid="composite-card" /> }));
+jest.mock("@/components/dashboard/SignalHistory",  () => ({ SignalHistory: () => <div data-testid="signal-history" /> }));
+jest.mock("@/components/dashboard/FlowEventsTab",  () => ({ FlowEventsTab: () => <div data-testid="flow-events-tab" /> }));
 jest.mock("@/components/dashboard/FlowEpisodesTab",() => ({ FlowEpisodesTab: () => <div data-testid="flow-episodes-tab" /> }));
 
 import DashboardPage from "../src/app/dashboard/page";
@@ -110,7 +116,6 @@ describe("DashboardPage", () => {
 
   it("[AUTH GUARD] does NOT redirect when authenticated", async () => {
     render(<DashboardPage />);
-    // Default tab is Flow Events — scoped to testid on the tab component
     await waitFor(() => expect(screen.queryByTestId("flow-events-tab")).toBeInTheDocument());
     expect(mockReplace).not.toHaveBeenCalled();
   });
@@ -135,17 +140,22 @@ describe("DashboardPage", () => {
   });
 
   // ── tab navigation ──────────────────────────────────────────────────────────
+  //
+  // DashboardLayout renders SidebarNav (desktop) AND MobileTabBar (mobile).
+  // Both are in the DOM simultaneously in jsdom (Tailwind visibility classes
+  // are not evaluated). Scope all tab-button assertions to data-testid="sidebar-nav"
+  // to avoid "Found multiple elements" errors.
 
   it("renders all tab labels", async () => {
     render(<DashboardPage />);
     await waitFor(() => {
-      // Scope all tab checks to role="button" to avoid collisions with page headings
-      expect(screen.getByRole("button", { name: /flow events/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /live signals/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /ai simulation/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /composite/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /signal history/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /episodes/i })).toBeInTheDocument();
+      const sidebar = screen.getByTestId("sidebar-nav");
+      expect(within(sidebar).getByRole("button", { name: /flow events/i })).toBeInTheDocument();
+      expect(within(sidebar).getByRole("button", { name: /live signals/i })).toBeInTheDocument();
+      expect(within(sidebar).getByRole("button", { name: /ai simulation/i })).toBeInTheDocument();
+      expect(within(sidebar).getByRole("button", { name: /composite/i })).toBeInTheDocument();
+      expect(within(sidebar).getByRole("button", { name: /signal history/i })).toBeInTheDocument();
+      expect(within(sidebar).getByRole("button", { name: /episodes/i })).toBeInTheDocument();
     });
   });
 
@@ -156,7 +166,8 @@ describe("DashboardPage", () => {
 
   it("switches to SignalFeed when Live Signals tab is clicked", async () => {
     render(<DashboardPage />);
-    const signalsTab = await screen.findByRole("button", { name: /live signals/i });
+    const sidebar = await screen.findByTestId("sidebar-nav");
+    const signalsTab = within(sidebar).getByRole("button", { name: /live signals/i });
     fireEvent.click(signalsTab);
     await waitFor(() => expect(screen.getByTestId("signal-feed")).toBeInTheDocument());
   });

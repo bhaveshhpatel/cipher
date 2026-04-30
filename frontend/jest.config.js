@@ -29,6 +29,13 @@ const config = {
     '**/?(*.)+(spec|test).(ts|tsx)',
   ],
 
+  // Exclude Next.js build output from Haste module map and test discovery.
+  // Without this, .next/standalone/package.json collides with the root
+  // package.json causing a non-deterministic Haste warning on every run.
+  modulePathIgnorePatterns: [
+    '<rootDir>/.next/',
+  ],
+
   // ---------------------------------------------------------------------------
   // Coverage collection — src only, exclude non-logic files
   // ---------------------------------------------------------------------------
