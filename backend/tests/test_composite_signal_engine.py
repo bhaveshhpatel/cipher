@@ -1,17 +1,21 @@
 """
-Unit tests for composite_signal_engine.py (Phase 3 + 5A),
+Unit tests for composite_signal_engine.py (Apex S0 — swarm removed),
 backtest_validator.py, and RepetitionEpisode/RepetitionAccumulator.
+
+Removals vs. pre-S0:
+  - build_composite_async import removed
+  - All swarm field assertions removed
+  - test_build_composite_async_* tests removed (covered by test_apex_s0_swarm_cleanup.py)
 """
 import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from signals.composite_signal_engine import (
     CompositeSignal,
     build_composite,
-    build_composite_async,
     compute_flow_score,
     volume_weighted_premium_factor,
 )
@@ -217,14 +221,14 @@ def test_build_composite_reasoning_mentions_accelerating():
     assert "Accelerating" in sig.reasoning or "accelerat" in sig.reasoning.lower()
 
 
-def test_build_composite_sync_swarm_fields_are_none():
-    sig = build_composite(_standard_ep(), _accum())
-    assert sig.swarm_direction  is None
-    assert sig.swarm_confidence is None
-    assert sig.swarm_bull_votes is None
-    assert sig.swarm_bear_votes is None
-    assert sig.swarm_hold_votes is None
-    assert sig.swarm_agents     == []
+def test_build_composite_has_no_swarm_fields():
+    """S0: CompositeSignal must carry zero swarm_* attributes."""
+    import dataclasses
+    swarm_fields = [
+        f.name for f in dataclasses.fields(CompositeSignal)
+        if f.name.startswith("swarm_")
+    ]
+    assert swarm_fields == []
 
 
 # --- backtest_validator ---
@@ -318,56 +322,3 @@ def test_is_accelerating_true_within_60s():
 def test_is_accelerating_false_span_over_60s():
     ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=False)
     assert ep.is_accelerating is False
-
-
-# --- build_composite_async ---
-
-def _swarm_result(direction="BUY", confidence=0.82, bull=6, bear=2, hold=2):
-    r = MagicMock()
-    r.direction   = direction
-    r.confidence  = confidence
-    r.bull_votes  = bull
-    r.bear_votes  = bear
-    r.hold_votes  = hold
-    r.agents      = [{"agent": f"a{i}", "vote": direction} for i in range(bull)]
-    return r
-
-
-def test_build_composite_async_populates_swarm_fields():
-    ep  = _standard_ep()
-    acc = _accum()
-
-    async def _test():
-        import signals.composite_signal_engine as cse
-        with patch.object(cse, "build_composite_async", wraps=build_composite_async):
-            with patch("simulation.ensemble_runner.run_ensemble",
-                       new_callable=AsyncMock,
-                       return_value=_swarm_result()):
-                sig = await build_composite_async(ep, acc)
-        return sig
-
-    sig = asyncio.run(_test())
-    assert isinstance(sig, CompositeSignal)
-    assert sig.swarm_direction  == "BUY"
-    assert sig.swarm_confidence == pytest.approx(0.82)
-    assert sig.swarm_bull_votes == 6
-    assert sig.swarm_bear_votes == 2
-    assert sig.swarm_hold_votes == 2
-    assert len(sig.swarm_agents) == 6
-
-
-def test_build_composite_async_swarm_failure_is_nonfatal():
-    ep  = _standard_ep()
-    acc = _accum()
-
-    async def _test():
-        with patch("simulation.ensemble_runner.run_ensemble",
-                   new_callable=AsyncMock,
-                   side_effect=RuntimeError("swarm down")):
-            sig = await build_composite_async(ep, acc)
-        return sig
-
-    sig = asyncio.run(_test())
-    assert isinstance(sig, CompositeSignal)
-    assert sig.swarm_direction is None
-    assert 0.0 <= sig.composite_score <= 1.0

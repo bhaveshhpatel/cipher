@@ -1,19 +1,20 @@
 """
-Phase 3 — test_composite_signal_extended.py
+Phase 3 — test_composite_signal_extended.py (Apex S0 — swarm removed)
 
-Extends existing test_composite_signal_engine.py with:
-  - build_composite_async(): swarm results injected correctly into CompositeSignal
-  - build_composite_async(): swarm exception is silently swallowed (non-fatal)
-  - build_composite_async(): n_agents kwarg forwarded to run_ensemble
-  - volume_weighted_premium_factor(): zero OI → 0.5, ratio capping at 1.0
-  - compute_flow_score(): various premium/accel/trade combinations
-  - build_composite(): BUY/SELL/HOLD recommendation branches
-  - get_backtest_score(): all 4 tier bias buckets, DTE bucketing, determinism
-  - RepetitionAccumulator.get_alert_level(): all 4 alert levels
+Removals vs. pre-S0:
+  - TestBuildCompositeAsync class removed entirely (build_composite_async gone)
+  - swarm_direction / swarm_confidence field assertions removed from
+    TestBuildCompositeRecommendation
+
+Covers:
+  - backtest_validator: dte buckets, score range, determinism, cache
+  - midcap_screener: is_midcap, unusual_oi_ratio, is_unusual_activity
+  - RepetitionAccumulator.get_alert_level: all 4 alert levels
+  - volume_weighted_premium_factor: zero OI, capped, empty events
+  - compute_flow_score: zero premium, high premium, accel bonus, capped
+  - build_composite: BUY/SELL/HOLD branches, reasoning, score range
 """
-import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
 from typing import List
 
 from signals.backtest_validator import get_backtest_score, _dte_bucket, _CACHE
@@ -299,77 +300,14 @@ class TestBuildCompositeRecommendation:
         sig = build_composite(ep, acc)
         assert "AAPL" in sig.reasoning
 
-    def test_swarm_fields_none_on_sync_build(self):
+    def test_no_swarm_fields_on_composite_signal(self):
+        """S0 guard: build_composite must not attach any swarm_* attributes."""
+        import dataclasses
         ep  = self._make_high_premium_episode("BULLISH")
         acc = RepetitionAccumulator()
         sig = build_composite(ep, acc)
-        assert sig.swarm_direction is None
-        assert sig.swarm_confidence is None
-
-
-# ---------------------------------------------------------------------------
-# build_composite_async swarm integration
-# ---------------------------------------------------------------------------
-class TestBuildCompositeAsync:
-
-    def _make_episode(self) -> RepetitionEpisode:
-        base_ts = datetime(2026, 4, 25, 10, 0, 0)
-        events = [
-            _make_event(premium=1_000_000, tier="WHALE", ts=base_ts + timedelta(seconds=i))
-            for i in range(3)
+        swarm_fields = [
+            f.name for f in dataclasses.fields(sig)
+            if f.name.startswith("swarm_")
         ]
-        ep = RepetitionEpisode(
-            ticker="AAPL",
-            contract_type="CALL",
-            strike=200.0,
-            expiry="2026-06-20",
-            events=events,
-            first_seen=events[0].timestamp,
-            last_seen=events[-1].timestamp,
-        )
-        return ep
-
-    def test_swarm_results_injected(self):
-        from simulation.ensemble_runner import EnsembleResult
-        mock_result = EnsembleResult(
-            ticker="AAPL",
-            direction="BUY",
-            confidence=0.833,
-            bull_votes=5,
-            bear_votes=1,
-            hold_votes=0,
-            summary="5 BUY votes.",
-            agents=[],
-        )
-        with patch("signals.composite_signal_engine.run_ensemble", new=AsyncMock(return_value=mock_result)):
-            from signals.composite_signal_engine import build_composite_async
-            ep  = self._make_episode()
-            acc = RepetitionAccumulator()
-            sig = asyncio.run(build_composite_async(ep, acc))
-        assert sig.swarm_direction == "BUY"
-        assert sig.swarm_confidence == 0.833
-        assert sig.swarm_bull_votes == 5
-        assert sig.swarm_bear_votes == 1
-        assert sig.swarm_hold_votes == 0
-
-    def test_swarm_exception_is_non_fatal(self):
-        with patch("signals.composite_signal_engine.run_ensemble", new=AsyncMock(side_effect=Exception("Groq down"))):
-            from signals.composite_signal_engine import build_composite_async
-            ep  = self._make_episode()
-            acc = RepetitionAccumulator()
-            sig = asyncio.run(build_composite_async(ep, acc))
-        assert sig.swarm_direction is None
-
-    def test_n_agents_forwarded(self):
-        from simulation.ensemble_runner import EnsembleResult
-        mock_result = EnsembleResult(
-            ticker="AAPL", direction="HOLD", confidence=0.5,
-            bull_votes=0, bear_votes=0, hold_votes=9, summary="", agents=[],
-        )
-        with patch("signals.composite_signal_engine.run_ensemble", new=AsyncMock(return_value=mock_result)) as mock_run:
-            from signals.composite_signal_engine import build_composite_async
-            ep  = self._make_episode()
-            acc = RepetitionAccumulator()
-            asyncio.run(build_composite_async(ep, acc, n_agents=9))
-            call_kwargs = mock_run.call_args[1]
-            assert call_kwargs.get("n_agents") == 9
+        assert swarm_fields == []
