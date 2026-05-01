@@ -70,14 +70,21 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **All pre-S3 gates cleared. S3 is unblocked — branch can be created and merged when ready.**
+> 🟢 **S3 merged. S4 is now unblocked — branch can be created when ready.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
+
+### Completed
+
+| Story | Description | PR | Status |
+|---|---|---|---|
+| S3 | Apex L1: `signal_gate.py` — spread gate (uniform 50%) + tier-aware premium floors per trade type; direction-agnostic; 100% branch coverage | [#43](https://github.com/bhaveshhpatel/cipher/pull/43) | ✅ |
+
+### Queued / Blocked
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S3 | Apex L1: `signal_gate.py` — filter noise before accumulation; tier-aware premium floors, spread quality, direction-aware aggression | TBD | 🟢 Ready to start |
-| S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | TBD | ⏳ Blocked |
-| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked |
+| S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | TBD | 🟢 Ready to start |
+| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked on S4 |
 
 ---
 
@@ -130,8 +137,8 @@ Exact execution order. Do not start a story until everything above it in the sam
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 2 ──────────────────────────────────────────────────────────────────────────────────
-12. 🟢  S3            — Apex L1: signal_gate.py  ← READY TO START + READY TO MERGE
-13. ⏳  S4            — Apex L2: dual-window accumulator
+12. ✅  S3            — Apex L1: signal_gate.py (PR #43)
+13. 🟢  S4            — Apex L2: dual-window accumulator  ← NEXT
 14. ⏳  S5            — Apex L4: ladder detection
 ───────────────────────────────────────────────────────────────────────────────────
 
@@ -142,7 +149,7 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
 17. ⏳  S8            — Real backtest score from flow_events
-───────────────────────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────────────────────────
 
 ── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────────
 18. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
@@ -158,11 +165,11 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 12: S3 — Apex L1 `signal_gate.py`. All pre-S3 gates are ✅ cleared. S3 is fully unblocked — ready to start AND ready to merge.
-- **"What must close before S3 merges?"** → Nothing. All 8 pre-S3 🟡 stories landed in PR #40. Gate is fully clear.
-- **"What is remaining?"** → Every row not marked ✅ — steps 12 through 23.
-- **"What blocks S3 start?"** → Nothing.
-- **"What blocks S3 merge?"** → Nothing. All pre-S3 gates cleared.
+- **"What is next?"** → Step 13: S4 — Apex L2 dual-window accumulator. S3 is ✅ merged. S4 is fully unblocked — ready to start.
+- **"What must close before S4 merges?"** → Nothing above it in the Sprint 2 gate block is open. S3 ✅ is the only gate.
+- **"What is remaining?"** → Every row not marked ✅ — steps 13 through 23.
+- **"What blocks S4 start?"** → Nothing.
+- **"What blocks S5 start?"** → S4 must merge first.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -170,5 +177,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — PR #40 merged, main CI green. All 8 pre-S3 🟡 gates marked ✅. S3 fully unblocked — no merge gate remaining.*
-*Version: 1.9*
+*Last updated: 2026-05-01 — PR #43 merged (S3 Apex L1 signal_gate.py). S3 ✅. S4 fully unblocked — no merge gate remaining.*
+*Version: 2.0*
