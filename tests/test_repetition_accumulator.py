@@ -31,7 +31,15 @@ Coverage targets (100% line + branch):
 QA scenarios exercised:
   QA-09 (accumulate/no emit), QA-10 (bypass positive), QA-11 (bypass negative),
   QA-17 (deep OTM pass), QA-18 (missing underlying fallback),
-  QA-21 (WATCH), QA-22 (ALERT), QA-23 (STRONG_SIGNAL), QA-24 (CONVICTION)
+  QA-21 (WATCH), QA-22 (ALERT at $250K boundary), QA-23 (STRONG_SIGNAL at $1M),
+  QA-24 (CONVICTION)
+
+Alert level thresholds (reconciled, panel deliberation May 1 2026):
+  CONVICTION    >= 2_000_000
+  CONVICTION    is_accelerating AND >= 500_000
+  STRONG_SIGNAL >= 1_000_000
+  ALERT         >= 250_000
+  WATCH         < 250_000
 """
 import asyncio
 import sys
@@ -1003,6 +1011,21 @@ class TestIngestShim:
 # ---------------------------------------------------------------------------
 
 class TestAlertLevel:
+    """
+    Alert level thresholds (reconciled, panel deliberation May 1 2026 — Finding 3):
+
+      CONVICTION    >= 2_000_000
+      CONVICTION    is_accelerating AND >= 500_000
+      STRONG_SIGNAL >= 1_000_000
+      ALERT         >= 250_000
+      WATCH         < 250_000
+
+    Finding 3 fix (May 1 2026): corrected two broken tests that referenced
+    pre-reconciliation thresholds from the S1 spec:
+      - test_alert_at_100k  -> test_alert_at_250k  (100K is WATCH, not ALERT)
+      - test_strong_signal_at_500k -> test_strong_signal_at_1m
+        (500K non-accelerating is ALERT, not STRONG_SIGNAL)
+    """
 
     def _ep_with_premium(self, total_premium: float, accelerating: bool = False) -> RepetitionEpisode:
         ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
@@ -1015,32 +1038,39 @@ class TestAlertLevel:
             ep.events.append(e)
         return ep
 
-    def test_watch_below_100k(self):
-        """QA-21: premium < $100K -> WATCH."""
-        acc = make_accumulator()
-        ep = self._ep_with_premium(50_000.0)
-        assert acc.get_alert_level(ep) == "WATCH"
-
-    def test_alert_at_100k(self):
-        """QA-22: premium == $100K -> ALERT (boundary)."""
+    def test_watch_below_250k(self):
+        """QA-21: premium < $250K -> WATCH."""
         acc = make_accumulator()
         ep = self._ep_with_premium(100_000.0)
-        assert acc.get_alert_level(ep) == "ALERT"
+        assert acc.get_alert_level(ep) == "WATCH"
 
-    def test_alert_between_100k_and_500k(self):
+    def test_watch_at_249k(self):
+        """$249,999 is still WATCH (boundary check below ALERT floor)."""
+        acc = make_accumulator()
+        ep = self._ep_with_premium(249_999.0)
+        assert acc.get_alert_level(ep) == "WATCH"
+
+    def test_alert_at_250k(self):
+        """QA-22: premium == $250K -> ALERT (boundary — ALERT >= 250_000)."""
         acc = make_accumulator()
         ep = self._ep_with_premium(250_000.0)
         assert acc.get_alert_level(ep) == "ALERT"
 
-    def test_strong_signal_at_500k(self):
-        """QA-23: premium == $500K -> STRONG_SIGNAL (non-accelerating)."""
+    def test_alert_between_250k_and_1m(self):
+        """$500K non-accelerating -> ALERT (below STRONG_SIGNAL floor of $1M)."""
         acc = make_accumulator()
         ep = self._ep_with_premium(500_000.0)
-        assert acc.get_alert_level(ep) == "STRONG_SIGNAL"
+        assert acc.get_alert_level(ep) == "ALERT"
 
-    def test_strong_signal_between_500k_and_2m(self):
+    def test_strong_signal_at_1m(self):
+        """QA-23: premium == $1M non-accelerating -> STRONG_SIGNAL."""
         acc = make_accumulator()
         ep = self._ep_with_premium(1_000_000.0)
+        assert acc.get_alert_level(ep) == "STRONG_SIGNAL"
+
+    def test_strong_signal_between_1m_and_2m(self):
+        acc = make_accumulator()
+        ep = self._ep_with_premium(1_500_000.0)
         assert acc.get_alert_level(ep) == "STRONG_SIGNAL"
 
     def test_conviction_at_2m(self):
@@ -1070,8 +1100,8 @@ class TestAlertLevel:
         is_accelerating=True AND premium == exactly $500K -> CONVICTION.
 
         At premium=$500K:
-          - non-accelerating -> STRONG_SIGNAL  (prem >= 500K, not accelerating)
-          - accelerating     -> CONVICTION     (is_accelerating AND prem >= 500K)
+          - non-accelerating -> ALERT         (prem >= 250K, not >= 1M)
+          - accelerating     -> CONVICTION    (is_accelerating AND prem >= 500K)
 
         These are different outcomes at the same premium. This test pins the
         boundary so any accidental reordering of the first two gate checks
@@ -1089,7 +1119,7 @@ class TestAlertLevel:
             ep.events.append(e)
         assert ep.is_accelerating is True
         assert abs(ep.total_premium - 500_000.0) < 0.01
-        # Must be CONVICTION, not STRONG_SIGNAL
+        # Must be CONVICTION, not ALERT
         assert acc.get_alert_level(ep) == "CONVICTION"
 
     def test_conviction_accelerating_below_threshold_is_alert(self):
