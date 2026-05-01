@@ -172,6 +172,49 @@ def order_side_to_direction(order_side: str, contract_type: str) -> str:
     return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
 ```
 
+```python
+class OrderDirection(NamedTuple):
+    order_side: str
+    sentiment: str
+    strong_sentiment: bool
+    execution_mechanic: str   # NEW — additive; does not change direction semantics
+
+
+_MECHANIC_MAP = {
+    ("BUY",     "CALL"): "DIRECTIONAL_LONG",
+    ("BUY",     "PUT"):  "DIRECTIONAL_SHORT",
+    ("SELL",    "PUT"):  "PASSIVE_BULLISH",
+    ("SELL",    "CALL"): "PASSIVE_BEARISH",
+    ("UNKNOWN", "CALL"): "AMBIGUOUS_LONG",
+    ("UNKNOWN", "PUT"):  "AMBIGUOUS_SHORT",
+}
+
+
+def classify_order_direction(
+    bid_ask_class: str,
+    contract_type: str,
+    is_synthetic: bool,
+) -> OrderDirection:
+    if is_synthetic:
+        fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+        mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
+        return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
+
+    if bid_ask_class in _BUY_CLASSES:
+        sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+        mechanic = _MECHANIC_MAP[("BUY", contract_type)]
+        return OrderDirection("BUY", sentiment, True, mechanic)
+
+    if bid_ask_class in _SELL_CLASSES:
+        sentiment = "BEARISH" if contract_type == "CALL" else "BULLISH"
+        mechanic = _MECHANIC_MAP[("SELL", contract_type)]
+        return OrderDirection("SELL", sentiment, True, mechanic)
+
+    fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+    mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
+    return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
+```
+
 ### Dataclass Changes
 #### `backend/parsers/options_flow_parser.py`
 Add fields to `OptionsFlowEvent`:
