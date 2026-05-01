@@ -14,6 +14,22 @@ Issue #27 — _process_tick registry lookup path (3 tests):
   - get_registry() returns None: avg_volume falls back to 1.0, tick processed
   - registry present but symbol missing from _avg_volume_by_ticker: fallback to 1.0
   - registry lookup raises: exception swallowed, tick still processed
+
+Inline fixes applied post-deliberation (2026-05-01):
+  Fix 2 — patch target comment: lazy imports inside _refresh_tier_map are
+    resolved at call time, so patching the source module is correct. If those
+    imports are ever hoisted to module level, the patch targets must change.
+  Fix 3 — removed unused `prices` and `oi` kwargs from _make_registry.
+  Fix 6 — test_symbol_missing_from_avg_volume_uses_fallback now explicitly
+    sets is_ready on the mock and documents why it is not the guard under test.
+
+Open follow-up issues from panel deliberation:
+  #30 — module-level global teardown (test isolation, High)
+  #31 — happy path must assert _tier_map_refresh_task state post-call
+  #32 — exception test must assert warning was logged
+  #33 — add test: _get_tier_map when task already running (not done)
+  #34 — add test: inner registry exception path in _process_tick
+  #35 — add test: assign_tiers returns empty dict
 """
 
 from __future__ import annotations
@@ -65,17 +81,17 @@ def _make_worker() -> Any:
 def _make_registry(
     watchlist: list[str] | None = None,
     avg_volume: dict | None = None,
-    prices: dict | None = None,
-    oi: dict | None = None,
     ready: bool = True,
 ) -> MagicMock:
-    """Build a minimal symbol registry mock."""
+    """Build a minimal symbol registry mock.
+
+    Fix 3: removed unused `prices` and `oi` parameters — neither is accessed
+    by any production code path covered in this file.
+    """
     reg = MagicMock()
     reg.is_ready.return_value = ready
     reg._watchlist = watchlist or ["AAPL", "TSLA"]
     reg._avg_volume_by_ticker = avg_volume or {"AAPL": 10_000, "TSLA": 5_000}
-    reg.stock_price = lambda ticker: (prices or {}).get(ticker, 100.0)
-    reg._oi_by_ticker = oi or {}
     return reg
 
 
@@ -90,8 +106,12 @@ class TestRefreshTierMap:
         """
         Happy path: registry ready, assign_tiers returns a valid map.
         Cache must be populated and timestamp updated.
-        Patches the lazy imports inside _refresh_tier_map via their
-        fully-qualified module paths.
+
+        Fix 2 — patch target note: _refresh_tier_map uses lazy imports
+        (inside the function body), so patching the source modules
+        services.symbol_registry and services.tier_engine is correct.
+        If those imports are ever hoisted to module level, the patch
+        targets must be updated to services.stream_worker.<name>.
         """
         import services.stream_worker as sw
 
@@ -157,6 +177,9 @@ class TestRefreshTierMap:
         """
         When assign_tiers raises, the exception must be caught and logged
         as a warning. Cache must remain unchanged (non-fatal).
+
+        Note: this test does not yet assert the warning was logged.
+        That gap is tracked in issue #32.
         """
         import services.stream_worker as sw
 
@@ -228,11 +251,19 @@ class TestProcessTickRegistryLookup:
         """
         Registry is present but the symbol is not in _avg_volume_by_ticker.
         .get() returns 0, which triggers the fallback to 1.0.
+
+        Fix 6: is_ready is set explicitly here. Note that _process_tick does
+        NOT currently gate on is_ready — avg_volume is read directly from
+        _avg_volume_by_ticker. is_ready is set so this mock accurately
+        reflects a live registry shape. If a future story adds an is_ready
+        guard to _process_tick, this test will need a companion covering
+        the not-ready branch.
         """
         w = _make_worker()
         tick = _timesale(symbol="NVDA", last=400.0, size=2, volume=10_000)
 
         reg = MagicMock()
+        reg.is_ready.return_value = True  # Fix 6: explicit, documents intent
         reg._avg_volume_by_ticker = {}  # NVDA absent
 
         with patch("services.symbol_registry.get_registry", return_value=reg):
@@ -245,6 +276,9 @@ class TestProcessTickRegistryLookup:
         """
         If get_registry() raises, the exception must be swallowed and the
         tick must still be accumulated with fallback avg_volume=1.0.
+
+        Note: this covers get_registry() itself raising. The inner path
+        where reg._avg_volume_by_ticker.get() raises is tracked in #34.
         """
         w = _make_worker()
         tick = _timesale(symbol="TSLA", last=200.0, size=3, volume=1_000)
