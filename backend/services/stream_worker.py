@@ -63,6 +63,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from config import settings
+from services.threshold_reconciliation import SymbolMetrics, reconcile
 from utils.tradier_client import get_session_token
 
 log = logging.getLogger("stream_worker")
@@ -82,13 +83,13 @@ _STALL_LOG_INTERVAL_S  = 60.0
 # ---------------------------------------------------------------------------
 # APEX-S2: tick field name constants
 # ---------------------------------------------------------------------------
-_TICK_TYPE        = "type"
-_TICK_SYMBOL      = "symbol"
-_TICK_LAST        = "last"
-_TICK_SIZE        = "size"
-_TICK_VOLUME      = "volume"
-_TICK_OI          = "open_interest"
-_TICK_TIMESTAMP   = "timestamp"
+_TICK_TYPE          = "type"
+_TICK_SYMBOL        = "symbol"
+_TICK_LAST          = "last"
+_TICK_SIZE          = "size"
+_TICK_VOLUME        = "volume"
+_TICK_OI            = "open_interest"
+_TICK_TIMESTAMP     = "timestamp"
 _TICK_TYPE_TIMESALE = "timesale"
 
 # ---------------------------------------------------------------------------
@@ -97,8 +98,8 @@ _TICK_TYPE_TIMESALE = "timesale"
 _TIER_MAP_TTL         = 300.0   # 5 minutes — matches tier_engine threshold TTL
 _RECONCILE_INTERVAL_S = 5.0     # flush window per worker
 
-_tier_map_cache: dict[str, str] = {}   # symbol → "T1" | "T2" | "T3"
-_tier_map_ts:    float          = 0.0
+_tier_map_cache: dict[str, str]        = {}    # symbol → "T1" | "T2" | "T3"
+_tier_map_ts:    float                 = 0.0
 _tier_map_refresh_task: Optional[asyncio.Task] = None
 
 
@@ -157,7 +158,6 @@ def _get_tier_map() -> dict[str, str]:
     global _tier_map_refresh_task
     now = _time.monotonic()
     if (now - _tier_map_ts) >= _TIER_MAP_TTL:
-        # Only schedule one refresh at a time
         if _tier_map_refresh_task is None or _tier_map_refresh_task.done():
             try:
                 _tier_map_refresh_task = asyncio.create_task(
@@ -165,8 +165,7 @@ def _get_tier_map() -> dict[str, str]:
                     name="tier_map_refresh",
                 )
             except RuntimeError:
-                # No running event loop (e.g. during unit tests that call
-                # _get_tier_map() synchronously) — return cache as-is.
+                # No running event loop (unit tests calling synchronously)
                 pass
     return dict(_tier_map_cache)
 
@@ -175,7 +174,7 @@ def _get_tier_map() -> dict[str, str]:
 # APEX-S2: tick → SymbolMetrics
 # ---------------------------------------------------------------------------
 
-def tick_to_metrics(tick: dict, avg_volume: float = 1.0):
+def tick_to_metrics(tick: dict, avg_volume: float = 1.0) -> Optional[SymbolMetrics]:
     """
     Convert a raw Tradier timesale tick to a SymbolMetrics instance.
 
@@ -188,13 +187,9 @@ def tick_to_metrics(tick: dict, avg_volume: float = 1.0):
     OI is a chain-level field. OI_SPIKE / OI_COLLAPSE breach types are
     suppressed in S2. S3 enrichment wires oi_delta from chain_store.
 
-    avg_volume parameter: pass symbol's average_volume from symbol_registry.
-    Falls back to 1.0 if not provided or if provided value is 0.
-    volume_ratio = tick_volume / avg_volume.
+    avg_volume: pass symbol's average_volume from symbol_registry.
+    Falls back to 1.0 if not provided or zero. volume_ratio = volume / avg_volume.
     """
-    from services.threshold_reconciliation import SymbolMetrics
-
-    # Filter: only process timesale events
     if tick.get(_TICK_TYPE) != _TICK_TYPE_TIMESALE:
         return None
 
@@ -202,7 +197,6 @@ def tick_to_metrics(tick: dict, avg_volume: float = 1.0):
     if not symbol:
         return None
 
-    # last price: required, must be positive numeric
     try:
         last = float(tick[_TICK_LAST])
     except (KeyError, TypeError, ValueError):
@@ -210,29 +204,23 @@ def tick_to_metrics(tick: dict, avg_volume: float = 1.0):
     if last <= 0:
         return None
 
-    # size: contracts traded in this tick
     try:
         size = float(tick.get(_TICK_SIZE, 0) or 0)
     except (TypeError, ValueError):
         size = 0.0
 
-    # volume: cumulative volume for the session
     try:
         volume = float(tick.get(_TICK_VOLUME, 0) or 0)
     except (TypeError, ValueError):
         volume = 0.0
 
-    # oi_delta: always 0.0 from timesale (see docstring)
+    # S2: oi_delta always 0.0 — timesale carries no OI (see docstring)
     oi_delta: float = 0.0
 
-    # premium_usd: notional per tick = last price × size
-    premium_usd = last * size
-
-    # volume_ratio: tick volume vs baseline; guard against zero baseline
-    base = avg_volume if avg_volume and avg_volume > 0 else 1.0
+    premium_usd  = last * size
+    base         = avg_volume if avg_volume and avg_volume > 0 else 1.0
     volume_ratio = volume / base
 
-    # timestamp
     try:
         ts = float(tick.get(_TICK_TIMESTAMP, 0) or 0)
     except (TypeError, ValueError):
@@ -284,25 +272,24 @@ class StreamWorker:
         shared_session_token: Optional[str] = None,
         session_lock: Optional[object] = None,   # kept for API compat, ignored
     ):
-        self.worker_id            = worker_id
-        self.symbols              = symbols
-        self.event_queue          = event_queue
-        self.startup_delay_s      = startup_delay_s
-        self._shared_token        = shared_session_token
-        self._token_expired       = False
-        self._running             = True
-        self._ticks               = 0
-        self._errors              = 0
-        self._reconnects          = 0
-        self._last_tick_at:       Optional[float] = None
-        self._session_ticks:      int   = 0
-        self._connect_at:         Optional[float] = None
-        self._ticks_at_last_stats: int  = 0
-        self._last_stats_at:      float = _time.monotonic()
-        self._last_stall_log_at:  float = 0.0
-
-        # APEX-S2: per-worker reconcile accumulator
-        self._pending: dict[str, object] = {}   # symbol → SymbolMetrics (last-write-wins)
+        self.worker_id             = worker_id
+        self.symbols               = symbols
+        self.event_queue           = event_queue
+        self.startup_delay_s       = startup_delay_s
+        self._shared_token         = shared_session_token
+        self._token_expired        = False
+        self._running              = True
+        self._ticks                = 0
+        self._errors               = 0
+        self._reconnects           = 0
+        self._last_tick_at:        Optional[float] = None
+        self._session_ticks:       int   = 0
+        self._connect_at:          Optional[float] = None
+        self._ticks_at_last_stats: int   = 0
+        self._last_stats_at:       float = _time.monotonic()
+        self._last_stall_log_at:   float = 0.0
+        # APEX-S2: per-worker reconcile accumulator (last-write-wins per symbol)
+        self._pending: dict[str, SymbolMetrics] = {}
 
     def update_symbols(self, new_symbols: list[str]):
         self.symbols = new_symbols
@@ -380,18 +367,15 @@ class StreamWorker:
             last_ago,
             queue_depth,
         )
-        self._ticks_at_last_stats  = self._ticks
-        self._last_stats_at        = now_mono
+        self._ticks_at_last_stats = self._ticks
+        self._last_stats_at       = now_mono
 
     # ------------------------------------------------------------------
     # APEX-S2: tick processing + reconcile flush
     # ------------------------------------------------------------------
 
     def _process_tick(self, raw: dict) -> None:
-        """
-        Convert raw tick to SymbolMetrics and accumulate into _pending.
-        avg_volume looked up from symbol_registry; falls back to 1.0.
-        """
+        """Convert raw tick to SymbolMetrics and accumulate into _pending."""
         symbol = raw.get(_TICK_SYMBOL, "")
         avg_volume = 1.0
         if symbol:
@@ -411,16 +395,14 @@ class StreamWorker:
 
     async def _flush_pending(self) -> None:
         """
-        Atomically drain _pending and fire a reconcile call.
-        Swap first so ticks arriving during reconcile go to the next window.
+        Atomically drain _pending and call reconcile.
+        Dict swapped before await so ticks arriving during reconcile
+        land in the next window, not the batch being processed.
         """
         if not self._pending:
             return
-
         batch, self._pending = self._pending, {}
-
         try:
-            from services.threshold_reconciliation import reconcile
             tier_map = _get_tier_map()
             await reconcile(batch, tier_map)
         except Exception as exc:
@@ -451,7 +433,6 @@ class StreamWorker:
             )
             await asyncio.sleep(self.startup_delay_s)
 
-        # APEX-S2: start the per-worker reconcile flush loop
         flush_task = asyncio.create_task(
             self._flush_loop(),
             name=f"flush-loop-{self.worker_id}",
@@ -467,7 +448,6 @@ class StreamWorker:
         try:
             while self._running:
 
-                # ---- Market hours gate ----
                 if not _is_market_hours():
                     log.info(
                         "[worker-%d] Market closed — sleeping %ds",
@@ -476,7 +456,6 @@ class StreamWorker:
                     await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
                     continue
 
-                # ---- Session token ----
                 session_token = (
                     self._shared_token
                     if self._shared_token
@@ -501,8 +480,8 @@ class StreamWorker:
                     "linebreak": "true",
                 }
 
-                self._session_ticks   = 0
-                first_line_logged     = False
+                self._session_ticks = 0
+                first_line_logged   = False
                 stats_task: Optional[asyncio.Task] = None
 
                 try:
@@ -545,9 +524,9 @@ class StreamWorker:
                                 self._inc_global_error()
 
                             else:
-                                self._connect_at       = _time.monotonic()
+                                self._connect_at          = _time.monotonic()
                                 self._ticks_at_last_stats = self._ticks
-                                self._last_stats_at    = _time.monotonic()
+                                self._last_stats_at       = _time.monotonic()
 
                                 log.info(
                                     "[worker-%d] CONNECT | symbols=%d session=%s... "
@@ -615,7 +594,7 @@ class StreamWorker:
                                             self.event_queue.qsize(),
                                         )
 
-                                    # APEX-S2: accumulate into pending batch
+                                    # APEX-S2
                                     self._process_tick(raw)
 
                                 log.info(

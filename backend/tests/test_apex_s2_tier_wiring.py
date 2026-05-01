@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -52,14 +52,13 @@ def _timesale(
     ts: float | None = None,
 ) -> dict:
     return {
-        _TICK_TYPE_TIMESALE:       _TICK_TYPE_TIMESALE,   # value matches key name
-        "type":                    _TICK_TYPE_TIMESALE,
-        _TICK_SYMBOL:              symbol,
-        _TICK_LAST:                last,
-        _TICK_SIZE:                size,
-        _TICK_VOLUME:              volume,
-        _TICK_OI:                  oi,
-        _TICK_TIMESTAMP:           ts if ts is not None else time.time(),
+        "type":        _TICK_TYPE_TIMESALE,
+        _TICK_SYMBOL:  symbol,
+        _TICK_LAST:    last,
+        _TICK_SIZE:    size,
+        _TICK_VOLUME:  volume,
+        _TICK_OI:      oi,
+        _TICK_TIMESTAMP: ts if ts is not None else time.time(),
     }
 
 
@@ -216,14 +215,13 @@ class TestTickToMetricsFields:
 # ---------------------------------------------------------------------------
 
 class TestGetTierMap:
-    def test_cold_start_returns_empty_dict(self):
+    def test_cold_start_returns_dict(self):
         import services.stream_worker as sw
         sw._tier_map_cache = {}
         sw._tier_map_ts    = 0.0
         sw._tier_map_refresh_task = None
         result = _get_tier_map()
         assert isinstance(result, dict)
-        # Cold start may be empty or have cached values — must be a dict
 
     def test_returns_copy_not_reference(self):
         import services.stream_worker as sw
@@ -237,13 +235,11 @@ class TestGetTierMap:
     async def test_stale_map_schedules_background_task(self):
         import services.stream_worker as sw
         sw._tier_map_cache = {}
-        sw._tier_map_ts    = 0.0   # stale
+        sw._tier_map_ts    = 0.0
         sw._tier_map_refresh_task = None
 
-        _get_tier_map()  # should schedule refresh task
-        # Give the event loop a tick to register the task
+        _get_tier_map()
         await asyncio.sleep(0)
-        # Task should have been created (may already be done if registry is None)
         assert sw._tier_map_refresh_task is not None
 
 
@@ -283,8 +279,8 @@ class TestProcessTick:
 
     def test_invalid_tick_does_not_raise(self):
         w = _make_worker()
-        w._process_tick({})           # empty dict
-        w._process_tick({"type": "timesale"})  # missing symbol
+        w._process_tick({})
+        w._process_tick({"type": "timesale"})
         assert len(w._pending) == 0
 
 
@@ -297,7 +293,6 @@ class TestFlushPending:
     async def test_empty_pending_is_noop(self):
         w = _make_worker()
         w._pending = {}
-        # Should not raise, should not call reconcile
         with patch("services.stream_worker.reconcile") as mock_rec:
             await w._flush_pending()
             mock_rec.assert_not_called()
@@ -340,16 +335,13 @@ class TestFlushPending:
         w._pending = {"AAPL": tick_to_metrics(_timesale(symbol="AAPL"))}
 
         async def fake_reconcile(batch, tier_map):
-            # Simulate a new tick arriving mid-reconcile
             w._process_tick(_timesale(symbol="TSLA"))
 
         with patch("services.stream_worker.reconcile", side_effect=fake_reconcile):
             with patch("services.stream_worker._get_tier_map", return_value={}):
                 await w._flush_pending()
 
-        # TSLA arrived during reconcile — must be in the new pending, not lost
         assert "TSLA" in w._pending
-        # AAPL was in the drained batch — not re-added
         assert "AAPL" not in w._pending
 
     @pytest.mark.asyncio
@@ -362,7 +354,6 @@ class TestFlushPending:
 
         with patch("services.stream_worker.reconcile", side_effect=boom):
             with patch("services.stream_worker._get_tier_map", return_value={}):
-                # Must not raise — logged as warning only
                 await w._flush_pending()
 
 
@@ -390,8 +381,7 @@ class TestFlushLoop:
         with patch("services.stream_worker.reconcile", AsyncMock()):
             with patch("services.stream_worker._get_tier_map", return_value={}):
                 with patch("asyncio.create_task", side_effect=mock_create_task):
-                    # Run one iteration of the flush loop
-                    w._running = False  # stop after first sleep
+                    w._running = False
                     loop_task = asyncio.create_task(w._flush_loop())
                     await asyncio.sleep(0.01)
                     loop_task.cancel()
@@ -408,27 +398,22 @@ class TestFlushLoop:
 class TestIntegration:
     @pytest.mark.asyncio
     async def test_volume_surge_breach_fires_end_to_end(self):
-        """
-        End-to-end: a tick with volume >> avg_volume should produce a
-        VOLUME_SURGE breach when flushed through reconcile.
-        """
         from services.threshold_reconciliation import (
             ThresholdReconciler,
             BreachType,
             _TIER_THRESHOLDS,
         )
 
-        thres = _TIER_THRESHOLDS["T1"]
-        # volume_ratio = volume / avg_volume; set ratio well above T1 threshold
-        avg_vol   = 10_000.0
-        tick_vol  = int(avg_vol * (thres["volume_ratio"] + 2))
+        thres    = _TIER_THRESHOLDS["T1"]
+        avg_vol  = 10_000.0
+        tick_vol = int(avg_vol * (thres["volume_ratio"] + 2))
 
         tick = _timesale(symbol="AAPL", last=150.0, size=10, volume=tick_vol)
         m    = tick_to_metrics(tick, avg_volume=avg_vol)
         assert m is not None
         assert m.volume_ratio > thres["volume_ratio"]
 
-        r = ThresholdReconciler()
+        r      = ThresholdReconciler()
         result = await r.reconcile({"AAPL": m}, {"AAPL": "T1"})
         assert result.breach_count >= 1
         assert any(b.breach_type == BreachType.VOLUME_SURGE for b in result.breaches)
@@ -441,24 +426,20 @@ class TestIntegration:
             _TIER_THRESHOLDS,
         )
 
-        thres     = _TIER_THRESHOLDS["T1"]
-        # premium_usd = last × size; set above T1 threshold
-        size      = int(thres["premium_usd"] + 1)
-        tick      = _timesale(symbol="TSLA", last=1.0, size=size)
-        m         = tick_to_metrics(tick)
+        thres = _TIER_THRESHOLDS["T1"]
+        size  = int(thres["premium_usd"] + 1)
+        tick  = _timesale(symbol="TSLA", last=1.0, size=size)
+        m     = tick_to_metrics(tick)
         assert m is not None
         assert m.premium_usd > thres["premium_usd"]
 
-        r = ThresholdReconciler()
+        r      = ThresholdReconciler()
         result = await r.reconcile({"TSLA": m}, {"TSLA": "T1"})
         assert result.breach_count >= 1
         assert any(b.breach_type == BreachType.PREMIUM_FLOOD for b in result.breaches)
 
     @pytest.mark.asyncio
     async def test_cold_start_tier_map_falls_back_to_T3(self):
-        """
-        Cold start: tier_map={} → reconciler assigns T3 to unknown symbols.
-        """
         from services.threshold_reconciliation import (
             ThresholdReconciler,
             _TIER_THRESHOLDS,
@@ -474,15 +455,11 @@ class TestIntegration:
         assert m is not None
 
         r      = ThresholdReconciler()
-        result = await r.reconcile({"UNKNWN": m}, {})  # empty tier_map
+        result = await r.reconcile({"UNKNWN": m}, {})
         assert result.breaches[0].tier == "T3"
 
     @pytest.mark.asyncio
     async def test_oi_breach_types_suppressed_in_s2(self):
-        """
-        S2 contract: oi_delta=0.0 on every tick → OI_SPIKE and OI_COLLAPSE
-        must never fire from timesale-derived metrics.
-        """
         from services.threshold_reconciliation import (
             ThresholdReconciler,
             BreachType,
@@ -491,7 +468,7 @@ class TestIntegration:
         tick   = _timesale(symbol="AAPL", last=150.0, size=1, oi=999_999)
         m      = tick_to_metrics(tick)
         assert m is not None
-        assert m.oi_delta == 0.0  # always 0 regardless of tick oi field
+        assert m.oi_delta == 0.0
 
         r      = ThresholdReconciler()
         result = await r.reconcile({"AAPL": m}, {"AAPL": "T1"})
