@@ -165,8 +165,10 @@ DELIBERATION
 ☐  All small fixes applied inline on the PR
 ☐  All new-work findings filed as GitHub Issues AND added to SPRINT.md
 ☐  Zero unresolved findings remaining
+☐  Display the detailed deliberation that happend and seek approval for the merge
 
 MERGE
+☐  Include this checklist in the comment of the PR with the status on each and every step marked in the checkbox
 ☐  Squash merge into main
 
 POST-MERGE
