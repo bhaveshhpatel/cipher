@@ -7,6 +7,7 @@ Coverage targets (100% line + branch):
   - DTE-adjusted premium floors (all 4 DTE buckets x T1 and T2/T3)
   - OTM classification: ATM (<=2%), standard OTM (2-12%), deep OTM (>12%)
   - Deep OTM multiplier gate: reject below, pass above
+  - deep_otm_multiplier=1.0: reject-then-pass pair pins the > 1.0 branch (S4-POST-1)
   - underlying_price == 0 fallback (no OTM classification, standard floor)
   - Sweep bypass: len(ep.events)==1 AND SWEEP AND premium >= threshold
   - Sweep bypass negative: len(ep.events)==2, bypass does NOT fire
@@ -24,6 +25,7 @@ Coverage targets (100% line + branch):
   - _get_episode_min_premium: empty dte_premium_tiers fallback
   - _get_episode_min_premium: DTE exceeds all explicit keys
   - _get_episode_min_premium: unknown ticker defaults to T1 strict (Finding 2)
+  - _get_episode_min_premium: _max_dte_key=None guard (S4-POST-2)
   - _is_single_whale_sweep: all False branches
   - Window pruning
   - _DictEventWrapper allocated at module level (not per-tick)
@@ -529,6 +531,184 @@ class TestGetEpisodeMinPremium:
 
 
 # ---------------------------------------------------------------------------
+# S4-POST-2 (#46) — _max_dte_key=None guard
+# ---------------------------------------------------------------------------
+
+class TestMaxDteKeyNoneGuard:
+    """
+    S4-POST-2 (#46, panel deliberation May 1 2026):
+
+    When dte_premium_tiers={}, _max_dte_key is set to None in __init__.
+    _get_episode_min_premium must hit the early-return
+    `if not self.dte_premium_tiers: return self.min_premium`
+    before it ever reaches `self.dte_premium_tiers[self._max_dte_key]`.
+
+    If that guard is removed or reordered, the overflow path would execute
+    `self.dte_premium_tiers[None]`, raising TypeError. These tests pin
+    both the structural invariant (_max_dte_key is None when tiers={}) and
+    the runtime behaviour (no exception, correct fallback value returned).
+    """
+
+    def test_max_dte_key_is_none_when_tiers_empty(self):
+        """
+        Structural pin: _max_dte_key must be None when dte_premium_tiers={}.
+        This is the BE-1 precompute invariant — if __init__ ever changes to
+        compute a non-None value for an empty dict, this test catches it
+        before the runtime guard is exercised.
+        """
+        acc = RepetitionAccumulator(dte_premium_tiers={}, min_premium=99_000)
+        assert acc._max_dte_key is None, (
+            "_max_dte_key must be None when dte_premium_tiers={} — S4-POST-2"
+        )
+
+    def test_call_with_none_max_dte_key_returns_min_premium_no_exception(self):
+        """
+        Runtime pin: calling _get_episode_min_premium when _max_dte_key=None
+        must return self.min_premium without raising TypeError.
+
+        The early-return guard `if not self.dte_premium_tiers: return self.min_premium`
+        prevents the code from ever reaching
+        `self.dte_premium_tiers[self._max_dte_key]` (which would be
+        `{}[None]` -> TypeError). This test will fail with TypeError if
+        that guard is removed or moved below the overflow path.
+        """
+        acc = RepetitionAccumulator(dte_premium_tiers={}, min_premium=77_000)
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
+        e = MagicMock()
+        e.dte = 9999  # would trigger overflow path if tiers were non-empty
+        ep.events = [e]
+        result = acc._get_episode_min_premium(ep)
+        assert result == 77_000, (
+            "Expected min_premium fallback (77_000) when dte_premium_tiers={}"
+        )
+
+    def test_ingest_tick_with_empty_tiers_uses_min_premium_no_exception(self):
+        """
+        End-to-end: an accumulator constructed with dte_premium_tiers={}
+        must complete ingest_tick without raising, using min_premium as floor.
+        This is the production scenario for a stream worker that omits tiers
+        during cold-start and relies on the min_premium fallback.
+        """
+        acc = RepetitionAccumulator(
+            min_trades=1,
+            min_premium=50_000,
+            dte_premium_tiers={},
+        )
+        ev = make_event(premium=100_000.0, dte=9999, underlying_price=0.0)
+        result = run(acc.ingest_tick(ev))
+        assert result is not None, (
+            "ingest_tick must succeed and return an episode when tiers={} "
+            "and premium exceeds min_premium"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S4-POST-1 (#45) — deep_otm_multiplier=1.0 reject-then-pass pair
+# ---------------------------------------------------------------------------
+
+class TestDeepOtmMultiplierEqualsOne:
+    """
+    S4-POST-1 (#45, panel deliberation May 1 2026):
+
+    The existing `test_deep_otm_multiplier_1_no_extra_floor` only proves the
+    pass path. It does not prove that the branch was reached because of the
+    multiplier being 1.0 — the premium used ($26K) already clears the standard
+    floor ($25K), so the test would pass even if _classify_otm or the `> 1.0`
+    guard were broken.
+
+    The correct pinning test is a reject-then-pass pair where:
+      - The same contract is DEEP_OTM (>12% OTM)
+      - The premium sits BETWEEN the standard floor and the 1.5x multiplied floor
+        (i.e., standard_floor < premium < standard_floor * 1.5)
+      - With multiplier=1.5  -> rejected  (premium < multiplied floor)
+      - With multiplier=1.0  -> accepted  (multiplier > 1.0 guard is False,
+                                            so DEEP_OTM branch is not entered,
+                                            standard floor applies)
+
+    The ONLY variable that changes between the two tests is deep_otm_multiplier.
+    Everything else — ticker, tier, DTE bucket, strike, underlying_price,
+    and premium — is identical. This isolates the branch decision.
+
+    Setup:
+      ticker=TSLA, tier=2, DTE=5 -> T2 standard floor = $25_000
+      strike=180, underlying_price=150 -> OTM% = 20% -> DEEP_OTM
+      premium = $30_000
+        With multiplier=1.5: multiplied floor = 25_000 * 1.5 = $37_500
+                             $30K < $37.5K -> None  (rejected)
+        With multiplier=1.0: `> 1.0` guard is False -> DEEP_OTM branch skipped
+                             standard floor $25K applies
+                             $30K >= $25K -> episode returned  (accepted)
+    """
+
+    # Shared parameters — must be identical in both tests to isolate the branch.
+    _TICKER         = "TSLA"
+    _TIER_MAP       = {"TSLA": 2}
+    _DTE            = 5          # T2 floor for DTE<=7: $25_000
+    _STANDARD_FLOOR = 25_000     # T2, DTE bucket 0-7
+    _STRIKE         = 180.0      # 20% OTM on underlying $150 -> DEEP_OTM
+    _UNDERLYING     = 150.0
+    _PREMIUM        = 30_000.0   # standard_floor < premium < standard_floor * 1.5
+                                 # 25_000 < 30_000 < 37_500
+
+    def test_deep_otm_rejected_at_1_5x_multiplier(self):
+        """
+        Proves the DEEP_OTM branch IS entered when multiplier > 1.0.
+        premium=$30K < multiplied_floor=$37.5K -> None.
+        """
+        acc = RepetitionAccumulator(
+            min_trades=1,
+            min_sweeps=0,
+            min_premium=1,           # disable flat floor; DTE tiers are the gate
+            dte_premium_tiers=dict(_DEFAULT_DTE_PREMIUM_TIERS),
+            deep_otm_multiplier=1.5,
+            tier_map=self._TIER_MAP,
+        )
+        ev = make_event(
+            ticker=self._TICKER,
+            premium=self._PREMIUM,
+            dte=self._DTE,
+            strike=self._STRIKE,
+            underlying_price=self._UNDERLYING,
+        )
+        result = run(acc.ingest_tick(ev))
+        assert result is None, (
+            f"Expected None: premium=${self._PREMIUM:,.0f} < "
+            f"multiplied_floor=${self._STANDARD_FLOOR * 1.5:,.0f} "
+            f"(standard_floor={self._STANDARD_FLOOR} * 1.5x multiplier)"
+        )
+
+    def test_deep_otm_passes_at_1_0x_multiplier(self):
+        """
+        Proves the DEEP_OTM branch is NOT entered when multiplier == 1.0.
+        The `> 1.0` guard short-circuits to the standard floor path.
+        premium=$30K >= standard_floor=$25K -> episode returned.
+
+        Only deep_otm_multiplier differs from the reject test above.
+        """
+        acc = RepetitionAccumulator(
+            min_trades=1,
+            min_sweeps=0,
+            min_premium=1,           # disable flat floor; DTE tiers are the gate
+            dte_premium_tiers=dict(_DEFAULT_DTE_PREMIUM_TIERS),
+            deep_otm_multiplier=1.0,  # <-- only change from reject test
+            tier_map=self._TIER_MAP,
+        )
+        ev = make_event(
+            ticker=self._TICKER,
+            premium=self._PREMIUM,
+            dte=self._DTE,
+            strike=self._STRIKE,
+            underlying_price=self._UNDERLYING,
+        )
+        result = run(acc.ingest_tick(ev))
+        assert result is not None, (
+            f"Expected episode: multiplier=1.0 skips DEEP_OTM branch; "
+            f"standard_floor=${self._STANDARD_FLOOR:,.0f} applies; "
+            f"premium=${self._PREMIUM:,.0f} >= floor"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sweep bypass tests
 # ---------------------------------------------------------------------------
 
@@ -752,8 +932,8 @@ class TestIngestTick:
         deep_otm_multiplier=1.0 -> the `> 1.0` guard in ingest_tick is False,
         so the DEEP_OTM branch is NOT entered regardless of OTM band.
         Standard floor applies. T2, 5 DTE floor=$25K, premium=$26K -> passes.
-        NOTE: QA-1 (filed as S4-POST-1) tracks a stricter reject-then-pass
-        pair that explicitly verifies which branch was taken.
+        See TestDeepOtmMultiplierEqualsOne for the full reject-then-pass pair
+        that explicitly pins which branch was taken (S4-POST-1 / #45).
         """
         acc = make_accumulator(
             min_trades=1,
