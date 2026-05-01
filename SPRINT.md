@@ -29,7 +29,6 @@
 | 🟢 | Queued — no current blocker |
 | ⏳ | Blocked — waiting on gates above |
 | ⚪ | Low priority / quality / anytime |
-| 🔀 | PR open — awaiting deliberation + merge |
 
 ---
 
@@ -44,6 +43,7 @@
 | S2 | Parser + detector layer fixes — direction inference, `order_side_classifier`, tier wiring into stream worker hot path | [#21](https://github.com/bhaveshhpatel/cipher/pull/21) | ✅ |
 | S2-POST-5 | `_refresh_tier_map` test coverage — 5 tests | [#26](https://github.com/bhaveshhpatel/cipher/issues/26) | ✅ |
 | S2-POST-6 | `_process_tick` registry avg_volume lookup path — 3 tests | [#27](https://github.com/bhaveshhpatel/cipher/issues/27) | ✅ |
+| S2-POST-inline | Inline fixes 2, 3, 6 — patch comment, dead params, `is_ready` mock | [#36](https://github.com/bhaveshhpatel/cipher/pull/36) | ✅ |
 
 ### Pre-S3 Hard Gates — ALL must merge before S3 starts 🔴
 
@@ -53,7 +53,7 @@
 | S2.5 | Supabase migration: `order_side` (BUY/SELL/UNKNOWN + index) + `strong_sentiment` (bool) on `flow_events` | [#29](https://github.com/bhaveshhpatel/cipher/issues/29) | 🔴 Open |
 | S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#20](https://github.com/bhaveshhpatel/cipher/issues/20) | 🔴 Open |
 
-> **Note:** S2-POST-8 added as a hard gate because module-level state pollution can cause silent false-passes in the test session, undermining the reliability of all subsequent gate tests.
+> **Note:** S2-POST-8 is a hard gate because module-level state pollution can cause silent false-passes in the test session, undermining the reliability of all subsequent gate tests.
 
 ### Must Close Before S3 Merges (can work in parallel with S3 branch) 🟡
 
@@ -67,12 +67,6 @@
 | S2-POST-11 | Add test: `_get_tier_map` when refresh task is already running (not done) | [#33](https://github.com/bhaveshhpatel/cipher/issues/33) | 🟡 Open |
 | S2-POST-12 | Add test: inner registry exception path in `_process_tick` (`_avg_volume_by_ticker.get()` raises) | [#34](https://github.com/bhaveshhpatel/cipher/issues/34) | 🟡 Open |
 | S2-POST-13 | Add test: `assign_tiers` returns empty dict `{}` in `_refresh_tier_map` | [#35](https://github.com/bhaveshhpatel/cipher/issues/35) | 🟡 Open |
-
-### In Review 🔀
-
-| Story | Description | PR | Status |
-|---|---|---|---|
-| S2-POST-inline | Inline fixes 2, 3, 6 — patch comment, remove dead `_make_registry` params, add `is_ready` to mock | [#36](https://github.com/bhaveshhpatel/cipher/pull/36) | 🔀 Awaiting deliberation |
 
 ### Low Priority / Anytime ⚪
 
@@ -135,9 +129,9 @@ Exact execution order. Do not start a story until everything above it in the sam
 2.  ✅  S1            — Alert level reconciliation + emit-cache flush (PR #19)
 3.  ✅  S2            — Parser + detector + stream worker tier wiring (PR #21)
 4.  ✅  #26+#27       — _refresh_tier_map + _process_tick test coverage
+5.  ✅  #36           — Inline fixes 2/3/6 (PR #36, panel approved, merged)
 
 ── PRE-S3 HARD GATES (all must merge before S3 starts) ──────────────────
-5.  🔀  #36           — Inline fixes 2/3/6 (PR open, awaiting deliberation)
 6.  🔴  #30           — S2-POST-8: test isolation / module global teardown [HIGH]
 7.  🔴  #29           — S2.5: order_side + strong_sentiment DB migration
 8.  🔴  #20           — S0.5: Delete ensemble_runner.py
@@ -181,9 +175,9 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 5: [PR #36](https://github.com/bhaveshhpatel/cipher/pull/36) — deliberate and merge inline fixes, then step 6: [#30](https://github.com/bhaveshhpatel/cipher/issues/30) test isolation.
-- **"What is remaining?"** → Every row not marked ✅ — steps 5 through 26.
-- **"What blocks S3?"** → Steps 5–8 (#36, #30, #29, #20).
+- **"What is next?"** → Step 6: [#30](https://github.com/bhaveshhpatel/cipher/issues/30) — S2-POST-8 test isolation / module global teardown.
+- **"What is remaining?"** → Every row not marked ✅ — steps 6 through 26.
+- **"What blocks S3?"** → Steps 6–8 (#30, #29, #20).
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -191,5 +185,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — Retroactive panel deliberation on test_apex_s2_tier_coverage.py. Issues #30–35 filed. PR #36 open for inline fixes.*
-*Version: 1.3*
+*Last updated: 2026-05-01 — PR #36 panel approved and merged. Next: #30 test isolation.*
+*Version: 1.4*
