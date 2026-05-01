@@ -16,14 +16,17 @@ Coverage targets (100% line + branch):
   - dominant_direction: SELL PUT resolves to REPEAT_BUY (S2 invariant)
   - dominant_direction: tie -> REPEAT_BUY (>= comparison)
   - Alert levels: WATCH, ALERT, STRONG_SIGNAL, CONVICTION (normal + accelerating)
+  - CONVICTION accelerating boundary: is_accelerating=True AND premium==500K exactly
   - get_signal cooldown gate
   - ingest shim backward-compat
   - cleanup_expired
   - set_tier_map
   - _get_episode_min_premium: empty dte_premium_tiers fallback
   - _get_episode_min_premium: DTE exceeds all explicit keys
+  - _get_episode_min_premium: unknown ticker defaults to T1 strict (Finding 2)
   - _is_single_whale_sweep: all False branches
   - Window pruning
+  - _DictEventWrapper allocated at module level (not per-tick)
 
 QA scenarios exercised:
   QA-09 (accumulate/no emit), QA-10 (bypass positive), QA-11 (bypass negative),
@@ -47,6 +50,7 @@ from signals.repetition_accumulator import (
     RepetitionAccumulator,
     RepetitionEpisode,
     _DEFAULT_DTE_PREMIUM_TIERS,
+    _DictEventWrapper,
     order_side_to_direction,
 )
 
@@ -57,7 +61,9 @@ from signals.repetition_accumulator import (
 
 def run(coro):
     """Run a coroutine synchronously in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run() preferred over deprecated get_event_loop().run_until_complete()
+    # (Finding 6 — deprecated in Python 3.10+)
+    return asyncio.run(coro)
 
 
 def _ts(offset_seconds: int = 0) -> datetime:
@@ -115,6 +121,93 @@ def make_accumulator(**kwargs) -> RepetitionAccumulator:
     )
     defaults.update(kwargs)
     return RepetitionAccumulator(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 — otm_band param removed
+# ---------------------------------------------------------------------------
+
+class TestOtmBandParamRemoved:
+
+    def test_constructor_does_not_accept_otm_band(self):
+        """
+        Finding 1 (panel deliberation May 1 2026): `otm_band` was stored but
+        never consumed by _classify_otm. Removed from constructor to prevent
+        callers from believing the bands are configurable when they are not.
+        """
+        import inspect
+        sig = inspect.signature(RepetitionAccumulator.__init__)
+        assert "otm_band" not in sig.parameters, (
+            "otm_band should have been removed — it was a dead stored attribute"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 — unknown-ticker default tier is T1 (strict)
+# ---------------------------------------------------------------------------
+
+class TestUnknownTierDefaultIsT1Strict:
+    """
+    Panel deliberation May 1 2026 — Finding 2:
+    Unknown tickers must default to T1 (strict) floor, not T2/T3 (lenient).
+    A ticker absent from the registry should not get easier qualification
+    than a known large-cap. set_tier_map() assigns correct tiers once ready.
+    """
+
+    def test_unknown_ticker_defaults_to_t1_floor(self):
+        acc = make_accumulator(tier_map={})  # AAPL not in map
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
+        e = MagicMock()
+        e.dte = 20  # 8-30 bucket: T1=$500K, T2/T3=$100K
+        ep.events = [e]
+        # Should return T1 strict floor ($500K), not T2/T3 lenient ($100K)
+        assert acc._get_episode_min_premium(ep) == 500_000, (
+            "Unknown ticker must use T1 (strict) floor — Finding 2 deliberation"
+        )
+
+    def test_known_t2_ticker_still_uses_t2_floor(self):
+        """Sanity: explicitly T2 tickers still get T2/T3 floor after the fix."""
+        acc = make_accumulator(tier_map={"TSLA": 2})
+        ep = RepetitionEpisode(ticker="TSLA", contract_type="CALL")
+        e = MagicMock()
+        e.dte = 20
+        ep.events = [e]
+        assert acc._get_episode_min_premium(ep) == 100_000
+
+
+# ---------------------------------------------------------------------------
+# Finding 7 — _DictEventWrapper is a module-level class
+# ---------------------------------------------------------------------------
+
+class TestDictEventWrapperModuleLevel:
+
+    def test_dict_event_wrapper_is_module_level_class(self):
+        """
+        Finding 7: _DictEventWrapper must be defined at module level,
+        not inside ingest_tick, so it is not re-created on every hot-path call.
+        """
+        import signals.repetition_accumulator as mod
+        assert hasattr(mod, "_DictEventWrapper"), (
+            "_DictEventWrapper should be a module-level class (Finding 7)"
+        )
+        assert isinstance(mod._DictEventWrapper, type)
+
+    def test_dict_event_wrapper_attrs(self):
+        d = {
+            "premium": 123.0,
+            "trade_type": "SWEEP",
+            "dte": 15,
+            "underlying_price": 150.0,
+            "order_side": "BUY",
+            "contract_type": "CALL",
+        }
+        w = _DictEventWrapper(d)
+        assert w.premium == 123.0
+        assert w.trade_type == "SWEEP"
+        assert w.dte == 15
+        assert w.underlying_price == 150.0
+        assert w.order_side == "BUY"
+        assert w.contract_type == "CALL"
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +373,6 @@ class TestOTMClassification:
 
     def test_standard_otm_just_above_2pct(self):
         """2.01% OTM -> STANDARD_OTM (not ATM)."""
-        # 150 * 0.0201 = 3.015; strike = 153.015 -> 2.01% OTM
         result = RepetitionAccumulator._classify_otm(153.016, 150.0)
         assert result == "STANDARD_OTM"
 
@@ -376,11 +468,19 @@ class TestGetEpisodeMinPremium:
         ep = self._ep("MSTR", 20)
         assert acc._get_episode_min_premium(ep) == 100_000
 
-    def test_unknown_tier_defaults_to_t2_t3_column(self):
-        """Ticker not in tier_map -> defaults to tier 3 (T2/T3 column)."""
-        acc = make_accumulator(tier_map={})  # no entry for UNKNOWN
-        ep = self._ep("UNKNOWN", 20)
-        assert acc._get_episode_min_premium(ep) == 100_000
+    def test_unknown_tier_defaults_to_t1_strict(
+        self,
+    ):
+        """
+        Finding 2 (panel deliberation May 1 2026):
+        Ticker not in tier_map -> defaults to tier 1 (T1 strict floor).
+        Prevents low-float noise from qualifying more easily than known large-caps
+        during registry warmup.
+        """
+        acc = make_accumulator(tier_map={})  # UNKNOWN not in map
+        ep = self._ep("UNKNOWN", 20)  # 8-30 bucket
+        # T1 strict floor = $500K, T2/T3 lenient floor = $100K
+        assert acc._get_episode_min_premium(ep) == 500_000
 
     def test_dte_at_exact_bucket_boundary_7(self):
         """DTE==7 should match the 7-bucket (inclusive upper bound)."""
@@ -655,28 +755,39 @@ class TestIngestTick:
 
     def test_min_sweeps_gate_rejects_when_not_enough_sweeps(self):
         """
-        min_sweeps=2, episode has 3 events but only 1 SWEEP -> rejected.
+        Finding 4 (panel deliberation May 1 2026) — isolated sweep-count gate test:
+        min_sweeps=2, min_trades=1, min_premium disabled.
+        Ingest exactly 1 SWEEP + 1 BLOCK = 2 events, only 1 SWEEP.
+        The ONLY failing gate is sweep_count (1) < min_sweeps (2).
+        Result must be None specifically because sweep gate fires.
         """
-        acc = make_accumulator(
+        acc = RepetitionAccumulator(
             min_trades=1,
             min_sweeps=2,
             sweep_bypass_premium=0.0,
             dte_premium_tiers={},
             min_premium=50_000,
         )
-        for trade_type in ["BLOCK", "SINGLE", "SWEEP"]:
-            ev = make_event(premium=100_000.0, dte=15,
-                            underlying_price=150.0, trade_type=trade_type)
-            run(acc.ingest_tick(ev))
-        # Only 1 SWEEP but min_sweeps=2
-        key = list(acc._episodes.keys())[0]
-        ep = acc._episodes[key]
-        # Manually check: sweep_count == 1 < 2 -> should have returned None
-        # Verify by re-running ingest with the accumulator state
-        ev_sweep = make_event(premium=100_000.0, dte=15,
-                              underlying_price=150.0, trade_type="BLOCK")
-        result = run(acc.ingest_tick(ev_sweep))
-        assert result is None
+        # Event 1: SWEEP, premium=$100K — passes min_trades(1), min_premium(50K)
+        ev_sweep = make_event(
+            ticker="AAPL", contract_type="CALL", strike=150.0, expiry="2026-06-20",
+            premium=100_000.0, dte=15, underlying_price=150.0, trade_type="SWEEP"
+        )
+        run(acc.ingest_tick(ev_sweep))
+
+        # Event 2: BLOCK, same contract key — still only 1 SWEEP in episode
+        ev_block = make_event(
+            ticker="AAPL", contract_type="CALL", strike=150.0, expiry="2026-06-20",
+            premium=100_000.0, dte=15, underlying_price=150.0, trade_type="BLOCK"
+        )
+        result = run(acc.ingest_tick(ev_block))
+
+        # trade_count=2 >= min_trades(1) ✓
+        # total_premium=$200K >= min_premium($50K) ✓
+        # sweep_count=1 < min_sweeps(2) -> None  <- this is the only failing gate
+        assert result is None, (
+            "sweep_count=1 should fail min_sweeps=2; no other gate should cause None here"
+        )
 
     def test_min_sweeps_gate_passes_when_enough_sweeps(self):
         """min_sweeps=2, episode has 2 SWEEP events -> passes."""
@@ -943,8 +1054,35 @@ class TestAlertLevel:
         """
         acc = make_accumulator()
         ep = self._ep_with_premium(600_000.0, accelerating=True)
-        # Verify is_accelerating is True (3 events within 60s)
         assert ep.is_accelerating is True
+        assert acc.get_alert_level(ep) == "CONVICTION"
+
+    def test_conviction_accelerating_at_exactly_500k(self):
+        """
+        Finding 3 (panel deliberation May 1 2026):
+        is_accelerating=True AND premium == exactly $500K -> CONVICTION.
+
+        At premium=$500K:
+          - non-accelerating -> STRONG_SIGNAL  (prem >= 500K, not accelerating)
+          - accelerating     -> CONVICTION     (is_accelerating AND prem >= 500K)
+
+        These are different outcomes at the same premium. This test pins the
+        boundary so any accidental reordering of the first two gate checks
+        is caught immediately.
+        """
+        acc = make_accumulator()
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
+        # 3 events each at $500K/3 = $166,666.67, spaced 10s apart -> is_accelerating=True
+        # total_premium = exactly $500K
+        each = 500_000.0 / 3
+        for i in range(3):
+            e = MagicMock()
+            e.premium   = each
+            e.timestamp = _ts(i * 10)  # 0s, 10s, 20s -> span=20s <= 60s
+            ep.events.append(e)
+        assert ep.is_accelerating is True
+        assert abs(ep.total_premium - 500_000.0) < 0.01
+        # Must be CONVICTION, not STRONG_SIGNAL
         assert acc.get_alert_level(ep) == "CONVICTION"
 
     def test_conviction_accelerating_threshold_is_500k(self):
@@ -953,7 +1091,6 @@ class TestAlertLevel:
         Must fall through to STRONG_SIGNAL check.
         """
         acc = make_accumulator()
-        # Need 3 events in <60s for is_accelerating, but total < 500K
         ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
         for i in range(3):
             e = MagicMock()
@@ -1003,7 +1140,6 @@ class TestCleanupExpired:
         run(acc.ingest_tick(ev))
         assert len(acc._episodes) == 1
 
-        # Manually set last_seen to old time so cleanup fires
         key = list(acc._episodes.keys())[0]
         acc._episodes[key].last_seen = old_ts
 

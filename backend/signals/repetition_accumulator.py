@@ -45,19 +45,9 @@ from typing import Optional, List, Dict, Tuple
 log = logging.getLogger("repetition_accumulator")
 
 # ---------------------------------------------------------------------------
-# Import order_side_to_direction for dominant_direction.
-# Graceful fallback if the S2 classifier has not landed yet.
+# Import order_side_to_direction for dominant_direction (S2 — always present).
 # ---------------------------------------------------------------------------
-try:
-    from parsers.order_side_classifier import order_side_to_direction  # pragma: no cover
-except ImportError:
-    def order_side_to_direction(order_side: str, contract_type: str) -> str:  # pragma: no cover
-        """Fallback: mirrors the S2 spec logic."""
-        if order_side == "BUY":
-            return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
-        if order_side == "SELL":
-            return "REPEAT_BUY" if contract_type == "PUT" else "REPEAT_SELL"
-        return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
+from parsers.order_side_classifier import order_side_to_direction
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +60,28 @@ _DEFAULT_DTE_PREMIUM_TIERS: Dict[int, Tuple[float, float]] = {
     90:   (1_000_000, 500_000),
     9999: (2_000_000, 1_000_000),
 }
+
+
+# ---------------------------------------------------------------------------
+# _DictEventWrapper — module-level; wraps raw dict ticks so attribute access
+# works identically to OptionsFlowEvent objects throughout the accumulator.
+# Defined here (not inside ingest_tick) to avoid a new class object being
+# allocated on every dict-type tick in the hot path. (Finding 7)
+# ---------------------------------------------------------------------------
+class _DictEventWrapper:
+    __slots__ = (
+        "premium", "timestamp", "trade_type", "dte",
+        "underlying_price", "order_side", "contract_type",
+    )
+
+    def __init__(self, d: dict) -> None:
+        self.premium          = d.get("premium", 0.0)
+        self.timestamp        = d.get("timestamp") or datetime.now(timezone.utc)
+        self.trade_type       = d.get("trade_type", "")
+        self.dte              = d.get("dte", 0)
+        self.underlying_price = d.get("underlying_price", 0.0)
+        self.order_side       = d.get("order_side", "UNKNOWN")
+        self.contract_type    = d.get("contract_type", "")
 
 
 @dataclass
@@ -167,13 +179,6 @@ class RepetitionAccumulator:
                               objects in this episode, NOT fill_count within a
                               single tick. (Issue 7 resolution — Architect +
                               Principal Engineer deliberation, April 30 2026)
-        otm_band:             (min_otm_pct, max_otm_pct) inclusive tuple defining
-                              the OTM range that qualifies at standard premium floor.
-                              Events outside this band but within 0–2% are ATM
-                              (standard floor). Events > max_otm_pct trigger
-                              deep_otm_multiplier when > 12%.
-                              Kept for backward-compat constructor signature;
-                              OTM classification is now fully range-based.
         deep_otm_multiplier:  Multiplier applied to the effective_min_premium when
                               OTM% > 12%. Default 1.5.
         dte_premium_tiers:    Dict[int, Tuple[float, float]] mapping DTE upper-bound
@@ -181,6 +186,14 @@ class RepetitionAccumulator:
                               min_premium is used as fallback.
         tier_map:             Optional dict mapping ticker -> tier (1, 2, or 3).
                               Injected by the stream worker after registry readiness.
+
+    NOTE — `otm_band` param removed (Finding 1, panel deliberation May 1 2026):
+        The original constructor accepted `otm_band: Tuple[float, float]` but
+        `_classify_otm` is a static method that hardcodes the 0.02 / 0.12
+        thresholds per the spec (Issue 6 resolution). `otm_band` was stored
+        but never read — a silent no-op that would mislead callers into thinking
+        the bands were configurable. Removed. If band configurability is needed
+        in a future sprint, _classify_otm must be updated to consume it.
     """
 
     def __init__(
@@ -194,7 +207,6 @@ class RepetitionAccumulator:
         # S4 params
         min_sweeps:           int   = 0,
         sweep_bypass_premium: float = 0.0,
-        otm_band:             Tuple[float, float] = (0.00, 0.25),
         deep_otm_multiplier:  float = 1.5,
         dte_premium_tiers:    Optional[Dict[int, Tuple[float, float]]] = None,
         tier_map:             Optional[Dict[str, int]] = None,
@@ -208,7 +220,6 @@ class RepetitionAccumulator:
         # S4
         self.min_sweeps           = min_sweeps
         self.sweep_bypass_premium = sweep_bypass_premium
-        self.otm_band             = otm_band
         self.deep_otm_multiplier  = deep_otm_multiplier
         self.dte_premium_tiers    = dte_premium_tiers or {}
         self._tier_map            = tier_map or {}
@@ -270,9 +281,16 @@ class RepetitionAccumulator:
         Falls back to self.min_premium when dte_premium_tiers is empty.
 
         Tier lookup:
-          tier == 1  -> column 0 (T1 floor)
-          tier != 1  -> column 1 (T2/T3 floor)
-        Unknown tiers default to T2/T3 (column 1) — least-permissive safe default.
+          tier == 1  -> column 0 (T1 floor — higher, stricter)
+          tier != 1  -> column 1 (T2/T3 floor — lower, more permissive)
+
+        Unknown-tier default: T1 (strict) — column 0.
+        Deliberation decision (panel, May 1 2026 — Finding 2):
+          Unknown tickers have no registry-validated volume or tier.
+          Defaulting to T2/T3 (lenient) would let low-float noise stocks
+          qualify more easily than large-caps during registry warmup.
+          T1 (strict) is the safer production default; set_tier_map() is
+          called once registry is ready to assign the correct tier.
         """
         if not self.dte_premium_tiers:
             return self.min_premium
@@ -281,7 +299,7 @@ class RepetitionAccumulator:
         if ep.events:
             latest_dte = int(getattr(ep.events[-1], "dte", 0) or 0)
 
-        tier = self._tier_map.get(ep.ticker, 3)
+        tier = self._tier_map.get(ep.ticker, 1)  # default T1 (strict)
         col  = 0 if tier == 1 else 1
 
         for dte_max in sorted(self.dte_premium_tiers):
@@ -312,6 +330,10 @@ class RepetitionAccumulator:
         Engineer deliberation April 30 2026. Expressed as fraction of underlying,
         not absolute dollar, so it works correctly across all underlying price
         regimes including high-price names like NVDA at $900+.)
+
+        Thresholds (0.02 and 0.12) are intentionally hardcoded per spec.
+        They are NOT configurable via constructor — see Finding 1 note in
+        RepetitionAccumulator docstring.
         """
         if underlying_price <= 0:
             return "UNKNOWN"
@@ -394,20 +416,10 @@ class RepetitionAccumulator:
                 ev_ts = datetime.fromtimestamp(ev_ts, tz=timezone.utc)
             cutoff = ev_ts - self.window
 
-            # Wrap dict events so .premium / .timestamp / .trade_type attributes work
-            if isinstance(ev, dict):
-                class _W:
-                    def __init__(self, d):
-                        self.premium         = d.get("premium", 0.0)
-                        self.timestamp       = d.get("timestamp") or datetime.now(timezone.utc)
-                        self.trade_type      = d.get("trade_type", "")
-                        self.dte             = d.get("dte", 0)
-                        self.underlying_price = d.get("underlying_price", 0.0)
-                        self.order_side      = d.get("order_side", "UNKNOWN")
-                        self.contract_type   = d.get("contract_type", "")
-                ev_wrapped = _W(ev)
-            else:
-                ev_wrapped = ev
+            # Wrap dict events so .premium / .timestamp / .trade_type attributes work.
+            # _DictEventWrapper is defined at module level (not inline here) to avoid
+            # allocating a new class object on every hot-path dict tick. (Finding 7)
+            ev_wrapped = _DictEventWrapper(ev) if isinstance(ev, dict) else ev
 
             ep.events = [
                 e for e in ep.events
