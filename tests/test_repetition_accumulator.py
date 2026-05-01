@@ -500,8 +500,9 @@ class TestGetEpisodeMinPremium:
 
     def test_dte_exceeds_all_explicit_keys_uses_highest(self):
         """
-        DTE > 9999 (impossible in practice but tests the overflow branch).
-        The accumulator uses the highest-key bucket.
+        DTE > max custom tier key — tests the overflow branch and the
+        A-1 log.debug path. Uses a custom tiers dict with max key=30.
+        _max_dte_key=30 is precomputed in __init__ (BE-1 fix).
         """
         custom_tiers = {10: (100_000, 50_000), 30: (500_000, 200_000)}
         acc = RepetitionAccumulator(
@@ -739,7 +740,13 @@ class TestIngestTick:
         assert result is not None
 
     def test_deep_otm_multiplier_1_no_extra_floor(self):
-        """deep_otm_multiplier=1.0 -> multiplier effectively disabled; standard floor only."""
+        """
+        deep_otm_multiplier=1.0 -> the `> 1.0` guard in ingest_tick is False,
+        so the DEEP_OTM branch is NOT entered regardless of OTM band.
+        Standard floor applies. T2, 5 DTE floor=$25K, premium=$26K -> passes.
+        NOTE: QA-1 (filed as S4-POST-1) tracks a stricter reject-then-pass
+        pair that explicitly verifies which branch was taken.
+        """
         acc = make_accumulator(
             min_trades=1,
             min_sweeps=0,
@@ -1085,10 +1092,12 @@ class TestAlertLevel:
         # Must be CONVICTION, not STRONG_SIGNAL
         assert acc.get_alert_level(ep) == "CONVICTION"
 
-    def test_conviction_accelerating_threshold_is_500k(self):
+    def test_conviction_accelerating_below_threshold_is_alert(self):
         """
-        is_accelerating=True but premium < $500K -> NOT CONVICTION.
-        Must fall through to STRONG_SIGNAL check.
+        QA-3 rename (deliberation May 1 2026): was test_conviction_accelerating_threshold_is_500k.
+        Renamed to accurately describe what is being tested:
+        is_accelerating=True but premium < $500K (total=$300K) -> ALERT, not CONVICTION.
+        The threshold check prevents the accelerating path from firing below $500K.
         """
         acc = make_accumulator()
         ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")

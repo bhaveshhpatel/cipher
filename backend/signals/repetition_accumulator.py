@@ -67,6 +67,10 @@ _DEFAULT_DTE_PREMIUM_TIERS: Dict[int, Tuple[float, float]] = {
 # works identically to OptionsFlowEvent objects throughout the accumulator.
 # Defined here (not inside ingest_tick) to avoid a new class object being
 # allocated on every dict-type tick in the hot path. (Finding 7)
+#
+# NOTE: `d` must be a plain dict. Passing None or a non-dict will raise
+# AttributeError on .get(). Callers are responsible for the isinstance check
+# (performed in ingest_tick) before constructing this wrapper. (BE-2)
 # ---------------------------------------------------------------------------
 class _DictEventWrapper:
     __slots__ = (
@@ -224,6 +228,14 @@ class RepetitionAccumulator:
         self.dte_premium_tiers    = dte_premium_tiers or {}
         self._tier_map            = tier_map or {}
 
+        # BE-1 (deliberation May 1 2026): cache max DTE key at construction time
+        # so _get_episode_min_premium never calls max() on every hot-path tick.
+        # dte_premium_tiers is immutable after __init__ (set_tier_map only updates
+        # _tier_map, not tiers). Safe to precompute once here.
+        self._max_dte_key: Optional[int] = (
+            max(self.dte_premium_tiers) if self.dte_premium_tiers else None
+        )
+
         self._episodes: dict = {}
         self._locks:    dict = {}
 
@@ -306,9 +318,21 @@ class RepetitionAccumulator:
             if latest_dte <= dte_max:
                 return self.dte_premium_tiers[dte_max][col]
 
-        # latest_dte exceeds all explicit keys — use the highest-key bucket
-        highest_key = max(self.dte_premium_tiers)
-        return self.dte_premium_tiers[highest_key][col]
+        # A-1 (deliberation May 1 2026): DTE exceeds all explicit tier keys.
+        # This branch fires only when a custom dte_premium_tiers dict is injected
+        # with a lower max key than the observed DTE. With _DEFAULT_DTE_PREMIUM_TIERS
+        # (max key 9999) this is unreachable in practice. Log at debug so that
+        # misconfigured custom tiers are observable in production without spam.
+        log.debug(
+            "_get_episode_min_premium: DTE %d exceeds all tier keys %s for %s; "
+            "falling back to highest-key bucket (key=%d). "
+            "Check dte_premium_tiers config if this appears unexpectedly.",
+            latest_dte,
+            sorted(self.dte_premium_tiers),
+            ep.ticker,
+            self._max_dte_key,
+        )
+        return self.dte_premium_tiers[self._max_dte_key][col]  # type: ignore[index]
 
     # ------------------------------------------------------------------ #
     # S4: OTM classification
