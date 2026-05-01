@@ -46,12 +46,7 @@
 | S2-POST-inline | Inline fixes 2, 3, 6 — patch comment, dead params, `is_ready` mock | [#36](https://github.com/bhaveshhpatel/cipher/pull/36) | ✅ |
 | S2-POST-8 | Test isolation — `reset_tier_map_globals` autouse fixture; saves/restores `_tier_map_cache`, `_tier_map_ts`, `_tier_map_refresh_task` | [#37](https://github.com/bhaveshhpatel/cipher/pull/37) | ✅ |
 | S2.5 | DB migration: `order_side` (BUY/SELL/UNKNOWN + index) + `strong_sentiment` (bool) + `execution_mechanic` (6-value enum) on `flow_events` | [#38](https://github.com/bhaveshhpatel/cipher/pull/38) | ✅ |
-
-### Pre-S3 Hard Gates — ALL must merge before S3 starts 🔴
-
-| Story | Description | Issue | Status |
-|---|---|---|---|
-| S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#20](https://github.com/bhaveshhpatel/cipher/issues/20) | 🔴 Open |
+| S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#39](https://github.com/bhaveshhpatel/cipher/pull/39) | ✅ |
 
 ### Must Close Before S3 Merges (can work in parallel with S3 branch) 🟡
 
@@ -77,12 +72,13 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> ⏳ **Blocked until the remaining Sprint 1 🔴 gate is merged (#20).**
+> 🟢 **Hard gate cleared. S3 branch can now be created.**
+> 🟡 The 8 🟡 stories above must still merge before S3 merges into main.
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S3 | Apex L1: `signal_gate.py` — filter noise before accumulation; tier-aware premium floors, spread quality, direction-aware aggression | TBD | ⏳ Blocked |
+| S3 | Apex L1: `signal_gate.py` — filter noise before accumulation; tier-aware premium floors, spread quality, direction-aware aggression | TBD | 🟢 Ready to start |
 | S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | TBD | ⏳ Blocked |
 | S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked |
 
@@ -122,7 +118,7 @@
 Exact execution order. Do not start a story until everything above it in the same gate block is merged.
 
 ```
-── SPRINT 1 ─────────────────────────────────────────────────────────────────────────
+── SPRINT 1 ────────────────────────────────────────────────────────────────────────────────
 1.  ✅  S0            — Swarm cleanup (PR #18)
 2.  ✅  S1            — Alert level reconciliation + emit-cache flush (PR #19)
 3.  ✅  S2            — Parser + detector + stream worker tier wiring (PR #21)
@@ -130,12 +126,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 5.  ✅  #36           — Inline fixes 2/3/6 (PR #36)
 6.  ✅  #30           — S2-POST-8: test isolation / module global teardown (PR #37)
 7.  ✅  #29           — S2.5: order_side + strong_sentiment + execution_mechanic DB migration (PR #38)
-
-── PRE-S3 HARD GATE (must merge before S3 starts) ────────────────────────────
-8.  🔴  #20           — S0.5: Delete ensemble_runner.py
+8.  ✅  #20           — S0.5: Delete ensemble_runner.py (PR #39)
 ─────────────────────────────────────────────────────────────────────────────────
 
-── BEFORE S3 MERGES (parallel with S3 branch) ────────────────────────────────────
+── BEFORE S3 MERGES (parallel with S3 branch) ──────────────────────────────────────
 9.  🟡  #24           — Tier map refresh race fix
 10. 🟡  #25           — CancelledError re-raise in StreamWorker.run()
 11. 🟡  #23           — Flush loop done callback
@@ -146,22 +140,22 @@ Exact execution order. Do not start a story until everything above it in the sam
 16. 🟡  #35           — S2-POST-13: assign_tiers returns empty dict
 ─────────────────────────────────────────────────────────────────────────────────
 
-── SPRINT 2 ─────────────────────────────────────────────────────────────────────────
-17. ⏳  S3            — Apex L1: signal_gate.py
+── SPRINT 2 ────────────────────────────────────────────────────────────────────────────────
+17. 🟢  S3            — Apex L1: signal_gate.py  ← READY TO START
 18. ⏳  S4            — Apex L2: dual-window accumulator
 19. ⏳  S5            — Apex L4: ladder detection
 ─────────────────────────────────────────────────────────────────────────────────
 
-── SPRINT 3 ─────────────────────────────────────────────────────────────────────────
+── SPRINT 3 ────────────────────────────────────────────────────────────────────────────────
 20. ⏳  S6            — Apex L3: composite formula overhaul
 21. ⏳  S7            — Tiered swarm + circuit breaker
 ─────────────────────────────────────────────────────────────────────────────────
 
-── FUTURE SPRINT ───────────────────────────────────────────────────────────────────
+── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
 22. ⏳  S8            — Real backtest score from flow_events
-───────────────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────────────────
 
-── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────
+── PARALLEL / ANYTIME ──────────────────────────────────────────────────────────────────
 23. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
 24. 🟢  C8            — Decouple persist/signal tier (#2)
 25. ⚪  #22           — Hoist get_registry import
@@ -173,9 +167,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 8: [#20](https://github.com/bhaveshhpatel/cipher/issues/20) — S0.5: Delete `simulation/ensemble_runner.py`.
-- **"What is remaining?"** → Every row not marked ✅ — steps 8 through 26.
-- **"What blocks S3?"** → Step 8 (#20) is the sole remaining hard gate.
+- **"What is next?"** → Step 17: S3 — Apex L1 `signal_gate.py`. The pre-S3 hard gate is cleared. S3 branch can be created now.
+- **"What must close before S3 merges?"** → Steps 9–16 (#23, #24, #25, #31, #32, #33, #34, #35) — 8 🟡 stories. Work them in parallel with the S3 branch.
+- **"What is remaining?"** → Every row not marked ✅ — steps 9 through 26.
+- **"What blocks S3 start?"** → Nothing. All hard gates are cleared (✅).
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -183,5 +178,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S2.5 PR #38 panel deliberated and merged. 1 hard gate remaining before S3 (#20).*  
-*Version: 1.6*
+*Last updated: 2026-05-01 — S0.5 PR #39 merged. Pre-S3 hard gate cleared. S3 is unblocked.*  
+*Version: 1.7*
