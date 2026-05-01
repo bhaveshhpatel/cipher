@@ -3,6 +3,7 @@
 # =============================================================================
 # DISABLED — all automatic triggers removed. Restore on:/pull_request block
 # to re-enable. Jobs and steps are fully preserved.
+# apex/** branches are intentionally excluded from all CI triggers.
 # =============================================================================
 name: Regression Gate
 

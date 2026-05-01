@@ -2,6 +2,7 @@ name: Pre-Market Registry Build
 
 # DISABLED — schedule removed. Restore on:/schedule block to re-enable.
 # workflow_dispatch retained for manual testing.
+# apex/** branches are intentionally excluded from all CI triggers.
 on:
   workflow_dispatch:
 

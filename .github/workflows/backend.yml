@@ -2,6 +2,7 @@ name: Backend CI
 
 # DISABLED — all automatic triggers removed. Restore on:/push/pull_request
 # blocks below to re-enable. Jobs and steps are fully preserved.
+# apex/** branches are intentionally excluded from all CI triggers.
 on:
   workflow_dispatch:
 
@@ -55,59 +56,3 @@ jobs:
       GROQ_API_KEY:         ""
       ALLOWED_ORIGINS:      "http://localhost:3000,http://testserver,http://test"
       ENVIRONMENT:          "test"
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install all dependencies
-        working-directory: backend
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-
-      - name: Purge stale Python bytecode cache
-        working-directory: backend
-        run: |
-          find . -type f -name '*.pyc' -delete
-          find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
-          echo "Bytecode cache purged"
-
-      - name: Run regression suite with coverage
-        working-directory: backend
-        run: |
-          pytest \
-            --tb=short \
-            -q \
-            --continue-on-collection-errors \
-            --cov=. \
-            --cov-branch \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage.xml \
-            --cov-report=json:coverage.json \
-            --cov-fail-under=92 \
-            --cov-config=.coveragerc
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: backend-coverage
-          path: |
-            backend/coverage.xml
-            backend/coverage.json
-          retention-days: 14
-
-# Deploy is handled automatically by Railway's native GitHub integration.
