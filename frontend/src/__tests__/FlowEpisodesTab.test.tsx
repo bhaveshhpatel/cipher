@@ -90,7 +90,7 @@ test('shows empty state when episodes is empty', () => {
 
 test('renders all 9 column headers', () => {
   render(<FlowEpisodesTab episodes={[makeEpisode()]} loading={false} error={null} onFiltersChange={noop} />);
-  ['Ticker', 'Direction', 'Contract Type', 'Alert Level', 'Trades', 'Total Premium', 'ΔPremium', 'Duration', 'Started']
+  ['Ticker', 'Direction', 'Contract Type', 'Alert Level', 'Trades', 'Total Premium', '\u0394Premium', 'Duration', 'Started']
     .forEach(h => expect(screen.getByText(h)).toBeInTheDocument());
 });
 
@@ -109,6 +109,7 @@ test('renders ticker in row', () => {
 
 test('BULLISH direction has badge-green class', () => {
   render(<FlowEpisodesTab episodes={[makeEpisode({ direction: 'BULLISH' })]} loading={false} error={null} onFiltersChange={noop} />);
+  // getAllByText guards against filter-bar vs row-badge ambiguity
   const badge = screen.getAllByText('BULLISH').find(el => el.classList.contains('badge-green'));
   expect(badge).toBeDefined();
 });
@@ -189,6 +190,7 @@ test('duration >= 60s shows minutes format', () => {
 });
 
 // ── filter interactions ───────────────────────────────────────────────────────
+// events=[] ensures only filter-bar elements are rendered; no row-badge ambiguity.
 
 test('clicking BULLISH calls onFiltersChange with direction=BULLISH', () => {
   render(<FlowEpisodesTab episodes={[]} loading={false} error={null} onFiltersChange={noop} />);

@@ -45,7 +45,7 @@
  */
 
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import { FlowEventsTab } from '../components/dashboard/FlowEventsTab';
 import type { FlowEventRaw } from '../lib/api';
 
@@ -164,6 +164,7 @@ test('PUT contract_type has badge-red class', () => {
 
 test('BULLISH sentiment renders badge-green', () => {
   render(<FlowEventsTab events={[makeEvent({ sentiment: 'BULLISH' })]} loading={false} error={null} onFiltersChange={noop} />);
+  // Use getAllByText + class check to avoid ambiguity with filter button vs table badge
   const badge = screen.getAllByText('BULLISH').find(el => el.classList.contains('badge-green'));
   expect(badge).toBeDefined();
 });
@@ -201,9 +202,12 @@ test('no flags rendered when both are false', () => {
 });
 
 // ── filter interactions ───────────────────────────────────────────────────────
+// Use getAllByText + [0] for labels that appear in both the filter bar and the
+// table body (e.g. "BULLISH" appears as a filter button AND as a row badge).
 
 test('clicking BULLISH filter calls onFiltersChange with sentiment=BULLISH', () => {
   render(<FlowEventsTab events={[]} loading={false} error={null} onFiltersChange={noop} />);
+  // No event rows rendered, so BULLISH can only appear as a filter button — getByText is safe here.
   fireEvent.click(screen.getByText('BULLISH'));
   expect(noop).toHaveBeenCalledWith(expect.objectContaining({ sentiment: 'BULLISH' }));
 });
@@ -216,6 +220,7 @@ test('clicking BEARISH filter calls onFiltersChange with sentiment=BEARISH', () 
 
 test('clicking PUT filter calls onFiltersChange with contract_type=PUT', () => {
   render(<FlowEventsTab events={[]} loading={false} error={null} onFiltersChange={noop} />);
+  // getAllByText guards against multiple matches; [0] = filter bar button
   const putBtn = screen.getAllByText('PUT')[0];
   fireEvent.click(putBtn);
   expect(noop).toHaveBeenCalledWith(expect.objectContaining({ contract_type: 'PUT' }));
