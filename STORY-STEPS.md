@@ -163,8 +163,8 @@ DELIBERATION
 ☐  Senior Architect reviews diff — scope, completeness, architecture + planning deliberations
 ☐  Principal Backend Engineer reviews diff — correctness, safety, engineering spec alignment
 ☐  Lead QA reviews diff — test coverage per QA path coverage spec, constraint tests, regression gaps
-☐  All small fixes applied inline on the PR
-☐  All new-work findings filed as GitHub Issues AND added to SPRINT.md
+☐  For all small fixes do the changes and apply it inline on the PR
+☐  Add all new-work findings filed as GitHub Issues AND added to SPRINT.md
 ☐  Zero unresolved findings remaining
 ☐  Display the detailed deliberation that happend and wait on approval for the merge
 
