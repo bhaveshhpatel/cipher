@@ -19,7 +19,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from typing import Dict, List
 
@@ -167,15 +166,12 @@ class TestMetricsComplete:
         m = _metrics(volume_ratio=float("nan"))
         assert ThresholdReconciler._metrics_complete(m) is False
 
-    def test_nan_skipped_in_reconcile(self):
+    @pytest.mark.asyncio
+    async def test_nan_skipped_in_reconcile(self):
         """End-to-end: NaN metric must increment skipped, not checked."""
         m = _metrics(oi_delta=float("nan"))
-
-        async def _run():
-            r = ThresholdReconciler()
-            return await r.reconcile({"AAPL": m}, {"AAPL": "T1"})
-
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        r = ThresholdReconciler()
+        result = await r.reconcile({"AAPL": m}, {"AAPL": "T1"})
         assert result.skipped == 1
         assert result.checked == 0
 
@@ -378,8 +374,6 @@ class TestReconcile:
             "AAPL": _metrics("AAPL", oi_delta=thres["oi_spike_pct"] + 0.05),
             "TSLA": _metrics("TSLA", oi_delta=thres["oi_spike_pct"] + 0.05),
         }
-        # Both symbols breach; emit_fn raises on every call.
-        # reconciler must process both and return breach_count == 2.
         result = await self.r.reconcile(metrics, {"AAPL": "T1", "TSLA": "T1"}, emit_fn=boom)
         assert result.breach_count == 2
         assert result.checked == 2
