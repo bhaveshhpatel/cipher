@@ -1,0 +1,735 @@
+# Cipher Apex Signal Pipeline — Engineering Spec
+
+## Document Role
+This is the engineering-spec version of the Apex story and sprint plan. It is intended to be pushed into the repo as an implementation-grade planning document, with concrete code examples, explicit acceptance criteria, and test expectations for each story.
+
+## Non-Negotiable Delivery Rules
+- New files must have 100% line and branch coverage.
+- Every changed branch in an existing file must be covered by tests.
+- The full regression suite must pass before merge.
+- Direction invariants are CI gate tests and cannot regress.
+- No swarm code may exist outside the new Apex-scoped implementation.
+- Fake backtest values must not influence production composite scoring.
+
+## Execution Order
+1. S0 — Swarm cleanup.
+2. S1 — Alert threshold reconciliation and emit-cache flush.
+3. S2 — Parser and detector layer fixes.
+4. S2.5 — DB migration for direction fields.
+5. S3 — Apex L1 signal gate.
+6. S4 — Apex L2 dual-window accumulator.
+7. S5 — Apex L4 ladder detection.
+8. S6 — Apex L3 composite overhaul and hot-path corrections.
+9. S7 — Tiered swarm and circuit breaker, only after stream worker review.
+10. S8 — Real backtest score, future sprint.
+
+---
+
+## S0 — Swarm Cleanup
+**Type:** prerequisite cleanup  
+**Status:** must land first
+
+### Objective
+Remove dead ensemble/swarm infrastructure from the current ingestion/composite layer so the codebase has one deterministic composite path before the new Apex-only swarm is introduced later.
+
+### Files
+- `backend/signals/composite_signal_engine.py`
+- `backend/simulation/ensemble_runner.py`
+- Any tests mocking the old async swarm path
+
+### Concrete Changes
+Remove all old async swarm hooks from `composite_signal_engine.py`.
+
+#### Before
+```python
+from simulation.ensemble_runner import run_ensemble as _original_run_ensemble
+
+run_ensemble = _original_run_ensemble
+
+async def build_composite_async(ep, accumulator):
+    result = await run_ensemble(ep, accumulator)
+    ...
+```
+
+#### After
+```python
+# build_composite() remains the only active path.
+# No run_ensemble import.
+# No async composite path.
+```
+
+### Implementation Notes
+- Do not delete `simulation/ensemble_runner.py` until grep confirms no tests or utilities still import it.
+- First mark it deprecated with a top-level comment if references still exist.
+- Remove patch-compatibility comments and alias wiring.
+
+### Acceptance Criteria
+- `build_composite_async()` no longer exists.
+- No `run_ensemble` import remains in `composite_signal_engine.py`.
+- Tests pass without import failures.
+
+### Tests
+- `tests/test_composite_signal_engine.py`
+- Grep/migration validation for old mock targets
+
+---
+
+## S1 — Alert Level Threshold Reconciliation + Emit Cache Flush
+**Type:** bug fix  
+**Depends on:** S0
+
+### Objective
+Bring alert-level thresholds into line with the approved Apex bands and prevent stale debounce state from causing bad re-emits or false de-escalations after deploy.
+
+### Files
+- `backend/signals/repetition_accumulator.py`
+- Stream startup path where `_signal_last_emit` can be reset
+
+### Concrete Changes
+
+#### Threshold example
+```python
+def get_alert_level(self, ep: RepetitionEpisode) -> str:
+    prem = ep.total_premium
+    if prem >= 2_000_000:
+        return "CONVICTION"
+    if prem >= 500_000:
+        return "STRONG_SIGNAL"
+    if prem >= 100_000:
+        return "ALERT"
+    return "WATCH"
+```
+
+#### Cache flush example
+```python
+# on startup / stream boot boundary
+_signal_last_emit.clear()
+```
+
+### Acceptance Criteria
+- Thresholds match the approved architecture bands.
+- Startup clears stale signal emit state.
+- Historical rows are not backfilled.
+
+### Tests
+```python
+def test_alert_level_boundaries():
+    ...
+
+def test_signal_emit_cache_flushed_on_startup():
+    ...
+```
+
+---
+
+## S2 — Parser + Detector Layer Fixes
+**Type:** feature + bug fix  
+**Depends on:** S0
+
+### Objective
+Replace naive contract-type sentiment with intelligent execution-aware direction inference, preserve SELL PUT = BULLISH end to end, and improve whale/shark classification fidelity.
+
+### New File
+#### `backend/parsers/order_side_classifier.py`
+```python
+from typing import NamedTuple
+
+_BUY_CLASSES = frozenset({"ABOVE_ASK", "AT_ASK"})
+_SELL_CLASSES = frozenset({"AT_BID", "BELOW_BID"})
+
+class OrderDirection(NamedTuple):
+    order_side: str
+    sentiment: str
+    strong_sentiment: bool
+
+
+def classify_order_direction(
+    bid_ask_class: str,
+    contract_type: str,
+    is_synthetic: bool,
+) -> OrderDirection:
+    if is_synthetic:
+        fallback = "BULLISH" if contract_type == "CALL" else "BEARISH"
+        return OrderDirection("UNKNOWN", fallback, False)
+
+    if bid_ask_class in _BUY_CLASSES:
+        sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+        return OrderDirection("BUY", sentiment, True)
+
+    if bid_ask_class in _SELL_CLASSES:
+        sentiment = "BEARISH" if contract_type == "CALL" else "BULLISH"
+        return OrderDirection("SELL", sentiment, True)
+
+    fallback = "BULLISH" if contract_type == "CALL" else "BEARISH"
+    return OrderDirection("UNKNOWN", fallback, False)
+
+
+def order_side_to_direction(order_side: str, contract_type: str) -> str:
+    if order_side == "BUY":
+        return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
+    if order_side == "SELL":
+        return "REPEAT_BUY" if contract_type == "PUT" else "REPEAT_SELL"
+    return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
+```
+
+### Dataclass Changes
+#### `backend/parsers/options_flow_parser.py`
+Add fields to `OptionsFlowEvent`:
+```python
+order_side: str = "UNKNOWN"
+strong_sentiment: bool = False
+daily_volume: int = 0
+```
+
+### Bid/Ask Classifier Changes
+#### `backend/parsers/bid_ask_classifier.py`
+```python
+def is_sell_aggressive(trade_type: str) -> bool:
+    return trade_type in ("AT_BID", "BELOW_BID")
+```
+
+### Trade Type Detector Changes
+#### `backend/parsers/trade_type_detector.py`
+```python
+def detect_trade_type(size, premium, exchange_cnt, fill_count):
+    if exchange_cnt >= 3 and fill_count >= 3:
+        return "SWEEP"
+    if (size >= 500 and fill_count == 1) or (premium >= 500_000 and exchange_cnt <= 2):
+        return "BLOCK"
+    if fill_count >= 5 and size >= 100:
+        return "SPLIT"
+    return "SINGLE"
+
+
+def is_golden_sweep(trade_type, premium, is_directionally_aggressive):
+    if trade_type == "SWEEP" and is_directionally_aggressive and premium >= 500_000:
+        return True
+    if trade_type == "BLOCK" and premium >= 1_000_000:
+        return True
+    return False
+```
+
+### Parser Changes
+#### First-pass direction inference
+```python
+ba_class = classify_bid_ask(fill, effective_bid, effective_ask)
+aggressive = is_aggressive(ba_class)
+is_sell_agr = is_sell_aggressive(ba_class)
+is_directionally_aggressive = aggressive or is_sell_agr
+
+golden = is_golden_sweep(ttype, premium, is_directionally_aggressive)
+direction = classify_order_direction(ba_class, ctype, is_synthetic_quote)
+```
+
+#### Event creation
+```python
+ev = OptionsFlowEvent(
+    ...
+    bid_ask_class=ba_class,
+    is_aggressive=aggressive,
+    order_side=direction.order_side,
+    sentiment=direction.sentiment,
+    strong_sentiment=direction.strong_sentiment,
+    ...
+)
+```
+
+#### Conviction scoring fix
+```python
+raw_conviction = round(
+    min(
+        (0.4 if is_directionally_aggressive else 0.15)
+        + (0.25 if golden else 0.0)
+        + min(premium / 10_000_000, 0.25)
+        + dte_urgency,
+        1.0,
+    ),
+    3,
+)
+```
+
+#### Registry enrichment fix
+```python
+if reg and reg.is_ready():
+    meta = reg.lookup(symbol)
+    if meta:
+        ev.ticker = meta.ticker
+        ev.strike = meta.strike
+        ev.expiry = meta.expiry
+        ev.contract_type = meta.contract_type
+        ev.dte = meta.dte
+        ev.open_interest = meta.open_interest
+
+        direction = classify_order_direction(
+            ev.bid_ask_class,
+            ev.contract_type,
+            ev.is_synthetic_quote,
+        )
+        ev.order_side = direction.order_side
+        ev.sentiment = direction.sentiment
+        ev.strong_sentiment = direction.strong_sentiment
+
+    if ev.underlying_price == 0.0:
+        up = reg.stock_price(ev.ticker)
+        if up > 0:
+            ev.underlying_price = up
+
+    if ev.daily_volume == 0:
+        ev.daily_volume = reg.get_daily_volume(ev.ticker)
+```
+
+### Symbol Registry Changes
+#### `backend/services/symbol_registry.py`
+```python
+self._raw_quotes: dict[str, dict] = {}
+```
+
+In `build()`:
+```python
+self._raw_quotes = raw_quotes
+```
+
+Add accessor:
+```python
+def get_daily_volume(self, ticker: str) -> int:
+    try:
+        return int(self._raw_quotes.get(ticker, {}).get("volume", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+```
+
+### Repetition Episode Direction Fix
+#### `backend/signals/repetition_accumulator.py`
+```python
+@property
+def dominant_direction(self) -> str:
+    buy_prem = 0.0
+    sell_prem = 0.0
+    for e in self.events:
+        direction = order_side_to_direction(
+            getattr(e, "order_side", "UNKNOWN"),
+            getattr(e, "contract_type", "CALL"),
+        )
+        if direction == "REPEAT_BUY":
+            buy_prem += getattr(e, "premium", 0.0)
+        else:
+            sell_prem += getattr(e, "premium", 0.0)
+    return "REPEAT_BUY" if buy_prem >= sell_prem else "REPEAT_SELL"
+```
+
+### Acceptance Criteria
+- SELL PUT resolves to bullish sentiment when quote placement indicates initiated selling.
+- Registry enrichment never naively overwrites sentiment.
+- BLOCK detection catches high-premium low-exchange whales.
+- Golden BLOCK is supported.
+- `underlying_price` and `daily_volume` enrich correctly.
+
+### Required Invariant Tests
+```python
+def test_sell_put_is_bullish_sentiment():
+    result = classify_order_direction("AT_BID", "PUT", False)
+    assert result.order_side == "SELL"
+    assert result.sentiment == "BULLISH"
+    assert result.strong_sentiment is True
+
+
+def test_sell_put_maps_to_repeat_buy():
+    assert order_side_to_direction("SELL", "PUT") == "REPEAT_BUY"
+```
+
+### Required Test Files
+- `tests/test_order_side_classifier.py`
+- `tests/test_direction_invariants.py`
+- `tests/test_bid_ask_classifier.py`
+- `tests/test_trade_type_detector.py`
+- `tests/test_options_flow_parser.py`
+- `tests/test_repetition_accumulator.py`
+
+---
+
+## S2.5 — Supabase Migration: `order_side` + `strong_sentiment`
+**Type:** DB migration  
+**Depends on:** S2
+
+### SQL
+```sql
+ALTER TABLE flow_events
+  ADD COLUMN IF NOT EXISTS order_side TEXT
+    CHECK (order_side IN ('BUY', 'SELL', 'UNKNOWN'))
+    DEFAULT 'UNKNOWN',
+  ADD COLUMN IF NOT EXISTS strong_sentiment BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_flow_events_order_side
+  ON flow_events (order_side);
+
+UPDATE flow_events
+SET order_side = 'BUY',
+    strong_sentiment = FALSE
+WHERE order_side = 'UNKNOWN';
+```
+
+### Persistence Payload Example
+```python
+await persist_flow_event({
+    ...
+    "order_side": ev.order_side,
+    "strong_sentiment": ev.strong_sentiment,
+})
+```
+
+### Acceptance Criteria
+- New fields persist without schema errors.
+- Existing readers remain compatible.
+
+---
+
+## S3 — Apex L1: `signal_gate.py`
+**Type:** new module  
+**Depends on:** S2
+
+### Objective
+Filter low-quality flow before it reaches accumulation.
+
+### New File Example
+#### `backend/signals/signal_gate.py`
+```python
+from typing import NamedTuple
+
+class GateVerdict(NamedTuple):
+    passed: bool
+    reason: str
+
+
+def passes_signal_gate(ev, tier: int) -> GateVerdict:
+    spread_pct = ((ev.ask - ev.bid) / ev.ask) if ev.ask > 0 and ev.ask > ev.bid else 0.0
+    if ev.ask > 0 and spread_pct > 0.50:
+        return GateVerdict(False, "spread_too_wide")
+
+    min_premium = {
+        1: {"SWEEP": 50_000, "BLOCK": 100_000, "SPLIT": 150_000, "SINGLE": 250_000},
+        2: {"SWEEP": 25_000, "BLOCK": 50_000,  "SPLIT": 100_000, "SINGLE": 150_000},
+        3: {"SWEEP": 25_000, "BLOCK": 50_000,  "SPLIT": 100_000, "SINGLE": 150_000},
+    }[tier]
+
+    if ev.premium < min_premium.get(ev.trade_type, 999999999):
+        return GateVerdict(False, "premium_below_floor")
+
+    return GateVerdict(True, "passed")
+```
+
+### Acceptance Criteria
+- Wide-spread junk is rejected.
+- Tier-specific floors are enforced.
+- High-quality SELL PUT flow can pass.
+
+### Tests
+- `tests/test_signal_gate.py`
+- 100% branch coverage
+
+---
+
+## S4 — Apex L2: Dual-Window Accumulator
+**Type:** refactor + feature  
+**Depends on:** S3
+
+### Objective
+Move from a simplistic threshold accumulator to a market-aware episode gate that handles LEAPS, ATM flow, deep OTM flow, and single massive sweeps correctly.
+
+### Default Tier Table
+```python
+_DEFAULT_DTE_PREMIUM_TIERS = {
+    7:    (50_000,    25_000),
+    30:   (500_000,   100_000),
+    90:   (1_000_000, 500_000),
+    9999: (2_000_000, 1_000_000),
+}
+```
+
+### Core Method Example
+```python
+def _get_episode_min_premium(self, ep):
+    if not self.dte_premium_tiers:
+        return self.min_premium
+    latest_dte = getattr(ep.events[-1], "dte", 0) if ep.events else 0
+    tier = self._tier_map.get(ep.ticker, 3)
+    col = 0 if tier == 1 else 1
+    for dte_max in sorted(self.dte_premium_tiers):
+        if latest_dte <= dte_max:
+            return self.dte_premium_tiers[dte_max][col]
+    return self.min_premium
+```
+
+### Sweep Bypass Example
+```python
+is_single_whale = (
+    self.sweep_bypass_premium > 0
+    and ep.trade_count == 1
+    and getattr(ep.events[-1], "trade_type", "") == "SWEEP"
+    and ep.total_premium >= self.sweep_bypass_premium
+)
+```
+
+### Deep OTM Example
+```python
+if self.deep_otm_multiplier > 1.0 and otm_pct > 0.12:
+    deep_floor = effective_min_prem * self.deep_otm_multiplier
+    if ep.total_premium < deep_floor:
+        return None
+```
+
+### Signal Accumulator Example
+```python
+signal_accumulator = RepetitionAccumulator(
+    window_minutes=10,
+    min_trades=3,
+    min_premium=100_000,
+    min_sweeps=3,
+    sweep_bypass_premium=500_000,
+    otm_band=(0.00, 0.25),
+    deep_otm_multiplier=1.5,
+    dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+)
+```
+
+### Acceptance Criteria
+- LEAPS are not automatically discarded.
+- ATM flow is eligible.
+- Deep OTM requires higher premium.
+- Single monster sweeps bypass `min_sweeps` when appropriate.
+
+---
+
+## S5 — Apex L4: Cross-Contract Ladder Detection
+**Type:** new module  
+**Depends on:** S4
+
+### Objective
+Detect coordinated multi-strike positioning on the same ticker and expiry.
+
+### Example Sketch
+```python
+class LadderSignal(NamedTuple):
+    ticker: str
+    expiry: str
+    strikes: list[float]
+    total_premium: float
+
+
+def detect_ladder(active_eps):
+    grouped = {}
+    for ep in active_eps:
+        key = (ep.ticker, ep.expiry)
+        grouped.setdefault(key, []).append(ep)
+
+    for (ticker, expiry), eps in grouped.items():
+        strikes = sorted({ep.strike for ep in eps})
+        if len(strikes) >= 3:
+            return LadderSignal(
+                ticker=ticker,
+                expiry=expiry,
+                strikes=strikes,
+                total_premium=sum(ep.total_premium for ep in eps),
+            )
+    return None
+```
+
+### Acceptance Criteria
+- Fires only on coordinated same-expiry structures.
+- Ignores unrelated expiries.
+- Expires stale ladder state.
+
+---
+
+## S6 — Apex L3: Composite Formula Overhaul + Hot Path Corrections
+**Type:** refactor + bug fix  
+**Depends on:** S2, S2.5, S4, S5
+
+### Objective
+Remove fake backtest influence, use episode-level semantics, and ensure hot-path publishing preserves the real direction of flow.
+
+### Composite Helpers
+```python
+def episode_influence_tier(ep):
+    prem = ep.total_premium
+    if prem >= 2_000_000:
+        return "WHALE"
+    if prem >= 500_000:
+        return "INSTITUTIONAL"
+    if prem >= 100_000:
+        return "LARGE"
+    return "RETAIL"
+```
+
+### Composite Formula Example
+```python
+flow_s = round(flow_s_raw * (1.0 if latest.strong_sentiment else 0.80), 3)
+bt_s = 0.0
+vwp_f = volume_weighted_premium_factor(ep)
+prem_t = premium_tier_score(ep)
+sector_s = 0.0
+
+comp = round(
+    flow_s * 0.55
+    + bt_s * 0.00
+    + vwp_f * 0.20
+    + prem_t * 0.15
+    + sector_s * 0.10,
+    3,
+)
+```
+
+### Hot Path Direction Fix
+#### `backend/services/tradier_stream.py`
+```python
+# before
+if sig_ep.contract_type == "CALL":
+    direction = "REPEAT_BUY"
+elif sig_ep.contract_type == "PUT":
+    direction = "REPEAT_SELL"
+else:
+    direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+
+# after
+direction = sig_ep.dominant_direction
+```
+
+### Persistence Payload Update
+```python
+await persist_flow_event({
+    ...
+    "order_side": ev.order_side,
+    "strong_sentiment": ev.strong_sentiment,
+})
+```
+
+### Composite Bus Payload Update
+```python
+composite_msg = {
+    "type": "composite_signal",
+    "data": {
+        "signal": {
+            "ticker": composite.ticker,
+            "recommendation": composite.recommendation,
+            "composite_score": composite.composite_score,
+            "flow_score": composite.flow_score,
+            "backtest_score": composite.backtest_score,
+            "volume_premium_factor": composite.volume_premium_factor,
+            "reasoning": composite.reasoning,
+            "alert_level": alert_level,
+            "order_side": ev.order_side,
+            "strong_sentiment": ev.strong_sentiment,
+        },
+        "episode": {
+            "contract_type": sig_ep.contract_type,
+            "direction": direction,
+            "influence_tier": episode_influence_tier(sig_ep),
+            "total_premium": sig_ep.total_premium,
+            "trade_count": sig_ep.trade_count,
+            "is_accelerating": sig_ep.is_accelerating,
+            "timestamp": ev.timestamp.isoformat(),
+        },
+    },
+}
+```
+
+### Demo-Mode Direction Fix
+```python
+order_side_demo = rng.choices(["BUY", "SELL", "UNKNOWN"], weights=[60, 25, 15])[0]
+direction = order_side_to_direction(order_side_demo, ctype)
+```
+
+### Acceptance Criteria
+- Production composite score ignores fake backtest output.
+- SELL PUT campaigns persist and publish as bullish direction.
+- Episode influence tier uses episode premium.
+- Order-side metadata is available to downstream consumers.
+
+---
+
+## S7 — Tiered Swarm + Circuit Breaker
+**Type:** new feature  
+**Depends on:** S6  
+**Status:** blocked pending stream worker review
+
+### Objective
+Add the only allowed swarm path, and only at the Apex layer.
+
+### Example Shape
+```python
+async def build_apex_swarm_composite(ep, accumulator):
+    return await asyncio.wait_for(_swarm_impl(ep, accumulator), timeout=2.0)
+```
+
+### Circuit Breaker Example
+```python
+if failures >= 3:
+    breaker_open_until = now + 300
+    return build_composite(ep, accumulator)
+```
+
+### Hard Rule
+Do not begin implementation until `stream_worker.py` confirms the runtime model is safe for async model calls.
+
+---
+
+## S8 — Real Backtest Score from `flow_events`
+**Type:** future feature  
+**Depends on:** S6
+
+### Objective
+Replace seeded fake backtest scoring with real historical win-rate data.
+
+### Example Direction
+```python
+def get_real_backtest_score(ticker, contract_type, dte_bucket):
+    # query aggregated signal outcomes from flow_events-derived analytics table
+    ...
+```
+
+### Hard Rule
+Until this lands, production composite scoring must keep `backtest_score` at zero weight.
+
+---
+
+## Directional Invariants — CI Gate Section
+These invariants must exist in a dedicated test file and run as a hard gate.
+
+```python
+def test_direction_invariants():
+    assert classify_order_direction("AT_BID", "PUT", False).sentiment == "BULLISH"
+    assert classify_order_direction("BELOW_BID", "PUT", False).sentiment == "BULLISH"
+    assert classify_order_direction("AT_BID", "PUT", False).order_side == "SELL"
+    assert classify_order_direction("AT_BID", "PUT", False).strong_sentiment is True
+    assert order_side_to_direction("SELL", "PUT") == "REPEAT_BUY"
+    assert order_side_to_direction("SELL", "CALL") == "REPEAT_SELL"
+```
+
+---
+
+## Suggested Sprint Packaging
+
+### Sprint 1
+- S0
+- S1
+- S2
+- S2.5
+
+### Sprint 2
+- S3
+- S4
+- S5
+
+### Sprint 3
+- S6
+- S7 if stream-worker review clears async safety
+
+### Future Sprint
+- S8
+
+---
+
+## Release Notes Guidance
+- S2 and S2.5 should release together because persistence schema must exist before new hot-path writes.
+- S6 should not start until S4 and S5 semantics are stable.
+- S7 remains blocked until concurrency review is complete.
+- S8 is intentionally separated so fake backtest influence does not silently creep back into production.
