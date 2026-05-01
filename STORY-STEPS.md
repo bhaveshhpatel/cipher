@@ -5,7 +5,7 @@
 
 ---
 
-## Rule 0 — Before Answering "What’s Next / What’s Remaining / What’s the Order"
+## Rule 0 — Before Answering “What’s Next / What’s Remaining / What’s the Order”
 
 **Both files must be consulted together. Neither alone is sufficient.**
 
@@ -69,7 +69,7 @@ Steps:
 2. Make all story changes on that branch
 3. Open a PR from the branch into `main`
 4. PR body must include:
-   - Story reference (e.g. "Closes #N")
+   - Story reference (e.g. “Closes #N”)
    - What the PR does (scope summary)
    - Files changed
    - Acceptance criteria checklist
@@ -84,19 +84,21 @@ Before any PR merges, all three roles must deliberate on the diff:
 
 ### Senior Architect
 - Is the scope correct and complete per the spec?
-- Are there missing columns, missing files, or scope gaps vs. `cipher_apex_story_and_sprint_plan.md`?
+- Are there missing columns, missing files, or scope gaps vs. `docs/cipher_apex_story_and_sprint_plan.md`?
+- Does the implementation align with the layered architecture defined in `docs/cipher_apex_layered_architecture.md`?
 - Are architectural constraints respected (e.g. columns that cannot be backfilled retroactively)?
-- Does the implementation match the deliberation notes already in the spec?
+- Does the implementation match the deliberation notes in `docs/cipher_apex_planning_deliberations.md`?
 
 ### Principal Backend Engineer
 - Is the implementation correct? Any logic errors, edge cases, or unsafe defaults?
 - Are constraints, types, and defaults exactly right?
 - Will existing code break? Are all callers updated?
 - Are there performance concerns (hot paths, missing indexes, unnecessary work)?
+- Does the implementation match the engineering spec in `docs/cipher_apex_engineering_spec.md`?
 
 ### Lead QA
 - Are all acceptance criteria from the issue and spec covered?
-- Is test coverage complete — happy path, default path, constraint violations, idempotency?
+- Is test coverage complete per `docs/cipher_apex_qa_path_coverage_spec.md` — happy path, default path, constraint violations, idempotency?
 - Are there missing test cases that a future regression could silently break?
 - Are integration tests gated on schema/state that doesn’t exist yet?
 
@@ -121,7 +123,7 @@ Immediately after a PR merges:
 2. **Update `SPRINT.md`**:
    - Mark the story row ✅ in the Completed table
    - Move it out of the gate block if applicable
-   - Update the **Quick Reference** section ("What is next?", "What blocks S3?", etc.)
+   - Update the **Quick Reference** section (“What is next?”, “What blocks S3?”, etc.)
    - Add any new post-merge stories to the relevant gate block
    - Bump the version number and update the `Last updated` line
 3. If new GitHub Issues were filed from panel findings — confirm they are open and linked in `SPRINT.md`
@@ -135,6 +137,10 @@ Run through this list top-to-bottom for every story, without skipping steps.
 ```
 PRE-FLIGHT
 ☐  Read docs/cipher_apex_story_and_sprint_plan.md for this story
+☐  Read docs/cipher_apex_engineering_spec.md for relevant section
+☐  Read docs/cipher_apex_layered_architecture.md if story touches signal layers
+☐  Read docs/cipher_apex_planning_deliberations.md for any prior deliberation on this story
+☐  Read docs/cipher_apex_qa_path_coverage_spec.md for test path requirements
 ☐  Read SPRINT.md — confirm all hard gates above this story are ✅
 ☐  Read the GitHub Issue for any post-filing amendments
 ☐  Confirm story is not ⏳ blocked
@@ -146,16 +152,16 @@ BRANCH
 IMPLEMENTATION
 ☐  Make all changes on the branch
 ☐  All acceptance criteria from the issue are addressed
-☐  All test coverage requirements from the issue are addressed
+☐  All test coverage requirements from the issue and QA path coverage spec are addressed
 
 PR
 ☐  Open PR from branch → main
 ☐  PR body includes: story ref, scope, files changed, AC checklist, test checklist
 
 DELIBERATION
-☐  Senior Architect reviews diff — scope, completeness, architectural constraints
-☐  Principal Backend Engineer reviews diff — correctness, safety, performance
-☐  Lead QA reviews diff — test coverage, constraint tests, regression gaps
+☐  Senior Architect reviews diff — scope, completeness, architecture + planning deliberations
+☐  Principal Backend Engineer reviews diff — correctness, safety, engineering spec alignment
+☐  Lead QA reviews diff — test coverage per QA path coverage spec, constraint tests, regression gaps
 ☐  All small fixes applied inline on the PR
 ☐  All new-work findings filed as GitHub Issues AND added to SPRINT.md
 ☐  Zero unresolved findings remaining
@@ -177,7 +183,11 @@ POST-MERGE
 
 | File | Purpose |
 |---|---|
-| `docs/cipher_apex_story_and_sprint_plan.md` | Canonical spec — story definitions, AC, test requirements, architecture notes |
-| `SPRINT.md` | Execution state — merged/open/blocked status, build order, gate tracking |
-| `STORY-STEPS.md` | This file — the protocol every story execution must follow |
+| [`docs/cipher_apex_story_and_sprint_plan.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_story_and_sprint_plan.md) | Canonical spec — story definitions, acceptance criteria, test requirements, architectural notes |
+| [`docs/cipher_apex_engineering_spec.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_engineering_spec.md) | Engineering implementation spec — detailed technical requirements per story |
+| [`docs/cipher_apex_layered_architecture.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_layered_architecture.md) | Layered signal architecture — L1/L2/L3/L4 layer definitions, data flow, component boundaries |
+| [`docs/cipher_apex_planning_deliberations.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_planning_deliberations.md) | Prior architectural deliberations — decisions made, tradeoffs recorded, constraints established |
+| [`docs/cipher_apex_qa_path_coverage_spec.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_qa_path_coverage_spec.md) | QA path coverage spec — required test scenarios, path IDs, constraint tests, integration gates |
+| [`SPRINT.md`](https://github.com/bhaveshhpatel/cipher/blob/main/SPRINT.md) | Execution state — merged/open/blocked status, build order, gate tracking |
+| [`STORY-STEPS.md`](https://github.com/bhaveshhpatel/cipher/blob/main/STORY-STEPS.md) | This file — the protocol every story execution must follow |
 | GitHub Issues | Execution tracking only — not the plan, not the source of truth for ordering |
