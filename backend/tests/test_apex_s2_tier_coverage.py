@@ -23,8 +23,13 @@ Inline fixes applied post-deliberation (2026-05-01):
   Fix 6 — test_symbol_missing_from_avg_volume_uses_fallback now explicitly
     sets is_ready on the mock and documents why it is not the guard under test.
 
+Issue #30 (2026-05-01) — Test isolation / module global teardown:
+  `reset_tier_map_globals` autouse fixture added to TestRefreshTierMap.
+  Saves and restores _tier_map_cache, _tier_map_ts, _tier_map_refresh_task
+  around every test in the class. Prevents session-level pollution from
+  sentinel values left behind by individual tests.
+
 Open follow-up issues from panel deliberation:
-  #30 — module-level global teardown (test isolation, High)
   #31 — happy path must assert _tier_map_refresh_task state post-call
   #32 — exception test must assert warning was logged
   #33 — add test: _get_tier_map when task already running (not done)
@@ -100,6 +105,43 @@ def _make_registry(
 # ---------------------------------------------------------------------------
 
 class TestRefreshTierMap:
+    """
+    Tests for _refresh_tier_map().
+
+    Isolation contract (#30):
+    The `reset_tier_map_globals` autouse fixture below saves the three
+    module-level globals (_tier_map_cache, _tier_map_ts, _tier_map_refresh_task)
+    before each test and restores them in a `finally` block after, regardless
+    of pass/fail. This prevents any sentinel value written by one test from
+    leaking into subsequent tests in this class or in other test files that
+    import services.stream_worker in the same pytest session.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_tier_map_globals(self):
+        """
+        Save and restore the three module-level tier_map globals around
+        every test in TestRefreshTierMap.
+
+        Globals protected:
+          - sw._tier_map_cache        (dict[str, str])
+          - sw._tier_map_ts           (float)
+          - sw._tier_map_refresh_task (asyncio.Task | None)
+
+        Pattern: snapshot before yield, unconditional restore in finally.
+        This makes each test hermetic — it can freely mutate module state
+        without affecting any other test in the session.
+        """
+        import services.stream_worker as sw
+        saved_cache = dict(sw._tier_map_cache)
+        saved_ts    = sw._tier_map_ts
+        saved_task  = sw._tier_map_refresh_task
+        try:
+            yield
+        finally:
+            sw._tier_map_cache        = saved_cache
+            sw._tier_map_ts           = saved_ts
+            sw._tier_map_refresh_task = saved_task
 
     @pytest.mark.asyncio
     async def test_happy_path_rebuilds_cache(self):
