@@ -40,17 +40,15 @@
 | S0 | Swarm cleanup — deprecate `ensemble_runner.py`, wire `CompositeEngine` | [#18](https://github.com/bhaveshhpatel/cipher/pull/18) | ✅ |
 | S1 | Alert level threshold reconciliation + emit-cache flush | [#19](https://github.com/bhaveshhpatel/cipher/pull/19) | ✅ |
 | S2 | Parser + detector layer fixes — direction inference, `order_side_classifier`, tier wiring into stream worker hot path | [#21](https://github.com/bhaveshhpatel/cipher/pull/21) | ✅ |
+| S2-POST-5 | `_refresh_tier_map` test coverage — 5 tests | [#26](https://github.com/bhaveshhpatel/cipher/issues/26) | ✅ |
+| S2-POST-6 | `_process_tick` registry avg_volume lookup path — 3 tests | [#27](https://github.com/bhaveshhpatel/cipher/issues/27) | ✅ |
 
 ### Pre-S3 Hard Gates — ALL must merge before S3 starts 🔴
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S2-POST-5 | `_refresh_tier_map` test coverage — 5 tests (happy path, None registry, assign_tiers failure, ts update) | [#26](https://github.com/bhaveshhpatel/cipher/issues/26) | 🔴 Open |
-| S2-POST-6 | `_process_tick` registry avg_volume lookup path — 3 tests | [#27](https://github.com/bhaveshhpatel/cipher/issues/27) | 🔴 Open |
 | S2.5 | Supabase migration: `order_side` (BUY/SELL/UNKNOWN + index) + `strong_sentiment` (bool) on `flow_events` | [#29](https://github.com/bhaveshhpatel/cipher/issues/29) | 🔴 Open |
 | S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#20](https://github.com/bhaveshhpatel/cipher/issues/20) | 🔴 Open |
-
-> **Recommended:** Run #26 + #27 as a single test-only PR. Then #29 (migration). Then #20 (deletion).
 
 ### Must Close Before S3 Merges (can work in parallel with S3 branch) 🟡
 
@@ -120,9 +118,9 @@ Exact execution order. Do not start a story until everything above it in the sam
 1.  ✅  S0        — Swarm cleanup (PR #18)
 2.  ✅  S1        — Alert level reconciliation + emit-cache flush (PR #19)
 3.  ✅  S2        — Parser + detector + stream worker tier wiring (PR #21)
+4.  ✅  #26+#27   — _refresh_tier_map + _process_tick test coverage
 
 ── PRE-S3 HARD GATES (all must merge before S3 starts) ──────────────────
-4.  🔴  #26+#27   — _refresh_tier_map + _process_tick test coverage [single PR]
 5.  🔴  #29       — S2.5: order_side + strong_sentiment DB migration
 6.  🔴  #20       — S0.5: Delete ensemble_runner.py
 ─────────────────────────────────────────────────────────────────────────
@@ -160,14 +158,14 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → First 🔴 item in the Pre-S3 Hard Gates block (step 4: #26 + #27).
-- **"What is remaining?"** → Every row not marked ✅ — steps 4 through 19.
-- **"What blocks S3?"** → Steps 4–6 (all 🔴 gates).
+- **"What is next?"** → Step 5: [#29](https://github.com/bhaveshhpatel/cipher/issues/29) — S2.5 Supabase migration.
+- **"What is remaining?"** → Every row not marked ✅ — steps 5 through 19.
+- **"What blocks S3?"** → Steps 5–6 (#29 and #20).
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for complete story definitions, then use this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
 
 ---
 
-*Last updated: 2026-05-01 — Updated to cross-reference canonical spec, added full S0–S8 sequence.*
-*Version: 1.1*
+*Last updated: 2026-05-01 — #26 and #27 closed, build green.*
+*Version: 1.2*
