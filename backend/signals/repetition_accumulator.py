@@ -29,7 +29,8 @@ S4 additions:
   - dominant_direction property on RepetitionEpisode (premium-weighted)
   - tier_map injection for DTE-floor tier lookup
 
-Alert levels (reconciled across all test suites):
+Alert levels (reconciled across all test suites — see get_alert_level() for
+full change-log from S1 spec):
   >= 2_000_000                            -> CONVICTION
   is_accelerating AND >= 500_000          -> CONVICTION
   >= 1_000_000                            -> STRONG_SIGNAL
@@ -38,6 +39,7 @@ Alert levels (reconciled across all test suites):
 """
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
@@ -228,6 +230,15 @@ class RepetitionAccumulator:
         self.dte_premium_tiers    = dte_premium_tiers or {}
         self._tier_map            = tier_map or {}
 
+        # Finding 2 (S4-POST-4, panel deliberation May 1 2026):
+        # set_tier_map() is called by stream workers (potentially 64 concurrent)
+        # and _get_episode_min_premium() reads _tier_map on every hot-path tick.
+        # A threading.Lock serialises the write in set_tier_map() and the read
+        # in _get_episode_min_premium() so the dict is never read mid-replacement.
+        # threading.Lock (not asyncio.Lock) because set_tier_map() is a sync
+        # method callable from both sync and async contexts.
+        self._tier_map_lock: threading.Lock = threading.Lock()
+
         # BE-1 (deliberation May 1 2026): cache max DTE key at construction time
         # so _get_episode_min_premium never calls max() on every hot-path tick.
         # dte_premium_tiers is immutable after __init__ (set_tier_map only updates
@@ -244,8 +255,23 @@ class RepetitionAccumulator:
     # ------------------------------------------------------------------ #
 
     def set_tier_map(self, tier_map: Dict[str, int]) -> None:
-        """Replace the internal tier map. Thread-safe for non-async callers."""
-        self._tier_map = tier_map
+        """
+        Replace the internal tier map.
+
+        Thread-safe: protected by self._tier_map_lock so concurrent calls
+        from multiple stream workers cannot interleave with a mid-flight
+        read in _get_episode_min_premium().
+
+        Finding 2 (S4-POST-4, panel deliberation May 1 2026):
+        The previous implementation had no lock despite the docstring claiming
+        thread-safety. With up to 64 workers potentially calling set_tier_map()
+        concurrently, _tier_map replacement (which is a pointer swap in CPython
+        but not guaranteed atomic under all interpreters or future GIL removal)
+        must be explicitly serialised. Lock added here and in
+        _get_episode_min_premium() to make the contract match the claim.
+        """
+        with self._tier_map_lock:
+            self._tier_map = tier_map
 
     # ------------------------------------------------------------------ #
     # Key helpers
@@ -303,6 +329,10 @@ class RepetitionAccumulator:
           qualify more easily than large-caps during registry warmup.
           T1 (strict) is the safer production default; set_tier_map() is
           called once registry is ready to assign the correct tier.
+
+        Thread-safety: _tier_map read is protected by _tier_map_lock to
+        prevent reading a partially-replaced dict during a concurrent
+        set_tier_map() call. (Finding 2 / S4-POST-4)
         """
         if not self.dte_premium_tiers:
             return self.min_premium
@@ -311,7 +341,8 @@ class RepetitionAccumulator:
         if ep.events:
             latest_dte = int(getattr(ep.events[-1], "dte", 0) or 0)
 
-        tier = self._tier_map.get(ep.ticker, 1)  # default T1 (strict)
+        with self._tier_map_lock:
+            tier = self._tier_map.get(ep.ticker, 1)  # default T1 (strict)
         col  = 0 if tier == 1 else 1
 
         for dte_max in sorted(self.dte_premium_tiers):
@@ -453,14 +484,14 @@ class RepetitionAccumulator:
             if ep.first_seen is None:
                 ep.first_seen = ev_ts
 
-            # ── Gate 1: min_trades ────────────────────────────────────────
+            # ── Gate 1: min_trades ────────────────────────────────────────────
             if ep.trade_count < self.min_trades:
                 return None
 
-            # ── Gate 2: DTE-adjusted premium floor ───────────────────────
+            # ── Gate 2: DTE-adjusted premium floor ───────────────────────────
             effective_min_prem = self._get_episode_min_premium(ep)
 
-            # ── Gate 3: Deep OTM multiplier ───────────────────────────────
+            # ── Gate 3: Deep OTM multiplier ─────────────────────────────────
             # OTM classification uses the latest event's underlying_price.
             # Guard against non-numeric values (e.g. MagicMock in tests) by
             # using isinstance before float() to avoid TypeError in the hot path.
@@ -483,7 +514,7 @@ class RepetitionAccumulator:
                 if ep.total_premium < effective_min_prem:
                     return None
 
-            # ── Gate 4: min_sweeps (with whale-sweep bypass) ─────────────
+            # ── Gate 4: min_sweeps (with whale-sweep bypass) ─────────────────
             if self.min_sweeps > 0:
                 is_bypass = self._is_single_whale_sweep(ep)
                 if not is_bypass:
@@ -552,26 +583,42 @@ class RepetitionAccumulator:
 
     def get_alert_level(self, ep: RepetitionEpisode) -> str:
         """
-        Alert level bands (reconciled across test_repetition_engine,
-        test_composite_signal_engine, test_composite_signal_extended, test_c007_8):
+        Return the alert level for a qualifying episode.
 
+        Thresholds (current — reconciled May 1 2026):
           CONVICTION    >= 2_000_000
           CONVICTION    is_accelerating AND >= 500_000
           STRONG_SIGNAL >= 1_000_000
           ALERT         >= 250_000
           WATCH         < 250_000
 
-        Rationale for threshold changes vs. previous S1 draft:
-          - ALERT floor raised from 100_000 -> 250_000:
-            test_repetition_engine line 18: premium=100_000 expects WATCH.
-            test_composite_signal_extended TestAlertLevels.test_watch_level:
-            ep with total_premium=200_000 expects WATCH.
-          - STRONG_SIGNAL floor raised from 500_000 -> 1_000_000:
-            test_repetition_engine line 16: premium=1_000_000 (not accel) -> STRONG_SIGNAL.
-            test_composite_signal_engine test_alert_level_strong_signal:
-            premium_each=400_000 * 3 = 1_200_000 -> STRONG_SIGNAL.
-          - CONVICTION high-premium floor stays 2_000_000 (all tests consistent).
-          - CONVICTION accel band stays accel + >= 500_000 (all tests consistent).
+        Change-log from S1 spec (Finding 1 / S4-POST-3, panel deliberation
+        May 1 2026 — no separate issue filed; resolved inline in this PR):
+
+          ALERT floor:        100_000  ->  250_000
+            Rationale: test_repetition_engine (line 18) asserts premium=$100K
+            returns WATCH. test_composite_signal_extended TestAlertLevels
+            .test_watch_level asserts total_premium=$200K returns WATCH.
+            Both existing suites independently pin the ALERT floor at $250K.
+            The S1 draft value of $100K was never validated against these suites
+            and was silently wrong from the start.
+
+          STRONG_SIGNAL floor: 500_000  ->  1_000_000
+            Rationale: test_repetition_engine (line 16) asserts premium=$1M
+            (non-accelerating) returns STRONG_SIGNAL. test_composite_signal_engine
+            test_alert_level_strong_signal uses premium_each=$400K × 3 = $1.2M
+            and expects STRONG_SIGNAL. The S1 draft value of $500K would have
+            promoted $500K non-accelerating episodes to STRONG_SIGNAL when all
+            other suites expected ALERT at that level.
+
+          CONVICTION high-premium floor: unchanged at 2_000_000
+            All test suites consistently pin this value.
+
+          CONVICTION accelerating band: unchanged (is_accelerating AND >= 500_000)
+            All test suites consistently pin this value.
+            NOTE: at exactly $500K, accelerating → CONVICTION but
+            non-accelerating → ALERT. This is intentional and pinned by
+            test_conviction_accelerating_at_exactly_500k in TestAlertLevel.
         """
         prem = ep.total_premium
         if prem >= 2_000_000:
