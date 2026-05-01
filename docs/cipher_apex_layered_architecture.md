@@ -1,6 +1,6 @@
 # Cipher Apex — Layered Signal Architecture
 
-**Date:** April 30, 2026 (revised April 30, 2026 — architect review: issues 1, 2, 3, 9)
+**Date:** April 30, 2026 (revised April 30, 2026 — architect review: issues 1, 2, 3, 9; issues 5, 6, 7, 8)
 **Subject:** Full Apex Signal Pipeline — Ingestion through Signal Emission  
 **Repository:** `bhaveshhpatel/cipher`
 
@@ -60,10 +60,10 @@
 │  DIRECTION INFERENCE  (order_side_classifier.py)                                │
 │  ├── BUY side:  AT_ASK | ABOVE_ASK                                             │
 │  ├── SELL side: AT_BID | BELOW_BID                                             │
-│  ├── CALL + BUY  → BULLISH  (strong)                                           │
+│  ├── CALL + BUY  → BULLISH  (strong)   ← CI GATE INVARIANT (Issue 8)          │
 │  ├── CALL + SELL → BEARISH  (strong)                                           │
-│  ├── PUT  + BUY  → BEARISH  (strong)                                           │
-│  ├── PUT  + SELL → BULLISH  (strong)   ← CI GATE INVARIANT                    │
+│  ├── PUT  + BUY  → BEARISH  (strong)   ← CI GATE INVARIANT (Issue 8)          │
+│  ├── PUT  + SELL → BULLISH  (strong)   ← CI GATE INVARIANT (original)         │
 │  ├── MID  / synthetic → fallback to contract type, strong_sentiment=False      │
 │  └── Returns OrderDirection(order_side, sentiment, strong_sentiment)           │
 │                                                                                 │
@@ -172,22 +172,30 @@
 │  ├── 31–90 DTE:  T1 = 1M     · T2/T3 = 500K                                   │
 │  └── 91+ DTE:    T1 = 2M     · T2/T3 = 1M                                     │
 │                                                                                 │
-│  OTM ELIGIBILITY                                                                │
-│  ├── ATM band (0% OTM): eligible — institutional hedging and positioning       │
-│  ├── Standard OTM (0–12%): eligible at normal premium floors                  │
+│  OTM ELIGIBILITY  (Issue 6 — April 30 2026)                                    │
+│  ├── ATM band: abs(strike - underlying_price) / underlying_price <= 0.02       │
+│  │   Definition: ±2% of underlying price (NOT an absolute dollar amount)       │
+│  │   Rationale: NVDA at $900 has a $9 gap per 1% — absolute thresholds break  │
+│  ├── ATM (0–2% OTM): eligible at standard premium floors                      │
+│  ├── Standard OTM (2–12%): eligible at standard premium floors                │
 │  ├── Deep OTM (>12%): eligible at 1.5× premium floor multiplier               │
-│  └── Strike must be computable — requires underlying_price > 0                 │
+│  └── underlying_price == 0 → standard floor, no OTM classification attempted  │
 │                                                                                 │
-│  SWEEP BYPASS (whale conviction)                                                │
-│  ├── Single episode event · trade_type == SWEEP · premium >= 500K             │
-│  └── Bypasses min_sweeps requirement when conviction is obvious                 │
-│      NOTE: trade_count here = episode event count, not fill count within tick  │
+│  SWEEP BYPASS  (Issue 7 — April 30 2026)                                       │
+│  ├── Condition: len(ep.events) == 1 · trade_type == SWEEP · premium >= 500K   │
+│  ├── IMPORTANT: len(ep.events) = episode event count, NOT fill_count           │
+│  │   fill_count is a field on individual OptionsFlowEvent (fills within tick)  │
+│  │   len(ep.events) == 1 means exactly one event entered the accumulator       │
+│  ├── Bypasses min_sweeps when single massive sweep makes repetition moot       │
+│  └── Negative: len(ep.events) == 2 with same SWEEP + premium → NO bypass      │
 │                                                                                 │
 │  EPISODE DIRECTION                                                              │
 │  ├── dominant_direction: premium-weighted across all episode events            │
 │  ├── Maps each event via order_side_to_direction(order_side, contract_type)    │
-│  ├── SELL + PUT → REPEAT_BUY  ← CI GATE INVARIANT                             │
-│  └── SELL + CALL → REPEAT_SELL ← CI GATE INVARIANT                            │
+│  ├── BUY  + CALL → REPEAT_BUY   ← CI GATE INVARIANT (Issue 8)                 │
+│  ├── BUY  + PUT  → REPEAT_SELL  ← CI GATE INVARIANT (Issue 8)                 │
+│  ├── SELL + PUT  → REPEAT_BUY   ← CI GATE INVARIANT (original)                │
+│  └── SELL + CALL → REPEAT_SELL  ← CI GATE INVARIANT (original)                │
 │                                                                                 │
 │  ALERT LEVELS (on total episode premium)                                        │
 │  ├── >= 2M → CONVICTION                                                        │
@@ -224,8 +232,18 @@
 │  ├── volume_premium_factor   × 0.20                                            │
 │  ├── premium_tier_score      × 0.15                                            │
 │  ├── sector_score            × 0.10  (reserved — activates when L4 ladder      │
-│  │                                    data is wired in; 0.0 until then)        │
+│  │                                    data is wired in S5; 0.0 until then)     │
 │  └── backtest_score          × 0.00  (zero until S8 real implementation)      │
+│                                                                                 │
+│  SCORE CEILING  (Issue 5 — April 30 2026)                                      │
+│  ├── While sector_score == 0.0 and backtest_score == 0.0, active weights       │
+│  │   sum to 0.90 → composite_score is silently capped at 0.90                  │
+│  ├── Decision: weights stay unchanged (redistributing 0.10 would invalidate    │
+│  │   threshold calibration done against the 0.55/0.20/0.15 split)             │
+│  ├── Ceiling exposed explicitly in composite bus payload:                      │
+│  │   composite_score_ceiling: 0.90                                             │
+│  └── Field removed from payload when S5 wires real ladder context and          │
+│      sector_score receives a non-zero value                                     │
 │                                                                                 │
 │  FLOW SCORE INPUTS                                                              │
 │  ├── conviction_score from parser                                               │
@@ -243,8 +261,9 @@
 │  ├── >= 100K → LARGE                                                           │
 │  └── < 100K → RETAIL                                                          │
 │                                                                                 │
-│  OUTPUT: CompositeSignal with composite_score · recommendation · reasoning     │
-│          backtest_score=0.0 · flow_score · alert_level · influence_tier        │
+│  OUTPUT: CompositeSignal with composite_score · composite_score_ceiling         │
+│          recommendation · reasoning · backtest_score=0.0 · flow_score          │
+│          alert_level · influence_tier                                           │
 └───────────────────────────────────┬─────────────────────────────────────────────┘
                                     │ composite signal
 ┌───────────────────────────────────▼─────────────────────────────────────────────┐
@@ -265,11 +284,15 @@
 │  └── type: "composite_signal" — episode-level composite recommendation         │
 │                                                                                 │
 │  COMPOSITE SIGNAL PAYLOAD                                                       │
-│  ├── signal: ticker · recommendation · composite_score · flow_score            │
-│  │           backtest_score · reasoning · alert_level                          │
+│  ├── signal: ticker · recommendation · composite_score                         │
+│  │           composite_score_ceiling: 0.90  ← explicit ceiling (pre-S5)       │
+│  │           flow_score · backtest_score · reasoning · alert_level             │
 │  │           order_side · strong_sentiment                                     │
 │  └── episode: contract_type · direction · influence_tier · total_premium       │
 │               trade_count · is_accelerating · timestamp                         │
+│                                                                                 │
+│  NOTE: composite_score_ceiling removed from payload when S5 ladder             │
+│  context is wired and sector_score receives a non-zero value.                  │
 │                                                                                 │
 │  FRONTEND BROADCAST                                                             │
 │  └── Supabase Realtime → flow_episodes + signal_history channels               │
@@ -386,11 +409,9 @@ The accumulator groups individual qualifying ticks into episodes — structured 
 
 **DTE-aware floors:** Different expiry structures carry different information. A $50K SWEEP on a 0DTE contract is extremely urgent. The same $50K on a 90DTE contract is routine positioning noise. Premium floors scale with DTE to reflect this.
 
-**ATM eligibility:** The original architecture excluded ATM contracts. This was wrong. Large institutional hedges and directional positioning frequently happen ATM, especially on SPY, QQQ, and liquid single-name tickers. ATM is now eligible.
+**ATM eligibility and OTM classification (Issue 6):** ATM is defined as `abs(strike - underlying_price) / underlying_price <= 0.02` — a ±2% band expressed as a fraction of underlying price, not an absolute dollar amount. This prevents incorrect exclusion on high-priced underlyings (e.g., NVDA at $900+ where a $9 gap is only 1%). Contracts in the ATM band use standard premium floors. Deep OTM (>12%) requires a 1.5× premium multiplier. Events with `underlying_price == 0` fall back to standard floor with no OTM classification attempted.
 
-**Deep OTM multiplier:** Far-OTM flow is not automatically excluded but requires a 1.5× premium multiplier to pass. This filters low-premium speculative lotto tickets while preserving large-premium far-OTM institutional hedges.
-
-**Sweep bypass:** A single episode event with `trade_type == SWEEP` and `premium >= $500K` can bypass the `min_sweeps` requirement. `trade_count` here refers to the number of events accumulated in the episode, not the fill count within a single stream tick. When one massive sweep enters the accumulator as episode event #1, the repetition threshold adds no information — the bypass fires immediately.
+**Sweep bypass (Issue 7):** A single episode event (`len(ep.events) == 1`) with `trade_type == SWEEP` and `premium >= $500K` can bypass the `min_sweeps` requirement. `len(ep.events)` is the count of `OptionsFlowEvent` objects accumulated in the episode — this is NOT the `fill_count` field on an individual event, which counts fills within a single stream tick. When one massive sweep enters the accumulator as episode event #1, the repetition threshold adds no information — the bypass fires immediately.
 
 **Dominant direction:** The episode's overall direction is computed as the premium-weighted sum of all constituent events' directions. A SELL PUT campaign produces `REPEAT_BUY` even if a few mid-prints happened to be ambiguous. This is not a last-event shortcut — it uses the full episode history.
 
@@ -407,9 +428,7 @@ The ladder detector runs **before** the composite scorer and passes its output a
 
 **Why it matters:** When an institution buys NVDA 600C, 590C, and 580C sweeps within 15 minutes, this is a deliberate positioning structure across strikes, not coincidental overlap. The total intent is directional and the conviction across strikes makes it higher quality than any single strike alone.
 
-**What it replaces:** The original L4 was an ATR-band check using historical high/low data. That was a trailing indicator describing where price had been, not where institutional activity was pointed. Ladder detection is forward-informative and buildable entirely from existing accumulator infrastructure — no external data feed required.
-
-**Output:** `LadderSignal` with ticker, expiry, strikes list, and combined total premium. This feeds the reserved `sector_score` input in L3 once wired in S5+S6.
+**Output:** `LadderSignal` with ticker, expiry, strikes list, and combined total premium. This feeds the reserved `sector_score` input in L3 once wired in S5+S6. When S5 wires real ladder context, `sector_score` receives a non-zero value and `composite_score_ceiling` is removed from the bus payload.
 
 ---
 
@@ -417,6 +436,8 @@ The ladder detector runs **before** the composite scorer and passes its output a
 **File:** `signals/composite_signal_engine.py`
 
 The composite scorer receives both the qualifying episode from L2 and the ladder context from L4, then combines multiple independent signal dimensions into a single score and recommendation.
+
+**Score ceiling (Issue 5):** With `sector_score = 0.0` and `backtest_score = 0.0`, the active weights sum to 0.90, capping `composite_score` at 0.90 until S5 wires ladder context. The weights were deliberately left unchanged — redistributing the 0.10 would shift the scoring baseline and invalidate threshold calibration. Instead, the ceiling is exposed explicitly in the composite bus payload as `composite_score_ceiling: 0.90`. Frontend consumers should treat scores above 0.85 as effectively maximum conviction pre-S5. This field is removed when S5 wires real ladder data.
 
 **Backtest weight is zero.** The prior implementation used a seeded pseudorandom score. Any non-zero contribution from a fake number degrades every recommendation. Backtest weight will remain zero until S8 implements a real historical win-rate computation from `flow_events`.
 
@@ -437,7 +458,7 @@ The broadcast layer is where all upstream computation becomes durable records an
 
 **Persistence fields:** All direction metadata is persisted — `order_side`, `strong_sentiment`, and episode-level fields. Schema migration S2.5 must be deployed before this layer's writes are activated.
 
-**Composite signal payload:** The bus message includes both tick-level metadata (order_side, strong_sentiment) and episode-level metadata (direction, influence_tier, total_premium, is_accelerating). Downstream consumers should use episode fields for display and tick fields for filtering.
+**Composite signal payload:** The bus message includes `composite_score_ceiling: 0.90` while sector_score is inactive (pre-S5). This field is removed once S5 wires real ladder context. The message also includes both tick-level metadata (order_side, strong_sentiment) and episode-level metadata (direction, influence_tier, total_premium, is_accelerating).
 
 **Frontend broadcast:** Supabase Realtime pushes INSERT events to frontend clients via `flow_episodes` and `signal_history` channels. No changes to this mechanism — it is inherently event-driven.
 
@@ -460,6 +481,13 @@ The swarm layer is the only place in the entire pipeline where AI model calls ar
 
 These invariants are enforced by dedicated tests that run before any other test in the suite. They cannot regress.
 
+> **Updated April 30 2026 (Issue 8 resolution):** All four direction quadrants are now required
+> CI invariants. The original table covered only SELL-side cases. BUY CALL and BUY PUT are
+> equally regressionable — a parser refactor breaking BUY PUT direction would not have been
+> caught by the original invariant set.
+
+### SELL-Side Invariants (original)
+
 | Invariant | Test assertion |
 |---|---|
 | AT_BID + PUT = SELL side, BULLISH sentiment | `classify_order_direction("AT_BID", "PUT", False).sentiment == "BULLISH"` |
@@ -468,6 +496,19 @@ These invariants are enforced by dedicated tests that run before any other test 
 | AT_BID + PUT = strong_sentiment True | `classify_order_direction("AT_BID", "PUT", False).strong_sentiment == True` |
 | SELL + PUT maps to REPEAT_BUY | `order_side_to_direction("SELL", "PUT") == "REPEAT_BUY"` |
 | SELL + CALL maps to REPEAT_SELL | `order_side_to_direction("SELL", "CALL") == "REPEAT_SELL"` |
+
+### BUY-Side Invariants (added — Issue 8)
+
+| Invariant | Test assertion |
+|---|---|
+| AT_ASK + CALL = BUY side, BULLISH sentiment | `classify_order_direction("AT_ASK", "CALL", False).sentiment == "BULLISH"` |
+| AT_ASK + CALL = order_side BUY | `classify_order_direction("AT_ASK", "CALL", False).order_side == "BUY"` |
+| AT_ASK + CALL = strong_sentiment True | `classify_order_direction("AT_ASK", "CALL", False).strong_sentiment == True` |
+| AT_ASK + PUT = BUY side, BEARISH sentiment | `classify_order_direction("AT_ASK", "PUT", False).sentiment == "BEARISH"` |
+| AT_ASK + PUT = order_side BUY | `classify_order_direction("AT_ASK", "PUT", False).order_side == "BUY"` |
+| AT_ASK + PUT = strong_sentiment True | `classify_order_direction("AT_ASK", "PUT", False).strong_sentiment == True` |
+| BUY + CALL maps to REPEAT_BUY | `order_side_to_direction("BUY", "CALL") == "REPEAT_BUY"` |
+| BUY + PUT maps to REPEAT_SELL | `order_side_to_direction("BUY", "PUT") == "REPEAT_SELL"` |
 
 ---
 
@@ -503,16 +544,16 @@ These invariants are enforced by dedicated tests that run before any other test 
 ---
 
 ## Architect Review Notes
-*Applied April 30, 2026 — issues resolved in this revision:*
+*Applied April 30, 2026 — issues resolved in revision 1:*
 
 - **Issue 1 (spread gate):** Corrected diagram from invented tiered 15%/25% thresholds to the spec-authoritative 50% uniform gate. Added inline rationale explaining why a permissive threshold is intentional.
 - **Issue 2 (dual numbering):** Added explicit `INGESTION SUBSYSTEM` and `APEX SIGNAL SUBSYSTEM` section dividers in the diagram to make the layer numbering reset visually unambiguous.
 - **Issue 3 (persistence path):** Redrawn persistence path as a concurrent long-lived fan-out consumer, not a terminal dead-end branch. Added explicit note that persistence runs independently of signal path outcome.
 - **Issue 9 (story map blast radius):** Expanded S2 story map row to list all six affected files explicitly. Other rows also expanded for precision.
 
-*Pending (require spec + sprint plan co-updates — tracked separately):*
-- Issue 4: L3/L4 execution order — diagram corrected here; S6 acceptance criteria update pending.
-- Issue 5: sector_score 0.10 weight gap — diagram note added; spec/plan update pending.
-- Issue 6: ATM band concrete threshold — pending spec/plan update.
-- Issue 7: trade_count sweep bypass semantics — diagram note added; spec/plan update pending.
-- Issue 8: BUY-side CI gate invariants — pending spec/plan update.
+*Applied April 30, 2026 — issues resolved in revision 2:*
+
+- **Issue 5 (sector_score ceiling):** Added `SCORE CEILING` block to Apex L3 diagram node. Documents that weights sum to 0.90 pre-S5, decision not to redistribute the 0.10, and that `composite_score_ceiling: 0.90` is added to composite bus payload. Field removed when S5 wires real ladder context. Updated Apex L5 diagram node and layer description accordingly.
+- **Issue 6 (ATM band threshold):** Replaced vague "ATM eligible" language with the approved definition `abs(strike - underlying_price) / underlying_price <= 0.02`. Added OTM classification tiers (ATM 0–2%, Standard 2–12%, Deep OTM >12%) and the zero-underlying-price fallback. Updated both diagram and layer description.
+- **Issue 7 (trade_count sweep bypass semantics):** Replaced `trade_count == 1` with `len(ep.events) == 1` throughout diagram. Added explicit clarifying comment distinguishing episode event count from `fill_count` within a single tick. Added negative bypass condition to diagram.
+- **Issue 8 (BUY-side CI invariants):** Added BUY CALL and BUY PUT direction labels to the direction inference block in Layer 2 diagram. Expanded CI Gate Invariants table from 6 rows (SELL-side only) to 14 rows covering all four quadrants. Added update note documenting the reasoning.
