@@ -32,15 +32,33 @@ STREAM-6 (2026-04-30):
   each worker expects ~1 tick per 110s. The old 60s threshold produced
   stalled=63 in every STREAM_HEALTH report even when all workers were healthy.
 
+STREAM-7 (2026-05-01):
+  Fix QUEUE_FULL drops at market open. Root cause: _consume_queue() awaited
+  _process_trade serially. persist_flow_event() has a 2s timeout and
+  accumulator.ingest_tick() has non-trivial latency, so the drain rate lagged
+  far behind the 64-worker ingest rate, causing QUEUE_FULL at depth=50,000.
+
+  Fix: drain the queue non-blocking via create_task(), bounded by a
+  Semaphore(_PROCESS_CONCURRENCY=32). Each _process_trade acquires the
+  semaphore on entry and releases on exit, capping concurrent executions
+  to 32. This prevents unbounded parallelism on shared accumulator / dedup
+  state while keeping the queue from backing up.
+
+  Also: asyncio.sleep(60) -> asyncio.sleep(10) in run() main loop so
+  401 token-expired events are detected and respawned within 10s instead
+  of up to 60s (previous worst-case session gap).
+
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
   - 64 workers x 500 symbols = 31,920 OCC symbols, all streaming in parallel
   - 50ms staggered startup to avoid thundering-herd on Tradier endpoint
   - asyncio.Queue(maxsize=50_000) feeds a single _consume_queue() task
+  - _consume_queue drains at wire speed; _process_trade runs concurrently
+    under a Semaphore(32) cap to protect shared accumulator/dedup state
   - Manager logs STREAM_HEALTH every 30s: aggregate ticks, active workers,
     stalled workers, queue depth, global tick rate
-  - On 401 from any worker: _token_expired flag detected within 60s,
+  - On 401 from any worker: _token_expired flag detected within 10s,
     full token refresh + worker respawn
 """
 import asyncio
@@ -61,6 +79,8 @@ _STALL_THRESHOLD_S       = 300.0      # STREAM-6: raised from 60s; matches 120s 
 _SESSION_TOKEN_TIMEOUT_S = 10.0       # hard timeout for each get_session_token() attempt (STREAM-4)
 _SESSION_RETRY_DELAY_S   = 15.0       # delay between retry attempts (STREAM-5)
 _SESSION_QUOTA_BACKOFF_S = 20.0       # extra backoff on 400 Quota Violation (STREAM-5)
+_PROCESS_CONCURRENCY     = 32         # STREAM-7: max concurrent _process_trade coroutines
+_TOKEN_POLL_INTERVAL_S   = 10.0       # STREAM-7: poll interval for 401 detection (was 60s)
 
 
 class StreamManager:
@@ -83,6 +103,8 @@ class StreamManager:
         self._spawn_at:    Optional[float] = None
         self._total_ticks_at_last_health: int = 0
         self._last_health_at: float = _time.monotonic()
+        # STREAM-7: semaphore to cap concurrent process_fn executions
+        self._process_sem: asyncio.Semaphore = asyncio.Semaphore(_PROCESS_CONCURRENCY)
 
     # ------------------------------------------------------------------
     # Properties
@@ -144,8 +166,10 @@ class StreamManager:
         elapsed = 0.0
         try:
             while self._running:
-                await asyncio.sleep(60)
-                elapsed += 60.0
+                # STREAM-7: poll every 10s (was 60s) so 401 token expiry is
+                # detected and respawned within one poll cycle, not up to 60s.
+                await asyncio.sleep(_TOKEN_POLL_INTERVAL_S)
+                elapsed += _TOKEN_POLL_INTERVAL_S
                 if self._any_token_expired():
                     log.warning("[stream_manager] Token expired detected -- refreshing session + respawning")
                     await self._respawn_workers(force_token_refresh=True)
@@ -417,25 +441,46 @@ class StreamManager:
         )
 
     async def _consume_queue(self):
+        """
+        STREAM-7: Non-blocking concurrent queue drain.
+
+        Previously awaited _process_fn serially — one tick at a time.
+        With persist_flow_event() at up to 2s latency, drain rate << ingest
+        rate at market open burst, causing QUEUE_FULL at depth=50,000.
+
+        Now: pull items as fast as they arrive and dispatch each as a Task.
+        A Semaphore(_PROCESS_CONCURRENCY=32) caps concurrent executions to
+        prevent unbounded parallelism on shared accumulator / dedup state.
+        The semaphore is acquired inside _run_process() so the drain loop
+        itself never blocks waiting for a slot — if all 32 slots are taken,
+        the semaphore acquire yields to the event loop which will free a slot
+        before the next iteration.
+        """
         if self._queue is None:
             return
         log.info(
-            "[stream_manager] Queue consumer started -- maxsize=%d", _QUEUE_SIZE
+            "[stream_manager] Queue consumer started -- maxsize=%d concurrency=%d",
+            _QUEUE_SIZE, _PROCESS_CONCURRENCY,
         )
         processed = 0
-        try:
-            while True:
-                raw = await self._queue.get()
+
+        async def _run_process(raw: dict) -> None:
+            async with self._process_sem:
                 try:
                     if self._process_fn:
                         await self._process_fn(raw)
-                    processed += 1
                 except Exception as e:
                     log.error("[stream_manager] process_fn error: %s", e)
                 finally:
                     self._queue.task_done()
+
+        try:
+            while True:
+                raw = await self._queue.get()
+                processed += 1
+                asyncio.create_task(_run_process(raw), name=f"process-{processed}")
         except asyncio.CancelledError:
             log.info(
-                "[stream_manager] Queue consumer stopped -- total_processed=%d", processed
+                "[stream_manager] Queue consumer stopped -- total_dispatched=%d", processed
             )
             raise
