@@ -245,7 +245,7 @@ class TestRefreshTierMap:
         async def boom(quotes):
             raise RuntimeError("tier_engine down")
 
-        with caplog.at_level(logging.WARNING, logger="stream_worker"):
+        with caplog.at_level(logging.WARNING, logger="services.stream_worker"):
             with patch("services.symbol_registry.get_registry", return_value=reg):
                 with patch("services.tier_engine.assign_tiers", side_effect=boom):
                     from services.stream_worker import _refresh_tier_map
