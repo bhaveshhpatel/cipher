@@ -22,7 +22,6 @@ NOTE on simulation/run mocking (Apex S0):
   to return a minimal EnsembleResult so the endpoint returns 200 without
   calling the real deprecated function.
 """
-import asyncio
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
 from main import app
