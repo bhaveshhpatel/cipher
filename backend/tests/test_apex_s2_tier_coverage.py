@@ -32,7 +32,6 @@ from services.stream_worker import (
     _TICK_SIZE,
     _TICK_VOLUME,
     _TICK_TIMESTAMP,
-    tick_to_metrics,
 )
 
 
@@ -91,6 +90,8 @@ class TestRefreshTierMap:
         """
         Happy path: registry ready, assign_tiers returns a valid map.
         Cache must be populated and timestamp updated.
+        Patches the lazy imports inside _refresh_tier_map via their
+        fully-qualified module paths.
         """
         import services.stream_worker as sw
 
@@ -99,71 +100,23 @@ class TestRefreshTierMap:
 
         reg = _make_registry(watchlist=["AAPL", "TSLA"])
 
-        from services.symbols_loader import SymbolQuote
         async def fake_assign_tiers(quotes):
             return {q.symbol: 1 for q in quotes}
-
-        with patch("services.stream_worker._refresh_tier_map.__globals__", {}, create=True):
-            pass  # import path patched below
 
         with patch("services.symbol_registry.get_registry", return_value=reg):
             with patch("services.tier_engine.assign_tiers", side_effect=fake_assign_tiers):
                 from services.stream_worker import _refresh_tier_map
                 await _refresh_tier_map()
 
-        assert sw._tier_map_cache != {} or True  # patched via module below
-
-    @pytest.mark.asyncio
-    async def test_happy_path_via_module_patch(self):
-        """
-        Happy path using module-level patches that match the function's
-        import path inside stream_worker.
-        """
-        import services.stream_worker as sw
-        from services.symbols_loader import SymbolQuote
-
-        sw._tier_map_cache = {}
-        sw._tier_map_ts = 0.0
-
-        reg = _make_registry(watchlist=["AAPL", "TSLA"])
-
-        async def fake_assign_tiers(quotes):
-            return {q.symbol: (1 if q.symbol == "AAPL" else 2) for q in quotes}
-
-        before = sw._tier_map_ts
-
-        with patch("services.stream_worker._refresh_tier_map") as mock_refresh:
-            # Call the real function directly with its dependencies patched
-            mock_refresh.side_effect = None  # we'll call real below
-
-        # Patch inside the function's own module globals
-        with patch.dict(
-            "sys.modules",
-            {
-                "services.symbol_registry": MagicMock(get_registry=lambda: reg),
-                "services.tier_engine": MagicMock(assign_tiers=AsyncMock(return_value={"AAPL": 1, "TSLA": 2})),
-            },
-        ):
-            # Re-import to pick up patched modules
-            import importlib
-            import services.stream_worker as sw2
-            importlib.reload(sw2)
-
-            sw2._tier_map_cache = {}
-            sw2._tier_map_ts = 0.0
-
-            # Patch the symbols_loader import path
-            with patch("services.stream_worker._refresh_tier_map", wraps=sw2._refresh_tier_map):
-                await sw2._refresh_tier_map()
-
-            # After reload the cache should be populated
-            assert isinstance(sw2._tier_map_cache, dict)
+        assert sw._tier_map_cache.get("AAPL") == "T1"
+        assert sw._tier_map_cache.get("TSLA") == "T1"
+        assert sw._tier_map_ts > 0.0
 
     @pytest.mark.asyncio
     async def test_registry_none_skips_update(self):
         """
         When get_registry() returns None, function returns early.
-        Cache must remain unchanged.
+        Cache and timestamp must remain unchanged.
         """
         import services.stream_worker as sw
 
@@ -227,10 +180,9 @@ class TestRefreshTierMap:
     async def test_int_tiers_converted_to_strings(self):
         """
         assign_tiers returns int tiers (1/2/3). Cache must store string
-        keys "T1"/"T2"/"T3" — not raw integers.
+        values "T1"/"T2"/"T3" — not raw integers.
         """
         import services.stream_worker as sw
-        from services.symbols_loader import SymbolQuote
 
         sw._tier_map_cache = {}
         sw._tier_map_ts = 0.0
@@ -269,32 +221,30 @@ class TestProcessTickRegistryLookup:
             w._process_tick(tick)
 
         assert "AAPL" in w._pending
-        # volume_ratio = 50_000 / 1.0 = 50_000 (fallback baseline used)
+        # volume_ratio = 50_000 / 1.0 (fallback baseline)
         assert w._pending["AAPL"].volume_ratio == pytest.approx(50_000.0)
 
     def test_symbol_missing_from_avg_volume_uses_fallback(self):
         """
-        Registry is present but does not have this symbol's avg_volume.
-        Must fall back to 1.0, not crash.
+        Registry is present but the symbol is not in _avg_volume_by_ticker.
+        .get() returns 0, which triggers the fallback to 1.0.
         """
         w = _make_worker()
         tick = _timesale(symbol="NVDA", last=400.0, size=2, volume=10_000)
 
         reg = MagicMock()
-        reg.is_ready.return_value = True
-        reg._avg_volume_by_ticker = {}  # NVDA not present
+        reg._avg_volume_by_ticker = {}  # NVDA absent
 
         with patch("services.symbol_registry.get_registry", return_value=reg):
             w._process_tick(tick)
 
         assert "NVDA" in w._pending
-        # avg_volume resolves to 0 from .get(), then fallback to 1.0
         assert w._pending["NVDA"].volume_ratio == pytest.approx(10_000.0)
 
     def test_registry_lookup_exception_still_processes_tick(self):
         """
-        If accessing registry internals throws, the exception must be swallowed
-        and the tick must still be accumulated with fallback avg_volume=1.0.
+        If get_registry() raises, the exception must be swallowed and the
+        tick must still be accumulated with fallback avg_volume=1.0.
         """
         w = _make_worker()
         tick = _timesale(symbol="TSLA", last=200.0, size=3, volume=1_000)
