@@ -29,17 +29,17 @@ Issue #30 (2026-05-01) — Test isolation / module global teardown:
   around every test in the class. Prevents session-level pollution from
   sentinel values left behind by individual tests.
 
-Open follow-up issues from panel deliberation:
-  #31 — happy path must assert _tier_map_refresh_task state post-call
-  #32 — exception test must assert warning was logged
-  #33 — add test: _get_tier_map when task already running (not done)
-  #34 — add test: inner registry exception path in _process_tick
-  #35 — add test: assign_tiers returns empty dict
+Post-deliberation follow-ups resolved in this file:
+  #31 — happy path now asserts _tier_map_refresh_task is None or done post-call
+  #32 — exception test now uses caplog to assert warning was emitted
+  #34 — new test: inner registry exception path (_avg_volume_by_ticker.get raises)
+  #35 — new test: assign_tiers returns empty dict {}
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -127,27 +127,31 @@ class TestRefreshTierMap:
           - sw._tier_map_cache        (dict[str, str])
           - sw._tier_map_ts           (float)
           - sw._tier_map_refresh_task (asyncio.Task | None)
+          - sw._tier_map_refresh_in_progress (bool)  (#24)
 
         Pattern: snapshot before yield, unconditional restore in finally.
         This makes each test hermetic — it can freely mutate module state
         without affecting any other test in the session.
         """
         import services.stream_worker as sw
-        saved_cache = dict(sw._tier_map_cache)
-        saved_ts    = sw._tier_map_ts
-        saved_task  = sw._tier_map_refresh_task
+        saved_cache    = dict(sw._tier_map_cache)
+        saved_ts       = sw._tier_map_ts
+        saved_task     = sw._tier_map_refresh_task
+        saved_progress = sw._tier_map_refresh_in_progress
         try:
             yield
         finally:
-            sw._tier_map_cache        = saved_cache
-            sw._tier_map_ts           = saved_ts
-            sw._tier_map_refresh_task = saved_task
+            sw._tier_map_cache               = saved_cache
+            sw._tier_map_ts                  = saved_ts
+            sw._tier_map_refresh_task        = saved_task
+            sw._tier_map_refresh_in_progress = saved_progress
 
     @pytest.mark.asyncio
     async def test_happy_path_rebuilds_cache(self):
         """
         Happy path: registry ready, assign_tiers returns a valid map.
-        Cache must be populated and timestamp updated.
+        Cache must be populated, timestamp updated, and _tier_map_refresh_task
+        must be None or done after the coroutine returns (#31 S2-POST-9).
 
         Fix 2 — patch target note: _refresh_tier_map uses lazy imports
         (inside the function body), so patching the source modules
@@ -173,6 +177,12 @@ class TestRefreshTierMap:
         assert sw._tier_map_cache.get("AAPL") == "T1"
         assert sw._tier_map_cache.get("TSLA") == "T1"
         assert sw._tier_map_ts > 0.0
+        # #31: _refresh_tier_map is a coroutine — no task is created inside it.
+        # After awaiting it directly, _tier_map_refresh_task must be None or done.
+        assert (
+            sw._tier_map_refresh_task is None
+            or sw._tier_map_refresh_task.done()
+        ), "_tier_map_refresh_task must be None or done after _refresh_tier_map completes"
 
     @pytest.mark.asyncio
     async def test_registry_none_skips_update(self):
@@ -215,13 +225,14 @@ class TestRefreshTierMap:
         assert sw._tier_map_ts == original_ts
 
     @pytest.mark.asyncio
-    async def test_assign_tiers_exception_does_not_raise(self):
+    async def test_assign_tiers_exception_does_not_raise(self, caplog):
         """
         When assign_tiers raises, the exception must be caught and logged
-        as a warning. Cache must remain unchanged (non-fatal).
+        as a warning (#32 S2-POST-10). Cache must remain unchanged (non-fatal).
 
-        Note: this test does not yet assert the warning was logged.
-        That gap is tracked in issue #32.
+        #32: caplog asserts a WARNING-level entry is emitted containing
+        meaningful context from the exception. A silent swallow (exception
+        caught, nothing logged) will now fail this test.
         """
         import services.stream_worker as sw
 
@@ -234,12 +245,20 @@ class TestRefreshTierMap:
         async def boom(quotes):
             raise RuntimeError("tier_engine down")
 
-        with patch("services.symbol_registry.get_registry", return_value=reg):
-            with patch("services.tier_engine.assign_tiers", side_effect=boom):
-                from services.stream_worker import _refresh_tier_map
-                await _refresh_tier_map()  # must not raise
+        with caplog.at_level(logging.WARNING, logger="services.stream_worker"):
+            with patch("services.symbol_registry.get_registry", return_value=reg):
+                with patch("services.tier_engine.assign_tiers", side_effect=boom):
+                    from services.stream_worker import _refresh_tier_map
+                    await _refresh_tier_map()  # must not raise
 
         assert sw._tier_map_cache == sentinel
+        # #32: assert the warning was actually logged
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records, "Expected a WARNING log entry when assign_tiers raises"
+        assert any(
+            "tier_engine down" in r.message or "_refresh_tier_map" in r.message
+            for r in warning_records
+        ), "WARNING log must contain meaningful context from the exception"
 
     @pytest.mark.asyncio
     async def test_int_tiers_converted_to_strings(self):
@@ -266,6 +285,38 @@ class TestRefreshTierMap:
         assert sw._tier_map_cache.get("AAPL") == "T1"
         assert sw._tier_map_cache.get("TSLA") == "T2"
         assert sw._tier_map_cache.get("SPY") == "T3"
+
+    @pytest.mark.asyncio
+    async def test_assign_tiers_returns_empty_dict(self):
+        """
+        #35 S2-POST-13: assign_tiers returns {} (e.g. tier_engine cold start).
+
+        Expected behaviour:
+          - _tier_map_cache is set to {} (no symbol has a tier)
+          - _tier_map_ts > 0.0 (timestamp IS updated — refresh did complete)
+          - No exception raised
+
+        Downstream impact: every symbol falls back to T3 until the next
+        refresh cycle, because ThresholdReconciler defaults missing symbols
+        to T3. This is documented as an operational edge case in issue #35.
+        """
+        import services.stream_worker as sw
+
+        sw._tier_map_cache = {"AAPL": "T1"}  # pre-existing cache
+        sw._tier_map_ts = 0.0
+
+        reg = _make_registry(watchlist=["AAPL", "TSLA"])
+
+        async def fake_assign_tiers(quotes):
+            return {}  # empty — tier_engine cold start scenario
+
+        with patch("services.symbol_registry.get_registry", return_value=reg):
+            with patch("services.tier_engine.assign_tiers", side_effect=fake_assign_tiers):
+                from services.stream_worker import _refresh_tier_map
+                await _refresh_tier_map()  # must not raise
+
+        assert sw._tier_map_cache == {}, "Empty assign_tiers result must write empty cache"
+        assert sw._tier_map_ts > 0.0, "Timestamp must be updated even when assign_tiers returns {}"
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +384,34 @@ class TestProcessTickRegistryLookup:
 
         assert "TSLA" in w._pending
         assert w._pending["TSLA"].volume_ratio == pytest.approx(1_000.0)
+
+    def test_inner_registry_exception_still_processes_tick(self):
+        """
+        #34 S2-POST-12: get_registry() succeeds and returns a non-None registry,
+        but reg._avg_volume_by_ticker.get() raises a RuntimeError (e.g. a
+        property getter that raises on access).
+
+        Expected behaviour:
+          - The exception is swallowed by the try/except in _process_tick
+          - avg_volume falls back to 1.0
+          - The tick still lands in _pending with volume_ratio = volume / 1.0
+          - No exception propagates to the caller
+
+        This is distinct from the get_registry() raise covered by
+        test_registry_lookup_exception_still_processes_tick: here the
+        registry object itself is returned, but its internal .get() raises.
+        """
+        w = _make_worker()
+        tick = _timesale(symbol="MSFT", last=300.0, size=4, volume=8_000)
+
+        reg = MagicMock()
+        reg.is_ready.return_value = True
+        # .get() raises instead of returning a value
+        reg._avg_volume_by_ticker.get.side_effect = RuntimeError("attribute error")
+
+        with patch("services.symbol_registry.get_registry", return_value=reg):
+            w._process_tick(tick)  # must not raise
+
+        assert "MSFT" in w._pending, "Tick must land in _pending despite inner registry exception"
+        # avg_volume falls back to 1.0 → volume_ratio = 8_000 / 1.0
+        assert w._pending["MSFT"].volume_ratio == pytest.approx(8_000.0)

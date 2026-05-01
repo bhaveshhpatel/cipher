@@ -44,12 +44,33 @@ APEX-S2 (2026-05-01):
     Stale refresh is a background asyncio.create_task — never blocks the
     stream reader. int tier (1/2/3) converted to str (T1/T2/T3) at this
     boundary so ThresholdReconciler.reconcile() receives the expected format.
+    _tier_map_refresh_in_progress flag prevents double-spawn across workers
+    (#24 S2-POST-3).
 
   _pending accumulator + _flush_loop() per worker.
     Ticks accumulate into dict[str, SymbolMetrics] (last-write-wins).
     Flushed every _RECONCILE_INTERVAL_S = 5.0s via asyncio.create_task.
     Atomic drain: pending dict swapped before await so in-flight ticks
     go to the next window, not a shared dict being iterated.
+    _flush_loop stores task + attaches done callback for silent failure
+    detection (#23 S2-POST-2).
+
+S2-POST-3 (2026-05-01):
+  Add _tier_map_refresh_in_progress bool flag. _get_tier_map() checks this
+  flag (in addition to task.done()) before spawning a new refresh task.
+  _refresh_tier_map sets it True at entry and clears it in finally.
+  Prevents double-spawn across 64 workers observing a stale cache on the
+  same tick cycle.
+
+S2-POST-2 (2026-05-01):
+  _flush_loop now stores the task returned by create_task and attaches a
+  done callback (_on_flush_done) that logs at ERROR level if the task raises
+  an unhandled exception. Guards against future refactors that remove the
+  try/except inside _flush_pending.
+
+S2-POST-4 (2026-05-01):
+  CancelledError in run() was swallowed (return instead of raise). Fixed:
+  raise after log so the parent task/gather observes cancellation correctly.
 """
 import asyncio
 import json
@@ -102,6 +123,12 @@ _tier_map_cache: dict[str, str]        = {}    # symbol → "T1" | "T2" | "T3"
 _tier_map_ts:    float                 = 0.0
 _tier_map_refresh_task: Optional[asyncio.Task] = None
 
+# S2-POST-3 (#24): boolean flag prevents double-spawn across 64 workers
+# observing a stale cache on the same tick cycle.
+# Set True at _refresh_tier_map entry; cleared in its finally block.
+# GIL makes bool reads atomic so no asyncio.Lock is needed.
+_tier_map_refresh_in_progress: bool = False
+
 
 def _int_tier_to_str(t: int) -> str:
     """Convert tier_engine int tier (1/2/3) to reconciler string (T1/T2/T3)."""
@@ -110,7 +137,9 @@ def _int_tier_to_str(t: int) -> str:
 
 async def _refresh_tier_map() -> None:
     """Background task: rebuild tier_map from tier_engine + symbol_registry."""
-    global _tier_map_cache, _tier_map_ts
+    global _tier_map_cache, _tier_map_ts, _tier_map_refresh_in_progress
+    # S2-POST-3 (#24): set flag at entry; cleared unconditionally in finally.
+    _tier_map_refresh_in_progress = True
     try:
         from services.symbol_registry import get_registry
         from services.tier_engine import assign_tiers
@@ -147,6 +176,8 @@ async def _refresh_tier_map() -> None:
         )
     except Exception as exc:
         log.warning("[stream_worker] _refresh_tier_map error (non-fatal): %s", exc)
+    finally:
+        _tier_map_refresh_in_progress = False
 
 
 def _get_tier_map() -> dict[str, str]:
@@ -154,11 +185,21 @@ def _get_tier_map() -> dict[str, str]:
     Return cached tier_map. If stale, schedule a background refresh and
     return the current (possibly empty) cache immediately — never blocks.
     Cold start: returns {} → reconciler falls back to T3 for all symbols.
+
+    S2-POST-3 (#24): also checks _tier_map_refresh_in_progress to prevent
+    a second task from spawning while a refresh is already running. Since
+    _refresh_tier_map is a coroutine (not a thread), the GIL guarantees that
+    the bool read and the task.done() check are effectively atomic within a
+    single event-loop tick.
     """
     global _tier_map_refresh_task
     now = _time.monotonic()
     if (now - _tier_map_ts) >= _TIER_MAP_TTL:
-        if _tier_map_refresh_task is None or _tier_map_refresh_task.done():
+        already_running = (
+            _tier_map_refresh_in_progress
+            or (_tier_map_refresh_task is not None and not _tier_map_refresh_task.done())
+        )
+        if not already_running:
             try:
                 _tier_map_refresh_task = asyncio.create_task(
                     _refresh_tier_map(),
@@ -411,14 +452,32 @@ class StreamWorker:
                 self.worker_id, exc,
             )
 
+    def _on_flush_done(self, task: asyncio.Task) -> None:
+        """
+        S2-POST-2 (#23): Done callback attached to every reconcile-flush task.
+        Logs at ERROR if the task raised an unhandled exception that escaped
+        _flush_pending's try/except — guards against future refactors that
+        weaken that guard.
+        """
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                log.error(
+                    "[worker-%d] reconcile-flush task raised unhandled exception: %s",
+                    self.worker_id, exc,
+                )
+
     async def _flush_loop(self) -> None:
         """Periodic flush task running alongside the stream reader."""
         while self._running:
             await asyncio.sleep(_RECONCILE_INTERVAL_S)
-            asyncio.create_task(
+            # S2-POST-2 (#23): store task + attach done callback to surface
+            # silent failures from any future refactor that weakens _flush_pending.
+            task = asyncio.create_task(
                 self._flush_pending(),
                 name=f"reconcile-flush-{self.worker_id}",
             )
+            task.add_done_callback(self._on_flush_done)
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -611,8 +670,11 @@ class StreamWorker:
                     )
 
                 except asyncio.CancelledError:
+                    # S2-POST-4 (#25): re-raise per asyncio contract.
+                    # flush_task.cancel() in the outer finally block runs
+                    # before this propagates, so shutdown is clean.
                     log.info("[worker-%d] Cancelled — stopping", self.worker_id)
-                    return
+                    raise
 
                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
                     self._errors += 1
