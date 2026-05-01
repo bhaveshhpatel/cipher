@@ -544,209 +544,187 @@ new sections for this issue.
   dependencies already enforce the correct implementation order.
   
 ---
-## Session 21 — Issue 9 Patch
-*May 1 2026, 2026 — post spec-review deliberation*
+## Session 21 — Issue 9: REPEAT_BUY Collapses BUY CALL and SELL PUT — Loss of Execution Mechanic Dimension
+*May 1, 2026 — panel deliberation: Senior Software Architect + Principal Backend Software Engineer + Lead QA Engineer*
 
-## 1. Changes to S2 — Parser + Detector Layer Fixes
+### Issue Raised
+The product owner raised the following concern:
 
-### Add to the `order_side_classifier.py` section, after the existing NamedTuple definition:
-
-```python
-class OrderDirection(NamedTuple):
-    order_side: str
-    sentiment: str
-    strong_sentiment: bool
-    execution_mechanic: str   # NEW — additive; does not change direction semantics
-
-
-_MECHANIC_MAP = {
-    ("BUY",     "CALL"): "DIRECTIONAL_LONG",
-    ("BUY",     "PUT"):  "DIRECTIONAL_SHORT",
-    ("SELL",    "PUT"):  "PASSIVE_BULLISH",
-    ("SELL",    "CALL"): "PASSIVE_BEARISH",
-    ("UNKNOWN", "CALL"): "AMBIGUOUS_LONG",
-    ("UNKNOWN", "PUT"):  "AMBIGUOUS_SHORT",
-}
-
-
-def classify_order_direction(
-    bid_ask_class: str,
-    contract_type: str,
-    is_synthetic: bool,
-) -> OrderDirection:
-    if is_synthetic:
-        fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
-        mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
-        return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
-
-    if bid_ask_class in _BUY_CLASSES:
-        sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
-        mechanic = _MECHANIC_MAP[("BUY", contract_type)]
-        return OrderDirection("BUY", sentiment, True, mechanic)
-
-    if bid_ask_class in _SELL_CLASSES:
-        sentiment = "BEARISH" if contract_type == "CALL" else "BULLISH"
-        mechanic = _MECHANIC_MAP[("SELL", contract_type)]
-        return OrderDirection("SELL", sentiment, True, mechanic)
-
-    fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
-    mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
-    return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
-```
-
-**Mechanic taxonomy (complete, non-overlapping):**
-
-| order_side | contract_type | execution_mechanic  | Market interpretation                             |
-|------------|---------------|---------------------|---------------------------------------------------|
-| BUY        | CALL          | DIRECTIONAL_LONG    | Long call; net premium outlay; urgency/conviction |
-| BUY        | PUT           | DIRECTIONAL_SHORT   | Long put hedge or short bet; premium outlay       |
-| SELL       | PUT           | PASSIVE_BULLISH     | Put selling; short vega; income or floor view     |
-| SELL       | CALL          | PASSIVE_BEARISH     | Call selling; short gamma; income or hedge        |
-| UNKNOWN    | CALL          | AMBIGUOUS_LONG      | Mid-print or synthetic call — intent unclear      |
-| UNKNOWN    | PUT           | AMBIGUOUS_SHORT     | Mid-print or synthetic put — intent unclear       |
-
-### Add `execution_mechanic` to `OptionsFlowEvent`:
-
-```python
-execution_mechanic: str = "AMBIGUOUS_LONG"   # persists alongside order_side
-```
-
-### Update parser assignment block (same location as order_side):
-
-```python
-ev.order_side          = direction.order_side
-ev.sentiment           = direction.sentiment
-ev.strong_sentiment    = direction.strong_sentiment
-ev.execution_mechanic  = direction.execution_mechanic   # NEW
-```
-
-### Update registry enrichment re-derive block (same location):
-
-```python
-direction = classify_order_direction(
-    ev.bid_ask_class, ev.contract_type, ev.is_synthetic_quote,
-)
-ev.order_side          = direction.order_side
-ev.sentiment           = direction.sentiment
-ev.strong_sentiment    = direction.strong_sentiment
-ev.execution_mechanic  = direction.execution_mechanic   # re-derived, not overwritten
-```
-
-> **Deliberation note (Architect + Principal Engineer + Lead QA, May 1 2026):**
-> BUY CALL and SELL PUT both resolve to REPEAT_BUY (delta-positive), but their execution
-> mechanics are structurally different. BUY CALL is an aggressive directional bet (long
-> premium, urgency signal). SELL PUT is passive positioning (short vega, income or floor
-> view). Collapsing them into REPEAT_BUY discards the mechanic dimension. The panel agreed
-> not to alter direction semantics — all downstream consumers stay unchanged — but to add
-> `execution_mechanic` as a new additive metadata field on `OrderDirection`, `OptionsFlowEvent`,
-> the persistence payload, and the composite bus payload. Direction, dominant_direction, and
-> all thresholds are unchanged. (Issue 9 resolution)
+> The current `order_side_to_direction()` mapping collapses two structurally distinct
+> trade mechanics into a single feature: REPEAT_BUY.
+>
+> - BUY + CALL = REPEAT_BUY: aggressive directional bet; urgency and conviction; net long delta via premium outlay.
+> - SELL + PUT = REPEAT_BUY: passive income generation, volatility trade (short vega), or floor expression; net long delta via premium collection.
+>
+> Both are delta-positive, but their mechanics, Greeks profile, and market interpretation
+> are entirely different. Collapsing them makes the system unable to distinguish between
+> a highly aggressive directional bet and passive positioning. This is a future capability
+> gap even if we do not use the dimension today.
 
 ---
 
-## 2. Changes to S2.5 — Supabase Migration
+### Architect Opening Position
 
-### Add `execution_mechanic` column to the S2.5 migration SQL:
+**Architect:** The concern is structurally correct. The `REPEAT_BUY` label was always an
+abstraction over delta direction — it captures what the market is expressing, not how it's
+being expressed. The pipeline was designed from first principles around the output question:
+"Is this flow bullish or bearish?" — not the execution question: "How is the participant
+expressing that view?"
+
+That said, I do not think the resolution is to add a third direction value like
+`REPEAT_BUY_PASSIVE` or to split the `REPEAT_BUY` path. That would break every downstream
+consumer of the direction field simultaneously and requires DB migration, frontend logic
+changes, and signal threshold recalibration — all for metadata that, by the product owner's
+own admission, we don't intend to act on yet.
+
+The correct resolution is to add a **metadata field** that preserves the execution mechanic
+dimension alongside the direction output, without altering direction semantics or any
+downstream consumer. The direction field stays as-is. The new field is an additive signal
+enrichment.
+
+**My proposal: add `execution_mechanic` as a new string field on `OptionsFlowEvent` and
+in the persistence payload.** The field captures how the delta-directional exposure was
+achieved, independently of whether the direction is REPEAT_BUY or REPEAT_SELL.
+
+---
+
+### Principal Engineer Response
+
+**Principal Engineer:** I agree with the architect's framing — don't touch direction
+semantics. Any change to `REPEAT_BUY`/`REPEAT_SELL` would cascade into every downstream
+consumer: frontend, WebSocket bus payload, `flow_episodes` persistence schema, and the
+composite scorer's `recommendation` field. That's a large blast radius for an enrichment.
+
+The mechanic metadata approach is clean because it decouples the two concerns:
+- "What direction?" → `dominant_direction` (existing, unchanged)
+- "How was that direction achieved?" → `execution_mechanic` (new, additive)
+
+On the implementation: the mechanic classification belongs in `order_side_classifier.py`
+alongside the existing `classify_order_direction()` function, since it reads from the same
+inputs: `order_side` and `contract_type`. It should be added to the `OrderDirection`
+NamedTuple as a fourth field.
+
+**Proposed mechanic taxonomy:**
+
+| order_side | contract_type | execution_mechanic        | rationale                                      |
+|------------|---------------|---------------------------|------------------------------------------------|
+| BUY        | CALL          | DIRECTIONAL_LONG          | Long call, net premium outlay, urgency signal  |
+| BUY        | PUT           | DIRECTIONAL_SHORT         | Long put hedge or short bet, premium outlay    |
+| SELL       | PUT           | PASSIVE_BULLISH           | Put selling, short vega, income/floor view     |
+| SELL       | CALL          | PASSIVE_BEARISH           | Call selling, short gamma, income or hedge     |
+| UNKNOWN    | CALL          | AMBIGUOUS_LONG            | Mid-print call — ambiguous intent              |
+| UNKNOWN    | PUT           | AMBIGUOUS_SHORT           | Mid-print put — ambiguous intent               |
+
+This six-value taxonomy is complete and non-overlapping. Every (order_side, contract_type)
+combination maps to exactly one mechanic. No ambiguity in implementation.
+
+---
+
+### Lead QA Engineer Position
+
+**QA Lead:** From a testability standpoint, the mechanic field is a significant improvement
+over the current model because it gives tests a way to assert *how* a signal was generated,
+not just what direction it resolved to. Two tests that currently produce identical
+`REPEAT_BUY` outputs are now distinguishable:
+
+```
+BUY CALL → REPEAT_BUY + DIRECTIONAL_LONG   ← aggressive long
+SELL PUT → REPEAT_BUY + PASSIVE_BULLISH    ← passive floor view
+```
+
+This matters for regression tests on the Apex composite layer. Right now, if a developer
+inadvertently transposes the conviction formula weights for buy-side vs sell-side, the
+test can only catch it via score magnitude. With `execution_mechanic`, a test can assert
+the mechanic directly and immediately surface any misclassification without needing to
+calibrate score thresholds.
+
+I propose adding 6 mechanic invariants to the CI gate alongside the 14 existing direction
+invariants. This brings the total direction CI gate to 20 assertions — still a single
+test file, still O(1) to run.
+
+**Additional QA concern:** The `execution_mechanic` field must be included in the
+`flow_events` persistence payload and the composite bus payload from day one, not added
+as a future enrichment. If we ship without it, we'll have a period of historical data
+in `flow_events` with no mechanic column, which degrades the value of S8 (real backtest
+scoring) because you can't retrospectively stratify by execution mechanic.
+
+---
+
+### Architect Response to QA
+
+**Architect:** Agreed on both points. The mechanic must persist from the moment the field
+exists, not optionally. The QA engineer is right that retroactive enrichment is not
+realistic for a high-volume stream table — you'd be running an UPDATE on millions of rows
+with no good join key.
+
+On the DB side, this means S2.5 gets a third new column:
 
 ```sql
 ALTER TABLE flow_events
-  ADD COLUMN IF NOT EXISTS order_side TEXT
-    CHECK (order_side IN ('BUY', 'SELL', 'UNKNOWN'))
-    DEFAULT 'UNKNOWN',
-  ADD COLUMN IF NOT EXISTS strong_sentiment BOOLEAN NOT NULL DEFAULT FALSE,
-  ADD COLUMN IF NOT EXISTS execution_mechanic TEXT                         -- NEW
+  ADD COLUMN IF NOT EXISTS execution_mechanic TEXT
     CHECK (execution_mechanic IN (
-      'DIRECTIONAL_LONG',
-      'DIRECTIONAL_SHORT',
-      'PASSIVE_BULLISH',
-      'PASSIVE_BEARISH',
-      'AMBIGUOUS_LONG',
-      'AMBIGUOUS_SHORT'
+      'DIRECTIONAL_LONG', 'DIRECTIONAL_SHORT',
+      'PASSIVE_BULLISH',  'PASSIVE_BEARISH',
+      'AMBIGUOUS_LONG',   'AMBIGUOUS_SHORT'
     ))
     DEFAULT 'AMBIGUOUS_LONG';
 ```
 
-### Update persistence payload to include `execution_mechanic`:
-
-```python
-await persist_flow_event({
-    ...
-    "order_side":         ev.order_side,
-    "strong_sentiment":   ev.strong_sentiment,
-    "execution_mechanic": ev.execution_mechanic,   # NEW
-})
-```
-
-> **QA Lead note:** The mechanic column must land in S2.5 alongside `order_side` and
-> `strong_sentiment`. Retroactive enrichment of the column is not feasible on a
-> high-volume stream table. Any future S8 backtest stratification by mechanic type
-> requires the column to be populated from first write.
+On the CI gate: I support the 6 new mechanic invariants. However, I want to be precise
+about what they assert. The mechanic invariants should not duplicate direction assertions —
+they should exclusively assert the mechanic given the same inputs. No cross-linking.
 
 ---
 
-## 3. Changes to S6 — Composite Bus Payload
+### Resolution
 
-### Add `execution_mechanic` to the `signal` block of the composite bus payload:
+**Agreed by all three:**
 
-```python
-"signal": {
-    "ticker":                  composite.ticker,
-    "recommendation":          composite.recommendation,
-    "composite_score":         composite.composite_score,
-    "composite_score_ceiling": 0.90,
-    "flow_score":              composite.flow_score,
-    "backtest_score":          composite.backtest_score,
-    "volume_premium_factor":   composite.volume_premium_factor,
-    "reasoning":               composite.reasoning,
-    "alert_level":             alert_level,
-    "order_side":              ev.order_side,
-    "strong_sentiment":        ev.strong_sentiment,
-    "execution_mechanic":      ev.execution_mechanic,   # NEW — additive, non-breaking
-},
-```
+1. **`execution_mechanic` field added to `OrderDirection` NamedTuple** as a fourth field.
+   The existing three fields (`order_side`, `sentiment`, `strong_sentiment`) are unchanged.
 
-> Existing downstream consumers can ignore this field safely. It is additive.
+2. **`classify_order_direction()` returns the mechanic** alongside existing output.
+   Implementation is a lookup against the six-entry taxonomy table above. No new function —
+   same function, same inputs, one additional output field.
 
----
+3. **`OptionsFlowEvent` gains `execution_mechanic: str = "AMBIGUOUS_LONG"`** as a new
+   field alongside `order_side` and `strong_sentiment`. Default is `AMBIGUOUS_LONG`
+   to safely handle any path that doesn't flow through the classifier.
 
-## 4. Changes to Directional Invariants — CI Gate Section
+4. **S2.5 migration adds `execution_mechanic` column** to `flow_events` with a `CHECK`
+   constraint on the six valid values and `DEFAULT 'AMBIGUOUS_LONG'`.
 
-### Update total assertion count to 20 (14 direction + 6 mechanic):
+5. **Composite bus payload includes `execution_mechanic`** in the `signal` block.
+   This is a non-breaking addition — existing consumers can ignore the field.
 
-```python
-# ── Execution Mechanic Invariants (added — Issue 9) ─────────────────────────
-def test_mechanic_invariants():
-    c = classify_order_direction
+6. **6 new CI gate invariants** added to `test_direction_invariants.py`:
 
-    assert c("AT_ASK",    "CALL", False).execution_mechanic == "DIRECTIONAL_LONG"
-    assert c("ABOVE_ASK", "CALL", False).execution_mechanic == "DIRECTIONAL_LONG"
-    assert c("AT_ASK",    "PUT",  False).execution_mechanic == "DIRECTIONAL_SHORT"
-    assert c("ABOVE_ASK", "PUT",  False).execution_mechanic == "DIRECTIONAL_SHORT"
-    assert c("AT_BID",    "PUT",  False).execution_mechanic == "PASSIVE_BULLISH"
-    assert c("BELOW_BID", "PUT",  False).execution_mechanic == "PASSIVE_BULLISH"
-    assert c("AT_BID",    "CALL", False).execution_mechanic == "PASSIVE_BEARISH"
-    assert c("BELOW_BID", "CALL", False).execution_mechanic == "PASSIVE_BEARISH"
-    assert c("MID",       "CALL", False).execution_mechanic == "AMBIGUOUS_LONG"
-    assert c("MID",       "PUT",  False).execution_mechanic == "AMBIGUOUS_SHORT"
-    assert c("AT_ASK",    "CALL", True).execution_mechanic  == "AMBIGUOUS_LONG"
-    assert c("AT_ASK",    "PUT",  True).execution_mechanic  == "AMBIGUOUS_SHORT"
-```
+   ```
+   (AT_ASK,    CALL) → DIRECTIONAL_LONG
+   (AT_ASK,    PUT)  → DIRECTIONAL_SHORT
+   (AT_BID,    PUT)  → PASSIVE_BULLISH
+   (AT_BID,    CALL) → PASSIVE_BEARISH
+   (MID,       CALL) → AMBIGUOUS_LONG
+   (MID,       PUT)  → AMBIGUOUS_SHORT
+   ```
+
+7. **No direction field changes.** `REPEAT_BUY` and `REPEAT_SELL` semantics are untouched.
+   `dominant_direction` on `RepetitionEpisode` is untouched. No downstream consumers need
+   updates for correctness — mechanic is purely additive.
+
+8. **Story impact: S2 gains one sub-task.** No new story needed. The implementation is
+   a single additive change to `order_side_classifier.py` and `options_flow_parser.py`,
+   a column in S2.5, and a field addition to the bus payload in S6.
 
 ---
 
-## 5. Story Impact Summary
+### What Does NOT Change (explicit agreement)
 
-| Story | Change type        | What changes                                                      |
-|-------|--------------------|-------------------------------------------------------------------|
-| S2    | Sub-task addition  | `OrderDirection` gets 4th field; `classify_order_direction()` updated; `OptionsFlowEvent` gets `execution_mechanic` field |
-| S2.5  | Migration addition | `execution_mechanic` column added to S2.5 SQL and persist payload |
-| S6    | Payload addition   | `execution_mechanic` added to composite bus signal block          |
-| S2    | New CI invariants  | 6 mechanic assertions added to `test_direction_invariants.py`     |
-
-**No new story sprint slot required.** No direction semantics changed. No downstream
-consumers break. `dominant_direction` on `RepetitionEpisode` is unchanged — it aggregates
-premium-weighted direction only, not mechanics. The mechanic field is per-event only.
-
+- `order_side_to_direction()` mapping is unchanged. SELL + PUT = REPEAT_BUY stands.
+- The 14 existing direction CI invariants are unchanged.
+- `dominant_direction` on `RepetitionEpisode` remains premium-weighted direction — it does
+  NOT aggregate execution mechanics. Mechanic is a per-event field only.
+- No new story sprint slot required. S2 sub-task, S2.5 column, S6 bus field.
 ---
 
 ## Final Summary: What the Deliberations Changed
