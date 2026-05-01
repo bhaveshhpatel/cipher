@@ -41,7 +41,7 @@ Before creating a branch:
 
 1. Read the full story definition in `docs/cipher_apex_story_and_sprint_plan.md`
 2. Identify: scope, acceptance criteria, test requirements, architectural notes
-3. If the story has a panel deliberation note in the spec ([`docs/cipher_apex_engineering_spec.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_engineering_spec.md) | Engineering implementation spec — detailed technical requirements per story) — internalize it; it was written for a reason
+3. If the story has a panel deliberation note in the spec ([`docs/cipher_apex_engineering_spec.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/cipher_apex_engineering_spec.md) - Engineering implementation spec — detailed technical requirements per story) — internalize it; it was written for a reason
 4. Cross-reference the story’s GitHub Issue for any post-filing amendments
 5. Only then proceed to branch creation
 
