@@ -141,6 +141,17 @@ class OrderDirection(NamedTuple):
     order_side: str
     sentiment: str
     strong_sentiment: bool
+    execution_mechanic: str   # NEW — additive; does not change direction semantics
+
+
+_MECHANIC_MAP = {
+    ("BUY",     "CALL"): "DIRECTIONAL_LONG",
+    ("BUY",     "PUT"):  "DIRECTIONAL_SHORT",
+    ("SELL",    "PUT"):  "PASSIVE_BULLISH",
+    ("SELL",    "CALL"): "PASSIVE_BEARISH",
+    ("UNKNOWN", "CALL"): "AMBIGUOUS_LONG",
+    ("UNKNOWN", "PUT"):  "AMBIGUOUS_SHORT",
+}
 
 
 def classify_order_direction(
@@ -149,19 +160,23 @@ def classify_order_direction(
     is_synthetic: bool,
 ) -> OrderDirection:
     if is_synthetic:
-        fallback = "BULLISH" if contract_type == "CALL" else "BEARISH"
-        return OrderDirection("UNKNOWN", fallback, False)
+        fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+        mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
+        return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
 
     if bid_ask_class in _BUY_CLASSES:
         sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
-        return OrderDirection("BUY", sentiment, True)
+        mechanic = _MECHANIC_MAP[("BUY", contract_type)]
+        return OrderDirection("BUY", sentiment, True, mechanic)
 
     if bid_ask_class in _SELL_CLASSES:
         sentiment = "BEARISH" if contract_type == "CALL" else "BULLISH"
-        return OrderDirection("SELL", sentiment, True)
+        mechanic = _MECHANIC_MAP[("SELL", contract_type)]
+        return OrderDirection("SELL", sentiment, True, mechanic)
 
-    fallback = "BULLISH" if contract_type == "CALL" else "BEARISH"
-    return OrderDirection("UNKNOWN", fallback, False)
+    fallback_sentiment = "BULLISH" if contract_type == "CALL" else "BEARISH"
+    mechanic = _MECHANIC_MAP.get(("UNKNOWN", contract_type), "AMBIGUOUS_LONG")
+    return OrderDirection("UNKNOWN", fallback_sentiment, False, mechanic)
 
 
 def order_side_to_direction(order_side: str, contract_type: str) -> str:
@@ -172,6 +187,17 @@ def order_side_to_direction(order_side: str, contract_type: str) -> str:
     return "REPEAT_BUY" if contract_type == "CALL" else "REPEAT_SELL"
 ```
 
+**Mechanic taxonomy (complete, non-overlapping):**
+
+| order_side | contract_type | execution_mechanic  | Market interpretation                             |
+|------------|---------------|---------------------|---------------------------------------------------|
+| BUY        | CALL          | DIRECTIONAL_LONG    | Long call; net premium outlay; urgency/conviction |
+| BUY        | PUT           | DIRECTIONAL_SHORT   | Long put hedge or short bet; premium outlay       |
+| SELL       | PUT           | PASSIVE_BULLISH     | Put selling; short vega; income or floor view     |
+| SELL       | CALL          | PASSIVE_BEARISH     | Call selling; short gamma; income or hedge        |
+| UNKNOWN    | CALL          | AMBIGUOUS_LONG      | Mid-print or synthetic call — intent unclear      |
+| UNKNOWN    | PUT           | AMBIGUOUS_SHORT     | Mid-print or synthetic put — intent unclear       |
+
 ### Dataclass Changes
 #### `backend/parsers/options_flow_parser.py`
 Add fields to `OptionsFlowEvent`:
@@ -179,6 +205,7 @@ Add fields to `OptionsFlowEvent`:
 order_side: str = "UNKNOWN"
 strong_sentiment: bool = False
 daily_volume: int = 0
+execution_mechanic: str = "AMBIGUOUS_LONG"   # persists alongside order_side
 ```
 
 ### Bid/Ask Classifier Changes
@@ -230,6 +257,7 @@ ev = OptionsFlowEvent(
     order_side=direction.order_side,
     sentiment=direction.sentiment,
     strong_sentiment=direction.strong_sentiment,
+    execution_mechanic=direction.execution_mechanic,
     ...
 )
 ```
@@ -265,9 +293,10 @@ if reg and reg.is_ready():
             ev.contract_type,
             ev.is_synthetic_quote,
         )
-        ev.order_side = direction.order_side
-        ev.sentiment = direction.sentiment
-        ev.strong_sentiment = direction.strong_sentiment
+        ev.order_side          = direction.order_side
+        ev.sentiment           = direction.sentiment
+        ev.strong_sentiment    = direction.strong_sentiment
+        ev.execution_mechanic  = direction.execution_mechanic   # re-derived, not overwritten
 
     if ev.underlying_price == 0.0:
         up = reg.stock_price(ev.ticker)
@@ -323,6 +352,7 @@ def dominant_direction(self) -> str:
 - BLOCK detection catches high-premium low-exchange whales.
 - Golden BLOCK is supported.
 - `underlying_price` and `daily_volume` enrich correctly.
+- `execution_mechanic` is derived, persisted, and re-derived on registry enrichment.
 
 ### Required Invariant Tests
 
@@ -374,7 +404,7 @@ def test_buy_put_maps_to_repeat_sell():
 
 ### Required Test Files
 - `tests/test_order_side_classifier.py`
-- `tests/test_direction_invariants.py`  ← must cover all 8 quadrant invariants above
+- `tests/test_direction_invariants.py`  ← must cover all 8 quadrant invariants above + 6 mechanic invariants (14 direction + 6 mechanic = 20 total assertions)
 - `tests/test_bid_ask_classifier.py`
 - `tests/test_trade_type_detector.py`
 - `tests/test_options_flow_parser.py`
@@ -382,7 +412,7 @@ def test_buy_put_maps_to_repeat_sell():
 
 ---
 
-## S2.5 — Supabase Migration: `order_side` + `strong_sentiment`
+## S2.5 — Supabase Migration: `order_side` + `strong_sentiment` + `execution_mechanic`
 **Type:** DB migration  
 **Depends on:** S2
 
@@ -392,7 +422,17 @@ ALTER TABLE flow_events
   ADD COLUMN IF NOT EXISTS order_side TEXT
     CHECK (order_side IN ('BUY', 'SELL', 'UNKNOWN'))
     DEFAULT 'UNKNOWN',
-  ADD COLUMN IF NOT EXISTS strong_sentiment BOOLEAN NOT NULL DEFAULT FALSE;
+  ADD COLUMN IF NOT EXISTS strong_sentiment BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS execution_mechanic TEXT
+    CHECK (execution_mechanic IN (
+      'DIRECTIONAL_LONG',
+      'DIRECTIONAL_SHORT',
+      'PASSIVE_BULLISH',
+      'PASSIVE_BEARISH',
+      'AMBIGUOUS_LONG',
+      'AMBIGUOUS_SHORT'
+    ))
+    DEFAULT 'AMBIGUOUS_LONG';
 
 CREATE INDEX IF NOT EXISTS idx_flow_events_order_side
   ON flow_events (order_side);
@@ -407,14 +447,21 @@ WHERE order_side = 'UNKNOWN';
 ```python
 await persist_flow_event({
     ...
-    "order_side": ev.order_side,
-    "strong_sentiment": ev.strong_sentiment,
+    "order_side":         ev.order_side,
+    "strong_sentiment":   ev.strong_sentiment,
+    "execution_mechanic": ev.execution_mechanic,   # NEW
 })
 ```
 
 ### Acceptance Criteria
 - New fields persist without schema errors.
 - Existing readers remain compatible.
+- `execution_mechanic` column is populated from first write; retroactive enrichment is not supported on a high-volume stream table.
+
+> **QA Lead note:** The mechanic column must land in S2.5 alongside `order_side` and
+> `strong_sentiment`. Retroactive enrichment of the column is not feasible on a
+> high-volume stream table. Any future S8 backtest stratification by mechanic type
+> requires the column to be populated from first write.
 
 ---
 
@@ -676,30 +723,33 @@ composite_msg = {
     "type": "composite_signal",
     "data": {
         "signal": {
-            "ticker": composite.ticker,
-            "recommendation": composite.recommendation,
-            "composite_score": composite.composite_score,
+            "ticker":                  composite.ticker,
+            "recommendation":          composite.recommendation,
+            "composite_score":         composite.composite_score,
             "composite_score_ceiling": 0.90,   # explicit — remove when sector_score activates
-            "flow_score": composite.flow_score,
-            "backtest_score": composite.backtest_score,
-            "volume_premium_factor": composite.volume_premium_factor,
-            "reasoning": composite.reasoning,
-            "alert_level": alert_level,
-            "order_side": ev.order_side,
-            "strong_sentiment": ev.strong_sentiment,
+            "flow_score":              composite.flow_score,
+            "backtest_score":          composite.backtest_score,
+            "volume_premium_factor":   composite.volume_premium_factor,
+            "reasoning":               composite.reasoning,
+            "alert_level":             alert_level,
+            "order_side":              ev.order_side,
+            "strong_sentiment":        ev.strong_sentiment,
+            "execution_mechanic":      ev.execution_mechanic,   # NEW — additive, non-breaking
         },
         "episode": {
-            "contract_type": sig_ep.contract_type,
-            "direction": direction,
-            "influence_tier": episode_influence_tier(sig_ep),
-            "total_premium": sig_ep.total_premium,
-            "trade_count": sig_ep.trade_count,
+            "contract_type":   sig_ep.contract_type,
+            "direction":       direction,
+            "influence_tier":  episode_influence_tier(sig_ep),
+            "total_premium":   sig_ep.total_premium,
+            "trade_count":     sig_ep.trade_count,
             "is_accelerating": sig_ep.is_accelerating,
-            "timestamp": ev.timestamp.isoformat(),
+            "timestamp":       ev.timestamp.isoformat(),
         },
     },
 }
 ```
+
+> Existing downstream consumers can ignore `execution_mechanic` safely. It is additive.
 
 ### Hot Path Direction Fix
 #### `backend/services/tradier_stream.py`
@@ -726,7 +776,7 @@ direction = order_side_to_direction(order_side_demo, ctype)
 - Production composite score ignores fake backtest output.
 - SELL PUT campaigns persist and publish as bullish direction.
 - Episode influence tier uses episode premium.
-- Order-side metadata is available to downstream consumers.
+- Order-side metadata and `execution_mechanic` are available to downstream consumers.
 - `composite_score_ceiling` field is present in bus payload and set to `0.90` until sector_score activates.
 - When S5 ladder context is wired, `sector_score` receives a real value and `composite_score_ceiling` is removed from the payload.
 
@@ -782,6 +832,9 @@ Until this lands, production composite scoring must keep `backtest_score` at zer
 > **Updated April 30 2026 (Issue 8 resolution):** All four direction quadrants are now
 > required CI invariants. The original list covered only SELL side. BUY CALL and BUY PUT
 > are equally regressionable and must be gated.
+>
+> **Updated May 1 2026 (Issue 9 resolution):** 6 mechanic assertions added. Total CI gate
+> assertion count is now 20 (14 direction + 6 mechanic).
 
 These invariants must exist in a dedicated test file and run as a hard gate.
 
@@ -804,7 +857,50 @@ def test_direction_invariants():
     assert classify_order_direction("AT_ASK", "PUT", False).strong_sentiment is True
     assert order_side_to_direction("BUY", "CALL") == "REPEAT_BUY"
     assert order_side_to_direction("BUY", "PUT") == "REPEAT_SELL"
+
+
+# ── Execution Mechanic Invariants (added — Issue 9) ─────────────────────────
+def test_mechanic_invariants():
+    c = classify_order_direction
+
+    assert c("AT_ASK",    "CALL", False).execution_mechanic == "DIRECTIONAL_LONG"
+    assert c("ABOVE_ASK", "CALL", False).execution_mechanic == "DIRECTIONAL_LONG"
+    assert c("AT_ASK",    "PUT",  False).execution_mechanic == "DIRECTIONAL_SHORT"
+    assert c("ABOVE_ASK", "PUT",  False).execution_mechanic == "DIRECTIONAL_SHORT"
+    assert c("AT_BID",    "PUT",  False).execution_mechanic == "PASSIVE_BULLISH"
+    assert c("BELOW_BID", "PUT",  False).execution_mechanic == "PASSIVE_BULLISH"
+    assert c("AT_BID",    "CALL", False).execution_mechanic == "PASSIVE_BEARISH"
+    assert c("BELOW_BID", "CALL", False).execution_mechanic == "PASSIVE_BEARISH"
+    assert c("MID",       "CALL", False).execution_mechanic == "AMBIGUOUS_LONG"
+    assert c("MID",       "PUT",  False).execution_mechanic == "AMBIGUOUS_SHORT"
+    assert c("AT_ASK",    "CALL", True).execution_mechanic  == "AMBIGUOUS_LONG"
+    assert c("AT_ASK",    "PUT",  True).execution_mechanic  == "AMBIGUOUS_SHORT"
 ```
+
+---
+
+## Issue 9 — Story Impact Summary
+
+> **Deliberation note (Architect + Principal Engineer + Lead QA, May 1 2026):**
+> BUY CALL and SELL PUT both resolve to REPEAT_BUY (delta-positive), but their execution
+> mechanics are structurally different. BUY CALL is an aggressive directional bet (long
+> premium, urgency signal). SELL PUT is passive positioning (short vega, income or floor
+> view). Collapsing them into REPEAT_BUY discards the mechanic dimension. The panel agreed
+> not to alter direction semantics — all downstream consumers stay unchanged — but to add
+> `execution_mechanic` as a new additive metadata field on `OrderDirection`, `OptionsFlowEvent`,
+> the persistence payload, and the composite bus payload. Direction, dominant_direction, and
+> all thresholds are unchanged. (Issue 9 resolution)
+
+| Story | Change type        | What changes                                                      |
+|-------|--------------------|-------------------------------------------------------------------|
+| S2    | Sub-task addition  | `OrderDirection` gets 4th field; `classify_order_direction()` updated; `OptionsFlowEvent` gets `execution_mechanic` field |
+| S2.5  | Migration addition | `execution_mechanic` column added to S2.5 SQL and persist payload |
+| S6    | Payload addition   | `execution_mechanic` added to composite bus signal block          |
+| S2    | New CI invariants  | 6 mechanic assertions added to `test_direction_invariants.py`     |
+
+**No new story sprint slot required.** No direction semantics changed. No downstream
+consumers break. `dominant_direction` on `RepetitionEpisode` is unchanged — it aggregates
+premium-weighted direction only, not mechanics. The mechanic field is per-event only.
 
 ---
 
@@ -836,3 +932,4 @@ def test_direction_invariants():
 - S7 remains blocked until concurrency review is complete.
 - S8 is intentionally separated so fake backtest influence does not silently creep back into production.
 - S6 introduces `composite_score_ceiling = 0.90` in the bus payload. This field must be removed from the payload when S5 ladder data is wired into `sector_score`.
+- `execution_mechanic` is additive across S2, S2.5, and S6. Downstream consumers that do not read it are unaffected.
