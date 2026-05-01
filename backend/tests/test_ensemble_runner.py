@@ -2,12 +2,9 @@
 test_ensemble_runner.py (Apex S0 — deprecated module)
 
 ensemble_runner.run_ensemble is now deprecated and raises NotImplementedError.
-This file retains the EnsembleResult structural tests (which still import fine
-from the module), and replaces all run_ensemble call tests with deprecation /
-NotImplementedError assertions so the test suite stays green.
-
-Full behavioral coverage of vote aggregation, summary strings, and SwarmEngine
-wiring is deferred until ensemble_runner is reintroduced or replaced.
+This file retains EnsembleResult structural tests (dataclass still exported
+for import compatibility) and replaces all run_ensemble call tests with
+deprecation / NotImplementedError assertions.
 """
 import asyncio
 import importlib
@@ -23,7 +20,6 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def test_ensemble_result_has_all_fields():
-    """EnsembleResult dataclass must still define all expected fields."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         from simulation.ensemble_runner import EnsembleResult
@@ -63,7 +59,7 @@ def test_run_ensemble_raises_not_implemented():
         warnings.simplefilter("ignore", DeprecationWarning)
         from simulation.ensemble_runner import run_ensemble
     with pytest.raises(NotImplementedError):
-        asyncio.get_event_loop().run_until_complete(run_ensemble())
+        asyncio.run(run_ensemble())
 
 
 def test_run_ensemble_not_callable_from_composite_engine():

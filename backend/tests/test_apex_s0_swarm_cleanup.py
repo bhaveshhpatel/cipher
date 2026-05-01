@@ -20,6 +20,7 @@ import asyncio
 import dataclasses
 import importlib
 import inspect
+import sys
 import pytest
 import warnings
 
@@ -126,7 +127,7 @@ def test_ensemble_runner_run_ensemble_raises():
         warnings.simplefilter("ignore", DeprecationWarning)
         import simulation.ensemble_runner as er
     with pytest.raises(NotImplementedError):
-        asyncio.get_event_loop().run_until_complete(er.run_ensemble())
+        asyncio.run(er.run_ensemble())
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +135,6 @@ def test_ensemble_runner_run_ensemble_raises():
 # ---------------------------------------------------------------------------
 
 def test_ensemble_runner_import_warns():
-    import sys
-    # Force a fresh import so the module-level warning fires
     sys.modules.pop("simulation.ensemble_runner", None)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -165,7 +164,6 @@ def test_vwpf_no_events_returns_half():
 # ---------------------------------------------------------------------------
 
 def test_vwpf_clamps_at_one():
-    # premium=10_000_000, oi=1 -> ratio = 100 -> clamped to 1.0
     ep = _make_ep(premium=10_000_000, oi=1)
     assert cse.volume_weighted_premium_factor(ep) == 1.0
 

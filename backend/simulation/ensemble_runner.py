@@ -9,6 +9,8 @@ be deleted once no remaining caller references it.
 DO NOT add new callers. DO NOT re-introduce this into the signal pipeline.
 """
 import warnings
+from dataclasses import dataclass, field
+from typing import List
 
 warnings.warn(
     "simulation.ensemble_runner is deprecated and will be removed. "
@@ -16,6 +18,19 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
+
+
+@dataclass
+class EnsembleResult:
+    """Retained for import compatibility. Do not instantiate in new code."""
+    ticker:     str
+    direction:  str
+    confidence: float
+    bull_votes: int
+    bear_votes: int
+    hold_votes: int
+    summary:    str
+    agents:     List[dict] = field(default_factory=list)
 
 
 async def run_ensemble(*args, **kwargs):  # type: ignore[override]
