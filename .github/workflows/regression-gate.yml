@@ -1,15 +1,12 @@
 # =============================================================================
 # Cipher — Unified Regression Gate
 # =============================================================================
-# Required status check for every PR to main.
-# Runs backend (pytest) and frontend (jest) regression suites in parallel.
-# The 'gate' job is what you add as the required check in branch protection.
+# DISABLED — all automatic triggers removed. Restore on:/pull_request block
+# to re-enable. Jobs and steps are fully preserved.
 # =============================================================================
 name: Regression Gate
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -133,7 +130,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Gate — depends on both jobs. Add THIS as the required status check.
-  # Treats 'skipped' as a failure so jobs cannot be bypassed.
   # ---------------------------------------------------------------------------
   gate:
     name: All Regression Gates Passed

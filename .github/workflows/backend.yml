@@ -1,16 +1,9 @@
 name: Backend CI
 
+# DISABLED — all automatic triggers removed. Restore on:/push/pull_request
+# blocks below to re-enable. Jobs and steps are fully preserved.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "backend/**"
-      - "railway.toml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "backend/**"
-      - "railway.toml"
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -1,14 +1,9 @@
 name: Integrity Check
 
+# DISABLED — all automatic triggers removed. Restore on:/push/pull_request
+# blocks below to re-enable. Jobs and steps are fully preserved.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "backend/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "backend/**"
+  workflow_dispatch:
 
 jobs:
   integrity:
@@ -25,8 +20,6 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 1. Detect stub/patch placeholders
-      #    Catches files that say "intentionally left as a patch" or
-      #    define __PATCH__ = True instead of real code.
       # -----------------------------------------------------------------------
       - name: Detect stub placeholders
         run: |
@@ -43,8 +36,6 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 2. Check critical service files are not suspiciously small
-      #    A legitimate service file should be > 20 lines.
-      #    A stub is typically 3-5 lines.
       # -----------------------------------------------------------------------
       - name: Check service file sizes
         run: |

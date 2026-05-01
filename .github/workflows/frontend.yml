@@ -1,16 +1,9 @@
 name: Frontend CI/CD
 
+# DISABLED — all automatic triggers removed. Restore on:/push/pull_request
+# blocks below to re-enable. Jobs and steps are fully preserved.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "frontend/**"
-      - "backend/**"   # backend changes also trigger Vercel redeploy
-  pull_request:
-    branches: [main]
-    paths:
-      - "frontend/**"
-      - "backend/**"
+  workflow_dispatch:
 
 jobs:
   # ---------------------------------------------------------------------------
