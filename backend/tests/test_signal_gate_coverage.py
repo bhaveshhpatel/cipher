@@ -12,7 +12,7 @@ Tests:
   - unknown trade_type uses sentinel -> fails
   - GateVerdict is a NamedTuple with .passed and .reason
 """
-from unittest.mock import SimpleNamespace
+from types import SimpleNamespace
 from signals.signal_gate import passes_signal_gate, GateVerdict, _PREMIUM_FLOORS
 
 

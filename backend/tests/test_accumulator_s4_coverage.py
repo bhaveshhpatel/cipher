@@ -19,7 +19,7 @@ Missing line groups addressed:
 """
 import asyncio
 from datetime import datetime, timezone, timedelta
-from unittest.mock import SimpleNamespace
+from types import SimpleNamespace
 
 from signals.repetition_accumulator import (
     RepetitionAccumulator,
