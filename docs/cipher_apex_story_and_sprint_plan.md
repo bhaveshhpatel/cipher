@@ -90,10 +90,10 @@ Responsibilities:
 - Convert `(order_side, contract_type)` into `REPEAT_BUY` / `REPEAT_SELL` direction.
 
 ### Core Rules
-- BUY CALL = BULLISH.
-- BUY PUT = BEARISH.
-- SELL CALL = BEARISH.
-- SELL PUT = BULLISH.
+- BUY CALL = BULLISH (strong).
+- BUY PUT = BEARISH (strong).
+- SELL CALL = BEARISH (strong).
+- SELL PUT = BULLISH (strong).
 - MID and synthetic quotes fall back to contract-type-based sentiment, but with `strong_sentiment=False`.
 
 ### Dataclass Changes
@@ -107,7 +107,7 @@ Add to `OptionsFlowEvent`:
 - Compute `is_directionally_aggressive = buy_aggressive or sell_aggressive`.
 - Pass directionally aggressive status into golden-sweep logic.
 - Call `classify_order_direction()` after bid/ask classification.
-- Remove the registry block’s naive sentiment overwrite.
+- Remove the registry block's naive sentiment overwrite.
 - Re-run direction classification after registry-corrected contract metadata is applied.
 - Populate `underlying_price` from `reg.stock_price(ticker)` when missing.
 - Populate `daily_volume` from registry quotes.
@@ -134,8 +134,16 @@ Add `dominant_direction` as a premium-weighted episode property. This must prese
 - `underlying_price` and `daily_volume` enrich correctly when registry is ready.
 
 ### Test Coverage
-#### CI Gate Invariants
+
+#### CI Gate Invariants — All Four Quadrants Required
+> **Updated April 30 2026 (Issue 8 resolution — Architect + Principal Engineer deliberation):**
+> All four direction quadrants are now CI gate requirements. The original list covered only
+> SELL side. BUY CALL = BULLISH and BUY PUT = BEARISH are equally regressionable. A parser
+> refactor breaking BUY PUT direction would not be caught by the old invariant set.
+
 A dedicated file must enforce:
+
+**SELL-side (original):**
 - `AT_BID + PUT => sentiment=BULLISH`
 - `BELOW_BID + PUT => sentiment=BULLISH`
 - `AT_BID + PUT => order_side=SELL`
@@ -143,9 +151,19 @@ A dedicated file must enforce:
 - `SELL + PUT => REPEAT_BUY`
 - `SELL + CALL => REPEAT_SELL`
 
+**BUY-side (added — Issue 8):**
+- `AT_ASK + CALL => sentiment=BULLISH`
+- `AT_ASK + CALL => order_side=BUY`
+- `AT_ASK + CALL => strong_sentiment=True`
+- `AT_ASK + PUT => sentiment=BEARISH`
+- `AT_ASK + PUT => order_side=BUY`
+- `AT_ASK + PUT => strong_sentiment=True`
+- `BUY + CALL => REPEAT_BUY`
+- `BUY + PUT => REPEAT_SELL`
+
 #### Required Test Files
 - `tests/test_order_side_classifier.py`
-- `tests/test_direction_invariants.py`
+- `tests/test_direction_invariants.py`  ← must cover all 14 invariants above
 - `tests/test_bid_ask_classifier.py`
 - `tests/test_trade_type_detector.py`
 - `tests/test_options_flow_parser.py`
@@ -190,8 +208,9 @@ A dedicated file must enforce:
 
 ### Acceptance Criteria
 - Weak, wide-spread, low-premium noise is rejected before entering the signal path.
+- Spread gate threshold is 50% of ask price, applied uniformly across all tiers.
 - High-quality SELL PUT flow can pass when it meets premium and quote-quality gates.
-- Tier-aware thresholds differ for T1 versus T2/T3 names.
+- Tier-aware premium floors differ for T1 versus T2/T3 names.
 
 ### Test Coverage
 - 100% branch coverage on gate outcomes.
@@ -207,8 +226,29 @@ A dedicated file must enforce:
 - Replace the static DTE cap with DTE-adjusted premium floors.
 - Expand OTM eligibility to include ATM and selected deeper OTM activity.
 - Add deep-OTM premium multiplier.
-- Add whale-conviction bypass for a single huge sweep.
+- Add whale-conviction bypass for a single huge sweep episode event.
 - Preserve low-threshold persistence in the DB path while raising the live signal bar.
+
+### ATM Band Definition
+> **Deliberation note (Architect + Principal Engineer, April 30 2026 — Issue 6 resolution):**
+> ATM is defined as a percentage of underlying price, not an absolute dollar amount.
+> ±2% was selected as the working threshold: tight enough to exclude clear OTM, wide
+> enough to capture ATM prints on high-underlying-price names (e.g., NVDA at $900+ where
+> a ±$5 strike gap is < 1%). Contracts with `underlying_price == 0` fall back to standard
+> floor and are not classified as OTM or deep OTM.
+
+ATM condition: `abs(strike - underlying_price) / underlying_price <= 0.02`
+
+### Sweep Bypass — `trade_count` Semantics
+> **Deliberation note (Architect + Principal Engineer, April 30 2026 — Issue 7 resolution):**
+> `trade_count` (or equivalently `len(ep.events)`) is the number of `OptionsFlowEvent`
+> objects that have accumulated in the episode. It is NOT the `fill_count` field within
+> a single stream tick. A single-event episode means exactly one qualifying event entered
+> the accumulator for this (ticker, strike, expiry) key. The bypass fires when that one
+> event is a SWEEP with premium >= $500K — at that size and structure, the min_sweeps
+> repetition requirement adds no information.
+
+Bypass condition: `len(ep.events) == 1 AND trade_type == "SWEEP" AND premium >= 500K`
 
 ### Default DTE Premium Tiers
 - 0–7 DTE: T1 = $50K, T2/T3 = $25K
@@ -216,14 +256,25 @@ A dedicated file must enforce:
 - 31–90 DTE: T1 = $1M, T2/T3 = $500K
 - 91+ DTE: T1 = $2M, T2/T3 = $1M
 
+### OTM Classification
+- ATM (0–2% OTM): standard premium floor
+- Standard OTM (2–12%): standard premium floor
+- Deep OTM (> 12%): 1.5× premium floor multiplier
+- No underlying_price: standard floor, no OTM classification attempted
+
 ### Acceptance Criteria
 - LEAPS are no longer blindly excluded.
-- ATM institutional flow is eligible.
-- Deep OTM flow must clear a higher premium bar.
-- Single monster sweeps can bypass `min_sweeps` when conviction is obvious.
+- ATM is defined as `abs(strike - underlying_price) / underlying_price <= 0.02`; contracts in this band use standard floors.
+- Deep OTM (> 12%) requires 1.5× premium floor.
+- Single-event episodes (`len(ep.events) == 1`) of type SWEEP at >= $500K bypass `min_sweeps`.
+- Events with `underlying_price == 0` fall back to standard floor, not OTM classification.
 
 ### Test Coverage
 - 100% new-branch coverage for DTE tiers, OTM checks, deep-OTM multiplier, and sweep bypass.
+- ATM boundary test: contract at exactly 2.0% OTM → standard floor; contract at 2.01% → standard OTM floor.
+- Sweep bypass: `len(ep.events) == 1` with SWEEP and premium >= 500K → passes without meeting min_sweeps.
+- Sweep bypass negative: `len(ep.events) == 2` same SWEEP and premium → bypass does not fire; must meet min_sweeps.
+- Zero underlying_price: no OTM computation, standard floor applied.
 
 ---
 
@@ -234,12 +285,15 @@ A dedicated file must enforce:
 ### Scope
 - Detect coordinated same-ticker, same-expiry multi-strike activity.
 - Surface ladder structures as higher-context conviction signals.
-- Feed ladder output into future sector/context scoring.
+- Feed ladder output into the `sector_score` input of the Apex L3 composite scorer.
+- Ladder detector runs **before** composite scoring in the hot path.
 
 ### Acceptance Criteria
 - Ladder only fires when multiple related strikes align within the active window.
 - Unrelated expiries do not false-trigger.
 - Expired ladder state is evicted correctly.
+- Ladder output is passed as context into L3 composite scoring (wires `sector_score`).
+- When S5 lands and ladder context is wired, `composite_score_ceiling` field is removed from the composite bus payload.
 
 ### Test Coverage
 - 100% branch coverage.
@@ -255,13 +309,23 @@ A dedicated file must enforce:
 - Remove fake backtest influence from production scoring.
 - Use episode-level influence tier instead of per-tick tier.
 - Discount flow confidence when sentiment is weak or unknown.
-- Keep sector/context weight reserved until ladder/context data is available.
+- Keep sector/context weight reserved until ladder/context data is available from S5.
+
+### Score Ceiling — Pre-S5 Behavior
+> **Deliberation note (Architect + Principal Engineer, April 30 2026 — Issue 5 resolution):**
+> With `sector_score = 0.0` and `backtest_score = 0.0`, the active weights sum to 0.90,
+> capping composite_score at 0.90 until S5 ladder data activates sector_score. The team
+> decided NOT to redistribute the 0.10 weight — doing so would shift scoring baselines
+> and invalidate threshold calibration. Instead, the ceiling is made explicit in the
+> composite bus payload via a `composite_score_ceiling` field (value: 0.90). This field
+> is removed from the payload when S5 wires in real ladder context and sector_score
+> receives a non-zero value.
 
 ### Approved Formula
 - `flow_score * 0.55`
 - `volume_weighted_premium_factor * 0.20`
 - `premium_tier_score * 0.15`
-- `sector_score * 0.10`
+- `sector_score * 0.10` — activates in S5; `0.0` until then
 - `backtest_score * 0.00` until S8 is implemented
 
 ### Hot Path Changes in `tradier_stream.py`
@@ -270,18 +334,22 @@ A dedicated file must enforce:
 - Add `order_side` and `strong_sentiment` to persistence payloads and composite signal payloads.
 - Publish episode influence tier using total episode premium, not latest tick premium.
 - Update demo-mode direction generation so it does not reinforce the naive CALL=BUY / PUT=SELL assumption.
+- Add `composite_score_ceiling: 0.90` to composite bus payload (remove when S5 activates sector_score).
 
 ### Acceptance Criteria
 - Composite scoring no longer depends on pseudorandom backtest values.
 - SELL PUT campaigns persist as bullish direction end to end.
 - Composite payloads include order-side information for frontend interpretation.
 - Episode influence tier reflects episode premium, not single-tick premium.
+- `composite_score_ceiling: 0.90` is present in bus payload while sector_score is inactive.
+- `composite_score_ceiling` is removed from payload when S5 ladder context is wired.
 
 ### Test Coverage
 - `episode_influence_tier()` boundaries.
 - `strong_sentiment=False` discount path.
 - `backtest_score == 0.0` in production composite output.
 - SELL PUT signal path publishes `REPEAT_BUY` in persistence and bus messages.
+- `composite_score_ceiling` field is present in payload before S5; absent after.
 
 ---
 
@@ -320,11 +388,12 @@ Review `stream_worker.py` to confirm whether `_process_trade()` runs sequentiall
 - Use `(ticker, contract_type, dte_bucket)` buckets.
 - Cache results to avoid per-tick database hits.
 - Reintroduce non-zero backtest weight only after the real implementation is complete.
+- When S8 lands, revisit composite weight distribution (backtest_score weight to be determined based on validated results).
 
 ### Acceptance Criteria
 - Backtest score is computed from real historical behavior.
 - Query cost is controlled through caching.
-- Composite reweighting is revisited only after validated results exist.
+- No production fallback to pseudorandom score.
 
 ### Test Coverage
 - Query bucket selection.
@@ -342,9 +411,21 @@ Review `stream_worker.py` to confirm whether `_process_trade()` runs sequentiall
 - Any new import fallbacks must use the same tested/fallback-safe import pattern already present in the parser.
 
 ### Directional Invariants
+> **Updated April 30 2026 (Issue 8 resolution):** All four quadrants are now non-negotiable
+> CI gate requirements. The original list only covered SELL-side invariants. BUY CALL and
+> BUY PUT symmetry is equally regressionable and must be enforced.
+
 These are non-negotiable and must be enforced by dedicated tests:
+
+**SELL-side (original):**
 - SELL PUT is bullish.
 - SELL CALL is bearish.
+
+**BUY-side (added):**
+- BUY CALL is bullish.
+- BUY PUT is bearish.
+
+**General:**
 - Unknown direction remains weak-confidence, not strong-confidence.
 - Registry enrichment must never overwrite direction inference with naive contract-type sentiment.
 
@@ -353,6 +434,7 @@ These are non-negotiable and must be enforced by dedicated tests:
 - Swarm is Apex-only and nowhere else.
 - Production composite scoring cannot use fake backtest values.
 - Episode-level fields must use episode context, not latest-tick shortcuts, where that changes semantics.
+- `composite_score_ceiling` must be present in bus payloads while sector_score is inactive (pre-S5 wiring).
 
 ---
 
@@ -383,3 +465,4 @@ These are non-negotiable and must be enforced by dedicated tests:
 - S6 should not begin until S4 and S5 have stabilized, because it consumes accumulator and episode semantics.
 - S7 is explicitly blocked pending stream-worker concurrency review.
 - S8 is intentionally separated so the team does not quietly keep fake backtest weight in production.
+- S6 introduces `composite_score_ceiling = 0.90` in the bus payload. This field must be removed from the payload — and from this note — when S5 ladder data is wired into `sector_score`.

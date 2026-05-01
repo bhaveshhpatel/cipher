@@ -325,21 +325,56 @@ def dominant_direction(self) -> str:
 - `underlying_price` and `daily_volume` enrich correctly.
 
 ### Required Invariant Tests
+
+> **Deliberation note (Architect + Principal Engineer, April 30 2026):**
+> The original CI gate only covered SELL-side invariants. The principal engineer raised that
+> BUY CALL = BULLISH and BUY PUT = BEARISH are equally regressionable — a parser refactor
+> breaking BUY PUT direction would not be caught. The architect agreed: both axes must be
+> gated. All four quadrants are now required CI invariants (Issue 8 resolution).
+
 ```python
+# ── SELL-side invariants (original) ──────────────────────────────────────────
 def test_sell_put_is_bullish_sentiment():
     result = classify_order_direction("AT_BID", "PUT", False)
     assert result.order_side == "SELL"
     assert result.sentiment == "BULLISH"
     assert result.strong_sentiment is True
 
+def test_sell_call_is_bearish_sentiment():
+    result = classify_order_direction("AT_BID", "CALL", False)
+    assert result.order_side == "SELL"
+    assert result.sentiment == "BEARISH"
+    assert result.strong_sentiment is True
 
 def test_sell_put_maps_to_repeat_buy():
     assert order_side_to_direction("SELL", "PUT") == "REPEAT_BUY"
+
+def test_sell_call_maps_to_repeat_sell():
+    assert order_side_to_direction("SELL", "CALL") == "REPEAT_SELL"
+
+# ── BUY-side invariants (added — Issue 8) ────────────────────────────────────
+def test_buy_call_is_bullish_sentiment():
+    result = classify_order_direction("AT_ASK", "CALL", False)
+    assert result.order_side == "BUY"
+    assert result.sentiment == "BULLISH"
+    assert result.strong_sentiment is True
+
+def test_buy_put_is_bearish_sentiment():
+    result = classify_order_direction("AT_ASK", "PUT", False)
+    assert result.order_side == "BUY"
+    assert result.sentiment == "BEARISH"
+    assert result.strong_sentiment is True
+
+def test_buy_call_maps_to_repeat_buy():
+    assert order_side_to_direction("BUY", "CALL") == "REPEAT_BUY"
+
+def test_buy_put_maps_to_repeat_sell():
+    assert order_side_to_direction("BUY", "PUT") == "REPEAT_SELL"
 ```
 
 ### Required Test Files
 - `tests/test_order_side_classifier.py`
-- `tests/test_direction_invariants.py`
+- `tests/test_direction_invariants.py`  ← must cover all 8 quadrant invariants above
 - `tests/test_bid_ask_classifier.py`
 - `tests/test_trade_type_detector.py`
 - `tests/test_options_flow_parser.py`
@@ -418,8 +453,8 @@ def passes_signal_gate(ev, tier: int) -> GateVerdict:
 ```
 
 ### Acceptance Criteria
-- Wide-spread junk is rejected.
-- Tier-specific floors are enforced.
+- Wide-spread junk is rejected (spread > 50% of ask, uniform across all tiers).
+- Tier-specific premium floors are enforced.
 - High-quality SELL PUT flow can pass.
 
 ### Tests
@@ -434,6 +469,24 @@ def passes_signal_gate(ev, tier: int) -> GateVerdict:
 
 ### Objective
 Move from a simplistic threshold accumulator to a market-aware episode gate that handles LEAPS, ATM flow, deep OTM flow, and single massive sweeps correctly.
+
+### ATM Band Definition
+
+> **Deliberation note (Architect + Principal Engineer, April 30 2026):**
+> The architect flagged that "ATM eligible" with no numeric boundary will be implemented
+> inconsistently across engineers. The principal engineer proposed ±2% of underlying price
+> as a practical ATM band — tight enough to exclude clear OTM, wide enough to capture
+> ATM prints on high-underlying-price names like NVDA ($900+) where a ±$5 strike gap
+> is less than 1%. The architect accepted ±2% as the working definition. This must be
+> expressed as a fraction of underlying price, not an absolute dollar amount (Issue 6 resolution).
+
+ATM is defined as:
+
+```
+abs(strike - underlying_price) / underlying_price <= 0.02
+```
+
+Contracts satisfying this condition are ATM-eligible and accumulate at standard premium floors (no OTM multiplier applied).
 
 ### Default Tier Table
 ```python
@@ -459,11 +512,23 @@ def _get_episode_min_premium(self, ep):
     return self.min_premium
 ```
 
-### Sweep Bypass Example
+### Sweep Bypass — Semantics Clarification
+
+> **Deliberation note (Architect + Principal Engineer, April 30 2026):**
+> The original spec used `ep.trade_count == 1` without defining what `trade_count` counts.
+> The architect raised that this is ambiguous between episode event count and fill count
+> within a single stream tick. The principal engineer clarified: `trade_count` is the
+> number of `OptionsFlowEvent` objects accumulated in the episode, not the fill_count
+> field within a single tick. A single-event episode means exactly one qualifying event
+> entered the accumulator for this (ticker, strike, expiry) key. This is the intended
+> bypass condition (Issue 7 resolution).
+
 ```python
+# trade_count = len(ep.events) — number of OptionsFlowEvents in this episode.
+# NOT fill_count within a single stream tick.
 is_single_whale = (
     self.sweep_bypass_premium > 0
-    and ep.trade_count == 1
+    and len(ep.events) == 1                          # one episode event, not one fill
     and getattr(ep.events[-1], "trade_type", "") == "SWEEP"
     and ep.total_premium >= self.sweep_bypass_premium
 )
@@ -475,6 +540,18 @@ if self.deep_otm_multiplier > 1.0 and otm_pct > 0.12:
     deep_floor = effective_min_prem * self.deep_otm_multiplier
     if ep.total_premium < deep_floor:
         return None
+```
+
+### OTM Classification Logic
+```python
+otm_pct = abs(strike - underlying_price) / underlying_price if underlying_price > 0 else 0.0
+
+if otm_pct <= 0.02:
+    otm_band = "ATM"           # standard floor applies
+elif otm_pct <= 0.12:
+    otm_band = "STANDARD_OTM"  # standard floor applies
+else:
+    otm_band = "DEEP_OTM"      # 1.5x floor multiplier applies
 ```
 
 ### Signal Accumulator Example
@@ -493,9 +570,10 @@ signal_accumulator = RepetitionAccumulator(
 
 ### Acceptance Criteria
 - LEAPS are not automatically discarded.
-- ATM flow is eligible.
-- Deep OTM requires higher premium.
-- Single monster sweeps bypass `min_sweeps` when appropriate.
+- ATM is defined as `abs(strike - underlying_price) / underlying_price <= 0.02`; contracts in this band accumulate at standard floors.
+- Deep OTM (> 12%) requires 1.5× premium floor.
+- Single-event episodes (`len(ep.events) == 1`) of type SWEEP at >= $500K bypass `min_sweeps`.
+- `underlying_price > 0` is required before OTM classification; events without underlying price fall back to standard floor.
 
 ---
 
@@ -560,14 +638,28 @@ def episode_influence_tier(ep):
     return "RETAIL"
 ```
 
-### Composite Formula Example
+### Composite Formula and Score Ceiling
+
+> **Deliberation note (Architect + Principal Engineer, April 30 2026):**
+> The architect identified that with `sector_score = 0.0` and `backtest_score = 0.0`,
+> the weights only sum to 0.90, meaning composite_score is silently capped at 0.90
+> until S5 ladder data is wired in. The principal engineer argued against redistributing
+> the 0.10 to other weights mid-sprint because it would change the scoring baseline and
+> break threshold calibration done against the 0.55/0.20/0.15 split. Decision: leave
+> weights unchanged, document the ceiling explicitly, and expose it in the composite
+> output payload so frontend consumers can normalize if needed (Issue 5 resolution).
+
 ```python
 flow_s = round(flow_s_raw * (1.0 if latest.strong_sentiment else 0.80), 3)
 bt_s = 0.0
 vwp_f = volume_weighted_premium_factor(ep)
 prem_t = premium_tier_score(ep)
-sector_s = 0.0
+sector_s = 0.0   # reserved — activates when S5 ladder context is wired
 
+# NOTE: while sector_s == 0.0, maximum achievable composite_score is 0.90.
+# This is intentional. Do not redistribute the 0.10 weight; it is reserved
+# for ladder/context data. Frontend consumers should treat scores > 0.85 as
+# effectively maximum conviction in the pre-S5 period.
 comp = round(
     flow_s * 0.55
     + bt_s * 0.00
@@ -578,31 +670,7 @@ comp = round(
 )
 ```
 
-### Hot Path Direction Fix
-#### `backend/services/tradier_stream.py`
-```python
-# before
-if sig_ep.contract_type == "CALL":
-    direction = "REPEAT_BUY"
-elif sig_ep.contract_type == "PUT":
-    direction = "REPEAT_SELL"
-else:
-    direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
-
-# after
-direction = sig_ep.dominant_direction
-```
-
-### Persistence Payload Update
-```python
-await persist_flow_event({
-    ...
-    "order_side": ev.order_side,
-    "strong_sentiment": ev.strong_sentiment,
-})
-```
-
-### Composite Bus Payload Update
+### Composite Bus Payload — Score Ceiling Field
 ```python
 composite_msg = {
     "type": "composite_signal",
@@ -611,6 +679,7 @@ composite_msg = {
             "ticker": composite.ticker,
             "recommendation": composite.recommendation,
             "composite_score": composite.composite_score,
+            "composite_score_ceiling": 0.90,   # explicit — remove when sector_score activates
             "flow_score": composite.flow_score,
             "backtest_score": composite.backtest_score,
             "volume_premium_factor": composite.volume_premium_factor,
@@ -632,6 +701,21 @@ composite_msg = {
 }
 ```
 
+### Hot Path Direction Fix
+#### `backend/services/tradier_stream.py`
+```python
+# before
+if sig_ep.contract_type == "CALL":
+    direction = "REPEAT_BUY"
+elif sig_ep.contract_type == "PUT":
+    direction = "REPEAT_SELL"
+else:
+    direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+
+# after
+direction = sig_ep.dominant_direction
+```
+
 ### Demo-Mode Direction Fix
 ```python
 order_side_demo = rng.choices(["BUY", "SELL", "UNKNOWN"], weights=[60, 25, 15])[0]
@@ -643,6 +727,8 @@ direction = order_side_to_direction(order_side_demo, ctype)
 - SELL PUT campaigns persist and publish as bullish direction.
 - Episode influence tier uses episode premium.
 - Order-side metadata is available to downstream consumers.
+- `composite_score_ceiling` field is present in bus payload and set to `0.90` until sector_score activates.
+- When S5 ladder context is wired, `sector_score` receives a real value and `composite_score_ceiling` is removed from the payload.
 
 ---
 
@@ -692,16 +778,32 @@ Until this lands, production composite scoring must keep `backtest_score` at zer
 ---
 
 ## Directional Invariants — CI Gate Section
+
+> **Updated April 30 2026 (Issue 8 resolution):** All four direction quadrants are now
+> required CI invariants. The original list covered only SELL side. BUY CALL and BUY PUT
+> are equally regressionable and must be gated.
+
 These invariants must exist in a dedicated test file and run as a hard gate.
 
 ```python
 def test_direction_invariants():
+    # SELL-side invariants (original)
     assert classify_order_direction("AT_BID", "PUT", False).sentiment == "BULLISH"
     assert classify_order_direction("BELOW_BID", "PUT", False).sentiment == "BULLISH"
     assert classify_order_direction("AT_BID", "PUT", False).order_side == "SELL"
     assert classify_order_direction("AT_BID", "PUT", False).strong_sentiment is True
     assert order_side_to_direction("SELL", "PUT") == "REPEAT_BUY"
     assert order_side_to_direction("SELL", "CALL") == "REPEAT_SELL"
+
+    # BUY-side invariants (added — Issue 8)
+    assert classify_order_direction("AT_ASK", "CALL", False).sentiment == "BULLISH"
+    assert classify_order_direction("AT_ASK", "CALL", False).order_side == "BUY"
+    assert classify_order_direction("AT_ASK", "CALL", False).strong_sentiment is True
+    assert classify_order_direction("AT_ASK", "PUT", False).sentiment == "BEARISH"
+    assert classify_order_direction("AT_ASK", "PUT", False).order_side == "BUY"
+    assert classify_order_direction("AT_ASK", "PUT", False).strong_sentiment is True
+    assert order_side_to_direction("BUY", "CALL") == "REPEAT_BUY"
+    assert order_side_to_direction("BUY", "PUT") == "REPEAT_SELL"
 ```
 
 ---
@@ -733,3 +835,4 @@ def test_direction_invariants():
 - S6 should not start until S4 and S5 semantics are stable.
 - S7 remains blocked until concurrency review is complete.
 - S8 is intentionally separated so fake backtest influence does not silently creep back into production.
+- S6 introduces `composite_score_ceiling = 0.90` in the bus payload. This field must be removed from the payload when S5 ladder data is wired into `sector_score`.
