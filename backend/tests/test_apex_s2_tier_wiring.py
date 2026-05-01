@@ -7,11 +7,14 @@ Covers:
   - tick_to_metrics(): oi_delta always 0.0 (S2 suppression documented)
   - _int_tier_to_str(): conversion correctness + unknown value fallback
   - _get_tier_map(): cold-start returns {}, stale triggers background task
+  - _get_tier_map(): task already running — no second task spawned (#33)
+  - _get_tier_map(): concurrent stale calls spawn at most one task (#24)
   - StreamWorker._process_tick(): non-timesale ignored, metrics accumulated
   - StreamWorker._pending: last-write-wins within window
   - StreamWorker._flush_pending(): atomic drain, reconcile called once per batch
   - StreamWorker._flush_pending(): empty pending is a no-op
   - StreamWorker._flush_loop(): produces asyncio.Task, does not block reader
+  - StreamWorker.run(): CancelledError is re-raised, not swallowed (#25)
   - Integration: tick → metrics → reconcile path end-to-end
 """
 
@@ -20,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -211,10 +214,26 @@ class TestTickToMetricsFields:
 
 
 # ---------------------------------------------------------------------------
-# _get_tier_map — cold start + stale trigger
+# _get_tier_map — cold start + stale trigger + race guard
 # ---------------------------------------------------------------------------
 
 class TestGetTierMap:
+    @pytest.fixture(autouse=True)
+    def reset_tier_map_globals(self):
+        """Restore module-level tier_map globals after each test."""
+        import services.stream_worker as sw
+        saved_cache    = dict(sw._tier_map_cache)
+        saved_ts       = sw._tier_map_ts
+        saved_task     = sw._tier_map_refresh_task
+        saved_progress = sw._tier_map_refresh_in_progress
+        try:
+            yield
+        finally:
+            sw._tier_map_cache               = saved_cache
+            sw._tier_map_ts                  = saved_ts
+            sw._tier_map_refresh_task        = saved_task
+            sw._tier_map_refresh_in_progress = saved_progress
+
     def test_cold_start_returns_dict(self):
         import services.stream_worker as sw
         sw._tier_map_cache = {}
@@ -241,6 +260,96 @@ class TestGetTierMap:
         _get_tier_map()
         await asyncio.sleep(0)
         assert sw._tier_map_refresh_task is not None
+
+    @pytest.mark.asyncio
+    async def test_task_already_running_does_not_spawn_second(self):
+        """
+        #33 S2-POST-11: when a refresh task is already running (not done),
+        _get_tier_map must NOT spawn a second task.
+
+        Setup:
+          - Cache is stale (_tier_map_ts = 0.0)
+          - _tier_map_refresh_task is set to a running (not-done) task
+
+        Expected behaviour:
+          - _get_tier_map() returns without replacing the existing task
+          - The original task object is still assigned to _tier_map_refresh_task
+        """
+        import services.stream_worker as sw
+
+        sw._tier_map_cache = {}
+        sw._tier_map_ts    = 0.0
+        sw._tier_map_refresh_in_progress = False
+
+        # Create a real task that will not complete on its own
+        async def _never_returns():
+            await asyncio.sleep(9999)
+
+        original_task = asyncio.create_task(_never_returns())
+        sw._tier_map_refresh_task = original_task
+
+        try:
+            _get_tier_map()
+            # Task must not have been replaced
+            assert sw._tier_map_refresh_task is original_task, (
+                "_get_tier_map must not replace an already-running refresh task"
+            )
+        finally:
+            original_task.cancel()
+            try:
+                await original_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stale_calls_spawn_single_refresh_task(self):
+        """
+        #24 S2-POST-3: calling _get_tier_map() 10 times in a tight loop
+        when the cache is stale must create at most ONE refresh task.
+
+        Rationale: 64 workers all observe a stale cache on the same tick cycle.
+        Without the _tier_map_refresh_in_progress guard, a second worker could
+        observe task.done()==True between when the first worker’s task finishes
+        and before _tier_map_refresh_task is updated, spawning a duplicate.
+        The flag prevents this.
+
+        This test simulates the synchronous-burst case (all calls in a single
+        event-loop tick) and asserts that no more than one task was scheduled.
+        """
+        import services.stream_worker as sw
+
+        sw._tier_map_cache               = {}
+        sw._tier_map_ts                  = 0.0
+        sw._tier_map_refresh_task        = None
+        sw._tier_map_refresh_in_progress = False
+
+        tasks_created: list[asyncio.Task] = []
+        original_create_task = asyncio.create_task
+
+        def tracking_create_task(coro, **kwargs):
+            t = original_create_task(coro, **kwargs)
+            tasks_created.append(t)
+            return t
+
+        with patch("asyncio.create_task", side_effect=tracking_create_task):
+            for _ in range(10):
+                _get_tier_map()
+
+        # Allow any spawned tasks to start so we can cancel them cleanly
+        await asyncio.sleep(0)
+
+        for t in tasks_created:
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        assert len(tasks_created) <= 1, (
+            f"Expected at most 1 refresh task from 10 concurrent stale calls, "
+            f"got {len(tasks_created)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +498,37 @@ class TestFlushLoop:
                         await loop_task
                     except asyncio.CancelledError:
                         pass
+
+
+# ---------------------------------------------------------------------------
+# StreamWorker.run() — CancelledError propagation
+# ---------------------------------------------------------------------------
+
+class TestRunCancellation:
+    @pytest.mark.asyncio
+    async def test_run_propagates_cancellation(self):
+        """
+        #25 S2-POST-4: CancelledError must propagate out of run() so the
+        owning task resolves as cancelled, not as a normal return.
+
+        Setup: patch _is_market_hours() to True and get_session_token() to
+        return None so the worker loops without opening a real connection.
+        Cancel the task after it starts sleeping on backoff, and assert
+        the task ends as asyncio.CancelledError rather than returning normally.
+        """
+        from services.stream_worker import StreamWorker
+
+        q = asyncio.Queue()
+        w = StreamWorker(worker_id=0, symbols=["AAPL"], event_queue=q, startup_delay_s=0)
+
+        with patch("services.stream_worker._is_market_hours", return_value=True):
+            with patch("services.stream_worker.get_session_token", return_value=None):
+                task = asyncio.create_task(w.run())
+                # Give the worker one event-loop tick to reach asyncio.sleep in backoff
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
 
 # ---------------------------------------------------------------------------
