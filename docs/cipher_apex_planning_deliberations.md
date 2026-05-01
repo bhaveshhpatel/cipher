@@ -488,6 +488,63 @@ The CI gate test list covered only SELL PUT and SELL CALL invariants. The BUY CA
 
 ---
 
+## Session 20 — Issue 4: Apex L4 / L3 Numbering vs Execution Order Ambiguity
+*April 30, 2026 — post spec-review deliberation*
+
+### Issue
+The architecture diagram numbers the Ladder Detector as "Apex L4" and the Composite Scorer
+as "Apex L3." In most layered systems, higher numbers run later. Here L4 runs **before** L3,
+which is the opposite of what a reader expects. The diagram carried a parenthetical
+clarification (`[runs before composite — feeds sector_score]`), but this created a latent
+confusion risk for every engineer picking up the code cold.
+
+**Architect:** The numbering is defensible — it reflects the original design order, where
+the composite was designed first (L3) and the ladder was inserted later as a feeder (L4).
+But "L4 feeds L3" violates the mental model of every engineer who reads layered architecture
+diagrams, where higher-numbered layers receive input from lower-numbered ones. I've reviewed
+the hot-path description and the story-to-layer map — both describe the correct execution
+order (accumulator → ladder → composite), but the numbering contradicts it. Anyone wiring
+up the hot path from the diagram alone will get the order wrong.
+
+**Principal Engineer:** I'd prefer not to renumber mid-planning. We have a spec, a story
+plan, and a deliberations doc that all use L3/L4 as they are. Renaming now creates a churn
+cost across four documents for a naming problem that the parenthetical already calls out.
+That said, I agree the parenthetical is easy to miss. The real fix is to make the execution
+order explicit in the hot path description — a numbered sequence that can't be misread —
+rather than changing the layer numbers.
+
+**Architect:** Fair. Renumbering four documents for a cosmetic issue is the wrong trade-off.
+But the fix has to do more than add a parenthetical. Three things need to be explicit and
+consistent: (1) the hot path execution sequence must be stated as a numbered list, not just
+implied by arrow flow in the diagram; (2) the Layer Descriptions section must open with an
+explicit "Execution Order Note" callout before the first layer description; (3) the
+Story-to-Layer Map must add a column for execution order position so it's machine-readable
+per story.
+
+**Principal Engineer:** Agreed on all three. On the spec side — S5 (the ladder story) is
+correctly scoped. The spec already says "passes output as context into Apex L3 composite
+scorer." The architecture doc is the one carrying the ambiguity. The stories file is clean.
+The deliberations doc should record this resolution but the spec and sprint plan don't need
+new sections for this issue.
+
+**Resolution:**
+- Apex L4/L3 numbering is preserved as-is. Renumbering was rejected as high-churn
+  cosmetic work with no functional payoff.
+- Architecture doc updated with three additions:
+  1. Hot-path bullet in the Layer 1 (Stream Ingestion) section replaced with a
+     numbered 7-step execution sequence that makes L4-before-L3 explicit.
+  2. New "Execution Order Note" callout box added immediately before the Layer
+     Descriptions section, stating the full Apex runtime sequence:
+     `L1 → L2 → L4 → L3 → L5` and the reason numbering diverges from execution order.
+  3. Story-to-Layer Map gets a new "Hot-path exec position" column showing the
+     runtime sequence position of each story's affected layer.
+- Spec (`cipher_apex_engineering_spec.md`): no changes. S5 already correctly
+  describes the feeder relationship.
+- Sprint plan (`cipher_apex_story_and_sprint_plan.md`): no changes. Story
+  dependencies already enforce the correct implementation order.
+  
+---
+
 ## Final Summary: What the Deliberations Changed
 
 The architect's original verdict correctly identified the most urgent data quality and signal logic problems. The principal engineer added depth and found additional issues that would have caused silent correctness failures even after the architect's fixes were applied. Sessions 16–19 resolved four remaining specification gaps identified during the spec and sprint plan review.
