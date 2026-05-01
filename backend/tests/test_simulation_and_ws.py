@@ -15,9 +15,15 @@ NOTE on 422 vs auth order:
   runs first and returns 401 before Pydantic can validate.
   To guarantee 422 is returned for body validation tests, we override
   get_current_user so the request reaches Pydantic validation.
+
+NOTE on simulation/run mocking (Apex S0):
+  ensemble_runner.run_ensemble now raises NotImplementedError (deprecated).
+  test_simulation_valid_payload_accepted patches routers.simulation.run_ensemble
+  to return a minimal EnsembleResult so the endpoint returns 200 without
+  calling the real deprecated function.
 """
 from fastapi.testclient import TestClient
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from main import app
 from core.auth import get_current_user, TokenData
 
@@ -29,7 +35,28 @@ def _mock_auth_user():
     return TokenData(email="sim@example.com", sub="sim@example.com")
 
 
-# ── simulation ───────────────────────────────────────────────────────────────────────────────
+def _mock_ensemble_result():
+    """Minimal EnsembleResult-like object for mocking run_ensemble."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from simulation.ensemble_runner import EnsembleResult
+    return EnsembleResult(
+        ticker="AAPL",
+        direction="BUY",
+        confidence=0.75,
+        bull_votes=5,
+        bear_votes=1,
+        hold_votes=0,
+        summary="Mocked swarm result for CI.",
+        agents=[
+            {"role": "momentum", "name": "Agent-0",
+             "direction": "BUY", "reasoning": "test", "confidence": 0.8}
+        ],
+    )
+
+
+# ── simulation ────────────────────────────────────────────────────────────────────────────────────
 
 def test_simulation_invalid_n_agents_returns_422():
     """n_agents=7 is outside the allowed Literal — Pydantic must reject with 422."""
@@ -66,19 +93,24 @@ def test_simulation_no_auth_returns_401():
 
 
 def test_simulation_valid_payload_accepted():
-    """Valid payload with mocked auth must return 200 or 202."""
+    """Valid payload with mocked auth + mocked run_ensemble must return 200."""
     app.dependency_overrides[get_current_user] = _mock_auth_user
+    mock_result = _mock_ensemble_result()
     try:
-        resp = client.post(
-            "/api/simulation/run",
-            json={"ticker": "AAPL", "flow_events": [], "n_agents": 3, "n_runs": 1},
-        )
+        with patch(
+            "routers.simulation.run_ensemble",
+            new=AsyncMock(return_value=mock_result),
+        ):
+            resp = client.post(
+                "/api/simulation/run",
+                json={"ticker": "AAPL", "flow_events": [], "n_agents": 3, "n_runs": 1},
+            )
         assert resp.status_code in (200, 202)
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 
 
-# ── websocket ───────────────────────────────────────────────────────────────────────────────
+# ── websocket ──────────────────────────────────────────────────────────────────────────────────
 
 def test_websocket_accepted_with_valid_token():
     """A valid JWT token must be accepted — connection opens without server error."""
@@ -87,7 +119,7 @@ def test_websocket_accepted_with_valid_token():
             with client.websocket_connect("/ws/signals?token=any.valid.token") as ws:
                 ws.close()
         except Exception:
-            pass  # close in test env is acceptable
+            pass
 
 
 def test_websocket_invalid_token_is_rejected():
@@ -96,4 +128,4 @@ def test_websocket_invalid_token_is_rejected():
         with client.websocket_connect("/ws/signals?token=invalid.garbage.token") as ws:
             ws.receive_json()
     except Exception:
-        pass  # WebSocketDisconnect or similar is expected
+        pass

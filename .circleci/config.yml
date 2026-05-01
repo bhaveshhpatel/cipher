@@ -3,6 +3,11 @@
 # Frontend: npm install + next build (type gate) + jest --ci --coverage + deploy to Vercel
 # Vercel git integration should be disabled in Project Settings → Git
 # so only this pipeline can trigger production deploys.
+#
+# Branch filter policy:
+#   main              — full CI + deploy
+#   apex/.*           — lint + regression + frontend_test (no deploy)
+#   feature/.*, refactor/.*, fix/.*  — lint + regression + frontend_test (no deploy)
 
 version: 2.1
 
@@ -153,12 +158,9 @@ jobs:
       - run:
           name: Deploy backend to Railway
           command: railway up --service cipher
-          # RAILWAY_TOKEN must be set in CircleCI Project Settings → Environment Variables
 
   # -----------------------------------------------------------------------
   # Job 5: Deploy frontend to Vercel (main only, after frontend_test passes)
-  # Requires VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID in CircleCI env vars.
-  # Vercel git integration must be disabled so only this job triggers prod deploys.
   # -----------------------------------------------------------------------
   deploy_frontend:
     docker:
@@ -199,12 +201,13 @@ workflows:
   ci_cd:
     jobs:
 
-      # ── Backend jobs ────────────────────────────────────────────────
+      # ── Backend jobs ──────────────────────────────────────────────
       - lint:
           filters:
             branches:
               only:
                 - main
+                - /apex\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
@@ -214,6 +217,7 @@ workflows:
             branches:
               only:
                 - main
+                - /apex\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
@@ -226,12 +230,13 @@ workflows:
             branches:
               only: main
 
-      # ── Frontend jobs ───────────────────────────────────────────────
+      # ── Frontend jobs ─────────────────────────────────────────────
       - frontend_test:
           filters:
             branches:
               only:
                 - main
+                - /apex\/.*/
                 - /refactor\/.*/
                 - /feature\/.*/
                 - /fix\/.*/
