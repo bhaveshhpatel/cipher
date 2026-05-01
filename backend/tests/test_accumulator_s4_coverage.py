@@ -18,14 +18,12 @@ Missing line groups addressed:
   592-599  ingest_tick Gate-4 whale-sweep bypass fires episode
 """
 import asyncio
-import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import SimpleNamespace
 
 from signals.repetition_accumulator import (
     RepetitionAccumulator,
     RepetitionEpisode,
-    _DictEventWrapper,
 )
 
 
@@ -332,8 +330,8 @@ def test_min_sweeps_gate_passes_when_enough_sweeps():
 def test_whale_sweep_bypass_fires_on_single_large_sweep():
     """
     min_trades=3, min_sweeps=2, sweep_bypass_premium=500_000.
-    A single SWEEP event with premium=600_000 >= 500_000 bypasses both
-    min_trades gate AND min_sweeps gate via _is_single_whale_sweep.
+    Single SWEEP event with premium=600_000 -> Gate-1 (min_trades=3) still
+    blocks since only 1 event in the episode. Bypass only skips min_sweeps.
     """
     acc = RepetitionAccumulator(
         window_minutes=60, min_trades=3, min_premium=50_000,
@@ -342,23 +340,19 @@ def test_whale_sweep_bypass_fires_on_single_large_sweep():
     ep = run(acc.ingest_tick(_ev(
         premium=600_000, trade_type="SWEEP", underlying_price=200.0,
     )))
-    # min_trades=3 but only 1 event -> Gate-1 should block
-    # (bypass doesn't skip min_trades, only min_sweeps)
     assert ep is None  # Gate-1 (min_trades) still blocks single event
 
 
 def test_whale_sweep_bypass_skips_sweep_count_check():
     """
-    3 BLOCK events qualify on premium (3x30k=90k > floor) but fail min_sweeps=2.
-    Then verify a single SWEEP at bypass premium WOULD bypass the sweep check.
-    We test the bypass specifically via _is_single_whale_sweep directly since
-    min_trades still requires 3 events.
+    min_trades=1, min_sweeps=2, sweep_bypass_premium=500_000.
+    Single SWEEP at 600_000 >= bypass -> _is_single_whale_sweep=True -> skips
+    sweep count check -> episode fires.
     """
     acc = RepetitionAccumulator(
         window_minutes=60, min_trades=1, min_premium=50_000,
         min_sweeps=2, sweep_bypass_premium=500_000,
     )
-    # single SWEEP event with premium >= bypass -> should fire (min_trades=1 OK)
     ep = run(acc.ingest_tick(_ev(
         premium=600_000, trade_type="SWEEP", underlying_price=200.0,
     )))

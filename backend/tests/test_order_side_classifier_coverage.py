@@ -6,7 +6,6 @@ Covers parsers/order_side_classifier.py (was at 33%, lines 48-59 all missed).
 Lines 48-59 are the _LOOKUP hit + UNKNOWN fallback paths in
 order_side_to_direction(). Every branch needs at least one hit.
 """
-import pytest
 from parsers.order_side_classifier import order_side_to_direction
 
 
