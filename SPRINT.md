@@ -47,19 +47,15 @@
 | S2-POST-8 | Test isolation — `reset_tier_map_globals` autouse fixture; saves/restores `_tier_map_cache`, `_tier_map_ts`, `_tier_map_refresh_task` | [#37](https://github.com/bhaveshhpatel/cipher/pull/37) | ✅ |
 | S2.5 | DB migration: `order_side` (BUY/SELL/UNKNOWN + index) + `strong_sentiment` (bool) + `execution_mechanic` (6-value enum) on `flow_events` | [#38](https://github.com/bhaveshhpatel/cipher/pull/38) | ✅ |
 | S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#39](https://github.com/bhaveshhpatel/cipher/pull/39) | ✅ |
-
-### Must Close Before S3 Merges (can work in parallel with S3 branch) 🟡
-
-| Story | Description | Issue | Status |
-|---|---|---|---|
-| S2-POST-3 | Tier map refresh double-spawn race — add `asyncio.Lock` guard | [#24](https://github.com/bhaveshhpatel/cipher/issues/24) | 🟡 Open |
-| S2-POST-4 | `CancelledError` not re-raised in `StreamWorker.run()` — pre-existing shutdown bug | [#25](https://github.com/bhaveshhpatel/cipher/issues/25) | 🟡 Open |
-| S2-POST-2 | Flush loop task leak — add `.add_done_callback` to `create_task` dispatch | [#23](https://github.com/bhaveshhpatel/cipher/issues/23) | 🟡 Open |
-| S2-POST-9 | Happy path `_refresh_tier_map` test must assert `_tier_map_refresh_task` state post-call | [#31](https://github.com/bhaveshhpatel/cipher/issues/31) | 🟡 Open |
-| S2-POST-10 | Exception test must assert `log.warning` was emitted when `assign_tiers` raises | [#32](https://github.com/bhaveshhpatel/cipher/issues/32) | 🟡 Open |
-| S2-POST-11 | Add test: `_get_tier_map` when refresh task is already running (not done) | [#33](https://github.com/bhaveshhpatel/cipher/issues/33) | 🟡 Open |
-| S2-POST-12 | Add test: inner registry exception path in `_process_tick` (`_avg_volume_by_ticker.get()` raises) | [#34](https://github.com/bhaveshhpatel/cipher/issues/34) | 🟡 Open |
-| S2-POST-13 | Add test: `assign_tiers` returns empty dict `{}` in `_refresh_tier_map` | [#35](https://github.com/bhaveshhpatel/cipher/issues/35) | 🟡 Open |
+| S2-POST-2 | Flush loop done callback — `.add_done_callback` + `_on_flush_done` error logger | [#23](https://github.com/bhaveshhpatel/cipher/issues/23) | ✅ |
+| S2-POST-3 | Tier map refresh double-spawn race — `_tier_map_refresh_in_progress` flag | [#24](https://github.com/bhaveshhpatel/cipher/issues/24) | ✅ |
+| S2-POST-4 | `CancelledError` re-raised in `StreamWorker.run()` | [#25](https://github.com/bhaveshhpatel/cipher/issues/25) | ✅ |
+| S2-POST-9 | Happy path `_refresh_tier_map` test asserts `_tier_map_refresh_task` state post-call | [#31](https://github.com/bhaveshhpatel/cipher/issues/31) | ✅ |
+| S2-POST-10 | Exception test asserts `log.warning` emitted when `assign_tiers` raises | [#32](https://github.com/bhaveshhpatel/cipher/issues/32) | ✅ |
+| S2-POST-11 | Test: `_get_tier_map` when refresh task already running (not done) | [#33](https://github.com/bhaveshhpatel/cipher/issues/33) | ✅ |
+| S2-POST-12 | Test: inner registry exception path in `_process_tick` (`_avg_volume_by_ticker.get()` raises) | [#34](https://github.com/bhaveshhpatel/cipher/issues/34) | ✅ |
+| S2-POST-13 | Test: `assign_tiers` returns empty dict `{}` in `_refresh_tier_map` | [#35](https://github.com/bhaveshhpatel/cipher/issues/35) | ✅ |
+| S2-POST (PR #40) | `ensemble_runner.py` deprecated stub + `_tier_map_refresh_in_progress` save/restore in fixture + concurrent stale call test; caplog logger fix (inline) | [#40](https://github.com/bhaveshhpatel/cipher/pull/40) | ✅ |
 
 ### Low Priority / Anytime ⚪
 
@@ -67,15 +63,14 @@
 |---|---|---|---|
 | S2-POST-1 | Hoist `get_registry` import out of `_process_tick` hot path | [#22](https://github.com/bhaveshhpatel/cipher/issues/22) | ⚪ Open |
 | S2-POST-7 | Fix misleading `test_flush_loop_creates_task_not_blocking` name + intent | [#28](https://github.com/bhaveshhpatel/cipher/issues/28) | ⚪ Open |
-| S2-POST-14 | `_flush_loop` orphaned flush tasks — cancel-on-shutdown or document as intentional (raised in PR #40 panel review) | [#41](https://github.com/bhaveshhpatel/cipher/issues/41) | ⚪ Open |
-| S2-POST-15 | `_get_tier_map` double-guard redundancy — remove stale `task.done()` clause or document belt-and-suspenders (raised in PR #40 panel review) | [#42](https://github.com/bhaveshhpatel/cipher/issues/42) | ⚪ Open |
+| S2-POST-14 | `_flush_loop` orphaned flush tasks — cancel-on-shutdown or document as intentional | [#41](https://github.com/bhaveshhpatel/cipher/issues/41) | ⚪ Open |
+| S2-POST-15 | `_get_tier_map` double-guard redundancy — remove stale `task.done()` clause or document belt-and-suspenders | [#42](https://github.com/bhaveshhpatel/cipher/issues/42) | ⚪ Open |
 
 ---
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **Hard gate cleared. S3 branch can now be created.**
-> 🟡 The 8 🟡 stories above must still merge before S3 merges into main.
+> 🟢 **All pre-S3 gates cleared. S3 is unblocked — branch can be created and merged when ready.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 | Story | Description | Issue | Status |
@@ -129,41 +124,33 @@ Exact execution order. Do not start a story until everything above it in the sam
 6.  ✅  #30           — S2-POST-8: test isolation / module global teardown (PR #37)
 7.  ✅  #29           — S2.5: order_side + strong_sentiment + execution_mechanic DB migration (PR #38)
 8.  ✅  #20           — S0.5: Delete ensemble_runner.py (PR #39)
-───────────────────────────────────────────────────────────────────────────────────
-
-── BEFORE S3 MERGES (parallel with S3 branch) ────────────────────────────────────
-9.  🟡  #24           — Tier map refresh race fix
-10. 🟡  #25           — CancelledError re-raise in StreamWorker.run()
-11. 🟡  #23           — Flush loop done callback
-12. 🟡  #31           — S2-POST-9: happy path assert task state post-call
-13. 🟡  #32           — S2-POST-10: exception test assert warning logged
-14. 🟡  #33           — S2-POST-11: _get_tier_map task-already-running branch
-15. 🟡  #34           — S2-POST-12: inner registry exception path
-16. 🟡  #35           — S2-POST-13: assign_tiers returns empty dict
+9.  ✅  #23+#24+#25   — S2-POST-2/3/4: flush done callback, tier map race fix, CancelledError re-raise
+10. ✅  #31–35        — S2-POST-9–13: 5 test coverage additions (PR #40)
+11. ✅  PR #40        — ensemble_runner.py stub, concurrent stale call test, caplog logger fix
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 2 ──────────────────────────────────────────────────────────────────────────────────
-17. 🟢  S3            — Apex L1: signal_gate.py  ← READY TO START
-18. ⏳  S4            — Apex L2: dual-window accumulator
-19. ⏳  S5            — Apex L4: ladder detection
+12. 🟢  S3            — Apex L1: signal_gate.py  ← READY TO START + READY TO MERGE
+13. ⏳  S4            — Apex L2: dual-window accumulator
+14. ⏳  S5            — Apex L4: ladder detection
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
-20. ⏳  S6            — Apex L3: composite formula overhaul
-21. ⏳  S7            — Tiered swarm + circuit breaker
+15. ⏳  S6            — Apex L3: composite formula overhaul
+16. ⏳  S7            — Tiered swarm + circuit breaker
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
-22. ⏳  S8            — Real backtest score from flow_events
+17. ⏳  S8            — Real backtest score from flow_events
 ───────────────────────────────────────────────────────────────────────────
 
-── PARALLEL / ANYTIME ──────────────────────────────────────────────────────────────────
-23. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
-24. 🟢  C8            — Decouple persist/signal tier (#2)
-25. ⚪  #22           — Hoist get_registry import
-26. ⚪  #28           — Fix misleading flush loop test
-27. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
-28. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
+── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────────
+18. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
+19. 🟢  C8            — Decouple persist/signal tier (#2)
+20. ⚪  #22           — Hoist get_registry import
+21. ⚪  #28           — Fix misleading flush loop test
+22. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
+23. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -171,10 +158,11 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 17: S3 — Apex L1 `signal_gate.py`. The pre-S3 hard gate is cleared. S3 branch can be created now.
-- **"What must close before S3 merges?"** → Steps 9–16 (#23, #24, #25, #31, #32, #33, #34, #35) — 8 🟡 stories. Work them in parallel with the S3 branch.
-- **"What is remaining?"** → Every row not marked ✅ — steps 9 through 28.
-- **"What blocks S3 start?"** → Nothing. All hard gates are cleared (✅).
+- **"What is next?"** → Step 12: S3 — Apex L1 `signal_gate.py`. All pre-S3 gates are ✅ cleared. S3 is fully unblocked — ready to start AND ready to merge.
+- **"What must close before S3 merges?"** → Nothing. All 8 pre-S3 🟡 stories landed in PR #40. Gate is fully clear.
+- **"What is remaining?"** → Every row not marked ✅ — steps 12 through 23.
+- **"What blocks S3 start?"** → Nothing.
+- **"What blocks S3 merge?"** → Nothing. All pre-S3 gates cleared.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -182,5 +170,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — PR #40 panel review complete. #41 and #42 filed and added (tech-debt, non-blocking). Steps updated to 28.*
-*Version: 1.8*
+*Last updated: 2026-05-01 — PR #40 merged, main CI green. All 8 pre-S3 🟡 gates marked ✅. S3 fully unblocked — no merge gate remaining.*
+*Version: 1.9*
