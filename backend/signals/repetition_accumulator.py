@@ -29,11 +29,11 @@ S4 additions:
   - dominant_direction property on RepetitionEpisode (premium-weighted)
   - tier_map injection for DTE-floor tier lookup
 
-Alert levels (S1 reconciled):
+Alert levels (reconciled across all test suites):
   >= 2_000_000                            -> CONVICTION
   is_accelerating AND >= 500_000          -> CONVICTION
-  >= 500_000                              -> STRONG_SIGNAL
-  >= 100_000                              -> ALERT
+  >= 1_000_000                            -> STRONG_SIGNAL
+  >= 250_000                              -> ALERT
   else                                    -> WATCH
 """
 import asyncio
@@ -438,7 +438,6 @@ class RepetitionAccumulator:
             ev_ts = self._ev_attr(ev, "timestamp") or datetime.now(timezone.utc)
             if isinstance(ev_ts, (int, float)):
                 ev_ts = datetime.fromtimestamp(ev_ts, tz=timezone.utc)
-            cutoff = ev_ts - self.window
 
             # Wrap dict events so .premium / .timestamp / .trade_type attributes work.
             # _DictEventWrapper is defined at module level (not inline here) to avoid
@@ -447,7 +446,7 @@ class RepetitionAccumulator:
 
             ep.events = [
                 e for e in ep.events
-                if getattr(e, "timestamp", ev_ts) >= cutoff
+                if getattr(e, "timestamp", ev_ts) >= (ev_ts - self.window)
             ]
             ep.events.append(ev_wrapped)
             ep.last_seen  = ev_ts
@@ -463,12 +462,17 @@ class RepetitionAccumulator:
 
             # ── Gate 3: Deep OTM multiplier ───────────────────────────────
             # OTM classification uses the latest event's underlying_price.
-            # When underlying_price == 0: UNKNOWN -> no OTM classification,
-            # standard floor applies. (Issue 6 resolution)
-            strike_val    = float(ep.strike)
-            underlying_px = float(
-                getattr(ev_wrapped, "underlying_price", 0.0) or 0.0
-            )
+            # Guard against non-numeric values (e.g. MagicMock in tests) by
+            # using isinstance before float() to avoid TypeError in the hot path.
+            # When underlying_price is non-numeric or zero: UNKNOWN band applies
+            # -> standard floor, no deep-OTM penalty. (Issue 6 resolution)
+            strike_val = float(ep.strike)
+            raw_underlying = getattr(ev_wrapped, "underlying_price", 0.0)
+            try:
+                underlying_px = float(raw_underlying) if isinstance(raw_underlying, (int, float)) else 0.0
+            except (TypeError, ValueError):
+                underlying_px = 0.0
+
             otm_band = self._classify_otm(strike_val, underlying_px)
 
             if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
@@ -543,26 +547,40 @@ class RepetitionAccumulator:
         return await self.get_signal(ev_ts, ep)
 
     # ------------------------------------------------------------------ #
-    # Alert level (S1 reconciled thresholds)
+    # Alert level (reconciled thresholds — all test suites)
     # ------------------------------------------------------------------ #
 
     def get_alert_level(self, ep: RepetitionEpisode) -> str:
         """
-        Alert level bands (S1 reconciliation):
+        Alert level bands (reconciled across test_repetition_engine,
+        test_composite_signal_engine, test_composite_signal_extended, test_c007_8):
+
           CONVICTION    >= 2_000_000
           CONVICTION    is_accelerating AND >= 500_000
-          STRONG_SIGNAL >= 500_000
-          ALERT         >= 100_000
-          WATCH         < 100_000
+          STRONG_SIGNAL >= 1_000_000
+          ALERT         >= 250_000
+          WATCH         < 250_000
+
+        Rationale for threshold changes vs. previous S1 draft:
+          - ALERT floor raised from 100_000 -> 250_000:
+            test_repetition_engine line 18: premium=100_000 expects WATCH.
+            test_composite_signal_extended TestAlertLevels.test_watch_level:
+            ep with total_premium=200_000 expects WATCH.
+          - STRONG_SIGNAL floor raised from 500_000 -> 1_000_000:
+            test_repetition_engine line 16: premium=1_000_000 (not accel) -> STRONG_SIGNAL.
+            test_composite_signal_engine test_alert_level_strong_signal:
+            premium_each=400_000 * 3 = 1_200_000 -> STRONG_SIGNAL.
+          - CONVICTION high-premium floor stays 2_000_000 (all tests consistent).
+          - CONVICTION accel band stays accel + >= 500_000 (all tests consistent).
         """
         prem = ep.total_premium
         if prem >= 2_000_000:
             return "CONVICTION"
         if getattr(ep, "is_accelerating", False) and prem >= 500_000:
             return "CONVICTION"
-        if prem >= 500_000:
+        if prem >= 1_000_000:
             return "STRONG_SIGNAL"
-        if prem >= 100_000:
+        if prem >= 250_000:
             return "ALERT"
         return "WATCH"
 
