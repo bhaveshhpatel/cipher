@@ -416,9 +416,81 @@ S2.5 must deploy before S6 hot-path changes go live.
 
 ---
 
+## Session 16 — Issue 5: sector_score 0.10 Weight Gap
+*April 30, 2026 — post spec-review deliberation*
+
+### Issue
+With `sector_score = 0.0` and `backtest_score = 0.0`, the composite weight formula active weights sum to only 0.90. Every composite_score emitted before S5 lands is silently capped at 0.90.
+
+**Architect:** The weights as written sum to 0.90 when sector_score and backtest_score are both zero. Every score emitted before S5 lands is silently capped. Frontend consumers calibrating thresholds won't know their "0.90 conviction" is actually a ceiling hit — they'll tune their alerting logic against a ceiling they can't see. That's a product quality bug even if the math is technically correct.
+
+**Principal Engineer:** I don't want to redistribute the 0.10 to the other weights. That shifts the entire scoring baseline. We've already tuned flow/volume/premium splits against real data from the stream. Changing them now means re-validating every threshold across every tier — that's weeks of recalibration on a live system.
+
+**Architect:** Agreed on not redistributing. The weight structure is right. But the ceiling must be explicit — it cannot be silent. If the frontend is normalizing scores to a 0–1 scale and treating 0.90 as "high conviction," they need to know that 0.90 is actually the maximum achievable score in the pre-S5 period. Put it in the payload.
+
+**Principal Engineer:** That works. A `composite_score_ceiling` field in the bus payload is cheap to add and gives downstream consumers exactly what they need to normalize without changing any core logic.
+
+**Resolution:** Weights stay unchanged. A `composite_score_ceiling: 0.90` field is added to the composite bus payload starting in S6. Frontend treats any score > 0.85 as effectively maximum conviction pre-S5. The field is removed when S5 wires real ladder context into sector_score and sector_score receives a non-zero value.
+
+---
+
+## Session 17 — Issue 6: ATM Band Has No Concrete Threshold
+*April 30, 2026 — post spec-review deliberation*
+
+### Issue
+The spec used the phrase "ATM eligible" with no numeric definition. Without a concrete threshold, different engineers would implement the boundary differently.
+
+**Architect:** "ATM eligible" with no number will be implemented three different ways. I've seen this before on production systems — one engineer does ±$1 from the strike, another does ±1% of underlying, another does exact strike match only. Each produces a meaningfully different set of qualifying contracts. On a live signal system, that inconsistency goes undetected until a signal regression surfaces weeks later. This has to be a number in the spec.
+
+**Principal Engineer:** ±1% is too tight on high-priced underlyings. NVDA at $900 — a $9 spread is 1%. Institutions buy ATM NVDA all the time and deliberately land slightly off-center on the strike. A 1% band would exclude a large portion of real ATM institutional prints on those names. I'd say ±2%.
+
+**Architect:** ±2% makes sense. It needs to be a percentage of underlying price, not an absolute dollar amount. Absolute amounts break across different underlying price regimes. A ±$5 threshold works on a $50 stock but is effectively zero on a $900 stock. Percentage is the only portable definition.
+
+**Principal Engineer:** Agreed. And we need to handle the zero-underlying-price case. If `underlying_price == 0`, we can't compute the ATM band at all. Those events should fall back to standard premium floor and skip OTM classification entirely — don't try to classify them as ATM or deep OTM.
+
+**Resolution:** ATM is defined as `abs(strike - underlying_price) / underlying_price <= 0.02`. This is now a required acceptance criterion in S4. Events with `underlying_price == 0` fall back to standard floor — no OTM classification attempted.
+
+---
+
+## Session 18 — Issue 7: trade_count == 1 Sweep Bypass Ambiguity
+*April 30, 2026 — post spec-review deliberation*
+
+### Issue
+The spec specified a sweep bypass condition using `ep.trade_count == 1`, but `trade_count` was not defined anywhere in the spec. It was ambiguous between two entirely different semantics.
+
+**Architect:** The spec says `ep.trade_count == 1` but nowhere defines what `trade_count` measures. Reading the accumulator code, I can see at least two plausible interpretations: episode event count (how many OptionsFlowEvent objects have been added to this episode) or fill count within a single stream tick (the `fill_count` field on an individual event). Those are completely different things. A single-tick event with 100 fills would fail the condition under one interpretation and pass under the other.
+
+**Principal Engineer:** It's episode event count — `len(ep.events)`. One event entered the accumulator for this (ticker, strike, expiry) key. The `fill_count` field lives on the individual `OptionsFlowEvent` and refers to how many exchange fills were reported within that single stream tick. They're different layers entirely. `fill_count` is about execution mechanics within one tick. `len(ep.events)` is about how many ticks have accumulated in the episode window.
+
+**Architect:** That distinction has to be in the spec explicitly. Any future engineer implementing the bypass condition in isolation — without reading the accumulator internals — will make the wrong assumption. The spec should use `len(ep.events) == 1` and include a comment explaining what it is not.
+
+**Principal Engineer:** Agreed. We should also add the negative test case explicitly: `len(ep.events) == 2` with the same SWEEP type and same premium must NOT trigger the bypass. That protects against an engineer accidentally broadening the condition.
+
+**Resolution:** Spec and sprint plan now use `len(ep.events) == 1` instead of `ep.trade_count == 1`, with an explicit comment distinguishing from `fill_count`. The bypass negative test case is added to S4 acceptance criteria: `len(ep.events) == 2` with same SWEEP and premium must NOT bypass min_sweeps.
+
+---
+
+## Session 19 — Issue 8: CI Invariants Missing BUY Side
+*April 30, 2026 — post spec-review deliberation*
+
+### Issue
+The CI gate test list covered only SELL PUT and SELL CALL invariants. The BUY CALL and BUY PUT quadrants were unguarded.
+
+**Architect:** The CI gate currently only covers SELL PUT and SELL CALL. If a parser refactor breaks BUY PUT direction — makes it bullish instead of bearish — nothing in the CI gate catches it. The change passes all tests. The bug ships. That's a gap in the invariant set.
+
+**Principal Engineer:** That's a real gap. BUY PUT = BEARISH is just as fundamental as SELL PUT = BULLISH. We added the sell-side invariants because SELL PUT = BULLISH is the counter-intuitive case — the one that violates naive contract-type logic. But we left the buy side unguarded by assuming it was "obvious." Obvious invariants are the ones that regress silently. Nobody writes a test for something they think is obviously true.
+
+**Architect:** Exactly. And the regression scenario is realistic, not theoretical. If someone refactors `classify_order_direction()` and gets the BUY-side logic wrong in a way that accidentally unifies CALL and PUT to both be BULLISH when bought, every BEARISH BUY PUT signal in the pipeline becomes a false bullish signal. That's a directional inversion on a real trade type that we'd catch in production anomaly reports, not in CI.
+
+**Principal Engineer:** Eight new assertions: BUY CALL and BUY PUT for sentiment, order_side, and strong_sentiment, plus the two REPEAT direction mappings for BUY + CALL and BUY + PUT. That covers the full four-quadrant matrix with all properties gated.
+
+**Resolution:** Eight new test assertions added across spec and sprint plan covering all four quadrants: BUY CALL = BULLISH, BUY PUT = BEARISH (with `order_side=BUY`, `strong_sentiment=True` for each), and the `REPEAT_BUY`/`REPEAT_SELL` mappings for both BUY + CALL and BUY + PUT. `test_direction_invariants.py` now enforces 14 total assertions (6 original SELL-side + 8 new BUY-side).
+
+---
+
 ## Final Summary: What the Deliberations Changed
 
-The architect's original verdict correctly identified the most urgent data quality and signal logic problems. The principal engineer added depth and found additional issues that would have caused silent correctness failures even after the architect's fixes were applied.
+The architect's original verdict correctly identified the most urgent data quality and signal logic problems. The principal engineer added depth and found additional issues that would have caused silent correctness failures even after the architect's fixes were applied. Sessions 16–19 resolved four remaining specification gaps identified during the spec and sprint plan review.
 
 | Area | Architect Verdict | Principal Engineer Addition |
 |---|---|---|
@@ -438,6 +510,10 @@ The architect's original verdict correctly identified the most urgent data quali
 | DB migration | Implicit | Made explicit as S2.5 |
 | Test coverage | Story-level mentions | Elevated to architecture-level policy |
 | Demo mode | Not reviewed | Fixed naive direction encoding |
+| sector_score weight gap (Issue 5) | Not in original verdict | composite_score_ceiling added to bus payload; weights unchanged |
+| ATM band threshold (Issue 6) | Not in original verdict | ATM defined as ±2% of underlying price; zero-price fallback |
+| trade_count ambiguity (Issue 7) | Not in original verdict | len(ep.events) == 1 with explicit comment; negative test added |
+| BUY-side CI invariants (Issue 8) | Not in original verdict | 8 new assertions; all four quadrants now gated |
 
 ---
 
@@ -445,11 +521,22 @@ The architect's original verdict correctly identified the most urgent data quali
 
 These invariants were agreed upon by both the architect and principal engineer as CI gate conditions.
 
+**SELL-side (original):**
 1. AT_BID + PUT must resolve to order_side=SELL, sentiment=BULLISH, strong_sentiment=True.
 2. BELOW_BID + PUT must resolve to sentiment=BULLISH.
 3. SELL + PUT must map to direction REPEAT_BUY.
 4. SELL + CALL must map to direction REPEAT_SELL.
-5. Registry enrichment must never overwrite sentiment with naive contract-type logic.
-6. Production composite scoring must not include a non-zero backtest weight until S8 is implemented.
-7. Episode influence tier must use total episode premium, not latest tick premium.
-8. dominant_direction must be premium-weighted, not first-event or latest-event.
+
+**BUY-side (added — Issue 8):**
+5. AT_ASK + CALL must resolve to order_side=BUY, sentiment=BULLISH, strong_sentiment=True.
+6. AT_ASK + PUT must resolve to order_side=BUY, sentiment=BEARISH, strong_sentiment=True.
+7. BUY + CALL must map to direction REPEAT_BUY.
+8. BUY + PUT must map to direction REPEAT_SELL.
+
+**General:**
+9. Registry enrichment must never overwrite sentiment with naive contract-type logic.
+10. Production composite scoring must not include a non-zero backtest weight until S8 is implemented.
+11. Episode influence tier must use total episode premium, not latest tick premium.
+12. dominant_direction must be premium-weighted, not first-event or latest-event.
+13. composite_score_ceiling must be present in bus payloads while sector_score is inactive (pre-S5 wiring).
+14. composite_score_ceiling must be removed from bus payloads once S5 wires real ladder context.
