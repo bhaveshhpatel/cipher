@@ -5,12 +5,13 @@ Covers:
   - BreachType enum values
   - SymbolMetrics / ThresholdBreach / ReconcileResult dataclasses
   - _epoch_minute + _breach_key helpers
-  - ThresholdReconciler._metrics_complete (static)
+  - ThresholdReconciler._metrics_complete (static) — None AND NaN guards
   - ThresholdReconciler._evaluate (static) — all four breach paths
   - ThresholdReconciler.get_thresholds_for_tier — known + unknown tier
   - ThresholdReconciler.reset_dedup_cache
   - ThresholdReconciler.reconcile — happy path, dedup, skip incomplete,
-    emit_fn forwarding, lock serialisation, elapsed_ms populated
+    emit_fn forwarding, emit_fn exception resilience, lock serialisation,
+    elapsed_ms populated
   - Module-level get_reconciler singleton + reconcile() wrapper
   - _maybe_evict under cap pressure
 """
@@ -18,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Dict, List
 
@@ -130,7 +132,7 @@ class TestHelpers:
 
 
 # ---------------------------------------------------------------------------
-# _metrics_complete
+# _metrics_complete — None AND NaN guards
 # ---------------------------------------------------------------------------
 
 class TestMetricsComplete:
@@ -151,6 +153,31 @@ class TestMetricsComplete:
         m = _metrics()
         m.volume_ratio = None  # type: ignore[assignment]
         assert ThresholdReconciler._metrics_complete(m) is False
+
+    def test_nan_oi_delta_returns_false(self):
+        """NaN oi_delta must be treated as incomplete — not a valid breach signal."""
+        m = _metrics(oi_delta=float("nan"))
+        assert ThresholdReconciler._metrics_complete(m) is False
+
+    def test_nan_premium_usd_returns_false(self):
+        m = _metrics(premium_usd=float("nan"))
+        assert ThresholdReconciler._metrics_complete(m) is False
+
+    def test_nan_volume_ratio_returns_false(self):
+        m = _metrics(volume_ratio=float("nan"))
+        assert ThresholdReconciler._metrics_complete(m) is False
+
+    def test_nan_skipped_in_reconcile(self):
+        """End-to-end: NaN metric must increment skipped, not checked."""
+        m = _metrics(oi_delta=float("nan"))
+
+        async def _run():
+            r = ThresholdReconciler()
+            return await r.reconcile({"AAPL": m}, {"AAPL": "T1"})
+
+        result = asyncio.get_event_loop().run_until_complete(_run())
+        assert result.skipped == 1
+        assert result.checked == 0
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +329,6 @@ class TestReconcile:
         ts = time.time()
         m = _metrics(oi_delta=thres["oi_spike_pct"] + 0.05, ts=ts)
         await self.r.reconcile({"AAPL": m}, {"AAPL": "T1"})
-        # same ts → same epoch-minute → dedup should suppress
         result2 = await self.r.reconcile({"AAPL": m}, {"AAPL": "T1"})
         assert result2.breach_count == 0
 
@@ -310,7 +336,7 @@ class TestReconcile:
     async def test_dedup_different_minute_allows_refire(self):
         thres = _TIER_THRESHOLDS["T1"]
         ts1 = 1_700_000_000.0
-        ts2 = ts1 + 61.0  # different epoch-minute
+        ts2 = ts1 + 61.0
         m1 = _metrics(oi_delta=thres["oi_spike_pct"] + 0.05, ts=ts1)
         m2 = _metrics(oi_delta=thres["oi_spike_pct"] + 0.05, ts=ts2)
         r1 = await self.r.reconcile({"AAPL": m1}, {"AAPL": "T1"})
@@ -341,8 +367,25 @@ class TestReconcile:
         assert result.breach_count >= 1
 
     @pytest.mark.asyncio
+    async def test_emit_fn_exception_does_not_halt_remaining_symbols(self):
+        """A crashing emit_fn must not abort processing of subsequent symbols."""
+        thres = _TIER_THRESHOLDS["T1"]
+
+        async def boom(_breach: ThresholdBreach) -> None:
+            raise RuntimeError("emit bus down")
+
+        metrics = {
+            "AAPL": _metrics("AAPL", oi_delta=thres["oi_spike_pct"] + 0.05),
+            "TSLA": _metrics("TSLA", oi_delta=thres["oi_spike_pct"] + 0.05),
+        }
+        # Both symbols breach; emit_fn raises on every call.
+        # reconciler must process both and return breach_count == 2.
+        result = await self.r.reconcile(metrics, {"AAPL": "T1", "TSLA": "T1"}, emit_fn=boom)
+        assert result.breach_count == 2
+        assert result.checked == 2
+
+    @pytest.mark.asyncio
     async def test_unknown_symbol_falls_back_to_T3(self):
-        """Symbol not in tier_map should use _DEFAULT_TIER = T3."""
         thres = _TIER_THRESHOLDS["T3"]
         m = _metrics(oi_delta=thres["oi_spike_pct"] + 0.05)
         result = await self.r.reconcile({"UNKNWN": m}, {})
@@ -357,11 +400,11 @@ class TestReconcile:
         metrics = {
             "AAPL": _metrics("AAPL", oi_delta=thres_t1["oi_spike_pct"] + 0.05),
             "TSLA": _metrics("TSLA", volume_ratio=thres_t2["volume_ratio"] + 1),
-            "MSFT": _metrics("MSFT", oi_delta=0.001),  # clean
+            "MSFT": _metrics("MSFT", oi_delta=0.001),
         }
         result = await self.r.reconcile(metrics, tier_map)
         assert result.checked == 3
-        assert result.breach_count >= 2  # AAPL + TSLA breach
+        assert result.breach_count >= 2
 
     @pytest.mark.asyncio
     async def test_reset_dedup_cache_allows_refire(self):
@@ -375,8 +418,7 @@ class TestReconcile:
 
     @pytest.mark.asyncio
     async def test_lock_serialises_concurrent_calls(self):
-        """Two concurrent reconcile calls must not race — both complete."""
-        m = _metrics(oi_delta=0.001)  # clean — we just want both to finish
+        m = _metrics(oi_delta=0.001)
         r1, r2 = await asyncio.gather(
             self.r.reconcile({"AAPL": m}, {"AAPL": "T1"}),
             self.r.reconcile({"TSLA": m}, {"TSLA": "T1"}),
@@ -392,11 +434,10 @@ class TestMaybeEvict:
     @pytest.mark.asyncio
     async def test_evicts_when_over_cap(self):
         r = ThresholdReconciler()
-        r._seen_cap = 10  # tiny cap for test speed
+        r._seen_cap = 10
 
-        # Feed 12 distinct epoch-minute keys to force eviction
         for i in range(12):
-            ts = float(i * 120)  # 2-minute spacing → 12 distinct minutes
+            ts = float(i * 120)
             m = _metrics(symbol="SYM", oi_delta=_TIER_THRESHOLDS["T1"]["oi_spike_pct"] + 0.05, ts=ts)
             await r.reconcile({"SYM": m}, {"SYM": "T1"})
 
@@ -410,7 +451,7 @@ class TestMaybeEvict:
 class TestModuleLevel:
     def test_get_reconciler_returns_singleton(self):
         import services.threshold_reconciliation as mod
-        mod._reconciler = None  # reset
+        mod._reconciler = None
         r1 = get_reconciler()
         r2 = get_reconciler()
         assert r1 is r2
@@ -424,7 +465,7 @@ class TestModuleLevel:
     @pytest.mark.asyncio
     async def test_module_reconcile_wrapper(self):
         import services.threshold_reconciliation as mod
-        mod._reconciler = None  # fresh singleton
+        mod._reconciler = None
         result = await reconcile({}, {})
         assert isinstance(result, ReconcileResult)
         assert result.checked == 0

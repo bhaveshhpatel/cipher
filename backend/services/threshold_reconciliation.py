@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -85,7 +86,7 @@ _TIER_THRESHOLDS: Dict[str, Dict[str, float]] = {
         "oi_spike_pct":      0.10,   # 10 % OI increase = breach
         "oi_collapse_pct":  -0.15,   # 15 % OI decrease
         "premium_usd":    250_000,   # $250 k single-event premium
-        "volume_ratio":       3.0,   # 3× avg volume
+        "volume_ratio":       3.0,   # 3\u00d7 avg volume
     },
     "T2": {
         "oi_spike_pct":      0.20,
@@ -199,24 +200,27 @@ class ThresholdReconciler:
                 if key in self._seen:
                     continue  # dedup
                 self._seen[key] = True
-                self._maybe_evict()
                 result.breaches.append(breach)
                 if emit_fn is not None:
                     try:
                         await emit_fn(breach)
-                    except Exception as exc:  # pragma: no cover
+                    except Exception as exc:
                         logger.warning("emit_fn raised: %s", exc)
+
+            # Evict once per symbol after all its breaches are processed
+            self._maybe_evict()
 
         result.elapsed_ms = (time.monotonic() - t0) * 1000
         return result
 
     @staticmethod
     def _metrics_complete(m: SymbolMetrics) -> bool:
-        """Return False if any metric is NaN / None — skip incomplete rows."""
+        """Return False if any metric is NaN or None — skip incomplete rows."""
         try:
-            return all(v is not None for v in (
-                m.oi_delta, m.premium_usd, m.volume_ratio
-            ))
+            for v in (m.oi_delta, m.premium_usd, m.volume_ratio):
+                if v is None or math.isnan(v):
+                    return False
+            return True
         except Exception:
             return False
 
