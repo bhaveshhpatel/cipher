@@ -161,9 +161,10 @@ PR
 
 DELIBERATION
 ☐  There has to be a 3-way deliberation between Senior Architect, Principal Backend Engineer and Lead QA
-☐  Senior Architect reviews diff — scope, completeness, architecture + planning deliberations
-☐  Principal Backend Engineer reviews diff — correctness, safety, engineering spec alignment
-☐  Lead QA reviews diff — test coverage per QA path coverage spec, constraint tests, regression gaps
+☐  Put on the hat of a Senior Architect reviews diff — scope, completeness, architecture + planning deliberations
+☐  Put on the hat Principal Backend Engineer reviews diff — correctness, safety, engineering spec alignment
+☐  Put on the hat Lead QA reviews diff — test coverage per QA path coverage spec, constraint tests, regression gaps
+☐  Have pushbacks if any and get a closure on it and report back in detail
 ☐  For all small fixes do the changes and apply it inline on the PR
 ☐  Add all new-work findings filed as GitHub Issues AND added to SPRINT.md
 ☐  Zero unresolved findings remaining
