@@ -160,6 +160,7 @@ PR
 ☐  Wait on approval for geen build before startign deliberation
 
 DELIBERATION
+☐  There has to be a 3-way deliberation between Senior Architect, Principal Backend Engineer and Lead QA
 ☐  Senior Architect reviews diff — scope, completeness, architecture + planning deliberations
 ☐  Principal Backend Engineer reviews diff — correctness, safety, engineering spec alignment
 ☐  Lead QA reviews diff — test coverage per QA path coverage spec, constraint tests, regression gaps
