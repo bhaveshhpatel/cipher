@@ -1,47 +1,27 @@
 """
-composite_signal_engine.py — Phase 3 + 5A
+composite_signal_engine.py — Apex S0
+
+Swarm / async layer removed. build_composite_async, run_ensemble import,
+and all swarm fields on CompositeSignal are gone. Only the synchronous
+hot-path (build_composite) survives.
 
 vwpf formula: min(1.0, premium / (oi * 100))
-
-Patch compatibility — both test files satisfied:
-  patch('signals.composite_signal_engine.run_ensemble', ...):
-    -> replaces module-level attr; identity check detects it differs from
-       simulation.ensemble_runner.run_ensemble, so module attr is used.
-  patch('simulation.ensemble_runner.run_ensemble', ...):
-    -> module attr still equals original (same object), so live
-       simulation.ensemble_runner.run_ensemble is used (which IS patched).
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 from signals.backtest_validator import get_backtest_score
-
-try:
-    from simulation.ensemble_runner import run_ensemble as _original_run_ensemble
-except Exception:
-    _original_run_ensemble = None  # type: ignore[assignment]
-
-# Module-level attr — patching 'signals.composite_signal_engine.run_ensemble'
-# replaces this name; identity check in build_composite_async detects the swap.
-run_ensemble = _original_run_ensemble
 
 
 @dataclass
 class CompositeSignal:
-    ticker:                 str
-    recommendation:         str
-    composite_score:        float
-    flow_score:             float
-    backtest_score:         float
-    volume_premium_factor:  float
-    reasoning:              str
-    swarm_direction:   Optional[str]   = None
-    swarm_confidence:  Optional[float] = None
-    swarm_bull_votes:  Optional[int]   = None
-    swarm_bear_votes:  Optional[int]   = None
-    swarm_hold_votes:  Optional[int]   = None
-    swarm_agents:      List[dict]      = field(default_factory=list)
+    ticker:                str
+    recommendation:        str
+    composite_score:       float
+    flow_score:            float
+    backtest_score:        float
+    volume_premium_factor: float
+    reasoning:             str
 
 
 def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
@@ -102,68 +82,3 @@ def build_composite(
         volume_premium_factor = vwp_f,
         reasoning             = reasoning,
     )
-
-
-async def build_composite_async(
-    ep:          RepetitionEpisode,
-    accumulator: RepetitionAccumulator,
-    n_agents:    int | None = None,
-) -> CompositeSignal:
-    import signals.composite_signal_engine as _self
-    import simulation.ensemble_runner as _er
-
-    _module_run  = _self.__dict__.get("run_ensemble")
-    _live_run    = getattr(_er, "run_ensemble", None)
-
-    # If the module attr has been replaced by a patch (identity differs from
-    # the live ensemble_runner attr), use the patched module attr.
-    # Otherwise always resolve from simulation.ensemble_runner live so that
-    # patch('simulation.ensemble_runner.run_ensemble') is respected.
-    if _module_run is not None and _module_run is not _original_run_ensemble:
-        _run = _module_run
-    else:
-        _run = _live_run
-
-    sig = build_composite(ep, accumulator)
-
-    if _run is None:
-        return sig
-
-    flow_events = [
-        {
-            "ticker":          getattr(ev, "ticker", ep.ticker),
-            "contract_type":   ep.contract_type,
-            "strike":          getattr(ev, "strike", 0),
-            "expiry":          getattr(ev, "expiry", ""),
-            "premium":         getattr(ev, "premium", 0),
-            "sentiment":       getattr(ev, "sentiment", "NEUTRAL"),
-            "influence_tier":  getattr(ev, "influence_tier", "RETAIL"),
-            "is_golden_sweep": getattr(ev, "is_golden_sweep", False),
-        }
-        for ev in ep.events
-    ]
-
-    kwargs: dict = {"ticker": ep.ticker, "flow_events": flow_events}
-    if n_agents is not None:
-        kwargs["n_agents"] = n_agents
-
-    try:
-        result = await _run(**kwargs)
-        if hasattr(result, "direction"):
-            sig.swarm_direction  = result.direction
-            sig.swarm_confidence = result.confidence
-            sig.swarm_bull_votes = result.bull_votes
-            sig.swarm_bear_votes = result.bear_votes
-            sig.swarm_hold_votes = result.hold_votes
-            sig.swarm_agents     = result.agents if hasattr(result, "agents") else []
-        elif isinstance(result, dict):
-            sig.swarm_direction  = result.get("direction")
-            sig.swarm_confidence = result.get("confidence")
-            sig.swarm_bull_votes = result.get("bull_votes")
-            sig.swarm_bear_votes = result.get("bear_votes")
-            sig.swarm_hold_votes = result.get("hold_votes")
-            sig.swarm_agents     = result.get("agents", [])
-    except Exception:
-        pass
-
-    return sig
