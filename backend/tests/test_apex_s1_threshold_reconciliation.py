@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Dict, List
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -377,7 +376,6 @@ class TestReconcile:
     @pytest.mark.asyncio
     async def test_lock_serialises_concurrent_calls(self):
         """Two concurrent reconcile calls must not race — both complete."""
-        thres = _TIER_THRESHOLDS["T1"]
         m = _metrics(oi_delta=0.001)  # clean — we just want both to finish
         r1, r2 = await asyncio.gather(
             self.r.reconcile({"AAPL": m}, {"AAPL": "T1"}),
@@ -395,12 +393,11 @@ class TestMaybeEvict:
     async def test_evicts_when_over_cap(self):
         r = ThresholdReconciler()
         r._seen_cap = 10  # tiny cap for test speed
-        thres = _TIER_THRESHOLDS["T1"]
 
         # Feed 12 distinct epoch-minute keys to force eviction
         for i in range(12):
             ts = float(i * 120)  # 2-minute spacing → 12 distinct minutes
-            m = _metrics(symbol="SYM", oi_delta=thres["oi_spike_pct"] + 0.05, ts=ts)
+            m = _metrics(symbol="SYM", oi_delta=_TIER_THRESHOLDS["T1"]["oi_spike_pct"] + 0.05, ts=ts)
             await r.reconcile({"SYM": m}, {"SYM": "T1"})
 
         assert len(r._seen) <= r._seen_cap
