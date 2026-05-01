@@ -44,16 +44,14 @@
 | S2-POST-5 | `_refresh_tier_map` test coverage — 5 tests | [#26](https://github.com/bhaveshhpatel/cipher/issues/26) | ✅ |
 | S2-POST-6 | `_process_tick` registry avg_volume lookup path — 3 tests | [#27](https://github.com/bhaveshhpatel/cipher/issues/27) | ✅ |
 | S2-POST-inline | Inline fixes 2, 3, 6 — patch comment, dead params, `is_ready` mock | [#36](https://github.com/bhaveshhpatel/cipher/pull/36) | ✅ |
+| S2-POST-8 | Test isolation — `reset_tier_map_globals` autouse fixture; saves/restores `_tier_map_cache`, `_tier_map_ts`, `_tier_map_refresh_task` | [#37](https://github.com/bhaveshhpatel/cipher/pull/37) | ✅ |
 
 ### Pre-S3 Hard Gates — ALL must merge before S3 starts 🔴
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S2-POST-8 | Test isolation — restore module-level globals after `_refresh_tier_map` tests (no teardown = session pollution) | [#30](https://github.com/bhaveshhpatel/cipher/issues/30) | 🔴 Open |
 | S2.5 | Supabase migration: `order_side` (BUY/SELL/UNKNOWN + index) + `strong_sentiment` (bool) on `flow_events` | [#29](https://github.com/bhaveshhpatel/cipher/issues/29) | 🔴 Open |
 | S0.5 | Delete deprecated `simulation/ensemble_runner.py` | [#20](https://github.com/bhaveshhpatel/cipher/issues/20) | 🔴 Open |
-
-> **Note:** S2-POST-8 is a hard gate because module-level state pollution can cause silent false-passes in the test session, undermining the reliability of all subsequent gate tests.
 
 ### Must Close Before S3 Merges (can work in parallel with S3 branch) 🟡
 
@@ -129,10 +127,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 2.  ✅  S1            — Alert level reconciliation + emit-cache flush (PR #19)
 3.  ✅  S2            — Parser + detector + stream worker tier wiring (PR #21)
 4.  ✅  #26+#27       — _refresh_tier_map + _process_tick test coverage
-5.  ✅  #36           — Inline fixes 2/3/6 (PR #36, panel approved, merged)
+5.  ✅  #36           — Inline fixes 2/3/6 (PR #36)
+6.  ✅  #30           — S2-POST-8: test isolation / module global teardown (PR #37)
 
 ── PRE-S3 HARD GATES (all must merge before S3 starts) ──────────────────
-6.  🔴  #30           — S2-POST-8: test isolation / module global teardown [HIGH]
 7.  🔴  #29           — S2.5: order_side + strong_sentiment DB migration
 8.  🔴  #20           — S0.5: Delete ensemble_runner.py
 ─────────────────────────────────────────────────────────────────────────
@@ -175,9 +173,9 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 6: [#30](https://github.com/bhaveshhpatel/cipher/issues/30) — S2-POST-8 test isolation / module global teardown.
-- **"What is remaining?"** → Every row not marked ✅ — steps 6 through 26.
-- **"What blocks S3?"** → Steps 6–8 (#30, #29, #20).
+- **"What is next?"** → Step 7: [#29](https://github.com/bhaveshhpatel/cipher/issues/29) — S2.5: `order_side` + `strong_sentiment` Supabase migration.
+- **"What is remaining?"** → Every row not marked ✅ — steps 7 through 26.
+- **"What blocks S3?"** → Steps 7–8 (#29, #20).
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -185,5 +183,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — PR #36 panel approved and merged. Next: #30 test isolation.*
-*Version: 1.4*
+*Last updated: 2026-05-01 — PR #37 (#30 test isolation) panel approved and merged. 2 hard gates remaining before S3.*
+*Version: 1.5*
