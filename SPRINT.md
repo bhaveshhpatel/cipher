@@ -96,7 +96,7 @@
 
 ## Sprint 3 — Apex L3 Composite + Swarm
 
-> ✅ **S6 merged via PR #54 (2026-05-01). S6-POST-1 filed as a 🟢 queued follow-up. S7 blocked pending stream worker concurrency review.**
+> ✅ **S6 merged via PR #54 (2026-05-01). S6-POST-1 blocked on spec definition. S7 blocked pending stream worker concurrency review.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -105,16 +105,11 @@
 |---|---|---|---|
 | S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, `dominant_direction` hot-path fix (SELL PUT → REPEAT_BUY), `composite_score_ceiling` field, `order_side`/`strong_sentiment`/`execution_mechanic`/`premium_tier_score` in bus payload | [#54](https://github.com/bhaveshhpatel/cipher/pull/54) | ✅ |
 
-### Queued 🟢
-
-| Story | Description | Issue | Status |
-|---|---|---|---|
-| S6-POST-1 | Wire `detect_ladder()` into `_process_trade()` hot path; pass `sector_score` into `build_composite()`; remove `composite_score_ceiling` from bus payload; deliberation required on score shape (binary vs graded) and `composite_score_ceiling` removal atomicity before coding | [#55](https://github.com/bhaveshhpatel/cipher/issues/55) | 🟢 Queued |
-
 ### Blocked ⏳
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
+| S6-POST-1 | Wire `detect_ladder()` into `_process_trade()` hot path; pass `sector_score` into `build_composite()`; remove `composite_score_ceiling` from bus payload. **Blocked on spec definition: (1) `sector_score` normalization function undefined — binary wiring not acceptable; (2) `RepetitionAccumulator` cross-episode enumeration API unconfirmed.** | [#55](https://github.com/bhaveshhpatel/cipher/issues/55) | ⏳ Blocked |
 | S7 | Tiered swarm + circuit breaker — Apex-only, timeout-bounded, deterministic fallback. **Blocked: review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling before scoping S7.** | TBD | ⏳ Blocked |
 
 ---
@@ -167,7 +162,7 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
 19. ✅  S6            — Apex L3: composite formula overhaul (PR #54)
-20. 🟢  S6-POST-1     — Wire detect_ladder() + sector_score into hot path; remove composite_score_ceiling from payload (#55)  ← QUEUED
+20. ⏳  S6-POST-1     — Wire detect_ladder() + sector_score into hot path (#55)  ← BLOCKED on spec definition
 21. ⏳  S7            — Tiered swarm + circuit breaker  ← BLOCKED (stream worker review first)
 ───────────────────────────────────────────────────────────────────────────────────
 
@@ -190,10 +185,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S6-POST-1 (step 20, issue [#55](https://github.com/bhaveshhpatel/cipher/issues/55)) — wire `detect_ladder()` + `sector_score` into hot path. Deliberation on score shape required before coding. Can run in parallel with S7 prep.
-- **"What must close before S7 starts?"** → Stream worker `_process_trade()` concurrency review. S6-POST-1 does not block S7.
+- **"What is next?"** → S7 prep (stream worker concurrency review) and S6-POST-1 spec definition can run in parallel. Neither has code to write yet.
+- **"What unblocks S6-POST-1?"** → (1) Decide `sector_score` normalization function — document in spec. (2) Confirm or add `RepetitionAccumulator.get_all_active_episodes()`. See issue [#55](https://github.com/bhaveshhpatel/cipher/issues/55).
+- **"What unblocks S7?"** → Review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling.
 - **"What is remaining?"** → Every row not marked ✅ — steps 20 through 29.
-- **"What blocks S7 start?"** → Stream worker concurrency review. If `_process_trade()` is sequential, swarm scope changes.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -201,5 +196,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S6 completed via PR #54. S6-POST-1 filed (issue #55): wire detect_ladder() + sector_score into hot path, remove composite_score_ceiling from bus payload. S7 blocked pending stream worker concurrency review.*
-*Version: 2.9*
+*Last updated: 2026-05-01 — S6 completed via PR #54. S6-POST-1 (issue #55) blocked on spec definition: sector_score normalization function undefined, RepetitionAccumulator cross-episode API unconfirmed. S7 blocked pending stream worker concurrency review.*
+*Version: 3.0*
