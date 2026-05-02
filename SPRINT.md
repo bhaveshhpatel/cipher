@@ -70,7 +70,7 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **S3 merged. S4 is now unblocked — branch can be created when ready.**
+> 🟢 **S4 merged. #45, #46, #47 open. S5 is unblocked once #46 + #47 close.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -78,16 +78,16 @@
 | Story | Description | PR | Status |
 |---|---|---|---|
 | S3 | Apex L1: `signal_gate.py` — spread gate (uniform 50%) + tier-aware premium floors per trade type; direction-agnostic; 100% branch coverage | [#43](https://github.com/bhaveshhpatel/cipher/pull/43) | ✅ |
+| S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | [#44](https://github.com/bhaveshhpatel/cipher/pull/44) | ✅ |
 
-### In Progress / Queued
+### Queued / Blocked
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | TBD | 🟢 In Progress |
 | S4-POST-1 | `deep_otm_multiplier=1.0` — add explicit reject-then-pass test pair to pin `> 1.0` branch (not coincidental floor pass) | [#45](https://github.com/bhaveshhpatel/cipher/issues/45) | 🟢 Open |
 | S4-POST-2 | `_max_dte_key=None` guard — test (+ optional runtime guard) for BE-1 cache when `dte_premium_tiers={}` | [#46](https://github.com/bhaveshhpatel/cipher/issues/46) | ⚪ Close before S5 starts |
 | S4-POST-3 | `_ev_attr` / `_make_key` dict-key bug — `getattr` on plain dict returns default; dict events from different symbols collapse to single `None|None|0.00|None` episode. Fix: add `isinstance(ev, dict)` branch using `.get()`. Confirm whether raw dict is a supported production path. | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) | ⚪ Close before S5 starts |
-| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked on S4 |
+| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked on #46 + #47 |
 
 ---
 
@@ -141,11 +141,11 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ── SPRINT 2 ──────────────────────────────────────────────────────────────────────────────────
 12. ✅  S3            — Apex L1: signal_gate.py (PR #43)
-13. 🟢  S4            — Apex L2: dual-window accumulator  ← IN PROGRESS
+13. ✅  S4            — Apex L2: dual-window accumulator (PR #44)
 14. 🟢  #45           — S4-POST-1: deep_otm_multiplier=1.0 reject-then-pass test pair
 15. ⚪  #46           — S4-POST-2: _max_dte_key=None guard (close before S5 starts)
-16. ⚪  #47           — S4-POST-3: _ev_attr dict-key bug — _make_key getattr on plain dict (close before S5 starts)
-17. ⏳  S5            — Apex L4: ladder detection
+16. ⚪  #47           — S4-POST-3: _ev_attr dict-key bug (close before S5 starts)
+17. ⏳  S5            — Apex L4: ladder detection  ← NEXT (unblocked once #46 + #47 close)
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ Exact execution order. Do not start a story until everything above it in the sam
 23. ⚪  #22           — Hoist get_registry import
 24. ⚪  #28           — Fix misleading flush loop test
 25. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
-26. ⚪  #46           — _get_tier_map double-guard redundancy (clean up or document)
+26. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -171,11 +171,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Step 13: S4 — Apex L2 dual-window accumulator. In progress on `apex/s4-dual-window-accumulator`.
-- **"What must close before S4 merges?"** → Nothing above it in the Sprint 2 gate block is open. S3 ✅ is the only gate.
-- **"What is remaining?"** → Every row not marked ✅ — steps 13 through 26.
-- **"What blocks S4 start?"** → Nothing.
-- **"What blocks S5 start?"** → S4 must merge first. #46 (S4-POST-2) and #47 (S4-POST-3) should close before S5 starts.
+- **"What is next?"** → Steps 14–16: close #45, #46, #47 (S4-POST-1/2/3). Then S5 (step 17) is unblocked.
+- **"What must close before S5 starts?"** → #46 (S4-POST-2) and #47 (S4-POST-3). #45 (S4-POST-1) is 🟢 open but not a hard S5 gate.
+- **"What is remaining?"** → Every row not marked ✅ — steps 14 through 26.
+- **"What blocks S5 start?"** → #46 + #47 must close first.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -183,5 +182,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S4 panel deliberation complete. BE-3 (#47) filed + sequenced as step 16. Close #46 + #47 before S5 starts.*
-*Version: 2.2*
+*Last updated: 2026-05-01 — S4 ✅ merged (PR #44, commit 79215bf). S4-POST-1 (#45), S4-POST-2 (#46), S4-POST-3 (#47) open. Close #46 + #47 before S5 starts.*
+*Version: 2.3*
