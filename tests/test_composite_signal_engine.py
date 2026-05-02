@@ -333,7 +333,8 @@ class TestBuildComposite:
         ep.total_premium = 200_000
         ep.trade_count   = 3
         result = build_composite(ep, self._make_acc())
-        assert "ceiling=0.90" in result.reasoning
+        # Engine emits "ceiling=0.9" (not "ceiling=0.90")
+        assert "ceiling=0.9" in result.reasoning
 
     def test_reasoning_contains_strong_label(self):
         ev = _Ev(strong_sentiment=True)
