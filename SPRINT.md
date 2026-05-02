@@ -193,11 +193,6 @@ def compute_flow_score(ep: RepetitionEpisode) -> float:
 | `backtest_score` | 0% | **0%** | Remains zeroed until S8 |
 | **TOTAL** | **100%** | **100%** | Formula now sums to 100% at all times |
 
-> **Deliberation point (SA):** The `otm_factor` slot at 5% will hold a neutral value of 0.50
-> until S10 lands. This means the formula is correct from day one of S9 — no dead weight,
-> no under-reporting. When S10 activates `otm_factor` with real spot prices, scores adjust
-> upward for ITM/ATM flow and downward for deep OTM — but the formula does not change shape.
-
 **3. Tier-relative BUY/SELL thresholds in `build_composite()`:**
 
 ```python
@@ -207,155 +202,16 @@ _TIER_THRESHOLDS = {
     "LARGE":         0.55,
     "RETAIL":        0.50,
 }
-
-tier      = episode_influence_tier(ep)
-threshold = _TIER_THRESHOLDS[tier]
-if comp >= threshold and sentiment == "BULLISH": rec = "BUY"
-elif comp >= threshold and sentiment == "BEARISH": rec = "SELL"
-else: rec = "HOLD"
 ```
-
-#### Scenario Analysis (evidence for deliberation)
-
-> ⚠️ **These scenarios are illustrative examples of formula behavior across different episode
-> types. They are not intended to validate or invalidate specific trades. The panel must
-> evaluate whether the formula's behavior is correct across the full range of WHALE,
-> INSTITUTIONAL, LARGE, and RETAIL tiers — not just for the specific tickers shown.**
-
-The following table shows scores under the current (S6) formula vs. the S9 formula across
-representative episodes from 2026-05-01 live flow:
-
-**AAOI — $311k CALL, Strike=$35, 5 trades, strong_sentiment=True, OI=800, event_prem=$62k**
-
-| Formula | `flow_score` | `vwp_f` | `prem_t` | Composite | Signal | Threshold |
-|---|---|---|---|---|---|---|
-| S6 (flat $10M) | 0.220 | 0.775 | 0.250 | 0.314 | HOLD | 0.65 |
-| S9 (tiered $500k) | 0.604 | 0.775 | 0.250 | 0.550 | **BUY** | 0.55 |
-
-**GLXY — $263k CALL, Strike=$40, 1 trade (single print), strong_sentiment=True, DTE=142**
-
-> This example exposes a general formula behavior: a single isolated print — regardless of
-> ticker or premium — should require episode accumulation before generating a BUY. The
-> formula correctly enforces this by design. This is not a GLXY-specific concern; it applies
-> to any single-print episode across any tier.
-
-| Formula | `flow_score` | `vwp_f` | `prem_t` | Composite | Signal | Threshold |
-|---|---|---|---|---|---|---|
-| S6 (flat $10M) | 0.067 | 0.500 | 0.250 | 0.174 | HOLD | 0.65 |
-| S9 (tiered $500k) | 0.393 | 0.500 | 0.250 | 0.379 | HOLD | 0.55 |
-
-GLXY correctly stays HOLD under both formulas. A $263k single print with no episode
-accumulation (`trade_count=1`, `is_accelerating=False`) is a WATCH signal. The formula
-will promote it when repeat prints follow on the same contract. This is correct behavior for
-**any ticker** — a single print is not sufficient for BUY regardless of premium size.
-
-**EBAY — $180k CALL, 3 trades, strong_sentiment=False, OI=1200:**
-
-| Formula | `flow_score` | Composite | Signal |
-|---|---|---|---|
-| S6 | 0.130 | 0.209 | HOLD |
-| S9 | 0.307 | 0.340 | HOLD |
-
-EBAY correctly stays HOLD — weak sentiment, only 3 trades, no acceleration. The formula
-differentiates signal quality rather than promoting everything.
-
-**LYB — $120k CALL, 3 trades, strong_sentiment=False, OI=600:**
-
-| Formula | `flow_score` | Composite | Signal |
-|---|---|---|---|
-| S6 | 0.126 | 0.240 | HOLD |
-| S9 | 0.245 | 0.340 | HOLD |
-
-**WHALE safety check — SPY $5M CALL, 12 trades, accelerating, strong_sentiment=True, OI=50k:**
-
-| Formula | `flow_score` | Composite | Signal | Threshold |
-|---|---|---|---|---|
-| S6 | 0.675 | 0.541 | HOLD | 0.65 |
-| S9 | 0.675 | 0.584 | HOLD | 0.65 |
-
-WHALE episodes use the same $10M ceiling — unchanged. The 0.65 WHALE threshold is appropriately
-demanding; a $5M episode with acceleration and strong sentiment scores 0.584 and correctly stays
-HOLD until more trades accumulate or premium crosses a higher band. WHALE BUY requires strong
-conviction across all components.
-
-**Gaming resistance check — $100k LARGE, OI=50 (thin), 3 trades, no accel, no strong sentiment:**
-
-```
-flow_score = min(100k/500k,1.0)*0.65 + 0 + min(3/20,0.20)*0.80 = 0.104 + 0.12 = 0.224 -> *0.80 = 0.179
-vwp_factor = min(1.0, 33_000 / (50 * 100)) = min(1.0, 6.6) = 1.0  # thin OI actually elevates vwp
-composite  = 0.179*0.55 + 1.0*0.20 + 0.0*0.15 + 0.50*0.05 = 0.098+0.20+0+0.025 = 0.323 → HOLD
-```
-
-A barely-LARGE episode with thin OI and no quality markers stays HOLD at 0.323 vs. the 0.55
-LARGE threshold. The formula does not auto-promote weak prints.
 
 #### Deliberation Points
 
-> ⚠️ **All deliberation points below are architectural concerns about the formula's general
-> behavior across all tickers and all episode types. Where specific trade examples appear,
-> they are cited only as evidence — the decision must be made for the general case.**
-
-1. **(SA)** Confirm `_TIER_CEILINGS` values are correct. Specifically: should LARGE ceiling be
-   $500k (top of the LARGE band = bottom of INSTITUTIONAL) or $250k (midpoint)? Midpoint would
-   make the ceiling more conservative for large-but-not-institutional episodes across all LARGE
-   tier flow. The INSTITUTIONAL ceiling ($2M = top of band) warrants separate review: a $1M
-   single INSTITUTIONAL print reaches composite ~0.421 (HOLD at threshold 0.60) under $2M
-   ceiling, but ~0.600 (BUY) under $1M midpoint ceiling. Panel must decide whether the ceiling
-   should reflect the top of the band (current proposal) or the midpoint of the band for each
-   tier. This affects every INSTITUTIONAL episode, not just specific cases.
-
-2. **(SA)** The formula currently scores premium as a dollar amount normalized to a tier ceiling.
-   This means a 1,220-contract print at $2.16/contract and a 122-contract print at $21.60/contract
-   score **identically** — both produce the same premium. However, in unusual options flow analysis,
-   **contract count relative to open interest (Vol/OI ratio)** is the primary unusualness indicator
-   used by professional flow desks. A Vol/OI > 1.0 means more contracts traded today than currently
-   exist in open interest — this is a structurally different signal from a high-premium, low-contract
-   print. The current `vwp_factor` (premium/OI) captures dollar weight vs. OI but not contract
-   count vs. OI. The panel must decide: should a future story (post-S9) replace `vwp_factor` with
-   a unified `flow_quality_factor` that blends Vol/OI (contract unusualness) with premium/OI
-   (dollar unusualness)?
-
-   Proposed `flow_quality_factor` design (for panel review — **not part of S9 implementation**):
-   ```python
-   # Vol/OI breakpoints (ticker-agnostic — scales correctly across all market caps):
-   # >= 2.0 → 1.00 (more contracts traded than exist in OI — extreme)
-   # >= 1.0 → 0.85 (full OI turnover — very unusual)
-   # >= 0.5 → 0.70 (half OI traded — unusual)
-   # >= 0.2 → 0.50 (mild)
-   # >= 0.1 → 0.35
-   # <  0.1 → 0.20 (noise)
-   #
-   # flow_quality_factor = (vol_oi_factor × 0.50) + (prem_oi_factor × 0.50)
-   ```
-   This approach is ticker-agnostic by design: a small-cap with OI=500 and a large-cap with
-   OI=500,000 both get scored relative to their own OI context. Absolute contract count is
-   never compared across tickers. **Risk:** this change marginally lowers `vwp_factor` for
-   episodes where the premium/OI ratio is high but the Vol/OI ratio is moderate (e.g., a
-   high-fill-price contract where few contracts generate large dollar premium). The panel
-   must confirm this tradeoff is acceptable before scoping as a post-S9 story.
-
-3. **(SA + BE)** The `strong_sentiment` field is read from `ep.events[-1]` inside
-   `compute_flow_score()`. This means the discount applies based on the most recent event, not
-   the dominant sentiment across the episode. Is this correct for all episode types, or should
-   it use a majority-vote across all events in `ep.events`? This affects any episode where
-   sentiment is mixed across individual prints.
-
-4. **(BE)** `episode_influence_tier()` is called twice in `build_composite()` — once for the
-   ceiling lookup and once for the threshold lookup. Confirm this is acceptable or refactor to
-   compute once and pass down.
-
-5. **(QA)** Regression test matrix must cover: (a) WHALE episode scores unchanged vs. S6,
-   (b) LARGE episode floor coverage (at $100k, $250k, $499k), (c) RETAIL episode at $50k and
-   $99k, (d) `strong_sentiment=False` discount still applies after tier normalization,
-   (e) gaming resistance: thin-OI barely-LARGE episode stays HOLD,
-   (f) single-print episodes across all tiers stay HOLD regardless of premium size
-   (no single print should auto-BUY without episode accumulation).
-
-6. **(QA)** `COMPOSITE_SCORE_CEILING` constant must be updated or documented. With S9's weight
-   split, the theoretical maximum composite score is no longer structurally capped at 0.90 —
-   it is now a full 1.0 scale (sector at 5% is no longer dead). Document whether
-   `COMPOSITE_SCORE_CEILING` should be removed, updated to 0.95 (sector reserved), or kept as
-   a soft frontend hint.
+1. **(SA)** Confirm `_TIER_CEILINGS` values are correct. LARGE ceiling: $500k (top of band) or $250k (midpoint)?
+2. **(SA)** Dollar-amount vs. Vol/OI ratio: should a future story replace `vwp_factor` with a unified `flow_quality_factor`?
+3. **(SA + BE)** `strong_sentiment` read from `ep.events[-1]` — should it use majority-vote across all events?
+4. **(BE)** `episode_influence_tier()` called twice in `build_composite()` — refactor to compute once.
+5. **(QA)** Regression matrix: WHALE unchanged, LARGE floor coverage, RETAIL coverage, sentiment discount, gaming resistance, single-print HOLD across all tiers.
+6. **(QA)** `COMPOSITE_SCORE_CEILING` — remove, update to 0.95, or retain as soft hint.
 
 #### Acceptance Criteria
 
@@ -367,13 +223,13 @@ LARGE threshold. The formula does not auto-promote weak prints.
 - [ ] `sector_score` weight reduced from 10% to 5%
 - [ ] WHALE episode composite scores are within ±0.005 of S6 scores (regression guard)
 - [ ] AAOI $311k scenario produces composite ≥ 0.55 and recommendation = BUY
-- [ ] GLXY $263k single-print scenario produces HOLD (single prints must not auto-BUY)
+- [ ] GLXY $263k single-print scenario produces HOLD
 - [ ] EBAY $180k scenario produces HOLD
 - [ ] LYB $120k scenario produces HOLD
 - [ ] All existing `test_composite_signal_engine.py` tests updated to new weight split
 - [ ] New parametrized test: `test_tier_relative_flow_score[WHALE/INSTITUTIONAL/LARGE/RETAIL]`
-- [ ] New test: `test_buy_threshold_by_tier` — each tier hits BUY at exactly its threshold
-- [ ] New test: `test_single_print_hold_across_tiers` — single-print episodes stay HOLD at all tier levels
+- [ ] New test: `test_buy_threshold_by_tier`
+- [ ] New test: `test_single_print_hold_across_tiers`
 
 ---
 
@@ -382,155 +238,26 @@ LARGE threshold. The formula does not auto-promote weak prints.
 **Status: ⏳ Blocked on S9**
 
 > ⚠️ **DELIBERATION REQUIRED before implementation begins.**
-> Senior Architect, Principal Backend Engineer, and Lead QA must deliberate on this story
-> and sign off before any code is written. Deliberation points are listed explicitly below.
 
 #### Problem Statement
 
 `underlying_price` on every `OptionsFlowEvent` is permanently `0.0` in production. The Tradier
-`timesale` stream does not carry the underlying spot price in its event payload —
-`parse_tradier_trade()` reads `raw.get("underlying_price", 0)` which always returns `0` because
-the field does not exist in stream data.
-
-This has two downstream consequences:
-
-1. **OTM/ITM classification is impossible.** Without knowing the spot price relative to the
-   strike, the system cannot distinguish a $311k CALL on a stock trading 20% below strike (deep
-   OTM lottery ticket) from a $311k CALL on a stock trading at the money (real institutional
-   interest). These have meaningfully different signal quality.
-
-2. **The `otm_factor` slot reserved in S9 remains at its neutral 0.50 fallback**, contributing
-   equally regardless of actual moneyness. Once S10 lands, real spot prices replace the neutral
-   fallback and the formula becomes fully active.
+`timesale` stream does not carry the underlying spot price. Without it: (1) OTM/ITM classification
+is impossible, (2) the `otm_factor` slot reserved in S9 remains at its neutral 0.50 fallback.
 
 #### Architecture
 
-**Source of truth:** Tradier REST quotes endpoint.
-```
-GET /v1/markets/quotes?symbols=AAPL,TSLA,NVDA,...
-Response: quotes.quote[].last  →  current spot price
-```
-
-This is a batch endpoint — all watchlist tickers can be fetched in a single call.
-
-**Implementation plan:**
-
-1. **`symbol_registry.py`** — add `_spot_cache: dict[str, float]` and
-   `async def refresh_spot_prices(tickers: list[str])` method. Called from existing
-   `refresh_loop()` every 60 seconds. One REST call per batch.
-
-2. **`symbol_registry.py`** — add `def get_spot(self, ticker: str) -> float` returning
-   `self._spot_cache.get(ticker, 0.0)`.
-
-3. **`options_flow_parser.py`** — after the existing registry lookup block:
-   ```python
-   if reg and reg.is_ready() and ev.underlying_price == 0.0:
-       spot = reg.get_spot(ev.ticker)
-       if spot > 0:
-           ev.underlying_price = spot
-   ```
-
-4. **`composite_signal_engine.py`** — replace the hardcoded `otm_factor = 0.50` with a real
-   computation using `ep.events[-1].underlying_price`.
-
-#### OTM Factor Formula
-
-The proposed `otm_factor` function uses a piecewise moneyness scale:
-
-```python
-def compute_otm_factor(strike: float, underlying: float, contract_type: str) -> float:
-    """
-    Returns a [0.30, 1.0] quality score based on moneyness.
-    Falls back to neutral 0.50 if underlying_price is 0.
-
-    For CALL:  moneyness = underlying / strike
-    For PUT:   moneyness = strike / underlying
-
-    Breakpoints (same for both):
-      moneyness >= 1.05  →  ITM:       1.00  (in-the-money, highest quality)
-      0.95–1.05          →  ATM:       0.85  (at-the-money)
-      0.80–0.95          →  OTM:       0.50–0.85 (linear interpolation)
-      < 0.80             →  Deep OTM:  0.30  (lottery territory)
-    """
-    if underlying <= 0:
-        return 0.50
-    m = (underlying / strike) if contract_type == "CALL" else (strike / underlying)
-    if m >= 1.05: return 1.00
-    if m >= 0.95: return 0.85
-    if m >= 0.80: return round(0.50 + (m - 0.80) / (0.95 - 0.80) * 0.35, 3)
-    return 0.30
-```
-
-#### Scenario Analysis — AAOI with Spot Price Variants
-
-**AAOI $311k CALL, Strike=$35, flow_score=0.604, vwp_f=0.775, prem_t=0.250**
-(S9 weights: flow=0.55, vwp=0.20, prem=0.15, otm=0.05)
-
-| Scenario | Underlying | Moneyness | OTM Factor | Composite | Signal |
-|---|---|---|---|---|---|
-| No spot (S9 neutral) | 0.00 | — | 0.500 | 0.550 | **BUY** |
-| Deep ITM ($42) | 42.00 | 1.200 | 1.000 | 0.575 | **BUY** |
-| Slight ITM ($36) | 36.00 | 1.029 | 0.850 | 0.567 | **BUY** |
-| ATM ($35) | 35.00 | 1.000 | 0.850 | 0.567 | **BUY** |
-| Slight OTM ($33) | 33.00 | 0.943 | 0.833 | 0.566 | **BUY** |
-| OTM ($30) | 30.00 | 0.857 | 0.633 | 0.556 | **BUY** |
-| Deep OTM ($25) | 25.00 | 0.714 | 0.300 | 0.540 | **HOLD** |
-
-Key observations:
-- AAOI remains BUY across all realistic moneyness scenarios (slight OTM to ITM).
-- Deep OTM ($25 stock vs. $35 strike = 28.6% OTM) correctly demotes to HOLD — this is
-  lottery-ticket territory where $311k CALL flow carries less signal quality.
-- The `otm_factor` at 5% weight is a quality modifier, not a binary gate. It adjusts by
-  ~0.025 max — it does not flip a strong signal to noise.
-
-**AAOI with acceleration (is_accelerating=True, stock=$36):**
-
-| Scenario | flow_score | OTM Factor | Composite | Signal |
-|---|---|---|---|---|
-| Accel + slight ITM | 0.754 | 0.850 | 0.650 | **BUY** |
-
-An accelerating $311k AAOI episode with the stock near the strike scores 0.650 — comfortably
-above the 0.55 LARGE threshold. Strong signal, correctly promoted.
-
-**Broader matrix — all tiers:**
-
-| Ticker | Tier | Total Prem | Underlying | OTM_f | Flow | Composite | Signal |
-|---|---|---|---|---|---|---|---|
-| AAOI | LARGE | $311k | $36.00 (ITM) | 0.850 | 0.604 | 0.567 | **BUY** |
-| AAOI | LARGE | $311k | $30.00 (OTM) | 0.633 | 0.604 | 0.556 | **BUY** |
-| AAOI | LARGE | $311k | $22.00 (deep OTM) | 0.300 | 0.604 | 0.540 | HOLD |
-| EBAY | LARGE | $180k | $58.50 (ATM) | 0.850 | 0.307 | 0.349 | HOLD |
-| LYB | LARGE | $120k | $69.00 (ATM) | 0.850 | 0.245 | 0.348 | HOLD |
-| SPY | WHALE | $5M | $515 (ATM) | 0.850 | 0.675 | 0.584 | HOLD |
-| NVDA | INST. | $800k | $895 (ATM) | 0.850 | 0.610 | 0.548 | HOLD |
-
-EBAY and LYB correctly stay HOLD even with a spot price known — their weakness is
-`flow_score` (no strong sentiment, only 3 trades), not the OTM factor.
+- `SymbolRegistry` gains `_spot_cache` + `refresh_spot_prices()` (Tradier REST batch quotes, every 60s)
+- `parse_tradier_trade()` enriches `ev.underlying_price` from registry cache when `== 0.0`
+- `compute_otm_factor()` implemented in `composite_signal_engine.py` using piecewise moneyness scale
 
 #### Deliberation Points
 
-1. **(SA)** Confirm spot price refresh cadence. 60 seconds aligns with existing
-   `refresh_loop()`. If market is closed (after 4pm ET), the cache can hold last known spot.
-   Is stale spot price (e.g., previous close) acceptable for after-hours flow, or should
-   `underlying_price = 0.0` and `otm_factor = 0.50` neutral be forced outside market hours?
-
-2. **(SA + BE)** `otm_factor` uses `ep.events[-1].underlying_price`. If the last event has
-   `underlying_price=0.0` but earlier events have real values, the factor falls back to neutral.
-   Should it use the most recent non-zero value across `ep.events` instead?
-
-3. **(BE)** Tradier REST quotes endpoint rate limit is 120 requests/minute on sandbox and
-   higher on production. A batch call with 50 tickers counts as 1 request. Confirm watchlist
-   size does not exceed batch limit and add a guard if it does (split into batches of 50).
-
-4. **(QA)** Test matrix must include: (a) `underlying_price=0.0` → `otm_factor=0.50` fallback,
-   (b) CALL ITM, ATM, OTM, deep-OTM cases, (c) PUT ITM, ATM, OTM, deep-OTM cases,
-   (d) `refresh_spot_prices` — mock Tradier REST, confirm cache population, (e) `get_spot`
-   returns 0.0 for unknown ticker, (f) parser enrichment path: registry ready + spot > 0
-   overwrites `ev.underlying_price`.
-
-5. **(QA)** Confirm `is_synthetic_quote=True` interaction: synthetic quotes already apply a
-   40% conviction haircut. Should `otm_factor` also be forced to `0.50` neutral for synthetic
-   quotes to avoid double-penalizing a contract whose bid/ask we don't know?
+1. **(SA)** Stale spot price acceptability after market close.
+2. **(SA + BE)** `otm_factor` uses `ep.events[-1].underlying_price` — use most recent non-zero instead?
+3. **(BE)** Tradier REST batch limit — guard for watchlists > 50 tickers.
+4. **(QA)** Test matrix: `underlying_price=0.0` fallback, CALL/PUT ITM/ATM/OTM/deep-OTM cases, parser enrichment path.
+5. **(QA)** `is_synthetic_quote=True` interaction — force `otm_factor=0.50` neutral for synthetic quotes?
 
 #### Acceptance Criteria
 
@@ -538,12 +265,12 @@ EBAY and LYB correctly stay HOLD even with a spot price known — their weakness
 - [ ] `SymbolRegistry.refresh_spot_prices(tickers)` calls Tradier REST, populates cache
 - [ ] `refresh_spot_prices` called from `refresh_loop()` every 60s
 - [ ] `SymbolRegistry.get_spot(ticker)` returns `0.0` for unknown tickers (no KeyError)
-- [ ] `parse_tradier_trade()` enriches `ev.underlying_price` from registry spot cache when `ev.underlying_price == 0.0`
-- [ ] `compute_otm_factor()` function implemented in `composite_signal_engine.py`
-- [ ] `otm_factor` in `build_composite()` uses `compute_otm_factor()` with live value; falls back to `0.50` when `underlying_price == 0.0`
-- [ ] `underlying_price` field visible in `/health/stream` or a dedicated debug endpoint
-- [ ] AAOI $311k CALL + stock $22 (deep OTM) → composite < 0.55 → HOLD (regression guard)
-- [ ] AAOI $311k CALL + stock $36 (slight ITM) → composite ≥ 0.55 → BUY (regression guard)
+- [ ] `parse_tradier_trade()` enriches `ev.underlying_price` from registry spot cache when `== 0.0`
+- [ ] `compute_otm_factor()` implemented in `composite_signal_engine.py`
+- [ ] `otm_factor` in `build_composite()` uses `compute_otm_factor()` with live value; falls back to `0.50`
+- [ ] `underlying_price` visible in `/health/stream` or debug endpoint
+- [ ] AAOI $311k CALL + stock $22 (deep OTM) → composite < 0.55 → HOLD
+- [ ] AAOI $311k CALL + stock $36 (slight ITM) → composite ≥ 0.55 → BUY
 - [ ] All `test_composite_signal_engine.py` tests updated for `otm_factor` active weight
 
 ---
@@ -553,128 +280,308 @@ EBAY and LYB correctly stay HOLD even with a spot price known — their weakness
 **Status: ⏳ Blocked on S9 + S10 + S6-POST-1 + S8**
 
 > ⚠️ **DELIBERATION REQUIRED before implementation begins.**
-> Senior Architect, Principal Backend Engineer, and Lead QA must deliberate on this story
-> and sign off before any code is written. This story cannot begin until S9, S10, S6-POST-1,
-> and S8 are all merged. Deliberation points are listed explicitly below.
 
-#### Problem Statement
+Final weight split (proposed — subject to panel deliberation once S8 backtest data available):
 
-With S9 and S10 merged, the composite formula has four active components (flow, vwp, prem, otm)
-summing to 95% of weight. The remaining 5% (`sector_score`) and 0% (`backtest_score`) are
-reserved slots. S11 activates both when their upstream data is available:
-
-- **`sector_score`** becomes available when S6-POST-1 wires `detect_ladder()` into the hot path
-  and defines a normalization function (currently undefined — blocker documented in issue #55).
-- **`backtest_score`** becomes available when S8 implements the 90-day rolling win-rate query
-  from `flow_events` grouped by `(ticker, contract_type, dte_bucket, influence_tier)`.
-
-#### Proposed Final Weight Split
-
-| Component | S9/S10 Weight | S11 Weight | Notes |
-|---|---|---|---|
-| `flow_score` (tiered ceiling) | 55% | **50%** | Slight reduction to make room |
-| `volume_premium_factor` | 20% | **18%** | Slight reduction |
-| `premium_tier_score` | 15% | **12%** | Slight reduction |
-| `otm_factor` | 5% | **5%** | Unchanged |
-| `sector_score` | 5% (reserved 0.0) | **8%** | Activated — requires normalization fn |
-| `backtest_score` | 0% | **7%** | Activated — requires S8 win-rate data |
-| **TOTAL** | **100%** | **100%** | |
-
-> **Note:** These weights are a starting proposal for deliberation — not a final decision.
-> The panel must deliberate on the weight split once real backtest data is available to
-> assess its variance and correlation with other components. A backtest win-rate signal with
-> low variance (e.g., 0.60–0.70 for most tickers) behaves very differently from one with
-> high variance (0.30–0.90). The panel should run a calibration pass on 30 days of historical
-> `flow_events` before finalizing `backtest_score` weight.
-
-#### Backtest Score Implementation (S8 dependency)
-
-The existing `get_backtest_score()` stub in `backtest_validator.py` has the correct function
-signature and is already called in `build_composite()` with weight `0.00`. The implementation
-change is the query behind it:
-
-```python
-# Current (fake): seeded pseudo-random per (ticker, contract_type, dte_bucket, influence_tier)
-# S8 implementation:
-async def get_backtest_score(ticker, contract_type, dte, influence_tier) -> float:
-    """
-    Query flow_events for historical win-rate over rolling 90 days.
-    Win = signal episode where underlying moved in predicted direction
-         within DTE days of the episode timestamp.
-    Returns 0.5 (neutral) if fewer than 10 historical episodes found.
-    Cached per session with 1-hour TTL.
-    """
-    key = (ticker, contract_type, _dte_bucket(dte), influence_tier)
-    # Supabase query: SELECT COUNT(*) won, COUNT(*) total FROM signal_history
-    #   WHERE ticker=? AND contract_type=? AND dte_bucket=? AND influence_tier=?
-    #   AND created_at >= NOW() - INTERVAL '90 days'
-    # win = rows where direction matched subsequent price movement
-    # Requires: outcome tracking column on signal_history (new migration needed)
-```
-
-> **Critical dependency:** S8 requires an `outcome` column on `signal_history` (or a
-> separate `signal_outcomes` table) that records whether each signal's directional prediction
-> was correct within the contract's DTE window. This data does not currently exist — it
-> requires either a scheduled job that resolves outcomes post-DTE or an enrichment pass on
-> historical flow. This architectural decision must be made before S8 scoping begins.
-
-#### Sector Score Normalization (S6-POST-1 dependency)
-
-`sector_score` is currently gated by issue #55 on two unresolved questions:
-1. The normalization function for `detect_ladder()` output → `[0, 1]` score is undefined.
-2. `RepetitionAccumulator.get_all_active_episodes()` API is unconfirmed.
-
-S11 assumes both are resolved by S6-POST-1. The weight of 8% for `sector_score` in S11 is
-provisional — if the ladder detection signal proves noisy or low-precision after initial wiring,
-the panel should reduce the weight or gate it behind a confidence threshold.
-
-#### `COMPOSITE_SCORE_CEILING` Resolution
-
-`COMPOSITE_SCORE_CEILING = 0.90` was set in S6 when sector carried 10% dead weight. With S9,
-the formula sums to 100% at all times (otm_factor neutral fallback ensures this). The constant
-should be:
-- **Removed** from `composite_signal_engine.py` and the bus payload after S11, OR
-- **Updated to 1.0** to reflect the now-fully-active formula, OR
-- **Retained as a soft cap** (e.g., `min(comp, 0.95)`) if the panel decides no episode should
-  ever score as perfect conviction
-
-The panel must decide this before S11 implementation begins.
-
-#### Deliberation Points
-
-1. **(SA)** Confirm the final weight split. Specifically: is `backtest_score` at 7% appropriate
-   before calibration data exists? Consider starting at 5% and raising after 30 days of
-   outcome data.
-
-2. **(SA + BE)** `signal_outcomes` table design: what constitutes a "win"? Options:
-   (a) underlying moved in predicted direction by expiry, (b) moved in predicted direction
-   within 3 days, (c) option premium increased by ≥20% within 2 days. Each definition
-   produces a different win-rate distribution and different signal quality.
-
-3. **(SA)** Resolve `COMPOSITE_SCORE_CEILING` — remove, update, or retain as hard cap.
-
-4. **(BE)** Confirm that activating `backtest_score` mid-sprint does not cause score
-   discontinuities in the frontend (e.g., signals that were BUY at 0.55 composite may become
-   HOLD if the backtest penalty is significant). Frontend consumers must be notified of the
-   formula change before S11 deploys.
-
-5. **(QA)** Regression test matrix must include: (a) scores with `backtest_score=0.5` (neutral)
-   vs. `backtest_score=0.3` (poor) vs. `backtest_score=0.8` (strong), (b) composite ceiling
-   behavior, (c) end-to-end: episode → `build_composite()` → bus payload → `signal_history`
-   write with all 6 active components present.
+| Component | S9/S10 Weight | S11 Weight |
+|---|---|---|
+| `flow_score` | 55% | **50%** |
+| `volume_premium_factor` | 20% | **18%** |
+| `premium_tier_score` | 15% | **12%** |
+| `otm_factor` | 5% | **5%** |
+| `sector_score` | 5% (reserved 0.0) | **8%** |
+| `backtest_score` | 0% | **7%** |
+| **TOTAL** | **100%** | **100%** |
 
 #### Acceptance Criteria
 
 - [ ] S6-POST-1 merged (sector_score wired, normalization defined)
 - [ ] S8 merged (real backtest win-rate from Supabase, outcome tracking in place)
-- [ ] S9 merged (tier-relative flow_score, tier thresholds)
-- [ ] S10 merged (underlying_price populated, otm_factor live)
+- [ ] S9 merged + S10 merged
 - [ ] Final weight split deliberated and documented in `docs/cipher_apex_story_and_sprint_plan.md`
 - [ ] `COMPOSITE_SCORE_CEILING` constant decision implemented
 - [ ] `build_composite()` uses all 6 active components with correct weights
 - [ ] End-to-end test: mock all 6 component values, assert composite formula arithmetic correct
 - [ ] Regression: WHALE episodes still require ≥0.65 for BUY
 - [ ] Deploy notes: frontend consumers notified of formula change before merge
+
+---
+
+## Sprint 5 — Repeat Conviction Engine
+
+> **⚠️ IMMEDIATE FIX — S12 requires deliberation before implementation begins.**
+> Root cause identified in architecture review 2026-05-02: the `RepetitionAccumulator` operates
+> exclusively on a 30-minute intraday window, missing multi-session institutional accumulation
+> entirely. Simultaneously, the composite formula ranks premium size over repeat conviction —
+> structurally backwards relative to the highest-conviction signal patterns observed in
+> institutional options flow. S12 fixes both. S12 may run in parallel with S9 deliberation
+> but the weight split conflict between S9 and S12 must be resolved before either begins
+> implementation (see S12 Deliberation Point 5).
+>
+> GitHub Issue: [#56](https://github.com/bhaveshhpatel/cipher/issues/56)
+
+---
+
+### 🔴 S12 — Dual-Window Repeat Conviction Engine: Cross-Session Accumulation + Composite Score Reweight
+**Priority: IMMEDIATE FIX — Do not defer.**
+**Status: 🟢 Queued — panel deliberation required before implementation**
+
+> ⚠️ **DELIBERATION REQUIRED before implementation begins.**
+> **Senior Software Director**, **Platform Backend Engineer**, and **QA Lead** must deliberate
+> on this story and sign off before any code is written. Deliberation points are listed
+> explicitly below. See GitHub Issue [#56](https://github.com/bhaveshhpatel/cipher/issues/56)
+> for full context.
+> **Work must never be pushed directly to `main`. Always branch + PR.**
+
+#### Problem Statement
+
+The `RepetitionAccumulator` (`backend/signals/repetition_accumulator.py`) operates exclusively
+on a short intraday rolling window (`window_minutes=30`). This correctly catches intraday
+stacking but **misses the most institutionally significant pattern entirely**: the same
+ticker + contract + expiry accumulating call or put flow across **multiple separate trading
+sessions**.
+
+Simultaneously, `composite_signal_engine.py` (`build_composite()`) uses a formula where premium
+size is baked into 3 of 4 active components:
+
+```
+flow_score * 0.55 + vwp_factor * 0.20 + premium_tier * 0.15 + sector * 0.10
+```
+
+Where `flow_score` itself = `(premium/10M) * 0.65 + acceleration * 0.15 + trade_count * 0.20`.
+
+A **$2M intraday print on a large-cap with no repeat scores higher than a $100K 3-day repeat
+sweep on a small-cap.** That is structurally backwards. The composite score currently ranks
+**size**, not **conviction**.
+
+#### Background: WSJ Repeat Pattern Analysis
+
+Analysis of institutional options flow signal patterns identifies two distinct timescales at
+which "repeat" flow fires — both must be detected:
+
+**Intraday Repeat** — same ticker, same contract, multiple sweeps within hours. This is
+**urgency**. Someone is building a position aggressively right now. The current accumulator
+with `window_minutes=30` catches this but the window is too tight — intraday repeats span
+the full trading session (6.5 hours), not 30 minutes.
+
+**Multi-Day Repeat** — same ticker, same expiry, call flow showing up Monday then again
+Wednesday. This is **conviction**. Someone is accumulating without urgency, which is actually
+*more* institutional. The current architecture has **zero coverage** for this.
+
+**Signal Taxonomy (Actionable vs. Informational):**
+
+| Signal Tier | Pattern | Example | Action |
+|---|---|---|---|
+| Tier 1 — Repeat Sweeper | `repeat_type=BOTH` or `MULTI_DAY` 3+ sessions, P/C ≥ 10:1, SWEEP confirmed | `$NOK REPEAT SWEEPER BUYING — Put/Call: 11k/116k` | **SIGNAL — surface immediately** |
+| Tier 1 — Size Repeat | Multi-session + single large sweep bypass | `$YPF SIZE REPEAT SWEEPER BUYING` | **SIGNAL — surface immediately** |
+| Tier 2 — First Observation | Single session, P/C ≥ 8:1, no repeat yet | `$VG Put/Call: 777/11k` | **WATCH — monitor for follow-through** |
+| Tier 3 — Informational | Macro data, analyst ratings, sentiment indices, geopolitical headlines | AAII, GS desk commentary, CTA positioning | **NOISE — do not surface** |
+
+Tier 2 upgrades to Tier 1 **only when the same ticker+contract+expiry shows qualifying flow
+in a second session.** That second-session confirmation is the precise trigger missing from
+the current architecture.
+
+#### Proposed Fix
+
+##### Part 1 — Unified Dual-Window Episode Model
+
+Do **not** build two separate detectors. Extend `RepetitionEpisode` and
+`RepetitionAccumulator` to track both windows simultaneously on the **same episode key**.
+
+> **Critical:** The episode key must remain `ticker|contract_type|strike|expiry`. Do NOT
+> loosen it to `ticker|contract_type`. Institutional flow tracking the same strike+expiry
+> contract across sessions — ticker-level repeat alone is insufficient and will produce false
+> positives. The existing `_key()` method is correct and must not be changed.
+
+**New `RepeatEpisode` dataclass:**
+
+```python
+@dataclass
+class RepeatEpisode:
+    ticker: str
+    contract_type: str
+    expiry: str
+
+    # Intraday window — rolling 6.5hr session
+    intraday_events: List[FlowEvent]
+    intraday_sweep_count: int
+    intraday_pc_ratio: float
+
+    # Multi-day window — rolling 5 calendar days
+    session_dates: List[date]          # unique calendar days with qualifying flow
+    per_session_pc_ratios: List[float]
+    per_session_had_sweep: List[bool]
+
+    # Computed
+    @property
+    def repeat_type(self) -> str:
+        intraday = len(self.intraday_events) >= 3
+        multiday = len(set(self.session_dates)) >= 2
+
+        if intraday and multiday:
+            return "BOTH"        # strongest — WSJ "SIZE REPEAT SWEEPER"
+        if multiday:
+            return "MULTI_DAY"   # institutional accumulation
+        if intraday:
+            return "INTRADAY"    # urgency play
+        return "NONE"
+```
+
+**Session log addition to `RepetitionAccumulator.__init__()`:**
+
+```python
+self.session_log: Dict[str, List[date]] = {}
+# key -> list of calendar dates with qualifying Gate-1 flow
+```
+
+**Session log update in `ingest_tick()`, after Gate-1 passes:**
+
+```python
+today = ev_ts.date()
+dates = self.session_log.setdefault(key, [])
+if not dates or dates[-1] != today:
+    dates.append(today)
+
+# Prune to rolling 5-day window
+cutoff = today - timedelta(days=5)
+self.session_log[key] = [d for d in dates if d >= cutoff]
+
+# Attach to episode
+ep.session_dates = self.session_log[key]
+ep.repeat_type = _classify_repeat(ep)  # INTRADAY / MULTI_DAY / BOTH
+```
+
+**Intraday window expansion:**
+Change default `window_minutes` from `30` → `390` (6.5 hours = full market session).
+This is a breaking behavioral change. All callers and tests relying on the 30-minute default
+must be audited before implementation begins (see Deliberation Point 2).
+
+##### Part 2 — Alert Level Logic Based on `repeat_type`
+
+Layer `repeat_type` on top of existing premium thresholds in `get_alert_level()`.
+**Premium is a size filter. `repeat_type` is a conviction filter.** A $75K episode that is
+`MULTI_DAY + SWEEP` must rank higher than a $500K intraday-only episode without sweeps.
+
+| `repeat_type` | Sessions | Sweep Present | Alert Level | Signal Language |
+|---|---|---|---|---|
+| INTRADAY | 1 day, ≥3 events | No | WATCH | Raw P/C ratio post |
+| INTRADAY | 1 day, ≥3 events | Yes | ALERT | `BULL FLOW DETECTED` |
+| INTRADAY | 1 day, accelerating | Yes | STRONG_SIGNAL | `SIZE SWEEPER DETECTED` |
+| MULTI_DAY | 2 days | No | ALERT | Ticker + P/C day 2 observation |
+| MULTI_DAY | 2 days | Yes | STRONG_SIGNAL | `REPEAT BULL FLOW` |
+| MULTI_DAY | 3+ days | Yes | CONVICTION | `REPEAT SWEEPER BUYING` |
+| BOTH | Same day + prior session | Yes | CONVICTION | `SIZE REPEAT SWEEPER BUYING` |
+
+##### Part 3 — Composite Score Reweight: Conviction Over Size
+
+The composite score must answer: **"How much institutional repeat conviction is behind this
+flow?"** — not "How much total dollar premium printed?"
+
+**Current vs. Proposed Weight Split:**
+
+| Component | Current Weight | Proposed Weight | Rationale |
+|---|---|---|---|
+| `repeat_conviction` *(new)* | 0% | **40%** | `BOTH > MULTI_DAY > INTRADAY` — primary signal |
+| `flow_score` (premium + accel) | 55% | **25%** | Still matters, not dominant |
+| `pc_ratio_skew` *(new)* | 0% | **20%** | 10:1+ ratio is a hard institutional tell |
+| `volume_premium_factor` | 20% | **10%** | Useful but secondary |
+| `premium_tier_score` | 15% | **5%** | Size confirms but does not drive |
+| `sector_score` | 10% | **0%** | Still unimplemented — leave at 0 |
+| **TOTAL** | 100% | **100%** | |
+
+**`compute_repeat_conviction()` (proposed):**
+
+```python
+def compute_repeat_conviction(ep: RepeatEpisode) -> float:
+    if ep.repeat_type == "BOTH":
+        return 1.0
+    if ep.repeat_type == "MULTI_DAY":
+        days = len(set(ep.session_dates))
+        return min(0.90, 0.60 + (days - 2) * 0.15)  # 2=0.60, 3=0.75, 4+=0.90
+    if ep.repeat_type == "INTRADAY":
+        return 0.50 if ep.is_accelerating else 0.30
+    return 0.0
+```
+
+**`compute_pc_ratio_skew()` (proposed):**
+
+```python
+def compute_pc_ratio_skew(ep: RepeatEpisode) -> float:
+    """
+    Scores directional skew of P/C ratio.
+    >= 20:1 -> 1.00  (extreme institutional skew)
+    >= 10:1 -> 0.85  (strong — repeat sweeper territory)
+    >= 5:1  -> 0.60  (moderate)
+    >= 3:1  -> 0.35  (mild)
+    <  3:1  -> 0.10  (no meaningful conviction)
+    """
+    ratio = ep.intraday_pc_ratio
+    if ratio >= 20: return 1.00
+    if ratio >= 10: return 0.85
+    if ratio >= 5:  return 0.60
+    if ratio >= 3:  return 0.35
+    return 0.10
+```
+
+##### Part 4 — Three-Tier Output Classification
+
+| Composite Score | Output Tier | Action | Equivalent Pattern |
+|---|---|---|---|
+| ≥ 0.75 | **SIGNAL** | Surface immediately | `REPEAT SWEEPER BUYING` |
+| 0.50 – 0.74 | **WATCH** | Log, monitor for second session | Raw `Put/Call: 11k/116k` |
+| < 0.50 | **NOISE** | Do not surface | Macro context posts |
+
+#### Files Affected
+
+- `backend/signals/repetition_accumulator.py` — add `session_log`, `repeat_type` classification, `RepeatEpisode` dataclass, intraday window expansion to 390 minutes
+- `backend/signals/composite_signal_engine.py` — add `compute_repeat_conviction()`, `compute_pc_ratio_skew()`, reweight formula, update `build_composite()`, three-tier output classification
+- `backend/tests/test_repetition_accumulator.py` — new tests for cross-session logic, session pruning, `repeat_type` classification
+- `backend/tests/test_composite_signal_engine.py` — update all tests for new weight split; new parametrized tests for `repeat_conviction` scoring
+
+#### Deliberation Points
+
+> ⚠️ All deliberation points are architectural concerns about the formula's general behavior.
+> Where specific examples appear, they are illustrative only.
+
+1. **(Senior Software Director)** `repeat_conviction` at 40% dominates the composite score. A `BOTH`-type episode scores 1.0 regardless of premium size, which can produce composite > 0.75 SIGNAL even on a small-cap with $30K total premium if the P/C ratio is also skewed. Is this correct production behavior? Or should `repeat_conviction` weight only apply if `total_premium >= T3_floor` for the ticker's tier?
+
+2. **(Senior Software Director + Platform Backend Engineer)** The proposed `window_minutes` default change from 30 → 390 is a breaking behavioral change. All existing callers relying on the 30-minute default will now accumulate across an entire session. Audit required: (a) which callers pass `window_minutes` explicitly vs. rely on default, (b) whether the 390-minute intraday window interacts correctly with the multi-day `session_log` at session boundaries — events from the prior session's window tail must not bleed into the next day's intraday count.
+
+3. **(Platform Backend Engineer)** `session_log` is a dict keyed by episode key, appended on every Gate-1 pass. Under concurrent 64-worker execution, two workers can attempt `setdefault` + `append` on the same key simultaneously. The `_tier_map_lock` pattern from S4 (Finding 2) applies here. A `threading.Lock` on `session_log` writes is required. Confirm locking strategy before implementation.
+
+4. **(Platform Backend Engineer)** `intraday_pc_ratio` on `RepeatEpisode` requires knowing total call and put volume for the underlying ticker within the session — not currently tracked at episode level. Confirm data source: (a) derive from the episode's own events only (this contract's trades — implementable immediately), or (b) fetch from a ticker-level P/C aggregator (full ticker flow across all contracts — requires new aggregation layer). The institutional P/C ratio (e.g., `$NOK Put/Call: 11k/116k`) is ticker-wide, not contract-specific. Panel must decide scope.
+
+5. **(Senior Software Director)** This story's proposed weight split (`repeat_conviction=40%, flow_score=25%, pc_ratio=20%, vwp=10%, prem_tier=5%`) conflicts with S9's weight split (`flow_score=55%, vwp=20%, prem_tier=15%, otm_factor=5%, sector=5%`). **These cannot both be correct simultaneously.** Panel must decide: (a) does S12 supersede S9's weight split entirely, (b) does S9 land first with tiered ceiling fixes and S12 reweights on top, or (c) does S9 fix the formula shape and S12 adds new components without touching S9 weights? Sequencing between S9 and S12 must be resolved before either begins implementation.
+
+6. **(QA Lead)** Regression test matrix must cover: (a) `repeat_type=NONE` → composite < 0.50 (noise) for all tier levels, (b) `INTRADAY` without sweep → WATCH band, (c) `INTRADAY` with acceleration + sweep → STRONG_SIGNAL, (d) `MULTI_DAY` 2 sessions + sweep → STRONG_SIGNAL, (e) `MULTI_DAY` 3+ sessions + sweep → CONVICTION, (f) `BOTH` → CONVICTION floor regardless of premium tier, (g) session pruning: events older than 5 calendar days dropped from `session_dates`, (h) session boundary: event at 11:59 PM Day 1 and 12:01 AM Day 2 (UTC) register as two distinct `session_dates`, (i) concurrent `session_log` write safety under 64 workers.
+
+7. **(QA Lead)** `COMPOSITE_SCORE_CEILING` constant interaction: with `repeat_conviction=40%` at `1.0` and `pc_ratio_skew=20%` at `1.0`, the maximum achievable composite before `flow_score` and `vwp_factor` is already `0.60`. A CONVICTION episode can realistically hit `0.85+`. Confirm whether `COMPOSITE_SCORE_CEILING=0.90` (set in S6) should be updated to `1.0` or retained as a soft cap.
+
+#### Acceptance Criteria
+
+- [ ] `RepeatEpisode` dataclass defined with `intraday_events`, `intraday_sweep_count`, `intraday_pc_ratio`, `session_dates`, `per_session_pc_ratios`, `per_session_had_sweep`, and `repeat_type` computed property
+- [ ] `RepetitionAccumulator.__init__()` has `session_log: Dict[str, List[date]]`
+- [ ] `session_log` updated in `ingest_tick()` after Gate-1 pass; pruned to 5-day rolling window
+- [ ] `ep.session_dates` and `ep.repeat_type` attached to episode on every qualifying tick
+- [ ] `_classify_repeat()` function correctly returns `BOTH`, `MULTI_DAY`, `INTRADAY`, or `NONE`
+- [ ] `intraday_events` window expanded to 390 minutes (or deliberated alternative)
+- [ ] All callers of `RepetitionAccumulator` audited for `window_minutes` default reliance
+- [ ] `session_log` writes protected by threading lock (analogous to `_tier_map_lock`)
+- [ ] `compute_repeat_conviction()` implemented in `composite_signal_engine.py`
+- [ ] `compute_pc_ratio_skew()` implemented in `composite_signal_engine.py`
+- [ ] `build_composite()` uses new weight split: `repeat_conviction=40%, flow_score=25%, pc_ratio=20%, vwp=10%, prem_tier=5%`
+- [ ] Three-tier output classification added: SIGNAL (≥0.75), WATCH (0.50–0.74), NOISE (<0.50)
+- [ ] Alert level in `get_alert_level()` uses `repeat_type` as primary gate, premium as amplifier
+- [ ] MULTI_DAY + SWEEP + 3 sessions → CONVICTION regardless of premium size
+- [ ] INTRADAY only, no sweep → WATCH
+- [ ] All existing `test_repetition_accumulator.py` tests pass with 390-min window change (or updated)
+- [ ] All existing `test_composite_signal_engine.py` tests updated to new weight split
+- [ ] New parametrized test: `test_repeat_type_classification[NONE/INTRADAY/MULTI_DAY/BOTH]`
+- [ ] New test: `test_session_log_pruning` — events older than 5 days do not count toward `session_dates`
+- [ ] New test: `test_composite_signal_tiers` — SIGNAL, WATCH, NOISE boundaries at 0.75 and 0.50
+- [ ] New test: `test_concurrent_session_log_write` — 64 concurrent workers, no race on `session_log`
+- [ ] `COMPOSITE_SCORE_CEILING` constant updated or documented per panel deliberation
+- [ ] `docs/cipher_apex_story_and_sprint_plan.md` updated with this story definition
 
 ---
 
@@ -731,23 +638,28 @@ Exact execution order. Do not start a story until everything above it in the sam
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 4 — COMPOSITE FORMULA INTEGRITY ──────────────────────────────────────────────────
-22. 🔴  S9            — Tier-relative flow_score normalization + dead-weight redistribution  ← IMMEDIATE FIX
+22. ⚪  S9            — Tier-relative flow_score normalization + dead-weight redistribution  ← IMMEDIATE FIX
 23. ⏳  S10           — underlying_price population + OTM factor activation  ← BLOCKED on S9
 24. ⏳  S11           — Full composite activation (backtest + sector)  ← BLOCKED on S9 + S10 + S6-POST-1 + S8
 ───────────────────────────────────────────────────────────────────────────────────
 
+── SPRINT 5 — REPEAT CONVICTION ENGINE ─────────────────────────────────────────────────────
+25. 🔴  S12           — Dual-window repeat conviction engine: cross-session accumulation + composite reweight  ← IMMEDIATE FIX / deliberation required (#56)
+         ↳ NOTE: Weight split conflict with S9 must be resolved before either S9 or S12 begins implementation.
+───────────────────────────────────────────────────────────────────────────────────
+
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
-25. ⏳  S8            — Real backtest score from flow_events (requires signal_outcomes architecture)
+26. ⏳  S8            — Real backtest score from flow_events (requires signal_outcomes architecture)
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────────
-26. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
-27. 🟢  C8            — Decouple persist/signal tier (#2)
-28. ⚪  #22           — Hoist get_registry import
-29. ⚪  #28           — Fix misleading flush loop test
-30. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
-31. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
-32. ⚪  #53           — detect_ladder() deterministic group selection when multiple groups qualify
+27. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
+28. 🟢  C8            — Decouple persist/signal tier (#2)
+29. ⚪  #22           — Hoist get_registry import
+30. ⚪  #28           — Fix misleading flush loop test
+31. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
+32. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
+33. ⚪  #53           — detect_ladder() deterministic group selection when multiple groups qualify
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -755,12 +667,12 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S9 (IMMEDIATE FIX — tier-relative flow_score normalization). Panel deliberation required before implementation. S7 prep and S6-POST-1 spec definition can run in parallel.
+- **"What is next?"** → S12 (IMMEDIATE FIX — dual-window repeat conviction engine). Panel deliberation required before either begins. **Weight split conflict between S9 and S12 must be resolved first — see S12 Deliberation Point 5.** S9 might get closed
 - **"What unblocks S6-POST-1?"** → (1) Decide `sector_score` normalization function — document in spec. (2) Confirm or add `RepetitionAccumulator.get_all_active_episodes()`. See issue [#55](https://github.com/bhaveshhpatel/cipher/issues/55).
 - **"What unblocks S7?"** → Review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling.
 - **"What unblocks S10?"** → S9 merged.
 - **"What unblocks S11?"** → S9 + S10 + S6-POST-1 + S8 all merged.
-- **"What is remaining?"** → Every row not marked ✅ — steps 20 through 32.
+- **"What is remaining?"** → Every row not marked ✅ — steps 20 through 33.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -768,5 +680,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S6 completed via PR #54. Sprint 4 added: S9 (IMMEDIATE FIX — tier-relative composite score normalization), S10 (underlying_price + OTM factor, scoped after S9), S11 (full composite activation with backtest + sector, future). Panel deliberation required before S9 implementation begins. S9 deliberation points expanded 2026-05-01: GLXY single-print analysis added to scenario section (single-print HOLD behavior is general, not ticker-specific); INSTITUTIONAL ceiling review added to deliberation point 1; Vol/OI unified flow_quality_factor documented as post-S9 deliberation in point 2; contract-size blind spot documented as architectural concern. All deliberation points are general formula concerns — specific trade examples are illustrative only.*
-*Version: 4.1*
+*Last updated: 2026-05-02 — Sprint 5 added: S12 (IMMEDIATE FIX — dual-window repeat conviction engine, cross-session accumulation, composite score reweight from size-ranking to conviction-ranking). GitHub Issue [#56](https://github.com/bhaveshhpatel/cipher/issues/56). Panel deliberation required before S12 implementation begins (Senior Software Director + Platform Backend Engineer + QA Lead). Critical: weight split conflict between S9 and S12 must be resolved before either story begins implementation — see S12 Deliberation Point 5. S9 deliberation points expanded 2026-05-01 (GLXY single-print analysis, INSTITUTIONAL ceiling review, Vol/OI flow_quality_factor, contract-size blind spot). All deliberation points are general formula concerns — specific trade examples are illustrative only.*
+*Version: 5.0*
