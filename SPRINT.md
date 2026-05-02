@@ -70,7 +70,7 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **S4 merged. #45 and #46 completed. #47 open. S5 is unblocked once #47 closes.**
+> 🟢 **S4 merged. #45, #46, and #47 all completed. S5 is unblocked.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -81,13 +81,13 @@
 | S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | [#44](https://github.com/bhaveshhpatel/cipher/pull/44) | ✅ |
 | S4-POST-1 | `deep_otm_multiplier=1.0` — add explicit reject-then-pass test pair to pin `> 1.0` branch (not coincidental floor pass) | [#45](https://github.com/bhaveshhpatel/cipher/issues/45) | ✅ |
 | S4-POST-2 | `_max_dte_key=None` guard — test (+ optional runtime guard) for BE-1 cache when `dte_premium_tiers={}` | [#46](https://github.com/bhaveshhpatel/cipher/issues/46) | ✅ |
+| S4-POST-3 (BE-3) | `_ev_attr` / `_make_key` dict-key bug — regression tests pinning key isolation (distinct tickers → distinct keys) and object/dict key parity; production-path confirmed as test-only | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) / [#48](https://github.com/bhaveshhpatel/cipher/pull/48) | ✅ |
 
 ### Queued / Blocked
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S4-POST-3 | `_ev_attr` / `_make_key` dict-key bug — `getattr` on plain dict returns default; dict events from different symbols collapse to single `None|None|0.00|None` episode. Fix: add `isinstance(ev, dict)` branch using `.get()`. Confirm whether raw dict is a supported production path. | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) | ⚪ Close before S5 starts |
-| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | ⏳ Blocked on #47 |
+| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | 🟢 Unblocked — ready to start |
 
 ---
 
@@ -144,8 +144,8 @@ Exact execution order. Do not start a story until everything above it in the sam
 13. ✅  S4            — Apex L2: dual-window accumulator (PR #44)
 14. ✅  #45           — S4-POST-1: deep_otm_multiplier=1.0 reject-then-pass test pair
 15. ✅  #46           — S4-POST-2: _max_dte_key=None guard
-16. ⚪  #47           — S4-POST-3: _ev_attr dict-key bug (close before S5 starts)
-17. ⏳  S5            — Apex L4: ladder detection  ← NEXT (unblocked once #47 closes)
+16. ✅  #47           — S4-POST-3 (BE-3): _ev_attr dict-key bug regression tests (PR #48)
+17. 🟢  S5            — Apex L4: ladder detection  ← NEXT
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
@@ -171,10 +171,10 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → Close #47 (S4-POST-3). Then S5 (step 17) is unblocked.
-- **"What must close before S5 starts?"** → #47 (S4-POST-3).
-- **"What is remaining?"** → Every row not marked ✅ — steps 16 through 26.
-- **"What blocks S5 start?"** → #47 must close first.
+- **"What is next?"** → S5 (step 17) — Apex L4: cross-contract ladder detection. No blockers remain.
+- **"What must close before S5 starts?"** → Nothing. All gates are clear.
+- **"What is remaining?"** → Every row not marked ✅ — steps 17 through 26.
+- **"What blocks S5 start?"** → Nothing. S5 is unblocked.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -182,5 +182,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S4-POST-1 (#45) and S4-POST-2 (#46) completed and closed after verification in PR #44. #47 remains open; close #47 before S5 starts.*
-*Version: 2.4*
+*Last updated: 2026-05-01 — S4-POST-3 (BE-3, #47) completed via PR #48. All S4 post-merge work is done. S5 is fully unblocked.*
+*Version: 2.5*
