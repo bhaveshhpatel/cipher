@@ -40,9 +40,17 @@ from signals.repetition_accumulator import RepetitionEpisode
 # ---------------------------------------------------------------------------
 # Fixed time sentinels — all timestamps in tests are relative to NOW so that
 # stale-expiry tests are deterministic regardless of when the suite runs.
-# IMPORTANT: _make_ep defaults to FRESH (not datetime.now()) so that episodes
-# built without an explicit last_seen are always treated as current relative
-# to NOW-based expires_before cutoffs used in TestStaleEpisodeExpiry.
+#
+# Timeline:  OLD (NOW-30m) -------- FRESH (NOW-1m) ---- NOW
+#
+# expires_before=OLD  -> keeps FRESH, keeps NOW-timestamped; excludes nothing
+#                        in practice since all sentinels are >= OLD
+# expires_before=NOW  -> excludes OLD *and* FRESH (both < NOW)
+# expires_before=FRESH-> excludes OLD only (OLD < FRESH); keeps FRESH (equal,
+#                        not strictly less) and NOW
+#
+# _make_ep defaults last_seen to FRESH so episodes without an explicit
+# last_seen are always treated as current relative to OLD-based cutoffs.
 # ---------------------------------------------------------------------------
 NOW   = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
 OLD   = NOW - timedelta(minutes=30)
@@ -58,14 +66,14 @@ def _make_ep(
     expiry: str,
     strike: float,
     premium: float,
-    last_seen: datetime | None = FRESH,  # fixed sentinel, NOT datetime.now()
+    last_seen: datetime | None = FRESH,
 ) -> RepetitionEpisode:
     """
     Build a minimal RepetitionEpisode suitable for ladder detection tests.
     total_premium is driven by the events list, so we inject a mock event.
 
     last_seen defaults to FRESH (NOW - 1 min) so that episodes built without
-    an explicit timestamp are always fresh relative to NOW-based cutoffs.
+    an explicit timestamp are always fresh relative to OLD-based cutoffs.
     Pass last_seen=None explicitly to test the None-last_seen path.
     """
     ep = RepetitionEpisode(
@@ -218,13 +226,21 @@ class TestStaleEpisodeExpiry:
         assert result is None
 
     def test_episode_with_none_last_seen_not_filtered(self):
-        """last_seen=None — no staleness data, episode is always kept."""
+        """
+        last_seen=None means no staleness data — episode is always kept.
+
+        expires_before=OLD is used here (not NOW) because FRESH < NOW would
+        cause the two FRESH companions to be filtered too, leaving only the
+        None episode which alone cannot form a 3-strike ladder.
+        With expires_before=OLD: FRESH (NOW-1m) >= OLD (NOW-30m) so companions
+        survive; OLD episodes would be cut but none exist here.
+        """
         eps = [
             _make_ep("NVDA", "2026-06-20", 580.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 590.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 600.0, 200_000, last_seen=None),
         ]
-        result = detect_ladder(eps, expires_before=NOW)
+        result = detect_ladder(eps, expires_before=OLD)
         assert result is not None
 
     def test_no_expires_before_no_stale_filtering(self):
