@@ -1,13 +1,21 @@
 # .circleci/config.yml
+#
+# DISABLED — all workflows suspended. No jobs will run on any branch.
+# To re-enable: restore the `workflows:` block at the bottom of this file
+# (full original below as comments).
+#
+# Original config preserved below — DO NOT DELETE.
+# Uncomment the `workflows:` section and remove this header to restore.
+#
 # Backend: lint + regression (92% coverage gate) + deploy to Railway
 # Frontend: npm install + next build (type gate) + jest --ci --coverage + deploy to Vercel
-# Vercel git integration should be disabled in Project Settings → Git
+# Vercel git integration should be disabled in Project Settings -> Git
 # so only this pipeline can trigger production deploys.
 #
 # Branch filter policy:
-#   main              — full CI + deploy
-#   apex/.*           — lint + regression + frontend_test (no deploy)
-#   feature/.*, refactor/.*, fix/.*  — lint + regression + frontend_test (no deploy)
+#   main              -- full CI + deploy
+#   apex/.*           -- lint + regression + frontend_test (no deploy)
+#   feature/.*, refactor/.*, fix/.*  -- lint + regression + frontend_test (no deploy)
 
 version: 2.1
 
@@ -34,13 +42,10 @@ commands:
             - ~/.cache/pip
 
 # -----------------------------------------------------------------------
-# Jobs
+# Jobs (fully preserved — not deleted)
 # -----------------------------------------------------------------------
 jobs:
 
-  # -----------------------------------------------------------------------
-  # Job 1: Syntax check — pyflakes only, no heavy deps
-  # -----------------------------------------------------------------------
   lint:
     docker:
       - image: cimg/python:3.11.9
@@ -56,9 +61,6 @@ jobs:
             python -m pyflakes .
             echo "All Python files OK"
 
-  # -----------------------------------------------------------------------
-  # Job 2: Regression tests + 92% coverage gate
-  # -----------------------------------------------------------------------
   regression:
     docker:
       - image: cimg/python:3.11.9
@@ -107,10 +109,6 @@ jobs:
           path: ~/project/backend/coverage.json
           destination: coverage.json
 
-  # -----------------------------------------------------------------------
-  # Job 3: Frontend — type-check + Jest coverage gate
-  # No package-lock.json in repo — uses npm install, cache keyed on package.json.
-  # -----------------------------------------------------------------------
   frontend_test:
     docker:
       - image: cimg/node:lts
@@ -137,16 +135,13 @@ jobs:
           working_directory: ~/project/frontend
           command: npm run build
       - run:
-          name: Jest — CI mode with coverage
+          name: Jest -- CI mode with coverage
           working_directory: ~/project/frontend
           command: npm run test:ci
       - store_artifacts:
           path: ~/project/frontend/coverage
           destination: frontend-coverage
 
-  # -----------------------------------------------------------------------
-  # Job 4: Deploy backend to Railway (main only, after lint + regression)
-  # -----------------------------------------------------------------------
   deploy_backend:
     docker:
       - image: cimg/node:lts
@@ -159,9 +154,6 @@ jobs:
           name: Deploy backend to Railway
           command: railway up --service cipher
 
-  # -----------------------------------------------------------------------
-  # Job 5: Deploy frontend to Vercel (main only, after frontend_test passes)
-  # -----------------------------------------------------------------------
   deploy_frontend:
     docker:
       - image: cimg/node:lts
@@ -195,55 +187,50 @@ jobs:
               --token=$VERCEL_TOKEN
 
 # -----------------------------------------------------------------------
-# Workflows
+# Workflows — DISABLED (no workflows defined = no jobs run on any branch)
+# To re-enable, uncomment the block below:
 # -----------------------------------------------------------------------
-workflows:
-  ci_cd:
-    jobs:
-
-      # ── Backend jobs ──────────────────────────────────────────────
-      - lint:
-          filters:
-            branches:
-              only:
-                - main
-                - /apex\/.*/
-                - /refactor\/.*/
-                - /feature\/.*/
-                - /fix\/.*/
-
-      - regression:
-          filters:
-            branches:
-              only:
-                - main
-                - /apex\/.*/
-                - /refactor\/.*/
-                - /feature\/.*/
-                - /fix\/.*/
-
-      - deploy_backend:
-          requires:
-            - lint
-            - regression
-          filters:
-            branches:
-              only: main
-
-      # ── Frontend jobs ─────────────────────────────────────────────
-      - frontend_test:
-          filters:
-            branches:
-              only:
-                - main
-                - /apex\/.*/
-                - /refactor\/.*/
-                - /feature\/.*/
-                - /fix\/.*/
-
-      - deploy_frontend:
-          requires:
-            - frontend_test
-          filters:
-            branches:
-              only: main
+#
+# workflows:
+#   ci_cd:
+#     jobs:
+#       - lint:
+#           filters:
+#             branches:
+#               only:
+#                 - main
+#                 - /apex\/.*/
+#                 - /refactor\/.*/
+#                 - /feature\/.*/
+#                 - /fix\/.*/
+#       - regression:
+#           filters:
+#             branches:
+#               only:
+#                 - main
+#                 - /apex\/.*/
+#                 - /refactor\/.*/
+#                 - /feature\/.*/
+#                 - /fix\/.*/
+#       - deploy_backend:
+#           requires:
+#             - lint
+#             - regression
+#           filters:
+#             branches:
+#               only: main
+#       - frontend_test:
+#           filters:
+#             branches:
+#               only:
+#                 - main
+#                 - /apex\/.*/
+#                 - /refactor\/.*/
+#                 - /feature\/.*/
+#                 - /fix\/.*/
+#       - deploy_frontend:
+#           requires:
+#             - frontend_test
+#           filters:
+#             branches:
+#               only: main
