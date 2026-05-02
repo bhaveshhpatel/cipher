@@ -38,6 +38,18 @@ from signals.repetition_accumulator import RepetitionEpisode
 
 
 # ---------------------------------------------------------------------------
+# Fixed time sentinels — all timestamps in tests are relative to NOW so that
+# stale-expiry tests are deterministic regardless of when the suite runs.
+# IMPORTANT: _make_ep defaults to FRESH (not datetime.now()) so that episodes
+# built without an explicit last_seen are always treated as current relative
+# to NOW-based expires_before cutoffs used in TestStaleEpisodeExpiry.
+# ---------------------------------------------------------------------------
+NOW   = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+OLD   = NOW - timedelta(minutes=30)
+FRESH = NOW - timedelta(minutes=1)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -46,11 +58,15 @@ def _make_ep(
     expiry: str,
     strike: float,
     premium: float,
-    last_seen: datetime | None = None,
+    last_seen: datetime | None = FRESH,  # fixed sentinel, NOT datetime.now()
 ) -> RepetitionEpisode:
     """
     Build a minimal RepetitionEpisode suitable for ladder detection tests.
     total_premium is driven by the events list, so we inject a mock event.
+
+    last_seen defaults to FRESH (NOW - 1 min) so that episodes built without
+    an explicit timestamp are always fresh relative to NOW-based cutoffs.
+    Pass last_seen=None explicitly to test the None-last_seen path.
     """
     ep = RepetitionEpisode(
         ticker=ticker,
@@ -61,13 +77,8 @@ def _make_ep(
     ev = MagicMock()
     ev.premium = premium
     ep.events.append(ev)
-    ep.last_seen = last_seen or datetime.now(timezone.utc)
+    ep.last_seen = last_seen  # assigned directly; None is preserved as-is
     return ep
-
-
-NOW = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
-OLD = NOW - timedelta(minutes=30)
-FRESH = NOW - timedelta(minutes=1)
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +143,9 @@ class TestCrossExpiryGuard:
     def test_two_expiries_first_qualifies_second_does_not(self):
         """One expiry has 3 strikes, the other has 2 — only first fires."""
         eps = [
-            # Qualifying group
             _make_ep("TSLA", "2026-06-20", 300.0, 200_000),
             _make_ep("TSLA", "2026-06-20", 310.0, 200_000),
             _make_ep("TSLA", "2026-06-20", 320.0, 200_000),
-            # Non-qualifying group (only 2 strikes)
             _make_ep("TSLA", "2026-07-18", 300.0, 100_000),
             _make_ep("TSLA", "2026-07-18", 310.0, 100_000),
         ]
@@ -209,14 +218,12 @@ class TestStaleEpisodeExpiry:
         assert result is None
 
     def test_episode_with_none_last_seen_not_filtered(self):
-        """last_seen=None means no staleness data — episode is kept."""
+        """last_seen=None — no staleness data, episode is always kept."""
         eps = [
             _make_ep("NVDA", "2026-06-20", 580.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 590.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 600.0, 200_000, last_seen=None),
         ]
-        # Override last_seen to None after construction (helper sets it)
-        eps[2].last_seen = None
         result = detect_ladder(eps, expires_before=NOW)
         assert result is not None
 
@@ -233,25 +240,22 @@ class TestStaleEpisodeExpiry:
     def test_tz_naive_last_seen_with_tz_aware_cutoff(self):
         """Covers the tz-naive ep_ts + tz-aware cutoff compatibility branch."""
         naive_ts = datetime(2026, 5, 1, 11, 0, 0)  # tz-naive, 1 hour before NOW
-        aware_cutoff = NOW  # tz-aware
         eps = [
             _make_ep("NVDA", "2026-06-20", 580.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 590.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 600.0, 200_000, last_seen=naive_ts),
         ]
-        eps[2].last_seen = naive_ts
         # naive_ts < NOW (both UTC-equivalent) — stale, should be excluded
-        result = detect_ladder(eps, expires_before=aware_cutoff)
+        result = detect_ladder(eps, expires_before=NOW)
         assert result is None
 
     def test_tz_aware_last_seen_with_tz_naive_cutoff(self):
         """Covers the tz-aware ep_ts + tz-naive cutoff compatibility branch."""
-        aware_old = OLD  # tz-aware, old
         naive_cutoff = datetime(2026, 5, 1, 12, 0, 0)  # tz-naive = NOW equivalent
         eps = [
             _make_ep("NVDA", "2026-06-20", 580.0, 200_000, last_seen=FRESH),
             _make_ep("NVDA", "2026-06-20", 590.0, 200_000, last_seen=FRESH),
-            _make_ep("NVDA", "2026-06-20", 600.0, 200_000, last_seen=aware_old),
+            _make_ep("NVDA", "2026-06-20", 600.0, 200_000, last_seen=OLD),
         ]
         result = detect_ladder(eps, expires_before=naive_cutoff)
         assert result is None
@@ -268,14 +272,12 @@ class TestMultiTickerIsolation:
             _make_ep("NVDA", "2026-06-20", 580.0, 300_000),
             _make_ep("NVDA", "2026-06-20", 590.0, 250_000),
             _make_ep("NVDA", "2026-06-20", 600.0, 200_000),
-            # Different ticker — should not mix
             _make_ep("AAPL", "2026-06-20", 200.0, 100_000),
             _make_ep("AAPL", "2026-06-20", 210.0, 100_000),
         ]
         result = detect_ladder(eps)
         assert result is not None
         assert result.ticker == "NVDA"
-        # AAPL only has 2 strikes — must not bleed in
         assert "AAPL" not in result.ticker
         assert 200.0 not in result.strikes
 
@@ -291,7 +293,6 @@ class TestMultiTickerIsolation:
         ]
         result = detect_ladder(eps)
         assert result is not None
-        # Whichever comes first in dict iteration — must be one of the two
         assert result.ticker in ("NVDA", "AAPL")
 
 
@@ -315,5 +316,5 @@ class TestMinStrikesOverride:
             _make_ep("NVDA", "2026-06-20", 580.0, 200_000),
             _make_ep("NVDA", "2026-06-20", 590.0, 200_000),
         ]
-        result = detect_ladder(eps)  # default min_strikes=3
+        result = detect_ladder(eps)
         assert result is None
