@@ -70,7 +70,7 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **S4 merged. #45, #46, and #47 all completed. S5 is unblocked.**
+> 🟢 **S4 and all post-merge work fully done. S5 is unblocked.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -81,7 +81,9 @@
 | S4 | Apex L2: Dual-window accumulator — DTE-adjusted floors, OTM/ATM/deep-OTM classification, whale-conviction sweep bypass, LEAPS eligibility | [#44](https://github.com/bhaveshhpatel/cipher/pull/44) | ✅ |
 | S4-POST-1 | `deep_otm_multiplier=1.0` — add explicit reject-then-pass test pair to pin `> 1.0` branch (not coincidental floor pass) | [#45](https://github.com/bhaveshhpatel/cipher/issues/45) | ✅ |
 | S4-POST-2 | `_max_dte_key=None` guard — test (+ optional runtime guard) for BE-1 cache when `dte_premium_tiers={}` | [#46](https://github.com/bhaveshhpatel/cipher/issues/46) | ✅ |
-| S4-POST-3 (BE-3) | `_ev_attr` / `_make_key` dict-key bug — regression tests pinning key isolation (distinct tickers → distinct keys) and object/dict key parity; production-path confirmed as test-only | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) / [#48](https://github.com/bhaveshhpatel/cipher/pull/48) | ✅ |
+| S4-POST-3 (BE-3) | `_ev_attr` / `_make_key` dict-key bug — regression tests pinning key isolation and object/dict key parity; production-path confirmed as test-only | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) / [#48](https://github.com/bhaveshhpatel/cipher/pull/48) | ✅ |
+| BE-3 F2 | `asyncio.run()` fix — replace deprecated `get_event_loop().run_until_complete()` in test helper | [#49](https://github.com/bhaveshhpatel/cipher/issues/49) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
+| BE-3 F3 | `contract_type` isolation test — CALL vs PUT same ticker/strike/expiry must produce two distinct episode keys | [#50](https://github.com/bhaveshhpatel/cipher/issues/50) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
 
 ### Queued / Blocked
 
@@ -144,26 +146,27 @@ Exact execution order. Do not start a story until everything above it in the sam
 13. ✅  S4            — Apex L2: dual-window accumulator (PR #44)
 14. ✅  #45           — S4-POST-1: deep_otm_multiplier=1.0 reject-then-pass test pair
 15. ✅  #46           — S4-POST-2: _max_dte_key=None guard
-16. ✅  #47           — S4-POST-3 (BE-3): _ev_attr dict-key bug regression tests (PR #48)
-17. 🟢  S5            — Apex L4: ladder detection  ← NEXT
+16. ✅  #47/#48       — S4-POST-3 (BE-3): _ev_attr dict-key bug regression tests
+17. ✅  #49+#50/#51   — BE-3 F2+F3: asyncio.run() fix + contract_type isolation test
+18. 🟢  S5            — Apex L4: ladder detection  ← NEXT
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
-18. ⏳  S6            — Apex L3: composite formula overhaul
-19. ⏳  S7            — Tiered swarm + circuit breaker
+19. ⏳  S6            — Apex L3: composite formula overhaul
+20. ⏳  S7            — Tiered swarm + circuit breaker
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
-20. ⏳  S8            — Real backtest score from flow_events
+21. ⏳  S8            — Real backtest score from flow_events
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────────
-21. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
-22. 🟢  C8            — Decouple persist/signal tier (#2)
-23. ⚪  #22           — Hoist get_registry import
-24. ⚪  #28           — Fix misleading flush loop test
-25. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
-26. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
+22. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
+23. 🟢  C8            — Decouple persist/signal tier (#2)
+24. ⚪  #22           — Hoist get_registry import
+25. ⚪  #28           — Fix misleading flush loop test
+26. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
+27. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -171,9 +174,9 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S5 (step 17) — Apex L4: cross-contract ladder detection. No blockers remain.
+- **"What is next?"** → S5 (step 18) — Apex L4: cross-contract ladder detection. No blockers remain.
 - **"What must close before S5 starts?"** → Nothing. All gates are clear.
-- **"What is remaining?"** → Every row not marked ✅ — steps 17 through 26.
+- **"What is remaining?"** → Every row not marked ✅ — steps 18 through 27.
 - **"What blocks S5 start?"** → Nothing. S5 is unblocked.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
@@ -182,5 +185,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S4-POST-3 (BE-3, #47) completed via PR #48. All S4 post-merge work is done. S5 is fully unblocked.*
-*Version: 2.5*
+*Last updated: 2026-05-01 — BE-3 F2+F3 completed via PR #51 (issues #49, #50 closed). All S4 and post-merge work is done. S5 is fully unblocked.*
+*Version: 2.6*
