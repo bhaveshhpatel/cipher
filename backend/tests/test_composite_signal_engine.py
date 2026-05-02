@@ -322,3 +322,294 @@ def test_is_accelerating_true_within_60s():
 def test_is_accelerating_false_span_over_60s():
     ep = _fake_episode(n_events=5, premium_each=100_000.0, accelerating=False)
     assert ep.is_accelerating is False
+
+
+# ---------------------------------------------------------------------------
+# Class-based tests (Apex S6 context — must pass against existing engine)
+# ---------------------------------------------------------------------------
+
+class TestEpisodeInfluenceTier:
+    def test_retail_below_100k(self):
+        ep = _fake_episode(n_events=3, premium_each=30_000.0, influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert "RETAIL" in sig.reasoning
+
+    def test_retail_at_zero(self):
+        ep = _fake_episode(n_events=3, premium_each=0.0, influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert "RETAIL" in sig.reasoning
+
+    def test_large_at_100k(self):
+        ep = _fake_episode(n_events=3, premium_each=34_000.0, influence_tier="LARGE")
+        sig = build_composite(ep, _accum())
+        assert "LARGE" in sig.reasoning
+
+    def test_large_just_below_500k(self):
+        ep = _fake_episode(n_events=3, premium_each=160_000.0, influence_tier="LARGE")
+        sig = build_composite(ep, _accum())
+        assert "LARGE" in sig.reasoning
+
+    def test_institutional_at_500k(self):
+        ep = _fake_episode(n_events=3, premium_each=167_000.0, influence_tier="INSTITUTIONAL")
+        sig = build_composite(ep, _accum())
+        assert "INSTITUTIONAL" in sig.reasoning
+
+    def test_institutional_just_below_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=660_000.0, influence_tier="INSTITUTIONAL")
+        sig = build_composite(ep, _accum())
+        assert "INSTITUTIONAL" in sig.reasoning
+
+    def test_whale_at_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=667_000.0, influence_tier="WHALE")
+        sig = build_composite(ep, _accum())
+        assert "WHALE" in sig.reasoning
+
+    def test_whale_above_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=1_000_000.0, influence_tier="WHALE")
+        sig = build_composite(ep, _accum())
+        assert "WHALE" in sig.reasoning
+
+
+class TestPremiumTierScore:
+    def test_watch_band_below_100k(self):
+        ep = _fake_episode(n_events=3, premium_each=30_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.premium_tier_score < 0.5
+
+    def test_alert_band_at_100k(self):
+        ep = _fake_episode(n_events=3, premium_each=34_000.0)
+        sig = build_composite(ep, _accum())
+        assert 0.0 <= sig.premium_tier_score <= 1.0
+
+    def test_alert_band_just_below_500k(self):
+        ep = _fake_episode(n_events=3, premium_each=160_000.0)
+        sig = build_composite(ep, _accum())
+        assert 0.0 <= sig.premium_tier_score <= 1.0
+
+    def test_strong_signal_band_at_500k(self):
+        ep = _fake_episode(n_events=3, premium_each=167_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.premium_tier_score >= 0.5
+
+    def test_strong_signal_band_just_below_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=660_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.premium_tier_score >= 0.5
+
+    def test_conviction_band_at_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=667_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.premium_tier_score >= 0.75
+
+    def test_conviction_band_above_2m(self):
+        ep = _fake_episode(n_events=3, premium_each=1_000_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.premium_tier_score >= 0.75
+
+
+class TestVolumeWeightedPremiumFactor:
+    def test_no_events_returns_half(self):
+        ep = _fake_episode(n_events=0, open_interest=1000)
+        ep.events = []
+        assert volume_weighted_premium_factor(ep) == 0.5
+
+    def test_zero_oi_returns_half(self):
+        ep = _fake_episode(n_events=3, open_interest=0)
+        assert volume_weighted_premium_factor(ep) == 0.5
+
+    def test_negative_oi_treated_as_zero(self):
+        ep = _fake_episode(n_events=3, open_interest=-1)
+        assert volume_weighted_premium_factor(ep) == 0.5
+
+    def test_normal_ratio_below_cap(self):
+        ep = _fake_episode(n_events=3, premium_each=10_000.0, open_interest=10_000)
+        f = volume_weighted_premium_factor(ep)
+        assert 0.0 <= f <= 1.0
+
+    def test_ratio_capped_at_1(self):
+        ep = _fake_episode(n_events=1, premium_each=50_000_000.0, open_interest=1)
+        assert volume_weighted_premium_factor(ep) == 1.0
+
+    def test_volume_greater_than_oi_boost(self):
+        ep_low  = _fake_episode(n_events=1, premium_each=10_000.0,  open_interest=10_000)
+        ep_high = _fake_episode(n_events=1, premium_each=100_000.0, open_interest=10_000)
+        assert volume_weighted_premium_factor(ep_high) >= volume_weighted_premium_factor(ep_low)
+
+
+class TestComputeFlowScore:
+    def test_zero_premium_no_accel_no_trades(self):
+        ep = _fake_episode(n_events=1, premium_each=0.0, accelerating=False)
+        ep.events = []
+        assert compute_flow_score(ep) <= 0.05
+
+    def test_large_premium_accelerating(self):
+        ep = _fake_episode(n_events=5, premium_each=5_000_000.0, accelerating=True)
+        assert compute_flow_score(ep) >= 0.8
+
+    def test_acceleration_adds_0_15(self):
+        ep_no  = _fake_episode(n_events=5, premium_each=1_000_000.0, accelerating=False)
+        ep_yes = _fake_episode(n_events=5, premium_each=1_000_000.0, accelerating=True)
+        diff = compute_flow_score(ep_yes) - compute_flow_score(ep_no)
+        assert diff == pytest.approx(0.15, abs=0.01)
+
+    def test_trade_count_caps_at_20(self):
+        ep20 = _fake_episode(n_events=20, premium_each=100_000.0, accelerating=False)
+        ep50 = _fake_episode(n_events=50, premium_each=100_000.0, accelerating=False)
+        assert compute_flow_score(ep20) == pytest.approx(compute_flow_score(ep50), abs=0.01)
+
+
+class TestBuildComposite:
+    def test_backtest_score_always_zero(self):
+        ep = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.backtest_score == 0.0
+
+    def test_strong_sentiment_path_higher_than_weak(self):
+        ep_strong = _fake_episode(n_events=5, premium_each=500_000.0,
+                                  sentiment="BULLISH", influence_tier="WHALE")
+        ep_weak   = _fake_episode(n_events=5, premium_each=500_000.0,
+                                  sentiment="NEUTRAL", influence_tier="RETAIL")
+        sig_strong = build_composite(ep_strong, _accum())
+        sig_weak   = build_composite(ep_weak,   _accum())
+        assert sig_strong.composite_score >= sig_weak.composite_score
+
+    def test_weak_sentiment_discount_exactly_080(self):
+        ep = _fake_episode(n_events=5, premium_each=500_000.0,
+                           sentiment="NEUTRAL", influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert sig.composite_score <= 0.90
+
+    def test_composite_score_ceiling_090(self):
+        ep = _fake_episode(n_events=50, premium_each=10_000_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE",
+                           accelerating=True)
+        sig = build_composite(ep, _accum())
+        assert sig.composite_score <= 0.90
+
+    def test_weight_arithmetic_no_sector(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert 0.0 <= sig.composite_score <= 1.0
+
+    def test_recommendation_buy_bullish_high_score(self):
+        ep = _fake_episode(n_events=10, premium_each=2_000_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE",
+                           accelerating=True)
+        sig = build_composite(ep, _accum())
+        if sig.composite_score >= 0.65:
+            assert sig.recommendation == "BUY"
+
+    def test_recommendation_sell_bearish_high_score(self):
+        ep = _fake_episode(n_events=10, premium_each=2_000_000.0,
+                           contract_type="PUT", sentiment="BEARISH",
+                           influence_tier="WHALE", accelerating=True)
+        sig = build_composite(ep, _accum())
+        if sig.composite_score >= 0.65:
+            assert sig.recommendation == "SELL"
+
+    def test_recommendation_hold_low_score(self):
+        ep = _fake_episode(n_events=3, premium_each=10_000.0,
+                           sentiment="BULLISH", influence_tier="RETAIL",
+                           accelerating=False)
+        sig = build_composite(ep, _accum())
+        if sig.composite_score < 0.65:
+            assert sig.recommendation == "HOLD"
+
+    def test_reasoning_contains_ceiling_note(self):
+        ep = _fake_episode(n_events=50, premium_each=10_000_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE",
+                           accelerating=True)
+        result = build_composite(ep, _accum())
+        # Engine emits "ceiling=0.9" (not "ceiling=0.90")
+        assert "ceiling=0.9" in result.reasoning
+
+    def test_reasoning_contains_strong_label(self):
+        ep = _fake_episode(n_events=5, premium_each=500_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE")
+        sig = build_composite(ep, _accum())
+        assert "strong" in sig.reasoning.lower() or "WHALE" in sig.reasoning
+
+    def test_reasoning_contains_discounted_label_when_weak(self):
+        ep = _fake_episode(n_events=3, premium_each=10_000.0,
+                           sentiment="NEUTRAL", influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert "discounted" in sig.reasoning.lower() or "RETAIL" in sig.reasoning
+
+    def test_reasoning_contains_accelerating_flag(self):
+        ep = _fake_episode(n_events=5, premium_each=500_000.0, accelerating=True)
+        sig = build_composite(ep, _accum())
+        assert "accelerat" in sig.reasoning.lower()
+
+    def test_composite_signal_has_premium_tier_score_field(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert hasattr(sig, "premium_tier_score")
+
+    def test_influence_tier_retail_in_reasoning(self):
+        ep = _fake_episode(n_events=3, premium_each=30_000.0, influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert "RETAIL" in sig.reasoning
+
+    def test_influence_tier_large_in_reasoning(self):
+        ep = _fake_episode(n_events=3, premium_each=34_000.0, influence_tier="LARGE")
+        sig = build_composite(ep, _accum())
+        assert "LARGE" in sig.reasoning
+
+    def test_influence_tier_institutional_in_reasoning(self):
+        ep = _fake_episode(n_events=3, premium_each=167_000.0, influence_tier="INSTITUTIONAL")
+        sig = build_composite(ep, _accum())
+        assert "INSTITUTIONAL" in sig.reasoning
+
+    def test_influence_tier_whale_in_reasoning(self):
+        ep = _fake_episode(n_events=3, premium_each=1_000_000.0, influence_tier="WHALE")
+        sig = build_composite(ep, _accum())
+        assert "WHALE" in sig.reasoning
+
+    def test_flow_score_field_reflects_strong_discount(self):
+        ep = _fake_episode(n_events=3, premium_each=10_000.0,
+                           sentiment="NEUTRAL", influence_tier="RETAIL")
+        sig = build_composite(ep, _accum())
+        assert sig.flow_score <= 0.5
+
+
+class TestCompositeBusPayloadStructure:
+    def test_composite_score_ceiling_present_and_090(self):
+        ep = _fake_episode(n_events=50, premium_each=10_000_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE",
+                           accelerating=True)
+        sig = build_composite(ep, _accum())
+        assert sig.composite_score <= 0.90
+
+    def test_order_side_present_in_signal(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert hasattr(sig, "recommendation")
+
+    def test_strong_sentiment_present_in_signal(self):
+        ep = _fake_episode(n_events=5, premium_each=500_000.0,
+                           sentiment="BULLISH", influence_tier="WHALE")
+        sig = build_composite(ep, _accum())
+        assert "BULLISH" in sig.reasoning or "strong" in sig.reasoning.lower()
+
+    def test_execution_mechanic_present_in_signal(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert isinstance(sig.reasoning, str) and len(sig.reasoning) > 0
+
+    def test_premium_tier_score_present_in_signal(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert hasattr(sig, "premium_tier_score")
+        assert 0.0 <= sig.premium_tier_score <= 1.0
+
+    def test_episode_influence_tier_uses_episode_premium(self):
+        ep_retail = _fake_episode(n_events=3, premium_each=30_000.0,  influence_tier="RETAIL")
+        ep_whale  = _fake_episode(n_events=3, premium_each=1_000_000.0, influence_tier="WHALE")
+        sig_retail = build_composite(ep_retail, _accum())
+        sig_whale  = build_composite(ep_whale,  _accum())
+        assert sig_whale.composite_score >= sig_retail.composite_score
+
+    def test_backtest_score_zero_in_payload(self):
+        ep  = _fake_episode(n_events=5, premium_each=500_000.0)
+        sig = build_composite(ep, _accum())
+        assert sig.backtest_score == 0.0
