@@ -70,7 +70,7 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> 🟢 **S4 and all post-merge work fully done. S5 is unblocked.**
+> ✅ **S5 is merged. Sprint 2 signal-layer foundation is complete. S6 is now unblocked.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -84,23 +84,24 @@
 | S4-POST-3 (BE-3) | `_ev_attr` / `_make_key` dict-key bug — regression tests pinning key isolation and object/dict key parity; production-path confirmed as test-only | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) / [#48](https://github.com/bhaveshhpatel/cipher/pull/48) | ✅ |
 | BE-3 F2 | `asyncio.run()` fix — replace deprecated `get_event_loop().run_until_complete()` in test helper | [#49](https://github.com/bhaveshhpatel/cipher/issues/49) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
 | BE-3 F3 | `contract_type` isolation test — CALL vs PUT same ticker/strike/expiry must produce two distinct episode keys | [#50](https://github.com/bhaveshhpatel/cipher/issues/50) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
+| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, detection primitive for later `sector_score` wiring in S6 | [#52](https://github.com/bhaveshhpatel/cipher/pull/52) | ✅ |
 
-### Queued / Blocked
+### Low Priority / Anytime ⚪
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, wires `sector_score` into L3 composite | TBD | 🟢 Unblocked — ready to start |
+| S5-POST-1 | `detect_ladder()` — document or enforce deterministic group selection when multiple `(ticker, expiry)` groups qualify | [#53](https://github.com/bhaveshhpatel/cipher/issues/53) | ⚪ Open |
 
 ---
 
 ## Sprint 3 — Apex L3 Composite + Swarm
 
-> ⏳ **Blocked until S4 + S5 are merged.**
+> 🟢 **S6 is now unblocked. S7 remains blocked pending S6 and stream worker concurrency review.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, SELL PUT end-to-end, `composite_score_ceiling` field | TBD | ⏳ Blocked |
+| S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, SELL PUT end-to-end, `composite_score_ceiling` field | TBD | 🟢 Unblocked — ready to start |
 | S7 | Tiered swarm + circuit breaker — Apex-only, timeout-bounded, deterministic fallback. **Blocked pending stream worker concurrency review.** | TBD | ⏳ Blocked |
 
 ---
@@ -148,11 +149,11 @@ Exact execution order. Do not start a story until everything above it in the sam
 15. ✅  #46           — S4-POST-2: _max_dte_key=None guard
 16. ✅  #47/#48       — S4-POST-3 (BE-3): _ev_attr dict-key bug regression tests
 17. ✅  #49+#50/#51   — BE-3 F2+F3: asyncio.run() fix + contract_type isolation test
-18. 🟢  S5            — Apex L4: ladder detection  ← NEXT
+18. ✅  S5            — Apex L4: ladder detection (PR #52)
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
-19. ⏳  S6            — Apex L3: composite formula overhaul
+19. 🟢  S6            — Apex L3: composite formula overhaul  ← NEXT
 20. ⏳  S7            — Tiered swarm + circuit breaker
 ───────────────────────────────────────────────────────────────────────────────────
 
@@ -167,6 +168,7 @@ Exact execution order. Do not start a story until everything above it in the sam
 25. ⚪  #28           — Fix misleading flush loop test
 26. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
 27. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
+28. ⚪  #53           — detect_ladder() deterministic group selection when multiple groups qualify
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -174,10 +176,11 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S5 (step 18) — Apex L4: cross-contract ladder detection. No blockers remain.
-- **"What must close before S5 starts?"** → Nothing. All gates are clear.
-- **"What is remaining?"** → Every row not marked ✅ — steps 18 through 27.
-- **"What blocks S5 start?"** → Nothing. S5 is unblocked.
+- **"What is next?"** → S6 (step 19) — Apex L3: composite formula overhaul. S6 is now unblocked.
+- **"What must close before S6 starts?"** → Nothing. All gates are clear.
+- **"What is remaining?"** → Every row not marked ✅ — steps 19 through 28.
+- **"What blocks S6 start?"** → Nothing. S6 is unblocked.
+- **"What blocks S7 start?"** → S6 must merge first; stream worker concurrency review also remains a stated blocker.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
@@ -185,5 +188,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — BE-3 F2+F3 completed via PR #51 (issues #49, #50 closed). All S4 and post-merge work is done. S5 is fully unblocked.*
-*Version: 2.6*
+*Last updated: 2026-05-01 — S5 completed via PR #52. Issue #53 filed from panel deliberation as low-priority follow-up. S6 is now unblocked and is the next story in sequence.*
+*Version: 2.7*
