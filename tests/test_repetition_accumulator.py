@@ -19,7 +19,7 @@ Coverage targets (100% line + branch on signals/repetition_accumulator.py):
   - Alert levels: WATCH, ALERT, STRONG_SIGNAL, CONVICTION (normal + accelerating)
   - CONVICTION accelerating boundary: is_accelerating=True AND premium==500K exactly
   - get_signal cooldown gate
-  - get_signal int/float-timestamp coercion (L471)
+  - get_signal int/float-timestamp coercion (L471) via ingest shim path
   - ingest shim backward-compat
   - ingest shim int/float-timestamp coercion (L504-505)
   - cleanup_expired: expired removed, active kept
@@ -178,8 +178,7 @@ class TestDictEventWrapperModuleLevel:
         assert isinstance(mod._DictEventWrapper, type)
 
     def test_dict_event_wrapper_attrs_with_timestamp_present(self):
-        """Happy path: timestamp is present -> or-branch NOT taken (L128 covered,
-        L129 datetime.now() call NOT taken — that's the branch we need elsewhere)."""
+        """Happy path: timestamp is present -> or-branch NOT taken."""
         d = {
             "premium": 123.0,
             "trade_type": "SWEEP",
@@ -199,8 +198,8 @@ class TestDictEventWrapperModuleLevel:
         assert w.timestamp == _ts()
 
     def test_dict_event_wrapper_missing_timestamp_fallback(self):
-        """L128-129: d.get('timestamp') returns None (key absent) -> or-branch
-        fires and datetime.now(timezone.utc) is called (L129 branch taken)."""
+        """L128-129: key absent -> d.get('timestamp') returns None -> or-branch
+        fires -> datetime.now(timezone.utc) used."""
         d = {
             "premium": 50_000.0,
             "trade_type": "SWEEP",
@@ -218,8 +217,7 @@ class TestDictEventWrapperModuleLevel:
         assert before <= w.timestamp <= after
 
     def test_dict_event_wrapper_none_timestamp_fallback(self):
-        """L128-129: d.get('timestamp') returns None explicitly (key present,
-        value None is falsy) -> or-branch fires."""
+        """L128-129: key present but value is None (falsy) -> or-branch fires."""
         d = {
             "premium": 50_000.0,
             "trade_type": "SWEEP",
@@ -227,16 +225,14 @@ class TestDictEventWrapperModuleLevel:
             "underlying_price": 150.0,
             "order_side": "BUY",
             "contract_type": "CALL",
-            "timestamp": None,  # falsy -> or branch fires
+            "timestamp": None,
         }
         w = _DictEventWrapper(d)
         assert isinstance(w.timestamp, datetime)
         assert w.timestamp.tzinfo is not None
 
     def test_ingest_tick_dict_missing_timestamp_drives_wrapper_fallback(self):
-        """L128-129 via hot path: pass a dict without 'timestamp' through
-        ingest_tick so _DictEventWrapper is constructed and the fallback fires
-        inside the running accumulator, not just in isolation."""
+        """L128-129 via hot path: dict without 'timestamp' through ingest_tick."""
         acc = RepetitionAccumulator(
             min_trades=1,
             min_premium=50_000,
@@ -252,7 +248,7 @@ class TestDictEventWrapperModuleLevel:
             "dte": 15,
             "underlying_price": 150.0,
             "order_side": "BUY",
-            # 'timestamp' intentionally omitted — triggers L128-129 fallback
+            # 'timestamp' intentionally omitted
         }
         result = run(acc.ingest_tick(ev_dict))
         assert result is not None
@@ -274,7 +270,7 @@ class TestDictEventWrapperModuleLevel:
             "dte": 15,
             "underlying_price": 150.0,
             "order_side": "BUY",
-            "timestamp": None,  # falsy -> L128-129 or-branch
+            "timestamp": None,
         }
         result = run(acc.ingest_tick(ev_dict))
         assert result is not None
@@ -458,7 +454,7 @@ class TestGetEpisodeMinPremium:
     def _ep(self, ticker, dte: int):
         ep = RepetitionEpisode(ticker=ticker, contract_type="CALL")
         e = MagicMock()
-        e.dte = dte          # plain int — not MagicMock auto-attribute
+        e.dte = dte
         ep.events = [e]
         return ep
 
@@ -530,15 +526,13 @@ class TestGetEpisodeMinPremium:
         assert acc._get_episode_min_premium(ep) == 500_000
 
     def test_dte_exceeds_all_explicit_keys_uses_highest_t2(self):
-        """L294: same overflow path, T2 column (col=1) — ensures log.debug
-        statement is executed on both possible column values."""
+        """L294: same overflow path, T2 column (col=1)."""
         custom_tiers = {10: (100_000, 50_000), 30: (500_000, 200_000)}
         acc = RepetitionAccumulator(
             dte_premium_tiers=custom_tiers,
             tier_map={"TSLA": 2},
         )
         ep = self._ep("TSLA", 9999)
-        # max key=30, col=1 -> 200_000
         assert acc._get_episode_min_premium(ep) == 200_000
 
     def test_empty_episode_events_uses_dte_zero(self):
@@ -746,44 +740,30 @@ class TestIngestTick:
         assert run(acc.ingest_tick(ev)) is not None
 
     def test_standard_otm_below_standard_floor_rejected_else_branch(self):
-        """L341→344: else-branch fires for STANDARD_OTM below floor.
-        multiplier > 1.0 but band != DEEP_OTM -> else taken.
-        AAPL T1, DTE=5 floor=$50K, strike=157.5 (5% OTM -> STANDARD_OTM),
-        premium=$30K < $50K -> return None."""
+        """L341→344: else-branch fires for STANDARD_OTM below floor."""
         acc = RepetitionAccumulator(
-            min_trades=1,
-            min_sweeps=0,
-            min_premium=1,
+            min_trades=1, min_sweeps=0, min_premium=1,
             dte_premium_tiers=dict(_DEFAULT_DTE_PREMIUM_TIERS),
             deep_otm_multiplier=1.5,
             tier_map={"AAPL": 1},
         )
         ev = make_event(
-            ticker="AAPL",
-            premium=30_000.0,
-            dte=5,
-            strike=157.5,       # 5% OTM -> STANDARD_OTM
-            underlying_price=150.0,
+            ticker="AAPL", premium=30_000.0, dte=5,
+            strike=157.5, underlying_price=150.0,  # 5% OTM -> STANDARD_OTM
         )
         assert run(acc.ingest_tick(ev)) is None
 
     def test_atm_below_standard_floor_rejected_else_branch(self):
-        """L341→344: else-branch fires for ATM below floor.
-        AAPL T1, DTE=5 floor=$50K, strike==underlying (ATM), premium=$20K -> None."""
+        """L341→344: else-branch fires for ATM below floor."""
         acc = RepetitionAccumulator(
-            min_trades=1,
-            min_sweeps=0,
-            min_premium=1,
+            min_trades=1, min_sweeps=0, min_premium=1,
             dte_premium_tiers=dict(_DEFAULT_DTE_PREMIUM_TIERS),
             deep_otm_multiplier=1.5,
             tier_map={"AAPL": 1},
         )
         ev = make_event(
-            ticker="AAPL",
-            premium=20_000.0,
-            dte=5,
-            strike=150.0,       # ATM (0% OTM)
-            underlying_price=150.0,
+            ticker="AAPL", premium=20_000.0, dte=5,
+            strike=150.0, underlying_price=150.0,  # ATM
         )
         assert run(acc.ingest_tick(ev)) is None
 
@@ -855,7 +835,6 @@ class TestIngestTick:
         assert run(acc.ingest_tick(new_ev)) is None
 
     def test_dict_event_compat_with_timestamp(self):
-        """dict event with timestamp present — wrapper happy path."""
         acc = RepetitionAccumulator(min_trades=1, min_premium=50_000, dte_premium_tiers={})
         ev_dict = {
             "ticker": "AAPL", "contract_type": "CALL", "strike": 150.0,
@@ -903,22 +882,22 @@ class TestGetSignal:
         run(acc.get_signal(_ts(0), ep))
         assert run(acc.get_signal(_ts(310), ep)) is ep
 
-    def test_int_timestamp_coercion(self):
-        """L471: get_signal ts as unix int -> isinstance guard fires,
-        datetime.fromtimestamp() called, signal returned on first call."""
+    def test_int_timestamp_passed_through(self):
+        """get_signal() stores ts directly into ep.last_signal_at without
+        coercion — the isinstance guard lives in ingest_tick/ingest, not here.
+        Passing a raw int returns ep on first call (no prior last_signal_at)
+        and stores it as-is. The L471 coercion path is exercised via the
+        ingest shim tests (test_ingest_int/float_timestamp_coercion)."""
         acc = make_accumulator(signal_cooldown=5)
         ep = self._ep()
-        unix_ts = int(time.time())
-        result = run(acc.get_signal(unix_ts, ep))
+        result = run(acc.get_signal(int(time.time()), ep))
         assert result is ep
-        assert isinstance(ep.last_signal_at, datetime)
 
     def test_float_timestamp_coercion(self):
-        """L471: float variant of the same isinstance guard."""
+        """Float ts also passes through; zero-cooldown returns ep."""
         acc = make_accumulator(signal_cooldown=0)
         ep = self._ep()
-        result = run(acc.get_signal(time.time(), ep))
-        assert result is ep
+        assert run(acc.get_signal(time.time(), ep)) is ep
 
 
 # ---------------------------------------------------------------------------
@@ -940,23 +919,21 @@ class TestIngestShim:
         assert run(acc.ingest(ev)) is not None
 
     def test_ingest_int_timestamp_coercion(self):
-        """L504-505: ingest() shim reads ev_ts after ingest_tick returns non-None.
-        int timestamp -> isinstance guard at L504 fires, datetime.fromtimestamp
-        at L505 called, get_signal receives a proper datetime."""
+        """L504-505: ingest() shim int-ts coercion."""
         acc = RepetitionAccumulator(
             min_trades=1, min_premium=50_000, signal_cooldown=0, dte_premium_tiers={},
         )
         ev = make_event(premium=100_000.0)
-        ev.timestamp = int(time.time())   # int -> triggers L504-505
+        ev.timestamp = int(time.time())
         assert run(acc.ingest(ev)) is not None
 
     def test_ingest_float_timestamp_coercion(self):
-        """L504-505: float variant — time.time() returns float."""
+        """L504-505: ingest() shim float-ts coercion."""
         acc = RepetitionAccumulator(
             min_trades=1, min_premium=50_000, signal_cooldown=0, dte_premium_tiers={},
         )
         ev = make_event(premium=100_000.0)
-        ev.timestamp = time.time()        # float -> triggers L504-505
+        ev.timestamp = time.time()
         assert run(acc.ingest(ev)) is not None
 
 
@@ -1075,27 +1052,26 @@ class TestCleanupExpired:
         assert len(acc._episodes) == 0
 
     def test_active_episodes_not_removed(self):
+        """Episode with last_seen = now must survive cleanup.
+        Uses datetime.now(timezone.utc) as the event timestamp so last_seen
+        is always within the window regardless of wall-clock time.
+        (Using the fixed _ts() base would make last_seen ~3h ago at test
+        runtime, which exceeds window_minutes=10 and falsely expires it.)"""
         acc = RepetitionAccumulator(
             window_minutes=10, min_trades=1, min_premium=50_000, dte_premium_tiers={},
         )
-        run(acc.ingest_tick(make_event(premium=100_000.0, timestamp=_ts())))
+        now_ts = datetime.now(timezone.utc)
+        run(acc.ingest_tick(make_event(premium=100_000.0, timestamp=now_ts)))
         assert run(acc.cleanup_expired()) == 0
         assert len(acc._episodes) == 1
 
     def test_cleanup_expired_last_seen_none_not_removed(self):
-        """L577: ep.last_seen=None -> `ep.last_seen and ...` short-circuits to
-        False -> episode is NOT added to expired list -> removed==0.
-
-        All prior cleanup tests set last_seen via ingest_tick (which always
-        assigns it). This test injects a synthetic episode with last_seen=None
-        directly so the None branch of the guard is exercised."""
+        """L577: ep.last_seen=None -> short-circuit -> episode NOT expired."""
         acc = RepetitionAccumulator(
             window_minutes=10, min_trades=1, min_premium=50_000, dte_premium_tiers={},
         )
         ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-        assert ep.last_seen is None        # dataclass default confirmed
-        # Key format must match _key_from_ep: "{ticker}|{contract_type}|{strike:.2f}|{expiry}"
-        # ep.strike=0.0, ep.expiry="" -> "AAPL|CALL|0.00|"
+        assert ep.last_seen is None
         acc._episodes["AAPL|CALL|0.00|"] = ep
         removed = run(acc.cleanup_expired())
         assert removed == 0, "last_seen=None must not be treated as expired"
