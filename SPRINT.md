@@ -84,7 +84,7 @@
 | S4-POST-3 (BE-3) | `_ev_attr` / `_make_key` dict-key bug — regression tests pinning key isolation and object/dict key parity; production-path confirmed as test-only | [#47](https://github.com/bhaveshhpatel/cipher/issues/47) / [#48](https://github.com/bhaveshhpatel/cipher/pull/48) | ✅ |
 | BE-3 F2 | `asyncio.run()` fix — replace deprecated `get_event_loop().run_until_complete()` in test helper | [#49](https://github.com/bhaveshhpatel/cipher/issues/49) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
 | BE-3 F3 | `contract_type` isolation test — CALL vs PUT same ticker/strike/expiry must produce two distinct episode keys | [#50](https://github.com/bhaveshhpatel/cipher/issues/50) / [#51](https://github.com/bhaveshhpatel/cipher/pull/51) | ✅ |
-| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, detection primitive for later `sector_score` wiring in S6 | [#52](https://github.com/bhaveshhpatel/cipher/pull/52) | ✅ |
+| S5 | Apex L4: Cross-contract ladder detection — multi-strike same-expiry coordination, detection primitive for later `sector_score` wiring | [#52](https://github.com/bhaveshhpatel/cipher/pull/52) | ✅ |
 
 ### Low Priority / Anytime ⚪
 
@@ -96,7 +96,7 @@
 
 ## Sprint 3 — Apex L3 Composite + Swarm
 
-> ✅ **S6 merged via PR #54 (2026-05-01). S7 remains blocked pending stream worker concurrency review.**
+> ✅ **S6 merged via PR #54 (2026-05-01). S6-POST-1 filed as a 🟢 queued follow-up. S7 blocked pending stream worker concurrency review.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -105,7 +105,13 @@
 |---|---|---|---|
 | S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, `dominant_direction` hot-path fix (SELL PUT → REPEAT_BUY), `composite_score_ceiling` field, `order_side`/`strong_sentiment`/`execution_mechanic`/`premium_tier_score` in bus payload | [#54](https://github.com/bhaveshhpatel/cipher/pull/54) | ✅ |
 
-### Blocked
+### Queued 🟢
+
+| Story | Description | Issue | Status |
+|---|---|---|---|
+| S6-POST-1 | Wire `detect_ladder()` into `_process_trade()` hot path; pass `sector_score` into `build_composite()`; remove `composite_score_ceiling` from bus payload; deliberation required on score shape (binary vs graded) and `composite_score_ceiling` removal atomicity before coding | [#55](https://github.com/bhaveshhpatel/cipher/issues/55) | 🟢 Queued |
+
+### Blocked ⏳
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
@@ -160,22 +166,23 @@ Exact execution order. Do not start a story until everything above it in the sam
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
-19. ✅  S6            — Apex L3: composite formula overhaul (PR #54)  ← JUST MERGED
-20. ⏳  S7            — Tiered swarm + circuit breaker  ← NEXT (blocked: stream worker review first)
+19. ✅  S6            — Apex L3: composite formula overhaul (PR #54)
+20. 🟢  S6-POST-1     — Wire detect_ladder() + sector_score into hot path; remove composite_score_ceiling from payload (#55)  ← QUEUED
+21. ⏳  S7            — Tiered swarm + circuit breaker  ← BLOCKED (stream worker review first)
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
-21. ⏳  S8            — Real backtest score from flow_events
+22. ⏳  S8            — Real backtest score from flow_events
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── PARALLEL / ANYTIME ─────────────────────────────────────────────────────────────────
-22. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
-23. 🟢  C8            — Decouple persist/signal tier (#2)
-24. ⚪  #22           — Hoist get_registry import
-25. ⚪  #28           — Fix misleading flush loop test
-26. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
-27. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
-28. ⚪  #53           — detect_ladder() deterministic group selection when multiple groups qualify
+23. 🟢  ING-1         — Ingestion rewrite + delta chain fetch (#6)
+24. 🟢  C8            — Decouple persist/signal tier (#2)
+25. ⚪  #22           — Hoist get_registry import
+26. ⚪  #28           — Fix misleading flush loop test
+27. ⚪  #41           — _flush_loop orphaned flush tasks (cancel-on-shutdown or document)
+28. ⚪  #42           — _get_tier_map double-guard redundancy (clean up or document)
+29. ⚪  #53           — detect_ladder() deterministic group selection when multiple groups qualify
 ───────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -183,17 +190,16 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S7 — Tiered swarm + circuit breaker. **Before starting S7:** review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling. Scope must be adjusted if sequential.
-- **"What must close before S7 starts?"** → Stream worker concurrency review must clear.
-- **"What is remaining?"** → Every row not marked ✅ — steps 20 through 28.
-- **"What blocks S7 start?"** → Stream worker `_process_trade()` concurrency review. If sequential, swarm scope changes.
+- **"What is next?"** → S6-POST-1 (step 20, issue [#55](https://github.com/bhaveshhpatel/cipher/issues/55)) — wire `detect_ladder()` + `sector_score` into hot path. Deliberation on score shape required before coding. Can run in parallel with S7 prep.
+- **"What must close before S7 starts?"** → Stream worker `_process_trade()` concurrency review. S6-POST-1 does not block S7.
+- **"What is remaining?"** → Every row not marked ✅ — steps 20 through 29.
+- **"What blocks S7 start?"** → Stream worker concurrency review. If `_process_trade()` is sequential, swarm scope changes.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
 - **Workflow rule** → Branch + PR always. Never push directly to `main`.
-- **S6 post-merge note** → `composite_score_ceiling` field removed from bus payload when S5 ladder context activates `sector_score`. That cleanup is S5/S7 scope — tracked in spec.
 
 ---
 
-*Last updated: 2026-05-01 — S6 completed via PR #54. Panel deliberation: no blocking items, no new stories filed. S7 is next but blocked pending stream worker concurrency review.*
-*Version: 2.8*
+*Last updated: 2026-05-01 — S6 completed via PR #54. S6-POST-1 filed (issue #55): wire detect_ladder() + sector_score into hot path, remove composite_score_ceiling from bus payload. S7 blocked pending stream worker concurrency review.*
+*Version: 2.9*
