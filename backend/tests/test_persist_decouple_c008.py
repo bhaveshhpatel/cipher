@@ -21,6 +21,12 @@ Test IDs:
   C008-8  regression: deduped events still never reach ingest_tick or persist
 
 Run: pytest backend/tests/test_persist_decouple_c008.py -v
+
+Fix (2026-05-01): Reset module-level _signal_last_emit and _stats["ticks"] before
+  every test that exercises _process_trade so SIG-DEBOUNCE state from a prior test
+  does not suppress signals in subsequent tests (C008-2, C008-4 were failing because
+  the first-crossing emit-key written by C008-1/C008-3 caused _should_emit_signal to
+  return should_emit=False in later tests).
 """
 import asyncio
 import sys
@@ -102,12 +108,28 @@ def _make_ep(trade_count=3, total_premium=300_000.0):
     return ep
 
 
+def _reset_stream_state():
+    """Reset module-level mutable state in tradier_stream between tests.
+
+    _signal_last_emit is a dict[str, dict] that persists across test runs within
+    the same pytest session. If a prior test wrote an emit-key, _should_emit_signal
+    will return should_emit=False in the next test (debounce window not elapsed).
+    Resetting it ensures each test starts from a clean "never emitted" state.
+    """
+    from services import tradier_stream as ts
+    ts._signal_last_emit.clear()
+    ts._stats["ticks"] = 0
+    ts._stats["signals"] = 0
+    ts._stats["sig_debounced"] = 0
+
+
 # ---------------------------------------------------------------------------
 # C008-1: qualifying tick during cooldown -> persist fires, bus does NOT
 # ---------------------------------------------------------------------------
 class TestC008PersistDuringCooldown:
     @pytest.mark.asyncio
     async def test_c008_1_persist_fires_bus_silent_during_cooldown(self):
+        _reset_stream_state()
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -138,6 +160,7 @@ class TestC008PersistDuringCooldown:
 class TestC008BothFireAfterCooldown:
     @pytest.mark.asyncio
     async def test_c008_2_both_fire_after_cooldown(self):
+        _reset_stream_state()
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -170,6 +193,7 @@ class TestC008BothFireAfterCooldown:
 class TestC008SubThresholdNeither:
     @pytest.mark.asyncio
     async def test_c008_3_sub_threshold_neither_fires(self):
+        _reset_stream_state()
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -199,6 +223,7 @@ class TestC008SubThresholdNeither:
 class TestC008FirstCrossingBothFire:
     @pytest.mark.asyncio
     async def test_c008_4_first_crossing_both_fire(self):
+        _reset_stream_state()
         from services import tradier_stream as ts
 
         ev = _make_ev()
@@ -323,6 +348,7 @@ class TestC008GetSignalCooldown:
 class TestC008DedupRegression:
     @pytest.mark.asyncio
     async def test_c008_8_deduped_never_reach_ingest_or_persist(self):
+        _reset_stream_state()
         from services import tradier_stream as ts
 
         ev = _make_ev()
