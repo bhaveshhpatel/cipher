@@ -70,7 +70,7 @@
 
 ## Sprint 2 — Apex L1 / L2 / L4 Signal Layers
 
-> ✅ **S5 is merged. Sprint 2 signal-layer foundation is complete. S6 is now unblocked.**
+> ✅ **S5 is merged. Sprint 2 signal-layer foundation is complete.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
 
 ### Completed
@@ -96,13 +96,20 @@
 
 ## Sprint 3 — Apex L3 Composite + Swarm
 
-> 🟢 **S6 is now unblocked. S7 remains blocked pending S6 and stream worker concurrency review.**
+> ✅ **S6 merged via PR #54 (2026-05-01). S7 remains blocked pending stream worker concurrency review.**
 > Full story definitions: [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md)
+
+### Completed
+
+| Story | Description | PR | Status |
+|---|---|---|---|
+| S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, `dominant_direction` hot-path fix (SELL PUT → REPEAT_BUY), `composite_score_ceiling` field, `order_side`/`strong_sentiment`/`execution_mechanic`/`premium_tier_score` in bus payload | [#54](https://github.com/bhaveshhpatel/cipher/pull/54) | ✅ |
+
+### Blocked
 
 | Story | Description | Issue | Status |
 |---|---|---|---|
-| S6 | Apex L3: Composite formula overhaul — remove fake backtest, episode-level influence tier, SELL PUT end-to-end, `composite_score_ceiling` field | TBD | 🟢 Unblocked — ready to start |
-| S7 | Tiered swarm + circuit breaker — Apex-only, timeout-bounded, deterministic fallback. **Blocked pending stream worker concurrency review.** | TBD | ⏳ Blocked |
+| S7 | Tiered swarm + circuit breaker — Apex-only, timeout-bounded, deterministic fallback. **Blocked: review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling before scoping S7.** | TBD | ⏳ Blocked |
 
 ---
 
@@ -153,8 +160,8 @@ Exact execution order. Do not start a story until everything above it in the sam
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── SPRINT 3 ──────────────────────────────────────────────────────────────────────────────────
-19. 🟢  S6            — Apex L3: composite formula overhaul  ← NEXT
-20. ⏳  S7            — Tiered swarm + circuit breaker
+19. ✅  S6            — Apex L3: composite formula overhaul (PR #54)  ← JUST MERGED
+20. ⏳  S7            — Tiered swarm + circuit breaker  ← NEXT (blocked: stream worker review first)
 ───────────────────────────────────────────────────────────────────────────────────
 
 ── FUTURE SPRINT ───────────────────────────────────────────────────────────────────────────
@@ -176,17 +183,17 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ## Quick Reference
 
-- **"What is next?"** → S6 (step 19) — Apex L3: composite formula overhaul. S6 is now unblocked.
-- **"What must close before S6 starts?"** → Nothing. All gates are clear.
-- **"What is remaining?"** → Every row not marked ✅ — steps 19 through 28.
-- **"What blocks S6 start?"** → Nothing. S6 is unblocked.
-- **"What blocks S7 start?"** → S6 must merge first; stream worker concurrency review also remains a stated blocker.
+- **"What is next?"** → S7 — Tiered swarm + circuit breaker. **Before starting S7:** review `stream_worker.py` to confirm whether `_process_trade()` runs sequentially or via task scheduling. Scope must be adjusted if sequential.
+- **"What must close before S7 starts?"** → Stream worker concurrency review must clear.
+- **"What is remaining?"** → Every row not marked ✅ — steps 20 through 28.
+- **"What blocks S7 start?"** → Stream worker `_process_trade()` concurrency review. If sequential, swarm scope changes.
 - **"What is the full plan?"** → Read [`docs/cipher_apex_story_and_sprint_plan.md`](docs/cipher_apex_story_and_sprint_plan.md) for story definitions, then this file for current status.
 - **After every merge** → Mark row ✅, update version below.
 - **After every panel review** → File issues for all findings, add rows to this file before merging.
 - **Workflow rule** → Branch + PR always. Never push directly to `main`.
+- **S6 post-merge note** → `composite_score_ceiling` field removed from bus payload when S5 ladder context activates `sector_score`. That cleanup is S5/S7 scope — tracked in spec.
 
 ---
 
-*Last updated: 2026-05-01 — S5 completed via PR #52. Issue #53 filed from panel deliberation as low-priority follow-up. S6 is now unblocked and is the next story in sequence.*
-*Version: 2.7*
+*Last updated: 2026-05-01 — S6 completed via PR #54. Panel deliberation: no blocking items, no new stories filed. S7 is next but blocked pending stream worker concurrency review.*
+*Version: 2.8*
