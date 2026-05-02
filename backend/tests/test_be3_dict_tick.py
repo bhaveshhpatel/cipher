@@ -10,6 +10,12 @@ Acceptance criteria (Issue #47):
   AC-3  (non-functional) Raw dict events are a test-only path; the production
         stream worker always passes OptionsFlowEvent objects (confirmed below).
 
+Post-merge findings addressed here:
+  #49   Replace asyncio.get_event_loop().run_until_complete() with asyncio.run()
+        (deprecated in 3.10+, RuntimeError in 3.12+).
+  #50   Add contract_type isolation test: CALL vs PUT on same ticker/strike/expiry
+        must produce two distinct episode keys.
+
 Production-path note
 --------------------
 The Tradier stream worker constructs OptionsFlowEvent objects via
@@ -67,7 +73,10 @@ def _dict_event(
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # F2 fix: asyncio.run() is the correct forward-compatible pattern.
+    # asyncio.get_event_loop().run_until_complete() is deprecated in Python
+    # 3.10+ and raises RuntimeError in Python 3.12+ when no loop exists.
+    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +131,28 @@ class TestDictTickDistinctKeys:
             f"Expiry isolation failed; got {len(keys)} keys: {keys}"
         )
 
+    def test_same_ticker_different_contract_type(self):
+        """CALL and PUT on the same ticker/strike/expiry must produce two distinct keys.
+
+        F3 regression guard: if _make_key ever drops contract_type from the key,
+        a CALL campaign and a PUT campaign on the same name would silently merge
+        into one episode, corrupting direction accounting.
+        """
+        acc = _make_acc()
+        ev_call = _dict_event("AAPL", contract_type="CALL", strike=150.0,
+                              expiry="2026-06-20")
+        ev_put  = _dict_event("AAPL", contract_type="PUT",  strike=150.0,
+                              expiry="2026-06-20")
+
+        _run(acc.ingest_tick(ev_call))
+        _run(acc.ingest_tick(ev_put))
+
+        keys = list(acc._episodes.keys())
+        assert len(keys) == 2, (
+            f"Contract-type isolation failed; got {len(keys)} keys: {keys}\n"
+            "A CALL and PUT on the same ticker/strike/expiry must not share an episode."
+        )
+
     def test_keys_never_none_components(self):
         """No key component should be the string 'None' after the fix."""
         acc = _make_acc()
@@ -162,16 +193,16 @@ class TestDictObjectKeyParity:
         class _Ev:
             pass
         ev = _Ev()
-        ev.ticker          = ticker
-        ev.contract_type   = contract_type
-        ev.strike          = strike
-        ev.expiry          = expiry
-        ev.premium         = premium
-        ev.trade_type      = trade_type
-        ev.dte             = dte
+        ev.ticker           = ticker
+        ev.contract_type    = contract_type
+        ev.strike           = strike
+        ev.expiry           = expiry
+        ev.premium          = premium
+        ev.trade_type       = trade_type
+        ev.dte              = dte
         ev.underlying_price = underlying_price
-        ev.order_side      = order_side
-        ev.timestamp       = datetime.now(timezone.utc)
+        ev.order_side       = order_side
+        ev.timestamp        = datetime.now(timezone.utc)
         return ev
 
     def _key_for(self, ev) -> str:
