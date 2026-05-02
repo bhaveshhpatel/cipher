@@ -107,8 +107,10 @@ def compute_flow_score(ep: RepetitionEpisode) -> float:
 # ---------------------------------------------------------------------------
 
 def build_composite(
-    ep:          RepetitionEpisode,
-    accumulator: RepetitionAccumulator,
+    ep:           RepetitionEpisode,
+    accumulator:  RepetitionAccumulator,
+    *,
+    sector_score: float = 0.0,
 ) -> CompositeSignal:
     """
     Build a composite signal score from an episode.
@@ -119,6 +121,10 @@ def build_composite(
         volume_premium_factor * 0.20
         premium_tier_score    * 0.15
         sector_score          * 0.10   (reserved — 0.0 until S5 ladder wired in)
+
+    sector_score is a keyword-only argument defaulting to 0.0.
+    When S5 ladder context is wired in, pass sector_score=<value> at the call
+    site in tradier_stream.py — no other callers need to change.
 
     While sector_score == 0.0, the maximum achievable composite_score is COMPOSITE_SCORE_CEILING.
     Do NOT redistribute the reserved 0.10 weight. Frontend consumers treat
@@ -139,17 +145,12 @@ def build_composite(
     vwp_f  = volume_weighted_premium_factor(ep)
     prem_t = premium_tier_score(ep)
 
-    # sector_score reserved — activates when S5 ladder context is wired into S6.
-    # NOTE: while sector_s == 0.0, maximum achievable composite_score is COMPOSITE_SCORE_CEILING.
-    # This is intentional. Do not redistribute the 0.10 weight.
-    sector_s = 0.0
-
     comp = round(
-        flow_s  * 0.55
-        + bt_s  * 0.00
-        + vwp_f * 0.20
-        + prem_t * 0.15
-        + sector_s * 0.10,
+        flow_s       * 0.55
+        + bt_s       * 0.00
+        + vwp_f      * 0.20
+        + prem_t     * 0.15
+        + sector_score * 0.10,
         3,
     )
 
