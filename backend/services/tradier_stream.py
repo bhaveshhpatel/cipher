@@ -102,6 +102,41 @@ Fix (EPISODE-FIX 2026-04-30):
   that point so it is in scope for both the episode write and the later bus
   publish. The flow_episodes write in _bus_signal_listener is removed —
   the "db_writer" channel is retained but is now a no-op for future use.
+
+Fix (S6-HOT-PATH 2026-05-01):
+  Hot-path direction was derived from sig_ep.contract_type alone:
+    CALL -> REPEAT_BUY, PUT -> REPEAT_SELL
+  This ignored the actual dominant_direction of the episode, meaning a
+  SELL PUT campaign (bullish) was published as REPEAT_SELL (incorrect).
+  Fix: direction = sig_ep.dominant_direction
+  The dominant_direction property on RepetitionEpisode is premium-weighted
+  across all events using order_side_to_direction(), correctly resolving
+  SELL PUT -> REPEAT_BUY and SELL CALL -> REPEAT_SELL (S2 invariants).
+
+Fix (S6-DEMO-MODE 2026-05-01):
+  Demo mode direction was also derived from contract_type alone.
+  Fix: use order_side_to_direction(order_side_demo, ctype) so demo signals
+  exercise the same direction logic as live signals.
+
+Fix (S6-COMPOSITE-PAYLOAD 2026-05-01):
+  Composite bus payload updated with S6 fields:
+    - composite_score_ceiling: COMPOSITE_SCORE_CEILING (explicit until sector_score activates)
+    - order_side: ev.order_side
+    - strong_sentiment: ev.strong_sentiment
+    - execution_mechanic: ev.execution_mechanic
+    - premium_tier_score: composite.premium_tier_score
+  Episode block updated:
+    - influence_tier: episode_influence_tier(sig_ep) using episode premium
+      (replaces ev.influence_tier which was event-level, not episode-level)
+
+Fix (S6-PRE-MERGE 2026-05-01):
+  Item 1: COMPOSITE_SCORE_CEILING constant imported from composite_signal_engine;
+          literal 0.90 replaced in both live and demo paths.
+  Item 4: log.warning added on all three getattr fallback paths (order_side,
+          strong_sentiment, execution_mechanic) so parser regressions surface
+          in Railway logs instead of silently emitting fallback values.
+  Item 5: Demo mode ceiling comment corrected from '# capped at 0.85 (pre-sector ceiling)'
+          to '# demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)'.
 """
 import asyncio
 import logging
@@ -116,9 +151,10 @@ import httpx
 from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade
+from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
-from signals.composite_signal_engine import build_composite
+from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
 
 log = logging.getLogger("tradier_stream")
@@ -470,6 +506,10 @@ async def _process_trade(raw: dict):
       persist_flow_episode() is called directly after the Signal Gate and BEFORE
       the SIG-DEBOUNCE check. flow_episodes records every Signal Gate crossing;
       SIG-DEBOUNCE only gates the WebSocket bus publish and signal_history.
+
+    S6-HOT-PATH (2026-05-01):
+      direction = sig_ep.dominant_direction (episode-level, premium-weighted)
+      Replaces naive contract_type -> direction mapping that broke SELL PUT campaigns.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -620,6 +660,23 @@ async def _process_trade(raw: dict):
         ev.fill_price, ev.size, ev.premium, ev.trade_type,
     )
 
+    # S6-PRE-MERGE (Item 4): getattr guards with warnings so parser regressions
+    # surface in Railway logs rather than silently emitting fallback values.
+    _order_side = getattr(ev, "order_side", None)
+    if _order_side is None:
+        log.warning("[composite] ev missing order_side for %s — defaulting to UNKNOWN", occ_symbol)
+        _order_side = "UNKNOWN"
+
+    _strong_sentiment = getattr(ev, "strong_sentiment", None)
+    if _strong_sentiment is None:
+        log.warning("[composite] ev missing strong_sentiment for %s — defaulting to False", occ_symbol)
+        _strong_sentiment = False
+
+    _execution_mechanic = getattr(ev, "execution_mechanic", None)
+    if _execution_mechanic is None:
+        log.warning("[composite] ev missing execution_mechanic for %s — defaulting to AMBIGUOUS_LONG", occ_symbol)
+        _execution_mechanic = "AMBIGUOUS_LONG"
+
     try:
         await asyncio.wait_for(
             persist_flow_event({
@@ -647,6 +704,9 @@ async def _process_trade(raw: dict):
                 "underlying_price":     ev.underlying_price,
                 "occ_symbol":           occ_symbol,
                 "is_synthetic_quote":   ev.is_synthetic_quote,
+                "order_side":           _order_side,
+                "strong_sentiment":     _strong_sentiment,
+                "execution_mechanic":   _execution_mechanic,
             }),
             timeout=_PERSIST_TIMEOUT,
         )
@@ -673,14 +733,11 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(sig_ep)
 
-    # EPISODE-FIX (2026-04-30): compute direction here so it is available for
-    # both persist_flow_episode (below) and the bus publish (after debounce).
-    if sig_ep.contract_type == "CALL":
-        direction = "REPEAT_BUY"
-    elif sig_ep.contract_type == "PUT":
-        direction = "REPEAT_SELL"
-    else:
-        direction = "REPEAT_BUY" if ev.sentiment == "BULLISH" else "REPEAT_SELL"
+    # S6-HOT-PATH: Use episode dominant_direction (premium-weighted, direction-aware).
+    # Replaces naive contract_type -> direction mapping that broke SELL PUT campaigns.
+    # dominant_direction resolves SELL PUT -> REPEAT_BUY and SELL CALL -> REPEAT_SELL
+    # via order_side_to_direction(), honouring the S2 directional invariants.
+    direction = sig_ep.dominant_direction
 
     # EPISODE-FIX (2026-04-30): persist flow_episode BEFORE the debounce gate.
     # flow_episodes records every Signal Gate crossing. SIG-DEBOUNCE only applies
@@ -747,8 +804,6 @@ async def _process_trade(raw: dict):
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
-    # direction already computed above (EPISODE-FIX 2026-04-30)
-
     signal = {
         "type": "signal",
         "data": {
@@ -773,19 +828,24 @@ async def _process_trade(raw: dict):
             "type": "composite_signal",
             "data": {
                 "signal": {
-                    "ticker":                composite.ticker,
-                    "recommendation":        composite.recommendation,
-                    "composite_score":       composite.composite_score,
-                    "flow_score":            composite.flow_score,
-                    "backtest_score":        composite.backtest_score,
-                    "volume_premium_factor": composite.volume_premium_factor,
-                    "reasoning":             composite.reasoning,
-                    "alert_level":           alert_level,   # BUG-1 fix
+                    "ticker":                  composite.ticker,
+                    "recommendation":          composite.recommendation,
+                    "composite_score":         composite.composite_score,
+                    "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
+                    "flow_score":              composite.flow_score,
+                    "backtest_score":          composite.backtest_score,
+                    "volume_premium_factor":   composite.volume_premium_factor,
+                    "premium_tier_score":      composite.premium_tier_score,
+                    "reasoning":               composite.reasoning,
+                    "alert_level":             alert_level,
+                    "order_side":              _order_side,
+                    "strong_sentiment":        _strong_sentiment,
+                    "execution_mechanic":      _execution_mechanic,
                 },
                 "episode": {
                     "contract_type":   sig_ep.contract_type,
                     "direction":       direction,
-                    "influence_tier":  ev.influence_tier,
+                    "influence_tier":  episode_influence_tier(sig_ep),   # S6: episode-level tier
                     "total_premium":   sig_ep.total_premium,
                     "trade_count":     sig_ep.trade_count,
                     "is_accelerating": sig_ep.is_accelerating,
@@ -813,13 +873,17 @@ async def _demo_mode_once(symbols: list[str]):
             ticker    = rng.choice(tickers)
             prem      = rng.randint(100_000, 8_000_000)
             ctype     = rng.choice(["CALL", "PUT"])
-            direction = "REPEAT_BUY" if ctype == "CALL" else "REPEAT_SELL"
             strike    = round(rng.uniform(100, 500), 0)
             fill      = round(rng.uniform(1.0, 15.0), 2)
             bid       = round(fill * 0.99, 2)
             ask       = round(fill * 1.01, 2)
             size      = rng.randint(10, 500)
             dte       = rng.randint(1, 60)
+
+            # S6-DEMO-MODE: use order_side_to_direction() so demo signals exercise
+            # the same direction semantics as live signals (SELL PUT -> REPEAT_BUY, etc.)
+            order_side_demo = rng.choices(["BUY", "SELL", "UNKNOWN"], weights=[60, 25, 15])[0]
+            direction = order_side_to_direction(order_side_demo, ctype)
 
             signal = {
                 "type": "signal",
@@ -843,7 +907,7 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["last_tick_at"] = _time.time()
             await bus.publish_all(signal)
 
-            composite_score = round(rng.uniform(0.40, 0.95), 3)
+            composite_score = round(rng.uniform(0.40, 0.85), 3)  # demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)
             rec = "BUY"  if composite_score >= 0.65 and ctype == "CALL" else \
                   "SELL" if composite_score >= 0.65 and ctype == "PUT"  else "HOLD"
 
@@ -851,14 +915,19 @@ async def _demo_mode_once(symbols: list[str]):
                 "type": "composite_signal",
                 "data": {
                     "signal": {
-                        "ticker":                ticker,
-                        "recommendation":        rec,
-                        "composite_score":       composite_score,
-                        "flow_score":            round(rng.uniform(0.4, 0.9), 3),
-                        "backtest_score":        round(rng.uniform(0.4, 0.85), 3),
-                        "volume_premium_factor": round(rng.uniform(0.3, 0.8), 3),
-                        "reasoning":             f"Demo synthetic signal for {ticker}",
-                        "alert_level":           rng.choices(levels, weights=[5, 15, 30, 50])[0],
+                        "ticker":                  ticker,
+                        "recommendation":          rec,
+                        "composite_score":         composite_score,
+                        "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
+                        "flow_score":              round(rng.uniform(0.4, 0.9), 3),
+                        "backtest_score":          0.0,   # S8 reserved
+                        "volume_premium_factor":   round(rng.uniform(0.3, 0.8), 3),
+                        "premium_tier_score":      round(rng.uniform(0.0, 1.0), 3),
+                        "reasoning":               f"Demo synthetic signal for {ticker}",
+                        "alert_level":             rng.choices(levels, weights=[5, 15, 30, 50])[0],
+                        "order_side":              order_side_demo,
+                        "strong_sentiment":        order_side_demo in ("BUY", "SELL"),
+                        "execution_mechanic":      "DIRECTIONAL_LONG" if ctype == "CALL" else "DIRECTIONAL_SHORT",
                     },
                     "episode": {
                         "contract_type":   ctype,
