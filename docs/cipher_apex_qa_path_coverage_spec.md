@@ -1,9 +1,11 @@
 # Cipher Apex QA Path Coverage Specification
 
 ## Purpose
-This document is the Lead QA path-exhaustion specification for the Cipher Apex layered architecture. It is designed to do two things: first, define the smallest practical but still exhaustive set of trade and episode scenarios required to cover all materially distinct runtime paths in the current architecture; second, serve as the source document for post-implementation integration tests, scenario replay tests, and end-to-end signal validation.
+This document is the Lead QA path-exhaustion specification for the Cipher Apex layered architecture. It is designed to do two things: first, define the smallest practical but still exhaustive set of trade and episode scenarios required to cover all materially distinct runtime paths in the current architecture; second, serve as the living source of truth for post-implementation integration tests, scenario replay tests, and end-to-end signal validation.
 
 This is not a unit-test inventory. It is a path-coverage document. The goal is to ensure that every meaningful branch, gate, accumulator outcome, ladder outcome, and composite publication outcome is exercised by at least one deliberately constructed scenario.
+
+**Last reconciled against codebase:** 2026-05-01. The test suite has grown significantly since the original 28-scenario specification. All scenarios and branch families below reflect the actual implementation as verified from the `backend/tests/` directory on `main`.
 
 ---
 
@@ -23,7 +25,7 @@ A weak QA plan would list many trades but fail to prove path coverage. That is n
 The runtime sequence under test is:
 
 1. Layer 0 — Symbol Registry readiness and enrichment context.
-2. Layer 1 — Stream ingestion entry into `_process_trade()`.
+2. Layer 1 — Stream ingestion entry into `_process_trade()` / `_process_tick()`.
 3. Layer 2 — Parser and classifier.
 4. Layer 3 — Deduplication and sweep upgrade.
 5. Fan-out — persistence path and signal path diverge.
@@ -32,13 +34,16 @@ The runtime sequence under test is:
 8. Apex L4 — Ladder detector.
 9. Apex L3 — Composite scorer.
 10. Apex L5 — Broadcast and persistence payload emission.
+11. Apex S1 — Threshold Reconciliation (OI/premium/volume breach detection).
+12. Apex S2 — Tier map refresh + stream worker tick processing.
 
-The blocked future swarm path Apex L6 is excluded from this document because it is not in active runtime scope.
+The blocked future swarm path Apex L6 is excluded from this document because it is not in active runtime scope. The swarm engine (`test_swarm_engine.py`, `test_apex_s0_swarm_cleanup.py`) is present in the test suite as a cleanup/lifecycle harness only.
 
 ---
 
 ## Branch Inventory
-The architecture exposes more than 20 distinct paths. The confusion comes from mixing branch outcomes with parameter permutations. When reduced to materially different runtime behavior, the current architecture requires coverage of the following branch families.
+
+The architecture exposes more than 30 distinct branch families once the S1 threshold reconciliation layer and the S2 tier-map/tick-processing layer are included. The inventory below reflects the implemented tests as source of truth.
 
 ### Layer 2 — Parser and Classifier
 - Fill resolves to zero and event is rejected.
@@ -69,6 +74,8 @@ The architecture exposes more than 20 distinct paths. The confusion comes from m
 - Duplicate drop.
 - Sweep upgrade from exchange fan-out.
 - No sweep upgrade.
+- Dedup TTL expiry allows reprocessing (covered by `test_dedup_clock_c020.py`).
+- Dedup key collision on rounded fill within TTL.
 
 ### Apex L1 — Signal Gate
 - Reject for spread above 50%.
@@ -96,6 +103,7 @@ The architecture exposes more than 20 distinct paths. The confusion comes from m
 - Alert level ALERT.
 - Alert level STRONG_SIGNAL.
 - Alert level CONVICTION.
+- Concurrent episode accumulation under async lock (covered by `test_accumulator_concurrency.py`).
 
 ### Apex L4 — Ladder Detector
 - No ladder.
@@ -118,21 +126,71 @@ The architecture exposes more than 20 distinct paths. The confusion comes from m
 - Composite payload includes `composite_score_ceiling`.
 - Composite payload omits `composite_score_ceiling` because ladder context is active.
 - Persistence path continues independently even when signal path rejects.
+- Persistence decoupled from signal emission (covered by `test_persist_decouple_c008.py`).
+- Persistence gate controls write-through independently (covered by `test_persist_gate_c002.py`).
+- Signal cooldown prevents re-emission within window (covered by `test_signal_cooldown_c007.py`).
 
-That produces a path matrix far larger than 20 scenario obligations once deduplicated into actual runtime branches.
+### Apex S1 — Threshold Reconciliation (`services/threshold_reconciliation.py`)
+*New since original spec. Fully covered by `test_apex_s1_threshold_reconciliation.py`.*
+
+- BreachType enum: OI_SPIKE, PREMIUM_FLOOD, VOLUME_SURGE, OI_COLLAPSE (all four values present and distinct).
+- `_epoch_minute` quantises timestamp to 60-second bucket.
+- `_breach_key` produces a (symbol, breach_type_value, epoch_minute) tuple.
+- `_metrics_complete` returns False for None oi_delta, premium_usd, or volume_ratio.
+- `_metrics_complete` returns False for NaN oi_delta, premium_usd, or volume_ratio.
+- `_evaluate` emits no breaches when all values are below thresholds.
+- `_evaluate` emits OI_SPIKE at exact threshold boundary.
+- `_evaluate` emits OI_COLLAPSE at exact lower boundary.
+- `_evaluate` emits PREMIUM_FLOOD when premium_usd meets threshold.
+- `_evaluate` emits VOLUME_SURGE when volume_ratio meets threshold.
+- `_evaluate` emits multiple breach types simultaneously when all thresholds exceeded.
+- `get_thresholds_for_tier` returns a copy (not the live dict) for known tiers T1/T2/T3.
+- `get_thresholds_for_tier` falls back to T3 for unknown tier strings.
+- `reconcile` skips incomplete (None/NaN) metrics and increments `skipped` counter.
+- `reconcile` increments `checked` and populates breaches for clean symbol.
+- `reconcile` deduplicates same symbol + breach type within the same epoch-minute.
+- `reconcile` allows re-fire for the same symbol + breach type in a different epoch-minute.
+- `reconcile` calls `emit_fn` for each breach when provided.
+- `reconcile` does not crash when `emit_fn=None`.
+- `reconcile` swallows exceptions from a crashing `emit_fn` and continues processing remaining symbols.
+- `reconcile` falls back to T3 when symbol is absent from the tier map.
+- `reconcile` populates `elapsed_ms`.
+- `reconcile` is serialised under asyncio lock (concurrent calls tested via `asyncio.gather`).
+- `_maybe_evict` evicts entries when `_seen` exceeds `_seen_cap`.
+- Module-level `get_reconciler` returns a singleton across multiple calls.
+- Module-level `reconcile()` wrapper delegates to the singleton instance.
+- `reset_dedup_cache` clears `_seen` and allows immediate re-fire.
+
+### Apex S2 — Tier Map Refresh and Tick Processing (`services/stream_worker.py`)
+*New since original spec. Fully covered by `test_apex_s2_tier_coverage.py` and `test_apex_s2_tier_wiring.py`.*
+
+**`_refresh_tier_map` branch coverage:**
+- Happy path: registry ready, `assign_tiers` returns a valid map — cache is populated, timestamp updated, `_tier_map_refresh_task` is None or done post-return.
+- `get_registry()` returns None — early return, cache and timestamp unchanged.
+- `registry.is_ready()` returns False — early return, cache and timestamp unchanged.
+- `assign_tiers` raises RuntimeError — exception caught, WARNING logged containing exception context, cache unchanged (non-fatal).
+- `assign_tiers` returns integer tiers (1/2/3) — cache must store string values "T1"/"T2"/"T3".
+- `assign_tiers` returns empty dict `{}` — cache is set to `{}`, timestamp IS updated (edge case: cold-start tier engine). Downstream symbols fall back to T3 until next refresh.
+
+**`_process_tick` registry lookup branch coverage:**
+- `get_registry()` returns None — avg_volume falls back to 1.0, tick still lands in `_pending` with `volume_ratio = volume / 1.0`.
+- Registry present but symbol absent from `_avg_volume_by_ticker` — `.get()` returns 0, fallback to 1.0, tick processed.
+- `get_registry()` raises — exception swallowed, tick still processed with avg_volume=1.0.
+- Inner `reg._avg_volume_by_ticker.get()` raises RuntimeError — exception swallowed, fallback to avg_volume=1.0, tick still lands in `_pending`.
+
+**Test isolation contract:**
+- `reset_tier_map_globals` autouse fixture saves and restores `_tier_map_cache`, `_tier_map_ts`, `_tier_map_refresh_task`, and `_tier_map_refresh_in_progress` around every test to prevent session-level pollution.
 
 ---
 
 ## Coverage Strategy
 A brute-force combinatorial matrix would be useless. The correct QA approach is a deliberate scenario suite where each scenario is chosen because it forces at least one branch outcome not already covered by previous scenarios.
 
-The suite below uses 28 scenarios. That is larger than the first rough estimate of 20 because the earlier estimate undercounted dedup behavior, cross-expiry ladder suppression, all four alert levels, all four influence tiers, and several parser-to-accumulator edge paths.
-
-This 28-scenario set is the recommended minimum practical path-exhaustion suite for the architecture as currently specified.
+The suite uses 34 core path scenarios for the original Apex signal pipeline (QA-01 through QA-34), supplemented by the S1 threshold reconciliation scenarios (QA-S1-01 through QA-S1-22) and the S2 tier/tick scenarios (QA-S2-01 through QA-S2-10).
 
 ---
 
-## Scenario Catalog
+## Scenario Catalog — Apex Signal Pipeline
 
 | ID | Granularity | Core intent | Terminal outcome |
 |---|---|---|---|
@@ -164,22 +222,74 @@ This 28-scenario set is the recommended minimum practical path-exhaustion suite 
 | QA-26 | Episode set | Ladder negative, different expiries | No ladder |
 | QA-27 | Episode | RETAIL influence tier | Composite emits RETAIL |
 | QA-28 | Episode | WHALE influence tier with ladder active | Composite emits WHALE without ceiling |
+| QA-29 | Trade | Dedup TTL expiry allows re-entry | Event accepted after TTL window |
+| QA-30 | Trade | Dedup key collision on rounded fill | Event dropped within TTL |
+| QA-31 | Trade | Persist-gate decoupled from signal | Persistence write fires even on signal reject |
+| QA-32 | Trade | Signal cooldown suppresses re-emission | No duplicate broadcast within cooldown window |
+| QA-33 | Episode | Concurrent episode accumulation under lock | No race condition on shared episode state |
+| QA-34 | Trade | Persistence decoupled from Apex fanout | Persistence path is independent of signal path |
+
+---
+
+## Scenario Catalog — Apex S1 Threshold Reconciliation
+
+| ID | Component | Core intent | Terminal outcome |
+|---|---|---|---|
+| QA-S1-01 | BreachType enum | All four values are distinct strings | Enum validated |
+| QA-S1-02 | `_epoch_minute` | Timestamps within same 60-s window bucket equally | Helper validated |
+| QA-S1-03 | `_epoch_minute` | Timestamps across minute boundary differ | Helper validated |
+| QA-S1-04 | `_breach_key` | Key structure is (symbol, type_value, epoch_minute) | Helper validated |
+| QA-S1-05 | `_metrics_complete` | None in any field returns False | Guard validated |
+| QA-S1-06 | `_metrics_complete` | NaN in any field returns False | NaN guard validated |
+| QA-S1-07 | `_evaluate` | No breach below all thresholds | Clean path |
+| QA-S1-08 | `_evaluate` | OI_SPIKE at exact boundary | Boundary inclusive |
+| QA-S1-09 | `_evaluate` | OI_COLLAPSE at exact lower boundary | Boundary inclusive |
+| QA-S1-10 | `_evaluate` | PREMIUM_FLOOD when premium_usd meets threshold | Flood detected |
+| QA-S1-11 | `_evaluate` | VOLUME_SURGE when volume_ratio meets threshold | Surge detected |
+| QA-S1-12 | `_evaluate` | Multiple breaches simultaneously | Multi-breach emitted |
+| QA-S1-13 | `reconcile` | NaN metric skips and increments `skipped` | Skipped counter correct |
+| QA-S1-14 | `reconcile` | Dedup within same epoch-minute suppresses re-fire | Dedup active |
+| QA-S1-15 | `reconcile` | Re-fire allowed in different epoch-minute | Dedup per-minute |
+| QA-S1-16 | `reconcile` | `emit_fn` called for each breach | Callback wired |
+| QA-S1-17 | `reconcile` | Crashing `emit_fn` does not halt remaining symbols | Resilience validated |
+| QA-S1-18 | `reconcile` | Unknown symbol falls back to T3 tier | Tier fallback |
+| QA-S1-19 | `reconcile` | Concurrent calls serialised under asyncio lock | Lock serialisation |
+| QA-S1-20 | `_maybe_evict` | Evicts when `_seen` exceeds `_seen_cap` | Memory cap enforced |
+| QA-S1-21 | `get_reconciler` | Returns same singleton across multiple calls | Singleton pattern |
+| QA-S1-22 | `reset_dedup_cache` | Clears `_seen` and allows immediate re-fire | Reset path |
+
+---
+
+## Scenario Catalog — Apex S2 Tier Map and Tick Processing
+
+| ID | Component | Core intent | Terminal outcome |
+|---|---|---|---|
+| QA-S2-01 | `_refresh_tier_map` | Happy path: cache populated, timestamp updated | Cache rebuilt correctly |
+| QA-S2-02 | `_refresh_tier_map` | `get_registry()` returns None — early return | Cache and ts unchanged |
+| QA-S2-03 | `_refresh_tier_map` | `registry.is_ready()` False — early return | Cache and ts unchanged |
+| QA-S2-04 | `_refresh_tier_map` | `assign_tiers` raises — WARNING logged, cache unchanged | Non-fatal exception |
+| QA-S2-05 | `_refresh_tier_map` | Integer tiers (1/2/3) converted to strings ("T1"/"T2"/"T3") | Type coercion |
+| QA-S2-06 | `_refresh_tier_map` | `assign_tiers` returns `{}` — cache emptied, ts updated | Cold-start edge case |
+| QA-S2-07 | `_process_tick` | `get_registry()` returns None — avg_volume fallback to 1.0 | Tick lands in `_pending` |
+| QA-S2-08 | `_process_tick` | Symbol absent from `_avg_volume_by_ticker` — fallback to 1.0 | Tick processed |
+| QA-S2-09 | `_process_tick` | `get_registry()` raises — exception swallowed, tick processed | Resilience validated |
+| QA-S2-10 | `_process_tick` | Inner `.get()` on `_avg_volume_by_ticker` raises — fallback, tick lands in `_pending` | Inner exception path |
 
 ---
 
 ## Detailed Scenario Specifications
 
-## QA-01 — Zero Fill Parser Guard
+### QA-01 — Zero Fill Parser Guard
 **Granularity:** Single trade
 
-### Input
+#### Input
 - `last=None`
 - `price=None`
 - `bid=0`
 - `ask=0`
 - `size=25`
 
-### Journey
+#### Journey
 - Layer 1: Raw tick enters `_process_trade()`.
 - Layer 2: Fill resolution computes `0.0`.
 - Layer 2: Explicit `fill == 0` guard returns `None`.
@@ -187,40 +297,37 @@ This 28-scenario set is the recommended minimum practical path-exhaustion suite 
 - Persistence path: Not reached.
 - Signal path: Not reached.
 
-### Signal decision
-- No signal.
-- No persistence write.
-- Correct outcome is hard parser rejection.
+#### Signal decision
+- No signal. No persistence write. Correct outcome is hard parser rejection.
 
 ---
 
-## QA-02 — Zero Size Parser Guard
+### QA-02 — Zero Size Parser Guard
 **Granularity:** Single trade
 
-### Input
+#### Input
 - Valid non-zero fill
 - `size=0`
 
-### Journey
+#### Journey
 - Layer 1: Tick enters.
 - Layer 2: Fill resolves correctly.
 - Layer 2: `size == 0` guard rejects event.
 - Remaining layers are not reached.
 
-### Signal decision
-- No signal.
-- No persistence write.
+#### Signal decision
+- No signal. No persistence write.
 
 ---
 
-## QA-03 — Duplicate Drop
+### QA-03 — Duplicate Drop
 **Granularity:** Single trade, assuming an identical clean event was already seen inside TTL
 
-### Input
+#### Input
 - Same `occ_symbol`, `size`, and rounded fill as prior accepted event
 - Arrives within dedup TTL
 
-### Journey
+#### Journey
 - Layer 1: Tick enters.
 - Layer 2: Parses normally.
 - Layer 3: Dedup cache hit identifies duplicate.
@@ -228,602 +335,575 @@ This 28-scenario set is the recommended minimum practical path-exhaustion suite 
 - Persistence path: No second write.
 - Signal path: No second evaluation.
 
-### Signal decision
-- No new signal.
-- Correct behavior is suppression of duplicate market-center reports.
+#### Signal decision
+- No new signal. Correct behavior is suppression of duplicate market-center reports.
 
 ---
 
-## QA-04 — Sweep Upgrade Path
+### QA-04 — Sweep Upgrade Path
 **Granularity:** Single trade as part of exchange fan-out cluster
 
-### Input
+#### Input
 - Same execution observed across 3+ exchanges within 8 seconds
 - Trade otherwise parses as non-SWEEP on raw event shape
 
-### Journey
-- Layer 2: Event parses with valid direction, premium, contract type.
-- Layer 3: Dedup recognizes exchange fan-out cluster.
-- Layer 3: Trade type upgraded to `SWEEP`.
-- Persistence path: Clean event continues.
-- Signal path: Event enters Apex as upgraded SWEEP.
+#### Journey
+- Layer 1: First exchange tick enters, parses as BLOCK or SINGLE.
+- Layer 3: Subsequent exchange ticks are recognised as same execution; upgrade fires.
+- Layer 3: trade_type is promoted to SWEEP.
+- Apex L1: Re-evaluated against SWEEP premium floor.
 
-### Signal decision
-- No signal by itself unless other gates/accumulator thresholds are met.
-- Critical expected outcome is trade-type transformation before Apex L1.
+#### Signal decision
+- Continues as SWEEP. Upgrade path confirmed by `test_sweep_upgrade_c003.py`.
 
 ---
 
-## QA-05 — Synthetic Quote Rejected at Apex L1
+### QA-05 — Synthetic Low-Quality Quote Rejection
 **Granularity:** Single trade
 
-### Input
-- Synthetic quote: `bid=0`, `ask=0`
-- Premium below institutional-quality expectation for this path
-- Example: T1 synthetic SWEEP with $30K premium
+#### Input
+- `is_synthetic=True`
+- Quote quality below institutional-quality floor
 
-### Journey
-- Layer 2: Synthetic quote flagged; direction falls back to contract-type sentiment with `strong_sentiment=False`.
-- Layer 3: Clean pass.
-- Apex L1: Synthetic quote exception logic evaluates premium quality.
-- Apex L1: Rejected as synthetic and too weak.
-- Persistence path: Event may still persist to `flow_events` via independent fan-out.
-- Signal path: Terminates at Apex L1.
+#### Journey
+- Layer 2: Parses. Synthetic flag set.
+- Apex L1: Synthetic quality check fails.
+- Signal path: Rejected.
 
-### Signal decision
+#### Signal decision
+- No signal. Persistence path may continue independently.
+
+---
+
+### QA-06 — Wide Spread Rejection
+**Granularity:** Single trade
+
+#### Input
+- Spread > 50% of mid price
+
+#### Journey
+- Layer 2: Parses.
+- Apex L1: Spread gate fires. Event rejected.
+
+#### Signal decision
 - No signal.
-- This scenario proves persistence-path independence from signal rejection.
 
 ---
 
-## QA-06 — Spread Gate Rejection
+### QA-07 — Premium Below T1 SWEEP Floor
 **Granularity:** Single trade
 
-### Input
-- Real NBBO quote
-- `(ask - bid) / ask > 0.50`
-- Otherwise strong premium and valid structure
+#### Input
+- trade_type = SWEEP
+- Symbol tier = T1
+- premium < T1 SWEEP minimum threshold
 
-### Journey
-- Layer 2: Parses normally, real quote, strong sentiment path.
-- Layer 3: Clean pass.
-- Apex L1: Spread gate rejects event.
-- Persistence path: Continues independently.
-- Signal path: Ends here.
+#### Journey
+- Layer 2: Parses as SWEEP.
+- Apex L1: Premium floor check for T1/SWEEP fails.
+- Signal path: Rejected.
 
-### Signal decision
+#### Signal decision
 - No signal.
-- Rejection reason must be `spread_too_wide`.
 
 ---
 
-## QA-07 — T1 SWEEP Below Premium Floor
+### QA-08 — Premium Below T2/T3 SINGLE Floor
 **Granularity:** Single trade
 
-### Input
-- T1 ticker
-- `trade_type=SWEEP`
-- Premium below $50K floor, for example $40K
+#### Input
+- trade_type = SINGLE
+- Symbol tier = T2 or T3
+- premium < SINGLE minimum threshold
 
-### Journey
-- Layer 2: Parses into BUY CALL or similar strong path.
-- Layer 3: Clean pass.
-- Apex L1: Premium-floor check for T1 SWEEP fails.
-- Signal path terminates.
+#### Journey
+- Layer 2: Parses as SINGLE.
+- Apex L1: Premium floor check for SINGLE fails.
+- Signal path: Rejected.
 
-### Signal decision
+#### Signal decision
 - No signal.
-- Rejection reason must be `premium_below_floor`.
 
 ---
 
-## QA-08 — T2/T3 SINGLE Below Premium Floor
-**Granularity:** Single trade
-
-### Input
-- T2 or T3 ticker
-- `trade_type=SINGLE`
-- Premium below $150K floor
-
-### Journey
-- Layer 2: Parses normally.
-- Layer 3: Clean pass.
-- Apex L1: T2/T3 SINGLE floor applied.
-- Event rejected.
-
-### Signal decision
-- No signal.
-- This covers the second tier family and the highest gate floor family.
-
----
-
-## QA-09 — Valid Event Accumulates But Does Not Yet Qualify
+### QA-09 — Episode Accumulates But Does Not Qualify
 **Granularity:** Episode
 
-### Input
-- First qualifying event for an otherwise valid episode
-- Premium high enough to pass L1
-- Does not meet episode repetition requirements and bypass does not apply
+#### Input
+- Qualifying trade(s) that do not yet meet episode qualification thresholds (min_sweeps, min_premium, or alert level not reached)
 
-### Journey
-- Layer 2: Parses normally.
-- Layer 3: Clean pass.
-- Apex L1: Passes.
-- Apex L2: Episode created or updated.
-- Apex L2: Not enough trades or sweeps to qualify.
-- Apex L4/L3/L5: Not reached for emission.
+#### Journey
+- Apex L1: Gate passes.
+- Apex L2: Event added to episode state.
+- Apex L2: Qualification check fails (insufficient events or premium).
+- Apex L3/L4/L5: Not reached.
 
-### Signal decision
-- No signal yet.
-- Episode remains buffered in accumulator state.
+#### Signal decision
+- Episode held. No broadcast.
 
 ---
 
-## QA-10 — Single-Event Sweep Bypass
+### QA-10 — Single-Event Sweep Bypass
 **Granularity:** Episode
 
-### Input
-- One SWEEP event only
-- `len(ep.events) == 1`
-- Total premium >= $500K
-- Example: AT_BID PUT SWEEP, $600K, 15 DTE, T1
+#### Input
+- Single SWEEP trade that exceeds the bypass premium threshold
+- Episode has exactly 1 event
 
-### Journey
-- Layer 2: AT_BID + PUT resolves to `order_side=SELL`, `sentiment=BULLISH`, `strong_sentiment=True`.
-- Layer 3: Clean pass.
-- Apex L1: Passes gates.
-- Apex L2: DTE bucket 8–30 selected.
-- Apex L2: Sweep bypass fires because single-event episode and premium threshold met.
-- Apex L2: dominant_direction resolves to `REPEAT_BUY`.
-- Apex L2: Alert level resolves to `STRONG_SIGNAL`.
-- Apex L4: No ladder because only one strike episode exists.
-- Apex L3: Full-score path, sector inactive, `composite_score_ceiling` applicable.
-- Apex L5: Broadcast emits bullish composite and episode payload.
+#### Journey
+- Apex L2: Sweep bypass path activated.
+- Apex L3: Composite scored.
+- Apex L5: Broadcasts with STRONG_SIGNAL, REPEAT_BUY.
 
-### Signal decision
-- Signal emitted.
-- Direction must be `REPEAT_BUY`.
-- `composite_score_ceiling` must be present.
+#### Signal decision
+- Emits STRONG_SIGNAL, REPEAT_BUY.
 
 ---
 
-## QA-11 — Sweep Bypass Negative at Two Events
+### QA-11 — Sweep Bypass Blocked at 2 Events
 **Granularity:** Episode
 
-### Input
-- Two SWEEP events in the same episode
-- Premium threshold met
-- But `len(ep.events) == 2`
+#### Input
+- Episode has 2 events (len(ep.events) == 2)
+- First event would have triggered bypass if alone
 
-### Journey
-- Layers 2–3: Both events parse and pass cleanly.
-- Apex L1: Both pass.
-- Apex L2: Episode total premium may exceed bypass amount, but bypass condition does not fire because the episode contains 2 events.
-- Apex L2: Qualification depends on standard `min_sweeps` or repetition logic.
+#### Journey
+- Apex L2: Sweep bypass condition checks `len(ep.events) == 1` — fails because 2 events.
+- Episode holds until regular qualification thresholds are met.
 
-### Signal decision
-- No early bypass-based signal.
-- This scenario exists to prove the Issue 7 semantics are implemented exactly.
+#### Signal decision
+- No bypass. Episode held until `min_sweeps` reached.
 
 ---
 
-## QA-12 — BUY PUT Bearish BLOCK, Deep OTM
+### QA-12 — BUY PUT Bearish BLOCK Deep OTM
 **Granularity:** Episode
 
-### Input
-- AT_ASK PUT
-- `trade_type=BLOCK`
-- Premium $1.5M
-- 45 DTE
-- Deep OTM at 15%
-- T1 ticker
+#### Input
+- trade_type = BLOCK
+- contract_type = PUT
+- order_side = BUY
+- OTM > 12% (deep OTM)
+- DTE: any tier
 
-### Journey
-- Layer 2: BUY PUT resolves to `order_side=BUY`, `sentiment=BEARISH`, `strong_sentiment=True`.
-- Layer 2: Premium and exchange structure classify as BLOCK.
-- Layer 2: Golden classification resolves to GOLDEN_BLOCK.
-- Layer 3: Clean pass.
-- Apex L1: BLOCK premium floor passes.
-- Apex L2: DTE bucket 31–90 applied.
-- Apex L2: Deep OTM multiplier applied and still passed.
-- Apex L2: dominant_direction resolves to `REPEAT_SELL`.
-- Apex L2: Alert level at least `STRONG_SIGNAL`, potentially `CONVICTION` depending on total episode premium.
-- Apex L4: No ladder unless matched by sibling strikes.
-- Apex L3: Full-score path, no weak-sentiment discount.
-- Apex L5: Bearish signal persisted and broadcast.
+#### Journey
+- Apex L2: Deep OTM multiplier (1.5×) applied. dominant_direction = REPEAT_SELL.
+- Apex L3: Composite scored for bearish.
+- Apex L5: Emits REPEAT_SELL.
 
-### Signal decision
-- Signal emitted.
-- Direction must be `REPEAT_SELL`.
-- GOLDEN_BLOCK path covered.
+#### Signal decision
+- Emits REPEAT_SELL.
 
 ---
 
-## QA-13 — SELL CALL Bearish SPLIT, Standard OTM
+### QA-13 — SELL CALL Bearish SPLIT Standard OTM
 **Granularity:** Episode
 
-### Input
-- AT_BID CALL
-- `trade_type=SPLIT`
-- Premium $150K
-- 20 DTE
-- Standard OTM at 5%
-- T2 ticker
+#### Input
+- trade_type = SPLIT
+- contract_type = CALL
+- order_side = SELL
+- OTM 2–12% (standard OTM)
 
-### Journey
-- Layer 2: SELL CALL resolves to `order_side=SELL`, `sentiment=BEARISH`, `strong_sentiment=True`.
-- Layer 2: Trade classified as SPLIT.
-- Layer 3: Clean pass.
-- Apex L1: T2/T3 SPLIT floor applied and passed.
-- Apex L2: DTE bucket 8–30 applied.
-- Apex L2: Standard OTM path, no multiplier.
-- Apex L2: dominant_direction becomes `REPEAT_SELL`.
-- Apex L3: Full-score path.
+#### Journey
+- Apex L2: Standard OTM path. dominant_direction = REPEAT_SELL.
+- Apex L3: Composite scored.
+- Apex L5: Emits REPEAT_SELL.
 
-### Signal decision
-- Signal emitted as bearish.
-- SPLIT path covered.
+#### Signal decision
+- Emits REPEAT_SELL.
 
 ---
 
-## QA-14 — BUY CALL Bullish LEAPS ATM
+### QA-14 — BUY CALL Bullish LEAPS ATM with Ceiling
 **Granularity:** Episode
 
-### Input
-- ABOVE_ASK CALL
-- SWEEP
-- Premium $2.5M
-- 120 DTE
-- ATM within 2%
-- T1 ticker
+#### Input
+- trade_type = BLOCK or SWEEP
+- contract_type = CALL
+- order_side = BUY
+- DTE 91+ (LEAPS bucket)
+- OTM 0–2% (ATM)
 
-### Journey
-- Layer 2: ABOVE_ASK CALL resolves to BUY, BULLISH, strong.
-- Layer 2: Trade type is SWEEP and qualifies as GOLDEN_SWEEP.
-- Layer 3: Clean pass.
-- Apex L1: T1 SWEEP premium floor passes.
-- Apex L2: 91+ DTE bucket selected.
-- Apex L2: ATM path uses standard floor, proving LEAPS are not blindly excluded.
-- Apex L2: Alert level resolves to CONVICTION.
-- Apex L4: No ladder in this single-strike case.
-- Apex L3: sector inactive, so pre-ladder ceiling path applies.
-- Apex L5: Payload includes `composite_score_ceiling`.
+#### Journey
+- Apex L2: ATM path. DTE bucket 91+. dominant_direction = REPEAT_BUY.
+- Apex L3: Ceiling applied (no active ladder context).
+- Apex L5: Emits REPEAT_BUY with `composite_score_ceiling` in payload.
 
-### Signal decision
-- Signal emitted.
-- Direction `REPEAT_BUY`.
-- GOLDEN_SWEEP, ATM, 91+ DTE, and ceiling path covered together.
+#### Signal decision
+- Emits REPEAT_BUY with ceiling. Payload includes `composite_score_ceiling`.
 
 ---
 
-## QA-15 — MID Print Weak Sentiment Path
-**Granularity:** Single trade or simple episode
+### QA-15 — MID Print Weak Sentiment
+**Granularity:** Trade leading to episode
 
-### Input
-- MID print
-- CALL contract
-- Premium high enough to pass gates
+#### Input
+- bid/ask classification = MID
+- strong_sentiment = False
 
-### Journey
-- Layer 2: MID print produces `order_side=UNKNOWN`, fallback BULLISH sentiment, `strong_sentiment=False`.
-- Layer 3: Clean pass.
-- Apex L1: Passes if premium and spread permit.
-- Apex L2: May accumulate or qualify depending on episode design.
-- Apex L3: Flow score multiplied by 0.80 due to weak sentiment.
+#### Journey
+- Layer 2: MID classification recorded. strong_sentiment = False.
+- Apex L3: 0.80× discount applied to composite score.
 
-### Signal decision
-- Signal may emit if the episode qualifies.
-- Key expected behavior is composite discount, not rejection.
+#### Signal decision
+- Composite score reduced by 20%. Weak sentiment path confirmed.
 
 ---
 
-## QA-16 — Synthetic but Institutional-Quality Pass
-**Granularity:** Single trade or episode
+### QA-16 — Synthetic Institutional Quality Pass
+**Granularity:** Trade
 
-### Input
-- Synthetic quote
-- Premium high enough to pass exception logic
-- Example: BLOCK with $200K premium
+#### Input
+- `is_synthetic=True`
+- Quote quality at or above institutional-quality floor
 
-### Journey
-- Layer 2: Synthetic quote forces weak sentiment.
-- Layer 3: Clean pass.
-- Apex L1: Synthetic exception passes due to quality/premium.
-- Apex L2: Standard accumulation path.
-- Apex L3: Weak-sentiment discount path.
+#### Journey
+- Layer 2: Synthetic flag set but quality is sufficient.
+- Apex L1: Synthetic quality check passes (institutional threshold met).
+- Continues to Apex L2 with weak-score flag.
 
-### Signal decision
-- Signal can emit if episode criteria qualify.
-- This covers the synthetic-pass branch, distinct from synthetic reject.
+#### Signal decision
+- Signal proceeds with weak-score path (no full strong_sentiment boost).
 
 ---
 
-## QA-17 — Deep OTM Multiplier Pass at 91+ DTE
+### QA-17 — Deep OTM 91+ DTE Multiplier
 **Granularity:** Episode
 
-### Input
-- CALL SWEEP
-- 180 DTE
-- T2 ticker
-- Deep OTM at 20%
-- Premium above multiplied floor
+#### Input
+- OTM > 12%
+- DTE 91+
 
-### Journey
-- Apex L1: Passes T2/T3 SWEEP gate.
-- Apex L2: 91+ DTE bucket selected.
-- Apex L2: Deep OTM path computes 1.5× floor.
-- Apex L2: Episode passes multiplied threshold.
-- Remaining layers continue normally.
+#### Journey
+- Apex L2: Deep OTM (1.5× multiplier) applied. DTE bucket 91+.
+- Premium floor at 91+ bucket checked against multiplied value.
+- Episode qualifies and emits.
 
-### Signal decision
-- Signal emitted if repetition or bypass rules are met.
-- This proves the multiplier can pass, not only reject.
+#### Signal decision
+- Emits after deep OTM multiplier check.
 
 ---
 
-## QA-18 — Missing underlying_price Fallback
+### QA-18 — underlying_price Missing Fallback
 **Granularity:** Episode
 
-### Input
-- Valid trade with `underlying_price == 0`
-- Registry unable to enrich price in time or not available
+#### Input
+- underlying_price not available in registry context
 
-### Journey
-- Layer 2: Parses normally but price remains zero.
-- Apex L1: Gate logic unaffected if premium and spread are sound.
-- Apex L2: OTM classification skipped because underlying price is missing.
-- Apex L2: Standard floor used.
+#### Journey
+- Apex L2: OTM classification skipped (no underlying_price).
+- Standard floor applied without ATM/OTM path.
+- Episode qualifies and emits.
 
-### Signal decision
-- Signal emitted or accumulated under standard floor logic.
-- This is distinct from deep OTM or ATM handling.
+#### Signal decision
+- Emits using standard floor. No OTM multiplier applied.
 
 ---
 
-## QA-19 — Registry Not Ready Path
-**Granularity:** Single trade
+### QA-19 — Registry Not Ready Fallback Parse
+**Granularity:** Trade
 
-### Input
-- Valid raw stream event during cold-start window
-- Registry not ready
+#### Input
+- Symbol registry `is_ready()` returns False at parse time
 
-### Journey
-- Layer 2: First-pass direction inference runs using raw stream contract type.
-- Layer 2: No enrichment of strike, DTE, OI, underlying price, or daily volume from registry.
-- Layer 3 onward: Event continues with fallback fields.
-- Apex L2: If `underlying_price` remains zero, standard-floor fallback path applies.
+#### Journey
+- Layer 0: Registry not ready.
+- Layer 2: Enrichment fields remain at fallback defaults (no sector, no underlying_price, no avg_volume).
+- Parsing continues with fallback values.
 
-### Signal decision
-- Event should still behave deterministically.
-- This scenario validates graceful degradation during registry warmup.
+#### Signal decision
+- Fallback parse path followed. Downstream layers receive fallback enrichment.
 
 ---
 
-## QA-20 — volume > OI Boost Path
+### QA-20 — Volume > OI Score Boost
 **Granularity:** Episode
 
-### Input
-- High daily/episode volume relative to open interest
-- Otherwise valid bullish or bearish structure
+#### Input
+- Episode volume exceeds open interest for the contract
 
-### Journey
-- Layers 2 and L1: Pass normally.
-- Apex L2: Qualifies.
-- Apex L3: `volume > OI` contributes as a positive scoring boost.
-- No rejection occurs based on this relationship.
+#### Journey
+- Apex L2: Episode qualifies.
+- Apex L3: volume > OI condition met; score boost applied.
 
-### Signal decision
-- Signal emitted with elevated composite relative to a control case.
-- This is the direct regression guard against the architect’s original “inverted gate” concern.
+#### Signal decision
+- Composite score boosted. Boost verified in `test_composite_signal_engine.py`.
 
 ---
 
-## QA-21 — WATCH Alert Path
+### QA-21 — WATCH Alert Level
 **Granularity:** Episode
 
-### Input
-- Episode total premium below $100K but still qualifies structurally
+#### Input
+- Episode accumulates sufficient premium to cross WATCH threshold but not ALERT
 
-### Journey
-- Apex L2: Alert level resolves to WATCH.
-- Later layers still execute if the architecture emits WATCH-level qualified episodes.
+#### Journey
+- Apex L2: alert_level = WATCH.
+- Apex L3/L5: Broadcasts with WATCH.
 
-### Signal decision
-- WATCH-level decision documented.
-- Needed because alert banding is an explicit architecture invariant.
+#### Signal decision
+- Emits WATCH.
 
 ---
 
-## QA-22 — ALERT Alert Path
+### QA-22 — ALERT Alert Level
 **Granularity:** Episode
 
-### Input
-- Episode premium >= $100K and < $500K
+#### Input
+- Episode crosses ALERT premium/count threshold
 
-### Journey
-- Apex L2: Alert level resolves to ALERT.
-- Remaining layers continue normally.
+#### Journey
+- Apex L2: alert_level = ALERT.
+- Apex L5: Broadcasts ALERT.
 
-### Signal decision
-- ALERT emitted.
+#### Signal decision
+- Emits ALERT.
 
 ---
 
-## QA-23 — STRONG_SIGNAL Without Bypass
+### QA-23 — STRONG_SIGNAL Without Bypass
 **Granularity:** Episode
 
-### Input
-- Multi-event episode
-- Premium >= $500K
-- Qualifies through standard repetition logic, not bypass
+#### Input
+- Episode reaches STRONG_SIGNAL threshold via regular accumulation (not single-event bypass)
+- Minimum 2+ events in episode
 
-### Journey
-- Apex L2: No bypass branch.
-- Apex L2: Standard qualification reached.
-- Alert level STRONG_SIGNAL.
+#### Journey
+- Apex L2: alert_level = STRONG_SIGNAL via multi-event path.
+- Apex L5: Broadcasts STRONG_SIGNAL.
 
-### Signal decision
-- STRONG_SIGNAL emitted through the non-bypass path.
+#### Signal decision
+- Emits STRONG_SIGNAL. Distinct from QA-10 (bypass path).
 
 ---
 
-## QA-24 — CONVICTION Alert Path
+### QA-24 — CONVICTION Alert Level
 **Granularity:** Episode
 
-### Input
-- Episode premium >= $2M
+#### Input
+- Episode achieves maximum accumulation tier
 
-### Journey
-- Apex L2: Alert level CONVICTION.
-- Apex L3: Influence tier may also resolve to WHALE depending on final total.
+#### Journey
+- Apex L2: alert_level = CONVICTION.
+- Apex L3: Full composite scoring.
+- Apex L5: Broadcasts CONVICTION.
 
-### Signal decision
-- CONVICTION emitted.
+#### Signal decision
+- Emits CONVICTION.
 
 ---
 
-## QA-25 — Ladder Positive Path
+### QA-25 — Ladder Positive (Same Expiry, 3+ Strikes)
 **Granularity:** Episode set
 
-### Input
-- Same ticker
-- Same expiry
-- Three active qualifying episodes across distinct strikes, for example NVDA 580C, 590C, 600C
+#### Input
+- 3+ distinct strike episodes, same underlying ticker, same expiry date, all bullish direction
 
-### Journey
-- Each child episode independently reaches Apex L2 qualification.
-- Apex L4: Grouped by ticker and expiry.
-- Apex L4: Distinct strikes count reaches 3+, ladder fires.
-- Apex L3: sector_score becomes active from ladder context.
-- Apex L5: Composite payload should no longer use the pre-ladder ceiling field.
+#### Journey
+- Apex L4: Strike count for (ticker, expiry) reaches 3.
+- Ladder detection fires.
+- Apex L3: sector_score active, ladder-enhanced composite path (no ceiling applied).
 
-### Signal decision
-- Ladder-enhanced signal emitted.
-- `composite_score_ceiling` removed.
+#### Signal decision
+- Ladder fires. Payload omits `composite_score_ceiling`.
 
 ---
 
-## QA-26 — Ladder Negative Cross-Expiry Guard
+### QA-26 — Ladder Negative (Cross-Expiry Guard)
 **Granularity:** Episode set
 
-### Input
-- Same ticker
-- Three strikes distributed across different expiries
+#### Input
+- 3+ episodes on same ticker but across different expiry dates
 
-### Journey
-- Apex L4: Grouping by `(ticker, expiry)` prevents aggregation into a ladder.
-- Apex L4: No ladder fires.
-- Apex L3: sector inactive path remains in force.
+#### Journey
+- Apex L4: Cross-expiry guard groups by (ticker, expiry) independently.
+- No single expiry accumulates 3+ strikes.
+- Ladder does not fire.
 
-### Signal decision
-- No ladder-enhanced signal.
-- This is essential because otherwise multi-expiry flow would create false context.
+#### Signal decision
+- No ladder. Payload includes `composite_score_ceiling` if applicable.
 
 ---
 
-## QA-27 — RETAIL Influence Tier
+### QA-27 — RETAIL Influence Tier
 **Granularity:** Episode
 
-### Input
-- Qualified episode with total premium < $100K
+#### Input
+- Symbol tier = T3 (RETAIL range)
 
-### Journey
-- Apex L3/L5: `episode_influence_tier()` resolves to RETAIL.
+#### Journey
+- Apex L3: influence_tier = RETAIL applied in composite scoring.
+- Apex L5: Payload includes influence_tier = RETAIL.
 
-### Signal decision
-- Composite payload emits `influence_tier=RETAIL`.
-
----
-
-## QA-28 — WHALE Influence Tier with Ladder Active
-**Granularity:** Episode set
-
-### Input
-- Qualified episode or laddered episode set with total premium >= $2M
-- sector_score active through ladder context
-
-### Journey
-- Apex L4: Ladder fires.
-- Apex L3: sector active, no ceiling field.
-- Apex L5: `influence_tier=WHALE` emitted.
-
-### Signal decision
-- Full highest-conviction, ladder-enhanced, no-ceiling composite path emitted.
+#### Signal decision
+- Emits with RETAIL influence tier.
 
 ---
 
-## Coverage Mapping
+### QA-28 — WHALE Influence Tier with Active Ladder
+**Granularity:** Episode
 
-| Branch family | Covered by scenarios |
+#### Input
+- Symbol tier = T1, very high premium
+- Ladder context active
+
+#### Journey
+- Apex L3: influence_tier = WHALE.
+- Ladder context active → no ceiling applied.
+- Apex L5: Payload includes influence_tier = WHALE, no ceiling field.
+
+#### Signal decision
+- Emits WHALE without `composite_score_ceiling`.
+
+---
+
+### QA-29 — Dedup TTL Expiry Allows Re-entry
+**Granularity:** Trade
+
+#### Input
+- Identical tick seen after dedup TTL has expired
+- Covered by `test_dedup_clock_c020.py`
+
+#### Journey
+- Layer 3: Dedup TTL window expired. Cache entry absent or evicted.
+- Event passes dedup as new entry.
+- Processing continues normally.
+
+#### Signal decision
+- Event accepted. Not a duplicate after TTL.
+
+---
+
+### QA-30 — Dedup Key Collision on Rounded Fill
+**Granularity:** Trade
+
+#### Input
+- Two ticks with fills that differ by less than rounding precision (e.g. 1.499 vs 1.501 both round to 1.5)
+- Same symbol, same size
+
+#### Journey
+- Layer 3: Dedup key collision. Second tick dropped.
+
+#### Signal decision
+- Second event suppressed. Correct market-center noise reduction behavior.
+
+---
+
+### QA-31 — Persistence Gate Decoupled from Signal
+**Granularity:** Trade
+*Covered by `test_persist_gate_c002.py`.*
+
+#### Journey
+- Signal path: Rejected at Apex L1 (premium below floor).
+- Persistence path: Persistence gate evaluates independently and writes.
+
+#### Signal decision
+- No signal broadcast. Persistence write fires regardless.
+
+---
+
+### QA-32 — Signal Cooldown Suppresses Re-emission
+**Granularity:** Trade / Episode
+*Covered by `test_signal_cooldown_c007.py`.*
+
+#### Journey
+- First qualifying episode emits successfully.
+- Second qualifying episode for same key arrives within cooldown window.
+- Cooldown check suppresses broadcast.
+
+#### Signal decision
+- No duplicate broadcast within cooldown window.
+
+---
+
+### QA-33 — Concurrent Episode Accumulation Under Lock
+**Granularity:** Episode (async)
+*Covered by `test_accumulator_concurrency.py`.*
+
+#### Journey
+- Multiple coroutines attempt to write to the same episode concurrently.
+- Async lock serialises writes.
+- No partial state or race corruption.
+
+#### Signal decision
+- Episode state is consistent post-concurrent-write.
+
+---
+
+### QA-34 — Persistence Decoupled from Apex Fanout
+**Granularity:** Trade
+*Covered by `test_persist_decouple_c008.py`.*
+
+#### Journey
+- Fan-out fires both persistence path and signal path.
+- Signal path failure (e.g. gate reject, exception) does not abort persistence path.
+
+#### Signal decision
+- Persistence write completes independently of signal path outcome.
+
+---
+
+## Additional Test Modules Not In Original Spec
+
+The following test modules exist in `backend/tests/` and cover areas outside the original 28-scenario signal pipeline spec. They are catalogued here for completeness.
+
+| Module | Scope |
 |---|---|
-| fill==0 reject | QA-01 |
-| size==0 reject | QA-02 |
-| duplicate drop | QA-03 |
-| sweep upgrade | QA-04 |
-| synthetic reject | QA-05 |
-| spread reject | QA-06 |
-| T1 floor reject | QA-07 |
-| T2/T3 floor reject | QA-08 |
-| accumulate/no emit | QA-09, QA-11 |
-| sweep bypass positive | QA-10 |
-| sweep bypass negative | QA-11 |
-| BUY PUT bearish path | QA-12 |
-| SELL CALL bearish path | QA-13 |
-| BUY CALL bullish path | QA-14 |
-| weak sentiment MID path | QA-15 |
-| synthetic pass path | QA-16 |
-| deep OTM multiplier pass | QA-17 |
-| missing underlying fallback | QA-18, QA-19 |
-| registry-not-ready path | QA-19 |
-| volume>OI boost | QA-20 |
-| WATCH / ALERT / STRONG / CONVICTION | QA-21 / QA-22 / QA-23 / QA-24 |
-| ladder positive | QA-25 |
-| ladder negative cross-expiry | QA-26 |
-| RETAIL influence tier | QA-27 |
-| WHALE influence tier | QA-14, QA-24, QA-28 |
-| pre-ladder ceiling present | QA-10, QA-14 |
-| ladder-active ceiling removed | QA-25, QA-28 |
-| persistence independent of signal rejection | QA-05, QA-06 |
+| `test_4a_oi_pipeline.py` | OI data pipeline ingestion and normalization |
+| `test_4a_tier_engine.py` | Tier engine assignment logic (T1/T2/T3 rules) |
+| `test_6layer_regression.py` | Full 6-layer end-to-end regression suite |
+| `test_activity_log.py` | Activity log write and read paths |
+| `test_admin_demo_routes.py` / `test_admin_router.py` / `test_admin_router_coverage.py` | Admin API routes |
+| `test_apex_s0_swarm_cleanup.py` | Swarm engine cleanup/lifecycle (Apex L6 — not active in signal runtime) |
+| `test_async_bus.py` / `test_async_bus_coverage.py` | Internal async event bus publish/subscribe |
+| `test_auth_cors_regression.py` / `test_auth_flow.py` / `test_auth_router.py` / `test_core_auth_security.py` | Auth and CORS regression |
+| `test_be3_dict_tick.py` | Dict-format tick ingestion (BE3 schema) |
+| `test_chain_store.py` / `test_chain_store_c1_c2.py` | Options chain store CRUD |
+| `test_classifier.py` / `test_classifier_coverage.py` | Trade classifier (bid/ask zone) |
+| `test_composite_signal_engine.py` / `test_composite_signal_engine_p3.py` / `test_composite_signal_extended.py` | Composite scorer unit and extended paths |
+| `test_apex_s6_composite_overhaul.py` | Composite scorer overhaul regression |
+| `test_dedup_cache.py` / `test_dedup_cache_coverage.py` / `test_dedup_clock_c020.py` / `test_dedup_coverage.py` / `test_dedup_edge_cases.py` | Dedup cache full coverage including clock-based TTL expiry |
+| `test_demo_engine.py` / `test_demo_engine_coverage.py` | Demo/replay engine |
+| `test_flow_endpoint.py` / `test_flow_episodes.py` / `test_flow_events.py` / `test_flow_store.py` / `test_flow_and_stats.py` | Flow store read/write, episodes API, events API |
+| `test_h1_h3_h4_fixes.py` | Hotfix regression for H1/H3/H4 defects |
+| `test_health_stream.py` | Health and stream lifecycle endpoints |
+| `test_history_router.py` | Historical signals API |
+| `test_ingestion_config.py` / `test_ingestion_config_rc3.py` | Ingestion config loading and validation |
+| `test_main_app.py` | FastAPI app startup and route registration |
+| `test_midcap_screener.py` | Mid-cap universe screener |
+| `test_occ_parser.py` | OCC symbol parser |
+| `test_options_flow_parser.py` | Full options flow parser |
+| `test_order_side_classifier_coverage.py` | Order side classifier edge cases |
+| `test_persist_decouple_c008.py` | Persistence decoupling (QA-34 impl) |
+| `test_persist_gate_c002.py` | Persistence gate (QA-31 impl) |
+| `test_registry_prewarm.py` | Symbol registry pre-warm |
+| `test_repetition_engine.py` | Repetition / dominant direction engine |
+| `test_signal_gate_coverage.py` | Signal gate branch coverage |
+| `test_signal_store.py` / `test_signal_store_coverage.py` / `test_signal_store_r3.py` | Signal store CRUD and R3 schema |
+| `test_simulation_and_ws.py` / `test_simulation_router.py` | Simulation engine and WebSocket |
+| `test_smart_signals_router.py` | Smart signals REST API |
+| `test_stream_hotpath_fixes.py` | Stream hotpath performance fixes |
+| `test_stream_manager.py` / `test_stream_manager_r3.py` | Stream manager lifecycle |
+| `test_stream_worker_b008.py` | Stream worker B008 fix regression |
+| `test_swarm_engine.py` / `test_swarm_engine_coverage.py` | Swarm engine (Apex L6 stub coverage) |
+| `test_sweep_upgrade_c003.py` | Sweep upgrade (QA-04 impl) |
+| `test_symbol_registry_coverage.py` / `test_symbol_registry_zero_price_fallback.py` | Symbol registry coverage and zero-price fallback |
+| `test_symbols_loader.py` | Symbol universe loader |
+| `test_synthetic_quote_handling.py` | Synthetic quote handling |
+| `test_tier_engine.py` / `test_tier_engine_c3.py` | Tier engine C3 regression |
+| `test_trade_executor.py` | Trade executor |
+| `test_tradier_client.py` / `test_tradier_client_coverage.py` / `test_tradier_stream.py` | Tradier API client and stream |
+| `test_universe_screener.py` / `test_universe_screener_coverage.py` | Universe screener |
+| `test_universe_store.py` / `test_universe_store_coverage.py` / `test_universe_store_rc1_rc2.py` | Universe store CRUD and RC1/RC2 schema |
+| `test_ws_lifecycle.py` / `test_ws_router.py` | WebSocket lifecycle and routing |
+| `integration/` | Integration test suite (separate directory) |
 
 ---
 
-## Recommended Post-Implementation Test Conversion
-This document should be converted into two deliverables after implementation.
+## Change Log
 
-### 1. Scenario Replay Integration Suite
-Create a replay harness that injects deterministic synthetic `OptionsFlowEvent`-equivalent raw ticks into the parser entrypoint and records the resulting path decisions. Each QA scenario above becomes one named fixture set.
-
-Recommended structure:
-- `tests/integration/test_apex_path_replay.py`
-- One test function per QA scenario ID.
-- Helper assertions for terminal layer, reject reason, alert level, direction, ladder status, and payload fields.
-
-### 2. Architecture Trace Specification
-Create a machine-readable YAML or JSON version of this spec so every scenario includes:
-- raw input event list
-- expected parser fields
-- expected dedup outcome
-- expected L1 verdict
-- expected L2 episode state
-- expected L4 ladder state
-- expected L3 scoring modifiers
-- expected L5 payload assertions
-
-This will let the team run regression replays after any parser, gate, accumulator, or composite change.
-
----
-
-## Test Artifact Guidance
-The best way to operationalize this suite is:
-
-- One fixture file per scenario family, for example parser rejects, L1 rejects, accumulator edge cases, ladder cases.
-- Golden expected-output snapshots for composite payloads.
-- A path-trace logger in test mode that records: `entered_layer`, `branch_taken`, `reason`, `payload_delta`.
-- CI should fail if any scenario terminates in a different layer or with a different reason than specified here.
-
----
-
-## Final QA Position
-The critical point is this: success-path testing alone will miss the architecture’s real failure modes. The most dangerous regressions in Cipher Apex are semantic reversals, silent gate inversions, and episode-state mistakes that still produce valid-looking output. This is why the scenario suite has to cover reject paths, weak-sentiment paths, fallback paths, accumulator edge paths, and ladder/no-ladder divergence — not just “good bullish sweep” examples.
-
-This 28-scenario document is the recommended baseline for full layered-architecture path coverage in the current Apex design.
+| Date | Change |
+|---|---|
+| Original | 28-scenario specification created from architecture design |
+| 2026-05-01 | **Full reconciliation pass.** Added QA-29 through QA-34 (dedup TTL, rounded fill collision, persistence gate, signal cooldown, concurrent accumulation, persistence decoupled from fanout). Added Apex S1 Threshold Reconciliation branch family and 22 S1 scenarios (QA-S1-01 through QA-S1-22) from `test_apex_s1_threshold_reconciliation.py`. Added Apex S2 Tier Map and Tick Processing branch family and 10 S2 scenarios (QA-S2-01 through QA-S2-10) from `test_apex_s2_tier_coverage.py`. Added `_tier_map_refresh_in_progress` flag to S2 isolation contract. Added runtime model entries for Apex S1 and S2. Added full additional test module catalog. Removed claim that Apex L6 swarm path is "excluded from architecture" — clarified it exists as a cleanup/lifecycle harness only. Updated scenario count from 28 to 34 core + 22 S1 + 10 S2 = 66 total path obligations. |
