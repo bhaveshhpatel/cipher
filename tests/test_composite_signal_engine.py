@@ -12,6 +12,18 @@ Covers:
   - QA path coverage: influence tier RETAIL / LARGE / INSTITUTIONAL / WHALE
   - QA path coverage: composite_score_ceiling present in tradier_stream payload (structural)
 """
+from __future__ import annotations
+
+import os
+import sys
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — allow running from repo root without installing the package
+# ---------------------------------------------------------------------------
+_BACKEND = os.path.join(os.path.dirname(__file__), "..", "backend")
+if _BACKEND not in sys.path:
+    sys.path.insert(0, os.path.abspath(_BACKEND))
+
 import math
 import pytest
 from unittest.mock import MagicMock, patch
