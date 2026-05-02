@@ -133,6 +133,9 @@
 > ⚠️ **DELIBERATION REQUIRED before implementation begins.**
 > Senior Architect, Principal Backend Engineer, and Lead QA must deliberate on this story
 > and sign off before any code is written. Deliberation points are listed explicitly below.
+> **The deliberation points are architectural concerns that apply to the formula and scoring
+> system generally — they are not specific to any single ticker or trade example. Examples
+> used in scenario analysis are illustrative only.**
 
 #### Problem Statement
 
@@ -214,6 +217,11 @@ else: rec = "HOLD"
 
 #### Scenario Analysis (evidence for deliberation)
 
+> ⚠️ **These scenarios are illustrative examples of formula behavior across different episode
+> types. They are not intended to validate or invalidate specific trades. The panel must
+> evaluate whether the formula's behavior is correct across the full range of WHALE,
+> INSTITUTIONAL, LARGE, and RETAIL tiers — not just for the specific tickers shown.**
+
 The following table shows scores under the current (S6) formula vs. the S9 formula across
 representative episodes from 2026-05-01 live flow:
 
@@ -223,6 +231,23 @@ representative episodes from 2026-05-01 live flow:
 |---|---|---|---|---|---|---|
 | S6 (flat $10M) | 0.220 | 0.775 | 0.250 | 0.314 | HOLD | 0.65 |
 | S9 (tiered $500k) | 0.604 | 0.775 | 0.250 | 0.550 | **BUY** | 0.55 |
+
+**GLXY — $263k CALL, Strike=$40, 1 trade (single print), strong_sentiment=True, DTE=142**
+
+> This example exposes a general formula behavior: a single isolated print — regardless of
+> ticker or premium — should require episode accumulation before generating a BUY. The
+> formula correctly enforces this by design. This is not a GLXY-specific concern; it applies
+> to any single-print episode across any tier.
+
+| Formula | `flow_score` | `vwp_f` | `prem_t` | Composite | Signal | Threshold |
+|---|---|---|---|---|---|---|
+| S6 (flat $10M) | 0.067 | 0.500 | 0.250 | 0.174 | HOLD | 0.65 |
+| S9 (tiered $500k) | 0.393 | 0.500 | 0.250 | 0.379 | HOLD | 0.55 |
+
+GLXY correctly stays HOLD under both formulas. A $263k single print with no episode
+accumulation (`trade_count=1`, `is_accelerating=False`) is a WATCH signal. The formula
+will promote it when repeat prints follow on the same contract. This is correct behavior for
+**any ticker** — a single print is not sufficient for BUY regardless of premium size.
 
 **EBAY — $180k CALL, 3 trades, strong_sentiment=False, OI=1200:**
 
@@ -266,25 +291,67 @@ LARGE threshold. The formula does not auto-promote weak prints.
 
 #### Deliberation Points
 
+> ⚠️ **All deliberation points below are architectural concerns about the formula's general
+> behavior across all tickers and all episode types. Where specific trade examples appear,
+> they are cited only as evidence — the decision must be made for the general case.**
+
 1. **(SA)** Confirm `_TIER_CEILINGS` values are correct. Specifically: should LARGE ceiling be
    $500k (top of the LARGE band = bottom of INSTITUTIONAL) or $250k (midpoint)? Midpoint would
-   make the ceiling more conservative for large-but-not-institutional episodes.
+   make the ceiling more conservative for large-but-not-institutional episodes across all LARGE
+   tier flow. The INSTITUTIONAL ceiling ($2M = top of band) warrants separate review: a $1M
+   single INSTITUTIONAL print reaches composite ~0.421 (HOLD at threshold 0.60) under $2M
+   ceiling, but ~0.600 (BUY) under $1M midpoint ceiling. Panel must decide whether the ceiling
+   should reflect the top of the band (current proposal) or the midpoint of the band for each
+   tier. This affects every INSTITUTIONAL episode, not just specific cases.
 
-2. **(SA + BE)** The `strong_sentiment` field is read from `ep.events[-1]` inside
+2. **(SA)** The formula currently scores premium as a dollar amount normalized to a tier ceiling.
+   This means a 1,220-contract print at $2.16/contract and a 122-contract print at $21.60/contract
+   score **identically** — both produce the same premium. However, in unusual options flow analysis,
+   **contract count relative to open interest (Vol/OI ratio)** is the primary unusualness indicator
+   used by professional flow desks. A Vol/OI > 1.0 means more contracts traded today than currently
+   exist in open interest — this is a structurally different signal from a high-premium, low-contract
+   print. The current `vwp_factor` (premium/OI) captures dollar weight vs. OI but not contract
+   count vs. OI. The panel must decide: should a future story (post-S9) replace `vwp_factor` with
+   a unified `flow_quality_factor` that blends Vol/OI (contract unusualness) with premium/OI
+   (dollar unusualness)?
+
+   Proposed `flow_quality_factor` design (for panel review — **not part of S9 implementation**):
+   ```python
+   # Vol/OI breakpoints (ticker-agnostic — scales correctly across all market caps):
+   # >= 2.0 → 1.00 (more contracts traded than exist in OI — extreme)
+   # >= 1.0 → 0.85 (full OI turnover — very unusual)
+   # >= 0.5 → 0.70 (half OI traded — unusual)
+   # >= 0.2 → 0.50 (mild)
+   # >= 0.1 → 0.35
+   # <  0.1 → 0.20 (noise)
+   #
+   # flow_quality_factor = (vol_oi_factor × 0.50) + (prem_oi_factor × 0.50)
+   ```
+   This approach is ticker-agnostic by design: a small-cap with OI=500 and a large-cap with
+   OI=500,000 both get scored relative to their own OI context. Absolute contract count is
+   never compared across tickers. **Risk:** this change marginally lowers `vwp_factor` for
+   episodes where the premium/OI ratio is high but the Vol/OI ratio is moderate (e.g., a
+   high-fill-price contract where few contracts generate large dollar premium). The panel
+   must confirm this tradeoff is acceptable before scoping as a post-S9 story.
+
+3. **(SA + BE)** The `strong_sentiment` field is read from `ep.events[-1]` inside
    `compute_flow_score()`. This means the discount applies based on the most recent event, not
-   the dominant sentiment across the episode. Is this correct, or should it use a majority-vote
-   across all events in `ep.events`?
+   the dominant sentiment across the episode. Is this correct for all episode types, or should
+   it use a majority-vote across all events in `ep.events`? This affects any episode where
+   sentiment is mixed across individual prints.
 
-3. **(BE)** `episode_influence_tier()` is called twice in `build_composite()` — once for the
+4. **(BE)** `episode_influence_tier()` is called twice in `build_composite()` — once for the
    ceiling lookup and once for the threshold lookup. Confirm this is acceptable or refactor to
    compute once and pass down.
 
-4. **(QA)** Regression test matrix must cover: (a) WHALE episode scores unchanged vs. S6,
+5. **(QA)** Regression test matrix must cover: (a) WHALE episode scores unchanged vs. S6,
    (b) LARGE episode floor coverage (at $100k, $250k, $499k), (c) RETAIL episode at $50k and
    $99k, (d) `strong_sentiment=False` discount still applies after tier normalization,
-   (e) gaming resistance: thin-OI barely-LARGE episode stays HOLD.
+   (e) gaming resistance: thin-OI barely-LARGE episode stays HOLD,
+   (f) single-print episodes across all tiers stay HOLD regardless of premium size
+   (no single print should auto-BUY without episode accumulation).
 
-5. **(QA)** `COMPOSITE_SCORE_CEILING` constant must be updated or documented. With S9's weight
+6. **(QA)** `COMPOSITE_SCORE_CEILING` constant must be updated or documented. With S9's weight
    split, the theoretical maximum composite score is no longer structurally capped at 0.90 —
    it is now a full 1.0 scale (sector at 5% is no longer dead). Document whether
    `COMPOSITE_SCORE_CEILING` should be removed, updated to 0.95 (sector reserved), or kept as
@@ -300,11 +367,13 @@ LARGE threshold. The formula does not auto-promote weak prints.
 - [ ] `sector_score` weight reduced from 10% to 5%
 - [ ] WHALE episode composite scores are within ±0.005 of S6 scores (regression guard)
 - [ ] AAOI $311k scenario produces composite ≥ 0.55 and recommendation = BUY
+- [ ] GLXY $263k single-print scenario produces HOLD (single prints must not auto-BUY)
 - [ ] EBAY $180k scenario produces HOLD
 - [ ] LYB $120k scenario produces HOLD
 - [ ] All existing `test_composite_signal_engine.py` tests updated to new weight split
 - [ ] New parametrized test: `test_tier_relative_flow_score[WHALE/INSTITUTIONAL/LARGE/RETAIL]`
 - [ ] New test: `test_buy_threshold_by_tier` — each tier hits BUY at exactly its threshold
+- [ ] New test: `test_single_print_hold_across_tiers` — single-print episodes stay HOLD at all tier levels
 
 ---
 
@@ -699,5 +768,5 @@ Exact execution order. Do not start a story until everything above it in the sam
 
 ---
 
-*Last updated: 2026-05-01 — S6 completed via PR #54. Sprint 4 added: S9 (IMMEDIATE FIX — tier-relative composite score normalization), S10 (underlying_price + OTM factor, scoped after S9), S11 (full composite activation with backtest + sector, future). Panel deliberation required before S9 implementation begins.*
-*Version: 4.0*
+*Last updated: 2026-05-01 — S6 completed via PR #54. Sprint 4 added: S9 (IMMEDIATE FIX — tier-relative composite score normalization), S10 (underlying_price + OTM factor, scoped after S9), S11 (full composite activation with backtest + sector, future). Panel deliberation required before S9 implementation begins. S9 deliberation points expanded 2026-05-01: GLXY single-print analysis added to scenario section (single-print HOLD behavior is general, not ticker-specific); INSTITUTIONAL ceiling review added to deliberation point 1; Vol/OI unified flow_quality_factor documented as post-S9 deliberation in point 2; contract-size blind spot documented as architectural concern. All deliberation points are general formula concerns — specific trade examples are illustrative only.*
+*Version: 4.1*
