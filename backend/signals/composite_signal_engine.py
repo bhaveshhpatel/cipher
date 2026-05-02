@@ -7,7 +7,7 @@ Composite formula overhaul:
   - strong_sentiment gate: flow_s *= 0.80 when latest event is not strongly directional.
   - episode_influence_tier() uses episode total_premium, not event-level influence_tier.
   - composite_score_ceiling=0.90 documented and exposed in bus payload (sector_score reserved).
-  - When sector_score is wired (S5 ladder context), composite_score_ceiling must be removed.
+  - When sector_score is wired (S5 ladder context), COMPOSITE_SCORE_CEILING must be updated.
 
 backtest_score field is preserved on CompositeSignal so callers do not break,
 but its value is always 0.0 until S8 lands.
@@ -15,6 +15,12 @@ but its value is always 0.0 until S8 lands.
 from __future__ import annotations
 from dataclasses import dataclass
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
+
+# ---------------------------------------------------------------------------
+# Ceiling constant — import this in tradier_stream.py; never emit a literal 0.90
+# Update this value when sector_score activates (S5 wire-up) or S8 backtest lands.
+# ---------------------------------------------------------------------------
+COMPOSITE_SCORE_CEILING: float = 0.90
 
 
 @dataclass
@@ -114,7 +120,7 @@ def build_composite(
         premium_tier_score    * 0.15
         sector_score          * 0.10   (reserved — 0.0 until S5 ladder wired in)
 
-    While sector_score == 0.0, the maximum achievable composite_score is 0.90.
+    While sector_score == 0.0, the maximum achievable composite_score is COMPOSITE_SCORE_CEILING.
     Do NOT redistribute the reserved 0.10 weight. Frontend consumers treat
     scores > 0.85 as effectively maximum conviction in the pre-ladder period.
     """
@@ -134,7 +140,7 @@ def build_composite(
     prem_t = premium_tier_score(ep)
 
     # sector_score reserved — activates when S5 ladder context is wired into S6.
-    # NOTE: while sector_s == 0.0, maximum achievable composite_score is 0.90.
+    # NOTE: while sector_s == 0.0, maximum achievable composite_score is COMPOSITE_SCORE_CEILING.
     # This is intentional. Do not redistribute the 0.10 weight.
     sector_s = 0.0
 
@@ -167,7 +173,7 @@ def build_composite(
         f"premium tier {prem_t:.0%}. "
         f"{'Accelerating flow detected. ' if ep.is_accelerating else ''}"
         f"Composite: {comp:.0%} -> {rec}. "
-        f"[ceiling=0.90 until sector_score active]"
+        f"[ceiling={COMPOSITE_SCORE_CEILING} until sector_score active]"
     )
 
     return CompositeSignal(

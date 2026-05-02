@@ -120,7 +120,7 @@ Fix (S6-DEMO-MODE 2026-05-01):
 
 Fix (S6-COMPOSITE-PAYLOAD 2026-05-01):
   Composite bus payload updated with S6 fields:
-    - composite_score_ceiling: 0.90 (explicit until sector_score activates)
+    - composite_score_ceiling: COMPOSITE_SCORE_CEILING (explicit until sector_score activates)
     - order_side: ev.order_side
     - strong_sentiment: ev.strong_sentiment
     - execution_mechanic: ev.execution_mechanic
@@ -128,6 +128,15 @@ Fix (S6-COMPOSITE-PAYLOAD 2026-05-01):
   Episode block updated:
     - influence_tier: episode_influence_tier(sig_ep) using episode premium
       (replaces ev.influence_tier which was event-level, not episode-level)
+
+Fix (S6-PRE-MERGE 2026-05-01):
+  Item 1: COMPOSITE_SCORE_CEILING constant imported from composite_signal_engine;
+          literal 0.90 replaced in both live and demo paths.
+  Item 4: log.warning added on all three getattr fallback paths (order_side,
+          strong_sentiment, execution_mechanic) so parser regressions surface
+          in Railway logs instead of silently emitting fallback values.
+  Item 5: Demo mode ceiling comment corrected from '# capped at 0.85 (pre-sector ceiling)'
+          to '# demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)'.
 """
 import asyncio
 import logging
@@ -145,7 +154,7 @@ from parsers.options_flow_parser import parse_tradier_trade
 from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
-from signals.composite_signal_engine import build_composite, episode_influence_tier
+from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
 
 log = logging.getLogger("tradier_stream")
@@ -651,6 +660,23 @@ async def _process_trade(raw: dict):
         ev.fill_price, ev.size, ev.premium, ev.trade_type,
     )
 
+    # S6-PRE-MERGE (Item 4): getattr guards with warnings so parser regressions
+    # surface in Railway logs rather than silently emitting fallback values.
+    _order_side = getattr(ev, "order_side", None)
+    if _order_side is None:
+        log.warning("[composite] ev missing order_side for %s — defaulting to UNKNOWN", occ_symbol)
+        _order_side = "UNKNOWN"
+
+    _strong_sentiment = getattr(ev, "strong_sentiment", None)
+    if _strong_sentiment is None:
+        log.warning("[composite] ev missing strong_sentiment for %s — defaulting to False", occ_symbol)
+        _strong_sentiment = False
+
+    _execution_mechanic = getattr(ev, "execution_mechanic", None)
+    if _execution_mechanic is None:
+        log.warning("[composite] ev missing execution_mechanic for %s — defaulting to AMBIGUOUS_LONG", occ_symbol)
+        _execution_mechanic = "AMBIGUOUS_LONG"
+
     try:
         await asyncio.wait_for(
             persist_flow_event({
@@ -678,9 +704,9 @@ async def _process_trade(raw: dict):
                 "underlying_price":     ev.underlying_price,
                 "occ_symbol":           occ_symbol,
                 "is_synthetic_quote":   ev.is_synthetic_quote,
-                "order_side":           getattr(ev, "order_side", "UNKNOWN"),
-                "strong_sentiment":     getattr(ev, "strong_sentiment", False),
-                "execution_mechanic":   getattr(ev, "execution_mechanic", "AMBIGUOUS_LONG"),
+                "order_side":           _order_side,
+                "strong_sentiment":     _strong_sentiment,
+                "execution_mechanic":   _execution_mechanic,
             }),
             timeout=_PERSIST_TIMEOUT,
         )
@@ -805,16 +831,16 @@ async def _process_trade(raw: dict):
                     "ticker":                  composite.ticker,
                     "recommendation":          composite.recommendation,
                     "composite_score":         composite.composite_score,
-                    "composite_score_ceiling": 0.90,   # S6: explicit until sector_score activates
+                    "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
                     "flow_score":              composite.flow_score,
                     "backtest_score":          composite.backtest_score,
                     "volume_premium_factor":   composite.volume_premium_factor,
                     "premium_tier_score":      composite.premium_tier_score,
                     "reasoning":               composite.reasoning,
                     "alert_level":             alert_level,
-                    "order_side":              getattr(ev, "order_side", "UNKNOWN"),
-                    "strong_sentiment":        getattr(ev, "strong_sentiment", False),
-                    "execution_mechanic":      getattr(ev, "execution_mechanic", "AMBIGUOUS_LONG"),
+                    "order_side":              _order_side,
+                    "strong_sentiment":        _strong_sentiment,
+                    "execution_mechanic":      _execution_mechanic,
                 },
                 "episode": {
                     "contract_type":   sig_ep.contract_type,
@@ -881,7 +907,7 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["last_tick_at"] = _time.time()
             await bus.publish_all(signal)
 
-            composite_score = round(rng.uniform(0.40, 0.85), 3)  # capped at 0.85 (pre-sector ceiling)
+            composite_score = round(rng.uniform(0.40, 0.85), 3)  # demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)
             rec = "BUY"  if composite_score >= 0.65 and ctype == "CALL" else \
                   "SELL" if composite_score >= 0.65 and ctype == "PUT"  else "HOLD"
 
@@ -892,7 +918,7 @@ async def _demo_mode_once(symbols: list[str]):
                         "ticker":                  ticker,
                         "recommendation":          rec,
                         "composite_score":         composite_score,
-                        "composite_score_ceiling": 0.90,
+                        "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
                         "flow_score":              round(rng.uniform(0.4, 0.9), 3),
                         "backtest_score":          0.0,   # S8 reserved
                         "volume_premium_factor":   round(rng.uniform(0.3, 0.8), 3),
