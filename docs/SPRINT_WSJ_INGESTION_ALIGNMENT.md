@@ -112,6 +112,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 - `below_min_premium` = clean filter drop (valid data, intentional gate)
 
 **QA-Q3: `"below_min_premium": 0` must be in `_stats` init block at module level**
+- Key must exist before first tick arrives — no `KeyError` from `/health/stream` on cold start
 
 #### Acceptance Criteria
 - [x] `_MIN_EVENT_PREMIUM = 10_000` defined at module level in `options_flow_parser.py`
@@ -142,9 +143,268 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 - Supabase migration — insert 9 new rows into `ingestion_config` table
 - Frontend: new admin panel card (separate frontend story; backend ships first)
 
+#### Context
+`_DEFAULT_DTE_PREMIUM_TIERS` is hardcoded in `repetition_accumulator.py` as a module-level constant. There is no mechanism to change floors without a code deploy. This is low risk while the system is early, but as Cipher matures there are legitimate use cases for an operator to dial signal sensitivity up or down — e.g., switching to a permissive preset during low-volatility periods to capture smaller institutional positioning.
+
+The `_MIN_EVENT_PREMIUM` scalar from ING-002 also belongs in this story's scope — wire it together rather than adding a second partial config story later.
+
+**Why named presets, not raw field editing:**
+Eight interdependent DTE floors with no validation create a footgun. A misconfigured floor silently changes which episodes qualify, changing signal volume, which is hard to attribute without strong observability. Named presets constrain the decision surface: the operator chooses a validated methodology, not raw numbers. Custom mode exists for deliberate expert use with full awareness.
+
+#### Preset Definitions
+
+**WSJ-Strict (default — current hardcoded values):**
+```python
+_PRESET_WSJ_STRICT: Dict[int, Tuple[float, float]] = {
+    7:    (50_000,    25_000),
+    30:   (500_000,   100_000),
+    90:   (1_000_000, 500_000),
+    9999: (2_000_000, 1_000_000),
+}
+```
+
+**WSJ-Permissive (half the strict T1 floors; T2/T3 column = ~half of strict T2/T3):**
+```python
+_PRESET_WSJ_PERMISSIVE: Dict[int, Tuple[float, float]] = {
+    7:    (25_000,   10_000),
+    30:   (100_000,  50_000),
+    90:   (500_000,  250_000),
+    9999: (1_000_000, 500_000),
+}
+```
+Rationale: permissive T1 floors equal the current strict T2/T3 floors — consistent internal logic. Permissive T2/T3 floors are half again. SA deliberation required to confirm these values before hardcoding.
+
+**Custom:** resolves floor values from 8 individual `ingestion_config` keys (see below).
+
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
 
-*(Full deliberation questions preserved — see previous sprint doc version or run deliberation session before starting.)*
+---
+
+##### Senior Architect (SA)
+
+**SA-Q1: Preset switch — live accumulator reload vs. next cold-start only**
+
+When an operator switches from WSJ-Strict to WSJ-Permissive, do the new floors apply immediately (live reload path calling `accumulator.set_dte_premium_tiers()`) or only after the next service restart?
+
+Trade-offs:
+- **Live reload:** operator can see immediate signal rate change. Risk: accumulator is stateful — existing in-flight episodes have accumulated premium under the old floor. Switching floors mid-episode could cause an episode to retroactively pass or fail Gate 6 on the next tick. Acceptable for an enrichment system; dangerous if episodes are used for immediate trade routing.
+- **Next cold-start only:** zero complexity, zero risk. Operator must restart the stream worker to apply new floors. Acceptable for a P2 admin feature.
+
+**Decision required: Live reload or cold-start-only?**
+
+**SA-Q2: Preset stored in `ingestion_config` key/value table vs. a new `ingestion_presets` table**
+
+Current `ingestion_config` is a flat key/value string store with no validation. Storing `DTE_TIER_PRESET = "wsj-strict"` as a single key works. But if `Custom` mode is selected, 8 additional keys must also be coherent (e.g., `dte_floor_dte7_t1` must be > `dte_floor_dte7_t23`). The flat K/V table has no cross-key validation.
+
+Options:
+- **A (recommended):** Store preset name in `DTE_TIER_PRESET`. If `custom`, read 8 individual keys. Validate floor ordering in `get_dte_premium_tiers()` at load time — log ERROR and fall back to WSJ-Strict if ordering is violated. No new table.
+- **B:** New `ingestion_presets` JSONB table. More structured; adds migration complexity.
+
+**Decision required: Option A or B?**
+
+**SA-Q3: `_MIN_EVENT_PREMIUM` in same story or separate?**
+
+The original ING-002-CONFIG scope was only `_MIN_EVENT_PREMIUM`. This story expands to DTE presets. Confirm: wire `min_event_premium` through `ingestion_config` in this same story (single config load call at startup covers both), or defer `_MIN_EVENT_PREMIUM` config to a third micro-story?
+
+Recommendation: same story — the loader (`get_dte_premium_tiers()`) and the config init path are the same code touched. Doing both in one PR is cheaper than two half-stories.
+
+**Decision required: Same PR or separate?**
+
+---
+
+##### Principal Backend Engineer (PBE)
+
+**PBE-Q1: Import-time vs. async load for `get_dte_premium_tiers()`**
+
+`get_config()` in `ingestion_config.py` is `async`. `_DEFAULT_DTE_PREMIUM_TIERS` is available synchronously at import time. The accumulator is currently instantiated synchronously in `tradier_stream.py` at module level.
+
+Two options:
+- **A:** `get_dte_premium_tiers()` is a sync function that calls `get_config()` via `asyncio.run()` — acceptable at startup (not in the hot path), but `asyncio.run()` inside an already-running async context (FastAPI lifespan) will raise `RuntimeError`.
+- **B (recommended):** `get_dte_premium_tiers()` returns the hardcoded preset synchronously at module-level init, then the lifespan startup hook calls `accumulator.set_dte_premium_tiers(await get_dte_premium_tiers_async())` to wire in the DB-sourced preset. Same two-phase pattern already used for `set_tier_map()`.
+
+**Decision required: Confirm Option B two-phase load is the correct pattern.**
+
+**PBE-Q2: Accumulator singleton is module-level in `tradier_stream.py` — can `set_dte_premium_tiers()` be added?**
+
+`set_tier_map()` already exists on `RepetitionAccumulator` and uses `threading.Lock`. The same pattern extends naturally to `set_dte_premium_tiers()`:
+```python
+def set_dte_premium_tiers(self, tiers: Dict[int, Tuple[float, float]]) -> None:
+    with self._tier_map_lock:  # reuse existing lock — tiers + tier_map reads are co-guarded
+        self.dte_premium_tiers = tiers
+        self._max_dte_key = max(tiers) if tiers else None
+```
+Confirm: reusing `_tier_map_lock` for both `_tier_map` and `dte_premium_tiers` is safe (same lock; no deadlock risk since neither holder calls back into the other).
+
+**Decision required: Confirm lock reuse pattern.**
+
+**PBE-Q3: `ingestion_config` cache TTL is 60 seconds — does this create an acceptable propagation delay for preset switches?**
+
+When admin switches preset via `POST /api/admin/ingestion/dte-tiers`, `update_config()` already sets `_cache_ts = 0.0` (invalidates cache). The next `get_config()` call fetches fresh. If live reload is chosen (SA-Q1), the admin endpoint calls `accumulator.set_dte_premium_tiers()` directly after writing to DB — no TTL wait. If cold-start-only is chosen, TTL is irrelevant. Either way, no issue.
+
+**Confirm: No TTL race condition regardless of SA-Q1 decision.**
+
+**PBE-Q4: Validation of Custom floor ordering**
+
+If `DTE_TIER_PRESET = "custom"`, the loader reads 8 keys and constructs the dict. Required invariant per DTE bucket: `T1_floor >= T2_T3_floor` (strict floor must be >= permissive floor). If violated (e.g., operator sets `dte_floor_dte7_t1 = 20_000` but `dte_floor_dte7_t23 = 30_000`), the gate logic silently inverts (T1 gets a lower floor than T2/T3). The loader must validate and fall back to WSJ-Strict with a logged ERROR if any bucket fails this invariant.
+
+**Confirm: Validation logic belongs in `get_dte_premium_tiers()`, not in the admin endpoint, so DB direct edits are also caught.**
+
+---
+
+##### Lead QA (QA)
+
+**QA-Q1: Preset load test matrix (required at startup)**
+
+| Scenario | `DTE_TIER_PRESET` DB value | Expected result |
+|---|---|---|
+| Normal | `"wsj-strict"` | Returns `_PRESET_WSJ_STRICT` |
+| Normal | `"wsj-permissive"` | Returns `_PRESET_WSJ_PERMISSIVE` |
+| Custom valid | `"custom"` + all 8 keys present + T1>=T2/T3 per bucket | Returns constructed dict |
+| Custom invalid | `"custom"` + `dte7_t1=20k`, `dte7_t23=30k` (inverted) | Logs ERROR, returns `_PRESET_WSJ_STRICT` |
+| Unknown preset | `"wsj-aggro"` (typo) | Logs WARNING, returns `_PRESET_WSJ_STRICT` |
+| DB unavailable | Supabase timeout | Returns `_PRESET_WSJ_STRICT` (hardcoded fallback) |
+| Missing key | `DTE_TIER_PRESET` row absent from DB | Returns `_PRESET_WSJ_STRICT` (default in `_DEFAULTS`) |
+
+All 7 cases are required tests.
+
+**QA-Q2: Admin endpoint test matrix**
+
+`POST /api/admin/ingestion/dte-tiers` with `{"preset": "wsj-permissive"}`:
+- Assert 200 OK
+- Assert `ingestion_config` row updated: `DTE_TIER_PRESET = "wsj-permissive"`
+- If live reload (SA-Q1 decision): assert `accumulator.dte_premium_tiers` now equals `_PRESET_WSJ_PERMISSIVE`
+- Assert activity log entry written: `action = "ingestion_config.dte_preset.update"`, `details.preset = "wsj-permissive"`
+
+`POST /api/admin/ingestion/dte-tiers` with `{"preset": "unknown-value"}`:
+- Assert 422 Unprocessable Entity
+
+Non-admin user hitting endpoint:
+- Assert 403 Forbidden
+
+**QA-Q3: Regression — existing accumulator tests must not break**
+
+`_DEFAULT_DTE_PREMIUM_TIERS` is imported by `tradier_stream.py` tests. Confirm the new preset dicts (`_PRESET_WSJ_STRICT`, `_PRESET_WSJ_PERMISSIVE`) do not shadow or replace the original constant — `_DEFAULT_DTE_PREMIUM_TIERS` should be aliased to `_PRESET_WSJ_STRICT` so all existing import references continue to work:
+```python
+# In repetition_accumulator.py:
+_PRESET_WSJ_STRICT = { ... }
+_DEFAULT_DTE_PREMIUM_TIERS = _PRESET_WSJ_STRICT  # backward-compat alias — do not remove
+```
+
+**QA-Q4: `/health/stream` must expose active preset name**
+
+`get_stats()` should include `"dte_tier_preset": "wsj-strict"` (or whichever is active). This gives Railway log observers immediate visibility into which methodology is running without an admin panel visit.
+
+---
+
+#### Implementation Plan (sequential, after deliberation sign-off)
+
+**Step 1 — `repetition_accumulator.py`**
+- Define `_PRESET_WSJ_STRICT`, `_PRESET_WSJ_PERMISSIVE`
+- Alias `_DEFAULT_DTE_PREMIUM_TIERS = _PRESET_WSJ_STRICT` (backward compat)
+- Add `set_dte_premium_tiers()` method with lock (PBE-Q2 pattern)
+
+**Step 2 — `services/ingestion_config.py`**
+- Add to `_DEFAULTS`:
+  ```python
+  "DTE_TIER_PRESET":         "wsj-strict",
+  "min_event_premium":       10_000,
+  "dte_floor_dte7_t1":       50_000,
+  "dte_floor_dte7_t23":      25_000,
+  "dte_floor_dte30_t1":      500_000,
+  "dte_floor_dte30_t23":     100_000,
+  "dte_floor_dte90_t1":      1_000_000,
+  "dte_floor_dte90_t23":     500_000,
+  "dte_floor_leaps_t1":      2_000_000,
+  "dte_floor_leaps_t23":     1_000_000,
+  ```
+- Add all 9 keys to `_EXPECTED_DB_KEYS`
+- Add `async get_dte_premium_tiers() -> Dict[int, Tuple[float, float]]` with full validation logic (QA-Q1 cases)
+
+**Step 3 — `services/tradier_stream.py`**
+- Keep synchronous module-level instantiation using `_PRESET_WSJ_STRICT` (no change)
+- In lifespan startup hook (after registry warms): `accumulator.set_dte_premium_tiers(await get_dte_premium_tiers())`
+- Expose `dte_tier_preset` string in `_stats` / `get_stats()` (QA-Q4)
+
+**Step 4 — `routers/admin.py`**
+```python
+class DteTierPresetUpdate(BaseModel):
+    preset: str  # "wsj-strict" | "wsj-permissive" | "custom"
+
+_VALID_PRESETS = {"wsj-strict", "wsj-permissive", "custom"}
+
+@router.get("/ingestion/dte-tiers")
+async def get_dte_tier_config(admin: TokenData = Depends(_require_admin)):
+    """Return active preset name + resolved floor table."""
+    from services.ingestion_config import get_config, get_dte_premium_tiers
+    cfg = await get_config()
+    active_preset = cfg.get("DTE_TIER_PRESET", "wsj-strict")
+    resolved_tiers = await get_dte_premium_tiers()
+    return {"active_preset": active_preset, "resolved_tiers": resolved_tiers}
+
+@router.post("/ingestion/dte-tiers")
+async def set_dte_tier_preset(
+    body: DteTierPresetUpdate,
+    request: Request,
+    admin: TokenData = Depends(_require_admin),
+):
+    if body.preset not in _VALID_PRESETS:
+        raise HTTPException(status_code=422, detail=f"Invalid preset '{body.preset}'. Valid: {sorted(_VALID_PRESETS)}")
+    from services.ingestion_config import update_config, get_dte_premium_tiers
+    ok = await update_config("DTE_TIER_PRESET", body.preset, updated_by=admin.email)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update DTE_TIER_PRESET")
+    # Live reload (if SA-Q1 decision = live):
+    from services.tradier_stream import accumulator
+    new_tiers = await get_dte_premium_tiers()
+    accumulator.set_dte_premium_tiers(new_tiers)
+    await log_action(admin.email, "ingestion_config.dte_preset.update", {"preset": body.preset}, _get_ip(request))
+    return {"ok": True, "preset": body.preset, "resolved_tiers": new_tiers}
+```
+
+**Step 5 — Supabase Migration**
+
+```sql
+-- Migration: add_ingestion_config_dte_preset_rows
+INSERT INTO ingestion_config (key, value, value_type, description) VALUES
+  ('DTE_TIER_PRESET',       'wsj-strict', 'string',  'Active DTE premium floor preset. Valid: wsj-strict | wsj-permissive | custom'),
+  ('min_event_premium',     '10000',      'float',   'Per-event minimum premium floor at parser (ING-002). Hard gate before accumulation.'),
+  ('dte_floor_dte7_t1',     '50000',      'float',   'Custom preset: T1 floor for DTE <= 7'),
+  ('dte_floor_dte7_t23',    '25000',      'float',   'Custom preset: T2/T3 floor for DTE <= 7'),
+  ('dte_floor_dte30_t1',    '500000',     'float',   'Custom preset: T1 floor for DTE 8-30'),
+  ('dte_floor_dte30_t23',   '100000',     'float',   'Custom preset: T2/T3 floor for DTE 8-30'),
+  ('dte_floor_dte90_t1',    '1000000',    'float',   'Custom preset: T1 floor for DTE 31-90'),
+  ('dte_floor_dte90_t23',   '500000',     'float',   'Custom preset: T2/T3 floor for DTE 31-90'),
+  ('dte_floor_leaps_t1',    '2000000',    'float',   'Custom preset: T1 floor for DTE > 90 (LEAPS)'),
+  ('dte_floor_leaps_t23',   '1000000',    'float',   'Custom preset: T2/T3 floor for DTE > 90 (LEAPS)')
+ON CONFLICT (key) DO NOTHING;
+```
+
+**Step 6 — Frontend admin panel card (separate frontend story)**
+- 3-button toggle: **WSJ-Strict** / **WSJ-Permissive** / **Custom**
+- When Custom: 4x2 editable table (DTE bucket rows x T1 / T2-T3 columns), values editable inline
+- Active preset: green badge
+- Warning banner when not WSJ-Strict: *"Non-default preset active. WSJ-Strict is the validated methodology."*
+- Calls `GET /api/admin/ingestion/dte-tiers` on load; `POST /api/admin/ingestion/dte-tiers` on change
+- Custom cell updates use existing `PATCH /api/admin/ingestion/config` endpoint (no new endpoint needed)
+
+---
+
+#### Acceptance Criteria
+- [ ] `_PRESET_WSJ_STRICT` and `_PRESET_WSJ_PERMISSIVE` defined in `repetition_accumulator.py`
+- [ ] `_DEFAULT_DTE_PREMIUM_TIERS` aliased to `_PRESET_WSJ_STRICT` — all existing import references unbroken
+- [ ] `set_dte_premium_tiers()` method added to `RepetitionAccumulator` with lock
+- [ ] `get_dte_premium_tiers()` async loader in `ingestion_config.py` with all 7 QA-Q1 scenarios handled
+- [ ] T1 >= T2/T3 invariant validated per bucket for custom preset; violation falls back to WSJ-Strict with logged ERROR
+- [ ] 9 new `ingestion_config` rows inserted via migration; `validate_ingestion_config()` reports all keys present on startup
+- [ ] `GET /api/admin/ingestion/dte-tiers` returns active preset + resolved floor table
+- [ ] `POST /api/admin/ingestion/dte-tiers` validates preset name (422 on unknown), writes to DB, live-reloads accumulator (per SA-Q1 decision)
+- [ ] Activity log entry written on every preset change
+- [ ] `"dte_tier_preset"` key in `/health/stream` response showing active preset name
+- [ ] `min_event_premium` wired through `ingestion_config` in same PR; `_MIN_EVENT_PREMIUM` uses DB value with hardcoded fallback
+- [ ] All 7 QA-Q1 test cases pass
+- [ ] All QA-Q2 admin endpoint test cases pass
+- [ ] No regression in existing accumulator or stream tests
+- [ ] Frontend card ships as follow-on in same sprint window (not blocking backend merge)
 
 ---
 
@@ -435,4 +695,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 deliberation complete, branch `ing/s4-underlying-price-fallback` in progress) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 pre-merge panel findings resolved — ING-002-CONFIG deliberation restored, test expiry date fixed) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
