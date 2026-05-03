@@ -4,6 +4,97 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## ING-005 — OTM Band Threshold Misalignment: Registry ↔ Accumulator
+
+**Date:** 2026-05-03
+**Severity:** P1 — signal quality; T1 contracts at 13–20% OTM incorrectly penalised by 1.5× deep OTM multiplier despite being valid per registry tier filter
+**Branch:** `ing/s5-otm-threshold-align`
+**Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing005_otm_threshold.py`
+
+### Root Cause
+
+`_classify_otm()` in `repetition_accumulator.py` uses a hardcoded `DEEP_OTM` threshold of 12%:
+
+```python
+# BEFORE — hardcoded threshold misaligned with registry
+if otm_pct <= 0.02:   return "ATM"
+if otm_pct <= 0.12:   return "STANDARD_OTM"
+return "DEEP_OTM"      # anything > 12% penalised 1.5×
+```
+
+The registry's per-tier OTM filter allows up to ~20% OTM for T1 contracts. A T1 contract at 18% OTM legitimately passes the registry's T1 OTM filter and arrives at the accumulator as a valid qualified tick — but `_classify_otm` classifies it as `DEEP_OTM` and applies a `1.5×` multiplier to the premium floor. For a T1 DTE≤7 contract that means an effective floor of $75,000 instead of $50,000, silently penalising valid institutional flow.
+
+Root cause was compounded by ING-004: before `underlying_price` was reliably populated (registry fallback), OTM classification was often returning `UNKNOWN` (underlying=0.0), which skipped the penalty anyway. Post-ING-004 fix, `underlying_price` is now correctly populated — exposing this pre-existing threshold mismatch in production.
+
+### Deliberation Outcomes (3-way panel, 2026-05-03)
+
+**Option A — Retire deep OTM multiplier as default** ✅ CHOSEN
+**Option B — Pass tier `atm_pct` into accumulator** ❌ REJECTED (layer inversion)
+**Option C — Bump hardcoded `0.12` → `0.20`** ❌ REJECTED (T1-specific patch; still misfires on T2/T3)
+
+**SA-Q1 — Why Option A:**
+The registry's per-tier OTM filter is the correct and purpose-built place for OTM qualification. If a tick passes the registry filter it belongs within the methodology's OTM envelope for that tier. Penalising it again in the accumulator with a 1.5× multiplier is double-gating on the same axis with inconsistent thresholds — contradictory policy, not defence-in-depth. The defensive 1.5× default was implicitly compensating for the ING-004 underlying_price=0 bug. That bug is fixed. The penalty is now actively harmful.
+
+**SA-Q2 — Option B layer violation confirmed:**
+Passing tier `atm_pct` from the registry into the accumulator creates a coupling from the signal layer back to registry internals. The accumulator must not know about tier definitions to set its own gate thresholds. Rejected.
+
+**PBE-Q1 — Code change scope (minimal):**
+- Change `deep_otm_multiplier` default: `1.5` → `1.0`
+- Do NOT remove the param — backward compat (callers passing `1.5` explicitly still work)
+- Do NOT change Gate 3 logic block structure — the `> 1.0` guard makes it a no-op at default
+- Keep `_classify_otm` static method intact — still provides observable OTM band data
+- Audit all explicit `deep_otm_multiplier=1.5` usages in test suite; update assertions where they assumed the default
+
+**QA-Q1 — Required regression matrix (3 cases):**
+
+| Case | Ticker | DTE | OTM% | Premium | Expected (after fix) |
+|---|---|---|---|---|---|
+| E-1 | T1 | 5 | 18% | $60,000 | PASSES — no deep OTM penalty |
+| E-2 | T2 | 15 | 14% | $110,000 | PASSES — no deep OTM penalty |
+| E-3 | T3 | 60 | 9% | $510,000 | PASSES — no deep OTM penalty |
+
+All 3 were previously failing due to DEEP_OTM penalty at 1.5× default.
+
+**QA-Q2 — `test_classify_otm` tests retained, not deleted:**
+`_classify_otm` static method is kept. Only tests asserting the *default* 1.5× penalty must be updated. Tests with explicit `deep_otm_multiplier=1.5` constructor arg continue working unchanged.
+
+**QA-Q3 — No new counter required:**
+`otm_band` is computed but no `/health/stream` counter added for this story. Observability deferred to future sprint if needed.
+
+### Fix
+
+**`backend/signals/repetition_accumulator.py`:**
+
+```python
+# BEFORE
+deep_otm_multiplier:  float = 1.5,
+
+# AFTER
+deep_otm_multiplier:  float = 1.0,  # ING-005: registry pre-filter is authoritative OTM gate
+```
+
+The Gate 3 logic block in `ingest_tick` requires no structural change:
+```python
+# This block is now a no-op at default (1.0 > 1.0 == False).
+# Callers passing deep_otm_multiplier=1.5 explicitly still apply the penalty.
+if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+    deep_floor = effective_min_prem * self.deep_otm_multiplier
+    if ep.total_premium < deep_floor:
+        return None
+else:
+    if ep.total_premium < effective_min_prem:
+        return None
+```
+
+### Outcome
+
+- T1 contracts at 13–20% OTM no longer incorrectly penalised
+- `deep_otm_multiplier` param retained for explicit opt-in use
+- Zero structural changes to Gate 3 — risk of regression is minimal
+- `_classify_otm` method preserved for future signal enrichment use
+
+---
+
 ## ING-003 — Cold-Start DTE Floor Bypass at Accumulator Instantiation
 
 **Date:** 2026-05-03
