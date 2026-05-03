@@ -18,7 +18,7 @@ Spec (STORY-STEPS_ING.md § ING-003 AC):
   AC-7  _stats["below_dte_floor"] increments once per filtered trade.
   AC-8  get_stats() exposes below_dte_floor key; does NOT expose parse_failed.
 
-Test IDs: D-01 … D-10
+Test IDs: D-01 … D-13
 
 Panel deliberation findings (ING-003 pre-merge, 2026-05-03):
   D-05  Cold-start lottery ticket (SA-Q1): fill=12.00, size=1 → premium=$1,200.
@@ -30,13 +30,25 @@ Panel deliberation findings (ING-003 pre-merge, 2026-05-03):
         T3 floor (premium=$10,000) must pass.
   D-10  Counter separation (QA-Q1): below_dte_floor must NOT increment on
         T1/T2/T3 passing trades; parse_failed must NOT change on sentinel.
+  D-11  Accumulator cold-start T1 drop (PBE-F1 / QA-F1 blocker):
+        ingest_tick() with DTE=5, premium=$30k, unknown ticker → None.
+        T1 floor for DTE≤7 = $50k. $30k is below floor. Must be dropped.
+  D-12  Accumulator cold-start T1 pass (PBE-F1 / QA-F1 blocker):
+        ingest_tick() with DTE=5, premium=$60k, unknown ticker → RepetitionEpisode.
+        $60k >= $50k T1 floor for DTE≤7. Must return episode.
+  D-13  Accumulator post-warmup tier override (QA-Q2 blocker):
+        After set_tier_map({"TESTTICKER": 2}), DTE=5, premium=$30k → RepetitionEpisode.
+        T2 floor for DTE≤7 = $25k. $30k >= $25k. Must pass after tier injection.
 """
+import asyncio
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
 from parsers.options_flow_parser import OptionsFlowEvent, parse_tradier_trade
 import parsers.options_flow_parser as _parser_module
+from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -66,6 +78,54 @@ def _reset_stats():
     """Zero the DTE-floor counter so tests start from a known baseline."""
     if "below_dte_floor" in _parser_module._stats:
         _parser_module._stats["below_dte_floor"] = 0
+
+
+def _make_event(
+    ticker="UNKNOWNTICKER",
+    contract_type="CALL",
+    strike=500.0,
+    expiry="2026-06-20",
+    premium=60_000.0,
+    dte=5,
+    underlying_price=500.0,
+    trade_type="TRADE",
+):
+    """
+    Build a minimal OptionsFlowEvent-compatible dict for accumulator tests.
+    Uses a dict (not OptionsFlowEvent) so tests have no dependency on the
+    parser layer and directly exercise the accumulator's _DictEventWrapper path.
+    """
+    return {
+        "ticker":           ticker,
+        "contract_type":    contract_type,
+        "strike":           strike,
+        "expiry":           expiry,
+        "premium":          premium,
+        "dte":              dte,
+        "underlying_price": underlying_price,
+        "trade_type":       trade_type,
+        "order_side":       "UNKNOWN",
+        "timestamp":        datetime.now(timezone.utc),
+    }
+
+
+def _fresh_accumulator(**kwargs):
+    """
+    Return a RepetitionAccumulator wired exactly as tradier_stream instantiates
+    it after ING-003: _DEFAULT_DTE_PREMIUM_TIERS passed at init, min_trades=1
+    so a single tick can trigger Gate-1 in isolation.
+
+    min_trades=1 (not the default 3) is intentional — these tests verify the
+    DTE-tier gate (Gate 2), not the count gate (Gate 1). Setting min_trades=1
+    removes Gate-1 as a confounding variable.
+    """
+    return RepetitionAccumulator(
+        window_minutes=30,
+        min_trades=1,
+        min_premium=10_000,
+        dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+        **kwargs,
+    )
 
 
 # ── D-01  T3 at-floor passes (premium == $10,000, size == 10) ────────────────
@@ -260,4 +320,106 @@ def test_D10_stream_parse_failed_unchanged_on_dte_sentinel():
     assert after == before, (
         f"tradier_stream._stats['parse_failed'] must not change on DTE sentinel. "
         f"before={before}, after={after}. Counter separation broken."
+    )
+
+
+# ── D-11  Accumulator cold-start T1 drop (PBE-F1 / QA-F1 blocker) ───────────
+
+def test_D11_accumulator_cold_start_T1_drops_30k():
+    """
+    PBE-F1 / QA-F1 — REQUIRED: exercise ingest_tick() directly, not the parser.
+
+    Setup:
+      - Fresh accumulator with _DEFAULT_DTE_PREMIUM_TIERS (as wired by ING-003).
+      - No tier_map injected → unknown ticker defaults to T1 (strict).
+      - DTE=5, premium=$30,000.
+
+    _DEFAULT_DTE_PREMIUM_TIERS[7] = (50_000, 25_000).
+    T1 floor for DTE≤7 = $50,000.
+    $30,000 < $50,000 → Gate-2 drops the tick.
+
+    Expected: ingest_tick() returns None.
+
+    This is the core cold-start correctness proof for ING-003: before this
+    fix, dte_premium_tiers=None caused _get_episode_min_premium() to fall
+    back to the flat min_premium=$10,000 floor, letting a $30k print through
+    as if it were a T1-qualified institutional event.
+    """
+    acc = _fresh_accumulator()
+    ev  = _make_event(ticker="UNKNOWNTICKER", dte=5, premium=30_000.0)
+    result = asyncio.run(acc.ingest_tick(ev))
+    assert result is None, (
+        f"DTE=5, premium=$30k, unknown ticker (T1 default, floor=$50k): "
+        f"ingest_tick() must return None (dropped). Got {result!r}. "
+        f"ING-003 cold-start DTE-tier gate is not active."
+    )
+
+
+# ── D-12  Accumulator cold-start T1 pass (PBE-F1 / QA-F1 blocker) ───────────
+
+def test_D12_accumulator_cold_start_T1_passes_60k():
+    """
+    PBE-F1 / QA-F1 — REQUIRED: boundary pass case for D-11.
+
+    Setup:
+      - Same fresh accumulator, same unknown ticker → T1 default.
+      - DTE=5, premium=$60,000.
+
+    T1 floor for DTE≤7 = $50,000.
+    $60,000 >= $50,000 → Gate-2 passes.
+
+    Expected: ingest_tick() returns a RepetitionEpisode (not None).
+
+    Confirms the gate has a real boundary: $30k drops (D-11), $60k passes
+    (D-12). Without both cases the test suite cannot distinguish a broken
+    gate from an always-pass or always-drop implementation.
+    """
+    acc = _fresh_accumulator()
+    ev  = _make_event(ticker="UNKNOWNTICKER", dte=5, premium=60_000.0)
+    result = asyncio.run(acc.ingest_tick(ev))
+    assert result is not None, (
+        f"DTE=5, premium=$60k, unknown ticker (T1 default, floor=$50k): "
+        f"ingest_tick() must return a RepetitionEpisode. Got None. "
+        f"ING-003 DTE-tier gate is incorrectly rejecting a qualifying print."
+    )
+    assert result.total_premium == pytest.approx(60_000.0), (
+        f"Episode total_premium must be $60,000. Got {result.total_premium}"
+    )
+
+
+# ── D-13  Accumulator post-warmup tier override (QA-Q2 blocker) ──────────────
+
+def test_D13_accumulator_post_warmup_tier_override_passes_30k():
+    """
+    QA-Q2 — REQUIRED: verify set_tier_map() correctly overrides the T1 default.
+
+    Setup:
+      - Fresh accumulator with _DEFAULT_DTE_PREMIUM_TIERS.
+      - Call set_tier_map({"TESTTICKER": 2}) — simulates registry warmup
+        assigning TESTTICKER to T2.
+      - DTE=5, premium=$30,000.
+
+    _DEFAULT_DTE_PREMIUM_TIERS[7] = (50_000, 25_000).
+    T2 floor for DTE≤7 = $25,000 (col 1).
+    $30,000 >= $25,000 → Gate-2 passes after tier injection.
+
+    Expected: ingest_tick() returns a RepetitionEpisode (not None).
+
+    Without this test, ING-003 cannot be certified: the fix wires the tiers
+    at init but set_tier_map() must also be confirmed to correctly transition
+    from T1-default to the registry-assigned tier after warmup. A broken
+    set_tier_map() (e.g. lock not releasing, wrong dict key) would leave all
+    tickers permanently at T1 after warmup, silently over-filtering T2/T3 flow.
+    """
+    acc = _fresh_accumulator()
+    acc.set_tier_map({"TESTTICKER": 2})
+    ev  = _make_event(ticker="TESTTICKER", dte=5, premium=30_000.0)
+    result = asyncio.run(acc.ingest_tick(ev))
+    assert result is not None, (
+        f"DTE=5, premium=$30k, TESTTICKER tier=T2 (floor=$25k): "
+        f"ingest_tick() must return a RepetitionEpisode after set_tier_map(). "
+        f"Got None. set_tier_map() is not correctly overriding the T1 default."
+    )
+    assert result.total_premium == pytest.approx(30_000.0), (
+        f"Episode total_premium must be $30,000. Got {result.total_premium}"
     )
