@@ -23,7 +23,9 @@ Three-tier accumulation API (C-007 / C-008):
 S4 additions:
   - DTE-adjusted premium floors (dte_premium_tiers)
   - OTM classification: ATM (<=2%), standard OTM (2-12%), deep OTM (>12%)
-  - Deep OTM applies deep_otm_multiplier (default 1.5x) to the floor
+  - deep_otm_multiplier param retained for backward-compat; default changed
+    to 1.0 (no penalty) by ING-005 — registry pre-filter is the authoritative
+    OTM gate post-ING-004. Pass explicit deep_otm_multiplier>1.0 to re-enable.
   - Sweep bypass: len(ep.events)==1 AND SWEEP AND premium >= sweep_bypass_premium
   - min_sweeps gate (in addition to min_trades)
   - dominant_direction property on RepetitionEpisode (premium-weighted)
@@ -68,7 +70,7 @@ _DEFAULT_DTE_PREMIUM_TIERS: Dict[int, Tuple[float, float]] = {
 # _DictEventWrapper — module-level; wraps raw dict ticks so attribute access
 # works identically to OptionsFlowEvent objects throughout the accumulator.
 # Defined here (not inside ingest_tick) to avoid a new class object being
-# allocated on every dict-type tick in the hot path. (Finding 7)
+# allocated on every hot-path dict tick. (Finding 7)
 #
 # NOTE: `d` must be a plain dict. Passing None or a non-dict will raise
 # AttributeError on .get(). Callers are responsible for the isinstance check
@@ -186,7 +188,23 @@ class RepetitionAccumulator:
                               single tick. (Issue 7 resolution — Architect +
                               Principal Engineer deliberation, April 30 2026)
         deep_otm_multiplier:  Multiplier applied to the effective_min_premium when
-                              OTM% > 12%. Default 1.5.
+                              OTM% > 12%. Default 1.0 (no penalty — ING-005
+                              deliberation decision, 2026-05-03).
+
+                              CHANGED from 1.5 to 1.0 by ING-005:
+                              The registry OTM filter is the authoritative
+                              moneyness gate post-ING-004. Contracts already
+                              passed the registry's per-tier atm_pct envelope
+                              before reaching the accumulator. Applying a
+                              second penalty here with an inconsistent threshold
+                              (hardcoded 12% vs. registry's per-tier bands up to
+                              ~20% for T1) was double-gating on the same axis
+                              and incorrectly penalising legitimate T1 prints
+                              at 12-20% OTM.
+
+                              Pass explicit deep_otm_multiplier > 1.0 to
+                              re-enable the penalty (e.g. for backtesting).
+
         dte_premium_tiers:    Dict[int, Tuple[float, float]] mapping DTE upper-bound
                               (inclusive) to (T1_floor, T2_T3_floor). If empty,
                               min_premium is used as fallback.
@@ -213,7 +231,7 @@ class RepetitionAccumulator:
         # S4 params
         min_sweeps:           int   = 0,
         sweep_bypass_premium: float = 0.0,
-        deep_otm_multiplier:  float = 1.5,
+        deep_otm_multiplier:  float = 1.0,   # ING-005: changed from 1.5 — see docstring
         dte_premium_tiers:    Optional[Dict[int, Tuple[float, float]]] = None,
         tier_map:             Optional[Dict[str, int]] = None,
     ):
@@ -389,6 +407,14 @@ class RepetitionAccumulator:
         Thresholds (0.02 and 0.12) are intentionally hardcoded per spec.
         They are NOT configurable via constructor — see Finding 1 note in
         RepetitionAccumulator docstring.
+
+        NOTE (ING-005 / SA-Q2): `_classify_otm()` is retained for forward use
+        in ING-007 pattern scoring and signal metadata enrichment. As of ING-005,
+        the `otm_band` classification is NOT yet written to RepetitionEpisode —
+        that wiring is deferred to ING-007. With deep_otm_multiplier defaulting
+        to 1.0, DEEP_OTM classification no longer triggers a premium floor
+        penalty in production — only the classification label is produced;
+        the penalty application changed (ING-005 deliberation, 2026-05-03).
         """
         if underlying_price <= 0:
             return "UNKNOWN"
@@ -436,7 +462,11 @@ class RepetitionAccumulator:
         Gates applied (in order):
           1. min_trades         — episode event count >= min_trades
           2. DTE-adjusted floor — episode total_premium >= _get_episode_min_premium(ep)
-          3. Deep OTM multiplier— if OTM% > 12%, floor is multiplied by deep_otm_multiplier
+          3. Deep OTM multiplier— if OTM% > 12% AND deep_otm_multiplier > 1.0,
+                                  floor is multiplied by deep_otm_multiplier.
+                                  With default deep_otm_multiplier=1.0 (ING-005),
+                                  this gate is effectively a no-op — registry
+                                  pre-filter is the authoritative OTM gate.
           4. min_sweeps         — episode must contain >= min_sweeps SWEEP events
                                   (bypassed when _is_single_whale_sweep returns True)
 
@@ -497,6 +527,12 @@ class RepetitionAccumulator:
             # using isinstance before float() to avoid TypeError in the hot path.
             # When underlying_price is non-numeric or zero: UNKNOWN band applies
             # -> standard floor, no deep-OTM penalty. (Issue 6 resolution)
+            #
+            # ING-005 (SA-Q1): deep_otm_multiplier defaults to 1.0. The `> 1.0`
+            # guard below is NEVER TRUE at the new default — this entire if-branch
+            # is a dormant backward-compat path in production. It activates only
+            # when an explicit deep_otm_multiplier > 1.0 is passed (e.g. backtesting).
+            # The else-branch (standard floor check) runs on every production tick.
             strike_val = float(ep.strike)
             raw_underlying = getattr(ev_wrapped, "underlying_price", 0.0)
             try:
@@ -506,7 +542,7 @@ class RepetitionAccumulator:
 
             otm_band = self._classify_otm(strike_val, underlying_px)
 
-            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":  # dormant at default 1.0 — ING-005/SA-Q1
                 deep_floor = effective_min_prem * self.deep_otm_multiplier
                 if ep.total_premium < deep_floor:
                     return None
@@ -616,8 +652,8 @@ class RepetitionAccumulator:
 
           CONVICTION accelerating band: unchanged (is_accelerating AND >= 500_000)
             All test suites consistently pin this value.
-            NOTE: at exactly $500K, accelerating → CONVICTION but
-            non-accelerating → ALERT. This is intentional and pinned by
+            NOTE: at exactly $500K, accelerating -> CONVICTION but
+            non-accelerating -> ALERT. This is intentional and pinned by
             test_conviction_accelerating_at_exactly_500k in TestAlertLevel.
         """
         prem = ep.total_premium

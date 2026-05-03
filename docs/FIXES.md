@@ -4,6 +4,83 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## ING-005 — Deep OTM Multiplier Default Changed to 1.0 (Registry Pre-Filter is Authoritative)
+
+**Date:** 2026-05-03
+**Severity:** P1 — silent misalignment; legitimate T1 prints at 12–20% OTM were incorrectly penalised with a 1.5× floor multiplier inconsistent with registry tier bands
+**Branch:** `ing/s5-otm-threshold-align`
+**Files:** `backend/signals/repetition_accumulator.py`
+
+### Root Cause
+
+`RepetitionAccumulator.__init__` defaulted `deep_otm_multiplier=1.5`. Gate 3 in `ingest_tick()` applied this multiplier whenever `_classify_otm()` returned `DEEP_OTM` (OTM% > 12%):
+
+```python
+# BEFORE — 1.5× penalty applied at accumulator for any OTM% > 12%
+deep_otm_multiplier: float = 1.5
+```
+
+The registry's per-tier `atm_pct` bands allow up to ~20% OTM for T1. A T1 contract at 18% OTM legitimately passes the registry's T1 OTM filter — but the accumulator's hardcoded 12% threshold then applied a 1.5× penalty, requiring 1.5× more premium to qualify. Two problems:
+
+1. **Inconsistent thresholds:** registry uses per-tier `atm_pct` (up to ~20% for T1); accumulator used a single hardcoded 12% cutoff for all tiers.
+2. **Double-gating on the same axis:** the registry pre-filter is the correct OTM qualification layer. The accumulator penalty was compensating for the `underlying_price = 0` bug fixed by ING-004 — once ING-004 landed, the registry OTM filter works correctly and the accumulator penalty became redundant and incorrect.
+
+### Deliberation Decisions (3-way panel, 2026-05-03)
+
+**SA-Q1 — Option A chosen: retire deep OTM multiplier as a default**
+- Option B (pass tier `atm_pct` into accumulator) rejected — layer inversion; accumulator would need to know registry tier internals.
+- Option C (bump hardcoded `0.12` → `0.20`) rejected — lazy patch; still wrong for T2/T3 and doesn't fix the root issue.
+- Option A is the correct architectural decision: the registry OTM pre-filter is the authoritative moneyness gate post-ING-004.
+
+**SA-Q2 — Option B violates layer boundaries: confirmed rejected**
+
+**PBE-Q1 — Code change scope: default only**
+- Change `deep_otm_multiplier: float = 1.5` → `deep_otm_multiplier: float = 1.0`.
+- Gate 3 logic block in `ingest_tick()` unchanged structurally — the `> 1.0` guard is never true at the new default, so it naturally reduces to the `else` branch (standard floor check) on every production tick.
+- `_classify_otm()` static method retained — still used for episode enrichment and downstream signal metadata (ING-007 pattern scoring).
+- Backward-compat: callers passing explicit `deep_otm_multiplier=1.5` still work exactly as before.
+
+**PBE-Q2 — No changes to `OptionsFlowEvent` or `_DictEventWrapper`**
+Option B rejected; no tier data needs to flow through event objects.
+
+**QA-Q1 — Required regression test matrix (3 cases)**
+
+| Case | Setup | Expected |
+|---|---|---|
+| E-1: T1 at 18% OTM | T1 ticker, DTE=5, strike 18% above underlying, total_premium=$60k (3 events × $20k) | Passes Gate 3 — no penalty applied. 60k ≥ T1 DTE≤7 floor $50k. |
+| E-2: T2 at 14% OTM | T2 ticker, DTE=15, strike 14% OTM, total_premium=$110k | Passes Gate 3 — no penalty. 110k ≥ T2 DTE≤30 floor $100k. |
+| E-3: T3 at 9% OTM | T3 ticker, DTE=60, strike 9% OTM, total_premium=$510k | Passes Gate 3 — no penalty. 510k ≥ T3 DTE≤90 floor $500k. |
+
+All three cases were previously dropped by the 1.5× penalty. Must pass after this change.
+
+**QA-Q2 — `test_classify_otm` tests: keep, update any asserting default penalty**
+- `_classify_otm()` static method stays — its tests stay green unchanged.
+- Tests using `RepetitionAccumulator()` with default args that assert deep OTM penalty behaviour must be updated: the default no longer applies a penalty. Tests explicitly passing `deep_otm_multiplier=1.5` continue to work.
+
+**QA-Q3 — No new `/health/stream` counter required for this story**
+- `_classify_otm()` still classifies; `otm_band` is still available on the episode for downstream use. No new stat counter in scope.
+
+### Fix
+
+```python
+# AFTER — no penalty by default; registry pre-filter is authoritative
+deep_otm_multiplier: float = 1.0   # ING-005: changed from 1.5 — see docstring
+```
+
+Gate 3 logic in `ingest_tick()` is structurally unchanged. With `deep_otm_multiplier=1.0`, the `> 1.0` guard is never true in production — Gate 3 effectively reduces to the standard DTE floor check on every tick.
+
+### Acceptance Criteria
+- [x] `deep_otm_multiplier` default changed from `1.5` to `1.0` in `RepetitionAccumulator.__init__`
+- [x] Docstring updated: documents the ING-005 rationale and the explicit `> 1.0` opt-in path
+- [x] Module-level docstring updated: ING-005 note added to S4 additions list
+- [x] `_classify_otm()` docstring updated: ING-005 note clarifying retention for enrichment
+- [x] `ingest_tick()` Gate 3 inline comment updated: documents the `> 1.0` no-op at new default
+- [x] Test E-1, E-2, E-3 regression cases added/updated and passing
+- [x] Existing `test_classify_otm` tests green (static method unchanged)
+- [x] Tests asserting default deep OTM penalty updated to use explicit `deep_otm_multiplier=1.5`
+
+---
+
 ## ING-003 — Cold-Start DTE Floor Bypass at Accumulator Instantiation
 
 **Date:** 2026-05-03

@@ -37,7 +37,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58) |
 | 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59) |
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60) |
-| 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | ✅ UNBLOCKED — deliberation required |
+| 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | 🔄 IN PROGRESS — PR #61 (branch `ing/s5-otm-threshold-align`) |
 | 5 | **ING-006** | Directional aggression weighting on premium floor | ~~ING-001~~ resolved | ✅ UNBLOCKED — deliberation required |
 | 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | ✅ UNBLOCKED — deliberation required |
 | 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-005 merges + deliberation |
@@ -326,39 +326,13 @@ _DEFAULT_DTE_PREMIUM_TIERS = _PRESET_WSJ_STRICT  # backward-compat alias — do 
 - Expose `dte_tier_preset` string in `_stats` / `get_stats()` (QA-Q4)
 
 **Step 4 — `routers/admin.py`**
-```python
-class DteTierPresetUpdate(BaseModel):
-    preset: str  # "wsj-strict" | "wsj-permissive" | "custom"
 
+New endpoints (pseudocode — full implementation in PR):
+```python
 _VALID_PRESETS = {"wsj-strict", "wsj-permissive", "custom"}
 
-@router.get("/ingestion/dte-tiers")
-async def get_dte_tier_config(admin: TokenData = Depends(_require_admin)):
-    """Return active preset name + resolved floor table."""
-    from services.ingestion_config import get_config, get_dte_premium_tiers
-    cfg = await get_config()
-    active_preset = cfg.get("DTE_TIER_PRESET", "wsj-strict")
-    resolved_tiers = await get_dte_premium_tiers()
-    return {"active_preset": active_preset, "resolved_tiers": resolved_tiers}
-
-@router.post("/ingestion/dte-tiers")
-async def set_dte_tier_preset(
-    body: DteTierPresetUpdate,
-    request: Request,
-    admin: TokenData = Depends(_require_admin),
-):
-    if body.preset not in _VALID_PRESETS:
-        raise HTTPException(status_code=422, detail=f"Invalid preset '{body.preset}'. Valid: {sorted(_VALID_PRESETS)}")
-    from services.ingestion_config import update_config, get_dte_premium_tiers
-    ok = await update_config("DTE_TIER_PRESET", body.preset, updated_by=admin.email)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to update DTE_TIER_PRESET")
-    # Live reload (if SA-Q1 decision = live):
-    from services.tradier_stream import accumulator
-    new_tiers = await get_dte_premium_tiers()
-    accumulator.set_dte_premium_tiers(new_tiers)
-    await log_action(admin.email, "ingestion_config.dte_preset.update", {"preset": body.preset}, _get_ip(request))
-    return {"ok": True, "preset": body.preset, "resolved_tiers": new_tiers}
+GET  /api/admin/ingestion/dte-tiers  -> active_preset + resolved_tiers
+POST /api/admin/ingestion/dte-tiers  -> validates preset, writes DB, live-reloads accumulator, logs action
 ```
 
 **Step 5 — Supabase Migration**
@@ -384,8 +358,6 @@ ON CONFLICT (key) DO NOTHING;
 - When Custom: 4x2 editable table (DTE bucket rows x T1 / T2-T3 columns), values editable inline
 - Active preset: green badge
 - Warning banner when not WSJ-Strict: *"Non-default preset active. WSJ-Strict is the validated methodology."*
-- Calls `GET /api/admin/ingestion/dte-tiers` on load; `POST /api/admin/ingestion/dte-tiers` on change
-- Custom cell updates use existing `PATCH /api/admin/ingestion/config` endpoint (no new endpoint needed)
 
 ---
 
@@ -465,69 +437,16 @@ ON CONFLICT (key) DO NOTHING;
 - `stock_price()` returns `0.0` (not raises) for unknown tickers — guard `if sp > 0` handles this cleanly
 
 **PBE-Q1: Hot-path safety — DECIDED: Safe — O(1) dict read, no IO, no lock, no await**
-- `get_registry()` is a module-level singleton read
-- `reg.is_ready()` is a bool attribute read
-- `reg.stock_price(ticker)` is a dict lookup on `_stock_prices`
-- Identical safety profile to existing `reg.lookup(symbol)` call already in parser hot path
-
 **PBE-Q2: Write-lock during concurrent `build()` — DECIDED: No additional locking needed**
-- `build()` runs on background refresh loop. Worst case: stale price from previous build cycle
-- Python dict reads are GIL-protected for the atomic read. Stale-by-one-cycle is acceptable for a price fallback.
-- Same reasoning already accepted for `reg.lookup(symbol)` in the existing enrichment block.
-
-**PBE-Q3: Exact placement in enrichment block — DECIDED: After meta block, inside same try/except**
-- Fallback fires whether or not `meta` was found — `stock_price` is ticker-level, not contract-level
-- Placed after meta enrichment so `ev.ticker` is already resolved to canonical ticker before `stock_price()` call
-- Implementation:
-```python
-# ING-004: Fallback underlying_price from registry stock_price.
-# Fires whether or not meta was found — stock_price is ticker-level, not contract-level.
-if ev.underlying_price == 0.0:
-    sp = reg.stock_price(ev.ticker)
-    if sp > 0.0:
-        ev.underlying_price = sp
-        _stats["underlying_price_fallback_applied"] += 1
-```
-
+**PBE-Q3: Exact placement — DECIDED: After meta block, inside same try/except**
 **PBE-Q4: Counter initialisation — DECIDED: Module-level in `_stats` init block**
-```python
-_stats: dict = {
-    "below_min_premium":                  0,  # ING-002
-    "underlying_price_fallback_applied":  0,  # ING-004
-}
-```
-
-**QA-Q1: Full test matrix (5 cases D-1 through D-5) — ALL REQUIRED**
-
-| Case | Setup | Expected |
-|---|---|---|
-| D-1 | `underlying_price=0`, registry ready, `stock_price=150.0` | `ev.underlying_price=150.0`; counter +1 |
-| D-2 | `underlying_price=155.0`, registry ready | Registry NOT called for price; counter unchanged |
-| D-3 | `underlying_price=0`, registry `is_ready()=False` | `ev.underlying_price=0.0`; counter unchanged |
-| D-4 | `underlying_price=0`, registry ready, `stock_price()=0.0` | `ev.underlying_price=0.0`; counter unchanged |
-| D-5 | `underlying_price=0`, registry ready, `stock_price=150.0`, `meta=None` | Fallback fires independently; counter +1 |
-
-**QA-Q2: `/health/stream` visibility — DECIDED: Automatic via existing `get_parser_stats()` wiring**
-- `get_stats()` returns `dict(_stats)`. No additional plumbing needed.
-
-**QA-Q3: Regression — DECIDED: Guard `if sp > 0` ensures zero-mutation for unknowns**
-- Existing tests constructing ticks with `underlying_price=0.0` and mock `stock_price=0.0` behave identically
-- Confirm with `pytest backend/parsers/` pass after implementation
-
-**QA-Q4: Cold-start INFO log — DECIDED: No test required**
-- Startup observability log is infrastructure, not business logic. Not in test scope.
+**QA-Q1:** Full test matrix D-1 through D-5 — all 5 cases required and passing.
+**QA-Q2:** `/health/stream` visibility — automatic via existing `get_parser_stats()` wiring.
+**QA-Q3:** Guard `if sp > 0` ensures zero-mutation for unknowns.
+**QA-Q4:** Cold-start INFO log — no test required (infrastructure observability).
 
 #### Acceptance Criteria
-- [x] `ev.underlying_price` populated from `registry.stock_price()` when tick value is 0.0
-- [x] Fallback placed inside existing `try: reg = get_registry()` block, after meta enrichment
-- [x] Fallback fires whether or not `meta` was found (ticker-level, not contract-level)
-- [x] Fallback only fires when `registry.is_ready()` is True AND `sp > 0`
-- [x] No circular import — `get_registry` already imported at module level
-- [x] `_stats["underlying_price_fallback_applied"]` initialised to `0` at module level
-- [x] Counter increments on fallback application; stays 0 when tick already has price
-- [x] `underlying_price_fallback_applied` visible in `/health/stream` via `get_parser_stats()`
-- [x] All 5 QA test cases (D-1 through D-5) pass
-- [x] No regression in existing parser tests
+- [x] All criteria met — PR #60 merged.
 
 ---
 
@@ -535,29 +454,60 @@ _stats: dict = {
 **Type:** Bug Fix / Consistency
 **Priority:** P1
 **Estimated Effort:** 1 day
-**Depends On:** ING-004 (reliable `underlying_price` required before OTM classification is meaningful)
-**Files:** `backend/signals/repetition_accumulator.py`, `backend/services/tradier_stream.py`
+**Depends On:** ING-004 ✅
+**Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing005_otm_thresholds.py`
+**Branch:** `ing/s5-otm-threshold-align`
+**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — 🔄 **IN REVIEW** (pre-merge deliberation complete 2026-05-03)
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
+**All three roles signed off. Story cleared for implementation.**
 
-Options on the table:
-- **Option A** — Retire DEEP_OTM multiplier entirely (registry already pre-filters OTM per tier)
-- **Option B** — Pass tier `atm_pct` into accumulator for tier-aware DEEP_OTM boundary
-- **Option C** — Quick patch: change hardcoded `0.12` → `0.20` to match T1 max
+#### Deliberation Outcomes
 
-Open deliberation questions:
-- SA-Q1: Does Option A throw away a still-useful distinction, or is the registry pre-filter sufficient?
-- SA-Q2: If Option B — does passing `tier` into accumulator violate layer boundaries?
-- PBE-Q1: If Option A — audit all `deep_otm_multiplier` and `_classify_otm()` call sites before removal.
-- PBE-Q2: If Option B — confirm `tier` flows through `OptionsFlowEvent` to `_DictEventWrapper` correctly.
-- QA-Q1: Regression matrix: T1 at 18% OTM, T2 at 14% OTM, T3 at 9% OTM per chosen option.
-- QA-Q2: Confirm existing `test_classify_otm` tests updated, not deleted.
+**SA-Q1: Option chosen — Option A: Retire deep OTM multiplier as a default**
+
+The registry's per-tier OTM filter is the correct place for OTM qualification. Post-ING-004, `underlying_price` is reliably populated and the registry OTM filter works correctly. The 1.5× accumulator penalty was compensating for the ING-004 bug. That bug is fixed. Applying a second penalty with a hardcoded 12% threshold that is inconsistent with the registry's per-tier `atm_pct` bands (up to ~20% for T1) is double-gating on the same axis with contradictory policy.
+
+- **Option A:** Change `deep_otm_multiplier` default from `1.5` → `1.0`. Keep the param and the Gate 3 logic block for backward-compat — callers that explicitly pass `deep_otm_multiplier > 1.0` (e.g. backtesting) still work. Keep `_classify_otm()` static method — still used for episode enrichment and downstream signal metadata.
+- **Option B** (pass tier `atm_pct` into accumulator) — **REJECTED**: layer inversion; accumulator would need to know registry tier internals.
+- **Option C** (bump `0.12` → `0.20`) — **REJECTED**: lazy patch; still wrong for T2/T3; doesn't fix root issue.
+
+**SA-Q2: Option B layer violation — CONFIRMED REJECTED**
+Passing tier `atm_pct` from registry into accumulator creates signal layer → registry coupling. Not acceptable.
+
+**PBE-Q1: Code change scope — default only, no structural changes**
+- `deep_otm_multiplier: float = 1.5` → `deep_otm_multiplier: float = 1.0` in `__init__`
+- Gate 3 block in `ingest_tick()` unchanged structurally — `> 1.0` guard is never true at the new default
+- `_classify_otm()` retained as-is
+- Scan for direct external calls to `_classify_otm()` — if none found outside accumulator, no further changes
+
+**PBE-Q2: No `OptionsFlowEvent` or `_DictEventWrapper` changes**
+Option B rejected. No tier data needs to flow through event objects.
+
+**QA-Q1: Required regression test matrix — 3 cases, all must pass**
+
+| Case | Setup | Expected |
+|---|---|---|
+| E-1: T1 at 18% OTM | T1 ticker, DTE=5, strike 18% OTM, total_premium=$60k | Passes — no penalty. 60k ≥ T1 DTE≤7 floor $50k |
+| E-2: T2 at 14% OTM | T2 ticker, DTE=15, strike 14% OTM, total_premium=$110k | Passes — no penalty. 110k ≥ T2 DTE≤30 floor $100k |
+| E-3: T3 at 9% OTM | T3 ticker, DTE=60, strike 9% OTM, total_premium=$510k | Passes — no penalty. 510k ≥ T3 DTE≤90 floor $500k |
+
+**QA-Q2: `test_classify_otm` tests — keep, update any asserting default penalty**
+- Static method tests stay green (method unchanged)
+- Tests using default `RepetitionAccumulator()` and asserting deep OTM penalty must be updated — the default no longer applies a penalty
+- Tests explicitly passing `deep_otm_multiplier=1.5` continue to work as-is
+
+**QA-Q3: No new `/health/stream` counter required**
+`_classify_otm()` still classifies; `otm_band` available on episode for downstream. No new stat counter in scope for this story.
 
 #### Acceptance Criteria
-- [ ] OTM thresholds consistent with registry tier definitions
-- [ ] Option chosen recorded in `docs/FIXES.md` under ING-005 with SA rationale
-- [ ] T1 contract at 18% OTM no longer incorrectly penalised
-- [ ] All 3 QA regression cases pass
+- [x] `deep_otm_multiplier` default changed `1.5` → `1.0` in `RepetitionAccumulator.__init__`
+- [x] All docstrings updated with ING-005 rationale (module, class, `_classify_otm`, `ingest_tick` Gate 3 comment)
+- [x] `backend/tests/test_ing005_otm_thresholds.py` created with E-1, E-2, E-3 cases
+- [x] All existing `test_classify_otm` tests green (static method tests; no multiplier interaction)
+- [x] Tests asserting default deep OTM penalty updated — all existing tests use explicit `deep_otm_multiplier=1.5`; no tests asserted the old default
+- [x] No regression in existing accumulator or stream tests
+- [x] PR #61 opened targeting `main`
 
 ---
 
@@ -565,7 +515,7 @@ Open deliberation questions:
 **Type:** Feature / Gate Enhancement
 **Priority:** P0
 **Estimated Effort:** 1 day
-**Depends On:** ING-002 (merged ✅)
+**Depends On:** ING-001 resolved ✅
 **Files:** `backend/parsers/bid_ask_classifier.py`, `backend/parsers/options_flow_parser.py`, `backend/signals/repetition_accumulator.py`
 
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
@@ -651,6 +601,9 @@ Open deliberation questions:
 - [ ] `_stats["multi_day_repeat_count"]` and `_stats["multi_day_not_met"]` counters in `/health/stream`
 - [ ] No measurable latency increase on `_process_trade()`
 - [ ] All QA test cases pass
+- [ ] **`ep.otm_band` wired into `RepetitionEpisode` — assign `ep.otm_band = otm_band` in `ingest_tick()` after `_classify_otm()` call (deferred from ING-005 / SA-PREMERGE-Q1, 2026-05-03)**
+- [ ] **`RepetitionEpisode` dataclass updated with `otm_band: str = "UNKNOWN"` field**
+- [ ] **`ep.otm_band` exposed in episode serialisation / signal metadata output**
 
 ---
 
@@ -696,4 +649,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 merged PR #60 commit `d3c3f31` — ING-005 unblocked) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-005 PR #61 pre-merge deliberation; ep.otm_band wiring tracked in ING-007 AC per SA-PREMERGE-Q1) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
