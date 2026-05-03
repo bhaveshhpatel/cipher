@@ -210,10 +210,15 @@ async def test_E01c_spec_T3_9pct_otm_passes():
     Old behaviour (1.5×): effective floor = $750,000. $510k < $750k → DROPPED.
     New behaviour (1.0×): effective floor = $500,000. $510k ≥ $500k → PASSES.
 
-    NOTE: 9% OTM is STANDARD_OTM (not DEEP_OTM) — below the 12% threshold.
-    Under either multiplier, STANDARD_OTM never enters the penalty branch.
-    This case validates that the DTE floor itself (Gate 2) operates correctly
-    for T3 at the $510k/$500k boundary independent of the OTM branch.
+    COVERAGE NOTE — Gate 2, not Gate 3:
+    9% OTM is STANDARD_OTM (below the 12% _classify_otm threshold), so this
+    trade never enters the deep_otm_multiplier branch (Gate 3) under either
+    multiplier value. This case exclusively validates Gate 2 (DTE tier floor)
+    for a T3 ticker at the $510k/$500k boundary. The old "DROPPED" narrative
+    in the spec header is hypothetical — at 9% OTM the multiplier branch was
+    never reached, and both 1.0× and 1.5× produce identical outcomes here.
+    Gate 3 coverage for T3 is provided by E-01, E-02, and E-02b using the
+    20%-OTM DEEP_OTM geometry instead.
     """
     acc = _fresh_acc_t3(ticker="T3TICKER")
     ev = _make_event(
