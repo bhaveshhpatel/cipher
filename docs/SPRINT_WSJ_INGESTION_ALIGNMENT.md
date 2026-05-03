@@ -601,6 +601,9 @@ Open deliberation questions:
 - [ ] `_stats["multi_day_repeat_count"]` and `_stats["multi_day_not_met"]` counters in `/health/stream`
 - [ ] No measurable latency increase on `_process_trade()`
 - [ ] All QA test cases pass
+- [ ] **`ep.otm_band` wired into `RepetitionEpisode` — assign `ep.otm_band = otm_band` in `ingest_tick()` after `_classify_otm()` call (deferred from ING-005 / SA-PREMERGE-Q1, 2026-05-03)**
+- [ ] **`RepetitionEpisode` dataclass updated with `otm_band: str = "UNKNOWN"` field**
+- [ ] **`ep.otm_band` exposed in episode serialisation / signal metadata output**
 
 ---
 
@@ -646,4 +649,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-005 PR #61 in review; pre-merge deliberation complete) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-005 PR #61 pre-merge deliberation; ep.otm_band wiring tracked in ING-007 AC per SA-PREMERGE-Q1) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
