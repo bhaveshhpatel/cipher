@@ -60,7 +60,7 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | Story | Deliberation Status |
 |---|---|
 | ING-002 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc |
-| ING-003 | 🔴 NOT STARTED — deliberation required before implementation |
+| ING-003 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #59 commit `62b159f`** |
 | ING-004 | 🔴 NOT STARTED — deliberation required before implementation |
 | ING-005 | 🔴 NOT STARTED — deliberation required before implementation |
 | ING-006 | 🔴 NOT STARTED — deliberation required before implementation |
@@ -68,6 +68,7 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-008 | 🔴 NOT STARTED — deliberation required before implementation |
 
 > For ING-002: deliberation is complete. The decisions are law. Do not re-litigate SA-Q1, SA-Q2, SA-Q3, PBE-Q1/2/3, or QA-Q1/2/3.
+> For ING-003: deliberation is complete and story is merged. Do not re-litigate any decisions.
 > For all other stories: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
@@ -264,15 +265,15 @@ POST-MERGE
 
 | Story | Title | Status | Branch Name |
 |---|---|---|---|
-| ING-002 | Hard $10k premium floor at parser | ✅ Deliberation complete — ready to implement | `ing/s2-premium-floor` |
-| ING-003 | Wire DTE premium tiers at accumulator init | 🔴 Deliberation required | `ing/s3-dte-tiers-init` |
+| ING-002 | Hard $10k premium floor at parser | ✅ MERGED 2026-05-03 — PR #58 commit `a38f837` | `ing/s2-premium-floor` |
+| ING-003 | Wire DTE premium tiers at accumulator init | ✅ MERGED 2026-05-03 — PR #59 commit `62b159f` | `ing/s3-dte-tiers-init` |
 | ING-004 | Fallback `underlying_price` from registry | 🔴 Deliberation required | `ing/s4-underlying-price-fallback` |
 | ING-005 | Align OTM band thresholds | 🔴 Blocked on ING-004 + deliberation | `ing/s5-otm-threshold-align` |
-| ING-006 | Directional aggression weighting | 🔴 Blocked on ING-002 + deliberation | `ing/s6-directional-aggression` |
-| ING-007 | Multi-day repeat window lookback | 🔴 Blocked on ING-002 + ING-003 + deliberation | `ing/s7-multiday-repeat` |
+| ING-006 | Directional aggression weighting | 🔴 Deliberation required (ING-002 ✅) | `ing/s6-directional-aggression` |
+| ING-007 | Multi-day repeat window lookback | 🔴 Deliberation required (ING-002 ✅ ING-003 ✅) | `ing/s7-multiday-repeat` |
 | ING-008 | Volume vs. OI gate | 🔴 Blocked on ING-004 + ING-005 + deliberation | `ing/s8-vol-oi-gate` |
 
 ---
 
-*Created: 2026-05-03 | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-03 (ING-003 merged PR #59 commit `62b159f`) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*

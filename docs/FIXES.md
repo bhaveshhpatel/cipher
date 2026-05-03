@@ -4,6 +4,71 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## ING-003 — Cold-Start DTE Floor Bypass at Accumulator Instantiation
+
+**Date:** 2026-05-03
+**Severity:** P0 — data quality; low-quality short-DTE lottery tickets passed Gate 6 during cold-start window (~30 min)
+**PR:** [#59](https://github.com/bhaveshhpatel/cipher/pull/59) — squash merged commit `62b159f`
+**Files:** `backend/services/tradier_stream.py`, `backend/tests/test_ing003_dte_floors.py`
+
+### Root Cause
+
+`RepetitionAccumulator` was instantiated in `tradier_stream.py` with `dte_premium_tiers=None`:
+
+```python
+# BEFORE (broken)
+accumulator = RepetitionAccumulator(
+    window_minutes=30,
+    min_trades=1,
+    min_premium=10_000,
+)
+```
+
+With `dte_premium_tiers=None`, `_get_episode_min_premium()` fell back to the flat `min_premium=$10,000` floor for all DTE buckets. This bypassed all DTE-stratified tier floors until registry warmup (~30 min) called `set_dte_premium_tiers()`. During cold-start:
+- A `$12k 2-DTE` lottery ticket cleared the same floor as a `$500k 45-DTE` institutional print
+- All unknown tickers defaulted to the flat $10k floor regardless of DTE
+
+### Fix
+
+Pass `_DEFAULT_DTE_PREMIUM_TIERS` at instantiation so DTE-stratified floors are active from tick 1:
+
+```python
+# AFTER (fixed)
+from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
+
+accumulator = RepetitionAccumulator(
+    window_minutes=30,
+    min_trades=1,
+    min_premium=10_000,
+    dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+)
+```
+
+### Deliberation Decisions (3-way panel, 2026-05-03)
+
+**SA-Q1 — Cold-start default tier: T1 (strictest)**
+Decision: T1-default stands. Unknown tickers default to T1 until registry warmup confirms their tier. Safe direction is too strict, not too permissive. A $30k DTE=7 print dropped at cold-start is the borderline noise ING-003 is designed to eliminate — the suppression is doing work.
+
+**SA-Q2 — T3-default rejected**
+T3-default would pass everything during cold-start, defeating DTE tiers for the first 30 minutes.
+
+**PBE-Q1 — Import safety confirmed**
+`_DEFAULT_DTE_PREMIUM_TIERS` is a module-level dict constant — instantiated at import time. No function call, no class instantiation, no side effects.
+
+**PBE-Q2 — `set_dte_premium_tiers()` override confirmed clean**
+Post-warmup `set_dte_premium_tiers()` replaces `self.dte_premium_tiers` entirely under lock. No merging, no double-application. Clean atomic replace.
+
+**QA-Q1 — Cold-start accumulator test (D-11, D-12)**
+DTE=5, unknown ticker (T1 default, floor=$50k): $30k → None (D-11), $60k → RepetitionEpisode (D-12).
+
+**QA-Q2 — Post-warmup tier override test (D-13)**
+After `set_tier_map({"TESTTICKER": 2})`, DTE=5, $30k → RepetitionEpisode (T2 floor=$25k).
+
+### No option choice required
+This story had no Option A/B/C decision — it was a single unambiguous fix: pass the existing constant at instantiation.
+
+---
+
 ## ALERT-LEVEL — `flow_episodes.alert_level` Always Written as `WATCH`
 
 **Date:** 2026-04-28
