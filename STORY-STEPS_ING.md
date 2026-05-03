@@ -15,7 +15,7 @@
    - Contains: story scope, acceptance criteria, 3-way deliberation outcomes, QA test matrices, implementation code, dependency graph
    - Defines *what* a story requires, *why*, and *what was already decided*
 
-2. Read **`SPRINT.md`** second
+2. Read **`docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`** second
    - This is the execution state tracker across all sprints
    - Contains: what is merged (✅), what is blocked (🔴), what is queued (⏳), post-merge findings, exact build order
    - Defines *where things currently stand*
@@ -91,7 +91,7 @@ Before creating a branch for any ING story:
 | [`docs/ORDER_SIDE_RESOLUTION.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/ORDER_SIDE_RESOLUTION.md) | ING-001 resolution — why `order_side` is not available from Tradier; aggression proxy rationale |
 | [`docs/FIXES.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/FIXES.md) | Running fixes log — ING stories must document Option decisions and API findings here |
 | [`docs/ARCHITECTURE.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/ARCHITECTURE.md) | Gate structure — must be updated post-sprint to reflect new gates added by ING stories |
-| [`SPRINT.md`](https://github.com/bhaveshhpatel/cipher/blob/main/SPRINT.md) | Execution state tracker |
+| [`docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md) | Execution state tracker |
 | [`STORY-STEPS.md`](https://github.com/bhaveshhpatel/cipher/blob/main/STORY-STEPS.md) | Root protocol — this file is the ING-specific extension of it |
 | GitHub Issues | Execution tracking only — [#57](https://github.com/bhaveshhpatel/cipher/issues/57) = ING-002 |
 
@@ -162,9 +162,9 @@ Before any ING PR merges, all three roles must deliberate on the diff.
 |---|---|
 | Typo, comment, non-logic change | Fix inline on the PR before merge |
 | Logic fix that fits in the same PR scope | Fix inline on the PR before merge |
-| New work requiring a separate PR | File a numbered GitHub Issue AND add a row to `SPRINT.md` AND note in sprint doc before merging |
+| New work requiring a separate PR | File a numbered GitHub Issue AND add a row to `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` AND note in sprint doc before merging |
 
-> No finding lives only in conversation. If it needs tracking, it gets a GitHub Issue AND a SPRINT.md row.
+> No finding lives only in conversation. If it needs tracking, it gets a GitHub Issue AND a docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md row.
 > Only after all findings are resolved does the PR merge.
 
 ---
@@ -175,7 +175,7 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 
 1. **Gate order is fixed.** `dedup → parse → accumulate → persist`. No story may reorder these gates.
 2. **Sentinels are not exceptions.** `"below_premium"` is a clean filter drop — never increment `parse_failed` for it. Maintain strict counter separation.
-3. **No TODO comments in implementation code.** Follow-up work goes in a GitHub Issue and `SPRINT.md` row. The code itself must be clean.
+3. **No TODO comments in implementation code.** Follow-up work goes in a GitHub Issue and `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` row. The code itself must be clean.
 4. **Every new `_stats` key must be in the module-level init block.** No `KeyError` on `/health/stream` from cold start.
 5. **No DB reads on the hot path.** Registry lookups must be non-blocking dict reads. DB-backed config is fine at module init with a hardcoded fallback — not inline per-tick.
 6. **Hardcoded floors are safe defaults, not tech debt.** ING-002's `_MIN_EVENT_PREMIUM = 10_000` is intentional architecture (see SA-Q1 deliberation). Do not move to DB config until ING-002-CONFIG is in scope.
@@ -189,10 +189,10 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 Immediately after an ING PR merges:
 
 1. **Close the GitHub Issue** (state: `completed`)
-2. **Update `SPRINT.md`**: mark story ✅, update Quick Reference, add any new post-merge stories
+2. **Update `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`**: mark story ✅, update Quick Reference, add any new post-merge stories
 3. **Update `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`**: mark the story row ✅ in the Sprint Order table, update `Last updated` line
 4. **Update `docs/FIXES.md`**: add Option decision record if story required a choice (e.g. ING-005 Option A/B/C)
-5. If new GitHub Issues were filed from panel findings — confirm they are open and linked in `SPRINT.md`
+5. If new GitHub Issues were filed from panel findings — confirm they are open and linked in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`
 6. If story adds new gates — update `docs/ARCHITECTURE.md` gate structure section
 
 ---
@@ -238,7 +238,7 @@ DELIBERATION (on PR diff)
 ☐  Senior Architect reviews diff — gate order, layer boundaries, Critical callout resolution, deliberation alignment
 ☐  Principal Backend Engineer reviews diff — correctness, caller updates, stats init, hot-path safety
 ☐  Lead QA reviews diff — all AC covered, full QA matrix present, boundary values, counter separation, cold-start
-☐  Resolve all findings inline or file GitHub Issues + SPRINT.md rows for new work
+☐  Resolve all findings inline or file GitHub Issues + docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md rows for new work
 ☐  Zero unresolved findings remaining
 ☐  Display full deliberation and wait for approval before merge
 
@@ -248,13 +248,13 @@ MERGE
 
 POST-MERGE
 ☐  Close GitHub Issue (state: completed)
-☐  Mark story row ✅ in SPRINT.md
+☐  Mark story row ✅ in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
 ☐  Mark story row ✅ in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md Sprint Order table
-☐  Update Quick Reference section in SPRINT.md
-☐  Add any new post-merge issue rows to SPRINT.md
+☐  Update Quick Reference section in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
+☐  Add any new post-merge issue rows to docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
 ☐  Update docs/FIXES.md with Option decisions if applicable
 ☐  Update docs/ARCHITECTURE.md if new gates were added
-☐  Bump SPRINT.md version + Last updated line
+☐  Bump docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md version + Last updated line
 ☐  Bump docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md Last updated line
 ```
 
