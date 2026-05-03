@@ -1,9 +1,18 @@
 name: Frontend CI/CD
 
-# DISABLED — all automatic triggers removed. Restore on:/push/pull_request
-# blocks below to re-enable. Jobs and steps are fully preserved.
-# apex/** branches are intentionally excluded from all CI triggers.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
   workflow_dispatch:
 
 jobs:
@@ -23,7 +32,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          # cache omitted — no package-lock.json in repo
 
       - name: Install dependencies
         run: npm install
@@ -51,15 +59,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          # cache omitted — no package-lock.json in repo
 
       - name: Install dependencies
         run: npm install
 
       - name: Run regression tests with coverage
-        # --ci:       fail on snapshot updates (no interactive mode)
-        # --coverage: enforce jest.config.ts coverageThreshold
-        # NOTE: --passWithNoTests removed intentionally — zero tests = CI fail
         run: npx jest --ci --coverage
 
       - name: Upload coverage report
@@ -72,7 +76,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 3: Build (validates the Next.js build compiles cleanly)
-  # Deploy is handled automatically by Vercel's GitHub integration on push to main.
   # ---------------------------------------------------------------------------
   build:
     name: Build
@@ -97,3 +100,38 @@ jobs:
         env:
           NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
           NEXT_PUBLIC_WS_URL:  ${{ secrets.NEXT_PUBLIC_WS_URL }}
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Deploy to Vercel on push to main (frontend changes only)
+  # Requires VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID secrets.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to Vercel
+    runs-on: ubuntu-latest
+    needs: [typecheck, regression, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel
+
+      - name: Pull Vercel environment
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: frontend
+
+      - name: Build Vercel project
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: frontend
+
+      - name: Deploy to Vercel production
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: frontend
+        env:
+          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
