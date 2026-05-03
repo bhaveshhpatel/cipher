@@ -137,6 +137,14 @@ Fix (S6-PRE-MERGE 2026-05-01):
           in Railway logs instead of silently emitting fallback values.
   Item 5: Demo mode ceiling comment corrected from '# capped at 0.85 (pre-sector ceiling)'
           to '# demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)'.
+
+Fix (ING-002 2026-05-03):
+  parse_tradier_trade() now returns sentinel "below_premium" for events
+  with premium < _MIN_EVENT_PREMIUM ($10,000). _process_trade() checks
+  for sentinel BEFORE the `if result is None` / parse_failed branch.
+  Counter ownership (Option A): below_min_premium is owned and incremented
+  by options_flow_parser._stats inside parse_tradier_trade(), not by the
+  caller. tradier_stream funnel log reads the counter from parser.get_stats().
 """
 import asyncio
 import logging
@@ -150,7 +158,7 @@ import httpx
 
 from config import settings
 from core.async_bus import bus
-from parsers.options_flow_parser import parse_tradier_trade
+from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
@@ -228,8 +236,8 @@ _stream_start_at: float = _time.time()
 _stats = {
     "active_symbols":    0,
     "ticks":             0,
-    "parsed":            0,   # FLOW-DEBUG: parse_tradier_trade returned non-None
-    "parse_failed":      0,   # FLOW-DEBUG: parse_tradier_trade returned None
+    "parsed":            0,   # FLOW-DEBUG: parse_tradier_trade returned non-None OptionsFlowEvent
+    "parse_failed":      0,   # FLOW-DEBUG: genuine parse error (bad data, exception, size==0)
     "classified":        0,
     "deduped":           0,
     "accumulator_gated": 0,   # FLOW-DEBUG: ingest_tick returned None (below threshold)
@@ -261,6 +269,8 @@ _signal_last_emit: dict[str, dict] = {}
 def get_stats() -> dict:
     stats = dict(_stats)
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
+    # ING-002: merge parser-level stats so /health/stream surfaces below_min_premium
+    stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
     return stats
 
@@ -495,6 +505,16 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
+    ING-002 (2026-05-03):
+      parse_tradier_trade() returns a 3-state result:
+        "below_premium" — clean filter drop, premium < $10k.
+                          Counter owned by parser (_stats["below_min_premium"]).
+                          Caller returns immediately, does NOT touch parse_failed.
+        None            — genuine parse error. Increment _stats["parse_failed"].
+        OptionsFlowEvent — valid event, assign to ev and continue.
+      Sentinel check MUST come before the `result is None` check because
+      "below_premium" is truthy and would silently pass through `if not result`.
+
     SIG-DEBOUNCE (2026-04-30):
       After initial signal threshold crossing, re-emit only when:
         a) alert_level changed since last emit for this episode, OR
@@ -523,13 +543,15 @@ async def _process_trade(raw: dict):
 
     # FLOW-DEBUG: periodic funnel summary
     if tick_n % _STATS_LOG_INTERVAL == 0:
+        _parser_stats = get_parser_stats()
         log.info(
-            "[flow-funnel] ticks=%d parsed=%d parse_failed=%d "
+            "[flow-funnel] ticks=%d parsed=%d parse_failed=%d below_min_premium=%d "
             "deduped=%d classified=%d accumulator_gated=%d "
             "persisted=%d signals=%d sig_debounced=%d",
             tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
+            _parser_stats["below_min_premium"],
             _stats["deduped"],
             _stats["classified"],
             _stats["accumulator_gated"],
@@ -555,8 +577,13 @@ async def _process_trade(raw: dict):
     else:
         trade_payload = raw
 
-    ev = parse_tradier_trade(trade_payload)
-    if not ev:
+    # ING-002: 3-state result — sentinel MUST be checked BEFORE None.
+    # "below_premium" is truthy; `if not result` would NOT catch it.
+    # Counter for "below_premium" is owned by the parser, not here.
+    result = parse_tradier_trade(trade_payload)
+    if result == "below_premium":
+        return
+    if result is None:
         _stats["parse_failed"] += 1
         log.info(
             "[flow] parse_tradier_trade returned None for symbol=%r "
@@ -568,6 +595,7 @@ async def _process_trade(raw: dict):
             trade_payload.get("last"),
         )
         return
+    ev = result
 
     _stats["parsed"] += 1
 
@@ -733,16 +761,9 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(sig_ep)
 
-    # S6-HOT-PATH: Use episode dominant_direction (premium-weighted, direction-aware).
-    # Replaces naive contract_type -> direction mapping that broke SELL PUT campaigns.
-    # dominant_direction resolves SELL PUT -> REPEAT_BUY and SELL CALL -> REPEAT_SELL
-    # via order_side_to_direction(), honouring the S2 directional invariants.
     direction = sig_ep.dominant_direction
 
     # EPISODE-FIX (2026-04-30): persist flow_episode BEFORE the debounce gate.
-    # flow_episodes records every Signal Gate crossing. SIG-DEBOUNCE only applies
-    # to the WebSocket bus publish and signal_history — not episode persistence.
-    # Fire-and-forget so the stream hot path is not blocked.
     asyncio.create_task(persist_flow_episode({
         "ticker":          sig_ep.ticker,
         "direction":       direction,
@@ -784,7 +805,6 @@ async def _process_trade(raw: dict):
         "ts":          now_ts,
     }
 
-    # SIG-DEBOUNCE-LOG fix: use %.0f not %,.0f — comma is invalid in %-style format strings
     log.info(
         "[signal] %s %s | alert=%s | trades=%d | total_prem=$%.0f "
         "| accel=%s | reason=%s | %s",
@@ -831,7 +851,7 @@ async def _process_trade(raw: dict):
                     "ticker":                  composite.ticker,
                     "recommendation":          composite.recommendation,
                     "composite_score":         composite.composite_score,
-                    "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
+                    "composite_score_ceiling": COMPOSITE_SCORE_CEILING,
                     "flow_score":              composite.flow_score,
                     "backtest_score":          composite.backtest_score,
                     "volume_premium_factor":   composite.volume_premium_factor,
@@ -845,7 +865,7 @@ async def _process_trade(raw: dict):
                 "episode": {
                     "contract_type":   sig_ep.contract_type,
                     "direction":       direction,
-                    "influence_tier":  episode_influence_tier(sig_ep),   # S6: episode-level tier
+                    "influence_tier":  episode_influence_tier(sig_ep),
                     "total_premium":   sig_ep.total_premium,
                     "trade_count":     sig_ep.trade_count,
                     "is_accelerating": sig_ep.is_accelerating,
@@ -880,8 +900,6 @@ async def _demo_mode_once(symbols: list[str]):
             size      = rng.randint(10, 500)
             dte       = rng.randint(1, 60)
 
-            # S6-DEMO-MODE: use order_side_to_direction() so demo signals exercise
-            # the same direction semantics as live signals (SELL PUT -> REPEAT_BUY, etc.)
             order_side_demo = rng.choices(["BUY", "SELL", "UNKNOWN"], weights=[60, 25, 15])[0]
             direction = order_side_to_direction(order_side_demo, ctype)
 
@@ -918,9 +936,9 @@ async def _demo_mode_once(symbols: list[str]):
                         "ticker":                  ticker,
                         "recommendation":          rec,
                         "composite_score":         composite_score,
-                        "composite_score_ceiling": COMPOSITE_SCORE_CEILING,   # S6: import from engine, not literal
+                        "composite_score_ceiling": COMPOSITE_SCORE_CEILING,
                         "flow_score":              round(rng.uniform(0.4, 0.9), 3),
-                        "backtest_score":          0.0,   # S8 reserved
+                        "backtest_score":          0.0,
                         "volume_premium_factor":   round(rng.uniform(0.3, 0.8), 3),
                         "premium_tier_score":      round(rng.uniform(0.0, 1.0), 3),
                         "reasoning":               f"Demo synthetic signal for {ticker}",

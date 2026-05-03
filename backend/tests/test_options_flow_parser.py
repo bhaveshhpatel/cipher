@@ -41,33 +41,12 @@ Covers:
   27. influence_tier WHALE at premium >= $2M
   28. influence_tier INSTITUTIONAL at $500K–$2M
   29. influence_tier LARGE at $100K–$500K
-  30. influence_tier RETAIL below $100K
+  30. influence_tier RETAIL below $100K  [NOTE: must be above $10K floor — ING-002]
   31. conviction_score in [0, 1]
   32. DTE urgency: dte<=7 adds 0.10 bonus to conviction
   33. Registry enrichment overrides parsed fields when registry ready
   34. Registry lookup failure is non-fatal (returns event from OCC parse)
-  35. Malformed payload returns None
-
-  bid_ask_classifier
-  36. fill > ask + 10% spread => ABOVE_ASK
-  37. fill within 10% of ask => AT_ASK
-  38. fill within 10% of bid => AT_BID
-  39. fill < bid - 10% spread => BELOW_BID
-  40. fill in middle => MID
-  41. ask <= bid (crossed market) => MID
-  42. is_aggressive True for ABOVE_ASK
-  43. is_aggressive True for AT_ASK
-  44. is_aggressive False for MID
-
-  trade_type_detector
-  45. exchange_cnt>=3 and fill_count>=3 => SWEEP
-  46. size>=500 and fill_count==1 => BLOCK
-  47. fill_count>=5 and size>=100 => SPLIT
-  48. otherwise => SINGLE
-  49. is_golden_sweep: SWEEP + above_ask + premium>=500K => True
-  50. is_golden_sweep False when premium < 500K
-  51. is_golden_sweep False when not SWEEP type
-  52. is_golden_sweep False when not above_ask
+  35. Malformed payload returns None  (size=0 guard fires, not floor gate)
 """
 from datetime import datetime, date, timedelta
 from unittest.mock import MagicMock, patch
@@ -91,11 +70,11 @@ def _base_payload(
     last=3.50,
     bid=3.40,
     ask=3.60,
-    size=10,
+    size=30,          # ING-002: default premium = 3.50*30*100 = $10,500 > floor
     exch="C",
     timestamp=1700000000000,
 ):
-    """Minimal valid timesale payload."""
+    """Minimal valid timesale payload.  Default premium ~$10,500 clears $10K floor."""
     return {
         "symbol":    symbol,
         "last":      last,
@@ -236,6 +215,7 @@ def test_parse_fill_from_last_field():
 
 # 17
 def test_parse_fill_falls_back_to_price_field():
+    # last=None, size=30 → premium = price*30*100; use price=3.75 → $11,250 > floor
     raw = _base_payload(last=None)
     raw["price"] = 3.75
     ev = parse_tradier_trade(raw)
@@ -244,6 +224,7 @@ def test_parse_fill_falls_back_to_price_field():
 
 # 18
 def test_parse_fill_falls_back_to_mid():
+    # last=None, size=30, bid=3.00, ask=4.00 → mid=3.50 → premium=$10,500 > floor
     raw = _base_payload(last=None, bid=3.00, ask=4.00)
     del raw["last"]
     ev = parse_tradier_trade(raw)
@@ -306,14 +287,15 @@ def test_parse_not_synthetic_when_real_bid_ask():
 
 # 26
 def test_parse_premium_formula():
+    # last=2.00, size=50 → premium = 2.00*50*100 = $10,000 (at floor — passes)
     raw = _base_payload(last=2.00, size=50)
     ev  = parse_tradier_trade(raw)
-    assert ev.premium == pytest.approx(2.00 * 50 * 100)
+    assert ev.premium == pytest.approx(10_000.0)
 
 
 # 27
 def test_parse_influence_tier_whale():
-    # fill=200, size=100 => premium=$2_000_000 => WHALE
+    # fill=200, size=100 => premium=$2,000,000 => WHALE
     raw = _base_payload(last=200.0, size=100)
     ev  = parse_tradier_trade(raw)
     assert ev.influence_tier == "WHALE"
@@ -321,7 +303,7 @@ def test_parse_influence_tier_whale():
 
 # 28
 def test_parse_influence_tier_institutional():
-    # fill=5, size=1100 => premium=$550_000 => INSTITUTIONAL
+    # fill=5, size=1100 => premium=$550,000 => INSTITUTIONAL
     raw = _base_payload(last=5.0, size=1100)
     ev  = parse_tradier_trade(raw)
     assert ev.influence_tier == "INSTITUTIONAL"
@@ -329,7 +311,7 @@ def test_parse_influence_tier_institutional():
 
 # 29
 def test_parse_influence_tier_large():
-    # fill=2.0, size=600 => premium=$120_000 => LARGE
+    # fill=2.0, size=600 => premium=$120,000 => LARGE
     raw = _base_payload(last=2.0, size=600)
     ev  = parse_tradier_trade(raw)
     assert ev.influence_tier == "LARGE"
@@ -337,9 +319,11 @@ def test_parse_influence_tier_large():
 
 # 30
 def test_parse_influence_tier_retail():
-    # fill=0.50, size=10 => premium=$500 => RETAIL
-    raw = _base_payload(last=0.50, size=10)
+    # ING-002: trade must clear $10K floor first.
+    # fill=1.00, size=100 => premium=$10,000 (at-floor) => RETAIL
+    raw = _base_payload(last=1.00, size=100)
     ev  = parse_tradier_trade(raw)
+    assert ev is not None, "At-floor $10K trade must not be filtered by ING-002 gate"
     assert ev.influence_tier == "RETAIL"
 
 
@@ -411,7 +395,7 @@ def test_parse_registry_failure_is_nonfatal():
 
 # 35
 def test_parse_malformed_payload_returns_none():
-    # Completely empty dict will produce size=0 → None
+    # Empty dict → size defaults to 0 → size==0 guard fires before floor gate → None
     assert parse_tradier_trade({}) is None
 
 

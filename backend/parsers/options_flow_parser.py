@@ -4,11 +4,20 @@ Parses raw Tradier options flow into a structured OptionsFlowEvent.
 Architecture change (Layer 1):
   Registry enrichment — get_registry is imported at module level so
   patch('parsers.options_flow_parser.get_registry', ...) works in tests.
+
+ING-002: Hard per-event $10k premium floor.
+  parse_tradier_trade() returns the sentinel "below_premium" for events
+  whose premium (fill * size * 100) is below _MIN_EVENT_PREMIUM.
+  This is a clean data-quality drop — not a parse error.
+  Counter: _stats["below_min_premium"] owned by this module (gate owns counter).
+  Exposed via get_stats() — visible in /health/stream through tradier_stream.
+  Future: wire through ingestion_config key "min_event_premium" with
+  10_000 as hardcoded cold-start fallback (ING-002-CONFIG story).
 """
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Union, Literal
 from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
 
@@ -18,6 +27,31 @@ try:
 except Exception:  # pragma: no cover
     def get_registry():  # type: ignore[misc]
         return None
+
+# ---------------------------------------------------------------------------
+# ING-002: Hard per-event premium floor.
+# Hardcoded safe default — active at import time, no DB dependency, no cold-start gap.
+# Future: wire through ingestion_config key "min_event_premium" with this as
+# fallback when admin config page is built (ING-002-CONFIG).
+# ---------------------------------------------------------------------------
+_MIN_EVENT_PREMIUM = 10_000
+
+# ---------------------------------------------------------------------------
+# Parser-level stats.
+# This module owns exactly one counter: below_min_premium.
+# parse_failed is owned by tradier_stream — do NOT add it here.
+# If get_stats() returned parse_failed, stats.update(get_parser_stats()) in
+# tradier_stream.get_stats() would overwrite the stream's real parse_failed
+# counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
+# ---------------------------------------------------------------------------
+_stats: dict = {
+    "below_min_premium": 0,  # ING-002: clean filter drops at parser premium floor ($10k)
+}
+
+
+def get_stats() -> dict:
+    """Return a snapshot of parser-level stats."""
+    return dict(_stats)
 
 
 @dataclass
@@ -104,8 +138,16 @@ def _parse_timestamp(ts) -> datetime:
         return datetime.utcnow()
 
 
-def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
-    """Parse a single Tradier stream trade dict into OptionsFlowEvent."""
+def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_premium"], None]:
+    """Parse a single Tradier stream trade dict into OptionsFlowEvent.
+
+    Returns:
+      OptionsFlowEvent  — valid event, passes all gates
+      "below_premium"   — clean filter drop: premium < _MIN_EVENT_PREMIUM (ING-002)
+                          Caller must NOT increment parse_failed for this sentinel.
+                          _stats["below_min_premium"] is incremented here, by the gate.
+      None              — genuine parse error or size==0 guard triggered
+    """
     try:
         symbol = raw.get("symbol", "")
 
@@ -124,6 +166,14 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
             return None
 
         premium = fill * size * 100
+
+        # ING-002: Hard per-event premium floor.
+        # Gate fires after size==0 guard, after premium is known,
+        # before OCC parsing and OptionsFlowEvent construction.
+        # Counter incremented here — gate owns its counter.
+        if premium < _MIN_EVENT_PREMIUM:
+            _stats["below_min_premium"] += 1
+            return "below_premium"
 
         ctype_raw = raw.get("option_type", "") or ""
         strike    = float(raw.get("strike", 0) or 0)
@@ -156,13 +206,13 @@ def parse_tradier_trade(raw: dict) -> Optional[OptionsFlowEvent]:
         # ------------------------------------------------------------------
         # Synthetic quote handling
         # When bid=ask=0 we have no real spread data. Instead of fabricating
-        # a tight \u00b10.5% spread and running classification (which almost
+        # a tight ±0.5% spread and running classification (which almost
         # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
         # wide-spread contracts), we:
         #   1. Flag is_synthetic_quote=True
-        #   2. Force bid_ask_class="MID" \u2014 neutral, unknown fill placement
-        #   3. Force is_aggressive=False \u2014 cannot claim aggression without quotes
-        #   4. Apply a 40% conviction haircut (\u00d70.6) downstream
+        #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
+        #   3. Force is_aggressive=False — cannot claim aggression without quotes
+        #   4. Apply a 40% conviction haircut (×0.6) downstream
         # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
