@@ -147,10 +147,16 @@ Fix (ING-002 2026-05-03):
   caller. tradier_stream funnel log reads the counter from parser.get_stats().
 
 Fix (ING-003 2026-05-03):
-  accumulator was instantiated without dte_premium_tiers, so Gate 2
-  (DTE-adjusted premium floor) fell back to min_premium ($10,000) for every
-  episode. _DEFAULT_DTE_PREMIUM_TIERS (defined in repetition_accumulator.py)
-  is now passed at construction time. Gate 2 is now active from cold start.
+  Accumulator was instantiated with dte_premium_tiers=None, meaning
+  _get_episode_min_premium() fell back to the flat min_premium=$10k floor
+  for all DTE buckets during the cold-start window (~30 min) until registry
+  warmup called set_dte_premium_tiers(). A $12k 2-DTE lottery ticket cleared
+  the same floor as a $500k 45-DTE institutional print.
+  Fix: pass _DEFAULT_DTE_PREMIUM_TIERS at instantiation — DTE-stratified
+  floors are active from tick 1. Unknown tickers default to T1 (strictest
+  floor) until registry warmup confirms their tier. Safe direction is too
+  strict, not too permissive.
+  3-way deliberation complete 2026-05-03 — all decisions in sprint doc.
 """
 import asyncio
 import logging
@@ -261,8 +267,12 @@ _stats = {
 # FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
 
-# ING-003: wire _DEFAULT_DTE_PREMIUM_TIERS so Gate 2 (DTE-adjusted premium
-# floor) is active from cold start instead of falling back to min_premium.
+# ING-003: pass _DEFAULT_DTE_PREMIUM_TIERS so DTE-stratified floors are active
+# from tick 1. Without this, dte_premium_tiers=None causes _get_episode_min_premium()
+# to fall back to the flat min_premium=$10k floor for ALL DTE buckets during the
+# ~30 min cold-start window (until registry warmup calls set_dte_premium_tiers()).
+# Unknown tickers default to T1 (strictest floor) — safe direction is too strict,
+# not too permissive. Deliberation complete 2026-05-03.
 accumulator = RepetitionAccumulator(
     window_minutes=30,
     min_trades=1,
