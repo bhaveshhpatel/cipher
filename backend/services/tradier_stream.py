@@ -140,10 +140,11 @@ Fix (S6-PRE-MERGE 2026-05-01):
 
 Fix (ING-002 2026-05-03):
   parse_tradier_trade() now returns sentinel "below_premium" for events
-  with premium < _MIN_EVENT_PREMIUM ($10,000). _process_trade() must check
+  with premium < _MIN_EVENT_PREMIUM ($10,000). _process_trade() checks
   for sentinel BEFORE the `if result is None` / parse_failed branch.
-  New _stats key "below_min_premium" tracks clean filter drops separately
-  from genuine parse errors (parse_failed). Strict counter separation enforced.
+  Counter ownership (Option A): below_min_premium is owned and incremented
+  by options_flow_parser._stats inside parse_tradier_trade(), not by the
+  caller. tradier_stream funnel log reads the counter from parser.get_stats().
 """
 import asyncio
 import logging
@@ -157,7 +158,7 @@ import httpx
 
 from config import settings
 from core.async_bus import bus
-from parsers.options_flow_parser import parse_tradier_trade
+from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator
@@ -237,7 +238,6 @@ _stats = {
     "ticks":             0,
     "parsed":            0,   # FLOW-DEBUG: parse_tradier_trade returned non-None OptionsFlowEvent
     "parse_failed":      0,   # FLOW-DEBUG: genuine parse error (bad data, exception, size==0)
-    "below_min_premium": 0,   # ING-002: clean filter drops at parser premium floor ($10k)
     "classified":        0,
     "deduped":           0,
     "accumulator_gated": 0,   # FLOW-DEBUG: ingest_tick returned None (below threshold)
@@ -269,6 +269,8 @@ _signal_last_emit: dict[str, dict] = {}
 def get_stats() -> dict:
     stats = dict(_stats)
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
+    # ING-002: merge parser-level stats so /health/stream surfaces below_min_premium
+    stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
     return stats
 
@@ -504,9 +506,10 @@ async def _process_trade(raw: dict):
     Process a raw Tradier stream event (filter=timesale).
 
     ING-002 (2026-05-03):
-      parse_tradier_trade() now returns a 3-state result:
-        "below_premium" — clean filter drop, premium < $10k. Increment
-                          _stats["below_min_premium"]. Do NOT increment parse_failed.
+      parse_tradier_trade() returns a 3-state result:
+        "below_premium" — clean filter drop, premium < $10k.
+                          Counter owned by parser (_stats["below_min_premium"]).
+                          Caller returns immediately, does NOT touch parse_failed.
         None            — genuine parse error. Increment _stats["parse_failed"].
         OptionsFlowEvent — valid event, assign to ev and continue.
       Sentinel check MUST come before the `result is None` check because
@@ -540,6 +543,7 @@ async def _process_trade(raw: dict):
 
     # FLOW-DEBUG: periodic funnel summary
     if tick_n % _STATS_LOG_INTERVAL == 0:
+        _parser_stats = get_parser_stats()
         log.info(
             "[flow-funnel] ticks=%d parsed=%d parse_failed=%d below_min_premium=%d "
             "deduped=%d classified=%d accumulator_gated=%d "
@@ -547,7 +551,7 @@ async def _process_trade(raw: dict):
             tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
-            _stats["below_min_premium"],
+            _parser_stats["below_min_premium"],
             _stats["deduped"],
             _stats["classified"],
             _stats["accumulator_gated"],
@@ -575,9 +579,9 @@ async def _process_trade(raw: dict):
 
     # ING-002: 3-state result — sentinel MUST be checked BEFORE None.
     # "below_premium" is truthy; `if not result` would NOT catch it.
+    # Counter for "below_premium" is owned by the parser, not here.
     result = parse_tradier_trade(trade_payload)
     if result == "below_premium":
-        _stats["below_min_premium"] += 1
         return
     if result is None:
         _stats["parse_failed"] += 1
@@ -757,7 +761,6 @@ async def _process_trade(raw: dict):
 
     alert_level = accumulator.get_alert_level(sig_ep)
 
-    # S6-HOT-PATH: Use episode dominant_direction (premium-weighted, direction-aware).
     direction = sig_ep.dominant_direction
 
     # EPISODE-FIX (2026-04-30): persist flow_episode BEFORE the debounce gate.
@@ -802,7 +805,6 @@ async def _process_trade(raw: dict):
         "ts":          now_ts,
     }
 
-    # SIG-DEBOUNCE-LOG fix: use %.0f not %,.0f
     log.info(
         "[signal] %s %s | alert=%s | trades=%d | total_prem=$%.0f "
         "| accel=%s | reason=%s | %s",

@@ -9,7 +9,8 @@ ING-002: Hard per-event $10k premium floor.
   parse_tradier_trade() returns the sentinel "below_premium" for events
   whose premium (fill * size * 100) is below _MIN_EVENT_PREMIUM.
   This is a clean data-quality drop — not a parse error.
-  Counter: _stats["below_min_premium"] in tradier_stream.py.
+  Counter: _stats["below_min_premium"] owned by this module (gate owns counter).
+  Exposed via get_stats() — visible in /health/stream through tradier_stream.
   Future: wire through ingestion_config key "min_event_premium" with
   10_000 as hardcoded cold-start fallback (ING-002-CONFIG story).
 """
@@ -34,6 +35,22 @@ except Exception:  # pragma: no cover
 # fallback when admin config page is built (ING-002-CONFIG).
 # ---------------------------------------------------------------------------
 _MIN_EVENT_PREMIUM = 10_000
+
+# ---------------------------------------------------------------------------
+# Parser-level stats.
+# Gate owns its counter — below_min_premium increments here, inside
+# parse_tradier_trade(), before the sentinel is returned.
+# Exposed via get_stats() so /health/stream can surface it.
+# ---------------------------------------------------------------------------
+_stats: dict = {
+    "below_min_premium": 0,  # ING-002: clean filter drops at parser premium floor ($10k)
+    "parse_failed":      0,  # genuine parse errors (bad data, exception, size==0)
+}
+
+
+def get_stats() -> dict:
+    """Return a snapshot of parser-level stats."""
+    return dict(_stats)
 
 
 @dataclass
@@ -127,6 +144,7 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
       OptionsFlowEvent  — valid event, passes all gates
       "below_premium"   — clean filter drop: premium < _MIN_EVENT_PREMIUM (ING-002)
                           Caller must NOT increment parse_failed for this sentinel.
+                          _stats["below_min_premium"] is incremented here, by the gate.
       None              — genuine parse error or size==0 guard triggered
     """
     try:
@@ -151,9 +169,9 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
         # ING-002: Hard per-event premium floor.
         # Gate fires after size==0 guard, after premium is known,
         # before OCC parsing and OptionsFlowEvent construction.
-        # Returns sentinel (not None) so caller can count clean drops
-        # separately from genuine parse errors.
+        # Counter incremented here — gate owns its counter.
         if premium < _MIN_EVENT_PREMIUM:
+            _stats["below_min_premium"] += 1
             return "below_premium"
 
         ctype_raw = raw.get("option_type", "") or ""
