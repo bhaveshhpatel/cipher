@@ -36,11 +36,11 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | ~~1~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
 | 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58) |
 | 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59) |
-| 3 | **ING-004** | Fallback `underlying_price` from registry | — | 🟡 IN PROGRESS — branch `ing/s4-underlying-price-fallback` |
-| 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | After ING-004 merges |
+| 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60) |
+| 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | ✅ UNBLOCKED — deliberation required |
 | 5 | **ING-006** | Directional aggression weighting on premium floor | ~~ING-001~~ resolved | ✅ UNBLOCKED — deliberation required |
 | 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | ✅ UNBLOCKED — deliberation required |
-| 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-004+005 |
+| 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-005 merges + deliberation |
 
 ---
 
@@ -441,9 +441,10 @@ ON CONFLICT (key) DO NOTHING;
 **Depends On:** Nothing
 **Files:** `backend/parsers/options_flow_parser.py`, `backend/tests/test_ing004_underlying_price.py`
 **Branch:** `ing/s4-underlying-price-fallback` (commit `327300d`)
+**PR:** [#60](https://github.com/bhaveshhpatel/cipher/pull/60) — ✅ **MERGED 2026-05-03** (commit `d3c3f31`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. Story cleared for implementation. Branch in progress.**
+**All three roles signed off. Story merged.**
 
 #### Deliberation Outcomes
 
@@ -695,4 +696,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 pre-merge panel findings resolved — ING-002-CONFIG deliberation restored, test expiry date fixed) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 merged PR #60 commit `d3c3f31` — ING-005 unblocked) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
