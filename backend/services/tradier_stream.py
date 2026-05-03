@@ -145,6 +145,18 @@ Fix (ING-002 2026-05-03):
   Counter ownership (Option A): below_min_premium is owned and incremented
   by options_flow_parser._stats inside parse_tradier_trade(), not by the
   caller. tradier_stream funnel log reads the counter from parser.get_stats().
+
+Fix (ING-003 2026-05-03):
+  Accumulator was instantiated with dte_premium_tiers=None, meaning
+  _get_episode_min_premium() fell back to the flat min_premium=$10k floor
+  for all DTE buckets during the cold-start window (~30 min) until registry
+  warmup called set_dte_premium_tiers(). A $12k 2-DTE lottery ticket cleared
+  the same floor as a $500k 45-DTE institutional print.
+  Fix: pass _DEFAULT_DTE_PREMIUM_TIERS at instantiation — DTE-stratified
+  floors are active from tick 1. Unknown tickers default to T1 (strictest
+  floor) until registry warmup confirms their tier. Safe direction is too
+  strict, not too permissive.
+  3-way deliberation complete 2026-05-03 — all decisions in sprint doc.
 """
 import asyncio
 import logging
@@ -161,7 +173,7 @@ from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
-from signals.repetition_accumulator import RepetitionAccumulator
+from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
 
@@ -255,7 +267,18 @@ _stats = {
 # FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
 
-accumulator = RepetitionAccumulator(window_minutes=30, min_trades=1, min_premium=10_000)
+# ING-003: pass _DEFAULT_DTE_PREMIUM_TIERS so DTE-stratified floors are active
+# from tick 1. Without this, dte_premium_tiers=None causes _get_episode_min_premium()
+# to fall back to the flat min_premium=$10k floor for ALL DTE buckets during the
+# ~30 min cold-start window (until registry warmup calls set_dte_premium_tiers()).
+# Unknown tickers default to T1 (strictest floor) — safe direction is too strict,
+# not too permissive. Deliberation complete 2026-05-03.
+accumulator = RepetitionAccumulator(
+    window_minutes=30,
+    min_trades=1,
+    min_premium=10_000,
+    dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+)
 
 # H4 fix: dict[str, float] with wall-clock timestamps instead of a bare Set.
 _sweep_upgrade_dispatched: dict[str, float] = {}
