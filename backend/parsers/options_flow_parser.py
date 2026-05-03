@@ -38,13 +38,14 @@ _MIN_EVENT_PREMIUM = 10_000
 
 # ---------------------------------------------------------------------------
 # Parser-level stats.
-# Gate owns its counter — below_min_premium increments here, inside
-# parse_tradier_trade(), before the sentinel is returned.
-# Exposed via get_stats() so /health/stream can surface it.
+# This module owns exactly one counter: below_min_premium.
+# parse_failed is owned by tradier_stream — do NOT add it here.
+# If get_stats() returned parse_failed, stats.update(get_parser_stats()) in
+# tradier_stream.get_stats() would overwrite the stream's real parse_failed
+# counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
 # ---------------------------------------------------------------------------
 _stats: dict = {
     "below_min_premium": 0,  # ING-002: clean filter drops at parser premium floor ($10k)
-    "parse_failed":      0,  # genuine parse errors (bad data, exception, size==0)
 }
 
 
