@@ -70,7 +70,7 @@ _DEFAULT_DTE_PREMIUM_TIERS: Dict[int, Tuple[float, float]] = {
 # _DictEventWrapper — module-level; wraps raw dict ticks so attribute access
 # works identically to OptionsFlowEvent objects throughout the accumulator.
 # Defined here (not inside ingest_tick) to avoid a new class object being
-# allocated on every dict-type tick in the hot path. (Finding 7)
+# allocated on every hot-path dict tick. (Finding 7)
 #
 # NOTE: `d` must be a plain dict. Passing None or a non-dict will raise
 # AttributeError on .get(). Callers are responsible for the isinstance check
@@ -408,11 +408,13 @@ class RepetitionAccumulator:
         They are NOT configurable via constructor — see Finding 1 note in
         RepetitionAccumulator docstring.
 
-        NOTE (ING-005): With deep_otm_multiplier defaulting to 1.0, the DEEP_OTM
-        classification no longer triggers a premium floor penalty in production.
-        This method is retained for episode enrichment and downstream use
-        (ING-007 pattern scoring, signal metadata). The classification itself
-        remains correct — only the penalty application changed.
+        NOTE (ING-005 / SA-Q2): `_classify_otm()` is retained for forward use
+        in ING-007 pattern scoring and signal metadata enrichment. As of ING-005,
+        the `otm_band` classification is NOT yet written to RepetitionEpisode —
+        that wiring is deferred to ING-007. With deep_otm_multiplier defaulting
+        to 1.0, DEEP_OTM classification no longer triggers a premium floor
+        penalty in production — only the classification label is produced;
+        the penalty application changed (ING-005 deliberation, 2026-05-03).
         """
         if underlying_price <= 0:
             return "UNKNOWN"
@@ -526,11 +528,11 @@ class RepetitionAccumulator:
             # When underlying_price is non-numeric or zero: UNKNOWN band applies
             # -> standard floor, no deep-OTM penalty. (Issue 6 resolution)
             #
-            # ING-005: deep_otm_multiplier default changed to 1.0. The > 1.0
-            # guard below is never true at the new default, so this block
-            # naturally reduces to the else branch (standard floor check) on
-            # every production tick. Explicit deep_otm_multiplier > 1.0 still
-            # works for callers that need it (e.g. backtesting).
+            # ING-005 (SA-Q1): deep_otm_multiplier defaults to 1.0. The `> 1.0`
+            # guard below is NEVER TRUE at the new default — this entire if-branch
+            # is a dormant backward-compat path in production. It activates only
+            # when an explicit deep_otm_multiplier > 1.0 is passed (e.g. backtesting).
+            # The else-branch (standard floor check) runs on every production tick.
             strike_val = float(ep.strike)
             raw_underlying = getattr(ev_wrapped, "underlying_price", 0.0)
             try:
@@ -540,7 +542,7 @@ class RepetitionAccumulator:
 
             otm_band = self._classify_otm(strike_val, underlying_px)
 
-            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":  # dormant at default 1.0 — ING-005/SA-Q1
                 deep_floor = effective_min_prem * self.deep_otm_multiplier
                 if ep.total_premium < deep_floor:
                     return None
