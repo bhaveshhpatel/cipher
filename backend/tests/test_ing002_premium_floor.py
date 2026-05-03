@@ -9,13 +9,23 @@ Spec (STORY-STEPS_ING.md § ING-002 AC):
   AC-5  _stats["below_min_premium"] is incremented on each filtered trade
   AC-6  get_stats() exposes below_min_premium key (visible in /health/stream)
 
-Test IDs: P-01 … P-08
+Test IDs: P-01 … P-09
 
 Panel deliberation findings (2026-05-03):
   P-07  Explicit floor−1 boundary from sprint spec QA-Q1 (fill=99.99, size=1 → $9,999)
   P-08  Counter separation proof: tradier_stream._stats["parse_failed"] must NOT
         increment on sentinel returns (QA-Q2). Asserts against the stream counter —
         the one that actually appears in /health/stream — not the parser's own stats.
+  P-09  Floor+1 boundary (ING-002-QA-F1 fix): fill=100.01, size=1 → premium=$10,001.
+        Completes the strict less-than (<) proof alongside P-02 (at-floor) and P-07
+        (floor-1). This is the exact case from sprint spec QA-Q1 matrix.
+
+SA-F1 resolution (2026-05-03):
+  Tests 36–52 from the old test_options_flow_parser.py (bid_ask_classifier and
+  trade_type_detector coverage) were NOT deleted. They exist in dedicated files:
+    - backend/tests/test_classifier.py
+    - backend/tests/test_classifier_coverage.py
+  Both files are present on this branch. No coverage gap.
 """
 import importlib
 from datetime import date, timedelta
@@ -215,4 +225,28 @@ def test_P08_stream_parse_failed_not_incremented_on_below_premium():
     # Assert parser's below_min_premium did increment.
     assert _parser_module._stats["below_min_premium"] >= 1, (
         "below_min_premium must have incremented on the below-floor call"
+    )
+
+
+# ── P-09  Floor+1 boundary — sprint spec QA-Q1 exact case (ING-002-QA-F1) ───
+
+def test_P09_floor_plus_one_passes():
+    """
+    ING-002-QA-F1 fix (pre-merge deliberation finding, 2026-05-03):
+
+    Sprint spec QA-Q1 matrix requires: size=1, fill=100.01 → premium=$10,001 → passes.
+    This is the floor+1 penny case. Together with P-02 (at-floor, $10,000 passes)
+    and P-07 (floor-1, $9,999 filtered), these three tests prove the gate uses
+    strict less-than (<) with no off-by-one on either side of the boundary.
+
+    fill=100.01, size=1  →  premium = 100.01 * 1 * 100 = $10,001.00  (> floor)
+    Expected: OptionsFlowEvent returned, not "below_premium".
+    """
+    raw = _payload(last=100.01, size=1, bid=99.90, ask=100.20)
+    result = parse_tradier_trade(raw)
+    assert isinstance(result, OptionsFlowEvent), (
+        f"Floor+1 $10,001 trade must pass gate (strict <), got {result!r}"
+    )
+    assert result.premium == pytest.approx(10_001.0), (
+        f"Expected premium=$10,001, got {result.premium}"
     )
