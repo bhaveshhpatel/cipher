@@ -75,9 +75,9 @@ Gate 3 logic in `ingest_tick()` is structurally unchanged. With `deep_otm_multip
 - [x] Module-level docstring updated: ING-005 note added to S4 additions list
 - [x] `_classify_otm()` docstring updated: ING-005 note clarifying retention for enrichment
 - [x] `ingest_tick()` Gate 3 inline comment updated: documents the `> 1.0` no-op at new default
-- [ ] Test E-1, E-2, E-3 regression cases added/updated and passing
-- [ ] Existing `test_classify_otm` tests green (static method unchanged)
-- [ ] Tests asserting default deep OTM penalty updated to use explicit `deep_otm_multiplier=1.5`
+- [x] Test E-1, E-2, E-3 regression cases added/updated and passing
+- [x] Existing `test_classify_otm` tests green (static method unchanged)
+- [x] Tests asserting default deep OTM penalty updated to use explicit `deep_otm_multiplier=1.5`
 
 ---
 
