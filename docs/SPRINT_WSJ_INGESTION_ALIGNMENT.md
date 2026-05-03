@@ -34,12 +34,12 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | Order | Story ID | Title | Depends On | Can Ship? |
 |-------|----------|-------|------------|-----------|
 | ~~1~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
-| 1 | **ING-002** | Hard per-event $10k premium floor at parser | — | ✅ NOW — deliberation complete (2026-05-03) |
+| 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58) |
 | 2 | **ING-003** | Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init | — | ✅ NOW |
 | 3 | **ING-004** | Fallback `underlying_price` from registry | — | ✅ NOW |
 | 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | After ING-004 |
-| 5 | **ING-006** | Directional aggression weighting on premium floor | ~~ING-001~~ resolved | ✅ UNBLOCKED — ships after ING-002 |
-| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | After infra prereqs |
+| 5 | **ING-006** | Directional aggression weighting on premium floor | ~~ING-001~~ resolved | ✅ UNBLOCKED — ships after ING-002 ✅ |
+| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | After ING-002 ✅ + ING-003 |
 | 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-004+005 |
 
 ---
@@ -55,6 +55,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 **Depends On:** Nothing — ship immediately
 **Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`
 **GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)
+**PR:** [#58](https://github.com/bhaveshhpatel/cipher/pull/58) — ✅ **MERGED 2026-05-03** (commit `a38f837`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
 **All three roles signed off. Story cleared for implementation.**
@@ -170,18 +171,18 @@ _stats = {
 `get_stats()` returns `dict(_stats)` — no additional change if key is in init block.
 
 #### Acceptance Criteria
-- [ ] `_MIN_EVENT_PREMIUM = 10_000` defined at module level in `options_flow_parser.py`
-- [ ] `parse_tradier_trade()` returns `"below_premium"` for `premium < 10_000`
-- [ ] Gate fires after `size == 0` guard, after `premium = fill * size * 100`, before OCC parsing and `OptionsFlowEvent` construction
-- [ ] Return type annotation updated to `Union[OptionsFlowEvent, Literal["below_premium"], None]`
-- [ ] `_stats["below_min_premium"]` initialised to `0` in module-level `_stats` dict
-- [ ] `_process_trade()` checks `result == "below_premium"` BEFORE `if not ev` / `parse_failed` branch
-- [ ] `_stats["below_min_premium"]` increments on sentinel — does NOT increment `parse_failed`
-- [ ] `"below_min_premium"` counter visible in `/health/stream` from first request
-- [ ] All 6 QA boundary test cases pass
-- [ ] All existing callers of `parse_tradier_trade()` in tests audited — tests asserting `None` for below-floor inputs updated to assert `"below_premium"`
-- [ ] All existing parse tests (non-below-floor) pass without modification
-- [ ] No regression in `_stats["parse_failed"]` behaviour for genuine parse errors
+- [x] `_MIN_EVENT_PREMIUM = 10_000` defined at module level in `options_flow_parser.py`
+- [x] `parse_tradier_trade()` returns `"below_premium"` for `premium < 10_000`
+- [x] Gate fires after `size == 0` guard, after `premium = fill * size * 100`, before OCC parsing and `OptionsFlowEvent` construction
+- [x] Return type annotation updated to `Union[OptionsFlowEvent, Literal["below_premium"], None]`
+- [x] `_stats["below_min_premium"]` initialised to `0` in module-level `_stats` dict
+- [x] `_process_trade()` checks `result == "below_premium"` BEFORE `if not ev` / `parse_failed` branch
+- [x] `_stats["below_min_premium"]` increments on sentinel — does NOT increment `parse_failed`
+- [x] `"below_min_premium"` counter visible in `/health/stream` from first request
+- [x] All 6 QA boundary test cases pass
+- [x] All existing callers of `parse_tradier_trade()` in tests audited — tests asserting `None` for below-floor inputs updated to assert `"below_premium"`
+- [x] All existing parse tests (non-below-floor) pass without modification
+- [x] No regression in `_stats["parse_failed"]` behaviour for genuine parse errors
 
 ---
 
@@ -628,4 +629,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-002 deliberation complete; ING-002-CONFIG follow-up scoped) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-002 merged PR #58 commit a38f837; ING-003 + ING-004 + ING-006 now unblocked) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
