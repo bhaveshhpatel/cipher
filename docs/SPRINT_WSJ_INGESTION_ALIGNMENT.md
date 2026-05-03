@@ -25,8 +25,6 @@ No story moves to `In Progress` without sign-off from all three roles.
 
 This is actually **more correct** for WSJ purposes than `order_side` alone — put selling at bid IS aggressive bullish positioning regardless of exchange-reported aggressor flag.
 
-**No secondary data source needed.** `order_side_classifier.py` is retained as-is for future use if OPRA/Polygon data is ever integrated.
-
 **Documented in:** `docs/ORDER_SIDE_RESOLUTION.md`
 
 ---
@@ -36,7 +34,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | Order | Story ID | Title | Depends On | Can Ship? |
 |-------|----------|-------|------------|-----------|
 | ~~1~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
-| 1 | **ING-002** | Hard per-event $10k premium floor at parser | — | ✅ NOW |
+| 1 | **ING-002** | Hard per-event $10k premium floor at parser | — | ✅ NOW — deliberation complete (2026-05-03) |
 | 2 | **ING-003** | Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init | — | ✅ NOW |
 | 3 | **ING-004** | Fallback `underlying_price` from registry | — | ✅ NOW |
 | 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | After ING-004 |
@@ -54,71 +52,148 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 **Type:** Feature / Gate Addition
 **Priority:** P0
 **Estimated Effort:** 0.5 day
-**Depends On:** Nothing — ship immediately after deliberation
+**Depends On:** Nothing — ship immediately
 **Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`
+**GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)
 
-#### Context
-Currently a single $11k mid-print on a 2-DTE contract passes all parser gates and enters the accumulator. The DTE-adjusted floor (Gate 6) only activates after registry warmup (~30 min post-deploy). Before warmup, the flat `min_premium=10_000` fallback means junk clears every gate. A hard floor at the parser level, independent of the accumulator and registry state, eliminates sub-threshold noise from ever entering `flow_events`.
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
+**All three roles signed off. Story cleared for implementation.**
+
+#### Deliberation Outcomes
+
+**SA-Q1: Hardcoded vs. DB-driven floor — DECIDED: Hardcoded now, admin-configurable later**
+- `_MIN_EVENT_PREMIUM = 10_000` defined at module level in `options_flow_parser.py`
+- Floor is active at import time — no DB dependency, no cold-start gap
+- Future path: when admin config page is built, wire through `ingestion_config` key `"min_event_premium"` with `10_000` as hardcoded cold-start fallback
+- Follow-up story filed: **ING-002-CONFIG** (see bottom of document)
+- Do NOT add TODO comments in code — the follow-up story is the tracking mechanism
+
+**SA-Q2: Floor placement — DECIDED: Parser only, after dedup, gate order unchanged**
+- Dedup cache operates on raw tick before premium is known — floor cannot apply there
+- Current gate order: `dedup → parse → accumulate → persist` is correct
+- `_MIN_EVENT_PREMIUM` gate fires inside `parse_tradier_trade()` after `premium = fill * size * 100`
+- No gate reordering needed
+
+**SA-Q3 (found in code review): Caller in `_process_trade()` currently uses `if not ev` — CRITICAL**
+- `"below_premium"` sentinel is truthy — `if not ev` will NOT catch it
+- If not fixed: sentinel passes through, hits `ev.ticker`, and crashes silently
+- **Caller update is mandatory and in-scope for this PR**
+- `_process_trade()` must check `result == "below_premium"` BEFORE the `if not ev` / `parse_failed` branch
+
+**PBE-Q1: Sentinel vs. exception vs. dataclass — DECIDED: Sentinel**
+- Return type: `Union[OptionsFlowEvent, Literal["below_premium"], None]`
+- Named exception adds try/except overhead on the hot path
+- Dataclass adds complexity for a 0.5-day story
+- Caller must handle 3-state return — enforced in this PR
+
+**PBE-Q2: Other callers of `parse_tradier_trade()` — DECIDED: Audit required before merge**
+- Only production caller is `_process_trade()` in `tradier_stream.py`
+- Unit tests asserting `result is None` for below-floor inputs must be updated to assert `result == "below_premium"`
+- All test callers must be audited before PR merges
+
+**PBE-Q3: Gate placement — DECIDED: Earliest possible exit after premium is known**
+- Gate fires after `size == 0` guard and after `premium = fill * size * 100`
+- Before OCC symbol parsing, before `OptionsFlowEvent` construction
+
+**QA-Q1: Boundary value test matrix — ALL 6 CASES REQUIRED:**
+
+| Input | Expected return | Counter impact |
+|---|---|---|
+| `size=1, fill=50.00` → premium=$5,000 | `"below_premium"` | `below_min_premium` +1, `parse_failed` unchanged |
+| `size=1, fill=99.99` → premium=$9,999 | `"below_premium"` | `below_min_premium` +1 |
+| `size=1, fill=100.00` → premium=$10,000 | `OptionsFlowEvent` | passes (floor is exclusive `<`) |
+| `size=1, fill=100.01` → premium=$10,001 | `OptionsFlowEvent` | passes |
+| `size=2, fill=55.00` → premium=$11,000 | `OptionsFlowEvent` | passes |
+| `size=0` (existing guard) | `None` | `parse_failed` +1 (existing path unchanged) |
+
+**QA-Q2: `parse_failed` must NOT increment on sentinel returns**
+- `parse_failed` = genuine parse error (bad data, missing fields, exception)
+- `below_min_premium` = clean filter drop (valid data, intentional gate)
+- A surge in `below_min_premium` must not look like a parsing error spike in Railway logs
+
+**QA-Q3: `"below_min_premium": 0` must be in `_stats` init block at module level**
+- Key must exist before first tick arrives — no `KeyError` from `/health/stream` on cold start
 
 #### Implementation
 
 **Step 1 — Add constant and gate in `options_flow_parser.py`:**
 ```python
-# After premium is calculated (fill * size * 100):
-_MIN_EVENT_PREMIUM = 10_000  # $10k hard floor — parser-level gate
+# Module-level constant — hardcoded safe default.
+# Future: wire through ingestion_config key "min_event_premium" with this as fallback (ING-002-CONFIG).
+_MIN_EVENT_PREMIUM = 10_000
 
+# Inside parse_tradier_trade(), after: premium = fill * size * 100
+# and after: if size == 0: return None
 if premium < _MIN_EVENT_PREMIUM:
-    return None  # drop before building OptionsFlowEvent
+    return "below_premium"  # sentinel — not a parse error, clean data drop
 ```
 
-**Step 2 — Return typed sentinel to distinguish floor-drop from parse failure:**
+**Step 2 — Return type annotation:**
 ```python
-# parse_tradier_trade() return type updated to:
-# OptionsFlowEvent | Literal["below_premium"] | None
+from typing import Optional, Union, Literal
 
-if premium < _MIN_EVENT_PREMIUM:
-    return "below_premium"  # sentinel — not a parse error
+def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_premium"], None]:
 ```
 
-**Step 3 — Add dedicated stat counter in `tradier_stream.py`:**
+**Step 3 — Update caller in `tradier_stream.py`:**
 ```python
-# In _stats dict initialisation:
-"below_min_premium": 0,
-
-# In _process_trade():
-result = parse_tradier_trade(raw)
+result = parse_tradier_trade(trade_payload)
 if result == "below_premium":
     _stats["below_min_premium"] += 1
     return
 if result is None:
     _stats["parse_failed"] += 1
+    log.info(
+        "[flow] parse_tradier_trade returned None for symbol=%r "
+        "(size=%s bid=%s ask=%s last=%s) — tick dropped",
+        trade_payload.get("symbol"),
+        trade_payload.get("size"),
+        trade_payload.get("bid"),
+        trade_payload.get("ask"),
+        trade_payload.get("last"),
+    )
     return
 ev = result
 ```
 
-**Step 4 — Expose counter in `/health/stream` endpoint.**
+**Step 4 — Add counter to `_stats` init block:**
+```python
+_stats = {
+    ...
+    "below_min_premium": 0,  # ING-002: clean drops at parser premium floor
+    "parse_failed":      0,
+    ...
+}
+```
 
-#### 3-Way Deliberation Questions
-**SA:**
-1. Should the $10k floor be configurable via `ingestion_config` (DB-driven) rather than hardcoded? Configurable is more flexible but adds warmup dependency — during cold-start before DB config is loaded, what is the fallback?
-2. Should the floor also apply to the dedup cache (Gate 3) or only to persistence in `flow_events`?
-
-**PBE:**
-1. The typed sentinel `Literal["below_premium"]` requires callers to handle a 3-state return. Is a named exception or a dedicated `ParseResult` dataclass cleaner for long-term maintainability?
-2. Confirm no other callers of `parse_tradier_trade()` break with the updated return type.
-
-**QA:**
-1. Add to `REGRESSION_TESTING.md`: premium floor test matrix covering boundary values ($9,999 → dropped, $10,000 → passes, $10,001 → passes).
-2. Confirm `parse_failed` stat does NOT increment on below-floor drops — this is a clean-data drop, not an error.
+**Step 5 — Expose counter in `/health/stream` endpoint.**
+`get_stats()` returns `dict(_stats)` — no additional change if key is in init block.
 
 #### Acceptance Criteria
-- [ ] `parse_tradier_trade()` returns sentinel `"below_premium"` for `premium < 10_000`
-- [ ] `_stats["below_min_premium"]` increments correctly — does NOT pollute `parse_failed`
-- [ ] Counter visible in `/health/stream` response
-- [ ] Unit test: size=1, fill=50.00 (premium=$5k) → sentinel returned
-- [ ] Unit test: size=2, fill=55.00 (premium=$11k) → OptionsFlowEvent returned
-- [ ] Unit test: size=1, fill=100.00 (premium=$10k exactly) → OptionsFlowEvent returned (floor is exclusive)
-- [ ] Regression: all existing parse tests pass
+- [ ] `_MIN_EVENT_PREMIUM = 10_000` defined at module level in `options_flow_parser.py`
+- [ ] `parse_tradier_trade()` returns `"below_premium"` for `premium < 10_000`
+- [ ] Gate fires after `size == 0` guard, after `premium = fill * size * 100`, before OCC parsing and `OptionsFlowEvent` construction
+- [ ] Return type annotation updated to `Union[OptionsFlowEvent, Literal["below_premium"], None]`
+- [ ] `_stats["below_min_premium"]` initialised to `0` in module-level `_stats` dict
+- [ ] `_process_trade()` checks `result == "below_premium"` BEFORE `if not ev` / `parse_failed` branch
+- [ ] `_stats["below_min_premium"]` increments on sentinel — does NOT increment `parse_failed`
+- [ ] `"below_min_premium"` counter visible in `/health/stream` from first request
+- [ ] All 6 QA boundary test cases pass
+- [ ] All existing callers of `parse_tradier_trade()` in tests audited — tests asserting `None` for below-floor inputs updated to assert `"below_premium"`
+- [ ] All existing parse tests (non-below-floor) pass without modification
+- [ ] No regression in `_stats["parse_failed"]` behaviour for genuine parse errors
+
+---
+
+### ING-002-CONFIG — Wire `_MIN_EVENT_PREMIUM` Through Admin Config Page *(Follow-Up — File When Admin Page Story Is In Scope)*
+**Type:** Feature / Configuration
+**Priority:** P2 — quality of life, not blocking
+**Depends On:** ING-002 (merged), Admin config page story
+**Scope:**
+- Add `"min_event_premium"` key to `ingestion_config` table with default `10_000`
+- Update `options_flow_parser.py` to read from config at module init: `_MIN_EVENT_PREMIUM = get_config("min_event_premium", fallback=10_000)`
+- Hardcoded constant remains as cold-start fallback — DB read is best-effort
+- Surface in admin panel for live floor adjustment without redeploy
 
 ---
 
@@ -553,4 +628,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-001 resolved pre-sprint, ING-006 rescoped) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-002 deliberation complete; ING-002-CONFIG follow-up scoped) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
