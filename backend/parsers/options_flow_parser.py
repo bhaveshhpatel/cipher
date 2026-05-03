@@ -13,6 +13,13 @@ ING-002: Hard per-event $10k premium floor.
   Exposed via get_stats() — visible in /health/stream through tradier_stream.
   Future: wire through ingestion_config key "min_event_premium" with
   10_000 as hardcoded cold-start fallback (ING-002-CONFIG story).
+
+ING-004: Fallback underlying_price from registry stock_price.
+  When Tradier omits underlying_price (returns 0.0), the registry
+  stock_price(ticker) is used as a fallback. Fires inside the existing
+  get_registry() enrichment block after meta enrichment so ev.ticker is
+  already canonical. Only applied when registry is ready and sp > 0.
+  Counter: _stats["underlying_price_fallback_applied"] owned by this module.
 """
 import re
 from dataclasses import dataclass
@@ -38,14 +45,18 @@ _MIN_EVENT_PREMIUM = 10_000
 
 # ---------------------------------------------------------------------------
 # Parser-level stats.
-# This module owns exactly one counter: below_min_premium.
+# This module owns exactly two counters:
+#   below_min_premium                 — ING-002: clean filter drops at parser premium floor
+#   underlying_price_fallback_applied — ING-004: ticks where registry stock_price used
+#
 # parse_failed is owned by tradier_stream — do NOT add it here.
 # If get_stats() returned parse_failed, stats.update(get_parser_stats()) in
 # tradier_stream.get_stats() would overwrite the stream's real parse_failed
 # counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
 # ---------------------------------------------------------------------------
 _stats: dict = {
-    "below_min_premium": 0,  # ING-002: clean filter drops at parser premium floor ($10k)
+    "below_min_premium":                  0,  # ING-002: clean filter drops at parser premium floor ($10k)
+    "underlying_price_fallback_applied":  0,  # ING-004: ticks where registry stock_price used as fallback
 }
 
 
@@ -300,6 +311,18 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
                     ev.dte           = meta.dte
                     ev.open_interest = meta.open_interest
                     ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
+
+                # ING-004: Fallback underlying_price from registry stock_price.
+                # Fires whether or not meta was found — stock_price is ticker-level,
+                # not contract-level. Only applied when tick value is 0.0 (Tradier
+                # frequently omits this field in timesale events).
+                # Placement after meta block so ev.ticker is already canonical.
+                # Deliberation: 2026-05-03 — SA/PBE/QA all signed off.
+                if ev.underlying_price == 0.0:
+                    sp = reg.stock_price(ev.ticker)
+                    if sp > 0.0:
+                        ev.underlying_price = sp
+                        _stats["underlying_price_fallback_applied"] += 1
         except Exception:
             pass
 

@@ -38,12 +38,12 @@ ING stories have hard sequential dependencies. Before touching any story:
 
 | Story | Depends On | Can Start? |
 |---|---|---|
-| ING-002 | Nothing | ✅ FIRST — deliberation already complete |
-| ING-003 | Nothing | ✅ After ING-002 (parallel ok) |
-| ING-004 | Nothing | ✅ After deliberation |
+| ING-002 | Nothing | ✅ MERGED |
+| ING-003 | Nothing | ✅ MERGED |
+| ING-004 | Nothing | ✅ Deliberation complete — IN PROGRESS (branch `ing/s4-underlying-price-fallback`) |
 | ING-005 | ING-004 | 🔴 After ING-004 merges |
-| ING-006 | ING-002 | After ING-002 merges + deliberation |
-| ING-007 | ING-002, ING-003 | After both merge + deliberation |
+| ING-006 | ING-002 | After deliberation |
+| ING-007 | ING-002, ING-003 | After deliberation |
 | ING-008 | ING-004, ING-005 | After both merge + deliberation |
 
 ---
@@ -59,16 +59,17 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 
 | Story | Deliberation Status |
 |---|---|
-| ING-002 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc |
+| ING-002 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #58 commit `a38f837`** |
 | ING-003 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #59 commit `62b159f`** |
-| ING-004 | 🔴 NOT STARTED — deliberation required before implementation |
+| ING-004 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **IN PROGRESS — branch `ing/s4-underlying-price-fallback` commit `327300d`** |
 | ING-005 | 🔴 NOT STARTED — deliberation required before implementation |
 | ING-006 | 🔴 NOT STARTED — deliberation required before implementation |
 | ING-007 | 🔴 NOT STARTED — deliberation required before implementation |
 | ING-008 | 🔴 NOT STARTED — deliberation required before implementation |
 
-> For ING-002: deliberation is complete. The decisions are law. Do not re-litigate SA-Q1, SA-Q2, SA-Q3, PBE-Q1/2/3, or QA-Q1/2/3.
+> For ING-002: deliberation is complete and story is merged. Do not re-litigate any decisions.
 > For ING-003: deliberation is complete and story is merged. Do not re-litigate any decisions.
+> For ING-004: deliberation is complete. The decisions are law. Do not re-litigate SA-Q1/2/3, PBE-Q1/2/3/4, or QA-Q1/2/3/4.
 > For all other stories: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
@@ -92,9 +93,8 @@ Before creating a branch for any ING story:
 | [`docs/ORDER_SIDE_RESOLUTION.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/ORDER_SIDE_RESOLUTION.md) | ING-001 resolution — why `order_side` is not available from Tradier; aggression proxy rationale |
 | [`docs/FIXES.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/FIXES.md) | Running fixes log — ING stories must document Option decisions and API findings here |
 | [`docs/ARCHITECTURE.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/ARCHITECTURE.md) | Gate structure — must be updated post-sprint to reflect new gates added by ING stories |
-| [`docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`](https://github.com/bhaveshhpatel/cipher/blob/main/docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md) | Execution state tracker |
 | [`STORY-STEPS.md`](https://github.com/bhaveshhpatel/cipher/blob/main/STORY-STEPS.md) | Root protocol — this file is the ING-specific extension of it |
-| GitHub Issues | Execution tracking only — [#57](https://github.com/bhaveshhpatel/cipher/issues/57) = ING-002 |
+| GitHub Issues | Execution tracking only |
 
 ---
 
@@ -116,6 +116,7 @@ Always: branch → commits → PR → deliberation → merge.
 **Examples:**
 - `ing/s2-premium-floor` → ING-002
 - `ing/s3-dte-tiers-init` → ING-003
+- `ing/s4-underlying-price-fallback` → ING-004
 - `ing/s6-directional-aggression` → ING-006
 
 ### PR Body Must Include
@@ -138,7 +139,7 @@ Before any ING PR merges, all three roles must deliberate on the diff.
 - Is scope correct per `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`?
 - Does the implementation respect the gate order: `dedup → parse → accumulate → persist`?
 - Are layer boundaries respected (e.g. no parser importing from services unless deliberation approved it)?
-- Does the PR correctly address any Critical callouts in the story (e.g. SA-Q3 caller fix in ING-002)?
+- Does the PR correctly address any Critical callouts in the story?
 - Does the implementation match the deliberation decisions already recorded in the sprint doc?
 
 ### Principal Backend Engineer Review
@@ -153,8 +154,8 @@ Before any ING PR merges, all three roles must deliberate on the diff.
 - Are all acceptance criteria checkboxes from the sprint doc covered?
 - Is every test case in the story's QA test matrix present and passing?
 - Are boundary value tests present (floor-1, floor, floor+1)?
-- Are counter separation tests present (e.g. `below_min_premium` vs `parse_failed` are distinct)?
-- Are cold-start safety tests present (key exists in `_stats` before first tick)?
+- Are counter separation tests present?
+- Are cold-start safety tests present?
 - Are regression tests for existing behaviour present and green?
 
 ### Findings Resolution
@@ -179,7 +180,7 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 3. **No TODO comments in implementation code.** Follow-up work goes in a GitHub Issue and `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` row. The code itself must be clean.
 4. **Every new `_stats` key must be in the module-level init block.** No `KeyError` on `/health/stream` from cold start.
 5. **No DB reads on the hot path.** Registry lookups must be non-blocking dict reads. DB-backed config is fine at module init with a hardcoded fallback — not inline per-tick.
-6. **Hardcoded floors are safe defaults, not tech debt.** ING-002's `_MIN_EVENT_PREMIUM = 10_000` is intentional architecture (see SA-Q1 deliberation). Do not move to DB config until ING-002-CONFIG is in scope.
+6. **Hardcoded floors are safe defaults, not tech debt.** ING-002's `_MIN_EVENT_PREMIUM = 10_000` is intentional architecture. Do not move to DB config until ING-002-CONFIG is in scope.
 7. **ING-007 Supabase migration is a hard prerequisite.** Run `EXPLAIN ANALYZE` and confirm index hit before writing any Python for the lookback query.
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
 
@@ -267,7 +268,7 @@ POST-MERGE
 |---|---|---|---|
 | ING-002 | Hard $10k premium floor at parser | ✅ MERGED 2026-05-03 — PR #58 commit `a38f837` | `ing/s2-premium-floor` |
 | ING-003 | Wire DTE premium tiers at accumulator init | ✅ MERGED 2026-05-03 — PR #59 commit `62b159f` | `ing/s3-dte-tiers-init` |
-| ING-004 | Fallback `underlying_price` from registry | 🔴 Deliberation required | `ing/s4-underlying-price-fallback` |
+| ING-004 | Fallback `underlying_price` from registry | 🟡 IN PROGRESS — branch `ing/s4-underlying-price-fallback` commit `327300d` | `ing/s4-underlying-price-fallback` |
 | ING-005 | Align OTM band thresholds | 🔴 Blocked on ING-004 + deliberation | `ing/s5-otm-threshold-align` |
 | ING-006 | Directional aggression weighting | 🔴 Deliberation required (ING-002 ✅) | `ing/s6-directional-aggression` |
 | ING-007 | Multi-day repeat window lookback | 🔴 Deliberation required (ING-002 ✅ ING-003 ✅) | `ing/s7-multiday-repeat` |
@@ -275,5 +276,5 @@ POST-MERGE
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-03 (ING-003 merged PR #59 commit `62b159f`) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 deliberation complete, branch `ing/s4-underlying-price-fallback` in progress) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
