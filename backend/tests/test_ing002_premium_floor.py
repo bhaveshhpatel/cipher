@@ -9,7 +9,11 @@ Spec (STORY-STEPS_ING.md § ING-002 AC):
   AC-5  _stats["below_min_premium"] is incremented on each filtered trade
   AC-6  get_stats() exposes below_min_premium key (visible in /health/stream)
 
-Test IDs: P-01 … P-06
+Test IDs: P-01 … P-08
+
+Panel deliberation findings (2026-05-03):
+  P-07  Explicit floor−1 boundary from sprint spec QA-Q1 (fill=99.99, size=1 → $9,999)
+  P-08  Counter separation proof: parse_failed must NOT increment on sentinel returns (QA-Q2)
 """
 import importlib
 from datetime import date, timedelta
@@ -21,7 +25,7 @@ import parsers.options_flow_parser as _parser_module
 from parsers.options_flow_parser import OptionsFlowEvent, parse_tradier_trade
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def _payload(
     symbol="AAPL  260117C00180000",
@@ -45,11 +49,12 @@ def _payload(
 
 
 def _reset_stats():
-    """Reset module-level _stats so counter tests start from 0."""
+    """Reset module-level _stats counters so tests start from a known baseline."""
     _parser_module._stats["below_min_premium"] = 0
+    _parser_module._stats["parse_failed"] = 0
 
 
-# ── P-01  Below floor → "below_premium" ─────────────────────────────────────
+# ── P-01  Below floor → "below_premium" ──────────────────────────────────────
 
 def test_P01_below_floor_returns_below_premium_sentinel():
     """
@@ -63,7 +68,7 @@ def test_P01_below_floor_returns_below_premium_sentinel():
     )
 
 
-# ── P-02  At exact floor → passes ───────────────────────────────────────────
+# ── P-02  At exact floor → passes ────────────────────────────────────────────
 
 def test_P02_at_floor_exact_passes():
     """
@@ -106,7 +111,7 @@ def test_P04_size_zero_still_returns_none_not_below_premium():
     )
 
 
-# ── P-05  Counter increments on each filtered trade ─────────────────────────
+# ── P-05  Counter increments on each filtered trade ──────────────────────────
 
 def test_P05_below_premium_counter_increments():
     """
@@ -137,3 +142,45 @@ def test_P06_get_stats_exposes_below_min_premium_key():
         f"get_stats() missing 'below_min_premium' key. Keys present: {list(stats.keys())}"
     )
     assert isinstance(stats["below_min_premium"], int)
+
+
+# ── P-07  Explicit floor−1 boundary (sprint spec QA-Q1) ──────────────────────
+
+def test_P07_floor_minus_one_returns_below_premium():
+    """
+    Panel finding: sprint spec QA-Q1 explicitly requires fill=99.99, size=1
+    (premium = $9,999.00 — exactly one cent below floor) to return "below_premium".
+
+    This is the floor−1 boundary case. fill=100.00 (P-02) is the floor case.
+    Both must be present to prove the gate uses strict less-than (<), not (<=).
+    """
+    raw = _payload(last=99.99, size=1, bid=99.80, ask=100.20)
+    result = parse_tradier_trade(raw)
+    assert result == "below_premium", (
+        f"Expected 'below_premium' for $9,999 premium (floor-1), got {result!r}"
+    )
+
+
+# ── P-08  Counter separation: parse_failed unchanged on sentinel ─────────────
+
+def test_P08_parse_failed_not_incremented_on_below_premium():
+    """
+    Panel finding (QA-Q2 counter separation):
+    A clean below-floor drop must increment below_min_premium ONLY.
+    parse_failed must remain unchanged — it tracks genuine parse errors,
+    not intentional filter drops. A spike in below_min_premium must never
+    look like a parsing error in Railway logs.
+    """
+    _reset_stats()
+
+    # Fire one below-floor call ($500)
+    result = parse_tradier_trade(_payload(last=1.00, size=5))
+    assert result == "below_premium"
+
+    assert _parser_module._stats["below_min_premium"] == 1, (
+        f"below_min_premium should be 1, got {_parser_module._stats['below_min_premium']}"
+    )
+    assert _parser_module._stats["parse_failed"] == 0, (
+        f"parse_failed must stay 0 on sentinel return, "
+        f"got {_parser_module._stats['parse_failed']}"
+    )
