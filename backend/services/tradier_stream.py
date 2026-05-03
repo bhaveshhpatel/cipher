@@ -145,6 +145,12 @@ Fix (ING-002 2026-05-03):
   Counter ownership (Option A): below_min_premium is owned and incremented
   by options_flow_parser._stats inside parse_tradier_trade(), not by the
   caller. tradier_stream funnel log reads the counter from parser.get_stats().
+
+Fix (ING-003 2026-05-03):
+  accumulator was instantiated without dte_premium_tiers, so Gate 2
+  (DTE-adjusted premium floor) fell back to min_premium ($10,000) for every
+  episode. _DEFAULT_DTE_PREMIUM_TIERS (defined in repetition_accumulator.py)
+  is now passed at construction time. Gate 2 is now active from cold start.
 """
 import asyncio
 import logging
@@ -161,7 +167,7 @@ from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
-from signals.repetition_accumulator import RepetitionAccumulator
+from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
 
@@ -255,7 +261,14 @@ _stats = {
 # FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
 
-accumulator = RepetitionAccumulator(window_minutes=30, min_trades=1, min_premium=10_000)
+# ING-003: wire _DEFAULT_DTE_PREMIUM_TIERS so Gate 2 (DTE-adjusted premium
+# floor) is active from cold start instead of falling back to min_premium.
+accumulator = RepetitionAccumulator(
+    window_minutes=30,
+    min_trades=1,
+    min_premium=10_000,
+    dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+)
 
 # H4 fix: dict[str, float] with wall-clock timestamps instead of a bare Set.
 _sweep_upgrade_dispatched: dict[str, float] = {}
