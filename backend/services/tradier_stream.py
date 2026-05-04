@@ -235,6 +235,21 @@ Fix (ING-007 2026-05-04):
     The async worker patches the DB row after the full DB fetch completes.
     is_multi_day_repeat is also forwarded in the signal bus payload so
     WebSocket consumers see the flag immediately on first emit.
+
+Fix (PBE-1 2026-05-04): reconcile is_multi_day_repeat threshold.
+  The sync cache check in _process_trade() was using a hardcoded `>= 1`
+  threshold while start_lookback_worker() uses
+  `>= accumulator._multi_day_min_days` (default 2).
+  This caused a threshold split: a contract with prior_days_active=1 would
+  be emitted as is_repeat=True by the sync path but patched to False by
+  the async worker (worker threshold 2 > 1), creating a transient
+  inconsistency between the signal bus payload and the DB row.
+  Fix: sync check now reads `accumulator._multi_day_min_days` as the
+  canonical threshold. Both paths are now consistent.
+  _lookback_result_cache eviction is also co-opted to the same
+  _SIGNAL_EMIT_TTL_S (2h) cycle via _evict_lookback_result_cache() so
+  the in-process dict does not grow unboundedly across the trading day
+  (PBE-3 non-blocking finding, resolved inline).
 """
 import asyncio
 import logging
@@ -372,6 +387,8 @@ _signal_last_emit: dict[str, dict] = {}
 # Populated synchronously from contract_day_cache on the persist path so
 # persist_flow_episode() receives is_multi_day_repeat without blocking.
 # The async worker later patches the DB row with the fresh DB-fetched value.
+# PBE-3 fix: evicted on the same _SIGNAL_EMIT_TTL_S cycle as _signal_last_emit
+# via _evict_lookback_result_cache() to prevent unbounded growth.
 _lookback_result_cache: dict[str, bool] = {}
 
 
@@ -574,6 +591,25 @@ def _evict_signal_emit_cache(now: float) -> None:
         del _signal_last_emit[k]
 
 
+# PBE-3 fix: evict _lookback_result_cache on the same 2h TTL cycle.
+# Keyed by emit_key (same as _signal_last_emit) so the eviction pass
+# is O(n) on active contract keys, not on total historical keys.
+# Called alongside _evict_signal_emit_cache in _process_trade.
+def _evict_lookback_result_cache(now: float) -> None:
+    # Evict any key that is no longer present in _signal_last_emit
+    # (meaning its TTL has expired from the signal tracker side).
+    # This is a conservative proxy: a key can only be absent from
+    # _signal_last_emit if it was evicted by _evict_signal_emit_cache,
+    # which uses the same 2h TTL. So this evicts at most as aggressively
+    # as the signal cache, never more.
+    stale = [
+        k for k in _lookback_result_cache
+        if k not in _signal_last_emit
+    ]
+    for k in stale:
+        del _lookback_result_cache[k]
+
+
 def _should_emit_signal(
     emit_key: str,
     alert_level: str,
@@ -628,6 +664,12 @@ async def _process_trade(raw: dict):
       async lookback worker patches the DB row after the full DB fetch.
       is_multi_day_repeat forwarded in persist_flow_episode() and signal
       bus payload.
+
+    PBE-1 fix (2026-05-04):
+      Sync cache check now uses accumulator._multi_day_min_days (default 2)
+      as the canonical threshold, matching the async worker. Previously
+      hardcoded >= 1 caused a transient split where the signal payload
+      could carry is_repeat=True while the DB row was later patched False.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -779,18 +821,20 @@ async def _process_trade(raw: dict):
     _contract_key = _ContractKey(ev.ticker, ev.contract_type, ev.strike, ev.expiry)
     enqueue_lookback(_contract_key)
 
-    # ING-007: resolve is_multi_day_repeat synchronously from the in-process
-    # cache. On a cache miss (first episode for this contract today) the cache
-    # module returns _ZERO_RESULT (prior_days_active=0) so is_repeat=False.
+    # ING-007 / PBE-1 fix: resolve is_multi_day_repeat synchronously from the
+    # in-process cache using accumulator._multi_day_min_days as the canonical
+    # threshold. This matches the async worker's threshold exactly.
+    # On a cache miss the result is False (cold-cache, prior_days_active=0).
     # The async worker will PATCH the DB row once the full DB fetch completes.
     emit_key = f"{ev.ticker}|{ev.contract_type}|{ev.strike}|{ev.expiry}"
+    _multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
     try:
         from utils.contract_day_cache import _cache as _lbc, _is_fresh as _lbc_fresh
         _lbc_entry = _lbc.get(_contract_key)
         _is_repeat_now: bool = (
             _lbc_entry is not None
             and _lbc_fresh(_lbc_entry)
-            and _lbc_entry.prior_days_active >= 1
+            and _lbc_entry.prior_days_active >= _multi_day_min_days
         )
     except Exception:
         _is_repeat_now = False
@@ -905,6 +949,7 @@ async def _process_trade(raw: dict):
     # SIG-DEBOUNCE
     now_ts = _time.time()
     _evict_signal_emit_cache(now_ts)
+    _evict_lookback_result_cache(now_ts)  # PBE-3: co-evict with signal cache
 
     should_emit, reason = _should_emit_signal(
         emit_key, alert_level, sig_ep.total_premium, now_ts
