@@ -54,9 +54,6 @@ Bug fixes applied:
      after Signal Gate, before SIG-DEBOUNCE. _bus_signal_listener no longer
      writes flow_episodes — it is retained but acts as a no-op consumer of
      the db_writer channel for future use.
-  4. ING-007 (2026-05-04): persist_flow_episode() now accepts and writes
-     is_multi_day_repeat (BOOLEAN). Requires migration
-     add_is_multi_day_repeat_to_flow_episodes.sql to be run first.
 """
 import asyncio
 import logging
@@ -256,52 +253,6 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         return False
 
 
-async def get_contract_prior_days(
-    ticker: str,
-    contract_type: str,
-    strike: float,
-    expiry: str,
-) -> int:
-    """
-    ING-007: Call the Supabase RPC function get_contract_prior_days() to
-    count the number of distinct prior trading days (ET) on which this
-    contract appeared in flow_episodes.
-
-    Returns 0 on any error so the stream degrades gracefully — a failed
-    RPC call never blocks a tick from being processed.
-
-    SQL function definition: backend/db/get_contract_prior_days.sql
-    """
-    if not _is_configured():
-        return 0
-
-    url = f"{_SUPABASE_URL}/rest/v1/rpc/get_contract_prior_days"
-    payload = {
-        "p_ticker":        ticker,
-        "p_contract_type": contract_type,
-        "p_strike":        strike,
-        "p_expiry":        expiry,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.post(url, headers=_headers(), json=payload)
-        if resp.status_code == 200:
-            return int(resp.json())
-        log.warning(
-            "[flow_store] get_contract_prior_days RPC failed: "
-            "%d -- %s (ticker=%s %s $%.0f %s)",
-            resp.status_code, resp.text[:200], ticker, contract_type, strike, expiry,
-        )
-        return 0
-    except Exception as e:
-        log.warning(
-            "[flow_store] get_contract_prior_days exception: %s "
-            "(ticker=%s %s $%.0f %s) — defaulting to 0",
-            e, ticker, contract_type, strike, expiry,
-        )
-        return 0
-
-
 async def persist_flow_episode(signal_data: dict):
     """
     Write one row to flow_episodes.
@@ -313,35 +264,28 @@ async def persist_flow_episode(signal_data: dict):
 
     strike and expiry are populated from sig_ep fields (not from the
     composite_msg bus payload which never included them).
-
-    ING-007: now accepts is_multi_day_repeat (BOOLEAN, default False).
-    Requires migration add_is_multi_day_repeat_to_flow_episodes.sql.
     """
     expiry = signal_data.get("expiry") or None
 
     row = {
-        "ticker":              signal_data.get("ticker"),
-        "direction":           signal_data.get("direction"),
-        "contract_type":       signal_data.get("contract_type"),
-        "strike":              signal_data.get("strike"),
-        "expiry":              expiry,
-        "total_premium":       signal_data.get("total_premium"),
-        "trade_count":         signal_data.get("trade_count"),
-        "alert_level":         signal_data.get("alert_level"),
-        "is_accelerating":     signal_data.get("is_accelerating", False),
-        "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
-        "seed_episode":        signal_data.get("seed_episode"),
-        "signal_ts":           signal_data.get("timestamp"),
+        "ticker":          signal_data.get("ticker"),
+        "direction":       signal_data.get("direction"),
+        "contract_type":   signal_data.get("contract_type"),
+        "strike":          signal_data.get("strike"),
+        "expiry":          expiry,
+        "total_premium":   signal_data.get("total_premium"),
+        "trade_count":     signal_data.get("trade_count"),
+        "alert_level":     signal_data.get("alert_level"),
+        "is_accelerating": signal_data.get("is_accelerating", False),
+        "seed_episode":    signal_data.get("seed_episode"),
+        "signal_ts":       signal_data.get("timestamp"),
     }
     ok = await _insert_rows("flow_episodes", [row])
     if ok:
         log.info(
-            "[flow_store] flow_episode saved: %s %s strike=%s expiry=%s "
-            "alert=%s prem=$%,.0f multi_day=%s",
-            row["ticker"], row["contract_type"],
-            row["strike"], row["expiry"],
-            row["alert_level"], (row["total_premium"] or 0),
-            row["is_multi_day_repeat"],
+            f"[flow_store] flow_episode saved: {row['ticker']} {row['contract_type']} "
+            f"strike={row['strike']} expiry={row['expiry']} "
+            f"alert={row['alert_level']} prem=${(row['total_premium'] or 0):,.0f}"
         )
 
 
