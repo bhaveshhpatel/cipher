@@ -516,14 +516,18 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
+# SA-2 fix: single-escape raw strings are correct for regex in Python.
+# r"\-" is a literal hyphen, r"\." is a literal dot.
+# Double-escaping (r"\\-", r"\\.") in a raw string produces the two-char
+# sequences \\ and \\. which never match - or . — breaking Vercel CORS.
 _explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
 ]
 _origin_pattern = "|".join(filter(None, [
-    r"https://[a-zA-Z0-9\\-]+\\.vercel\\.app",
+    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
     r"http://localhost:(3000|3001)",
-    r"http://127\\.0\\.0\\.1:3000",
+    r"http://127\.0\.0\.1:3000",
 ] + _explicit_patterns))
 
 log.info("CORS allow_origin_regex: %s", _origin_pattern)
