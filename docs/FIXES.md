@@ -4,6 +4,113 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## Fix 6 — `signal_store.py`: Raw `sentiment` / `alert_level` Passthrough Caused 23514 CHECK Violations
+
+**Date:** 2026-05-04
+**Severity:** P1 — every composite signal insert was rejected by Postgres when upstream emitted lowercase/mixed-case or aliased sentiment values (e.g. `"bullish"`, `"STRONG_BULLISH"`)
+**PR:** [#72](https://github.com/bhaveshhpatel/cipher/pull/72) — squash merged 2026-05-04 (commit `8ad8ebc`)
+**Branch:** `hotfix/signal-store-23514-sentiment-normalisation`
+**Files:** `backend/services/signal_store.py`, `backend/tests/test_signal_store.py`
+
+### Root Cause
+
+`_build_row()` passed `sig["sentiment"]` raw to the `signal_history` row dict with no case normalisation and no constraint validation:
+
+```python
+# BEFORE (broken)
+if sig.get("sentiment"):
+    sentiment = sig["sentiment"]   # raw passthrough — no normalisation
+```
+
+The live DB CHECK constraint `signal_feed_log_sentiment_check` requires exactly one of:
+```
+BULLISH | BEARISH | NEUTRAL
+```
+
+If upstream emits `"bullish"` (lowercase), `"Bearish"` (mixed-case), `"STRONG_BULLISH"` (composite), or any other variant, Postgres rejects the row with `23514`. The same latent risk existed on `alert_level`: if `sig["alert_level"]` carried `"NORMAL"` (the column's pre-migration default value) or any string outside `CONVICTION | STRONG_SIGNAL | ALERT | WATCH`, the `signal_feed_log_alert_level_check` constraint would also reject the row.
+
+**Note:** PR #71 (`fix/signal-store-constraint-defaults`) was opened as a first attempt to fix this. It was closed pre-merge during panel deliberation after schema verification confirmed it targeted 4 non-existent columns (`order_side`, `execution_mechanic`, `quote_source`, `strong_sentiment`) — consistent with `docs/ORDER_SIDE_RESOLUTION.md` (ING-001 ADR) which explicitly states `order_side` is not added to the schema. The real cause was identified via live schema query against `cipher-database`.
+
+### Schema Verification (2026-05-04, `cipher-database / kpajucxqlrteckfuafvq`)
+
+All 5 CHECK constraints on `signal_history`:
+
+| Constraint | Allowed Values |
+|---|---|
+| `signal_feed_log_sentiment_check` | `BULLISH \| BEARISH \| NEUTRAL` |
+| `signal_feed_log_alert_level_check` | `CONVICTION \| STRONG_SIGNAL \| ALERT \| WATCH` |
+| `signal_feed_log_direction_check` | `BUY \| SELL \| HOLD` |
+| `signal_feed_log_trade_type_check` | `SWEEP \| BLOCK \| SPLIT \| SINGLE` |
+| `signal_feed_log_influence_tier_check` | `WHALE \| INSTITUTIONAL \| LARGE \| RETAIL` |
+
+`direction`, `trade_type`, and `influence_tier` were already routed through normalisation helpers — safe. Only `sentiment` and `alert_level` had raw passthrough.
+
+### Fix
+
+**Two new normalisation helpers added:**
+
+```python
+def _normalise_sentiment(raw: str) -> str:
+    """Routes raw upstream sentiment to a constraint-safe value."""
+    if not raw:
+        return "NEUTRAL"
+    upper = raw.upper()
+    if upper in _VALID_SENTIMENTS:          # BULLISH / BEARISH / NEUTRAL
+        return upper
+    if upper in ("BULL", "BULLISH_STRONG", "STRONG_BULLISH", "BUY"):
+        return "BULLISH"
+    if upper in ("BEAR", "BEARISH_STRONG", "STRONG_BEARISH", "SELL"):
+        return "BEARISH"
+    log.warning("[signal_store] unknown sentiment value %r -- defaulting to NEUTRAL", raw)
+    return "NEUTRAL"
+
+def _normalise_alert_level(raw: str) -> str:
+    """Validates alert_level against live CHECK constraint; falls back to WATCH."""
+    if not raw:
+        return "WATCH"
+    upper = raw.upper()
+    if upper in _VALID_ALERT_LEVELS:        # CONVICTION / STRONG_SIGNAL / ALERT / WATCH
+        return upper
+    log.warning("[signal_store] unknown alert_level value %r -- defaulting to WATCH", raw)
+    return "WATCH"
+```
+
+**`_build_row()` updated:**
+
+```python
+# AFTER (fixed)
+if sig.get("sentiment"):
+    sentiment = _normalise_sentiment(sig["sentiment"])   # normalised — no more raw passthrough
+
+if sig.get("alert_level"):
+    alert_level = _normalise_alert_level(sig["alert_level"])   # validated
+```
+
+**Module-level sets document the exact constraint values:**
+
+```python
+_VALID_SENTIMENTS   = {"BULLISH", "BEARISH", "NEUTRAL"}
+_VALID_ALERT_LEVELS = {"CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"}
+```
+
+### Tests Added (`backend/tests/test_signal_store.py`)
+
+17 new test functions covering:
+- `_normalise_sentiment`: valid uppercase passthrough, lowercase, mixed-case, bullish aliases (BULL, STRONG_BULLISH, BUY), bearish aliases (BEAR, STRONG_BEARISH, SELL), unknown → NEUTRAL, empty/None → NEUTRAL
+- `_normalise_alert_level`: valid passthrough, lowercase, `"NORMAL"` → WATCH, unknown → WATCH, empty/None → WATCH
+- `_build_row` integration: lowercase sentiment produces uppercase DB value, STRONG_BULLISH alias resolves to BULLISH, `alert_level="NORMAL"` remapped to WATCH, smoke test — all 5 constrained fields always within CHECK sets
+
+### Acceptance Criteria
+- [x] `_normalise_sentiment(raw)` → `BULLISH | BEARISH | NEUTRAL` added
+- [x] `_normalise_alert_level(raw)` → `CONVICTION | STRONG_SIGNAL | ALERT | WATCH` added
+- [x] `_build_row()` routes `sentiment` through `_normalise_sentiment()` — no raw passthrough
+- [x] `_build_row()` routes `sig["alert_level"]` through `_normalise_alert_level()` — validated
+- [x] `_VALID_SENTIMENTS` and `_VALID_ALERT_LEVELS` at module level — mirror live DB constraints
+- [x] 17 QA test functions added, all passing
+- [x] No schema changes, no new columns added to row dict
+- [x] `docs/ORDER_SIDE_RESOLUTION.md` ING-001 ADR respected — `order_side` not touched
+
+---
 ## ING-005 — Deep OTM Multiplier Default Changed to 1.0 (Registry Pre-Filter is Authoritative)
 
 **Date:** 2026-05-03
