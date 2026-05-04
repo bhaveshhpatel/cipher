@@ -16,6 +16,32 @@ QA-PREMERGE-F2 (2026-05-03): classify_bid_ask() mid-split boundary tests.
   ±10% tolerance bands to a mid-split had no dedicated test coverage.
   TestClassifyBidAsk covers the 8-case boundary table for the new logic.
 
+QA-F1 (2026-05-03, pre-merge fix):
+  Added 3 test cases for ctype null/empty/unknown paths in
+  is_directionally_aggressive(). The original F-matrix only covered
+  F-8 (AT_ASK + empty ctype -> True) but did not test the AT_BID branch
+  with empty/None/unknown ctype, which must return False.
+  See TestIsDirectionallyAggressive: test_empty_ctype_at_bid_returns_false,
+  test_none_ctype_at_bid_returns_false, test_unknown_ctype_at_bid_returns_false.
+
+QA-F2 (2026-05-03, pre-merge fix):
+  Added test_contract_type_flip_post_registry to TestWeightedPremiumGate.
+  Exercises the post-registry re-computation path where an event arrives
+  with contract_type='' (unknown at parse time) and is re-evaluated after
+  the registry resolves it to 'CALL'. Confirms Gate 2 weighted_premium
+  reflects the updated contract_type, not the stale empty-string value.
+
+SA-F2 / ING-007 SCOPE NOTE (2026-05-03):
+  is_aggressive is NOT yet included in the persist_flow_episode dict and
+  has no corresponding column in the flow_events DB table. ING-007 MUST
+  explicitly cover:
+    1. Adding is_aggressive to the persist_flow_episode serialisation dict
+       in options_flow_parser.py (or equivalent persist layer).
+    2. Adding a flow_events.is_aggressive boolean column via S2.5 migration.
+  Without this, historical rows are missing is_aggressive data and S8
+  backtest stratification (by aggression) will be degraded. This is a
+  blocking pre-production requirement, not a nice-to-have cleanup.
+
 SCOPE NOTE (QA-F1 — deliberation pre-merge review 2026-05-03):
   This file covers ING-006 scope only: is_directionally_aggressive() behaviour
   and the weighted_premium Gate 2 change in RepetitionAccumulator.
@@ -211,6 +237,45 @@ class TestIsDirectionallyAggressive:
         """None inputs should not raise — treated as empty string."""
         assert is_directionally_aggressive(None, None) is False  # type: ignore[arg-type]
 
+    # -----------------------------------------------------------------------
+    # QA-F1 (2026-05-03): ctype null / empty / unknown paths
+    # -----------------------------------------------------------------------
+
+    def test_empty_ctype_at_bid_returns_false(self):
+        """
+        QA-F1-A: AT_BID + '' (empty ctype) -> False.
+
+        AT_BID seller-side aggression requires a confirmed PUT or CALL.
+        An empty contract_type means the registry has not yet resolved the
+        instrument — we cannot assign directional meaning to the trade.
+        The intentional safe default (PBE-F2) is to return False here,
+        not True, to avoid false-positive aggression flags on unknown legs.
+        """
+        assert is_directionally_aggressive("AT_BID", "") is False
+
+    def test_none_ctype_at_bid_returns_false(self):
+        """
+        QA-F1-B: AT_BID + None -> False.
+
+        None is normalised to '' by the (contract_type or '') guard.
+        Same safe-default logic as empty string: no contract type, no
+        directional classification on the seller side.
+        """
+        assert is_directionally_aggressive("AT_BID", None) is False  # type: ignore[arg-type]
+
+    def test_unknown_ctype_at_bid_returns_false(self):
+        """
+        QA-F1-C: AT_BID + 'SPREAD' (unknown / multi-leg value) -> False.
+
+        Values outside {PUT, CALL} are not recognised directional instruments.
+        Examples include 'SPREAD', 'STRADDLE', or any other multi-leg label
+        that may appear on a complex order event. These must return False to
+        prevent misclassification of complex-order legs as single-leg conviction.
+        """
+        assert is_directionally_aggressive("AT_BID", "SPREAD") is False
+        assert is_directionally_aggressive("BELOW_BID", "STRADDLE") is False
+        assert is_directionally_aggressive("AT_BID", "UNKNOWN") is False
+
 
 # ---------------------------------------------------------------------------
 # QA-Q2: Accumulator weighted_premium gate
@@ -379,6 +444,59 @@ class TestWeightedPremiumGate:
 
         result = asyncio.run(run())
         assert result is not None, "passive episode at exactly 2x floor should pass"
+
+    def test_contract_type_flip_post_registry(self):
+        """
+        QA-F2 (2026-05-03): post-registry contract_type re-computation path.
+
+        Scenario: an event arrives at the parser with contract_type='' because
+        the registry has not yet resolved the instrument (e.g., a new symbol
+        seen for the first time mid-session). The accumulator ingests it as
+        passive (is_directionally_aggressive(AT_BID, '') -> False). Later,
+        the registry resolves contract_type='CALL', and the event is re-evaluated.
+
+        This test simulates that by building the episode directly with one
+        event whose initial is_aggressive=False (the pre-registry state) and
+        then verifying that weighted_premium reflects the post-registry state
+        after is_aggressive is updated to True on the event object.
+
+        Why this matters: if weighted_premium is computed lazily from
+        event.is_aggressive at read time (not cached at ingest time), then
+        a registry-triggered contract_type flip will propagate correctly.
+        If it is cached at ingest time, the flip will be silently dropped
+        and the episode will under-count aggressive premium.
+
+        Expected: after flipping event.is_aggressive from False to True,
+        ep.weighted_premium must equal ep.total_premium (all aggressive).
+        """
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
+
+        # Two events: one known-aggressive, one initially passive (pre-registry)
+        known_aggressive   = _make_event(50_000, True,  contract_type="CALL")
+        pre_registry_event = _make_event(50_000, False, contract_type="")   # unknown ctype
+
+        ep.events = [known_aggressive, pre_registry_event]
+
+        # Pre-registry state: pre_registry_event is passive -> weighted < total
+        pre_weighted = ep.weighted_premium   # 50k + 25k = 75k
+        assert pre_weighted == 75_000, (
+            f"Pre-registry: expected weighted=75k, got {pre_weighted}"
+        )
+
+        # Simulate post-registry resolution: ctype resolved to CALL, re-flagged aggressive
+        pre_registry_event.is_aggressive  = True
+        pre_registry_event.contract_type  = "CALL"
+
+        # Post-registry state: both events aggressive -> weighted == total
+        post_weighted = ep.weighted_premium  # 50k + 50k = 100k
+        assert post_weighted == 100_000, (
+            f"Post-registry: expected weighted=100k (all aggressive), got {post_weighted}. "
+            f"If this fails, weighted_premium is cached at ingest time and contract_type "
+            f"flips will be silently lost — requires accumulator re-design for ING-007."
+        )
+        assert post_weighted == ep.total_premium, (
+            "Post-registry all-aggressive episode: weighted must equal total premium."
+        )
 
 
 # ---------------------------------------------------------------------------

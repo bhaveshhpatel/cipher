@@ -126,8 +126,16 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     ba    = (bid_ask_class or "").strip().upper()
     ctype = (contract_type or "").strip().upper()
     if ba in ("AT_ASK", "ABOVE_ASK"):
+        # PBE-F2 (2026-05-03): AT_ASK/ABOVE_ASK are unconditional — a buyer
+        # paying up (or above) the ask is directionally aggressive regardless
+        # of contract type. ctype is intentionally not checked here.
         return True
     if ba in ("AT_BID", "BELOW_BID") and ctype in ("PUT", "CALL"):
+        # Seller writing at or below bid on a known contract type.
+        # ctype="" / unknown safely falls through to return False below —
+        # we require a confirmed PUT or CALL before flagging seller-side
+        # aggression, since an unknown contract type has no directional meaning.
+        # (PBE-F2 intentional safe default, 2026-05-03)
         return True
     return False
 
