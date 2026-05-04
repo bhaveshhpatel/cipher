@@ -39,7 +39,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60, commit `d3c3f31`) |
 | 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ CLOSED — 2026-05-03 (PR #61, commit `252d75f`) |
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
-| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅ | 🔓 UNBLOCKED — deliberation required before implementation. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
+| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅ | 🔓 UNBLOCKED — deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
 | 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
 
 ---
@@ -197,552 +197,275 @@ Rationale: permissive T1 floors equal the current strict T2/T3 floors — consis
 
 ---
 
-##### Senior Architect (SA)
-
-**SA-Q1: Preset switch — live accumulator reload vs. next cold-start only**
-
-When an operator switches from WSJ-Strict to WSJ-Permissive, do the new floors apply immediately (live reload path calling `accumulator.set_dte_premium_tiers()`) or only after the next service restart?
-
-Trade-offs:
-- **Live reload:** operator can see immediate signal rate change. Risk: accumulator is stateful — existing in-flight episodes have accumulated premium under the old floor. Switching floors mid-episode could cause an episode to retroactively pass or fail Gate 6 on the next tick. Acceptable for an enrichment system; dangerous if episodes are used for immediate trade routing.
-- **Next cold-start only:** zero complexity, zero risk. Operator must restart the stream worker to apply new floors. Acceptable for a P2 admin feature.
-
-**Decision required: Live reload or cold-start-only?**
-
-**SA-Q2: Preset stored in `ingestion_config` key/value table vs. a new `ingestion_presets` table**
-
-Current `ingestion_config` is a flat key/value string store with no validation. Storing `DTE_TIER_PRESET = "wsj-strict"` as a single key works. But if `Custom` mode is selected, 8 additional keys must also be coherent (e.g., `dte_floor_dte7_t1` must be > `dte_floor_dte7_t23`). The flat K/V table has no cross-key validation.
-
-Options:
-- **A (recommended):** Store preset name in `DTE_TIER_PRESET`. If `custom`, read 8 individual keys. Validate floor ordering in `get_dte_premium_tiers()` at load time — log ERROR and fall back to WSJ-Strict if ordering is violated. No new table.
-- **B:** New `ingestion_presets` JSONB table. More structured; adds migration complexity.
-
-**Decision required: Option A or B?**
-
-**SA-Q3: `_MIN_EVENT_PREMIUM` in same story or separate?**
-
-The original ING-002-CONFIG scope was only `_MIN_EVENT_PREMIUM`. This story expands to DTE presets. Confirm: wire `min_event_premium` through `ingestion_config` in this same story (single config load call at startup covers both), or defer `_MIN_EVENT_PREMIUM` config to a third micro-story?
-
-Recommendation: same story — the loader (`get_dte_premium_tiers()`) and the config init path are the same code touched. Doing both in one PR is cheaper than two half-stories.
-
-**Decision required: Same PR or separate?**
-
----
-
-##### Principal Backend Engineer (PBE)
-
-**PBE-Q1: Import-time vs. async load for `get_dte_premium_tiers()`**
-
-`get_config()` in `ingestion_config.py` is `async`. `_DEFAULT_DTE_PREMIUM_TIERS` is available synchronously at import time. The accumulator is currently instantiated synchronously in `tradier_stream.py` at module level.
-
-Two options:
-- **A:** `get_dte_premium_tiers()` is a sync function that calls `get_config()` via `asyncio.run()` — acceptable at startup (not in the hot path), but `asyncio.run()` inside an already-running async context (FastAPI lifespan) will raise `RuntimeError`.
-- **B (recommended):** `get_dte_premium_tiers()` returns the hardcoded preset synchronously at module-level init, then the lifespan startup hook calls `accumulator.set_dte_premium_tiers(await get_dte_premium_tiers_async())` to wire in the DB-sourced preset. Same two-phase pattern already used for `set_tier_map()`.
-
-**Decision required: Confirm Option B two-phase load is the correct pattern.**
-
-**PBE-Q2: Accumulator singleton is module-level in `tradier_stream.py` — can `set_dte_premium_tiers()` be added?**
-
-`set_tier_map()` already exists on `RepetitionAccumulator` and uses `threading.Lock`. The same pattern extends naturally to `set_dte_premium_tiers()`:
-```python
-def set_dte_premium_tiers(self, tiers: Dict[int, Tuple[float, float]]) -> None:
-    with self._tier_map_lock:  # reuse existing lock — tiers + tier_map reads are co-guarded
-        self.dte_premium_tiers = tiers
-        self._max_dte_key = max(tiers) if tiers else None
-```
-Confirm: reusing `_tier_map_lock` for both `_tier_map` and `dte_premium_tiers` is safe (same lock; no deadlock risk since neither holder calls back into the other).
-
-**Decision required: Confirm lock reuse pattern.**
-
-**PBE-Q3: `ingestion_config` cache TTL is 60 seconds — does this create an acceptable propagation delay for preset switches?**
-
-When admin switches preset via `POST /api/admin/ingestion/dte-tiers`, `update_config()` already sets `_cache_ts = 0.0` (invalidates cache). The next `get_config()` call fetches fresh. If live reload is chosen (SA-Q1), the admin endpoint calls `accumulator.set_dte_premium_tiers()` directly after writing to DB — no TTL wait. If cold-start-only is chosen, TTL is irrelevant. Either way, no issue.
-
-**Confirm: No TTL race condition regardless of SA-Q1 decision.**
-
-**PBE-Q4: Validation of Custom floor ordering**
-
-If `DTE_TIER_PRESET = "custom"`, the loader reads 8 keys and constructs the dict. Required invariant per DTE bucket: `T1_floor >= T2_T3_floor` (strict floor must be >= permissive floor). If violated (e.g., operator sets `dte_floor_dte7_t1 = 20_000` but `dte_floor_dte7_t23 = 30_000`), the gate logic silently inverts (T1 gets a lower floor than T2/T3). The loader must validate and fall back to WSJ-Strict with a logged ERROR if any bucket fails this invariant.
-
-**Confirm: Validation logic belongs in `get_dte_premium_tiers()`, not in the admin endpoint, so DB direct edits are also caught.**
-
----
-
-##### Lead QA (QA)
-
-**QA-Q1: Preset load test matrix (required at startup)**
-
-| Scenario | `DTE_TIER_PRESET` DB value | Expected result |
-|---|---|---|
-| Normal | `"wsj-strict"` | Returns `_PRESET_WSJ_STRICT` |
-| Normal | `"wsj-permissive"` | Returns `_PRESET_WSJ_PERMISSIVE` |
-| Custom valid | `"custom"` + all 8 keys present + T1>=T2/T3 per bucket | Returns constructed dict |
-| Custom invalid | `"custom"` + `dte7_t1=20k`, `dte7_t23=30k` (inverted) | Logs ERROR, returns `_PRESET_WSJ_STRICT` |
-| Unknown preset | `"wsj-aggro"` (typo) | Logs WARNING, returns `_PRESET_WSJ_STRICT` |
-| DB unavailable | Supabase timeout | Returns `_PRESET_WSJ_STRICT` (hardcoded fallback) |
-| Missing key | `DTE_TIER_PRESET` row absent from DB | Returns `_PRESET_WSJ_STRICT` (default in `_DEFAULTS`) |
-
-All 7 cases are required tests.
-
-**QA-Q2: Admin endpoint test matrix**
-
-`POST /api/admin/ingestion/dte-tiers` with `{"preset": "wsj-permissive"}`:
-- Assert 200 OK
-- Assert `ingestion_config` row updated: `DTE_TIER_PRESET = "wsj-permissive"`
-- If live reload (SA-Q1 decision): assert `accumulator.dte_premium_tiers` now equals `_PRESET_WSJ_PERMISSIVE`
-- Assert activity log entry written: `action = "ingestion_config.dte_preset.update"`, `details.preset = "wsj-permissive"`
-
-`POST /api/admin/ingestion/dte-tiers` with `{"preset": "unknown-value"}`:
-- Assert 422 Unprocessable Entity
-
-Non-admin user hitting endpoint:
-- Assert 403 Forbidden
-
-**QA-Q3: Regression — existing accumulator tests must not break**
-
-`_DEFAULT_DTE_PREMIUM_TIERS` is imported by `tradier_stream.py` tests. Confirm the new preset dicts (`_PRESET_WSJ_STRICT`, `_PRESET_WSJ_PERMISSIVE`) do not shadow or replace the original constant — `_DEFAULT_DTE_PREMIUM_TIERS` should be aliased to `_PRESET_WSJ_STRICT` so all existing import references continue to work:
-```python
-# In repetition_accumulator.py:
-_PRESET_WSJ_STRICT = { ... }
-_DEFAULT_DTE_PREMIUM_TIERS = _PRESET_WSJ_STRICT  # backward-compat alias — do not remove
-```
-
-**QA-Q4: `/health/stream` must expose active preset name**
-
-`get_stats()` should include `"dte_tier_preset": "wsj-strict"` (or whichever is active). This gives Railway log observers immediate visibility into which methodology is running without an admin panel visit.
-
----
-
-#### Implementation Plan (sequential, after deliberation sign-off)
-
-**Step 1 — `repetition_accumulator.py`**
-- Define `_PRESET_WSJ_STRICT`, `_PRESET_WSJ_PERMISSIVE`
-- Alias `_DEFAULT_DTE_PREMIUM_TIERS = _PRESET_WSJ_STRICT` (backward compat)
-- Add `set_dte_premium_tiers()` method with lock (PBE-Q2 pattern)
-
-**Step 2 — `services/ingestion_config.py`**
-- Add to `_DEFAULTS`:
-  ```python
-  "DTE_TIER_PRESET":         "wsj-strict",
-  "min_event_premium":       10_000,
-  "dte_floor_dte7_t1":       50_000,
-  "dte_floor_dte7_t23":      25_000,
-  "dte_floor_dte30_t1":      500_000,
-  "dte_floor_dte30_t23":     100_000,
-  "dte_floor_dte90_t1":      1_000_000,
-  "dte_floor_dte90_t23":     500_000,
-  "dte_floor_leaps_t1":      2_000_000,
-  "dte_floor_leaps_t23":     1_000_000,
-  ```
-- Add all 9 keys to `_EXPECTED_DB_KEYS`
-- Add `async get_dte_premium_tiers() -> Dict[int, Tuple[float, float]]` with full validation logic (QA-Q1 cases)
-
-**Step 3 — `services/tradier_stream.py`**
-- Keep synchronous module-level instantiation using `_PRESET_WSJ_STRICT` (no change)
-- In lifespan startup hook (after registry warms): `accumulator.set_dte_premium_tiers(await get_dte_premium_tiers())`
-- Expose `dte_tier_preset` string in `_stats` / `get_stats()` (QA-Q4)
-
-**Step 4 — `routers/admin.py`**
-
-New endpoints (pseudocode — full implementation in PR):
-```python
-_VALID_PRESETS = {"wsj-strict", "wsj-permissive", "custom"}
-
-GET  /api/admin/ingestion/dte-tiers  -> active_preset + resolved_tiers
-POST /api/admin/ingestion/dte-tiers  -> validates preset, writes DB, live-reloads accumulator, logs action
-```
-
-**Step 5 — Supabase Migration**
-
-```sql
--- Migration: add_ingestion_config_dte_preset_rows
-INSERT INTO ingestion_config (key, value, value_type, description) VALUES
-  ('DTE_TIER_PRESET',       'wsj-strict', 'string',  'Active DTE premium floor preset. Valid: wsj-strict | wsj-permissive | custom'),
-  ('min_event_premium',     '10000',      'float',   'Per-event minimum premium floor at parser (ING-002). Hard gate before accumulation.'),
-  ('dte_floor_dte7_t1',     '50000',      'float',   'Custom preset: T1 floor for DTE <= 7'),
-  ('dte_floor_dte7_t23',    '25000',      'float',   'Custom preset: T2/T3 floor for DTE <= 7'),
-  ('dte_floor_dte30_t1',    '500000',     'float',   'Custom preset: T1 floor for DTE 8-30'),
-  ('dte_floor_dte30_t23',   '100000',     'float',   'Custom preset: T2/T3 floor for DTE 8-30'),
-  ('dte_floor_dte90_t1',    '1000000',    'float',   'Custom preset: T1 floor for DTE 31-90'),
-  ('dte_floor_dte90_t23',   '500000',     'float',   'Custom preset: T2/T3 floor for DTE 31-90'),
-  ('dte_floor_leaps_t1',    '2000000',    'float',   'Custom preset: T1 floor for DTE > 90 (LEAPS)'),
-  ('dte_floor_leaps_t23',   '1000000',    'float',   'Custom preset: T2/T3 floor for DTE > 90 (LEAPS)')
-ON CONFLICT (key) DO NOTHING;
-```
-
-**Step 6 — Frontend admin panel card (separate frontend story)**
-- 3-button toggle: **WSJ-Strict** / **WSJ-Permissive** / **Custom**
-- When Custom: 4x2 editable table (DTE bucket rows x T1 / T2-T3 columns), values editable inline
-- Active preset: green badge
-- Warning banner when not WSJ-Strict: *"Non-default preset active. WSJ-Strict is the validated methodology."*
-
----
-
-#### Acceptance Criteria
-- [ ] `_PRESET_WSJ_STRICT` and `_PRESET_WSJ_PERMISSIVE` defined in `repetition_accumulator.py`
-- [ ] `_DEFAULT_DTE_PREMIUM_TIERS` aliased to `_PRESET_WSJ_STRICT` — all existing import references unbroken
-- [ ] `set_dte_premium_tiers()` method added to `RepetitionAccumulator` with lock
-- [ ] `get_dte_premium_tiers()` async loader in `ingestion_config.py` with all 7 QA-Q1 scenarios handled
-- [ ] T1 >= T2/T3 invariant validated per bucket for custom preset; violation falls back to WSJ-Strict with logged ERROR
-- [ ] 9 new `ingestion_config` rows inserted via migration; `validate_ingestion_config()` reports all keys present on startup
-- [ ] `GET /api/admin/ingestion/dte-tiers` returns active preset + resolved floor table
-- [ ] `POST /api/admin/ingestion/dte-tiers` validates preset name (422 on unknown), writes to DB, live-reloads accumulator (per SA-Q1 decision)
-- [ ] Activity log entry written on every preset change
-- [ ] `"dte_tier_preset"` key in `/health/stream` response showing active preset name
-- [ ] `min_event_premium` wired through `ingestion_config` in same PR; `_MIN_EVENT_PREMIUM` uses DB value with hardcoded fallback
-- [ ] All 7 QA-Q1 test cases pass
-- [ ] All QA-Q2 admin endpoint test cases pass
-- [ ] No regression in existing accumulator or stream tests
-- [ ] Frontend card ships as follow-on in same sprint window (not blocking backend merge)
-
----
-
-### ING-003 — Wire `_DEFAULT_DTE_PREMIUM_TIERS` at Accumulator Instantiation
-**Type:** Bug Fix / Configuration
+### ING-003 — Wire `_DEFAULT_DTE_PREMIUM_TIERS` at Accumulator Init
+**Type:** Bug Fix / Wiring
 **Priority:** P0
-**Estimated Effort:** 0.25 day
-**Depends On:** Nothing
-**Files:** `backend/services/tradier_stream.py`
+**GitHub Issue:** [#59](https://github.com/bhaveshhpatel/cipher/issues/59)
 **PR:** [#59](https://github.com/bhaveshhpatel/cipher/pull/59) — ✅ **MERGED 2026-05-03** (commit `62b159f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
 
-**SA-Q1:** T1-default stands. Unknown tickers default to T1 until registry warmup. Safe direction is too strict, not too permissive.
-**SA-Q2:** T3-default rejected — would pass everything during cold-start, defeating DTE tiers for 30 min.
-**PBE-Q1:** `_DEFAULT_DTE_PREMIUM_TIERS` import safety confirmed — module-level dict constant, no side effects.
-**PBE-Q2:** `set_dte_premium_tiers()` post-warmup override confirmed clean — atomic replace under lock, no merging.
-**QA-Q1:** Cold-start test D-11/D-12: DTE=5 unknown ticker (T1 default $50k floor). $30k → None. $60k → episode.
-**QA-Q2:** Post-warmup transition test D-13: after `set_tier_map({"TESTTICKER": 2})`, DTE=5, $30k → passes (T2=$25k).
-
-#### Acceptance Criteria
-- [x] Accumulator instantiated with `dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS`
-- [x] Unit test: DTE=5, T1 ticker, premium=$30k pre-warmup → Gate 6 drops
-- [x] Unit test: DTE=5, T1 ticker, premium=$60k pre-warmup → Gate 6 passes
-- [x] Post-warmup `set_dte_premium_tiers()` still overrides correctly
-- [x] No regression in existing accumulator tests
-
 ---
 
-### ING-004 — Fallback `underlying_price` From Registry When Tick Has Zero
+### ING-004 — Fallback `underlying_price` from Registry
 **Type:** Bug Fix
 **Priority:** P0
-**Estimated Effort:** 0.25 day
-**Depends On:** Nothing
-**Files:** `backend/parsers/options_flow_parser.py`, `backend/tests/test_ing004_underlying_price.py`
-**Branch:** `ing/s4-underlying-price-fallback` (commit `327300d`)
+**GitHub Issue:** [#60](https://github.com/bhaveshhpatel/cipher/issues/60)
 **PR:** [#60](https://github.com/bhaveshhpatel/cipher/pull/60) — ✅ **MERGED 2026-05-03** (commit `d3c3f31`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. Story merged.**
-
-#### Deliberation Outcomes
-
-**SA-Q1: Parser-layer coupling — DECIDED: Non-issue — add to existing enrichment block**
-- `get_registry()` is already imported at module level in `options_flow_parser.py` for test patchability
-- The existing enrichment block already calls `reg.lookup(symbol)` and mutates `ev.ticker`, `ev.strike`, `ev.expiry`, `ev.dte`, `ev.open_interest`
-- Adding `ev.underlying_price` to this same block is not a new architectural decision — it completes an existing enrichment pass
-- No parameter injection needed. Two-source design (tick data → registry override) is already the established pattern.
-
-**SA-Q2: Cold-start log visibility — DECIDED: Single startup INFO log only; no per-tick warnings**
-- Per-tick warnings during 30-min cold-start window would generate thousands of log lines and bury real errors
-- Single `INFO` log at stream start: `"[flow] underlying_price fallback: registry not ready at cold-start — OTM classification degraded until warmup"`
-- `/health/stream` counter `underlying_price_fallback_applied` provides Railway-level observability
-
-**SA-Q3: `stock_price()` vs `ContractMeta.underlying_price` — DECIDED: `reg.stock_price(ev.ticker)`**
-- `ContractMeta` does not carry `underlying_price` — it carries contract-level data
-- `SymbolRegistry.stock_price(ticker)` returns equity price fetched at chain build time
-- `stock_price()` returns `0.0` (not raises) for unknown tickers — guard `if sp > 0` handles this cleanly
-
-**PBE-Q1: Hot-path safety — DECIDED: Safe — O(1) dict read, no IO, no lock, no await**
-**PBE-Q2: Write-lock during concurrent `build()` — DECIDED: No additional locking needed**
-**PBE-Q3: Exact placement — DECIDED: After meta block, inside same try/except**
-**PBE-Q4: Counter initialisation — DECIDED: Module-level in `_stats` init block**
-**QA-Q1:** Full test matrix D-1 through D-5 — all 5 cases required and passing.
-**QA-Q2:** `/health/stream` visibility — automatic via existing `get_parser_stats()` wiring.
-**QA-Q3:** Guard `if sp > 0` ensures zero-mutation for unknowns.
-**QA-Q4:** Cold-start INFO log — no test required (infrastructure observability).
-
-#### Acceptance Criteria
-- [x] All criteria met — PR #60 merged.
 
 ---
 
-### ING-005 — Align OTM Band Thresholds: Registry ↔ Accumulator
-**Type:** Bug Fix / Consistency
-**Priority:** P1
-**Estimated Effort:** 1 day
-**Depends On:** ING-004 ✅
-**Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing005_otm_thresholds.py`
-**Branch:** `ing/s5-otm-threshold-align`
-**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **CLOSED — MERGED 2026-05-03** (commit `252d75f`)
+### ING-005 — Align OTM Band Thresholds Registry ↔ Accumulator
+**Type:** Threshold Alignment
+**Priority:** P0
+**GitHub Issue:** [#61](https://github.com/bhaveshhpatel/cipher/issues/61)
+**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **MERGED 2026-05-03** (commit `252d75f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. Story closed.**
 
-#### Deliberation Outcomes
-
-**SA-Q1: Option chosen — Option A: Retire deep OTM multiplier as a default**
-
-The registry's per-tier OTM filter is the correct place for OTM qualification. Post-ING-004, `underlying_price` is reliably populated and the registry OTM filter works correctly. The 1.5× accumulator penalty was compensating for the ING-004 bug. That bug is fixed. Applying a second penalty with a hardcoded 12% threshold that is inconsistent with the registry's per-tier `atm_pct` bands (up to ~20% for T1) is double-gating on the same axis with contradictory policy.
-
-- **Option A:** Change `deep_otm_multiplier` default from `1.5` → `1.0`. Keep the param and the Gate 3 logic block for backward-compat — callers that explicitly pass `deep_otm_multiplier > 1.0` (e.g. backtesting) still work. Keep `_classify_otm()` static method — still used for episode enrichment and downstream signal metadata.
-- **Option B** (pass tier `atm_pct` into accumulator) — **REJECTED**: layer inversion; accumulator would need to know registry tier internals.
-- **Option C** (bump `0.12` → `0.20`) — **REJECTED**: lazy patch; still wrong for T2/T3; doesn't fix root issue.
-
-**SA-Q2: Option B layer violation — CONFIRMED REJECTED**
-Passing tier `atm_pct` from registry into accumulator creates signal layer → registry coupling. Not acceptable.
-
-**PBE-Q1: Code change scope — default only, no structural changes**
-- `deep_otm_multiplier: float = 1.5` → `deep_otm_multiplier: float = 1.0` in `__init__`
-- Gate 3 block in `ingest_tick()` unchanged structurally — `> 1.0` guard is never true at the new default
-- `_classify_otm()` retained as-is
-- Scan for direct external calls to `_classify_otm()` — if none found outside accumulator, no further changes
-
-**PBE-Q2: No `OptionsFlowEvent` or `_DictEventWrapper` changes**
-Option B rejected. No tier data needs to flow through event objects.
-
-**QA-Q1: Required regression test matrix — 3 cases, all must pass**
-
-| Case | Setup | Expected |
-|---|---|---|
-| E-1: T1 at 18% OTM | T1 ticker, DTE=5, strike 18% OTM, total_premium=$60k | Passes — no penalty. 60k ≥ T1 DTE≤7 floor $50k |
-| E-2: T2 at 14% OTM | T2 ticker, DTE=15, strike 14% OTM, total_premium=$110k | Passes — no penalty. 110k ≥ T2 DTE≤30 floor $100k |
-| E-3: T3 at 9% OTM | T3 ticker, DTE=60, strike 9% OTM, total_premium=$510k | Passes — no penalty. 510k ≥ T3 DTE≤90 floor $500k |
-
-**QA-Q2: `test_classify_otm` tests — keep, update any asserting default penalty**
-- Static method tests stay green (method unchanged)
-- Tests using default `RepetitionAccumulator()` and asserting deep OTM penalty must be updated — the default no longer applies a penalty
-- Tests explicitly passing `deep_otm_multiplier=1.5` continue to work as-is
-
-**QA-Q3: No new `/health/stream` counter required**
-`_classify_otm()` still classifies; `otm_band` available on episode for downstream. No new stat counter in scope for this story.
-
-#### Acceptance Criteria
-- [x] `deep_otm_multiplier` default changed `1.5` → `1.0` in `RepetitionAccumulator.__init__`
-- [x] All docstrings updated with ING-005 rationale (module, class, `_classify_otm`, `ingest_tick` Gate 3 comment)
-- [x] `backend/tests/test_ing005_otm_thresholds.py` created with E-1, E-2, E-3 cases
-- [x] All existing `test_classify_otm` tests green (static method unchanged)
-- [x] Tests asserting default deep OTM penalty updated — all existing tests use explicit `deep_otm_multiplier=1.5`; no tests asserted the old default
-- [x] No regression in existing accumulator or stream tests
-- [x] PR #61 opened targeting `main`
+**Key Decision — `deep_otm_multiplier` 1.5 → 1.0:**
+- `deep_otm_multiplier` set to `1.0` — delegates OTM filtering entirely to `SymbolRegistry` pre-filter
+- **Dependency documented:** Gate 3 OTM filtering is now fully dependent on `SymbolRegistry.atm_pct` band accuracy. If registry bands are misconfigured or stale, Gate 3 provides no backstop. This dependency is intentional — document explicitly in code.
+- `ep.otm_band` wiring deferred to ING-007 (see QA: otm_band wiring below)
 
 ---
 
 ### ING-006 — Directional Aggression Weighting on Premium Floor
-**Type:** Feature / Gate Enhancement
+**Type:** Feature / Signal Enhancement
 **Priority:** P0
-**Estimated Effort:** 1 day
-**Depends On:** ING-001 resolved ✅
-**Files:** `backend/parsers/bid_ask_classifier.py`, `backend/parsers/options_flow_parser.py`, `backend/signals/repetition_accumulator.py`
-**Branch:** `ing/s6-directional-aggression`
+**GitHub Issue:** [#62](https://github.com/bhaveshhpatel/cipher/issues/62)
 **PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **MERGED 2026-05-04** (commit `501b170`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. All 7 findings resolved. Merged 2026-05-04.**
 
-#### Deliberation Outcomes
-
-**SA-Q1: Size threshold for AT_BID/BELOW_BID — DECIDED: No additional threshold**
-- ING-002 $10k per-event floor is the correct upstream guard
-- By the time `is_directionally_aggressive()` runs, the event has already cleared $10k
-- No additional size threshold needed in this function
-
-**SA-Q2: `is_aggressive` persistence in `flow_events` — DECIDED: Deferred to ING-007**
-- Column `is_aggressive BOOLEAN DEFAULT FALSE` added in ING-007 Supabase migration (see Issues #64, #67, #69)
-- Documented in `options_flow_parser.py` module docstring
-- ING-007 AC explicitly calls out this migration prerequisite
-
-**SA-F1: TODO comment in `bid_ask_classifier.py` — RESOLVED**
-- `TODO(ING-007/S2)` removed per Rule 6 Constraint 3 (no TODO in implementation code)
-- Migration of `is_directionally_aggressive()` to `order_side_classifier.py` tracked in **[Issue #66](https://github.com/bhaveshhpatel/cipher/issues/66)**
-- Prose note retained in function docstring referencing Issue #66 as the tracking mechanism
-
-**PBE-Q1: `is_aggressive` in `_DictEventWrapper` — DECIDED: Correct**
-- `"is_aggressive"` added to `__slots__`; read with `bool(d.get("is_aggressive", False))`
-- Dict ticks without `is_aggressive` default to `False` (passive) — correct conservative default
-
-**PBE-Q2: `aggression_discount` configurability — DECIDED: Hardcoded now, ING-002-CONFIG later**
-- `_AGGRESSION_DISCOUNT = 0.5` module constant retained as property/episode fallback
-- `aggression_discount: float = 0.5` added as `RepetitionAccumulator` constructor parameter (PBE-F1 fix)
-- Wire through `ingestion_config` in ING-002-CONFIG sprint
-
-**PBE-F1: `aggression_discount` constructor param — RESOLVED**
-- `aggression_discount: float = 0.5` added to `RepetitionAccumulator.__init__`
-- Stored as `self._aggression_discount`
-- `ingest_tick()` calls `ep.get_weighted_premium(self._aggression_discount)` (not module constant)
-- `RepetitionEpisode.weighted_premium` property uses module constant as convenience default for direct episode tests
-- `RepetitionEpisode.get_weighted_premium(discount)` added for caller-supplied discount
-- Test `test_aggression_discount_constructor_param` verifies discount=1.0 flows through Gate 2
-
-**PBE-F2: `threading.Lock` removed — RESOLVED**
-- `threading.Lock` restored on `set_tier_map()` and `_get_episode_min_premium()` per S4-POST-4 deliberation
-- Rationale documented in class docstring: safe under CPython GIL, required for correctness under all interpreters and future GIL removal
-
-**PBE-F3: `ingest()` shim removal — RESOLVED**
-- Grep audit (2026-05-03): zero callers of `.ingest()` in `backend/` outside deleted method
-- Documented in module docstring under "ingest() shim retirement note"
-
-**PBE-F4: `get_signal()` / cooldown gate removed — RESOLVED**
-- Cooldown gate intentionally removed: never wired in production
-- Stream layer (`tradier_stream.py`) handles emit throttling at higher level
-- Documented in module docstring under "cooldown gate (get_signal) retirement note"
-- `_signal_last_emit` dict retained in `__init__` for `flush_emit_cache()` compat; may be removed in future sprint after confirming no callers
-
-**QA-Q1: Test matrix — RESOLVED (9 cases, F-1 through F-9)**
-
-| Case | Input | Expected |
-|---|---|---|
-| F-1 | AT_ASK + CALL | True |
-| F-2 | ABOVE_ASK + PUT | True |
-| F-3 | AT_BID + PUT | True |
-| F-4 | BELOW_BID + CALL | True |
-| F-5 | AT_BID + CALL | True |
-| F-6 | MID + CALL | False |
-| F-7 | MID + PUT | False |
-| F-8 | AT_ASK + '' | True |
-| F-9 | BELOW_BID + PUT | True *(added QA-F1 fix — was missing from original 8-case spec)* |
-
-All 9 cases implemented in `test_ing006_directional_aggression.py`.
-
-**QA-Q2: Weighted premium gate tests — RESOLVED**
-- `test_weighted_premium_calculation`: 2 agg@$40k + 2 pass@$40k → weighted=$120k, total=$160k
-- `test_passive_only_drops_below_floor`: 3×$20k passive → weighted=$30k < $50k floor → None
-- `test_aggressive_at_exact_floor_passes`: 3×$20k aggressive → $60k ≥ $50k → passes
-- `test_mixed_episode_weighted_passes`: mixed → $120k weighted → passes
-- `test_boundary_passive_at_double_floor_passes`: 3×$34k passive → $51k ≥ $50k → passes
-
-**QA-F1: Sprint doc QA-Q1 matrix updated to 9 cases — RESOLVED**
-- F-9 (BELOW_BID + PUT → True) added to canonical matrix above
-- Test file docstring updated
-
-**QA-F4: Counter-separation test — RESOLVED**
-- `TestCounterSeparation` class added to `test_ing006_directional_aggression.py`
-- `test_passive_gate2_drop_returns_none_no_exception`: asserts no exception raised on passive Gate 2 drop
-- `test_aggressive_pass_returns_episode_not_none`: baseline confirming the correct path
-
-#### Post-Merge Findings (all tracked in GitHub Issues — no TODOs in code)
-
-| Finding | Issue | Title | Blocking? |
-|---------|-------|-------|-----------|
-| SA-F1 | [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Blocking ING-007/008 signal-layer imports |
-| SA-F2 | [#67](https://github.com/bhaveshhpatel/cipher/issues/67) / [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `is_aggressive` column to `flow_events` + persist_flow_episode serialisation | **Blocking production deploy** |
-| PBE-PREMERGE-F1 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | `is_aggressive()` deprecated shim removal | Coordinate with #63/#66 |
-| SA-Q2 resolved | [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | Persist `is_aggressive` to `flow_events` for ING-007 pattern quality scoring | P1 — ING-007 prerequisite |
-
-#### Acceptance Criteria
-- [x] `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` in parser
-- [x] All 9 QA test matrix cases pass (F-1 through F-9, including F-9 added per QA-F1 fix)
-- [x] Accumulator uses aggression-weighted premium for Gate 2 floor check
-- [x] `aggression_discount: float = 0.5` parameter on `RepetitionAccumulator` (PBE-F1 fix)
-- [x] `ingest_tick()` calls `ep.get_weighted_premium(self._aggression_discount)` — constructor param flows through to Gate 2
-- [x] Old `is_aggressive()` retained as deprecated shim
-- [x] `is_aggressive` field available in `_DictEventWrapper`
-- [x] `threading.Lock` restored on `set_tier_map()` / `_get_episode_min_premium()` (PBE-F2 fix)
-- [x] `ingest()` shim removal confirmed by grep audit — zero callers (PBE-F3 fix)
-- [x] `get_signal()` / cooldown removal documented as intentional (PBE-F4 fix)
-- [x] TODO comment removed from `bid_ask_classifier.py`; migration tracked in Issue #66 (SA-F1 fix)
-- [x] Sprint doc QA-Q1 matrix updated to 9 cases (QA-F1 fix)
-- [x] `TestCounterSeparation` tests confirm passive Gate 2 drop returns None without raising (QA-F4 fix)
-- [x] `test_aggression_discount_constructor_param` confirms custom discount flows through Gate 2
+**Key Decisions:**
+- `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` shim — `AT_BID`/`BELOW_BID` now correctly flags PUT **and** CALL as directional
+- `RepetitionEpisode.weighted_premium` property added — Gate 2 and Gate 3 evaluate weighted premium, not total premium
+- `_AGGRESSION_DISCOUNT = 0.5` hardcoded; wire through `ingestion_config` deferred to ING-002-CONFIG
+- New test file `test_ing006_directional_aggression.py` — F-matrix cases F-1 through F-8 + weighted premium boundary cases
 
 ---
 
-### ING-007 — Multi-Day Repeat Window Lookback
-**Type:** Feature / New Gate
-**Priority:** P1
-**Estimated Effort:** 3 days
-**Depends On:** ING-002 (merged ✅), ING-003 (merged ✅)
-**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) *(canonical — supersedes #65)*
-**Status:** 🔓 **UNBLOCKED** — ING-006 merged 2026-05-04. Deliberation required before implementation.
-**Files:** `backend/services/flow_store.py`, `backend/services/tradier_stream.py`, `backend/utils/contract_day_cache.py` (new), Supabase migration
+### ING-007 — Multi-Day Repeat Window Lookback (DB + Cache)
+**Type:** Feature / Signal Enhancement
+**Priority:** P0
+**Estimated Effort:** 2 days
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅ — fully unblocked
+**Files:**
+- `backend/utils/contract_day_cache.py` — NEW: async TTL cache + DB fetch logic
+- `backend/signals/repetition_accumulator.py` — wire `prior_days_active`, `prior_days_aggressive`, `is_multi_day_repeat`, `otm_band` onto `RepetitionEpisode`; constructor params `require_multi_day`, `multi_day_min_days`
+- `backend/services/flow_store.py` — background `asyncio.Queue` worker; `_stats["lookback_queue_overflow"]` counter
+- `backend/services/tradier_stream.py` — wire `_lookback_queue.put_nowait()` in `_process_trade()`
+- `supabase/migrations/` — S2.5 migration: index + `order_side` column + `is_aggressive` column
+- `backend/tests/test_ing007_multiday_lookback.py` — NEW: G-1 through G-8 fixture cases + TTL expiry + latency benchmark + otm_band wiring
+**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70)
+**Branch:** `ing/s7-multiday-repeat`
 
-#### 🚨 Infrastructure Prerequisites — MUST LAND BEFORE ANY PYTHON
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
+**All three roles signed off. Story cleared for implementation.**
 
-The following must be applied and verified before any ING-007 Python implementation begins:
+---
 
-**S2.5 Migration (Supabase — tracked in Issues [#67](https://github.com/bhaveshhpatel/cipher/issues/67) and [#69](https://github.com/bhaveshhpatel/cipher/issues/69)):**
+#### Senior Architect (SA) — Decisions
+
+**SA-Q1: Hard gate vs. soft enrichment flag — DECIDED: Flag**
+
+`require_multi_day: bool = False` constructor param on `RepetitionAccumulator`. A hard gate would silently drop episodes for new listings, newly-tracked symbols, or any ticker that hasn't repeated in 5 days — signal quality degradation disguised as a feature. WSJ uses multi-day recurrence as a conviction amplifier, not a binary qualifier. The flag pattern (`ep.is_multi_day_repeat = True/False`) lets the signal layer weight it without destroying otherwise-valid single-day sweeps. Promotion to hard gate deferred until backtest data from ING-007 confirms false-positive reduction justifies the drop rate.
+
+**SA-Q2: Lookback window — DECIDED: 5 calendar days**
+
+Calendar days are deterministic with no market calendar dependency. `pandas_market_calendars` / `trading-calendars` adds a dependency and failure mode (stale calendar, holiday edge cases) that is unnecessary at this stage. Combined with SA-Q3's qualifying-flow-only counting, weekends and holidays auto-drop out because there is no flow on those days. No extra logic required.
+
+**SA-Q3: `prior_days_active` counting method — DECIDED: Days-with-qualifying-flow only**
+
+`prior_days_active = COUNT(DISTINCT DATE(created_at))` on qualifying flow for that contract over the lookback window. "Qualifying" = same `(ticker, contract_type, strike, expiry)` tuple, `premium >= DTE-tier floor`. Counting calendar days inflates the metric on quiet days (e.g., SPY swept Monday, nothing Tuesday–Friday → `prior_days_active = 1`, not 4). The DB query returns distinct-day count; the cache stores it.
+
+**SA-F2-Q1: Two counters — DECIDED: Both `prior_days_active` + `prior_days_aggressive`**
+
+Collapsing to one counter loses the most important distinguishing signal for WSJ-style flow reading. `prior_days_active = 3` where all 3 prior days were passive fills (MID pricing) is categorically weaker than `prior_days_active = 3` where all 3 were aggressive (AT_ASK, ABOVE_ASK). The `is_aggressive` column from S2.5 migration makes the second counter free — it is a second `COUNT(DISTINCT DATE(created_at)) WHERE is_aggressive = TRUE` in the same query.
+
+- `prior_days_active: int` — all qualifying flows, distinct calendar days
+- `prior_days_aggressive: int` — aggressively-filled qualifying flows only, distinct calendar days
+- Both stored on `RepetitionEpisode` dataclass
+- Both exposed in episode serialisation / signal metadata
+- `is_multi_day_repeat = prior_days_active >= 2` (threshold below)
+
+**SA: Multi-day threshold — DECIDED: >= 2, configurable**
+
+`>= 2` means it repeated on at least one prior day — the minimal bar that catches early accumulation. WSJ commentary targets recurrence, not dominance. Wire threshold as `multi_day_min_days: int = 2` constructor param on `RepetitionAccumulator`. Do NOT hardcode `2` inline — configurable from day 1 for future backtest tuning.
+
+`is_multi_day_repeat = prior_days_active >= multi_day_min_days`
+
+**SA: S2.5 Migration — CRITICAL ORDER**
+
+S2.5 migration must land before any Python. Three parts:
+
 ```sql
-CREATE INDEX idx_flow_events_contract_day
+-- Part 1: Index
+CREATE INDEX IF NOT EXISTS idx_flow_events_contract_day
 ON flow_events (ticker, contract_type, strike, expiry, created_at DESC);
 
+-- Part 2: Columns
 ALTER TABLE flow_events ADD COLUMN IF NOT EXISTS order_side TEXT DEFAULT 'UNKNOWN';
 ALTER TABLE flow_events ADD COLUMN IF NOT EXISTS is_aggressive BOOLEAN DEFAULT FALSE;
+
+-- Part 3: Backfill gap (DOCUMENT — do not attempt backfill)
+-- Existing rows: is_aggressive = FALSE (default). prior_days_aggressive will be 0
+-- for all historical data until enough newly-flagged rows accumulate (~5 trading days).
+-- Backfilling is_aggressive from bid_ask_class string on existing rows is error-prone.
+-- Document this cold-start characteristic explicitly in the PR. Do not attempt backfill.
 ```
-Apply migration, run `EXPLAIN ANALYZE` on lookback query, confirm index hit before any Python.
 
-> ⚠️ `is_aggressive` column MUST exist before `persist_flow_episode` serialisation fix is attempted. Do not merge the serialisation fix without the migration applied.
-
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
-
-Open deliberation questions:
-- SA-Q1: Hard gate vs. soft enrichment flag — recommend starting as flag (`require_multi_day=False`).
-- SA-Q2: Lookback window — 5 calendar days vs. 5 trading days?
-- SA-Q3: `prior_days_active` — calendar days or days-with-qualifying-flow only?
-- PBE-Q1: `cachetools.TTLCache` — confirm in `requirements.txt` or evaluate stdlib alternative.
-- PBE-Q2: Background queue eventual consistency — acceptable for flag, not for hard gate.
-- PBE-Q3: `asyncio.Queue` backpressure — add `maxsize=5000` with overflow counter.
-- QA-Q1: Integration test with seeded `flow_events` fixture (3 prior days). Assert `prior_days_active=3`.
-- QA-Q2: Cache TTL expiry test — after 5 min, re-fetch from DB.
-- QA-Q3: `_process_trade()` latency benchmark before/after.
-- **SA-F2-Q1 (new — from ING-006 deliberation):** `is_aggressive` lookback filter — should `prior_days_active` count ALL prior qualifying flows, or ONLY aggressively-filled prior episodes? Recommendation: two counters — `prior_days_active` (all) + `prior_days_aggressive` (aggressive-only). Deliberation required.
-
-#### Acceptance Criteria
-- [ ] S2.5 Supabase migration applied (`idx_flow_events_contract_day`, `is_aggressive` column, `order_side` column) — Issues #67, #69
-- [ ] `EXPLAIN ANALYZE` on lookback query confirms index hit (document result in PR description)
-- [ ] `persist_flow_episode` dict includes `is_aggressive` key — Issue #69
-- [ ] `get_prior_contract_volume()` returns correct results for seeded fixture
-- [ ] Background worker populates cache; hot path is non-blocking
-- [ ] `ep.is_multi_day_repeat` flag set correctly
-- [ ] `_stats["multi_day_repeat_count"]` and `_stats["multi_day_not_met"]` counters in `/health/stream`
-- [ ] No measurable latency increase on `_process_trade()`
-- [ ] All QA test cases pass
-- [ ] **`ep.otm_band` wired into `RepetitionEpisode` — assign `ep.otm_band = otm_band` in `ingest_tick()` after `_classify_otm()` call (deferred from ING-005 / SA-PREMERGE-Q1, 2026-05-03)**
-- [ ] **`RepetitionEpisode` dataclass updated with `otm_band: str = "UNKNOWN"` field**
-- [ ] **`ep.otm_band` exposed in episode serialisation / signal metadata output**
+Run `EXPLAIN ANALYZE` and confirm index hit before writing any Python for the lookback query (Rule 6 of STORY-STEPS_ING.md).
 
 ---
 
-### ING-008 — Volume vs. OI Gate via Registry Injection
-**Type:** Feature / New Gate
-**Priority:** P1
-**Estimated Effort:** 2 days
-**Depends On:** ING-004 ✅, ING-005 ✅
-**Status:** 🔓 **UNBLOCKED** — ING-004 and ING-005 both merged. Deliberation required before implementation.
-**Files:** `backend/signals/repetition_accumulator.py`, `backend/parsers/options_flow_parser.py`
+#### Principal Backend Engineer (PBE) — Decisions
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
+**PBE-Q1: Cache library — DECIDED: Check requirements first; manual dict fallback; no new deps**
 
-**🚨 Prerequisite — Chain API OI Verification Required Before Any Code:**
-Run one-off chain fetch on AAPL/SPY. Document OI quality in `docs/FIXES.md` under ING-008 before writing gate logic.
+Check `requirements.txt` before assuming. If `cachetools` is present: use `TTLCache(maxsize=500, ttl=300)`. If absent: use manual `{key: (value, expires_at)}` dict pattern with expiry-on-read. Do NOT add `cachetools` as a new dependency solely for this story. If `redis` or another caching lib is already present, evaluate that first. The TTL cache is not complex enough to justify a new dependency.
 
-Open deliberation questions:
-- SA-Q1: Prior-day OI vs. intraday — false positives early in session when intraday vol naturally low?
-- SA-Q2: T3 tickers with OI=0 — auto-skip or lower `vol_oi_min_ratio`?
-- PBE-Q1: Live boolean feature flag mechanism in `ingestion_config` without restart.
-- PBE-Q2: `vol_oi_min_ratio` per-tier vs. global scalar?
-- QA-Q1: OI=0 edge case — gate MUST skip silently (not drop episode).
-- QA-Q2: OI=500, size=499 → dropped. OI=500, size=500 → passes.
-- QA-Q3: Gate observably disabled when `vol_oi_check_enabled=False`.
+**PBE-Q2: Background queue eventual consistency — DECIDED: Acceptable for flag pattern**
 
-#### Acceptance Criteria
-- [ ] `open_interest` sourced from `ContractMeta` when tick OI = 0
-- [ ] `_DictEventWrapper` includes `open_interest`
-- [ ] Gate implemented but disabled by default; toggled via `ingestion_config`
-- [ ] `_stats["vol_oi_suppressed"]` in `/health/stream`
-- [ ] Tradier chain API OI quality documented in `docs/FIXES.md` under ING-008
-- [ ] All 3 QA edge case tests pass
+The background `asyncio.Queue` pattern means lookback results are populated asynchronously after the first episode for a contract arrives. The first episode in a session may briefly see `prior_days_active = 0` and `is_multi_day_repeat = False` until the queue worker completes the DB fetch and populates the cache. Acceptable — signal layer treats `is_multi_day_repeat` as enrichment, not a gate. Document the "first-episode cold-cache" behaviour in `flow_store.py` module docstring.
+
+**PBE-Q3: Queue overflow — DECIDED: `maxsize=5000`, overflow counter, no exception propagation**
+
+```python
+try:
+    _lookback_queue.put_nowait(contract_key)
+except asyncio.QueueFull:
+    _stats["lookback_queue_overflow"] += 1
+```
+
+`_stats["lookback_queue_overflow"]` exposed in `/health/stream`. Do NOT let `asyncio.QueueFull` propagate as an unhandled exception that kills the hot path. Overflow means lookback enrichment is silently skipped for that episode; the episode still produces and emits correctly.
+
+**PBE: Cache key — DECIDED: 4-tuple `(ticker, contract_type, strike, expiry)`**
+
+```python
+ContractKey = Tuple[str, str, float, str]  # (ticker, contract_type, strike, expiry)
+```
+
+Using `(ticker, strike)` is incorrect — same strike different expiry is a different contract. Cache key must match the DB query predicate exactly.
+
+**PBE: Lookback DB query — DECIDED: 6-param with DATE_TRUNC ceiling + premium floor param**
+
+```sql
+SELECT
+    COUNT(DISTINCT DATE(created_at))                                          AS prior_days_active,
+    COUNT(DISTINCT DATE(created_at)) FILTER (WHERE is_aggressive = TRUE)      AS prior_days_aggressive
+FROM flow_events
+WHERE ticker        = $1
+  AND contract_type = $2
+  AND strike        = $3
+  AND expiry        = $4
+  AND created_at   >= NOW() - INTERVAL '5 days'
+  AND created_at   <  DATE_TRUNC('day', NOW())  -- exclude today
+  AND premium      >= $5;  -- DTE-appropriate floor passed from accumulator context
+```
+
+`AND created_at < DATE_TRUNC('day', NOW())` is critical — today's flow must NOT count toward `prior_days_active`. Today's episode is what is being evaluated; prior days are the lookback. Without this clause, the first episode of the day sets `prior_days_active = 1` (counting itself), which is wrong.
+
+Premium floor `$5` is passed as a parameter from accumulator context — no hardcoding in the query.
+
+**PBE: Module structure — DECIDED: `contract_day_cache.py` in `backend/utils/`**
+
+```python
+# contract_day_cache.py
+# Async TTL cache for per-contract multi-day lookback results.
+# Cache entries: ContractKey -> LookbackResult
+# TTL: 5 minutes (300s) — stale reads acceptable; hard gate not in use
+
+LookbackResult = NamedTuple:
+    prior_days_active:     int
+    prior_days_aggressive: int
+    fetched_at:            float  # time.monotonic()
+
+_cache: Dict[ContractKey, LookbackResult] = {}
+_CACHE_TTL_S = 300
+
+async def get_lookback(key: ContractKey, min_premium: float) -> LookbackResult: ...
+async def _fetch_from_db(key: ContractKey, min_premium: float) -> LookbackResult: ...
+```
+
+`flow_store.py` handles the write path — it is NOT the right home for cache + DB fetch logic. `contract_day_cache.py` is read-only, separate concern.
 
 ---
 
-## Sprint Exit Criteria
-All 7 stories pass acceptance criteria AND:
-- [ ] No regression in existing passing tests (`pytest backend/`)
-- [ ] `/health/stream` exposes all new counters: `below_min_premium`, `underlying_price_fallback_applied`, `multi_day_repeat_count`, `multi_day_not_met`, `vol_oi_suppressed`, `dte_tier_preset`
-- [ ] 3-way deliberation sign-off documented for every story in this file
-- [ ] `docs/ARCHITECTURE.md` updated to reflect new gate structure (Gate 2 now evaluates `weighted_premium`)
-- [ ] `docs/CHANGELOG.md` updated with sprint summary
-- [ ] `docs/ORDER_SIDE_RESOLUTION.md` referenced from `docs/ARCHITECTURE.md`
+#### Lead QA (QA) — Decisions
+
+**QA-Q1: Integration test fixture cases — ALL 8 REQUIRED**
+
+| Case | Seeded Data | Expected `prior_days_active` | Expected `prior_days_aggressive` |
+|------|-------------|------------------------------|----------------------------------|
+| G-1 | 3 qualifying rows on 3 distinct prior days, all aggressive | 3 | 3 |
+| G-2 | 5 rows on 3 days, 2 days aggressive only | 3 | 2 |
+| G-3 | 3 rows all on same prior day | 1 | depends on `is_aggressive` seed |
+| G-4 | No prior qualifying rows | 0 | 0 |
+| G-5 | Rows exist but all today (excluded by ceiling clause) | 0 | 0 |
+| G-6 | Rows outside 5-day window (6 days ago) | 0 | 0 |
+| G-7 | Mix: 2 qualifying days prior + 1 today | 2 | per `is_aggressive` seed |
+| G-8 | Premium below DTE floor on all prior rows | 0 | 0 |
+
+G-5 and G-6 are the most important regression guards — they confirm the `DATE_TRUNC` ceiling clause and the 5-day window are both applied correctly.
+
+**QA-Q2: Cache TTL expiry test**
+
+Mock `time.monotonic()` to advance 301 seconds after initial fetch. Next call to `get_lookback()` must re-fetch from DB — assert `_fetch_from_db` call count == 2 (mock/patch the function and assert call count). Stale cached value must NOT be returned after TTL expiry.
+
+**QA-Q3: `_process_trade()` latency benchmark**
+
+The sprint doc requires "no measurable latency increase." Before implementation, run:
+
+```bash
+python -m pytest backend/tests/test_latency_baseline.py -v --tb=short
+```
+
+If no latency baseline test exists, create one in this PR: time 1,000 `_process_trade()` calls with the background queue worker running, assert p99 < 5ms. Post-implementation, same test must still pass. The async queue pattern means hot-path latency should be near-zero (just a `put_nowait`), but this must be confirmed empirically.
+
+**QA: `otm_band` wiring — REQUIRED (deferred from ING-005)**
+
+`ep.otm_band` wiring was explicitly deferred from ING-005. It is required in ING-007. Not optional.
+
+```python
+# In repetition_accumulator.py ingest_tick(), after _classify_otm() call:
+ep.otm_band = self._classify_otm(ev.strike, ev.underlying_price)
+
+# On RepetitionEpisode dataclass:
+otm_band: str = "UNKNOWN"
+```
+
+Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `ep.otm_band` is set correctly on the returned episode. Two-line test — explicitly verify, do not assume.
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-04 (ING-005 PR #61 CLOSED; ING-006 PR #62 MERGED commit `501b170`; ING-007 canonical Issue #70 filed; ING-007 and ING-008 unblocked; post-merge findings tracked in Issues #63–#70; Rule 7 post-merge doc update complete) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+#### ING-007 Acceptance Criteria
+
+- [ ] S2.5 migration runs cleanly — index, `order_side` column, `is_aggressive` column all present in `flow_events`
+- [ ] `EXPLAIN ANALYZE` confirms index hit on lookback query before Python implementation begins
+- [ ] `contract_day_cache.py` created in `backend/utils/` — owns all cache + DB fetch logic
+- [ ] Cache key is 4-tuple `(ticker, contract_type, strike, expiry)` — no collisions on same strike different expiry
+- [ ] `get_lookback()` returns cached result within TTL (300s); re-fetches from DB after expiry
+- [ ] DB query uses 6-param form with `DATE_TRUNC('day', NOW())` ceiling — today excluded from `prior_days_active`
+- [ ] DB query passes DTE-tier premium floor as `$5` parameter — no hardcoded floor in query
+- [ ] `RepetitionEpisode` dataclass gains: `prior_days_active: int`, `prior_days_aggressive: int`, `is_multi_day_repeat: bool`, `otm_band: str = "UNKNOWN"`
+- [ ] `RepetitionAccumulator` constructor gains: `require_multi_day: bool = False`, `multi_day_min_days: int = 2`
+- [ ] `is_multi_day_repeat = prior_days_active >= multi_day_min_days` — threshold not hardcoded inline
+- [ ] Background `asyncio.Queue` worker in `flow_store.py` — `maxsize=5000`
+- [ ] `_stats["lookback_queue_overflow"]` initialised at module level; increments on `asyncio.QueueFull`; never propagates as unhandled exception
+- [ ] `_stats["lookback_queue_overflow"]` visible in `/health/stream` from cold start
+- [ ] "first-episode cold-cache" behaviour documented in `flow_store.py` module docstring
+- [ ] `is_aggressive` cold-start lag documented in PR description — no backfill attempted
+- [ ] All 8 fixture cases G-1 through G-8 pass
+- [ ] TTL expiry test passes — `_fetch_from_db` call count asserted
+- [ ] Latency benchmark: p99 < 5ms for 1,000 `_process_trade()` calls with queue worker running
+- [ ] `otm_band` wiring: `ep.otm_band` set correctly; dedicated test with known strike/underlying pair passes
+- [ ] Both `prior_days_active` and `prior_days_aggressive` exposed in episode serialisation / signal metadata
+- [ ] No new dependencies added unless `cachetools` already present in `requirements.txt`
+
+---
+
+*Last updated: 2026-05-04 (ING-007 3-way deliberation complete; branch `ing/s7-multiday-repeat` ready for implementation) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
