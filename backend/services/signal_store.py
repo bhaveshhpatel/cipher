@@ -26,6 +26,21 @@ Fix 6 (2026-05-04):
       signal_feed_log_sentiment_check:   BULLISH | BEARISH | NEUTRAL
       signal_feed_log_alert_level_check: CONVICTION | STRONG_SIGNAL | ALERT | WATCH
 
+Fix 7 (2026-05-04):
+  - Aligned _VALID_ALERT_LEVELS, _build_row() score branches, and
+    _normalise_alert_level() to the corrected DB constraint vocabulary:
+      CONVICTION | WHALE | INSTITUTIONAL | LARGE | RETAIL
+    The old constraint (CONVICTION | STRONG_SIGNAL | ALERT | WATCH) was
+    mismatched against RepetitionAccumulator.get_alert_level() which already
+    emitted the correct size-tier vocab. Migration:
+      backend/db/migrations/20260504_fix_alert_level_constraint.sql
+    Score-to-level mapping updated:
+      >= 0.85 -> CONVICTION      (unchanged)
+      >= 0.70 -> WHALE           (was STRONG_SIGNAL)
+      >= 0.55 -> INSTITUTIONAL   (was ALERT)
+      <  0.55 -> LARGE           (was WATCH)
+    _normalise_alert_level() fallback changed to 'LARGE' (was 'WATCH').
+
 Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
@@ -37,7 +52,7 @@ Normalisation helpers:
   _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral'
   _normalise_trade_type(raw) -> 'sweep' | 'block' | 'split' | 'single'
   _normalise_sentiment(raw) -> 'BULLISH' | 'BEARISH' | 'NEUTRAL'
-  _normalise_alert_level(raw) -> 'CONVICTION' | 'STRONG_SIGNAL' | 'ALERT' | 'WATCH'
+  _normalise_alert_level(raw) -> 'CONVICTION' | 'WHALE' | 'INSTITUTIONAL' | 'LARGE' | 'RETAIL'
 
 CI / no-network behaviour:
   When Supabase is configured but the host is unreachable (DNS -2 in CI),
@@ -69,8 +84,8 @@ _TABLE = "signal_history"
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
-_VALID_SENTIMENTS   = {"BULLISH", "BEARISH", "NEUTRAL"}           # signal_feed_log_sentiment_check
-_VALID_ALERT_LEVELS = {"CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"}  # signal_feed_log_alert_level_check
+_VALID_SENTIMENTS   = {"BULLISH", "BEARISH", "NEUTRAL"}                              # signal_feed_log_sentiment_check
+_VALID_ALERT_LEVELS = {"CONVICTION", "WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}   # signal_feed_log_alert_level_check (Fix 7)
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
@@ -213,17 +228,31 @@ def _normalise_sentiment(raw: str) -> str:
 def _normalise_alert_level(raw: str) -> str:
     """
     Validate alert_level against signal_feed_log_alert_level_check.
-    If the value is not in the live constraint, fall back to 'WATCH'.
-    This guards against upstream passing stale values like 'NORMAL'
-    (the column default pre-migration) or any other out-of-range string.
+    Accepted values (Fix 7): CONVICTION | WHALE | INSTITUTIONAL | LARGE | RETAIL
+    If the value is not in the live constraint, fall back to 'LARGE'.
+    This guards against upstream passing stale values from the old constraint
+    vocab (STRONG_SIGNAL, ALERT, WATCH) or any other out-of-range string.
     """
     if not raw:
-        return "WATCH"
+        return "LARGE"
     upper = raw.upper()
     if upper in _VALID_ALERT_LEVELS:
         return upper
-    log.warning("[signal_store] unknown alert_level value %r -- defaulting to WATCH", raw)
-    return "WATCH"
+    # Migration bridge: map old constraint values to nearest equivalent
+    _LEGACY_MAP = {
+        "STRONG_SIGNAL": "WHALE",
+        "ALERT":         "INSTITUTIONAL",
+        "WATCH":         "LARGE",
+        "NORMAL":        "LARGE",
+    }
+    if upper in _LEGACY_MAP:
+        log.warning(
+            "[signal_store] legacy alert_level value %r mapped to %r",
+            raw, _LEGACY_MAP[upper],
+        )
+        return _LEGACY_MAP[upper]
+    log.warning("[signal_store] unknown alert_level value %r -- defaulting to LARGE", raw)
+    return "LARGE"
 
 
 def _db_direction(raw: str) -> str:
@@ -257,16 +286,17 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
 
     # Derive alert_level from score first, then validate whatever came from sig
     # through _normalise_alert_level to guard against out-of-constraint values.
+    # Fix 7: score branches updated to match new constraint vocab.
     if sig.get("alert_level"):
         alert_level = _normalise_alert_level(sig["alert_level"])
     elif score >= 0.85:
         alert_level = "CONVICTION"
     elif score >= 0.70:
-        alert_level = "STRONG_SIGNAL"
+        alert_level = "WHALE"          # was STRONG_SIGNAL (Fix 7)
     elif score >= 0.55:
-        alert_level = "ALERT"
+        alert_level = "INSTITUTIONAL"  # was ALERT (Fix 7)
     else:
-        alert_level = "WATCH"
+        alert_level = "LARGE"          # was WATCH (Fix 7)
 
     ctype   = episode.get("contract_type") or sig.get("contract_type", "")
     raw_dir = episode.get("direction", sig.get("direction", ""))
