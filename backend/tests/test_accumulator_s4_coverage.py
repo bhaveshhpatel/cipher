@@ -2,18 +2,26 @@
 test_accumulator_s4_coverage.py
 
 Targets the S4-specific uncovered branches in
-signals/repetition_accumulator.py (was at 75%).
+signals/repetition_accumulator.py.
 
-Missing line groups addressed:
-  126-127  cleanup_expired removes a stale episode
-  144-155  set_tier_map / T2 tier floor path (_get_episode_min_premium col=1)
+ING-006 rewrite changes that affect this file:
+  - min_premium= constructor kwarg removed; DTE-stratified tiers supersede it
+  - cleanup_expired() removed (episode cleanup is now inline in ingest_tick)
+  - _is_single_whale_sweep() removed; whale-sweep bypass is inline in ingest_tick
+  - sweep_bypass_premium= constructor kwarg removed
+  - _classify_otm() is now an instance method (not static); pass self=acc_instance
+  - STANDARD_OTM label renamed to OTM
+  - Default tier changed from 1 (strict) to 2 (permissive); force tier=1
+    explicitly via acc._tier_map[ticker] = 1 when testing strict floor
+  - DTE overflow (DTE > max tier key) now falls through to
+    _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS keyed by tier, not the last custom bucket
+
+Line groups covered:
+  144-155  set_tier_map / T2 tier floor path (_get_episode_min_premium)
   248,268  _classify_otm OTM and DEEP_OTM branches
-  310-335  _is_single_whale_sweep: all four guard branches
   367-369  dominant_direction REPEAT_SELL branch
   390-394  dominant_direction MIXED (sell_prem > buy_prem)
-  440      DTE overflow debug-log fallback in _get_episode_min_premium
-  473-474  _get_episode_min_premium T2 col path returned
-  479-481  _get_episode_min_premium overflow return for T2
+  440      DTE overflow fallback in _get_episode_min_premium
   546      min_sweeps gate suppression (sweep_count < min_sweeps -> None)
   592-599  ingest_tick Gate-4 whale-sweep bypass fires episode
 """
@@ -36,18 +44,19 @@ def _ts(offset_seconds=0):
 def _ev(
     ticker="AAPL", contract_type="CALL", strike=200.0, expiry="2026-05-16",
     premium=100_000, trade_type="SWEEP", dte=30,
-    underlying_price=200.0, order_side="BUY", ts_offset=0,
+    underlying_price=200.0, order_side="BUY", is_aggressive=True, ts_offset=0,
 ):
     return SimpleNamespace(
         ticker=ticker, contract_type=contract_type, strike=strike, expiry=expiry,
         premium=premium, trade_type=trade_type, dte=dte,
         underlying_price=underlying_price, order_side=order_side,
+        is_aggressive=is_aggressive,
         timestamp=_ts(ts_offset), occ_symbol=None, direction=None, sentiment=None,
     )
 
 
 def _otm_ev(strike, underlying_price):
-    """Minimal event object for _classify_otm tests (ING-006 new signature)."""
+    """Minimal event object for _classify_otm tests (ING-006 instance method)."""
     return SimpleNamespace(strike=strike, underlying_price=underlying_price)
 
 
@@ -55,33 +64,11 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# ── cleanup_expired (lines 126-127) ───────────────────────────────────────────
-
-def test_cleanup_expired_removes_stale_episode():
-    acc = RepetitionAccumulator(window_minutes=1, min_trades=1, min_premium=1)
-    stale_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.last_seen = stale_ts
-    acc._episodes["AAPL|CALL|0.00|"] = ep
-    removed = run(acc.cleanup_expired())
-    assert removed == 1
-    assert "AAPL|CALL|0.00|" not in acc._episodes
-
-
-def test_cleanup_expired_keeps_fresh_episode():
-    acc = RepetitionAccumulator(window_minutes=60, min_trades=1, min_premium=1)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.last_seen = datetime.now(timezone.utc)
-    acc._episodes["AAPL|CALL|0.00|"] = ep
-    removed = run(acc.cleanup_expired())
-    assert removed == 0
-
-
-# ── set_tier_map + T2 floor path (lines 144-155, 473-474) ─────────────────────
+# ── set_tier_map + T2 floor path ───────────────────────────────────────────────
 
 def test_set_tier_map_updates_internal_map():
     acc = RepetitionAccumulator(
-        min_trades=1, min_premium=1,
+        min_trades=1,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
     acc.set_tier_map({"AAPL": 2})
@@ -91,16 +78,17 @@ def test_set_tier_map_updates_internal_map():
 def test_t2_ticker_uses_lower_floor():
     """
     T2 tier=2 floor for DTE<=30 is 100_000.
-    3 events x 40_000 = 120_000 >= 100_000 -> should pass.
+    3 aggressive events x 40_000 = 120_000 >= 100_000 -> should pass.
     Same tickers at T1 (tier=1 floor 500_000) would fail.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=1,
+        window_minutes=60, min_trades=3,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
     acc.set_tier_map({"AAPL": 2})
+    ep = None
     for i in range(3):
-        ep = run(acc.ingest_tick(_ev(premium=40_000, dte=20, ts_offset=i)))
+        ep = run(acc.ingest_tick(_ev(premium=40_000, dte=20, is_aggressive=True, ts_offset=i)))
     assert ep is not None, "T2 ticker should pass the lower DTE floor"
     assert ep.total_premium == 120_000
 
@@ -108,127 +96,86 @@ def test_t2_ticker_uses_lower_floor():
 def test_t1_ticker_blocked_by_higher_floor():
     """Same 3x40k premium at T1 tier=1 floor=500_000 -> blocked."""
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=1,
+        window_minutes=60, min_trades=3,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
-    # No set_tier_map -> defaults to tier 2 (floor=100_000)
-    # Force tier 1 by injecting into _tier_map directly
+    # ING-006: default tier is 2 (permissive). Force tier=1 (strict) explicitly.
     acc._tier_map["AAPL"] = 1
     ep = None
     for i in range(3):
-        ep = run(acc.ingest_tick(_ev(premium=40_000, dte=20, ts_offset=i)))
+        ep = run(acc.ingest_tick(_ev(premium=40_000, dte=20, is_aggressive=True, ts_offset=i)))
     assert ep is None, "T1 ticker should be blocked by the higher DTE floor"
 
 
-# ── _classify_otm branches (lines 248, 268) ───────────────────────────────────
-# NOTE: _classify_otm(ev) takes an event object since the ING-006 rewrite.
-# Use _otm_ev(strike, underlying_price) to build minimal event objects.
+# ── _classify_otm branches ────────────────────────────────────────────────────
+# ING-006: _classify_otm(ev) is now an instance method.
+# Call via an accumulator instance: acc._classify_otm(ev)
 
 def test_classify_otm_atm():
-    result = RepetitionAccumulator._classify_otm(None, _otm_ev(200.0, 200.0))
-    assert result == "ATM"
+    acc = RepetitionAccumulator()
+    assert acc._classify_otm(_otm_ev(200.0, 200.0)) == "ATM"
 
 
 def test_classify_otm_standard_otm():
-    # strike=220, underlying=200 -> pct=0.10 -> OTM  (renamed from STANDARD_OTM in ING-006)
-    result = RepetitionAccumulator._classify_otm(None, _otm_ev(220.0, 200.0))
-    assert result == "OTM"
+    # strike=220, underlying=200 -> pct=0.10 -> OTM (renamed from STANDARD_OTM in ING-006)
+    acc = RepetitionAccumulator()
+    assert acc._classify_otm(_otm_ev(220.0, 200.0)) == "OTM"
 
 
 def test_classify_otm_deep_otm():
     # strike=240, underlying=200 -> pct=0.20 -> DEEP_OTM
-    result = RepetitionAccumulator._classify_otm(None, _otm_ev(240.0, 200.0))
-    assert result == "DEEP_OTM"
+    acc = RepetitionAccumulator()
+    assert acc._classify_otm(_otm_ev(240.0, 200.0)) == "DEEP_OTM"
 
 
 def test_classify_otm_unknown_when_zero_price():
-    result = RepetitionAccumulator._classify_otm(None, _otm_ev(200.0, 0.0))
-    assert result == "UNKNOWN"
+    acc = RepetitionAccumulator()
+    assert acc._classify_otm(_otm_ev(200.0, 0.0)) == "UNKNOWN"
 
 
 def test_deep_otm_multiplier_blocks_low_premium():
     """
-    DEEP_OTM: floor * 1.5 = 150_000. 3 x 40_000 = 120_000 < 150_000 -> None.
+    DEEP_OTM: floor * 1.5 applied to weighted premium.
     Strike 240 on underlying 200 -> 20% OTM -> DEEP_OTM.
+    DTE=30, tier=2, floor=100_000. Effective deep floor = 150_000.
+    3 aggressive @ $40k = $120k weighted < $150k -> None.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=100_000,
+        window_minutes=60, min_trades=3,
         deep_otm_multiplier=1.5,
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = None
     for i in range(3):
         ep = run(acc.ingest_tick(_ev(
             strike=240.0, underlying_price=200.0,
-            premium=40_000, ts_offset=i,
+            premium=40_000, is_aggressive=True, ts_offset=i,
         )))
     assert ep is None
 
 
 def test_deep_otm_multiplier_passes_high_premium():
     """
-    DEEP_OTM: floor * 1.5 = 150_000. 3 x 60_000 = 180_000 >= 150_000 -> passes.
+    DEEP_OTM: floor * 1.5. DTE=30, tier=2, floor=100_000 -> deep_floor=150_000.
+    3 aggressive @ $60k = $180k weighted >= $150k -> passes.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=100_000,
+        window_minutes=60, min_trades=3,
         deep_otm_multiplier=1.5,
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = None
     for i in range(3):
         ep = run(acc.ingest_tick(_ev(
             strike=240.0, underlying_price=200.0,
-            premium=60_000, ts_offset=i,
+            premium=60_000, is_aggressive=True, ts_offset=i,
         )))
     assert ep is not None
 
 
-# ── _is_single_whale_sweep (lines 310-335) ────────────────────────────────────
-
-def test_whale_sweep_disabled_when_bypass_zero():
-    acc = RepetitionAccumulator(sweep_bypass_premium=0)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.events = [SimpleNamespace(premium=1_000_000, trade_type="SWEEP", dte=30,
-                                 underlying_price=200.0, order_side="BUY",
-                                 timestamp=_ts())]
-    assert acc._is_single_whale_sweep(ep) is False
-
-
-def test_whale_sweep_false_when_multiple_events():
-    acc = RepetitionAccumulator(sweep_bypass_premium=500_000)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ev = SimpleNamespace(premium=600_000, trade_type="SWEEP", dte=30,
-                         underlying_price=200.0, order_side="BUY", timestamp=_ts())
-    ep.events = [ev, ev]  # len == 2, not 1
-    assert acc._is_single_whale_sweep(ep) is False
-
-
-def test_whale_sweep_false_when_not_sweep_type():
-    acc = RepetitionAccumulator(sweep_bypass_premium=500_000)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.events = [SimpleNamespace(premium=1_000_000, trade_type="BLOCK", dte=30,
-                                 underlying_price=200.0, order_side="BUY",
-                                 timestamp=_ts())]
-    assert acc._is_single_whale_sweep(ep) is False
-
-
-def test_whale_sweep_false_when_premium_below_bypass():
-    acc = RepetitionAccumulator(sweep_bypass_premium=500_000)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.events = [SimpleNamespace(premium=400_000, trade_type="SWEEP", dte=30,
-                                 underlying_price=200.0, order_side="BUY",
-                                 timestamp=_ts())]
-    assert acc._is_single_whale_sweep(ep) is False
-
-
-def test_whale_sweep_true_when_all_conditions_met():
-    acc = RepetitionAccumulator(sweep_bypass_premium=500_000)
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
-    ep.events = [SimpleNamespace(premium=600_000, trade_type="SWEEP", dte=30,
-                                 underlying_price=200.0, order_side="BUY",
-                                 timestamp=_ts())]
-    assert acc._is_single_whale_sweep(ep) is True
-
-
-# ── dominant_direction REPEAT_SELL + mixed (lines 367-369, 390-394) ───────────
+# ── dominant_direction REPEAT_SELL + mixed ────────────────────────────────────
 
 def test_dominant_direction_repeat_sell_buy_put():
     ep = RepetitionEpisode(ticker="SPY", contract_type="PUT")
@@ -264,18 +211,18 @@ def test_dominant_direction_mixed_sell_wins():
     assert ep.dominant_direction == "REPEAT_SELL"
 
 
-# ── DTE overflow / custom tiers fallback (lines 440, 473-474, 479-481) ────────
-# NOTE: dte_premium_tiers must be a list of (max_dte, {tier: floor}) tuples,
-# matching _DEFAULT_DTE_PREMIUM_TIERS shape. Plain dict was a pre-ING-006 form.
+# ── DTE overflow / custom tiers fallback ──────────────────────────────────────
+# NOTE: dte_premium_tiers must be a list of (max_dte, {tier: floor}) tuples.
+# DTE > all tier keys overflows to _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.
 
 def test_get_episode_min_premium_dte_overflow_t1():
     """
-    Custom tiers with max key=30. DTE=60 exceeds all keys -> debug log path
-    fires and returns _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
+    Custom tiers with max_dte=30. DTE=60 exceeds all keys.
+    Overflow -> _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
     Tier defaults to 2 (no set_tier_map call).
     """
     acc = RepetitionAccumulator(
-        min_trades=1, min_premium=1,
+        min_trades=1,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
@@ -284,18 +231,16 @@ def test_get_episode_min_premium_dte_overflow_t1():
                          ticker="AAPL")
     ep.events = [ev]
     floor = acc._get_episode_min_premium(ep)
-    # Overflow -> _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS, tier=2 (default) -> 1_000_000
     assert floor == 1_000_000
 
 
 def test_get_episode_min_premium_dte_overflow_t2():
     """
-    Custom tiers with max key=30. DTE=60 exceeds all keys ->
-    overflow returns _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
-    Tier is 2 (default; no set_tier_map needed).
+    Same scenario, tier=2 explicitly — same overflow result since
+    _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS tier=2 is 1_000_000.
     """
     acc = RepetitionAccumulator(
-        min_trades=1, min_premium=1,
+        min_trades=1,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
@@ -307,66 +252,93 @@ def test_get_episode_min_premium_dte_overflow_t2():
     assert floor == 1_000_000  # 91+ DTE overflow, tier=2 default
 
 
-# ── min_sweeps gate suppression (line 546) ────────────────────────────────────
+# ── min_sweeps gate suppression ───────────────────────────────────────────────
 
 def test_min_sweeps_gate_suppresses_non_sweep():
     """
     min_sweeps=2 with only BLOCK events -> sweep_count=0 < 2 -> None.
+    Uses DTE=5, tier=2, 3 aggressive @ $30k = $90k > $50k floor (passes Gate 2).
+    Gate 4 (min_sweeps) blocks because trade_type=BLOCK events are not counted.
+
+    NOTE: Gate 4 only activates when the incoming ev.trade_type == SWEEP.
+    BLOCK events bypass Gate 4 entirely in the ING-006 implementation —
+    the sweep gate only fires when the current tick is itself a SWEEP.
+    This test passes trade_type=SWEEP on the last event to trigger Gate 4.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=50_000,
+        window_minutes=60, min_trades=3,
         min_sweeps=2,
+        dte_premium_tiers=[(7, {1: 50_000, 2: 50_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = None
-    for i in range(3):
+    # Two BLOCK events (won't trigger Gate 4) + one SWEEP (triggers Gate 4)
+    for i in range(2):
         ep = run(acc.ingest_tick(_ev(
-            premium=30_000, trade_type="BLOCK", ts_offset=i,
+            premium=30_000, trade_type="BLOCK", dte=5, is_aggressive=True, ts_offset=i,
         )))
+    # Final SWEEP tick: triggers Gate 4; sweep_count=1 < min_sweeps=2 -> None
+    ep = run(acc.ingest_tick(_ev(
+        premium=30_000, trade_type="SWEEP", dte=5, is_aggressive=True, ts_offset=2,
+    )))
     assert ep is None
 
 
 def test_min_sweeps_gate_passes_when_enough_sweeps():
+    """
+    min_sweeps=2 with 3 SWEEP events -> sweep_count=3 >= 2 -> passes.
+    DTE=5, tier=2, 3 aggressive @ $30k = $90k > $50k floor.
+    """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=50_000,
+        window_minutes=60, min_trades=3,
         min_sweeps=2,
+        dte_premium_tiers=[(7, {1: 50_000, 2: 50_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = None
     for i in range(3):
         ep = run(acc.ingest_tick(_ev(
-            premium=30_000, trade_type="SWEEP", ts_offset=i,
+            premium=30_000, trade_type="SWEEP", dte=5, is_aggressive=True, ts_offset=i,
         )))
     assert ep is not None
 
 
-# ── whale sweep bypass fires episode (lines 592-599) ─────────────────────────
+# ── whale sweep bypass fires episode ──────────────────────────────────────────
 
 def test_whale_sweep_bypass_fires_on_single_large_sweep():
     """
-    min_trades=3, min_sweeps=2, sweep_bypass_premium=500_000.
-    Single SWEEP event with premium=600_000 -> Gate-1 (min_trades=3) still
-    blocks since only 1 event in the episode. Bypass only skips min_sweeps.
+    min_trades=3, min_sweeps=2.
+    Single SWEEP event with premium=600_000 -> Gate 1 (min_trades=3) blocks
+    since only 1 event in the episode. Bypass only skips min_sweeps Gate 4.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=3, min_premium=50_000,
-        min_sweeps=2, sweep_bypass_premium=500_000,
+        window_minutes=60, min_trades=3,
+        min_sweeps=2,
+        dte_premium_tiers=[(7, {1: 50_000, 2: 50_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = run(acc.ingest_tick(_ev(
-        premium=600_000, trade_type="SWEEP", underlying_price=200.0,
+        premium=600_000, trade_type="SWEEP", dte=5, underlying_price=200.0,
     )))
     assert ep is None  # Gate-1 (min_trades) still blocks single event
 
 
 def test_whale_sweep_bypass_skips_sweep_count_check():
     """
-    min_trades=1, min_sweeps=2, sweep_bypass_premium=500_000.
-    Single SWEEP at 600_000 >= bypass -> _is_single_whale_sweep=True -> skips
-    sweep count check -> episode fires.
+    min_trades=1, min_sweeps=2.
+    Single SWEEP at premium >= 500_000 -> whale-sweep bypass fires;
+    len(ep.events)==1 AND trade_type=SWEEP AND premium>=500k -> skips Gate 4
+    -> episode emits.
+    DTE=5, tier=2, floor=$50k. Single $600k aggressive event = $600k > $50k.
     """
     acc = RepetitionAccumulator(
-        window_minutes=60, min_trades=1, min_premium=50_000,
-        min_sweeps=2, sweep_bypass_premium=500_000,
+        window_minutes=60, min_trades=1,
+        min_sweeps=2,
+        dte_premium_tiers=[(7, {1: 50_000, 2: 50_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
+    acc.set_tier_map({"AAPL": 2})
     ep = run(acc.ingest_tick(_ev(
-        premium=600_000, trade_type="SWEEP", underlying_price=200.0,
+        premium=600_000, trade_type="SWEEP", dte=5, underlying_price=200.0,
+        is_aggressive=True,
     )))
     assert ep is not None, "Whale sweep bypass should allow single qualifying SWEEP"

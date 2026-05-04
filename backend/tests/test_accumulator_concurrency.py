@@ -13,6 +13,8 @@ API surface changes since original authoring (ING-006 rewrite):
   - acc.get_signal(...)  retired per PBE-F4 deliberation (2026-05-03);
     stream layer handles emit throttling; cooldown gate tests removed
   - acc.ingest(ev)       backward-compat shim removed (PBE-F3); use ingest_tick
+  - min_premium=         constructor kwarg removed in ING-006 rewrite;
+    DTE-stratified floors via dte_premium_tiers supersede the flat floor
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -37,6 +39,7 @@ def _make_ev(
     dte=30,
     underlying_price=200.0,
     order_side="BUY",
+    is_aggressive=True,
     ts: datetime | None = None,
 ):
     """Return a minimal OptionsFlowEvent-like SimpleNamespace."""
@@ -51,6 +54,7 @@ def _make_ev(
         dte=dte,
         underlying_price=underlying_price,
         order_side=order_side,
+        is_aggressive=is_aggressive,
         timestamp=ts,
     )
 
@@ -61,18 +65,25 @@ def _make_ev(
 
 @pytest.mark.asyncio
 async def test_ingest_tick_below_threshold_returns_none():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    ev = _make_ev(premium=10_000)
+    # min_trades=3, default DTE floor for tier=2 DTE<=7 is $50k.
+    # 3 events at $10k each = $30k weighted (aggressive) < $50k -> None at Gate 2.
+    # Use DTE=5 to hit the $50k T1 floor bucket and keep premium below it.
+    acc = RepetitionAccumulator(min_trades=3)
+    ev = _make_ev(premium=10_000, dte=5)
     result = await acc.ingest_tick(ev)
     assert result is None
 
 
 @pytest.mark.asyncio
 async def test_ingest_tick_crosses_threshold():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    # Use DTE=5 (<=7 bucket), tier=2 floor=$50k (default tier).
+    # 3 aggressive events at $20k each = $60k weighted > $50k -> should pass.
+    acc = RepetitionAccumulator(min_trades=3)
+    acc.set_tier_map({"AAPL": 2})
     now = datetime.now(timezone.utc)
+    result = None
     for i in range(3):
-        ev = _make_ev(premium=20_000, ts=now + timedelta(seconds=i))
+        ev = _make_ev(premium=20_000, dte=5, is_aggressive=True, ts=now + timedelta(seconds=i))
         result = await acc.ingest_tick(ev)
     assert result is not None
     assert result.trade_count == 3
@@ -87,13 +98,18 @@ async def test_ingest_tick_crosses_threshold():
 async def test_concurrent_ingest_tick_no_phantom_threshold():
     """
     Fire 10 concurrent ingest_tick calls each contributing 10_000 premium.
-    Threshold is min_trades=3, min_premium=50_000.
-    Only ticks 3+ should return a non-None episode; none should see a
+    Threshold is min_trades=3; DTE=5, tier=2, floor=$50k.
+    10 aggressive events * $10k = $100k total / $100k weighted > $50k floor.
+    Only ticks 3+ can return a non-None episode; none should see a
     corrupted trade_count from interleaved list mutation.
     """
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    acc = RepetitionAccumulator(min_trades=3)
+    acc.set_tier_map({"AAPL": 2})
     now = datetime.now(timezone.utc)
-    events = [_make_ev(premium=10_000, ts=now + timedelta(milliseconds=i)) for i in range(10)]
+    events = [
+        _make_ev(premium=10_000, dte=5, is_aggressive=True, ts=now + timedelta(milliseconds=i))
+        for i in range(10)
+    ]
 
     results = await asyncio.gather(*[acc.ingest_tick(ev) for ev in events])
 
@@ -124,10 +140,10 @@ async def test_concurrent_ingest_tick_consistent_episode_state():
     internal consistency under concurrent load, replacing the old double-fire
     get_signal test.
     """
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
+    acc = RepetitionAccumulator(min_trades=3)
     now = datetime.now(timezone.utc)
     events = [
-        _make_ev(premium=10_000, ts=now + timedelta(milliseconds=i))
+        _make_ev(premium=10_000, dte=5, ts=now + timedelta(milliseconds=i))
         for i in range(20)
     ]
 
@@ -152,12 +168,12 @@ async def test_stale_events_pruned_episode_evicted():
     key should be removed from _episodes on the next ingest_tick call for a
     new event on the same key.
     """
-    acc = RepetitionAccumulator(window_minutes=1, min_trades=3, min_premium=50_000)
+    acc = RepetitionAccumulator(window_minutes=1, min_trades=3)
     old_ts = datetime.now(timezone.utc) - timedelta(minutes=5)
 
     # Inject two old events directly (below threshold, old timestamps)
-    ev1 = _make_ev(premium=10_000, ts=old_ts)
-    ev2 = _make_ev(premium=10_000, ts=old_ts + timedelta(seconds=1))
+    ev1 = _make_ev(premium=10_000, dte=5, ts=old_ts)
+    ev2 = _make_ev(premium=10_000, dte=5, ts=old_ts + timedelta(seconds=1))
     await acc.ingest_tick(ev1)
     await acc.ingest_tick(ev2)
 
@@ -165,7 +181,7 @@ async def test_stale_events_pruned_episode_evicted():
     assert key in acc._episodes
 
     # Now ingest a fresh event — old ones get pruned, leaving only this one
-    new_ev = _make_ev(premium=10_000, ts=datetime.now(timezone.utc))
+    new_ev = _make_ev(premium=10_000, dte=5, ts=datetime.now(timezone.utc))
     result = await acc.ingest_tick(new_ev)
     assert result is None  # only 1 event left after pruning, below threshold
     # Episode should still exist (it has 1 live event), not evicted
