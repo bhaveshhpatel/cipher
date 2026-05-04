@@ -38,7 +38,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59) |
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60) |
 | 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | 🔄 IN PROGRESS — PR #61 (branch `ing/s5-otm-threshold-align`) |
-| 5 | **ING-006** | Directional aggression weighting on premium floor | ~~ING-001~~ resolved | ✅ UNBLOCKED — deliberation required |
+| 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ~~ING-001~~ resolved | ✅ DELIBERATION COMPLETE — PR #62 (branch `ing/s6-directional-aggression`) |
 | 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | ✅ UNBLOCKED — deliberation required |
 | 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-005 merges + deliberation |
 
@@ -517,16 +517,91 @@ Option B rejected. No tier data needs to flow through event objects.
 **Estimated Effort:** 1 day
 **Depends On:** ING-001 resolved ✅
 **Files:** `backend/parsers/bid_ask_classifier.py`, `backend/parsers/options_flow_parser.py`, `backend/signals/repetition_accumulator.py`
+**Branch:** `ing/s6-directional-aggression`
+**PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **DELIBERATION COMPLETE — CLEARED FOR MERGE (2026-05-03)**
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
+**All three roles signed off. All 7 findings resolved. Story cleared for merge.**
 
-Open deliberation questions:
-- SA-Q1: `AT_BID`/`BELOW_BID` on both PUT and CALL returns True. Does a size threshold prevent routine small MM fills being flagged as aggressive?
-- SA-Q2: Should `is_aggressive` be persisted as a column in `flow_events` for ING-007 pattern quality scoring?
-- PBE-Q1: Confirm `is_aggressive` is included in `OptionsFlowEvent.__dict__` serialisation path to `_DictEventWrapper`.
-- PBE-Q2: `aggression_discount=0.5` — hardcoded initially or configurable via `ingestion_config` from day one?
-- QA-Q1: 8-case test matrix for `is_directionally_aggressive()` (see story section below).
-- QA-Q2: Accumulator weighted premium test: $80k aggressive + $40k passive → weighted=$100k.
+#### Deliberation Outcomes
+
+**SA-Q1: Size threshold for AT_BID/BELOW_BID — DECIDED: No additional threshold**
+- ING-002 $10k per-event floor is the correct upstream guard
+- By the time `is_directionally_aggressive()` runs, the event has already cleared $10k
+- No additional size threshold needed in this function
+
+**SA-Q2: `is_aggressive` persistence in `flow_events` — DECIDED: Deferred to ING-007**
+- Column `is_aggressive BOOLEAN DEFAULT FALSE` added in ING-007 Supabase migration
+- Documented in `options_flow_parser.py` module docstring
+- ING-007 AC explicitly calls out this migration prerequisite
+
+**SA-F1: TODO comment in `bid_ask_classifier.py` — RESOLVED**
+- `TODO(ING-007/S2)` removed per Rule 6 Constraint 3 (no TODO in implementation code)
+- Migration of `is_directionally_aggressive()` to `order_side_classifier.py` tracked in **[Issue #63](https://github.com/bhaveshhpatel/cipher/issues/63)**
+- Prose note retained in function docstring referencing Issue #63 as the tracking mechanism
+
+**PBE-Q1: `is_aggressive` in `_DictEventWrapper` — DECIDED: Correct**
+- `"is_aggressive"` added to `__slots__`; read with `bool(d.get("is_aggressive", False))`
+- Dict ticks without `is_aggressive` default to `False` (passive) — correct conservative default
+
+**PBE-Q2: `aggression_discount` configurability — DECIDED: Hardcoded now, ING-002-CONFIG later**
+- `_AGGRESSION_DISCOUNT = 0.5` module constant retained as property/episode fallback
+- `aggression_discount: float = 0.5` added as `RepetitionAccumulator` constructor parameter (PBE-F1 fix)
+- Wire through `ingestion_config` in ING-002-CONFIG sprint
+
+**PBE-F1: `aggression_discount` constructor param — RESOLVED**
+- `aggression_discount: float = 0.5` added to `RepetitionAccumulator.__init__`
+- Stored as `self._aggression_discount`
+- `ingest_tick()` calls `ep.get_weighted_premium(self._aggression_discount)` (not module constant)
+- `RepetitionEpisode.weighted_premium` property uses module constant as convenience default for direct episode tests
+- `RepetitionEpisode.get_weighted_premium(discount)` added for caller-supplied discount
+- Test `test_aggression_discount_constructor_param` verifies discount=1.0 flows through Gate 2
+
+**PBE-F2: `threading.Lock` removed — RESOLVED**
+- `threading.Lock` restored on `set_tier_map()` and `_get_episode_min_premium()` per S4-POST-4 deliberation
+- Rationale documented in class docstring: safe under CPython GIL, required for correctness under all interpreters and future GIL removal
+
+**PBE-F3: `ingest()` shim removal — RESOLVED**
+- Grep audit (2026-05-03): zero callers of `.ingest()` in `backend/` outside deleted method
+- Documented in module docstring under "ingest() shim retirement note"
+
+**PBE-F4: `get_signal()` / cooldown gate removed — RESOLVED**
+- Cooldown gate intentionally removed: never wired in production
+- Stream layer (`tradier_stream.py`) handles emit throttling at higher level
+- Documented in module docstring under "cooldown gate (get_signal) retirement note"
+- `_signal_last_emit` dict retained in `__init__` for `flush_emit_cache()` compat; may be removed in future sprint after confirming no callers
+
+**QA-Q1: Test matrix — RESOLVED (9 cases, F-1 through F-9)**
+
+| Case | Input | Expected |
+|---|---|---|
+| F-1 | AT_ASK + CALL | True |
+| F-2 | ABOVE_ASK + PUT | True |
+| F-3 | AT_BID + PUT | True |
+| F-4 | BELOW_BID + CALL | True |
+| F-5 | AT_BID + CALL | True |
+| F-6 | MID + CALL | False |
+| F-7 | MID + PUT | False |
+| F-8 | AT_ASK + '' | True |
+| F-9 | BELOW_BID + PUT | True *(added QA-F1 fix — was missing from original 8-case spec)* |
+
+All 9 cases implemented in `test_ing006_directional_aggression.py`.
+
+**QA-Q2: Weighted premium gate tests — RESOLVED**
+- `test_weighted_premium_calculation`: 2 agg@$40k + 2 pass@$40k → weighted=$120k, total=$160k
+- `test_passive_only_drops_below_floor`: 3×$20k passive → weighted=$30k < $50k floor → None
+- `test_aggressive_at_exact_floor_passes`: 3×$20k aggressive → $60k ≥ $50k → passes
+- `test_mixed_episode_weighted_passes`: mixed → $120k weighted → passes
+- `test_boundary_passive_at_double_floor_passes`: 3×$34k passive → $51k ≥ $50k → passes
+
+**QA-F1: Sprint doc QA-Q1 matrix updated to 9 cases — RESOLVED**
+- F-9 (BELOW_BID + PUT → True) added to canonical matrix above
+- Test file docstring updated
+
+**QA-F4: Counter-separation test — RESOLVED**
+- `TestCounterSeparation` class added to `test_ing006_directional_aggression.py`
+- `test_passive_gate2_drop_returns_none_no_exception`: asserts no exception raised on passive Gate 2 drop
+- `test_aggressive_pass_returns_episode_not_none`: baseline confirming the correct path
 
 #### Implementation
 
@@ -554,12 +629,20 @@ def is_directionally_aggressive(
 **Step 5 — Retain old `is_aggressive(trade_type)` as deprecated.**
 
 #### Acceptance Criteria
-- [ ] `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` in parser
-- [ ] All 8 QA test matrix cases pass
-- [ ] Accumulator uses aggression-weighted premium for Gate 6 floor check
-- [ ] `aggression_discount` parameter on `RepetitionAccumulator` with default 0.5
-- [ ] Old `is_aggressive()` retained as deprecated
-- [ ] `is_aggressive` field available in `_DictEventWrapper`
+- [x] `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` in parser
+- [x] All 9 QA test matrix cases pass (F-1 through F-9, including F-9 added per QA-F1 fix)
+- [x] Accumulator uses aggression-weighted premium for Gate 2 floor check
+- [x] `aggression_discount: float = 0.5` parameter on `RepetitionAccumulator` (PBE-F1 fix)
+- [x] `ingest_tick()` calls `ep.get_weighted_premium(self._aggression_discount)` — constructor param flows through to Gate 2
+- [x] Old `is_aggressive()` retained as deprecated shim
+- [x] `is_aggressive` field available in `_DictEventWrapper`
+- [x] `threading.Lock` restored on `set_tier_map()` / `_get_episode_min_premium()` (PBE-F2 fix)
+- [x] `ingest()` shim removal confirmed by grep audit — zero callers (PBE-F3 fix)
+- [x] `get_signal()` / cooldown removal documented as intentional (PBE-F4 fix)
+- [x] TODO comment removed from `bid_ask_classifier.py`; migration tracked in Issue #63 (SA-F1 fix)
+- [x] Sprint doc QA-Q1 matrix updated to 9 cases (QA-F1 fix)
+- [x] `TestCounterSeparation` tests confirm passive Gate 2 drop returns None without raising (QA-F4 fix)
+- [x] `test_aggression_discount_constructor_param` confirms custom discount flows through Gate 2
 
 ---
 
@@ -649,4 +732,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-005 PR #61 pre-merge deliberation; ep.otm_band wiring tracked in ING-007 AC per SA-PREMERGE-Q1) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-006 PR #62 deliberation complete — all 7 findings resolved, cleared for merge; Issue #63 filed for SA-F1 order_side_classifier migration) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
