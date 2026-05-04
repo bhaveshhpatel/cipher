@@ -139,7 +139,7 @@ Fix (S6-PRE-MERGE 2026-05-01):
           to '# demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)'.
 
 Fix (ING-002 2026-05-03):
-  parse_tradier_trade() now returns sentinel "below_premium" for events
+  parse_tradier_trade() returns sentinel "below_premium" for events
   with premium < _MIN_EVENT_PREMIUM ($10,000). _process_trade() checks
   for sentinel BEFORE the `if result is None` / parse_failed branch.
   Counter ownership (Option A): below_min_premium is owned and incremented
@@ -190,6 +190,38 @@ Fix (ING-006-PREMERGE 2026-05-03):
   PREMERGE-6/7: set_dte_premium_tiers() — method renamed to set_tier_map()
     Any downstream callers updated. No call sites remain in this file
     (stream layer uses accumulator.set_tier_map() from registry warmup).
+
+Fix (ING-007 2026-05-04):
+  Log noise cleanup + strong_sentiment coupling fix.
+
+  ISSUE-1: order_side WARN fired on every tick.
+    Tradier timesale stream never provides order_side (ING-001 resolution).
+    Per-tick log.warning was flooding Railway logs with noise, making real
+    warnings invisible. The field default to UNKNOWN is CORRECT and EXPECTED —
+    it is not a parser regression condition.
+    Fix: removed per-tick warn. Added one-time INFO at stream startup:
+      "[stream] order_side not available on Tradier timesale stream —
+       using bid/ask spread as aggression proxy (ING-001)"
+    _order_side still defaults to UNKNOWN and is passed through to persist
+    and composite payload unchanged.
+
+  ISSUE-2: execution_mechanic WARN fired on every tick.
+    AMBIGUOUS_LONG is the correct cold default for an enrichment field not
+    present at the timesale layer. Not a warning condition.
+    Fix: downgraded to log.debug only (production Railway log level is INFO,
+    so this is effectively silent in prod). No behaviour change.
+
+  ISSUE-3: strong_sentiment derived from stale pre-ING-006 path.
+    getattr(ev, "strong_sentiment") was returning whatever the parser set,
+    which pre-ING-006 was coupled to execution_mechanic / order_side.
+    After ING-006, strong_sentiment MUST be computed from
+    is_directionally_aggressive(bid_ask_class, contract_type) — the ING-006
+    contract explicitly replaced order_side as the aggression signal.
+    Fix: compute _strong_sentiment inline using is_directionally_aggressive()
+    before the persist_flow_event call. The parser's ev.strong_sentiment
+    field is no longer the source of truth at this layer.
+    execution_mechanic payload field preserved in composite_msg for
+    downstream consumers (signal_store, frontend) — only derivation changed.
 """
 import asyncio
 import logging
@@ -204,7 +236,7 @@ import httpx
 from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
-from parsers.order_side_classifier import order_side_to_direction
+from parsers.order_side_classifier import order_side_to_direction, is_directionally_aggressive
 from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
@@ -299,6 +331,10 @@ _stats = {
 
 # FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
+
+# ING-007: one-time startup flag so order_side platform limitation is logged
+# once at stream start rather than per-tick.
+_order_side_startup_logged: bool = False
 
 # PREMERGE-3 (ING-006): min_premium= constructor kwarg was removed in ING-006.
 # ING-003 already provides DTE-stratified floors via dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS.
@@ -408,6 +444,8 @@ async def stream_options_flow(
     When `registry` is None (standalone / test usage), fall back to the
     original behaviour of building a fresh registry inline.
     """
+    global _order_side_startup_logged
+
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
 
@@ -415,6 +453,14 @@ async def stream_options_flow(
         log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
         _stats["mode"] = "idle"
         return
+
+    # ING-007: log order_side platform limitation once at startup (not per-tick).
+    if not _order_side_startup_logged:
+        log.info(
+            "[stream] order_side not available on Tradier timesale stream — "
+            "using bid/ask spread as aggression proxy via is_directionally_aggressive() (ING-001/ING-006)"
+        )
+        _order_side_startup_logged = True
 
     from services.stream_manager import StreamManager
 
@@ -590,6 +636,16 @@ async def _process_trade(raw: dict):
       PREMERGE-1: get_alert_level() now accepts total_premium float, not episode.
       PREMERGE-4: accumulator.min_premium no longer exists — log line updated.
       PREMERGE-5: sig_ep.summary_str() removed — replaced with inline f-string.
+
+    ING-007 (2026-05-04):
+      order_side: WARN removed. Field is UNKNOWN by platform design (ING-001).
+        Default to UNKNOWN silently. One-time INFO logged at startup instead.
+      execution_mechanic: WARN downgraded to DEBUG. AMBIGUOUS_LONG is correct
+        cold default — not a regression condition at the timesale layer.
+      strong_sentiment: now computed inline from is_directionally_aggressive(
+        ev.bid_ask_class, ev.contract_type) per ING-006 contract. Severs the
+        stale coupling to ev.strong_sentiment / execution_mechanic from the
+        pre-ING-006 parser path.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -745,29 +801,33 @@ async def _process_trade(raw: dict):
         )
         return
 
+    # ING-007: order_side is UNKNOWN by platform design — not a regression.
+    # No per-tick warning. One-time INFO logged at startup in stream_options_flow().
+    _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
+
+    # ING-007: strong_sentiment computed from is_directionally_aggressive() per
+    # ING-006 contract. Severs stale coupling to ev.strong_sentiment / execution_mechanic.
+    # AT_BID or BELOW_BID on either CALL or PUT = directionally aggressive = strong sentiment.
+    _strong_sentiment = is_directionally_aggressive(
+        getattr(ev, "bid_ask_class", ""), ev.contract_type
+    )
+
+    # ING-007: execution_mechanic AMBIGUOUS_LONG is the correct cold default.
+    # Not a warning condition — debug only (silent in prod at INFO log level).
+    _execution_mechanic = getattr(ev, "execution_mechanic", None)
+    if _execution_mechanic is None:
+        log.debug(
+            "[composite] execution_mechanic unavailable for %s — defaulting to AMBIGUOUS_LONG",
+            occ_symbol,
+        )
+        _execution_mechanic = "AMBIGUOUS_LONG"
+
     _stats["persisted"] += 1
     log.info(
         "[persist] %s %s $%.0f %s fill=%.2f size=%d prem=$%.0f type=%s",
         ev.ticker, ev.contract_type, ev.strike, ev.expiry,
         ev.fill_price, ev.size, ev.premium, ev.trade_type,
     )
-
-    # S6-PRE-MERGE (Item 4): getattr guards with warnings so parser regressions
-    # surface in Railway logs rather than silently emitting fallback values.
-    _order_side = getattr(ev, "order_side", None)
-    if _order_side is None:
-        log.warning("[composite] ev missing order_side for %s — defaulting to UNKNOWN", occ_symbol)
-        _order_side = "UNKNOWN"
-
-    _strong_sentiment = getattr(ev, "strong_sentiment", None)
-    if _strong_sentiment is None:
-        log.warning("[composite] ev missing strong_sentiment for %s — defaulting to False", occ_symbol)
-        _strong_sentiment = False
-
-    _execution_mechanic = getattr(ev, "execution_mechanic", None)
-    if _execution_mechanic is None:
-        log.warning("[composite] ev missing execution_mechanic for %s — defaulting to AMBIGUOUS_LONG", occ_symbol)
-        _execution_mechanic = "AMBIGUOUS_LONG"
 
     try:
         await asyncio.wait_for(
