@@ -15,6 +15,14 @@ ING-006: Added is_directionally_aggressive() which replaces is_aggressive()
   is_aggressive(trade_type) is retained as a deprecated shim.
   Do not remove until all callers are audited (ING-006 AC).
 
+  Grep audit result (PBE-PREMERGE-F1, 2026-05-03):
+  Zero callers of is_aggressive() remain in backend/ outside
+  bid_ask_classifier.py itself after the options_flow_parser.py migration
+  to is_directionally_aggressive(). The shim is safe to remove in the
+  ING-007 cleanup sprint. Audit command used:
+    grep -r "is_aggressive(" backend/ --include="*.py" -l
+  Files found: bid_ask_classifier.py only.
+
 SA-F2 / ING-007 NOTE:
   is_aggressive on OptionsFlowEvent is NOT yet persisted as a separate column
   in flow_events. The column must be added before this branch ships to production
@@ -32,14 +40,14 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
     """Return trade aggressiveness classification."""
     if ask <= bid:
         return "MID"
-    tenth = (ask - bid) * 0.1
-    if fill >= ask + tenth:
-        return "ABOVE_ASK"
-    if fill >= ask - tenth:
+    mid = (bid + ask) / 2
+    if fill >= ask:
+        return "ABOVE_ASK" if fill > ask else "AT_ASK"
+    if fill <= bid:
+        return "BELOW_BID" if fill < bid else "AT_BID"
+    if fill > mid:
         return "AT_ASK"
-    if fill <= bid - tenth:
-        return "BELOW_BID"
-    if fill <= bid + tenth:
+    if fill < mid:
         return "AT_BID"
     return "MID"
 
@@ -82,5 +90,9 @@ def is_aggressive(trade_type: TradeType) -> bool:
 
     Retained as backward-compat shim for any callers not yet migrated.
     Do not use for new code.
+
+    Removal status (PBE-PREMERGE-F1, 2026-05-03): grep audit confirmed zero
+    callers remain in backend/ after options_flow_parser.py migration.
+    Safe to remove in ING-007 cleanup sprint.
     """
     return trade_type in ("ABOVE_ASK", "AT_ASK")

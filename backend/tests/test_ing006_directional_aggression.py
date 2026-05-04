@@ -7,6 +7,10 @@ QA-Q1: 9-case is_directionally_aggressive() matrix (F-1 through F-9).
 QA-Q2: Accumulator weighted_premium gate tests.
 QA-F4: Counter-separation test — passive Gate 2 drop does not increment
        any parse counter (deliberation fix 2026-05-03).
+QA-PREMERGE-F1 (2026-05-03): dominant_direction fallback test — verifies
+  that a PUT episode where one event is missing contract_type resolves
+  dominant_direction using the episode's own contract_type (self.contract_type),
+  not a hardcoded string. Added to confirm SA-PREMERGE-F1 fix is correct.
 
 SCOPE NOTE (QA-F1 — deliberation pre-merge review 2026-05-03):
   This file covers ING-006 scope only: is_directionally_aggressive() behaviour
@@ -103,12 +107,23 @@ class TestIsDirectionallyAggressive:
 # QA-Q2: Accumulator weighted_premium gate
 # ---------------------------------------------------------------------------
 
-def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
+def _make_event(
+    premium: float,
+    is_aggressive: bool,
+    dte: int = 5,
+    contract_type: str = "CALL",
+    order_side: str = "UNKNOWN",
+    omit_contract_type: bool = False,
+) -> object:
     """Build a minimal mock event compatible with _DictEventWrapper / ingest_tick.
 
     Only fields actually consumed by RepetitionAccumulator / _DictEventWrapper
     are set here. Do not add fields that do not exist on OptionsFlowEvent —
     phantom fields mask future AttributeErrors when the real dataclass changes.
+
+    omit_contract_type: if True, the contract_type attribute is not set on
+    the returned object. Used by TestDominantDirectionFallback to exercise
+    the getattr fallback path in RepetitionEpisode.dominant_direction.
     """
 
     class _Ev:
@@ -116,7 +131,6 @@ def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
 
     e = _Ev()
     e.ticker           = "AAPL"
-    e.contract_type    = "CALL"
     e.strike           = 180.0
     e.expiry           = "2026-05-10"
     e.dte              = dte
@@ -125,8 +139,10 @@ def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
     e.timestamp        = datetime.now(timezone.utc)
     e.trade_type       = "BLOCK"
     e.underlying_price = 175.0
-    e.order_side       = "UNKNOWN"
+    e.order_side       = order_side
     e.sentiment        = "BULLISH"
+    if not omit_contract_type:
+        e.contract_type = contract_type
     return e
 
 
@@ -254,6 +270,89 @@ class TestWeightedPremiumGate:
 
         result = asyncio.run(run())
         assert result is not None, "passive episode at exactly 2x floor should pass"
+
+
+# ---------------------------------------------------------------------------
+# QA-PREMERGE-F1: dominant_direction fallback test (SA-PREMERGE-F1 fix)
+# ---------------------------------------------------------------------------
+
+class TestDominantDirectionFallback:
+    """
+    QA-PREMERGE-F1 (2026-05-03).
+
+    Verifies that RepetitionEpisode.dominant_direction correctly falls back
+    to self.contract_type (the episode's own contract_type) when an individual
+    event is missing its contract_type attribute — not to a hardcoded string.
+
+    SA-PREMERGE-F1 identified that the property previously used
+    getattr(e, "contract_type", "CALL") — hardcoded "CALL" — which would
+    misclassify premium contributions in PUT episodes where an event had
+    no contract_type. The fix reverts to getattr(e, "contract_type",
+    self.contract_type) so the episode context is always the fallback.
+
+    Two tests:
+      1. PUT episode where one event has no contract_type — must resolve
+         REPEAT_SELL (SELL PUT is bearish → REPEAT_SELL via fallback mapping),
+         not REPEAT_BUY (what "CALL" fallback would produce for SELL order_side).
+         Wait — order_side_to_direction(SELL, PUT) = REPEAT_BUY (put seller is
+         bullish). With "CALL" fallback: order_side_to_direction(SELL, CALL)
+         would return REPEAT_SELL (call seller is bearish). This is the
+         misclassification: selling a PUT is bullish, but if we substitute
+         "CALL" as the fallback, the same SELL order_side reads as bearish.
+      2. Sanity check — episode with all events carrying correct contract_type
+         is unaffected.
+    """
+
+    def test_put_episode_missing_contract_type_uses_episode_fallback(self):
+        """
+        PUT episode, 3 events all with order_side=SELL.
+        order_side_to_direction(SELL, PUT) = REPEAT_BUY (put seller is bullish).
+
+        One event is missing contract_type entirely (omit_contract_type=True).
+        With self.contract_type fallback ("PUT"): that event still resolves
+        REPEAT_BUY -> buy_prem increases correctly.
+        With "CALL" fallback: order_side_to_direction(SELL, CALL) = REPEAT_SELL
+        -> sell_prem increases instead -> dominant_direction may flip to REPEAT_SELL
+        if the missing-contract_type event has enough premium weight.
+
+        This test uses 1 normal event @ $10k and 1 event with missing
+        contract_type @ $100k (dominant weight). The missing-contract_type
+        event must resolve REPEAT_BUY, not REPEAT_SELL.
+        """
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="PUT")
+
+        normal_ev = _make_event(10_000, True, contract_type="PUT", order_side="SELL")
+        missing_ct_ev = _make_event(
+            100_000, True, contract_type="PUT",
+            order_side="SELL", omit_contract_type=True
+        )
+        ep.events = [normal_ev, missing_ct_ev]
+
+        # With correct fallback (self.contract_type = "PUT"):
+        #   both events: order_side_to_direction(SELL, PUT) = REPEAT_BUY
+        #   buy_prem = 110_000, sell_prem = 0 -> REPEAT_BUY
+        #
+        # With broken fallback ("CALL"):
+        #   missing_ct_ev: order_side_to_direction(SELL, CALL) = REPEAT_SELL
+        #   buy_prem = 10_000, sell_prem = 100_000 -> REPEAT_SELL (WRONG)
+        assert ep.dominant_direction == "REPEAT_BUY", (
+            "PUT episode with missing contract_type event must resolve REPEAT_BUY "
+            "using episode fallback (self.contract_type='PUT'), not 'CALL' fallback"
+        )
+
+    def test_all_events_with_contract_type_unaffected(self):
+        """
+        Sanity check: when all events have contract_type set, the result
+        is identical regardless of the fallback value — the fallback is
+        never invoked.
+        """
+        ep = RepetitionEpisode(ticker="AAPL", contract_type="PUT")
+        ep.events = [
+            _make_event(50_000, True, contract_type="PUT", order_side="SELL"),
+            _make_event(50_000, True, contract_type="PUT", order_side="SELL"),
+        ]
+        # Both SELL PUT -> REPEAT_BUY
+        assert ep.dominant_direction == "REPEAT_BUY"
 
 
 # ---------------------------------------------------------------------------

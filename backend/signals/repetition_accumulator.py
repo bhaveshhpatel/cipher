@@ -16,6 +16,20 @@
 #   signal volume drops unexpectedly. aggression_discount will be wired
 #   through ingestion_config in ING-002-CONFIG (future sprint) at which
 #   point a config-level rollback will be available.
+#
+# DEPLOY NOTE (ING-006 / PBE-PREMERGE-F3 — 2026-05-03):
+#   min_sweeps constructor default changed from 0 (disabled) to 2.
+#   tradier_stream.py does not pass min_sweeps at instantiation, so the
+#   production accumulator now requires at least 2 sweep-typed events before
+#   a sweep episode emits (whale-sweep bypass still applies: single event,
+#   trade_type=SWEEP, premium >= $500k bypasses this gate entirely).
+#
+#   PRODUCTION IMPACT: Sweep episodes that previously emitted on a single
+#   non-whale sweep will now require a second confirming sweep event.
+#   Monitor sweep signal volume on day 1 alongside weighted_premium impact.
+#
+#   ROLLBACK: Pass min_sweeps=0 to RepetitionAccumulator at instantiation
+#   to restore previous behaviour without a full PR revert.
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -64,7 +78,7 @@ Alert level thresholds (S1 reconciliation):
 Registry enrichment block (ING-005):
   underlying_price enrichment runs after the initial parse in the stream layer,
   not here. The accumulator receives events with underlying_price already set
-  by the parser’s registry enrichment. OTM classification here uses
+  by the parser's registry enrichment. OTM classification here uses
   ev.underlying_price directly.
 
 dominant_direction property (S2 spec):
@@ -92,11 +106,17 @@ ING-006 additions:
 
 cooldown gate (get_signal) retirement note (PBE-F4 deliberation fix 2026-05-03):
   get_signal() and the _signal_last_emit cooldown dict were intentionally
-  removed. The cooldown gate was never wired in production — the stream
-  layer (tradier_stream.py) handles emit throttling at a higher level via
-  its own debounce logic. Removing it here eliminates dead state. If a
-  per-accumulator cooldown is needed in a future sprint, re-introduce it
-  with a deliberation session before implementation.
+  removed in their entirety. _signal_last_emit does NOT exist in __init__ —
+  it was removed along with get_signal() and is not referenced by
+  flush_emit_cache() (which only calls self._episodes.clear()). The cooldown
+  gate was never wired in production — the stream layer (tradier_stream.py)
+  handles emit throttling at a higher level via its own debounce logic.
+  Removing it here eliminates dead state. If a per-accumulator cooldown is
+  needed in a future sprint, re-introduce it with a deliberation session
+  before implementation.
+  Correction note (PBE-PREMERGE-F2, 2026-05-03): an earlier version of this
+  docstring incorrectly stated _signal_last_emit was "retained in __init__ for
+  flush_emit_cache() compat" — that was inaccurate and has been corrected here.
 
 ingest() shim retirement note (PBE-F3 deliberation fix 2026-05-03):
   The ingest() backward-compat async shim was removed. Grep audit result
@@ -257,12 +277,18 @@ class RepetitionEpisode:
 
         An episode dominated by SELL PUT premium resolves REPEAT_BUY even
         if the last tick was a passive mid-print (Session 10 resolution).
+
+        SA-PREMERGE-F1 fix (2026-05-03): fallback for missing contract_type
+        on an individual event uses self.contract_type (the episode's own
+        contract_type), not a hardcoded string. Using a hardcoded "CALL"
+        would misclassify premium contribution in a PUT episode where an
+        event is missing its contract_type attribute.
         """
         buy_prem = sell_prem = 0.0
         for e in self.events:
             d = order_side_to_direction(
                 getattr(e, "order_side", "UNKNOWN"),
-                getattr(e, "contract_type", "CALL"),
+                getattr(e, "contract_type", self.contract_type),
             )
             if d == "REPEAT_BUY":
                 buy_prem += getattr(e, "premium", 0.0)
@@ -293,6 +319,7 @@ class RepetitionAccumulator:
     min_sweeps : int
         Gate 4 — minimum sweep events required. Whale-sweep bypass applies
         when len(ep.events) == 1 AND trade_type=SWEEP AND premium >= 500k.
+        Default changed from 0 (disabled) to 2 in ING-006. See DEPLOY NOTE.
     aggression_discount : float
         ING-006 / PBE-F1 — passive event premium discount for Gate 2.
         Default 0.5: passive events contribute premium * 0.5 to
