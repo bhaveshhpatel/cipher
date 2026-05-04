@@ -41,10 +41,10 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-002 | Nothing | ✅ MERGED |
 | ING-003 | Nothing | ✅ MERGED |
 | ING-004 | Nothing | ✅ MERGED |
-| ING-005 | ING-004 | ✅ UNBLOCKED — deliberation required |
-| ING-006 | ING-002 | After deliberation |
-| ING-007 | ING-002, ING-003 | After deliberation |
-| ING-008 | ING-004, ING-005 | After ING-005 merges + deliberation |
+| ING-005 | ING-004 | ✅ MERGED |
+| ING-006 | ING-002 | ✅ MERGED |
+| ING-007 | ING-002, ING-003 | 🔴 Deliberation required |
+| ING-008 | ING-004, ING-005 | 🔴 Blocked — deliberation required after ING-005 |
 
 ---
 
@@ -62,14 +62,12 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-002 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #58 commit `a38f837`** |
 | ING-003 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #59 commit `62b159f`** |
 | ING-004 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #60 commit `d3c3f31`** |
-| ING-005 | 🔴 NOT STARTED — deliberation required before implementation |
-| ING-006 | 🔴 NOT STARTED — deliberation required before implementation |
-| ING-007 | 🔴 NOT STARTED — deliberation required before implementation |
-| ING-008 | 🔴 NOT STARTED — deliberation required before implementation |
+| ING-005 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #61 commit `252d75f`** |
+| ING-006 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #62 commit `501b170`** |
+| ING-007 | 🔴 NOT STARTED — deliberation required before implementation. GitHub Issue #70 filed. |
+| ING-008 | 🔴 NOT STARTED — blocked on ING-005 ✅ + deliberation required |
 
-> For ING-002: deliberation is complete and story is merged. Do not re-litigate any decisions.
-> For ING-003: deliberation is complete and story is merged. Do not re-litigate any decisions.
-> For ING-004: deliberation is complete and story is merged. Do not re-litigate any decisions.
+> For ING-002 through ING-006: deliberation is complete and stories are merged. Do not re-litigate any decisions.
 > For all other stories: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
@@ -119,6 +117,7 @@ Always: branch → commits → PR → deliberation → merge.
 - `ing/s4-underlying-price-fallback` → ING-004
 - `ing/s5-otm-threshold-align` → ING-005
 - `ing/s6-directional-aggression` → ING-006
+- `ing/s7-multiday-repeat` → ING-007
 
 ### PR Body Must Include
 
@@ -270,12 +269,12 @@ POST-MERGE
 | ING-002 | Hard $10k premium floor at parser | ✅ MERGED 2026-05-03 — PR #58 commit `a38f837` | `ing/s2-premium-floor` |
 | ING-003 | Wire DTE premium tiers at accumulator init | ✅ MERGED 2026-05-03 — PR #59 commit `62b159f` | `ing/s3-dte-tiers-init` |
 | ING-004 | Fallback `underlying_price` from registry | ✅ MERGED 2026-05-03 — PR #60 commit `d3c3f31` | `ing/s4-underlying-price-fallback` |
-| ING-005 | Align OTM band thresholds | 🔴 Deliberation required (ING-004 ✅) | `ing/s5-otm-threshold-align` |
-| ING-006 | Directional aggression weighting | 🔴 Deliberation required (ING-002 ✅) | `ing/s6-directional-aggression` |
-| ING-007 | Multi-day repeat window lookback | 🔴 Deliberation required (ING-002 ✅ ING-003 ✅) | `ing/s7-multiday-repeat` |
-| ING-008 | Volume vs. OI gate | 🔴 Blocked on ING-005 + deliberation | `ing/s8-vol-oi-gate` |
+| ING-005 | Align OTM band thresholds | ✅ MERGED 2026-05-03 — PR #61 commit `252d75f` | `ing/s5-otm-threshold-align` |
+| ING-006 | Directional aggression weighting on premium floor | ✅ MERGED 2026-05-04 — PR #62 commit `501b170` | `ing/s6-directional-aggression` |
+| ING-007 | Multi-day repeat window lookback + is_aggressive DB column | 🔴 Deliberation required — Issue #70 | `ing/s7-multiday-repeat` |
+| ING-008 | Volume vs. OI gate | 🔴 Blocked — deliberation required after ING-005 ✅ | `ing/s8-vol-oi-gate` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-03 (ING-004 merged PR #60 commit `d3c3f31`) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-04 (ING-006 merged PR #62 commit `501b170`; ING-007 Issue #70 filed) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
