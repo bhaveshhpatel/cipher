@@ -62,6 +62,14 @@ Bug fixes applied:
      ContractKeys enqueued by _process_trade() after each persisted episode,
      fetches the lookback result from contract_day_cache, then PATCHes the
      most-recent flow_episodes row for that contract with is_multi_day_repeat.
+
+ING-007 cold-cache note:
+  The background asyncio.Queue pattern means lookback results are populated
+  asynchronously after the first episode for a contract arrives. The first
+  episode in a session may briefly see prior_days_active=0 and
+  is_multi_day_repeat=False until the queue worker completes the DB fetch
+  and populates the cache. Acceptable — is_multi_day_repeat is enrichment,
+  not a gate (SA-Q1, 2026-05-04).
 """
 import asyncio
 import logging
@@ -93,14 +101,15 @@ _RETRY_DELAY_S = 1.0
 
 # ---------------------------------------------------------------------------
 # ING-007: async lookback enrichment queue
-#   Bounded at _LOOKBACK_QUEUE_MAX to prevent unbounded memory growth on
-#   a very active trading day. Overflow is counted and surfaced in stats.
+#   Bounded at _LOOKBACK_QUEUE_MAX (5000 — PBE-Q3 deliberation 2026-05-04)
+#   to prevent unbounded memory growth on a very active trading day.
+#   Overflow is counted and surfaced in stats as "lookback_queue_overflow".
 # ---------------------------------------------------------------------------
-_LOOKBACK_QUEUE_MAX = 500
+_LOOKBACK_QUEUE_MAX = 5_000  # PBE-Q3: 5000, not 500
 _lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=_LOOKBACK_QUEUE_MAX)
 _lookback_stats: Dict[str, int] = {
-    "lookback_queued":   0,
-    "lookback_overflow": 0,
+    "lookback_queued":        0,
+    "lookback_queue_overflow": 0,  # PBE-Q3: exact key name per deliberation
 }
 
 
@@ -117,7 +126,7 @@ def enqueue_lookback(key) -> None:
         _lookback_queue.put_nowait(key)
         _lookback_stats["lookback_queued"] += 1
     except asyncio.QueueFull:
-        _lookback_stats["lookback_overflow"] += 1
+        _lookback_stats["lookback_queue_overflow"] += 1  # PBE-Q3 key
         log.debug(
             "[lookback] queue full (%d) — key dropped: %s",
             _LOOKBACK_QUEUE_MAX, key,
@@ -432,7 +441,10 @@ async def start_lookback_worker(accumulator) -> None:
          lookback query uses the same floor as the persist gate.
       2. Call contract_day_cache.get_lookback(key, min_premium).
       3. PATCH the most-recent flow_episodes row via _update_episode_multiday()
-         with is_multi_day_repeat = (prior_days_active >= 1).
+         with is_multi_day_repeat = (
+             prior_days_active >= accumulator._multi_day_min_days
+         ).
+         Uses the accumulator's configured threshold — never hardcoded.
 
     Cold-cache note: the first episode for any contract returns
     prior_days_active=0 (cache miss → DB fetch). Subsequent ticks within
@@ -445,7 +457,14 @@ async def start_lookback_worker(accumulator) -> None:
     # Deferred import to avoid circular dependency at module load time.
     from utils.contract_day_cache import get_lookback
 
-    log.info("[lookback_worker] started — draining ContractKey queue")
+    # Resolve multi_day_min_days from accumulator (default 2 per SA deliberation).
+    multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
+
+    log.info(
+        "[lookback_worker] started — draining ContractKey queue "
+        "(maxsize=%d, multi_day_min_days=%d)",
+        _LOOKBACK_QUEUE_MAX, multi_day_min_days,
+    )
     try:
         while True:
             key = await _lookback_queue.get()
@@ -463,15 +482,17 @@ async def start_lookback_worker(accumulator) -> None:
 
             try:
                 result = await get_lookback(key, min_premium)
-                is_repeat = result.prior_days_active >= 1
+                # PBE-F3 fix: use accumulator's configured threshold, not hardcoded 1.
+                is_repeat = result.prior_days_active >= multi_day_min_days
                 await _update_episode_multiday(
                     ticker, contract_type, strike, expiry, is_repeat
                 )
                 log.debug(
                     "[lookback_worker] %s %s $%.0f %s — "
-                    "prior_days_active=%d aggressive=%d is_repeat=%s",
+                    "prior_days_active=%d aggressive=%d is_repeat=%s (min_days=%d)",
                     ticker, contract_type, strike, expiry,
-                    result.prior_days_active, result.prior_days_aggressive, is_repeat,
+                    result.prior_days_active, result.prior_days_aggressive,
+                    is_repeat, multi_day_min_days,
                 )
             except Exception as exc:
                 log.warning(
