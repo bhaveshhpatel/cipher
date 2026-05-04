@@ -33,13 +33,13 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 
 | Order | Story ID | Title | Depends On | Can Ship? |
 |-------|----------|-------|------------|-----------|
-| ~~1~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
+| ~~0~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
 | 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58, commit `a38f837`) |
 | 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59, commit `62b159f`) |
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60, commit `d3c3f31`) |
-| 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ MERGED — 2026-05-03 (PR #61) |
+| 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ CLOSED — 2026-05-03 (PR #61, commit `252d75f`) |
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
-| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
+| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅ | 🔓 UNBLOCKED — deliberation required before implementation. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
 | 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
 
 ---
@@ -57,6 +57,7 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 | [#67](https://github.com/bhaveshhpatel/cipher/issues/67) | ING-007 prereq (SA-F2): Add `is_aggressive` boolean column to `flow_events` | **Blocking for ING-007 and S8 backtest work** | ING-007 S2.5 migration |
 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
 | [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
+| [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue |
 
 ---
 
@@ -473,10 +474,10 @@ ON CONFLICT (key) DO NOTHING;
 **Depends On:** ING-004 ✅
 **Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing005_otm_thresholds.py`
 **Branch:** `ing/s5-otm-threshold-align`
-**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **MERGED 2026-05-03** (commit `252d75f`)
+**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **CLOSED — MERGED 2026-05-03** (commit `252d75f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. Story merged.**
+**All three roles signed off. Story closed.**
 
 #### Deliberation Outcomes
 
@@ -520,7 +521,7 @@ Option B rejected. No tier data needs to flow through event objects.
 - [x] `deep_otm_multiplier` default changed `1.5` → `1.0` in `RepetitionAccumulator.__init__`
 - [x] All docstrings updated with ING-005 rationale (module, class, `_classify_otm`, `ingest_tick` Gate 3 comment)
 - [x] `backend/tests/test_ing005_otm_thresholds.py` created with E-1, E-2, E-3 cases
-- [x] All existing `test_classify_otm` tests green (static method tests; no multiplier interaction)
+- [x] All existing `test_classify_otm` tests green (static method unchanged)
 - [x] Tests asserting default deep OTM penalty updated — all existing tests use explicit `deep_otm_multiplier=1.5`; no tests asserted the old default
 - [x] No regression in existing accumulator or stream tests
 - [x] PR #61 opened targeting `main`
@@ -625,7 +626,7 @@ All 9 cases implemented in `test_ing006_directional_aggression.py`.
 |---------|-------|-------|-----------|
 | SA-F1 | [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Blocking ING-007/008 signal-layer imports |
 | SA-F2 | [#67](https://github.com/bhaveshhpatel/cipher/issues/67) / [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `is_aggressive` column to `flow_events` + persist_flow_episode serialisation | **Blocking production deploy** |
-| PBE-PREMERGE-F1 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | `is_aggressive()` deprecated shim removal | Coordinate with #66 |
+| PBE-PREMERGE-F1 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | `is_aggressive()` deprecated shim removal | Coordinate with #63/#66 |
 | SA-Q2 resolved | [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | Persist `is_aggressive` to `flow_events` for ING-007 pattern quality scoring | P1 — ING-007 prerequisite |
 
 #### Acceptance Criteria
@@ -651,7 +652,7 @@ All 9 cases implemented in `test_ing006_directional_aggression.py`.
 **Priority:** P1
 **Estimated Effort:** 3 days
 **Depends On:** ING-002 (merged ✅), ING-003 (merged ✅)
-**GitHub Issue:** [#65](https://github.com/bhaveshhpatel/cipher/issues/65)
+**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) *(canonical — supersedes #65)*
 **Status:** 🔓 **UNBLOCKED** — ING-006 merged 2026-05-04. Deliberation required before implementation.
 **Files:** `backend/services/flow_store.py`, `backend/services/tradier_stream.py`, `backend/utils/contract_day_cache.py` (new), Supabase migration
 
@@ -744,4 +745,4 @@ All 7 stories pass acceptance criteria AND:
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-04 (ING-006 PR #62 merged — commit `501b170`; ING-005 PR #61 merged; ING-007 and ING-008 unblocked; post-merge findings tracked in Issues #63–#69; Rule 7 post-merge doc update complete) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-04 (ING-005 PR #61 CLOSED; ING-006 PR #62 MERGED commit `501b170`; ING-007 canonical Issue #70 filed; ING-007 and ING-008 unblocked; post-merge findings tracked in Issues #63–#70; Rule 7 post-merge doc update complete) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
