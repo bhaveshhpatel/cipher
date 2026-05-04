@@ -10,10 +10,6 @@ Usage — call once at startup from main.py lifespan:
     from services.flow_store import start_flow_writer
     asyncio.create_task(start_flow_writer())
 
-    # ING-007: also start the lookback queue worker:
-    from services.flow_store import start_lookback_worker
-    asyncio.create_task(start_lookback_worker())
-
 Tables written:
   - flow_events   : one row per classified tick (batched every 500ms or 100 rows)
   - flow_episodes : one row per Signal Gate crossing, written directly from
@@ -41,27 +37,6 @@ C-003 — Sweep Retroactive Upgrade:
   from _process_trade() via asyncio.create_task() so it does not block
   the stream hot path.
 
-ING-007 — Background Lookback Queue:
-  _lookback_queue: asyncio.Queue (maxsize=5000) — receives ContractKey
-  tuples from _process_trade() in tradier_stream.py. The queue worker
-  (_lookback_worker) calls contract_day_cache.get_lookback() and writes
-  results back onto the RepetitionEpisode in _accumulator.
-
-  First-episode cold-cache behaviour:
-    The first episode for a contract in a session enqueues its ContractKey
-    before the cache entry exists. Until the queue worker completes the
-    DB fetch, ep.prior_days_active = 0 and ep.is_multi_day_repeat = False.
-    This is acceptable — is_multi_day_repeat is enrichment, not a gate
-    (SA-Q1, 2026-05-04). The field self-corrects on subsequent ingest_tick
-    calls once the cache is populated.
-
-  Overflow behaviour:
-    If the queue is full (500 unique contracts firing in rapid succession
-    during a volatile session), put_nowait() raises asyncio.QueueFull.
-    The caller in _process_trade() catches this and increments
-    _stats["lookback_queue_overflow"]. The episode still produces and
-    emits correctly — lookback enrichment is silently skipped for that tick.
-
 Bug fixes applied:
   1. ALERT-LEVEL (2026-04-29): _bus_signal_listener was reading
      sig.get("alert_level") but the published signal dict uses key "alert".
@@ -79,6 +54,9 @@ Bug fixes applied:
      after Signal Gate, before SIG-DEBOUNCE. _bus_signal_listener no longer
      writes flow_episodes — it is retained but acts as a no-op consumer of
      the db_writer channel for future use.
+  4. ING-007 (2026-05-04): persist_flow_episode() now accepts and writes
+     is_multi_day_repeat (BOOLEAN). Requires migration
+     add_is_multi_day_repeat_to_flow_episodes.sql to be run first.
 """
 import asyncio
 import logging
@@ -107,19 +85,6 @@ _flow_event_buffer: list[dict] = []
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
-
-# ---------------------------------------------------------------------------
-# ING-007: Background lookback queue
-# ContractKey = (ticker, contract_type, strike, expiry) — 4-tuple (PBE, 2026-05-04)
-# maxsize=5000 — overflow is caught and counted; never propagated (PBE-Q3)
-# ---------------------------------------------------------------------------
-_lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-
-# Module-level stats — all keys initialised here so /health/stream never
-# raises KeyError on cold start (Rule 6.4, STORY-STEPS_ING.md)
-_stats: Dict[str, int] = {
-    "lookback_queue_overflow": 0,
-}
 
 
 def _is_configured() -> bool:
@@ -182,103 +147,6 @@ async def _flush_flow_events():
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
 
 
-# ---------------------------------------------------------------------------
-# ING-007: Lookback queue worker
-# ---------------------------------------------------------------------------
-
-async def _lookback_worker(accumulator) -> None:
-    """
-    ING-007: Background worker that drains _lookback_queue and enriches
-    RepetitionEpisode objects with prior_days_active / prior_days_aggressive.
-
-    Receives ContractKey tuples enqueued by _process_trade() in tradier_stream.py.
-    Calls contract_day_cache.get_lookback() for each key, then writes results
-    back onto the live RepetitionEpisode in the accumulator (if still present).
-
-    accumulator: RepetitionAccumulator instance from tradier_stream module.
-    This avoids a circular import — the caller (tradier_stream.py) passes
-    its module-level accumulator reference at startup.
-
-    The worker runs indefinitely until cancelled. It never raises — all
-    exceptions are caught and logged so the worker cannot kill the event loop.
-    """
-    from utils.contract_day_cache import get_lookback, ContractKey  # local import avoids circular
-
-    log.info("[flow_store] ING-007 lookback queue worker started")
-    while True:
-        try:
-            key: ContractKey = await _lookback_queue.get()
-            ticker, contract_type, strike, expiry = key
-
-            # Resolve DTE-tier floor from the live episode if still present.
-            episode_key = f"{ticker}:{contract_type}:{strike}:{expiry}"
-            ep = accumulator._episodes.get(episode_key)
-            min_premium = 0.0
-            if ep is not None:
-                min_premium = accumulator._get_episode_min_premium(ep)
-
-            result = await get_lookback(key, min_premium)
-
-            # Write back onto the episode if it is still active.
-            if ep is not None:
-                ep.prior_days_active     = result.prior_days_active
-                ep.prior_days_aggressive = result.prior_days_aggressive
-                ep.is_multi_day_repeat   = (
-                    result.prior_days_active >= accumulator._multi_day_min_days
-                )
-                log.debug(
-                    f"[flow_store] lookback enriched {ticker} {contract_type} "
-                    f"{strike} {expiry}: active={result.prior_days_active} "
-                    f"aggressive={result.prior_days_aggressive} "
-                    f"multi_day={ep.is_multi_day_repeat}"
-                )
-            _lookback_queue.task_done()
-
-        except asyncio.CancelledError:
-            log.info("[flow_store] lookback worker cancelled")
-            raise
-        except Exception as exc:  # pragma: no cover
-            log.warning(f"[flow_store] lookback worker exception (non-fatal): {exc}")
-            try:
-                _lookback_queue.task_done()
-            except Exception:
-                pass
-
-
-async def start_lookback_worker(accumulator) -> None:
-    """
-    ING-007: Start the background lookback queue worker.
-    Call once at startup from main.py lifespan alongside start_flow_writer().
-
-        asyncio.create_task(start_lookback_worker(accumulator))
-
-    accumulator: the RepetitionAccumulator instance from tradier_stream module.
-    """
-    await _lookback_worker(accumulator)
-
-
-def enqueue_lookback(contract_key) -> None:
-    """
-    ING-007: Enqueue a ContractKey for async lookback enrichment.
-
-    Called from _process_trade() in tradier_stream.py on the hot path.
-    Uses put_nowait() — never blocks. On QueueFull, increments
-    _stats["lookback_queue_overflow"] and returns silently. The episode
-    still produces and emits correctly; lookback enrichment is skipped
-    for this tick only.
-    """
-    try:
-        _lookback_queue.put_nowait(contract_key)
-    except asyncio.QueueFull:
-        _stats["lookback_queue_overflow"] += 1
-        log.debug("[flow_store] lookback_queue full — overflow +1")
-
-
-def get_lookback_stats() -> Dict[str, int]:
-    """Return a copy of the lookback stats dict for /health/stream."""
-    return dict(_stats)
-
-
 async def persist_flow_event(ev_dict: dict):
     global _flow_event_buffer
 
@@ -339,13 +207,6 @@ async def persist_flow_event(ev_dict: dict):
 async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
     """
     C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
-
-    Fix (2026-04-29): The previous implementation embedded the raw SQL
-    expression "now()-interval 30 seconds" directly in the PostgREST
-    filter URL. PostgREST treats filter values as literals, not SQL, so
-    the expression was passed verbatim and Postgres rejected it with
-    error code 22007 (invalid_datetime_format). Fixed by pre-computing
-    the cutoff timestamp in Python and formatting it as ISO 8601.
     """
     if not _is_configured():
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
@@ -387,54 +248,93 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         return False
 
 
+async def get_contract_prior_days(
+    ticker: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+) -> int:
+    """
+    ING-007: Call the Supabase RPC function get_contract_prior_days() to
+    count the number of distinct prior trading days (ET) on which this
+    contract appeared in flow_episodes.
+
+    Returns 0 on any error so the stream degrades gracefully — a failed
+    RPC call never blocks a tick from being processed.
+
+    SQL function definition: backend/db/get_contract_prior_days.sql
+    """
+    if not _is_configured():
+        return 0
+
+    url = f"{_SUPABASE_URL}/rest/v1/rpc/get_contract_prior_days"
+    payload = {
+        "p_ticker":        ticker,
+        "p_contract_type": contract_type,
+        "p_strike":        strike,
+        "p_expiry":        expiry,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code == 200:
+            return int(resp.json())
+        log.warning(
+            "[flow_store] get_contract_prior_days RPC failed: "
+            "%d -- %s (ticker=%s %s $%.0f %s)",
+            resp.status_code, resp.text[:200], ticker, contract_type, strike, expiry,
+        )
+        return 0
+    except Exception as e:
+        log.warning(
+            "[flow_store] get_contract_prior_days exception: %s "
+            "(ticker=%s %s $%.0f %s) — defaulting to 0",
+            e, ticker, contract_type, strike, expiry,
+        )
+        return 0
+
+
 async def persist_flow_episode(signal_data: dict):
     """
     Write one row to flow_episodes.
 
-    Called directly from _process_trade() in tradier_stream.py after the
-    Signal Gate check and BEFORE the SIG-DEBOUNCE check. This ensures
-    flow_episodes records every qualifying Signal Gate crossing, not just
-    the subset that also clears the debounce gate.
-
-    strike and expiry are populated from sig_ep fields (not from the
-    composite_msg bus payload which never included them).
+    ING-007: now accepts is_multi_day_repeat (BOOLEAN, default False).
+    Requires migration add_is_multi_day_repeat_to_flow_episodes.sql.
     """
     expiry = signal_data.get("expiry") or None
 
     row = {
-        "ticker":          signal_data.get("ticker"),
-        "direction":       signal_data.get("direction"),
-        "contract_type":   signal_data.get("contract_type"),
-        "strike":          signal_data.get("strike"),
-        "expiry":          expiry,
-        "total_premium":   signal_data.get("total_premium"),
-        "trade_count":     signal_data.get("trade_count"),
-        "alert_level":     signal_data.get("alert_level"),
-        "is_accelerating": signal_data.get("is_accelerating", False),
-        "seed_episode":    signal_data.get("seed_episode"),
-        "signal_ts":       signal_data.get("timestamp"),
+        "ticker":              signal_data.get("ticker"),
+        "direction":           signal_data.get("direction"),
+        "contract_type":       signal_data.get("contract_type"),
+        "strike":              signal_data.get("strike"),
+        "expiry":              expiry,
+        "total_premium":       signal_data.get("total_premium"),
+        "trade_count":         signal_data.get("trade_count"),
+        "alert_level":         signal_data.get("alert_level"),
+        "is_accelerating":     signal_data.get("is_accelerating", False),
+        "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
+        "seed_episode":        signal_data.get("seed_episode"),
+        "signal_ts":           signal_data.get("timestamp"),
     }
     ok = await _insert_rows("flow_episodes", [row])
     if ok:
         log.info(
-            f"[flow_store] flow_episode saved: {row['ticker']} {row['contract_type']} "
-            f"strike={row['strike']} expiry={row['expiry']} "
-            f"alert={row['alert_level']} prem=${(row['total_premium'] or 0):,.0f}"
+            "[flow_store] flow_episode saved: %s %s strike=%s expiry=%s "
+            "alert=%s prem=$%,.0f multi_day=%s",
+            row["ticker"], row["contract_type"],
+            row["strike"], row["expiry"],
+            row["alert_level"], (row["total_premium"] or 0),
+            row["is_multi_day_repeat"],
         )
 
 
 async def _bus_signal_listener():
-    """
-    EPISODE-FIX (2026-04-30): flow_episodes are now written directly from
-    _process_trade() before the SIG-DEBOUNCE gate. This listener is retained
-    to consume the db_writer channel (preventing queue build-up) but no longer
-    writes any rows itself.
-    """
     q = bus.subscribe("db_writer")
     log.info("[flow_store] DB writer subscribed to bus (flow_episodes written directly from stream, not here)")
     try:
         while True:
-            await q.get()  # drain the channel — no-op consumer
+            await q.get()
     except asyncio.CancelledError:
         bus.unsubscribe("db_writer", q)
         log.info("[flow_store] DB writer unsubscribed from bus")
@@ -456,10 +356,6 @@ async def start_flow_writer():
         _flush_flow_events(),
     )
 
-
-# ---------------------------------------------------------------------------
-# FlowStore — in-memory store for unit / regression tests.
-# ---------------------------------------------------------------------------
 
 class FlowStore:
     """In-memory store for options flow events."""
