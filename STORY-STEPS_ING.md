@@ -15,7 +15,7 @@
    - Contains: story scope, acceptance criteria, 3-way deliberation outcomes, QA test matrices, implementation code, dependency graph
    - Defines *what* a story requires, *why*, and *what was already decided*
 
-2. Read **`docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`** second
+2. Read **`STORY-STEPS_ING.md`** second
    - This is the execution state tracker across all sprints
    - Contains: what is merged (✅), what is blocked (🔴), what is queued (⏳), post-merge findings, exact build order
    - Defines *where things currently stand*
@@ -43,8 +43,8 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-004 | Nothing | ✅ MERGED |
 | ING-005 | ING-004 | ✅ MERGED |
 | ING-006 | ING-002 | ✅ MERGED |
-| ING-007 | ING-002, ING-003 | 🔴 Deliberation required |
-| ING-008 | ING-004, ING-005 | 🔴 Blocked — deliberation required after ING-005 |
+| ING-007 | ING-002, ING-003, ING-006 | ✅ Deliberation COMPLETE 2026-05-04 — cleared for implementation |
+| ING-008 | ING-004, ING-005 | 🔴 Deliberation required |
 
 ---
 
@@ -64,11 +64,11 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-004 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #60 commit `d3c3f31`** |
 | ING-005 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #61 commit `252d75f`** |
 | ING-006 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #62 commit `501b170`** |
-| ING-007 | 🔴 NOT STARTED — deliberation required before implementation. GitHub Issue #70 filed. |
+| ING-007 | ✅ COMPLETE (2026-05-04) — all decisions recorded in sprint doc. Branch `ing/s7-multiday-repeat` ready. Issue #70. |
 | ING-008 | 🔴 NOT STARTED — blocked on ING-005 ✅ + deliberation required |
 
-> For ING-002 through ING-006: deliberation is complete and stories are merged. Do not re-litigate any decisions.
-> For all other stories: read the open deliberation questions in the sprint doc before writing a single line of code.
+> For ING-002 through ING-007: deliberation is complete. Do not re-litigate any decisions.
+> For ING-008: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
 
@@ -192,7 +192,7 @@ Immediately after an ING PR merges:
 
 1. **Close the GitHub Issue** (state: `completed`)
 2. **Update `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`**: mark story ✅, update Quick Reference, add any new post-merge stories
-3. **Update `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`**: mark the story row ✅ in the Sprint Order table, update `Last updated` line
+3. **Update `STORY-STEPS_ING.md`**: mark the story row ✅ in the Sprint Order table, update `Last updated` line
 4. **Update `docs/FIXES.md`**: add Option decision record if story required a choice (e.g. ING-005 Option A/B/C)
 5. If new GitHub Issues were filed from panel findings — confirm they are open and linked in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`
 6. If story adds new gates — update `docs/ARCHITECTURE.md` gate structure section
@@ -251,13 +251,13 @@ MERGE
 POST-MERGE
 ☐  Close GitHub Issue (state: completed)
 ☐  Mark story row ✅ in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
-☐  Mark story row ✅ in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md Sprint Order table
+☐  Mark story row ✅ in STORY-STEPS_ING.md Sprint Order table
 ☐  Update Quick Reference section in docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
 ☐  Add any new post-merge issue rows to docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md
 ☐  Update docs/FIXES.md with Option decisions if applicable
 ☐  Update docs/ARCHITECTURE.md if new gates were added
-☐  Bump docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md version + Last updated line
 ☐  Bump docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md Last updated line
+☐  Bump STORY-STEPS_ING.md Last updated line
 ```
 
 ---
@@ -271,10 +271,10 @@ POST-MERGE
 | ING-004 | Fallback `underlying_price` from registry | ✅ MERGED 2026-05-03 — PR #60 commit `d3c3f31` | `ing/s4-underlying-price-fallback` |
 | ING-005 | Align OTM band thresholds | ✅ MERGED 2026-05-03 — PR #61 commit `252d75f` | `ing/s5-otm-threshold-align` |
 | ING-006 | Directional aggression weighting on premium floor | ✅ MERGED 2026-05-04 — PR #62 commit `501b170` | `ing/s6-directional-aggression` |
-| ING-007 | Multi-day repeat window lookback + is_aggressive DB column | 🔴 Deliberation required — Issue #70 | `ing/s7-multiday-repeat` |
-| ING-008 | Volume vs. OI gate | 🔴 Blocked — deliberation required after ING-005 ✅ | `ing/s8-vol-oi-gate` |
+| ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ Deliberation COMPLETE 2026-05-04 — Issue #70 — branch `ing/s7-multiday-repeat` ready | `ing/s7-multiday-repeat` |
+| ING-008 | Volume vs. OI gate | 🔴 Deliberation required | `ing/s8-vol-oi-gate` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-04 (ING-006 merged PR #62 commit `501b170`; ING-007 Issue #70 filed) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-04 (ING-007 3-way deliberation complete; branch `ing/s7-multiday-repeat` ready for implementation) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
