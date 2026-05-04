@@ -14,6 +14,12 @@ Fix 5 (2026-04-26):
   - persist_composite_signal() now falls back to _signal_memory when
     Supabase is not configured (matches save_signal() behaviour).
 
+Fix 6 (2026-05-04):
+  - _build_row() now explicitly sets order_side, execution_mechanic,
+    quote_source, and strong_sentiment with safe defaults so that
+    CHECK constraints on signal_history never receive NULL values
+    (was causing 23514 violations on every composite signal insert).
+
 Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
@@ -53,6 +59,12 @@ _TABLE = "signal_history"
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
+_VALID_MECHANICS    = {
+    "DIRECTIONAL_LONG", "DIRECTIONAL_SHORT",
+    "PASSIVE_BULLISH",  "PASSIVE_BEARISH",
+    "AMBIGUOUS_LONG",   "AMBIGUOUS_SHORT",
+}
+_VALID_QUOTE_SOURCES = {"live", "synthetic_spread", "fallback_last"}
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
@@ -230,6 +242,35 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
         episode.get("influence_tier") or sig.get("influence_tier", "")
     )
 
+    # Fix 6: resolve order_side with safe fallback — CHECK requires BUY/SELL/UNKNOWN
+    raw_order_side = (
+        episode.get("order_side")
+        or sig.get("order_side")
+        or ""
+    ).upper()
+    order_side = raw_order_side if raw_order_side in ("BUY", "SELL", "UNKNOWN") else "UNKNOWN"
+
+    # Fix 6: resolve execution_mechanic with safe fallback
+    raw_mechanic = (
+        episode.get("execution_mechanic")
+        or sig.get("execution_mechanic")
+        or ""
+    ).upper()
+    execution_mechanic = raw_mechanic if raw_mechanic in _VALID_MECHANICS else "AMBIGUOUS_LONG"
+
+    # Fix 6: resolve quote_source with safe fallback
+    raw_qs = (
+        episode.get("quote_source")
+        or sig.get("quote_source")
+        or ""
+    ).lower()
+    quote_source = raw_qs if raw_qs in _VALID_QUOTE_SOURCES else "fallback_last"
+
+    # Fix 6: strong_sentiment — cast to bool, never NULL
+    strong_sentiment = bool(
+        episode.get("strong_sentiment") or sig.get("strong_sentiment", False)
+    )
+
     return {
         "ticker":                sig.get("ticker"),
         "recommendation":        sig.get("recommendation"),
@@ -258,6 +299,11 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
         "swarm_bear_votes":      sig.get("swarm_bear_votes"),
         "swarm_hold_votes":      sig.get("swarm_hold_votes"),
         "swarm_agents":          sig.get("swarm_agents"),
+        # Fix 6: constrained fields with guaranteed safe values
+        "order_side":            order_side,
+        "execution_mechanic":    execution_mechanic,
+        "quote_source":          quote_source,
+        "strong_sentiment":      strong_sentiment,
     }
 
 
