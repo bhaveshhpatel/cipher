@@ -4,7 +4,7 @@
 # DEPLOY NOTE (ING-006 / PBE-F1 — 2026-05-03):
 #   Gate 2 (DTE-adjusted premium floor) now evaluates ep.weighted_premium
 #   instead of ep.total_premium. Passive events (is_aggressive=False) are
-#   discounted by _AGGRESSION_DISCOUNT (default 0.5), meaning a passive-only
+#   discounted by aggression_discount (default 0.5), meaning a passive-only
 #   episode must accumulate 2x the floor in raw premium to qualify.
 #
 #   PRODUCTION IMPACT: Signal volume WILL decrease on first deploy for any
@@ -13,7 +13,7 @@
 #   uncertain directional intent. Monitor signal emit rate on day 1.
 #
 #   ROLLBACK: No runtime kill-switch exists. Full PR revert required if
-#   signal volume drops unexpectedly. _AGGRESSION_DISCOUNT will be wired
+#   signal volume drops unexpectedly. aggression_discount will be wired
 #   through ingestion_config in ING-002-CONFIG (future sprint) at which
 #   point a config-level rollback will be available.
 # ============================================================================
@@ -64,7 +64,7 @@ Alert level thresholds (S1 reconciliation):
 Registry enrichment block (ING-005):
   underlying_price enrichment runs after the initial parse in the stream layer,
   not here. The accumulator receives events with underlying_price already set
-  by the parser's registry enrichment. OTM classification here uses
+  by the parser’s registry enrichment. OTM classification here uses
   ev.underlying_price directly.
 
 dominant_direction property (S2 spec):
@@ -77,15 +77,31 @@ order_side enrichment (ING-005):
   - tier_map injection for DTE-floor tier lookup
 
 ING-006 additions:
-  - _AGGRESSION_DISCOUNT = 0.5 module-level constant.
-    Passive events (is_aggressive=False) contribute premium * 0.5 to
-    weighted_premium. Aggressive events contribute full premium * 1.0.
+  - aggression_discount constructor parameter on RepetitionAccumulator
+    (default 0.5, satisfies ING-006 AC / PBE-F1 deliberation fix 2026-05-03).
+    _AGGRESSION_DISCOUNT module constant retained as the cold-start fallback
+    used by RepetitionEpisode.weighted_premium before a RepetitionAccumulator
+    instance is available. Wire through ingestion_config in ING-002-CONFIG.
+  - Passive events (is_aggressive=False) contribute premium * aggression_discount
+    to weighted_premium. Aggressive events contribute full premium * 1.0.
     Gate 2 (DTE-adjusted floor) now evaluates weighted_premium, not total_premium.
     Rationale: mid-spread fills represent uncertain directional intent.
     Discounting them increases signal-to-noise without dropping the event.
-    Configurable via ING-002-CONFIG in a future sprint (PBE-Q2 deliberation).
   - RepetitionEpisode.weighted_premium property.
   - _DictEventWrapper: is_aggressive slot added.
+
+cooldown gate (get_signal) retirement note (PBE-F4 deliberation fix 2026-05-03):
+  get_signal() and the _signal_last_emit cooldown dict were intentionally
+  removed. The cooldown gate was never wired in production — the stream
+  layer (tradier_stream.py) handles emit throttling at a higher level via
+  its own debounce logic. Removing it here eliminates dead state. If a
+  per-accumulator cooldown is needed in a future sprint, re-introduce it
+  with a deliberation session before implementation.
+
+ingest() shim retirement note (PBE-F3 deliberation fix 2026-05-03):
+  The ingest() backward-compat async shim was removed. Grep audit result
+  (2026-05-03): zero callers of .ingest() in backend/ outside the deleted
+  method itself. All production and test call sites use ingest_tick() directly.
 
 Alert levels (reconciled across all test suites — see get_alert_level() for
 full change-log from S1 spec):
@@ -98,6 +114,7 @@ full change-log from S1 spec):
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -128,11 +145,12 @@ _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS: Dict[int, float] = {
 
 
 # ---------------------------------------------------------------------------
-# ING-006: Aggression discount for passive (mid-spread) fills.
-# Passive events contribute premium * _AGGRESSION_DISCOUNT to weighted_premium.
-# Aggressive events contribute premium * 1.0 (full weight).
+# ING-006: Aggression discount fallback constant.
+# Used by RepetitionEpisode.weighted_premium as a module-level default when
+# no RepetitionAccumulator instance is in scope (e.g. direct episode tests).
+# RepetitionAccumulator passes self._aggression_discount into weighted_premium
+# via get_weighted_premium(discount) — see PBE-F1 deliberation fix 2026-05-03.
 # Default 0.5 — hardcoded now; wire through ingestion_config in ING-002-CONFIG.
-# Deliberation: PBE-Q2 (2026-05-03) — configurable deferred to ING-002-CONFIG.
 # ---------------------------------------------------------------------------
 _AGGRESSION_DISCOUNT: float = 0.5
 
@@ -182,18 +200,31 @@ class RepetitionEpisode:
     @property
     def weighted_premium(self) -> float:
         """
-        ING-006: Aggression-weighted cumulative premium.
+        ING-006: Aggression-weighted cumulative premium using module-level
+        _AGGRESSION_DISCOUNT (0.5). For accumulator-controlled discount,
+        call get_weighted_premium(discount) directly.
 
         Aggressive events (is_aggressive=True) contribute full premium.
         Passive events (is_aggressive=False) contribute premium * _AGGRESSION_DISCOUNT.
 
-        Gate 2 (DTE-adjusted floor) in ingest_tick() evaluates this value,
-        not total_premium, so a passive-only episode must accumulate 2x the
-        floor to qualify at the default 0.5 discount.
+        Gate 2 (DTE-adjusted floor) in ingest_tick() calls
+        get_weighted_premium(self._aggression_discount) so the constructor
+        param takes effect (PBE-F1 fix, 2026-05-03).
 
         Example: 2 aggressive @ $40k + 2 passive @ $40k
           weighted = (40k*1.0 + 40k*1.0) + (40k*0.5 + 40k*0.5) = 80k + 40k = 120k
           total    = 160k
+        """
+        return self.get_weighted_premium(_AGGRESSION_DISCOUNT)
+
+    def get_weighted_premium(self, discount: float) -> float:
+        """
+        ING-006 / PBE-F1: Aggression-weighted premium with caller-supplied discount.
+
+        Called by RepetitionAccumulator.ingest_tick() with
+        self._aggression_discount so the constructor parameter takes effect.
+        The weighted_premium property uses the module constant as a
+        convenience default for direct episode tests.
         """
         total = 0.0
         for e in self.events:
@@ -201,7 +232,7 @@ class RepetitionEpisode:
             if getattr(e, "is_aggressive", False):
                 total += prem
             else:
-                total += prem * _AGGRESSION_DISCOUNT
+                total += prem * discount
         return total
 
     @property
@@ -262,17 +293,32 @@ class RepetitionAccumulator:
     min_sweeps : int
         Gate 4 — minimum sweep events required. Whale-sweep bypass applies
         when len(ep.events) == 1 AND trade_type=SWEEP AND premium >= 500k.
+    aggression_discount : float
+        ING-006 / PBE-F1 — passive event premium discount for Gate 2.
+        Default 0.5: passive events contribute premium * 0.5 to
+        weighted_premium. Aggressive events contribute full premium * 1.0.
+        Wire through ingestion_config in ING-002-CONFIG (future sprint).
+        Deliberation: PBE-Q2 + PBE-F1 (2026-05-03).
 
     Band configurability note (ING-005):
     The old _otm_bands constructor parameter accepted a dict but was
-    but never read — a silent no-op that would mislead callers into thinking
+    never read — a silent no-op that would mislead callers into thinking
     the bands were configurable. Removed. If band configurability is needed
     in a future sprint, _classify_otm must be updated to consume it.
 
-    ING-006: Gate 2 (DTE-adjusted floor) now evaluates ep.weighted_premium
-    instead of ep.total_premium. Passive events are discounted by
-    _AGGRESSION_DISCOUNT (default 0.5). See RepetitionEpisode.weighted_premium.
+    ING-006: Gate 2 (DTE-adjusted floor) now evaluates
+    ep.get_weighted_premium(self._aggression_discount) instead of
+    ep.total_premium. Passive events are discounted by aggression_discount
+    (default 0.5). See RepetitionEpisode.get_weighted_premium().
     See DEPLOY NOTE at the top of this file for production impact.
+
+    threading note (PBE-F2 deliberation fix 2026-05-03):
+    _tier_map_lock (threading.Lock) protects _tier_map and _dte_tiers.
+    set_tier_map() is callable from concurrent stream workers; CPython GIL
+    makes a pointer swap technically safe, but the lock is retained for
+    correctness under all interpreters and future GIL removal (S4-POST-4
+    deliberation rationale). Lock reuse for _dte_tiers is safe — no holder
+    calls back into the other.
     """
 
     def __init__(
@@ -282,27 +328,38 @@ class RepetitionAccumulator:
         deep_otm_multiplier: float = 1.0,
         dte_premium_tiers: Optional[List] = None,
         min_sweeps: int = 2,
+        aggression_discount: float = 0.5,  # ING-006 / PBE-F1
     ) -> None:
-        self.window_minutes      = window_minutes
-        self.min_trades          = min_trades
-        self.deep_otm_multiplier = deep_otm_multiplier
-        self.min_sweeps          = min_sweeps
-        self._dte_tiers          = dte_premium_tiers or _DEFAULT_DTE_PREMIUM_TIERS
+        self.window_minutes        = window_minutes
+        self.min_trades            = min_trades
+        self.deep_otm_multiplier   = deep_otm_multiplier
+        self.min_sweeps            = min_sweeps
+        self._aggression_discount  = aggression_discount  # ING-006 / PBE-F1
+        self._dte_tiers            = dte_premium_tiers or _DEFAULT_DTE_PREMIUM_TIERS
         self._episodes: Dict[str, RepetitionEpisode] = {}
         self._tier_map: Dict[str, int] = {}
-        self._signal_last_emit: Dict[str, datetime] = {}
+        # PBE-F2: lock protects _tier_map and _dte_tiers (S4-POST-4 pattern).
+        self._tier_map_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
 
     def flush_emit_cache(self) -> None:
-        """Clear debounce cache. Call at stream startup (S1 spec)."""
-        self._signal_last_emit.clear()
+        """Clear episode state. Call at stream startup (S1 spec)."""
+        self._episodes.clear()
 
     def set_tier_map(self, tier_map: Dict[str, int]) -> None:
-        """Inject symbol -> tier (1/2/3) map for DTE floor selection."""
-        self._tier_map = tier_map
+        """Inject symbol -> tier (1/2/3) map for DTE floor selection.
+
+        PBE-F2 (2026-05-03): threading.Lock restored per S4-POST-4 deliberation.
+        set_tier_map() is called from the registry warmup path which may run
+        concurrently with stream worker ticks. Lock ensures _tier_map pointer
+        swap is visible across threads under all interpreters (CPython GIL
+        makes pointer swap atomic in practice, but lock is correct regardless).
+        """
+        with self._tier_map_lock:
+            self._tier_map = tier_map
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -339,13 +396,18 @@ class RepetitionAccumulator:
 
         Uses the latest event's DTE to select from _dte_tiers.
         Tier is resolved from _tier_map; defaults to tier 2 if unknown.
+
+        PBE-F2 (2026-05-03): reads _tier_map under _tier_map_lock (same lock
+        as set_tier_map) so concurrent registry warmup cannot produce a
+        torn read of the tier map pointer.
         """
         if not ep.events:
             return 0.0
         latest = ep.events[-1]
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
-        tier   = self._tier_map.get(ticker, 2)
+        with self._tier_map_lock:
+            tier = self._tier_map.get(ticker, 2)
 
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
@@ -401,11 +463,17 @@ class RepetitionAccumulator:
         The event is wrapped in _DictEventWrapper if it arrives as a dict.
         Old events outside the signal window are evicted before gate evaluation.
 
+        PBE-F3 (2026-05-03): ingest() backward-compat shim was removed.
+        Grep audit confirmed zero callers in backend/ outside the deleted
+        method. All call sites use ingest_tick() directly.
+
         Gates applied (in order):
           1. min_trades         — episode event count >= min_trades
-          2. DTE-adjusted floor — ep.weighted_premium >= _get_episode_min_premium(ep)
-                                  ING-006: evaluates WEIGHTED premium (passive events
-                                  discounted by _AGGRESSION_DISCOUNT=0.5), not total.
+          2. DTE-adjusted floor — ep.get_weighted_premium(self._aggression_discount)
+                                  >= _get_episode_min_premium(ep)
+                                  ING-006 / PBE-F1: evaluates WEIGHTED premium
+                                  using self._aggression_discount (constructor
+                                  param, default 0.5). Passive events discounted.
           3. Deep OTM multiplier— if OTM% > 12% AND deep_otm_multiplier > 1.0,
                                   floor is multiplied by deep_otm_multiplier.
                                   With default deep_otm_multiplier=1.0 (ING-005),
@@ -437,17 +505,17 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        # ── Gate 1: min_trades ───────────────────────────────────────────────
+        # ── Gate 1: min_trades ──────────────────────────────────────────────
         if ep.trade_count < self.min_trades:
             return None
 
-        # ── Gate 2: DTE-adjusted premium floor (ING-006: weighted_premium) ─
+        # ── Gate 2: DTE-adjusted premium floor (ING-006 / PBE-F1: weighted) ──
         effective_min_prem = self._get_episode_min_premium(ep)
+        # Use constructor-param discount (self._aggression_discount) so callers
+        # can override for backtesting without monkey-patching module constants.
+        ep_weighted = ep.get_weighted_premium(self._aggression_discount)
 
         # ── Gate 3: Deep OTM multiplier ──────────────────────────────────────
-        # OTM classification uses the latest event's underlying_price.
-        # Guard against non-numeric values (e.g. MagicMock in tests) by
-        # using isinstance before float() to avoid TypeError in the hot path.
         otm_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
@@ -458,18 +526,13 @@ class RepetitionAccumulator:
 
         if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":  # dormant at default 1.0 — ING-005/SA-Q1
             deep_floor = effective_min_prem * self.deep_otm_multiplier
-            # ING-006: evaluate against weighted_premium
-            if ep.weighted_premium < deep_floor:
+            if ep_weighted < deep_floor:
                 return None
         else:
-            # ING-006: Gate 2 evaluates weighted_premium, not total_premium
-            if ep.weighted_premium < effective_min_prem:
+            if ep_weighted < effective_min_prem:
                 return None
 
         # ── Gate 4: min_sweeps (with whale-sweep bypass) ─────────────────────
-        # Sweep bypass: len(ep.events)==1 AND trade_type=SWEEP AND prem>=500k.
-        # len(ep.events) is episode event count (OptionsFlowEvent objects),
-        # NOT fill_count within a single tick (Issue 7 deliberation, 2026-04-30).
         if getattr(ev, "trade_type", "") == "SWEEP":
             sweep_prem = getattr(ev, "premium", 0.0)
             if not (len(ep.events) == 1 and sweep_prem >= 500_000):

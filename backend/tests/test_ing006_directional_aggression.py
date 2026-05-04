@@ -5,6 +5,8 @@ ING-006 acceptance tests.
 
 QA-Q1: 9-case is_directionally_aggressive() matrix (F-1 through F-9).
 QA-Q2: Accumulator weighted_premium gate tests.
+QA-F4: Counter-separation test — passive Gate 2 drop does not increment
+       any parse counter (deliberation fix 2026-05-03).
 
 SCOPE NOTE (QA-F1 — deliberation pre-merge review 2026-05-03):
   This file covers ING-006 scope only: is_directionally_aggressive() behaviour
@@ -82,9 +84,8 @@ class TestIsDirectionallyAggressive:
         """F-9: BELOW_BID + PUT -> True (put seller writing below bid = conviction bullish).
 
         Symmetric to F-3 (AT_BID + PUT) and F-4 (BELOW_BID + CALL).
-        The implementation handles this via `ba in ("AT_BID", "BELOW_BID")
-        and ctype in ("PUT", "CALL")` but the explicit test was missing
-        from the original F-matrix — added per deliberation F3 fix (2026-05-03).
+        Added per deliberation QA-F1 fix (2026-05-03) — was missing from the
+        original F-matrix in the sprint spec. Sprint doc updated accordingly.
         """
         assert is_directionally_aggressive("BELOW_BID", "PUT") is True
 
@@ -132,11 +133,38 @@ def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
 class TestWeightedPremiumGate:
     """ING-006 QA-Q2 — Gate 2 evaluates weighted_premium."""
 
-    def _acc(self):
+    def _acc(self, aggression_discount: float = 0.5):
+        """Build accumulator. Accepts discount param for PBE-F1 coverage."""
         return RepetitionAccumulator(
             window_minutes=30,
             min_trades=3,
             dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+            aggression_discount=aggression_discount,
+        )
+
+    def test_aggression_discount_constructor_param(self):
+        """
+        PBE-F1 (2026-05-03): aggression_discount is a constructor param,
+        not only a module constant. Verify a custom discount flows through
+        to Gate 2 correctly.
+
+        Discount=1.0: passive events get full weight. Same episode that
+        drops at discount=0.5 should pass at discount=1.0.
+        3 passive @ $20k = $60k. Floor=$50k. weighted@1.0=$60k >= $50k -> passes.
+        weighted@0.5=$30k < $50k -> drops (verified in test_passive_only_drops_below_floor).
+        """
+        acc = self._acc(aggression_discount=1.0)
+        acc.set_tier_map({"AAPL": 1})
+
+        async def run():
+            result = None
+            for _ in range(3):
+                result = await acc.ingest_tick(_make_event(20_000, False, dte=5))
+            return result
+
+        result = asyncio.run(run())
+        assert result is not None, (
+            "discount=1.0 passive episode: weighted=$60k >= $50k floor should pass"
         )
 
     def test_weighted_premium_calculation(self):
@@ -152,7 +180,7 @@ class TestWeightedPremiumGate:
         assert ep.weighted_premium == 120_000  # 80k full + 40k*0.5*2
 
     def test_aggression_discount_constant(self):
-        """_AGGRESSION_DISCOUNT is 0.5."""
+        """_AGGRESSION_DISCOUNT module constant is 0.5."""
         assert _AGGRESSION_DISCOUNT == 0.5
 
     def test_passive_only_drops_below_floor(self):
@@ -161,8 +189,6 @@ class TestWeightedPremiumGate:
         T1 DTE<=7 floor = $50k. Weighted = $60k * 0.5 = $30k < $50k -> None.
 
         Note: weighted_premium ($30k) is BELOW the floor ($50k), not at it.
-        The test name was corrected from the original 'drops_at_exact_floor'
-        which was factually wrong (QA-F2 deliberation fix, 2026-05-03).
         """
         acc = self._acc()
         acc.set_tier_map({"AAPL": 1})
@@ -203,7 +229,7 @@ class TestWeightedPremiumGate:
         async def run():
             result = None
             for i in range(4):
-                aggressive = i < 2  # first two aggressive, last two passive
+                aggressive = i < 2
                 result = await acc.ingest_tick(_make_event(40_000, aggressive, dte=5))
             return result
 
@@ -228,3 +254,78 @@ class TestWeightedPremiumGate:
 
         result = asyncio.run(run())
         assert result is not None, "passive episode at exactly 2x floor should pass"
+
+
+# ---------------------------------------------------------------------------
+# QA-F4: Counter-separation test
+# Passive Gate 2 drop must not increment any parse counter.
+# ---------------------------------------------------------------------------
+
+class TestCounterSeparation:
+    """
+    QA-F4 (deliberation fix 2026-05-03).
+
+    Verifies that a passive-only episode dropped by Gate 2 (weighted_premium
+    below floor) does not incorrectly increment any parse-level counter.
+
+    The accumulator does not maintain a _stats dict — parse counters
+    (parse_failed, below_min_premium) live in options_flow_parser.py.
+    This test confirms Gate 2 returns None cleanly with no side-effects
+    that could be misread as a parse error by the stream layer.
+    """
+
+    def test_passive_gate2_drop_returns_none_no_exception(self):
+        """
+        A passive-only episode that fails Gate 2 must return None without
+        raising any exception. No parse counter lives in the accumulator,
+        so the assertion is: no exception raised AND result is None.
+        If any exception propagates here, the stream layer would catch it,
+        increment parse_failed, and misattribute a clean gate drop as a
+        parse error.
+        """
+        acc = RepetitionAccumulator(
+            window_minutes=30,
+            min_trades=3,
+            dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+            aggression_discount=0.5,
+        )
+        acc.set_tier_map({"AAPL": 1})
+
+        async def run():
+            result = None
+            try:
+                for _ in range(3):
+                    result = await acc.ingest_tick(_make_event(20_000, False, dte=5))
+            except Exception as exc:
+                raise AssertionError(
+                    f"Gate 2 passive drop raised an exception — "
+                    f"stream layer would miscount this as parse_failed: {exc}"
+                ) from exc
+            return result
+
+        result = asyncio.run(run())
+        assert result is None, (
+            "passive Gate 2 drop must return None, not an episode"
+        )
+
+    def test_aggressive_pass_returns_episode_not_none(self):
+        """
+        Baseline: aggressive episode that clears Gate 2 returns an episode,
+        confirming the counter-separation test above is testing the right path.
+        """
+        acc = RepetitionAccumulator(
+            window_minutes=30,
+            min_trades=3,
+            dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
+            aggression_discount=0.5,
+        )
+        acc.set_tier_map({"AAPL": 1})
+
+        async def run():
+            result = None
+            for _ in range(3):
+                result = await acc.ingest_tick(_make_event(20_000, True, dte=5))
+            return result
+
+        result = asyncio.run(run())
+        assert result is not None, "aggressive episode above floor must return an episode"

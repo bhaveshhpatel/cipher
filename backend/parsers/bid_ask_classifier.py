@@ -44,13 +44,6 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
     return "MID"
 
 
-# TODO(ING-007/S2): migrate is_directionally_aggressive() to
-# parsers/order_side_classifier.py per Session 8 deliberation resolution.
-# bid_ask_classifier.py answers "where in the spread did this fill occur?"
-# order_side_classifier.py answers "what directional intent do we infer?"
-# These are different abstraction levels and must not be mixed long-term.
-# Placed here temporarily because order_side_classifier.py does not yet exist
-# (S2 scope). Remove this function from this module when S2 lands.
 def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     """
     ING-006: Directional aggression classification.
@@ -70,7 +63,10 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     (deliberation SA-Q1, 2026-05-03).
 
     TEMPORARY LOCATION: This function belongs in order_side_classifier.py
-    (S2 scope). See TODO above.
+    (S2 scope). Migration tracked in GitHub Issue filed 2026-05-03 and
+    SPRINT_WSJ_INGESTION_ALIGNMENT.md ING-006 SA-F1 resolution row.
+    Do not add TODO comments here — the issue is the tracking mechanism
+    (Rule 6 Constraint 3, SA-F1 deliberation fix 2026-05-03).
     """
     ba    = (bid_ask_class or "").strip().upper()
     ctype = (contract_type or "").strip().upper()
