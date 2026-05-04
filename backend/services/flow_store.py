@@ -57,6 +57,11 @@ Bug fixes applied:
   4. ING-007 (2026-05-04): persist_flow_episode() now accepts and writes
      is_multi_day_repeat (BOOLEAN). Requires migration
      add_is_multi_day_repeat_to_flow_episodes.sql to be run first.
+  5. ING-007 (2026-05-04): enqueue_lookback() / get_lookback_stats() /
+     start_lookback_worker() added. The worker drains an asyncio.Queue of
+     ContractKeys enqueued by _process_trade() after each persisted episode,
+     fetches the lookback result from contract_day_cache, then PATCHes the
+     most-recent flow_episodes row for that contract with is_multi_day_repeat.
 """
 import asyncio
 import logging
@@ -85,6 +90,43 @@ _flow_event_buffer: list[dict] = []
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
+
+# ---------------------------------------------------------------------------
+# ING-007: async lookback enrichment queue
+#   Bounded at _LOOKBACK_QUEUE_MAX to prevent unbounded memory growth on
+#   a very active trading day. Overflow is counted and surfaced in stats.
+# ---------------------------------------------------------------------------
+_LOOKBACK_QUEUE_MAX = 500
+_lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=_LOOKBACK_QUEUE_MAX)
+_lookback_stats: Dict[str, int] = {
+    "lookback_queued":   0,
+    "lookback_overflow": 0,
+}
+
+
+def enqueue_lookback(key) -> None:
+    """
+    Non-blocking enqueue of a ContractKey for async lookback enrichment.
+
+    Called from _process_trade() hot path after the persist_ep gate passes.
+    Never raises — overflow is silently counted and surfaced in get_lookback_stats().
+
+    key: ContractKey = Tuple[str, str, float, str]  (ticker, contract_type, strike, expiry)
+    """
+    try:
+        _lookback_queue.put_nowait(key)
+        _lookback_stats["lookback_queued"] += 1
+    except asyncio.QueueFull:
+        _lookback_stats["lookback_overflow"] += 1
+        log.debug(
+            "[lookback] queue full (%d) — key dropped: %s",
+            _LOOKBACK_QUEUE_MAX, key,
+        )
+
+
+def get_lookback_stats() -> Dict[str, int]:
+    """Return a copy of lookback queue stats for /health/stream surfacing."""
+    return dict(_lookback_stats)
 
 
 def _is_configured() -> bool:
@@ -327,6 +369,120 @@ async def persist_flow_episode(signal_data: dict):
             row["alert_level"], (row["total_premium"] or 0),
             row["is_multi_day_repeat"],
         )
+
+
+async def _update_episode_multiday(
+    ticker: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+    is_multi_day_repeat: bool,
+) -> None:
+    """
+    ING-007: PATCH the most-recent flow_episodes row for this contract
+    to set is_multi_day_repeat after the async lookback fetch completes.
+
+    Uses PostgREST ordering + limit to target the single latest row.
+    Silently swallows errors — enrichment failure must never block the stream.
+    """
+    if not _is_configured():
+        return
+
+    url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+        f"?ticker=eq.{quote(ticker)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+        f"&order=signal_ts.desc"
+        f"&limit=1"
+    )
+    patch_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+    payload = {"is_multi_day_repeat": is_multi_day_repeat}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(url, headers=patch_headers, json=payload)
+        if resp.status_code not in (200, 204):
+            log.warning(
+                "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
+                "(ticker=%s %s $%.0f %s)",
+                resp.status_code, resp.text[:200],
+                ticker, contract_type, strike, expiry,
+            )
+    except Exception as exc:
+        log.warning(
+            "[flow_store] _update_episode_multiday exception: %s "
+            "(ticker=%s %s $%.0f %s)",
+            exc, ticker, contract_type, strike, expiry,
+        )
+
+
+async def start_lookback_worker(accumulator) -> None:
+    """
+    ING-007: Async queue worker — drains _lookback_queue populated by
+    enqueue_lookback() in _process_trade().
+
+    For each ContractKey dequeued:
+      1. Resolve the DTE-tier min_premium from the accumulator so the
+         lookback query uses the same floor as the persist gate.
+      2. Call contract_day_cache.get_lookback(key, min_premium).
+      3. PATCH the most-recent flow_episodes row via _update_episode_multiday()
+         with is_multi_day_repeat = (prior_days_active >= 1).
+
+    Cold-cache note: the first episode for any contract returns
+    prior_days_active=0 (cache miss → DB fetch). Subsequent ticks within
+    the 5-min TTL window use the cached result. This is acceptable —
+    is_multi_day_repeat is enrichment-only, not a hard gate.
+
+    Runs as a persistent background task spawned from main.py lifespan.
+    Cancelled cleanly on shutdown via lookback_task.cancel().
+    """
+    # Deferred import to avoid circular dependency at module load time.
+    from utils.contract_day_cache import get_lookback
+
+    log.info("[lookback_worker] started — draining ContractKey queue")
+    try:
+        while True:
+            key = await _lookback_queue.get()
+            ticker, contract_type, strike, expiry = key
+
+            # Resolve DTE-tier min_premium from accumulator if available.
+            try:
+                dte_tiers = getattr(accumulator, "_dte_premium_tiers", None) or {}
+                # Use the lowest tier floor as the lookback floor — we want
+                # prior days where ANY qualifying flow appeared, not just the
+                # current episode's tier. Fallback to $10k if no tiers set.
+                min_premium = min(dte_tiers.values()) if dte_tiers else 10_000.0
+            except Exception:
+                min_premium = 10_000.0
+
+            try:
+                result = await get_lookback(key, min_premium)
+                is_repeat = result.prior_days_active >= 1
+                await _update_episode_multiday(
+                    ticker, contract_type, strike, expiry, is_repeat
+                )
+                log.debug(
+                    "[lookback_worker] %s %s $%.0f %s — "
+                    "prior_days_active=%d aggressive=%d is_repeat=%s",
+                    ticker, contract_type, strike, expiry,
+                    result.prior_days_active, result.prior_days_aggressive, is_repeat,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[lookback_worker] error processing key %s: %s", key, exc
+                )
+            finally:
+                _lookback_queue.task_done()
+
+    except asyncio.CancelledError:
+        log.info("[lookback_worker] cancelled — shutting down cleanly")
+        raise
 
 
 async def _bus_signal_listener():
