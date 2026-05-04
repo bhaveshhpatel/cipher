@@ -3,13 +3,19 @@ Tests for RepetitionAccumulator concurrent safety fixes (issues #1 + #2).
 
 Covers:
   - Per-key lock prevents phantom threshold crossings under concurrent ingest
-  - get_signal cooldown is atomic: concurrent coroutines cannot both fire
-    on the same episode within the cooldown window
-  - Backward-compat ingest() shim still works correctly
+  - Backward-compat ingest() shim removed (PBE-F3, 2026-05-03); tests updated
+    to use ingest_tick() directly
   - Eviction of empty episodes after window pruning
+
+API surface changes since original authoring (ING-006 rewrite):
+  - acc._key(ev)         removed -> use acc._episode_key(ev)
+  - acc._key_from_ep(ep) never existed in production; removed from tests
+  - acc.get_signal(...)  retired per PBE-F4 deliberation (2026-05-03);
+    stream layer handles emit throttling; cooldown gate tests removed
+  - acc.ingest(ev)       backward-compat shim removed (PBE-F3); use ingest_tick
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -27,18 +33,26 @@ def _make_ev(
     strike=180.0,
     expiry="2026-06-20",
     premium=20_000.0,
+    trade_type="SWEEP",
+    dte=30,
+    underlying_price=200.0,
+    order_side="BUY",
     ts: datetime | None = None,
 ):
     """Return a minimal OptionsFlowEvent-like SimpleNamespace."""
-    ev = SimpleNamespace(
+    ts = ts or datetime.now(timezone.utc)
+    return SimpleNamespace(
         ticker=ticker,
         contract_type=contract_type,
         strike=strike,
         expiry=expiry,
         premium=premium,
-        timestamp=ts or datetime.utcnow(),
+        trade_type=trade_type,
+        dte=dte,
+        underlying_price=underlying_price,
+        order_side=order_side,
+        timestamp=ts,
     )
-    return ev
 
 
 # ---------------------------------------------------------------------------
@@ -56,50 +70,13 @@ async def test_ingest_tick_below_threshold_returns_none():
 @pytest.mark.asyncio
 async def test_ingest_tick_crosses_threshold():
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for i in range(3):
         ev = _make_ev(premium=20_000, ts=now + timedelta(seconds=i))
         result = await acc.ingest_tick(ev)
     assert result is not None
     assert result.trade_count == 3
     assert result.total_premium == 60_000
-
-
-@pytest.mark.asyncio
-async def test_get_signal_first_call_fires():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    result = await acc.get_signal(now, ep)
-    assert result is ep
-    assert ep.last_signal_at == now
-
-
-@pytest.mark.asyncio
-async def test_get_signal_cooldown_suppresses_second_fire():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    await acc.get_signal(now, ep)  # first: fires
-    result = await acc.get_signal(now + timedelta(minutes=1), ep)  # too soon
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_get_signal_fires_after_cooldown_elapsed():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    await acc.get_signal(now, ep)
-    result = await acc.get_signal(now + timedelta(minutes=6), ep)
-    assert result is ep
-
-
-@pytest.mark.asyncio
-async def test_get_signal_none_episode_is_noop():
-    acc = RepetitionAccumulator()
-    result = await acc.get_signal(datetime.utcnow(), None)
-    assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +92,7 @@ async def test_concurrent_ingest_tick_no_phantom_threshold():
     corrupted trade_count from interleaved list mutation.
     """
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     events = [_make_ev(premium=10_000, ts=now + timedelta(milliseconds=i)) for i in range(10)]
 
     results = await asyncio.gather(*[acc.ingest_tick(ev) for ev in events])
@@ -125,72 +102,47 @@ async def test_concurrent_ingest_tick_no_phantom_threshold():
     assert len(non_none) >= 1
 
     # The final episode state must be internally consistent
-    key = acc._key(events[0])
+    key = acc._episode_key(events[0])
     ep  = acc._episodes[key]
     assert ep.trade_count == len(ep.events)
     assert ep.total_premium == sum(e.premium for e in ep.events)
 
 
 # ---------------------------------------------------------------------------
-# Concurrent safety — issue #2: get_signal double-fire race
+# Concurrent safety — issue #2: single-fire invariant under concurrent ingest
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_concurrent_get_signal_only_one_fires():
+async def test_concurrent_ingest_tick_consistent_episode_state():
     """
-    Fire 20 concurrent get_signal calls on the same episode with the same
-    timestamp (simulating 20 StreamWorker coroutines all hitting the cooldown
-    check simultaneously). Exactly one should return ep; the rest None.
+    Fire 20 concurrent ingest_tick calls on the same (ticker, strike, expiry)
+    key. The episode's trade_count must equal len(ep.events) after all settle —
+    no torn writes, no phantom events.
+
+    NOTE: get_signal() was retired in PBE-F4 (2026-05-03). Emit throttling is
+    now owned by the stream layer. This test validates the accumulator's own
+    internal consistency under concurrent load, replacing the old double-fire
+    get_signal test.
     """
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    ep  = RepetitionEpisode(ticker="AAPL", contract_type="CALL", strike=180.0, expiry="2026-06-20")
-    # Seed the lock so _get_lock creates it before concurrent access
-    acc._get_lock(acc._key_from_ep(ep))
-
-    results = await asyncio.gather(*[acc.get_signal(now, ep) for _ in range(20)])
-
-    fired = [r for r in results if r is not None]
-    assert len(fired) == 1, f"Expected exactly 1 signal fire, got {len(fired)}"
-
-
-# ---------------------------------------------------------------------------
-# Backward-compat shim
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_ingest_shim_returns_none_below_threshold():
     acc = RepetitionAccumulator(min_trades=3, min_premium=50_000)
-    ev  = _make_ev(premium=10_000)
-    result = await acc.ingest(ev)
-    assert result is None
+    now = datetime.now(timezone.utc)
+    events = [
+        _make_ev(premium=10_000, ts=now + timedelta(milliseconds=i))
+        for i in range(20)
+    ]
 
+    await asyncio.gather(*[acc.ingest_tick(ev) for ev in events])
 
-@pytest.mark.asyncio
-async def test_ingest_shim_fires_at_threshold():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    result = None
-    for i in range(3):
-        ev = _make_ev(premium=20_000, ts=now + timedelta(seconds=i))
-        result = await acc.ingest(ev)
-    assert result is not None
-    assert result.trade_count == 3
-
-
-@pytest.mark.asyncio
-async def test_ingest_shim_cooldown_suppresses_repeat():
-    acc = RepetitionAccumulator(min_trades=3, min_premium=50_000, signal_cooldown=5)
-    now = datetime.utcnow()
-    for i in range(3):
-        await acc.ingest(_make_ev(premium=20_000, ts=now + timedelta(seconds=i)))
-    # 4th call within cooldown should return None from signal gate
-    result = await acc.ingest(_make_ev(premium=20_000, ts=now + timedelta(seconds=10)))
-    assert result is None
+    key = acc._episode_key(events[0])
+    ep  = acc._episodes[key]
+    assert ep.trade_count == len(ep.events), (
+        f"trade_count {ep.trade_count} != len(events) {len(ep.events)} — torn write detected"
+    )
+    assert ep.total_premium == sum(e.premium for e in ep.events)
 
 
 # ---------------------------------------------------------------------------
-# Episode eviction after window pruning (issue #3 preview — empty ep cleanup)
+# Episode eviction after window pruning
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -201,7 +153,7 @@ async def test_stale_events_pruned_episode_evicted():
     new event on the same key.
     """
     acc = RepetitionAccumulator(window_minutes=1, min_trades=3, min_premium=50_000)
-    old_ts = datetime.utcnow() - timedelta(minutes=5)
+    old_ts = datetime.now(timezone.utc) - timedelta(minutes=5)
 
     # Inject two old events directly (below threshold, old timestamps)
     ev1 = _make_ev(premium=10_000, ts=old_ts)
@@ -209,11 +161,11 @@ async def test_stale_events_pruned_episode_evicted():
     await acc.ingest_tick(ev1)
     await acc.ingest_tick(ev2)
 
-    key = acc._key(ev1)
+    key = acc._episode_key(ev1)
     assert key in acc._episodes
 
     # Now ingest a fresh event — old ones get pruned, leaving only this one
-    new_ev = _make_ev(premium=10_000, ts=datetime.utcnow())
+    new_ev = _make_ev(premium=10_000, ts=datetime.now(timezone.utc))
     result = await acc.ingest_tick(new_ev)
     assert result is None  # only 1 event left after pruning, below threshold
     # Episode should still exist (it has 1 live event), not evicted

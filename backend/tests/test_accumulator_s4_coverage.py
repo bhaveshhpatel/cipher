@@ -7,7 +7,7 @@ signals/repetition_accumulator.py (was at 75%).
 Missing line groups addressed:
   126-127  cleanup_expired removes a stale episode
   144-155  set_tier_map / T2 tier floor path (_get_episode_min_premium col=1)
-  248,268  _classify_otm STANDARD_OTM and DEEP_OTM branches
+  248,268  _classify_otm OTM and DEEP_OTM branches
   310-335  _is_single_whale_sweep: all four guard branches
   367-369  dominant_direction REPEAT_SELL branch
   390-394  dominant_direction MIXED (sell_prem > buy_prem)
@@ -46,6 +46,11 @@ def _ev(
     )
 
 
+def _otm_ev(strike, underlying_price):
+    """Minimal event object for _classify_otm tests (ING-006 new signature)."""
+    return SimpleNamespace(strike=strike, underlying_price=underlying_price)
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -77,7 +82,7 @@ def test_cleanup_expired_keeps_fresh_episode():
 def test_set_tier_map_updates_internal_map():
     acc = RepetitionAccumulator(
         min_trades=1, min_premium=1,
-        dte_premium_tiers={30: (500_000, 100_000), 9999: (2_000_000, 1_000_000)},
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
     acc.set_tier_map({"AAPL": 2})
     assert acc._tier_map["AAPL"] == 2
@@ -85,13 +90,13 @@ def test_set_tier_map_updates_internal_map():
 
 def test_t2_ticker_uses_lower_floor():
     """
-    T2 col=1 floor for DTE<=30 is 100_000.
+    T2 tier=2 floor for DTE<=30 is 100_000.
     3 events x 40_000 = 120_000 >= 100_000 -> should pass.
-    Same tickers at T1 (col=0 floor 500_000) would fail.
+    Same tickers at T1 (tier=1 floor 500_000) would fail.
     """
     acc = RepetitionAccumulator(
         window_minutes=60, min_trades=3, min_premium=1,
-        dte_premium_tiers={30: (500_000, 100_000), 9999: (2_000_000, 1_000_000)},
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
     acc.set_tier_map({"AAPL": 2})
     for i in range(3):
@@ -101,12 +106,14 @@ def test_t2_ticker_uses_lower_floor():
 
 
 def test_t1_ticker_blocked_by_higher_floor():
-    """Same 3x40k premium at T1 col=0 floor=500_000 -> blocked."""
+    """Same 3x40k premium at T1 tier=1 floor=500_000 -> blocked."""
     acc = RepetitionAccumulator(
         window_minutes=60, min_trades=3, min_premium=1,
-        dte_premium_tiers={30: (500_000, 100_000), 9999: (2_000_000, 1_000_000)},
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
-    # No set_tier_map -> defaults to T1
+    # No set_tier_map -> defaults to tier 2 (floor=100_000)
+    # Force tier 1 by injecting into _tier_map directly
+    acc._tier_map["AAPL"] = 1
     ep = None
     for i in range(3):
         ep = run(acc.ingest_tick(_ev(premium=40_000, dte=20, ts_offset=i)))
@@ -114,26 +121,28 @@ def test_t1_ticker_blocked_by_higher_floor():
 
 
 # ── _classify_otm branches (lines 248, 268) ───────────────────────────────────
+# NOTE: _classify_otm(ev) takes an event object since the ING-006 rewrite.
+# Use _otm_ev(strike, underlying_price) to build minimal event objects.
 
 def test_classify_otm_atm():
-    result = RepetitionAccumulator._classify_otm(200.0, 200.0)
+    result = RepetitionAccumulator._classify_otm(None, _otm_ev(200.0, 200.0))
     assert result == "ATM"
 
 
 def test_classify_otm_standard_otm():
-    # strike=220, underlying=200 -> pct=0.10 -> STANDARD_OTM
-    result = RepetitionAccumulator._classify_otm(220.0, 200.0)
-    assert result == "STANDARD_OTM"
+    # strike=220, underlying=200 -> pct=0.10 -> OTM  (renamed from STANDARD_OTM in ING-006)
+    result = RepetitionAccumulator._classify_otm(None, _otm_ev(220.0, 200.0))
+    assert result == "OTM"
 
 
 def test_classify_otm_deep_otm():
     # strike=240, underlying=200 -> pct=0.20 -> DEEP_OTM
-    result = RepetitionAccumulator._classify_otm(240.0, 200.0)
+    result = RepetitionAccumulator._classify_otm(None, _otm_ev(240.0, 200.0))
     assert result == "DEEP_OTM"
 
 
 def test_classify_otm_unknown_when_zero_price():
-    result = RepetitionAccumulator._classify_otm(200.0, 0.0)
+    result = RepetitionAccumulator._classify_otm(None, _otm_ev(200.0, 0.0))
     assert result == "UNKNOWN"
 
 
@@ -256,42 +265,46 @@ def test_dominant_direction_mixed_sell_wins():
 
 
 # ── DTE overflow / custom tiers fallback (lines 440, 473-474, 479-481) ────────
+# NOTE: dte_premium_tiers must be a list of (max_dte, {tier: floor}) tuples,
+# matching _DEFAULT_DTE_PREMIUM_TIERS shape. Plain dict was a pre-ING-006 form.
 
 def test_get_episode_min_premium_dte_overflow_t1():
     """
     Custom tiers with max key=30. DTE=60 exceeds all keys -> debug log path
-    fires and returns tiers[30][col=0].
+    fires and returns _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
+    Tier defaults to 2 (no set_tier_map call).
     """
-    custom_tiers = {30: (500_000, 100_000)}
     acc = RepetitionAccumulator(
         min_trades=1, min_premium=1,
-        dte_premium_tiers=custom_tiers,
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
     ev = SimpleNamespace(premium=100_000, dte=60, underlying_price=200.0,
-                         order_side="BUY", trade_type="SWEEP", timestamp=_ts())
+                         order_side="BUY", trade_type="SWEEP", timestamp=_ts(),
+                         ticker="AAPL")
     ep.events = [ev]
     floor = acc._get_episode_min_premium(ep)
-    assert floor == 500_000  # col=0 (T1), key=30 (only key, overflow fallback)
+    # Overflow -> _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS, tier=2 (default) -> 1_000_000
+    assert floor == 1_000_000
 
 
 def test_get_episode_min_premium_dte_overflow_t2():
     """
     Custom tiers with max key=30. DTE=60 exceeds all keys ->
-    overflow return tiers[30][col=1] for T2 ticker.
+    overflow returns _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
+    Tier is 2 (default; no set_tier_map needed).
     """
-    custom_tiers = {30: (500_000, 100_000)}
     acc = RepetitionAccumulator(
         min_trades=1, min_premium=1,
-        dte_premium_tiers=custom_tiers,
+        dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
-    acc.set_tier_map({"AAPL": 2})
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
     ev = SimpleNamespace(premium=100_000, dte=60, underlying_price=200.0,
-                         order_side="BUY", trade_type="SWEEP", timestamp=_ts())
+                         order_side="BUY", trade_type="SWEEP", timestamp=_ts(),
+                         ticker="AAPL")
     ep.events = [ev]
     floor = acc._get_episode_min_premium(ep)
-    assert floor == 100_000  # col=1 (T2), overflow fallback
+    assert floor == 1_000_000  # 91+ DTE overflow, tier=2 default
 
 
 # ── min_sweeps gate suppression (line 546) ────────────────────────────────────
