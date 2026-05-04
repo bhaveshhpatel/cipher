@@ -4,6 +4,7 @@ test_ing006_directional_aggression.py
 ING-006 acceptance tests.
 
 QA-Q1: 8-case is_directionally_aggressive() matrix (F-1 through F-8)
+        + F-9 (BELOW_BID + PUT) added per deliberation F3 fix (2026-05-03)
 QA-Q2: Accumulator weighted_premium gate test
   - 2 aggressive @ $40k + 2 passive @ $40k -> weighted=$120k, total=$160k
   - Passive-only episode at $50k raw against T1 DTE<=7 floor ($50k) ->
@@ -27,7 +28,7 @@ from signals.repetition_accumulator import (
 # ---------------------------------------------------------------------------
 
 class TestIsDirectionallyAggressive:
-    """F-1 through F-8 — deliberation QA-Q1 matrix (2026-05-03)."""
+    """F-1 through F-9 — deliberation QA-Q1 matrix (2026-05-03)."""
 
     def test_f1_at_ask_call(self):
         """F-1: AT_ASK + CALL -> True (buyer paying up)."""
@@ -60,6 +61,16 @@ class TestIsDirectionallyAggressive:
     def test_f8_at_ask_unknown_contract(self):
         """F-8: AT_ASK + '' -> True (AT_ASK is unconditional; contract type irrelevant)."""
         assert is_directionally_aggressive("AT_ASK", "") is True
+
+    def test_f9_below_bid_put(self):
+        """F-9: BELOW_BID + PUT -> True (put seller writing below bid = conviction bullish).
+
+        Symmetric to F-3 (AT_BID + PUT) and F-4 (BELOW_BID + CALL).
+        The implementation handles this via `ba in ("AT_BID", "BELOW_BID")
+        and ctype in ("PUT", "CALL")` but the explicit test was missing
+        from the original F-matrix — added per deliberation F3 fix (2026-05-03).
+        """
+        assert is_directionally_aggressive("BELOW_BID", "PUT") is True
 
     def test_case_insensitive(self):
         """Inputs normalised to upper — lowercase should work."""
