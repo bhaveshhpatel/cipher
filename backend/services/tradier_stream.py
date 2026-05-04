@@ -192,7 +192,7 @@ Fix (ING-006-PREMERGE 2026-05-03):
     (stream layer uses accumulator.set_tier_map() from registry warmup).
 
 Fix (ING-007 2026-05-04):
-  Log noise cleanup + strong_sentiment coupling fix + lookback wiring.
+  Log noise cleanup + strong_sentiment coupling fix.
 
   ISSUE-1: order_side WARN fired on every tick.
     Tradier timesale stream never provides order_side (ING-001 resolution).
@@ -222,11 +222,6 @@ Fix (ING-007 2026-05-04):
     field is no longer the source of truth at this layer.
     execution_mechanic payload field preserved in composite_msg for
     downstream consumers (signal_store, frontend) — only derivation changed.
-
-  WIRING: enqueue_lookback() called after persist_ep gate passes.
-    Every persisted episode's ContractKey is enqueued for async lookback
-    enrichment via start_lookback_worker(accumulator) in main.py lifespan.
-    get_lookback_stats() surfaced in get_stats() for /health/stream.
 """
 import asyncio
 import logging
@@ -242,14 +237,7 @@ from config import settings
 from core.async_bus import bus
 from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction, is_directionally_aggressive
-# ING-007: enqueue_lookback + get_lookback_stats wired for async lookback enrichment
-from services.flow_store import (
-    persist_flow_event,
-    persist_flow_episode,
-    upgrade_to_sweep_in_db,
-    enqueue_lookback,
-    get_lookback_stats,
-)
+from services.flow_store import persist_flow_event, persist_flow_episode, upgrade_to_sweep_in_db
 from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
@@ -372,8 +360,6 @@ def get_stats() -> dict:
     # ING-002: merge parser-level stats so /health/stream surfaces below_min_premium
     stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
-    # ING-007: surface lookback queue depth and overflow counter
-    stats.update(get_lookback_stats())
     return stats
 
 
@@ -660,9 +646,6 @@ async def _process_trade(raw: dict):
         ev.bid_ask_class, ev.contract_type) per ING-006 contract. Severs the
         stale coupling to ev.strong_sentiment / execution_mechanic from the
         pre-ING-006 parser path.
-      enqueue_lookback: ContractKey enqueued for async lookback enrichment after
-        persist_ep gate passes. Processed by start_lookback_worker(accumulator)
-        running in main.py lifespan.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -821,11 +804,6 @@ async def _process_trade(raw: dict):
     # ING-007: order_side is UNKNOWN by platform design — not a regression.
     # No per-tick warning. One-time INFO logged at startup in stream_options_flow().
     _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
-
-    # ING-007: enqueue ContractKey for async lookback enrichment (non-blocking).
-    # start_lookback_worker(accumulator) in main.py lifespan drains this queue.
-    from utils.contract_day_cache import ContractKey as _ContractKey
-    enqueue_lookback(_ContractKey(ev.ticker, ev.contract_type, ev.strike, ev.expiry))
 
     # ING-007: strong_sentiment computed from is_directionally_aggressive() per
     # ING-006 contract. Severs stale coupling to ev.strong_sentiment / execution_mechanic.
