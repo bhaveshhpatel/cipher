@@ -34,13 +34,29 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | Order | Story ID | Title | Depends On | Can Ship? |
 |-------|----------|-------|------------|-----------|
 | ~~1~~ | ~~ING-001~~ | ~~Verify Tradier `order_side` field~~ | — | ✅ CLOSED — resolved pre-sprint |
-| 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58) |
-| 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59) |
-| 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60) |
-| 4 | **ING-005** | Align OTM band thresholds registry ↔ accumulator | ING-004 | 🔄 IN PROGRESS — PR #61 (branch `ing/s5-otm-threshold-align`) |
-| 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ~~ING-001~~ resolved | ✅ DELIBERATION COMPLETE — PR #62 (branch `ing/s6-directional-aggression`) |
-| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002, ING-003 | ✅ UNBLOCKED — deliberation required |
-| 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004, ING-005 | After ING-005 merges + deliberation |
+| 1 | ~~**ING-002**~~ | ~~Hard per-event $10k premium floor at parser~~ | — | ✅ MERGED — 2026-05-03 (PR #58, commit `a38f837`) |
+| 2 | ~~**ING-003**~~ | ~~Wire `_DEFAULT_DTE_PREMIUM_TIERS` at accumulator init~~ | — | ✅ MERGED — 2026-05-03 (PR #59, commit `62b159f`) |
+| 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60, commit `d3c3f31`) |
+| 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ MERGED — 2026-05-03 (PR #61) |
+| 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
+| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
+| 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
+
+---
+
+## Post-ING-006-Merge Findings (GitHub Issues Filed)
+
+The following issues were filed during ING-006 deliberation and are tracked separately. None block ING-007 implementation start (deliberation is what blocks ING-007).
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| [#63](https://github.com/bhaveshhpatel/cipher/issues/63) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Not blocking ING-006 merge. Blocking ING-007/008 callers importing from `bid_ask_classifier.py` | SA-F1 post-ING-006 |
+| [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | SA-F1: Persist `is_aggressive` flag to `flow_events` for ING-007 pattern quality scoring | P1 — required before ING-007 pattern quality scoring is meaningful | ING-007 prerequisite |
+| [#65](https://github.com/bhaveshhpatel/cipher/issues/65) | ING-007 story issue — Multi-day repeat window lookback | — | ING-007 |
+| [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | ING-006 SA-F1: Migrate `is_directionally_aggressive()` out of `bid_ask_classifier.py` | Not blocking ING-006. Blocking for ING-007/008 signal-layer import path | SA-F1 post-ING-006 |
+| [#67](https://github.com/bhaveshhpatel/cipher/issues/67) | ING-007 prereq (SA-F2): Add `is_aggressive` boolean column to `flow_events` | **Blocking for ING-007 and S8 backtest work** | ING-007 S2.5 migration |
+| [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
+| [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
 
 ---
 
@@ -457,10 +473,10 @@ ON CONFLICT (key) DO NOTHING;
 **Depends On:** ING-004 ✅
 **Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing005_otm_thresholds.py`
 **Branch:** `ing/s5-otm-threshold-align`
-**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — 🔄 **IN REVIEW** (pre-merge deliberation complete 2026-05-03)
+**PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **MERGED 2026-05-03** (commit `252d75f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. Story cleared for implementation.**
+**All three roles signed off. Story merged.**
 
 #### Deliberation Outcomes
 
@@ -518,10 +534,10 @@ Option B rejected. No tier data needs to flow through event objects.
 **Depends On:** ING-001 resolved ✅
 **Files:** `backend/parsers/bid_ask_classifier.py`, `backend/parsers/options_flow_parser.py`, `backend/signals/repetition_accumulator.py`
 **Branch:** `ing/s6-directional-aggression`
-**PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **DELIBERATION COMPLETE — CLEARED FOR MERGE (2026-05-03)**
+**PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **MERGED 2026-05-04** (commit `501b170`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
-**All three roles signed off. All 7 findings resolved. Story cleared for merge.**
+**All three roles signed off. All 7 findings resolved. Merged 2026-05-04.**
 
 #### Deliberation Outcomes
 
@@ -531,14 +547,14 @@ Option B rejected. No tier data needs to flow through event objects.
 - No additional size threshold needed in this function
 
 **SA-Q2: `is_aggressive` persistence in `flow_events` — DECIDED: Deferred to ING-007**
-- Column `is_aggressive BOOLEAN DEFAULT FALSE` added in ING-007 Supabase migration
+- Column `is_aggressive BOOLEAN DEFAULT FALSE` added in ING-007 Supabase migration (see Issues #64, #67, #69)
 - Documented in `options_flow_parser.py` module docstring
 - ING-007 AC explicitly calls out this migration prerequisite
 
 **SA-F1: TODO comment in `bid_ask_classifier.py` — RESOLVED**
 - `TODO(ING-007/S2)` removed per Rule 6 Constraint 3 (no TODO in implementation code)
-- Migration of `is_directionally_aggressive()` to `order_side_classifier.py` tracked in **[Issue #63](https://github.com/bhaveshhpatel/cipher/issues/63)**
-- Prose note retained in function docstring referencing Issue #63 as the tracking mechanism
+- Migration of `is_directionally_aggressive()` to `order_side_classifier.py` tracked in **[Issue #66](https://github.com/bhaveshhpatel/cipher/issues/66)**
+- Prose note retained in function docstring referencing Issue #66 as the tracking mechanism
 
 **PBE-Q1: `is_aggressive` in `_DictEventWrapper` — DECIDED: Correct**
 - `"is_aggressive"` added to `__slots__`; read with `bool(d.get("is_aggressive", False))`
@@ -603,30 +619,14 @@ All 9 cases implemented in `test_ing006_directional_aggression.py`.
 - `test_passive_gate2_drop_returns_none_no_exception`: asserts no exception raised on passive Gate 2 drop
 - `test_aggressive_pass_returns_episode_not_none`: baseline confirming the correct path
 
-#### Implementation
+#### Post-Merge Findings (all tracked in GitHub Issues — no TODOs in code)
 
-**Step 1 — Replace `is_aggressive()` with `is_directionally_aggressive()` in `bid_ask_classifier.py`:**
-```python
-def is_directionally_aggressive(
-    bid_ask_class: str,
-    contract_type: str,
-) -> bool:
-    ba    = (bid_ask_class or "").strip().upper()
-    ctype = (contract_type or "").strip().upper()
-    if ba in ("AT_ASK", "ABOVE_ASK"):
-        return True
-    if ba in ("AT_BID", "BELOW_BID") and ctype in ("PUT", "CALL"):
-        return True
-    return False
-```
-
-**Step 2 — Update `parse_tradier_trade()` to use new function.**
-
-**Step 3 — Add `is_aggressive` to `_DictEventWrapper.__slots__`.**
-
-**Step 4 — Add aggression-weighted premium check in `ingest_tick()`.**
-
-**Step 5 — Retain old `is_aggressive(trade_type)` as deprecated.**
+| Finding | Issue | Title | Blocking? |
+|---------|-------|-------|-----------|
+| SA-F1 | [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Blocking ING-007/008 signal-layer imports |
+| SA-F2 | [#67](https://github.com/bhaveshhpatel/cipher/issues/67) / [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `is_aggressive` column to `flow_events` + persist_flow_episode serialisation | **Blocking production deploy** |
+| PBE-PREMERGE-F1 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | `is_aggressive()` deprecated shim removal | Coordinate with #66 |
+| SA-Q2 resolved | [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | Persist `is_aggressive` to `flow_events` for ING-007 pattern quality scoring | P1 — ING-007 prerequisite |
 
 #### Acceptance Criteria
 - [x] `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` in parser
@@ -639,7 +639,7 @@ def is_directionally_aggressive(
 - [x] `threading.Lock` restored on `set_tier_map()` / `_get_episode_min_premium()` (PBE-F2 fix)
 - [x] `ingest()` shim removal confirmed by grep audit — zero callers (PBE-F3 fix)
 - [x] `get_signal()` / cooldown removal documented as intentional (PBE-F4 fix)
-- [x] TODO comment removed from `bid_ask_classifier.py`; migration tracked in Issue #63 (SA-F1 fix)
+- [x] TODO comment removed from `bid_ask_classifier.py`; migration tracked in Issue #66 (SA-F1 fix)
 - [x] Sprint doc QA-Q1 matrix updated to 9 cases (QA-F1 fix)
 - [x] `TestCounterSeparation` tests confirm passive Gate 2 drop returns None without raising (QA-F4 fix)
 - [x] `test_aggression_discount_constructor_param` confirms custom discount flows through Gate 2
@@ -651,11 +651,15 @@ def is_directionally_aggressive(
 **Priority:** P1
 **Estimated Effort:** 3 days
 **Depends On:** ING-002 (merged ✅), ING-003 (merged ✅)
+**GitHub Issue:** [#65](https://github.com/bhaveshhpatel/cipher/issues/65)
+**Status:** 🔓 **UNBLOCKED** — ING-006 merged 2026-05-04. Deliberation required before implementation.
 **Files:** `backend/services/flow_store.py`, `backend/services/tradier_stream.py`, `backend/utils/contract_day_cache.py` (new), Supabase migration
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
+#### 🚨 Infrastructure Prerequisites — MUST LAND BEFORE ANY PYTHON
 
-**🚨 Infrastructure Prerequisite — Supabase Migration FIRST:**
+The following must be applied and verified before any ING-007 Python implementation begins:
+
+**S2.5 Migration (Supabase — tracked in Issues [#67](https://github.com/bhaveshhpatel/cipher/issues/67) and [#69](https://github.com/bhaveshhpatel/cipher/issues/69)):**
 ```sql
 CREATE INDEX idx_flow_events_contract_day
 ON flow_events (ticker, contract_type, strike, expiry, created_at DESC);
@@ -664,6 +668,10 @@ ALTER TABLE flow_events ADD COLUMN IF NOT EXISTS order_side TEXT DEFAULT 'UNKNOW
 ALTER TABLE flow_events ADD COLUMN IF NOT EXISTS is_aggressive BOOLEAN DEFAULT FALSE;
 ```
 Apply migration, run `EXPLAIN ANALYZE` on lookback query, confirm index hit before any Python.
+
+> ⚠️ `is_aggressive` column MUST exist before `persist_flow_episode` serialisation fix is attempted. Do not merge the serialisation fix without the migration applied.
+
+#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
 
 Open deliberation questions:
 - SA-Q1: Hard gate vs. soft enrichment flag — recommend starting as flag (`require_multi_day=False`).
@@ -675,9 +683,12 @@ Open deliberation questions:
 - QA-Q1: Integration test with seeded `flow_events` fixture (3 prior days). Assert `prior_days_active=3`.
 - QA-Q2: Cache TTL expiry test — after 5 min, re-fetch from DB.
 - QA-Q3: `_process_trade()` latency benchmark before/after.
+- **SA-F2-Q1 (new — from ING-006 deliberation):** `is_aggressive` lookback filter — should `prior_days_active` count ALL prior qualifying flows, or ONLY aggressively-filled prior episodes? Recommendation: two counters — `prior_days_active` (all) + `prior_days_aggressive` (aggressive-only). Deliberation required.
 
 #### Acceptance Criteria
-- [ ] Supabase migration applied; `EXPLAIN ANALYZE` confirms index hit
+- [ ] S2.5 Supabase migration applied (`idx_flow_events_contract_day`, `is_aggressive` column, `order_side` column) — Issues #67, #69
+- [ ] `EXPLAIN ANALYZE` on lookback query confirms index hit (document result in PR description)
+- [ ] `persist_flow_episode` dict includes `is_aggressive` key — Issue #69
 - [ ] `get_prior_contract_volume()` returns correct results for seeded fixture
 - [ ] Background worker populates cache; hot path is non-blocking
 - [ ] `ep.is_multi_day_repeat` flag set correctly
@@ -694,7 +705,8 @@ Open deliberation questions:
 **Type:** Feature / New Gate
 **Priority:** P1
 **Estimated Effort:** 2 days
-**Depends On:** ING-004, ING-005
+**Depends On:** ING-004 ✅, ING-005 ✅
+**Status:** 🔓 **UNBLOCKED** — ING-004 and ING-005 both merged. Deliberation required before implementation.
 **Files:** `backend/signals/repetition_accumulator.py`, `backend/parsers/options_flow_parser.py`
 
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
@@ -726,10 +738,10 @@ All 7 stories pass acceptance criteria AND:
 - [ ] No regression in existing passing tests (`pytest backend/`)
 - [ ] `/health/stream` exposes all new counters: `below_min_premium`, `underlying_price_fallback_applied`, `multi_day_repeat_count`, `multi_day_not_met`, `vol_oi_suppressed`, `dte_tier_preset`
 - [ ] 3-way deliberation sign-off documented for every story in this file
-- [ ] `docs/ARCHITECTURE.md` updated to reflect new gate structure
+- [ ] `docs/ARCHITECTURE.md` updated to reflect new gate structure (Gate 2 now evaluates `weighted_premium`)
 - [ ] `docs/CHANGELOG.md` updated with sprint summary
 - [ ] `docs/ORDER_SIDE_RESOLUTION.md` referenced from `docs/ARCHITECTURE.md`
 
 ---
 
-*Sprint created: 2026-05-03 | Last updated: 2026-05-03 (ING-006 PR #62 deliberation complete — all 7 findings resolved, cleared for merge; Issue #63 filed for SA-F1 order_side_classifier migration) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
+*Sprint created: 2026-05-03 | Last updated: 2026-05-04 (ING-006 PR #62 merged — commit `501b170`; ING-005 PR #61 merged; ING-007 and ING-008 unblocked; post-merge findings tracked in Issues #63–#69; Rule 7 post-merge doc update complete) | Owner: Dhruv Patel | Classification: P0 — WSJ Ingestion Alignment*
