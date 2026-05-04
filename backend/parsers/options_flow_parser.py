@@ -27,6 +27,9 @@ ING-006: Directional aggression classification.
   the deprecated is_aggressive(trade_type) shim.
   AT_BID/BELOW_BID on PUT or CALL now correctly returns True — seller
   writing at bid is conviction directional flow.
+  IMPORTANT: is_aggressive is re-computed after registry enrichment block
+  in case the registry overwrites contract_type (AT_BID + flipped ctype
+  would produce a stale is_aggressive if computed only pre-enrichment).
   is_aggressive is NOT yet persisted as a separate column in flow_events;
   that column is added in the ING-007 migration (SA-Q2 deliberation, 2026-05-03).
 """
@@ -46,15 +49,26 @@ except Exception:  # pragma: no cover
 
 # ---------------------------------------------------------------------------
 # ING-002: Hard per-event premium floor.
+# Hardcoded safe default — active at import time, no DB dependency, no cold-start gap.
+# Future: wire through ingestion_config key "min_event_premium" with this as
+# fallback when admin config page is built (ING-002-CONFIG).
 # ---------------------------------------------------------------------------
 _MIN_EVENT_PREMIUM = 10_000
 
 # ---------------------------------------------------------------------------
 # Parser-level stats.
+# This module owns exactly two counters:
+#   below_min_premium                 — ING-002: clean filter drops at parser premium floor
+#   underlying_price_fallback_applied — ING-004: ticks where registry stock_price used
+#
+# parse_failed is owned by tradier_stream — do NOT add it here.
+# If get_stats() returned parse_failed, stats.update(get_parser_stats()) in
+# tradier_stream.get_stats() would overwrite the stream's real parse_failed
+# counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
 # ---------------------------------------------------------------------------
 _stats: dict = {
-    "below_min_premium":                  0,
-    "underlying_price_fallback_applied":  0,
+    "below_min_premium":                  0,  # ING-002: clean filter drops at parser premium floor ($10k)
+    "underlying_price_fallback_applied":  0,  # ING-004: ticks where registry stock_price used as fallback
 }
 
 
@@ -86,7 +100,7 @@ class OptionsFlowEvent:
     # Derived
     trade_type:     str = ""         # SWEEP | BLOCK | SPLIT | SINGLE
     bid_ask_class:  str = ""         # ABOVE_ASK | AT_ASK | MID | AT_BID | BELOW_BID
-    is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive()
+    is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive(); re-computed post-registry
     is_golden_sweep: bool = False
 
     # Classification (set later)
@@ -177,6 +191,9 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
         premium = fill * size * 100
 
         # ING-002: Hard per-event premium floor.
+        # Gate fires after size==0 guard, after premium is known,
+        # before OCC parsing and OptionsFlowEvent construction.
+        # Counter incremented here — gate owns its counter.
         if premium < _MIN_EVENT_PREMIUM:
             _stats["below_min_premium"] += 1
             return "below_premium"
@@ -211,6 +228,16 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
 
         # ------------------------------------------------------------------
         # Synthetic quote handling
+        # When bid=ask=0 we have no real spread data. Instead of fabricating
+        # a tight ±0.5% spread and running classification (which almost
+        # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
+        # wide-spread contracts), we:
+        #   1. Flag is_synthetic_quote=True
+        #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
+        #   3. Force is_aggressive=False — cannot claim aggression without quotes
+        #   4. Apply a 40% conviction haircut (×0.6) downstream
+        # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
+        # post-registry — synthetic spreads have no valid aggression signal.
         # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
@@ -220,8 +247,8 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
             effective_bid = round(fill * 0.995, 4)
             effective_ask = round(fill * 1.005, 4)
             is_synthetic_quote = True
-            ba_class   = "MID"
-            aggressive = False
+            ba_class   = "MID"   # force neutral, skip classify_bid_ask
+            aggressive = False   # cannot claim aggression without real quotes
         else:
             ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
             # ING-006: use directional aggression classifier (replaces is_aggressive shim)
@@ -279,6 +306,9 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
             3,
         )
 
+        # 40% conviction haircut for synthetic quotes — prevents wide-spread
+        # contracts with unknown fill placement from scoring as high-conviction
+        # events solely on premium size.
         if is_synthetic_quote:
             ev.conviction_score = round(raw_conviction * 0.6, 3)
         else:
@@ -298,11 +328,28 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
                     ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
 
                 # ING-004: Fallback underlying_price from registry stock_price.
+                # Fires whether or not meta was found — stock_price is ticker-level,
+                # not contract-level. Only applied when tick value is 0.0 (Tradier
+                # frequently omits this field in timesale events).
+                # Placement after meta block so ev.ticker is already canonical.
+                # Deliberation: 2026-05-03 — SA/PBE/QA all signed off.
                 if ev.underlying_price == 0.0:
                     sp = reg.stock_price(ev.ticker)
                     if sp > 0.0:
                         ev.underlying_price = sp
                         _stats["underlying_price_fallback_applied"] += 1
+
+                # ING-006 (I-1 fix): re-compute is_aggressive after registry enrichment.
+                # Registry may overwrite ev.contract_type (meta.contract_type).
+                # is_directionally_aggressive() depends on contract_type — if the
+                # registry flips PUT->CALL or CALL->PUT on an AT_BID/BELOW_BID fill,
+                # the pre-enrichment value would be stale.
+                # Synthetic quotes are exempt: aggressive is pinned False regardless
+                # of contract_type (no valid spread data to claim aggression on).
+                if not ev.is_synthetic_quote:
+                    ev.is_aggressive = is_directionally_aggressive(
+                        ev.bid_ask_class, ev.contract_type
+                    )
         except Exception:
             pass
 

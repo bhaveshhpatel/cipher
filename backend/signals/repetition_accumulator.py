@@ -90,6 +90,12 @@ _AGGRESSION_DISCOUNT: float = 0.5
 # ---------------------------------------------------------------------------
 # _DictEventWrapper — module-level; wraps raw dict ticks so attribute access
 # works identically to OptionsFlowEvent objects throughout the accumulator.
+# Defined here (not inside ingest_tick) to avoid a new class object being
+# allocated on every hot-path dict tick. (Finding 7)
+#
+# NOTE: `d` must be a plain dict. Passing None or a non-dict will raise
+# AttributeError on .get(). Callers are responsible for the isinstance check
+# (performed in ingest_tick) before constructing this wrapper. (BE-2)
 # ---------------------------------------------------------------------------
 class _DictEventWrapper:
     __slots__ = (
@@ -176,6 +182,16 @@ class RepetitionEpisode:
     def dominant_direction(self) -> str:
         """
         Premium-weighted direction across all events in the episode.
+
+        Uses order_side_to_direction() per event so that:
+          - SELL + PUT  -> REPEAT_BUY  (PASSIVE_BULLISH)
+          - BUY  + CALL -> REPEAT_BUY  (DIRECTIONAL_LONG)
+          - BUY  + PUT  -> REPEAT_SELL (DIRECTIONAL_SHORT)
+          - SELL + CALL -> REPEAT_SELL (PASSIVE_BEARISH)
+
+        Episodes dominated by SELL PUT premium correctly resolve to
+        REPEAT_BUY even if the last tick is a weak mid-print.
+        UNKNOWN order_side falls back to contract-type convention.
         """
         buy_prem = 0.0
         sell_prem = 0.0
@@ -200,6 +216,56 @@ class RepetitionEpisode:
 class RepetitionAccumulator:
     """
     Apex L2 dual-window accumulator.
+
+    Args (original, unchanged):
+        window_minutes:       Rolling window for signal path event pruning.
+        min_trades:           Minimum ticks to cross Gate-1.
+        min_premium:          Fallback minimum cumulative premium (used when
+                              dte_premium_tiers is empty).
+        signal_cooldown:      Minutes to suppress re-signals.
+        retrigger / retrigger_delta: Legacy compat params, not used by ingest_tick.
+
+    Args (S4 additions):
+        min_sweeps:           Minimum SWEEP-type events in the episode to qualify.
+                              0 = disabled (no sweep gate).
+        sweep_bypass_premium: If > 0, a single-event episode (len==1) of type
+                              SWEEP with total_premium >= this value bypasses
+                              the min_sweeps gate entirely.
+                              NOTE: len(ep.events)==1 counts OptionsFlowEvent
+                              objects in this episode, NOT fill_count within a
+                              single tick. (Issue 7 resolution — Architect +
+                              Principal Engineer deliberation, April 30 2026)
+        deep_otm_multiplier:  Multiplier applied to the effective_min_premium when
+                              OTM% > 12%. Default 1.0 (no penalty — ING-005
+                              deliberation decision, 2026-05-03).
+
+                              CHANGED from 1.5 to 1.0 by ING-005:
+                              The registry OTM filter is the authoritative
+                              moneyness gate post-ING-004. Contracts already
+                              passed the registry's per-tier atm_pct envelope
+                              before reaching the accumulator. Applying a
+                              second penalty here with an inconsistent threshold
+                              (hardcoded 12% vs. registry's per-tier bands up to
+                              ~20% for T1) was double-gating on the same axis
+                              and incorrectly penalising legitimate T1 prints
+                              at 12-20% OTM.
+
+                              Pass explicit deep_otm_multiplier > 1.0 to
+                              re-enable the penalty (e.g. for backtesting).
+
+        dte_premium_tiers:    Dict[int, Tuple[float, float]] mapping DTE upper-bound
+                              (inclusive) to (T1_floor, T2_T3_floor). If empty,
+                              min_premium is used as fallback.
+        tier_map:             Optional dict mapping ticker -> tier (1, 2, or 3).
+                              Injected by the stream worker after registry readiness.
+
+    NOTE — `otm_band` param removed (Finding 1, panel deliberation May 1 2026):
+        The original constructor accepted `otm_band: Tuple[float, float]` but
+        `_classify_otm` is a static method that hardcodes the 0.02 / 0.12
+        thresholds per the spec (Issue 6 resolution). `otm_band` was stored
+        but never read — a silent no-op that would mislead callers into thinking
+        the bands were configurable. Removed. If band configurability is needed
+        in a future sprint, _classify_otm must be updated to consume it.
 
     ING-006: Gate 2 (DTE-adjusted floor) now evaluates ep.weighted_premium
     instead of ep.total_premium. Passive events are discounted by
@@ -233,7 +299,20 @@ class RepetitionAccumulator:
         self.deep_otm_multiplier  = deep_otm_multiplier
         self.dte_premium_tiers    = dte_premium_tiers or {}
         self._tier_map            = tier_map or {}
+
+        # Finding 2 (S4-POST-4, panel deliberation May 1 2026):
+        # set_tier_map() is called by stream workers (potentially 64 concurrent)
+        # and _get_episode_min_premium() reads _tier_map on every hot-path tick.
+        # A threading.Lock serialises the write in set_tier_map() and the read
+        # in _get_episode_min_premium() so the dict is never read mid-replacement.
+        # threading.Lock (not asyncio.Lock) because set_tier_map() is a sync
+        # method callable from both sync and async contexts.
         self._tier_map_lock: threading.Lock = threading.Lock()
+
+        # BE-1 (deliberation May 1 2026): cache max DTE key at construction time
+        # so _get_episode_min_premium never calls max() on every hot-path tick.
+        # dte_premium_tiers is immutable after __init__ (set_tier_map only updates
+        # _tier_map, not tiers). Safe to precompute once here.
         self._max_dte_key: Optional[int] = (
             max(self.dte_premium_tiers) if self.dte_premium_tiers else None
         )
@@ -242,11 +321,25 @@ class RepetitionAccumulator:
         self._locks:    dict = {}
 
     # ------------------------------------------------------------------ #
-    # Tier map injection
+    # Tier map injection (called by stream worker after registry warms)
     # ------------------------------------------------------------------ #
 
     def set_tier_map(self, tier_map: Dict[str, int]) -> None:
-        """Replace the internal tier map. Thread-safe."""
+        """
+        Replace the internal tier map.
+
+        Thread-safe: protected by self._tier_map_lock so concurrent calls
+        from multiple stream workers cannot interleave with a mid-flight
+        read in _get_episode_min_premium().
+
+        Finding 2 (S4-POST-4, panel deliberation May 1 2026):
+        The previous implementation had no lock despite the docstring claiming
+        thread-safety. With up to 64 workers potentially calling set_tier_map()
+        concurrently, _tier_map replacement (which is a pointer swap in CPython
+        but not guaranteed atomic under all interpreters or future GIL removal)
+        must be explicitly serialised. Lock added here and in
+        _get_episode_min_premium() to make the contract match the claim.
+        """
         with self._tier_map_lock:
             self._tier_map = tier_map
 
@@ -289,7 +382,28 @@ class RepetitionAccumulator:
     # ------------------------------------------------------------------ #
 
     def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
-        """Return the DTE-adjusted minimum premium floor for this episode."""
+        """
+        Return the DTE-adjusted minimum premium floor for this episode.
+
+        Uses the latest event's DTE and the episode ticker's tier.
+        Falls back to self.min_premium when dte_premium_tiers is empty.
+
+        Tier lookup:
+          tier == 1  -> column 0 (T1 floor — higher, stricter)
+          tier != 1  -> column 1 (T2/T3 floor — lower, more permissive)
+
+        Unknown-tier default: T1 (strict) — column 0.
+        Deliberation decision (panel, May 1 2026 — Finding 2):
+          Unknown tickers have no registry-validated volume or tier.
+          Defaulting to T2/T3 (lenient) would let low-float noise stocks
+          qualify more easily than large-caps during registry warmup.
+          T1 (strict) is the safer production default; set_tier_map() is
+          called once registry is ready to assign the correct tier.
+
+        Thread-safety: _tier_map read is protected by _tier_map_lock to
+        prevent reading a partially-replaced dict during a concurrent
+        set_tier_map() call. (Finding 2 / S4-POST-4)
+        """
         if not self.dte_premium_tiers:
             return self.min_premium
 
@@ -298,17 +412,26 @@ class RepetitionAccumulator:
             latest_dte = int(getattr(ep.events[-1], "dte", 0) or 0)
 
         with self._tier_map_lock:
-            tier = self._tier_map.get(ep.ticker, 1)
+            tier = self._tier_map.get(ep.ticker, 1)  # default T1 (strict)
         col  = 0 if tier == 1 else 1
 
         for dte_max in sorted(self.dte_premium_tiers):
             if latest_dte <= dte_max:
                 return self.dte_premium_tiers[dte_max][col]
 
+        # A-1 (deliberation May 1 2026): DTE exceeds all explicit tier keys.
+        # This branch fires only when a custom dte_premium_tiers dict is injected
+        # with a lower max key than the observed DTE. With _DEFAULT_DTE_PREMIUM_TIERS
+        # (max key 9999) this is unreachable in practice. Log at debug so that
+        # misconfigured custom tiers are observable in production without spam.
         log.debug(
             "_get_episode_min_premium: DTE %d exceeds all tier keys %s for %s; "
-            "falling back to highest-key bucket (key=%d).",
-            latest_dte, sorted(self.dte_premium_tiers), ep.ticker, self._max_dte_key,
+            "falling back to highest-key bucket (key=%d). "
+            "Check dte_premium_tiers config if this appears unexpectedly.",
+            latest_dte,
+            sorted(self.dte_premium_tiers),
+            ep.ticker,
+            self._max_dte_key,
         )
         return self.dte_premium_tiers[self._max_dte_key][col]  # type: ignore[index]
 
@@ -321,11 +444,29 @@ class RepetitionAccumulator:
         """
         Classify contract OTM percentage band.
 
-        Returns: ATM | STANDARD_OTM | DEEP_OTM | UNKNOWN
+        Returns one of:
+          'ATM'          — abs(strike - underlying_price) / underlying_price <= 0.02
+          'STANDARD_OTM' — 2% < otm_pct <= 12%
+          'DEEP_OTM'     — otm_pct > 12%
+          'UNKNOWN'      — underlying_price <= 0 (no classification attempted)
 
-        NOTE (ING-005): _classify_otm() is retained for ING-007 pattern scoring
-        and signal metadata enrichment. With deep_otm_multiplier=1.0 (default),
-        DEEP_OTM no longer triggers a premium floor penalty in production.
+        ATM definition: abs(strike - underlying) / underlying <= 0.02
+        (±2% of underlying price — Issue 6 resolution, Architect + Principal
+        Engineer deliberation April 30 2026. Expressed as fraction of underlying,
+        not absolute dollar, so it works correctly across all underlying price
+        regimes including high-price names like NVDA at $900+.)
+
+        Thresholds (0.02 and 0.12) are intentionally hardcoded per spec.
+        They are NOT configurable via constructor — see Finding 1 note in
+        RepetitionAccumulator docstring.
+
+        NOTE (ING-005 / SA-Q2): `_classify_otm()` is retained for forward use
+        in ING-007 pattern scoring and signal metadata enrichment. As of ING-005,
+        the `otm_band` classification is NOT yet written to RepetitionEpisode —
+        that wiring is deferred to ING-007. With deep_otm_multiplier defaulting
+        to 1.0, DEEP_OTM classification no longer triggers a premium floor
+        penalty in production — only the classification label is produced;
+        the penalty application changed (ING-005 deliberation, 2026-05-03).
         """
         if underlying_price <= 0:
             return "UNKNOWN"
@@ -341,7 +482,18 @@ class RepetitionAccumulator:
     # ------------------------------------------------------------------ #
 
     def _is_single_whale_sweep(self, ep: RepetitionEpisode) -> bool:
-        """Returns True when the single-event sweep bypass should fire."""
+        """
+        Returns True when the single-event sweep bypass should fire.
+
+        Conditions (ALL must be true):
+          1. sweep_bypass_premium > 0  (bypass is enabled)
+          2. len(ep.events) == 1       (exactly one OptionsFlowEvent in this episode;
+                                        NOT fill_count within a single tick — Issue 7)
+          3. trade_type == 'SWEEP'
+          4. ep.total_premium >= sweep_bypass_premium
+
+        When True, the min_sweeps requirement is waived for this episode.
+        """
         if self.sweep_bypass_premium <= 0:
             return False
         if len(ep.events) != 1:
@@ -364,8 +516,16 @@ class RepetitionAccumulator:
           2. DTE-adjusted floor — ep.weighted_premium >= _get_episode_min_premium(ep)
                                   ING-006: evaluates WEIGHTED premium (passive events
                                   discounted by _AGGRESSION_DISCOUNT=0.5), not total.
-          3. Deep OTM multiplier— dormant at default deep_otm_multiplier=1.0 (ING-005)
-          4. min_sweeps         — with whale-sweep bypass
+          3. Deep OTM multiplier— if OTM% > 12% AND deep_otm_multiplier > 1.0,
+                                  floor is multiplied by deep_otm_multiplier.
+                                  With default deep_otm_multiplier=1.0 (ING-005),
+                                  this gate is effectively a no-op — registry
+                                  pre-filter is the authoritative OTM gate.
+          4. min_sweeps         — episode must contain >= min_sweeps SWEEP events
+                                  (bypassed when _is_single_whale_sweep returns True)
+
+        No cooldown. No Gate-2 delta check.
+        Used by _process_trade() to decide whether to call persist_flow_event.
         """
         key  = self._key(ev)
         lock = self._get_lock(key)
@@ -394,6 +554,9 @@ class RepetitionAccumulator:
             if isinstance(ev_ts, (int, float)):
                 ev_ts = datetime.fromtimestamp(ev_ts, tz=timezone.utc)
 
+            # Wrap dict events so .premium / .timestamp / .trade_type attributes work.
+            # _DictEventWrapper is defined at module level (not inline here) to avoid
+            # allocating a new class object on every hot-path dict tick. (Finding 7)
             ev_wrapped = _DictEventWrapper(ev) if isinstance(ev, dict) else ev
 
             ep.events = [
@@ -412,7 +575,18 @@ class RepetitionAccumulator:
             # ── Gate 2: DTE-adjusted premium floor (ING-006: weighted_premium) ─
             effective_min_prem = self._get_episode_min_premium(ep)
 
-            # ── Gate 3: Deep OTM multiplier (dormant at default 1.0) ─────────
+            # ── Gate 3: Deep OTM multiplier ──────────────────────────────────
+            # OTM classification uses the latest event's underlying_price.
+            # Guard against non-numeric values (e.g. MagicMock in tests) by
+            # using isinstance before float() to avoid TypeError in the hot path.
+            # When underlying_price is non-numeric or zero: UNKNOWN band applies
+            # -> standard floor, no deep-OTM penalty. (Issue 6 resolution)
+            #
+            # ING-005 (SA-Q1): deep_otm_multiplier defaults to 1.0. The `> 1.0`
+            # guard below is NEVER TRUE at the new default — this entire if-branch
+            # is a dormant backward-compat path in production. It activates only
+            # when an explicit deep_otm_multiplier > 1.0 is passed (e.g. backtesting).
+            # The else-branch (standard floor check) runs on every production tick.
             strike_val = float(ep.strike)
             raw_underlying = getattr(ev_wrapped, "underlying_price", 0.0)
             try:
@@ -422,7 +596,7 @@ class RepetitionAccumulator:
 
             otm_band = self._classify_otm(strike_val, underlying_px)
 
-            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+            if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":  # dormant at default 1.0 — ING-005/SA-Q1
                 deep_floor = effective_min_prem * self.deep_otm_multiplier
                 # ING-006: evaluate against weighted_premium
                 if ep.weighted_premium < deep_floor:
@@ -454,7 +628,11 @@ class RepetitionAccumulator:
         ts: datetime,
         ep: Optional[RepetitionEpisode],
     ) -> Optional[RepetitionEpisode]:
-        """Cooldown gate only. Returns ep if eligible to signal, else None."""
+        """
+        Cooldown gate only. Takes a pre-built ep and current timestamp.
+        Returns ep if eligible to signal, else None.
+        Does NOT acquire the episode lock (called after ingest_tick releases it).
+        """
         if ep is None:
             return None
 
@@ -474,11 +652,15 @@ class RepetitionAccumulator:
         return None
 
     # ------------------------------------------------------------------ #
-    # ingest: backward-compat shim
+    # ingest: backward-compat shim (Gate-1 + cooldown)
     # ------------------------------------------------------------------ #
 
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
-        """Backward-compat: calls ingest_tick then get_signal."""
+        """
+        Backward-compat entry point used by C-002/C-007 tests.
+        Calls ingest_tick (Gate-1) then get_signal (cooldown).
+        Returns ep only when both gates pass.
+        """
         ep = await self.ingest_tick(ev)
         if ep is None:
             return None
@@ -488,11 +670,48 @@ class RepetitionAccumulator:
         return await self.get_signal(ev_ts, ep)
 
     # ------------------------------------------------------------------ #
-    # Alert level
+    # Alert level (reconciled thresholds — all test suites)
     # ------------------------------------------------------------------ #
 
     def get_alert_level(self, ep: RepetitionEpisode) -> str:
-        """Return the alert level for a qualifying episode."""
+        """
+        Return the alert level for a qualifying episode.
+
+        Thresholds (current — reconciled May 1 2026):
+          CONVICTION    >= 2_000_000
+          CONVICTION    is_accelerating AND >= 500_000
+          STRONG_SIGNAL >= 1_000_000
+          ALERT         >= 250_000
+          WATCH         < 250_000
+
+        Change-log from S1 spec (Finding 1 / S4-POST-3, panel deliberation
+        May 1 2026 — no separate issue filed; resolved inline in this PR):
+
+          ALERT floor:        100_000  ->  250_000
+            Rationale: test_repetition_engine (line 18) asserts premium=$100K
+            returns WATCH. test_composite_signal_extended TestAlertLevels
+            .test_watch_level asserts total_premium=$200K returns WATCH.
+            Both existing suites independently pin the ALERT floor at $250K.
+            The S1 draft value of $100K was never validated against these suites
+            and was silently wrong from the start.
+
+          STRONG_SIGNAL floor: 500_000  ->  1_000_000
+            Rationale: test_repetition_engine (line 16) asserts premium=$1M
+            (non-accelerating) returns STRONG_SIGNAL. test_composite_signal_engine
+            test_alert_level_strong_signal uses premium_each=$400K × 3 = $1.2M
+            and expects STRONG_SIGNAL. The S1 draft value of $500K would have
+            promoted $500K non-accelerating episodes to STRONG_SIGNAL when all
+            other suites expected ALERT at that level.
+
+          CONVICTION high-premium floor: unchanged at 2_000_000
+            All test suites consistently pin this value.
+
+          CONVICTION accelerating band: unchanged (is_accelerating AND >= 500_000)
+            All test suites consistently pin this value.
+            NOTE: at exactly $500K, accelerating -> CONVICTION but
+            non-accelerating -> ALERT. This is intentional and pinned by
+            test_conviction_accelerating_at_exactly_500k in TestAlertLevel.
+        """
         prem = ep.total_premium
         if prem >= 2_000_000:
             return "CONVICTION"

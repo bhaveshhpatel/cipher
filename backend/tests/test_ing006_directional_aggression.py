@@ -11,9 +11,7 @@ QA-Q2: Accumulator weighted_premium gate test
   - Boundary: aggressive-only at exactly floor -> passes
 """
 import asyncio
-import pytest
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 from parsers.bid_ask_classifier import is_directionally_aggressive
 from signals.repetition_accumulator import (
@@ -79,26 +77,25 @@ class TestIsDirectionallyAggressive:
 
 def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
     """Build a minimal mock event compatible with _DictEventWrapper / ingest_tick."""
-    from datetime import datetime, timezone
 
     class _Ev:
         pass
 
     e = _Ev()
-    e.ticker        = "AAPL"
-    e.contract_type = "CALL"
-    e.strike        = 180.0
-    e.expiry        = "2026-05-10"
-    e.dte           = dte
-    e.premium       = premium
-    e.is_aggressive = is_aggressive
-    e.timestamp     = datetime.now(timezone.utc)
-    e.trade_type    = "BLOCK"
+    e.ticker           = "AAPL"
+    e.contract_type    = "CALL"
+    e.strike           = 180.0
+    e.expiry           = "2026-05-10"
+    e.dte              = dte
+    e.premium          = premium
+    e.is_aggressive    = is_aggressive
+    e.timestamp        = datetime.now(timezone.utc)
+    e.trade_type       = "BLOCK"
     e.underlying_price = 175.0
-    e.order_side    = "UNKNOWN"
-    e.occ_symbol    = None
-    e.direction     = None
-    e.sentiment     = "BULLISH"
+    e.order_side       = "UNKNOWN"
+    e.occ_symbol       = None
+    e.direction        = None
+    e.sentiment        = "BULLISH"
     return e
 
 
@@ -134,15 +131,15 @@ class TestWeightedPremiumGate:
         T1 DTE<=7 floor = $50k. Weighted = 60k * 0.5 = $30k < $50k -> None.
         """
         acc = self._acc()
-        # Set tier map so AAPL = T1
         acc.set_tier_map({"AAPL": 1})
 
         async def run():
+            result = None
             for _ in range(3):
                 result = await acc.ingest_tick(_make_event(20_000, False, dte=5))
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is None, "passive-only episode below weighted floor should be dropped"
 
     def test_aggressive_at_exact_floor_passes(self):
@@ -159,7 +156,7 @@ class TestWeightedPremiumGate:
                 result = await acc.ingest_tick(_make_event(20_000, True, dte=5))
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None, "aggressive episode above floor should pass Gate 2"
 
     def test_mixed_episode_weighted_passes(self):
@@ -176,7 +173,7 @@ class TestWeightedPremiumGate:
                 result = await acc.ingest_tick(_make_event(40_000, aggressive, dte=5))
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None
         assert result.weighted_premium == 120_000
         assert result.total_premium == 160_000
@@ -195,5 +192,5 @@ class TestWeightedPremiumGate:
                 result = await acc.ingest_tick(_make_event(34_000, False, dte=5))
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None, "passive episode at exactly 2x floor should pass"
