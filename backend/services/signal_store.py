@@ -14,6 +14,18 @@ Fix 5 (2026-04-26):
   - persist_composite_signal() now falls back to _signal_memory when
     Supabase is not configured (matches save_signal() behaviour).
 
+Fix 6 (2026-05-04):
+  - _build_row() now normalises `sentiment` through _normalise_sentiment()
+    before inserting, preventing 23514 CHECK violations when upstream emits
+    lowercase/mixed-case values (e.g. "bullish", "Bearish") or unexpected
+    values like "STRONG_BULLISH".
+  - _build_row() now validates `alert_level` through _normalise_alert_level()
+    before inserting, preventing 23514 CHECK violations if sig["alert_level"]
+    carries a value outside the live DB constraint (e.g. "NORMAL").
+  - Root cause confirmed by schema inspection of cipher-database (2026-05-04):
+      signal_feed_log_sentiment_check:   BULLISH | BEARISH | NEUTRAL
+      signal_feed_log_alert_level_check: CONVICTION | STRONG_SIGNAL | ALERT | WATCH
+
 Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
@@ -24,6 +36,8 @@ Public API (for tests):
 Normalisation helpers:
   _normalise_direction(raw) -> 'bullish' | 'bearish' | 'neutral'
   _normalise_trade_type(raw) -> 'sweep' | 'block' | 'split' | 'single'
+  _normalise_sentiment(raw) -> 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+  _normalise_alert_level(raw) -> 'CONVICTION' | 'STRONG_SIGNAL' | 'ALERT' | 'WATCH'
 
 CI / no-network behaviour:
   When Supabase is configured but the host is unreachable (DNS -2 in CI),
@@ -50,9 +64,13 @@ _SUPABASE_KEY: Optional[str] = (
 
 _TABLE = "signal_history"
 
+# These sets mirror the live DB CHECK constraints exactly.
+# Update here if and only if the corresponding migration alters the constraint.
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
 _VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
+_VALID_SENTIMENTS   = {"BULLISH", "BEARISH", "NEUTRAL"}           # signal_feed_log_sentiment_check
+_VALID_ALERT_LEVELS = {"CONVICTION", "STRONG_SIGNAL", "ALERT", "WATCH"}  # signal_feed_log_alert_level_check
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
@@ -172,6 +190,42 @@ def _normalise_influence_tier(raw: str) -> str:
     return upper if upper in _VALID_TIERS else "RETAIL"
 
 
+def _normalise_sentiment(raw: str) -> str:
+    """
+    Normalise raw sentiment to a value accepted by signal_feed_log_sentiment_check.
+    Handles lowercase, mixed-case, and aliased values from upstream emitters.
+    Unknown values fall back to 'NEUTRAL'.
+    """
+    if not raw:
+        return "NEUTRAL"
+    upper = raw.upper()
+    if upper in _VALID_SENTIMENTS:
+        return upper
+    # Common upstream aliases
+    if upper in ("BULL", "BULLISH_STRONG", "STRONG_BULLISH", "BUY"):
+        return "BULLISH"
+    if upper in ("BEAR", "BEARISH_STRONG", "STRONG_BEARISH", "SELL"):
+        return "BEARISH"
+    log.warning("[signal_store] unknown sentiment value %r -- defaulting to NEUTRAL", raw)
+    return "NEUTRAL"
+
+
+def _normalise_alert_level(raw: str) -> str:
+    """
+    Validate alert_level against signal_feed_log_alert_level_check.
+    If the value is not in the live constraint, fall back to 'WATCH'.
+    This guards against upstream passing stale values like 'NORMAL'
+    (the column default pre-migration) or any other out-of-range string.
+    """
+    if not raw:
+        return "WATCH"
+    upper = raw.upper()
+    if upper in _VALID_ALERT_LEVELS:
+        return upper
+    log.warning("[signal_store] unknown alert_level value %r -- defaulting to WATCH", raw)
+    return "WATCH"
+
+
 def _db_direction(raw: str) -> str:
     normalised = _normalise_direction(raw)
     mapping = {"bullish": "BUY", "bearish": "SELL"}
@@ -200,8 +254,11 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     episode = ep or {}
 
     score = sig.get("composite_score") or 0.0
+
+    # Derive alert_level from score first, then validate whatever came from sig
+    # through _normalise_alert_level to guard against out-of-constraint values.
     if sig.get("alert_level"):
-        alert_level = sig["alert_level"]
+        alert_level = _normalise_alert_level(sig["alert_level"])
     elif score >= 0.85:
         alert_level = "CONVICTION"
     elif score >= 0.70:
@@ -213,8 +270,11 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
 
     ctype   = episode.get("contract_type") or sig.get("contract_type", "")
     raw_dir = episode.get("direction", sig.get("direction", ""))
+
+    # Fix 6: route through _normalise_sentiment — never pass raw sig["sentiment"]
+    # directly to the DB row. Raw passthrough was the source of 23514 violations.
     if sig.get("sentiment"):
-        sentiment = sig["sentiment"]
+        sentiment = _normalise_sentiment(sig["sentiment"])
     elif "BUY" in raw_dir.upper() or ctype.upper() == "CALL":
         sentiment = "BULLISH"
     elif "SELL" in raw_dir.upper() or ctype.upper() == "PUT":
