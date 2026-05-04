@@ -3,12 +3,28 @@ test_ing006_directional_aggression.py
 
 ING-006 acceptance tests.
 
-QA-Q1: 8-case is_directionally_aggressive() matrix (F-1 through F-8)
-        + F-9 (BELOW_BID + PUT) added per deliberation F3 fix (2026-05-03)
-QA-Q2: Accumulator weighted_premium gate test
+QA-Q1: 9-case is_directionally_aggressive() matrix (F-1 through F-9).
+QA-Q2: Accumulator weighted_premium gate tests.
+
+SCOPE NOTE (QA-F1 — deliberation pre-merge review 2026-05-03):
+  This file covers ING-006 scope only: is_directionally_aggressive() behaviour
+  and the weighted_premium Gate 2 change in RepetitionAccumulator.
+
+  It does NOT satisfy the S2 CI gate invariants defined in the sprint plan and
+  deliberation doc (Sessions 15/19). Those invariants require:
+    - sentiment (BULLISH / BEARISH) per (bid_ask_class, contract_type)
+    - order_side (BUY / SELL / UNKNOWN)
+    - strong_sentiment (True / False)
+    - dominant_direction (REPEAT_BUY / REPEAT_SELL) per (order_side, contract_type)
+  All four depend on order_side_classifier.py which does not yet exist (S2 scope).
+  The full 14-assertion CI gate lives in tests/test_direction_invariants.py,
+  which is created in S2 and must pass before S2 merges. Do not treat this
+  file as a substitute for that gate.
+
+QA-Q2 notes:
   - 2 aggressive @ $40k + 2 passive @ $40k -> weighted=$120k, total=$160k
-  - Passive-only episode at $50k raw against T1 DTE<=7 floor ($50k) ->
-    weighted=$25k -> DROPS (floor is inclusive >=)
+  - Passive-only episode at $60k raw against T1 DTE<=7 floor ($50k) ->
+    weighted=$30k < $50k -> DROPS (weighted is below floor, not at it)
   - Boundary: aggressive-only at exactly floor -> passes
 """
 import asyncio
@@ -24,7 +40,7 @@ from signals.repetition_accumulator import (
 
 
 # ---------------------------------------------------------------------------
-# QA-Q1: 8-case is_directionally_aggressive() matrix
+# QA-Q1: 9-case is_directionally_aggressive() matrix
 # ---------------------------------------------------------------------------
 
 class TestIsDirectionallyAggressive:
@@ -87,7 +103,12 @@ class TestIsDirectionallyAggressive:
 # ---------------------------------------------------------------------------
 
 def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
-    """Build a minimal mock event compatible with _DictEventWrapper / ingest_tick."""
+    """Build a minimal mock event compatible with _DictEventWrapper / ingest_tick.
+
+    Only fields actually consumed by RepetitionAccumulator / _DictEventWrapper
+    are set here. Do not add fields that do not exist on OptionsFlowEvent —
+    phantom fields mask future AttributeErrors when the real dataclass changes.
+    """
 
     class _Ev:
         pass
@@ -104,8 +125,6 @@ def _make_event(premium: float, is_aggressive: bool, dte: int = 5) -> object:
     e.trade_type       = "BLOCK"
     e.underlying_price = 175.0
     e.order_side       = "UNKNOWN"
-    e.occ_symbol       = None
-    e.direction        = None
     e.sentiment        = "BULLISH"
     return e
 
@@ -130,16 +149,20 @@ class TestWeightedPremiumGate:
             _make_event(40_000, False),
         ]
         assert ep.total_premium == 160_000
-        assert ep.weighted_premium == 120_000  # 80k + 40k*0.5*2
+        assert ep.weighted_premium == 120_000  # 80k full + 40k*0.5*2
 
     def test_aggression_discount_constant(self):
         """_AGGRESSION_DISCOUNT is 0.5."""
         assert _AGGRESSION_DISCOUNT == 0.5
 
-    def test_passive_only_drops_at_exact_floor(self):
+    def test_passive_only_drops_below_floor(self):
         """
         Passive-only episode: 3 events @ $20k each = $60k raw.
-        T1 DTE<=7 floor = $50k. Weighted = 60k * 0.5 = $30k < $50k -> None.
+        T1 DTE<=7 floor = $50k. Weighted = $60k * 0.5 = $30k < $50k -> None.
+
+        Note: weighted_premium ($30k) is BELOW the floor ($50k), not at it.
+        The test name was corrected from the original 'drops_at_exact_floor'
+        which was factually wrong (QA-F2 deliberation fix, 2026-05-03).
         """
         acc = self._acc()
         acc.set_tier_map({"AAPL": 1})

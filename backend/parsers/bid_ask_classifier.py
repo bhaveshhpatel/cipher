@@ -14,6 +14,14 @@ ING-006: Added is_directionally_aggressive() which replaces is_aggressive()
 
   is_aggressive(trade_type) is retained as a deprecated shim.
   Do not remove until all callers are audited (ING-006 AC).
+
+SA-F2 / ING-007 NOTE:
+  is_aggressive on OptionsFlowEvent is NOT yet persisted as a separate column
+  in flow_events. The column must be added before this branch ships to production
+  otherwise historical rows will be missing is_aggressive data and S8 backtest
+  stratification will be degraded (same argument as execution_mechanic — Session
+  21 deliberation). ING-007 story must be created and S2.5 migration extended
+  before production deploy.
 """
 from typing import Literal
 
@@ -36,6 +44,13 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
     return "MID"
 
 
+# TODO(ING-007/S2): migrate is_directionally_aggressive() to
+# parsers/order_side_classifier.py per Session 8 deliberation resolution.
+# bid_ask_classifier.py answers "where in the spread did this fill occur?"
+# order_side_classifier.py answers "what directional intent do we infer?"
+# These are different abstraction levels and must not be mixed long-term.
+# Placed here temporarily because order_side_classifier.py does not yet exist
+# (S2 scope). Remove this function from this module when S2 lands.
 def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     """
     ING-006: Directional aggression classification.
@@ -53,6 +68,9 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     No size threshold here — ING-002 $10k per-event floor is the correct
     upstream guard. By the time this runs the event has already cleared $10k
     (deliberation SA-Q1, 2026-05-03).
+
+    TEMPORARY LOCATION: This function belongs in order_side_classifier.py
+    (S2 scope). See TODO above.
     """
     ba    = (bid_ask_class or "").strip().upper()
     ctype = (contract_type or "").strip().upper()
