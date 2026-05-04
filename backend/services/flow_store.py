@@ -10,6 +10,10 @@ Usage — call once at startup from main.py lifespan:
     from services.flow_store import start_flow_writer
     asyncio.create_task(start_flow_writer())
 
+    # ING-007: also start the lookback queue worker:
+    from services.flow_store import start_lookback_worker
+    asyncio.create_task(start_lookback_worker())
+
 Tables written:
   - flow_events   : one row per classified tick (batched every 500ms or 100 rows)
   - flow_episodes : one row per Signal Gate crossing, written directly from
@@ -36,6 +40,27 @@ C-003 — Sweep Retroactive Upgrade:
   were written as 'BTO' before the sweep threshold was confirmed. Called
   from _process_trade() via asyncio.create_task() so it does not block
   the stream hot path.
+
+ING-007 — Background Lookback Queue:
+  _lookback_queue: asyncio.Queue (maxsize=5000) — receives ContractKey
+  tuples from _process_trade() in tradier_stream.py. The queue worker
+  (_lookback_worker) calls contract_day_cache.get_lookback() and writes
+  results back onto the RepetitionEpisode in _accumulator.
+
+  First-episode cold-cache behaviour:
+    The first episode for a contract in a session enqueues its ContractKey
+    before the cache entry exists. Until the queue worker completes the
+    DB fetch, ep.prior_days_active = 0 and ep.is_multi_day_repeat = False.
+    This is acceptable — is_multi_day_repeat is enrichment, not a gate
+    (SA-Q1, 2026-05-04). The field self-corrects on subsequent ingest_tick
+    calls once the cache is populated.
+
+  Overflow behaviour:
+    If the queue is full (500 unique contracts firing in rapid succession
+    during a volatile session), put_nowait() raises asyncio.QueueFull.
+    The caller in _process_trade() catches this and increments
+    _stats["lookback_queue_overflow"]. The episode still produces and
+    emits correctly — lookback enrichment is silently skipped for that tick.
 
 Bug fixes applied:
   1. ALERT-LEVEL (2026-04-29): _bus_signal_listener was reading
@@ -82,6 +107,19 @@ _flow_event_buffer: list[dict] = []
 
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
+
+# ---------------------------------------------------------------------------
+# ING-007: Background lookback queue
+# ContractKey = (ticker, contract_type, strike, expiry) — 4-tuple (PBE, 2026-05-04)
+# maxsize=5000 — overflow is caught and counted; never propagated (PBE-Q3)
+# ---------------------------------------------------------------------------
+_lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+
+# Module-level stats — all keys initialised here so /health/stream never
+# raises KeyError on cold start (Rule 6.4, STORY-STEPS_ING.md)
+_stats: Dict[str, int] = {
+    "lookback_queue_overflow": 0,
+}
 
 
 def _is_configured() -> bool:
@@ -142,6 +180,103 @@ async def _flush_flow_events():
         ok = await _insert_rows_with_retry("flow_events", batch)
         if ok:
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
+
+
+# ---------------------------------------------------------------------------
+# ING-007: Lookback queue worker
+# ---------------------------------------------------------------------------
+
+async def _lookback_worker(accumulator) -> None:
+    """
+    ING-007: Background worker that drains _lookback_queue and enriches
+    RepetitionEpisode objects with prior_days_active / prior_days_aggressive.
+
+    Receives ContractKey tuples enqueued by _process_trade() in tradier_stream.py.
+    Calls contract_day_cache.get_lookback() for each key, then writes results
+    back onto the live RepetitionEpisode in the accumulator (if still present).
+
+    accumulator: RepetitionAccumulator instance from tradier_stream module.
+    This avoids a circular import — the caller (tradier_stream.py) passes
+    its module-level accumulator reference at startup.
+
+    The worker runs indefinitely until cancelled. It never raises — all
+    exceptions are caught and logged so the worker cannot kill the event loop.
+    """
+    from utils.contract_day_cache import get_lookback, ContractKey  # local import avoids circular
+
+    log.info("[flow_store] ING-007 lookback queue worker started")
+    while True:
+        try:
+            key: ContractKey = await _lookback_queue.get()
+            ticker, contract_type, strike, expiry = key
+
+            # Resolve DTE-tier floor from the live episode if still present.
+            episode_key = f"{ticker}:{contract_type}:{strike}:{expiry}"
+            ep = accumulator._episodes.get(episode_key)
+            min_premium = 0.0
+            if ep is not None:
+                min_premium = accumulator._get_episode_min_premium(ep)
+
+            result = await get_lookback(key, min_premium)
+
+            # Write back onto the episode if it is still active.
+            if ep is not None:
+                ep.prior_days_active     = result.prior_days_active
+                ep.prior_days_aggressive = result.prior_days_aggressive
+                ep.is_multi_day_repeat   = (
+                    result.prior_days_active >= accumulator._multi_day_min_days
+                )
+                log.debug(
+                    f"[flow_store] lookback enriched {ticker} {contract_type} "
+                    f"{strike} {expiry}: active={result.prior_days_active} "
+                    f"aggressive={result.prior_days_aggressive} "
+                    f"multi_day={ep.is_multi_day_repeat}"
+                )
+            _lookback_queue.task_done()
+
+        except asyncio.CancelledError:
+            log.info("[flow_store] lookback worker cancelled")
+            raise
+        except Exception as exc:  # pragma: no cover
+            log.warning(f"[flow_store] lookback worker exception (non-fatal): {exc}")
+            try:
+                _lookback_queue.task_done()
+            except Exception:
+                pass
+
+
+async def start_lookback_worker(accumulator) -> None:
+    """
+    ING-007: Start the background lookback queue worker.
+    Call once at startup from main.py lifespan alongside start_flow_writer().
+
+        asyncio.create_task(start_lookback_worker(accumulator))
+
+    accumulator: the RepetitionAccumulator instance from tradier_stream module.
+    """
+    await _lookback_worker(accumulator)
+
+
+def enqueue_lookback(contract_key) -> None:
+    """
+    ING-007: Enqueue a ContractKey for async lookback enrichment.
+
+    Called from _process_trade() in tradier_stream.py on the hot path.
+    Uses put_nowait() — never blocks. On QueueFull, increments
+    _stats["lookback_queue_overflow"] and returns silently. The episode
+    still produces and emits correctly; lookback enrichment is skipped
+    for this tick only.
+    """
+    try:
+        _lookback_queue.put_nowait(contract_key)
+    except asyncio.QueueFull:
+        _stats["lookback_queue_overflow"] += 1
+        log.debug("[flow_store] lookback_queue full — overflow +1")
+
+
+def get_lookback_stats() -> Dict[str, int]:
+    """Return a copy of the lookback stats dict for /health/stream."""
+    return dict(_stats)
 
 
 async def persist_flow_event(ev_dict: dict):
@@ -216,7 +351,6 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
         return False
 
-    # Pre-compute the cutoff in Python — PostgREST cannot evaluate SQL expressions
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
 
     url = (

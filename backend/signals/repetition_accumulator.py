@@ -216,7 +216,7 @@ class _DictEventWrapper:
     __slots__ = (
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
-        "is_aggressive",
+        "is_aggressive", "ticker", "strike", "expiry",
     )
 
     def __init__(self, d: dict) -> None:
@@ -228,6 +228,9 @@ class _DictEventWrapper:
         self.order_side       = d.get("order_side", "UNKNOWN")
         self.contract_type    = d.get("contract_type", "")
         self.is_aggressive    = bool(d.get("is_aggressive", False))
+        self.ticker           = d.get("ticker", "")
+        self.strike           = float(d.get("strike", 0.0))
+        self.expiry           = d.get("expiry", "")
 
 
 @dataclass
