@@ -157,6 +157,39 @@ Fix (ING-003 2026-05-03):
   floor) until registry warmup confirms their tier. Safe direction is too
   strict, not too permissive.
   3-way deliberation complete 2026-05-03 — all decisions in sprint doc.
+
+Fix (ING-006-PREMERGE 2026-05-03):
+  7 pre-merge issues resolved for ING-006 / PR #62:
+
+  PREMERGE-1: get_alert_level(sig_ep) → get_alert_level(sig_ep.total_premium)
+    ING-006 changed the signature to accept a float. Passing the episode
+    object caused the tier comparisons to always evaluate falsy (comparing
+    a float against an object returns False in all branches), silently
+    returning RETAIL for every episode regardless of premium.
+
+  PREMERGE-2: get_signal() removed — AttributeError on every tick
+    get_signal() was retired in ING-006 (PBE-F4 cooldown retirement).
+    The call `await accumulator.get_signal(ev.timestamp, persist_ep)` raises
+    AttributeError in production. sig_ep is now set equal to persist_ep —
+    the stream's own SIG-DEBOUNCE / SIGNAL-GATE already handle throttling.
+
+  PREMERGE-3: min_premium= constructor kwarg removed
+    RepetitionAccumulator.__init__ no longer accepts min_premium.
+    Passing it raises TypeError on startup. Removed from instantiation.
+    ING-003 already set dte_premium_tiers which provides the equivalent
+    DTE-stratified floor.
+
+  PREMERGE-4: accumulator.min_premium attribute removed
+    The log line in accumulator_gated branch referenced accumulator.min_premium
+    which no longer exists. Replaced with literal floor description.
+
+  PREMERGE-5: sig_ep.summary_str() removed from RepetitionEpisode
+    All three call sites replaced with an inline f-string built from the
+    episode's public properties.
+
+  PREMERGE-6/7: set_dte_premium_tiers() — method renamed to set_tier_map()
+    Any downstream callers updated. No call sites remain in this file
+    (stream layer uses accumulator.set_tier_map() from registry warmup).
 """
 import asyncio
 import logging
@@ -214,7 +247,7 @@ _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
 # Signal gate thresholds (SIGNAL-GATE 2026-04-29):
-#   Persist to flow_events at low threshold (min_trades=1 / min_premium=10_000).
+#   Persist to flow_events at low threshold (min_trades=1).
 #   Only publish to signal bus when episode has >= _SIGNAL_MIN_TRADES trades
 #   AND total_premium > _SIGNAL_MIN_PREMIUM.
 # ---------------------------------------------------------------------------
@@ -267,16 +300,12 @@ _stats = {
 # FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
 
-# ING-003: pass _DEFAULT_DTE_PREMIUM_TIERS so DTE-stratified floors are active
-# from tick 1. Without this, dte_premium_tiers=None causes _get_episode_min_premium()
-# to fall back to the flat min_premium=$10k floor for ALL DTE buckets during the
-# ~30 min cold-start window (until registry warmup calls set_dte_premium_tiers()).
-# Unknown tickers default to T1 (strictest floor) — safe direction is too strict,
-# not too permissive. Deliberation complete 2026-05-03.
+# PREMERGE-3 (ING-006): min_premium= constructor kwarg was removed in ING-006.
+# ING-003 already provides DTE-stratified floors via dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS.
+# The flat $10k floor is superseded by the tier table — no min_premium kwarg needed.
 accumulator = RepetitionAccumulator(
     window_minutes=30,
     min_trades=1,
-    min_premium=10_000,
     dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
 )
 
@@ -553,6 +582,14 @@ async def _process_trade(raw: dict):
     S6-HOT-PATH (2026-05-01):
       direction = sig_ep.dominant_direction (episode-level, premium-weighted)
       Replaces naive contract_type -> direction mapping that broke SELL PUT campaigns.
+
+    ING-006-PREMERGE (2026-05-03):
+      PREMERGE-2: get_signal() was removed from RepetitionAccumulator (PBE-F4
+      cooldown retirement). sig_ep is now set equal to persist_ep — the stream's
+      own SIG-DEBOUNCE / SIGNAL-GATE handle all throttling at this layer.
+      PREMERGE-1: get_alert_level() now accepts total_premium float, not episode.
+      PREMERGE-4: accumulator.min_premium no longer exists — log line updated.
+      PREMERGE-5: sig_ep.summary_str() removed — replaced with inline f-string.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -692,15 +729,19 @@ async def _process_trade(raw: dict):
     )
 
     persist_ep = await accumulator.ingest_tick(ev)
-    sig_ep     = await accumulator.get_signal(ev.timestamp, persist_ep)
+
+    # PREMERGE-2 (ING-006): get_signal() was removed from RepetitionAccumulator
+    # (PBE-F4 cooldown retirement — dead state). sig_ep is the same episode
+    # returned by ingest_tick. The stream's SIGNAL-GATE + SIG-DEBOUNCE handle
+    # all throttling; no per-accumulator cooldown is needed at this layer.
+    sig_ep = persist_ep
 
     if not persist_ep:
         _stats["accumulator_gated"] += 1
         log.info(
             "[accumulator] gated %s %s $%.0f dte=%d prem=$%.0f "
-            "(below min_premium=$%.0f threshold)",
+            "(below DTE-adjusted premium floor)",
             ev.ticker, ev.contract_type, ev.strike, ev.dte, ev.premium,
-            accumulator.min_premium,
         )
         return
 
@@ -782,11 +823,20 @@ async def _process_trade(raw: dict):
         )
         return
 
-    alert_level = accumulator.get_alert_level(sig_ep)
+    # PREMERGE-1 (ING-006): get_alert_level() signature changed to accept
+    # total_premium: float. Passing the episode object returned wrong tier
+    # (float comparisons against an object always evaluated falsy).
+    alert_level = accumulator.get_alert_level(sig_ep.total_premium)
 
     direction = sig_ep.dominant_direction
 
     # EPISODE-FIX (2026-04-30): persist flow_episode BEFORE the debounce gate.
+    # PREMERGE-5 (ING-006): summary_str() removed from RepetitionEpisode —
+    # replaced with inline f-string using public episode properties.
+    ep_summary = (
+        f"{sig_ep.ticker} {sig_ep.contract_type} ${sig_ep.strike:.0f} {sig_ep.expiry} "
+        f"trades={sig_ep.trade_count} prem=${sig_ep.total_premium:,.0f}"
+    )
     asyncio.create_task(persist_flow_episode({
         "ticker":          sig_ep.ticker,
         "direction":       direction,
@@ -797,7 +847,7 @@ async def _process_trade(raw: dict):
         "trade_count":     sig_ep.trade_count,
         "alert_level":     alert_level,
         "is_accelerating": sig_ep.is_accelerating,
-        "seed_episode":    sig_ep.summary_str(),
+        "seed_episode":    ep_summary,
         "timestamp":       ev.timestamp.isoformat(),
     }))
 
@@ -837,7 +887,7 @@ async def _process_trade(raw: dict):
         sig_ep.total_premium,
         sig_ep.is_accelerating,
         reason,
-        sig_ep.summary_str(),
+        ep_summary,
     )
 
     try:
@@ -859,7 +909,7 @@ async def _process_trade(raw: dict):
             "trade_count":     sig_ep.trade_count,
             "alert_level":     alert_level,
             "is_accelerating": sig_ep.is_accelerating,
-            "seed_episode":    sig_ep.summary_str(),
+            "seed_episode":    ep_summary,
             "timestamp":       ev.timestamp.isoformat(),
         },
     }

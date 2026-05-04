@@ -20,12 +20,31 @@ ING-004: Fallback underlying_price from registry stock_price.
   get_registry() enrichment block after meta enrichment so ev.ticker is
   already canonical. Only applied when registry is ready and sp > 0.
   Counter: _stats["underlying_price_fallback_applied"] owned by this module.
+
+ING-006: Directional aggression classification.
+  is_aggressive field on OptionsFlowEvent now set via
+  is_directionally_aggressive(bid_ask_class, contract_type) instead of
+  the deprecated is_aggressive(trade_type) shim.
+  AT_BID/BELOW_BID on PUT or CALL now correctly returns True — seller
+  writing at bid is conviction directional flow.
+  IMPORTANT: is_aggressive is re-computed after registry enrichment block
+  in case the registry overwrites contract_type (meta.contract_type).
+  is_directionally_aggressive() depends on contract_type — if the registry
+  flips PUT->CALL or CALL->PUT on an AT_BID/BELOW_BID fill, the
+  pre-enrichment value would be stale.
+  The re-computation runs in its own isolated try/except (separate from
+  the registry enrichment try/except) so that a registry exception cannot
+  silently skip the aggression update — deliberation F1 fix (2026-05-03).
+  Synthetic quotes are exempt: is_aggressive is pinned False regardless
+  of contract_type (no valid spread data to claim aggression on).
+  is_aggressive is NOT yet persisted as a separate column in flow_events;
+  that column is added in the ING-007 migration (SA-Q2 deliberation, 2026-05-03).
 """
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional, Union, Literal
-from parsers.bid_ask_classifier import classify_bid_ask, is_aggressive
+from parsers.bid_ask_classifier import classify_bid_ask, is_directionally_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
 
 # Module-level import so tests can patch('parsers.options_flow_parser.get_registry', ...)
@@ -88,7 +107,7 @@ class OptionsFlowEvent:
     # Derived
     trade_type:     str = ""         # SWEEP | BLOCK | SPLIT | SINGLE
     bid_ask_class:  str = ""         # ABOVE_ASK | AT_ASK | MID | AT_BID | BELOW_BID
-    is_aggressive:  bool = False
+    is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive(); re-computed post-registry
     is_golden_sweep: bool = False
 
     # Classification (set later)
@@ -224,6 +243,8 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
         #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
         #   3. Force is_aggressive=False — cannot claim aggression without quotes
         #   4. Apply a 40% conviction haircut (×0.6) downstream
+        # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
+        # post-registry — synthetic spreads have no valid aggression signal.
         # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
@@ -237,7 +258,8 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
             aggressive = False   # cannot claim aggression without real quotes
         else:
             ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
-            aggressive = is_aggressive(ba_class)
+            # ING-006: use directional aggression classifier (replaces is_aggressive shim)
+            aggressive = is_directionally_aggressive(ba_class, ctype)
 
         ttype  = detect_trade_type(size, premium, exc_cnt, fill_cnt)
         golden = is_golden_sweep(ttype, premium, aggressive)
@@ -299,6 +321,11 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
         else:
             ev.conviction_score = raw_conviction
 
+        # ------------------------------------------------------------------
+        # Registry enrichment block.
+        # Guarded by its own try/except so registry errors degrade gracefully
+        # without poisoning ev.is_aggressive (see F1 fix below).
+        # ------------------------------------------------------------------
         try:
             reg = get_registry()
             if reg and reg.is_ready():
@@ -325,6 +352,30 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
                         _stats["underlying_price_fallback_applied"] += 1
         except Exception:
             pass
+
+        # ------------------------------------------------------------------
+        # ING-006 (F1 fix): re-compute is_aggressive AFTER registry enrichment,
+        # in its own isolated try/except.
+        #
+        # WHY separate from registry try/except:
+        # The registry enrichment block above uses a catch-all `except Exception: pass`.
+        # If that block raised mid-way (before reaching this code), is_aggressive
+        # would retain its pre-enrichment value — stale if registry flipped
+        # ev.contract_type (PUT->CALL or CALL->PUT) on an AT_BID/BELOW_BID fill.
+        # By placing re-computation outside that try/except, registry errors
+        # cannot silently skip the aggression update.
+        #
+        # Synthetic quotes are exempt: is_aggressive is pinned False regardless
+        # of contract_type — no valid spread data to claim aggression on.
+        # Deliberation: SA finding F1, 2026-05-03.
+        # ------------------------------------------------------------------
+        if not ev.is_synthetic_quote:
+            try:
+                ev.is_aggressive = is_directionally_aggressive(
+                    ev.bid_ask_class, ev.contract_type
+                )
+            except Exception:
+                pass  # is_aggressive retains pre-enrichment value on unexpected error
 
         return ev
     except Exception:
