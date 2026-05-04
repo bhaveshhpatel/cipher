@@ -11,6 +11,10 @@ QA-PREMERGE-F1 (2026-05-03): dominant_direction fallback test — verifies
   that a PUT episode where one event is missing contract_type resolves
   dominant_direction using the episode's own contract_type (self.contract_type),
   not a hardcoded string. Added to confirm SA-PREMERGE-F1 fix is correct.
+QA-PREMERGE-F2 (2026-05-03): classify_bid_ask() mid-split boundary tests.
+  SA-PREMERGE-F1 deliberation identified that the behavioral change from
+  ±10% tolerance bands to a mid-split had no dedicated test coverage.
+  TestClassifyBidAsk covers the 8-case boundary table for the new logic.
 
 SCOPE NOTE (QA-F1 — deliberation pre-merge review 2026-05-03):
   This file covers ING-006 scope only: is_directionally_aggressive() behaviour
@@ -36,13 +40,118 @@ QA-Q2 notes:
 import asyncio
 from datetime import datetime, timezone
 
-from parsers.bid_ask_classifier import is_directionally_aggressive
+from parsers.bid_ask_classifier import classify_bid_ask, is_directionally_aggressive
 from signals.repetition_accumulator import (
     RepetitionAccumulator,
     RepetitionEpisode,
     _DEFAULT_DTE_PREMIUM_TIERS,
     _AGGRESSION_DISCOUNT,
 )
+
+
+# ---------------------------------------------------------------------------
+# QA-PREMERGE-F2: classify_bid_ask() mid-split boundary tests
+# ---------------------------------------------------------------------------
+
+class TestClassifyBidAsk:
+    """
+    ING-006 SA-PREMERGE-F1 / QA-PREMERGE-F2 (2026-05-03).
+
+    classify_bid_ask() was refactored in ING-006 from ±10%-of-spread
+    tolerance bands to a half-spread (mid) split. This class covers the
+    8-case boundary table for the new logic.
+
+    Reference spread for all cases: bid=1.00, ask=2.00, mid=1.50.
+
+    Boundary table:
+      C-1: fill == ask (2.00)           -> AT_ASK
+      C-2: fill >  ask (2.01)           -> ABOVE_ASK
+      C-3: fill == bid (1.00)           -> AT_BID
+      C-4: fill <  bid (0.99)           -> BELOW_BID
+      C-5: fill >  mid, < ask (1.80)    -> AT_ASK
+      C-6: fill <  mid, > bid (1.20)    -> AT_BID
+      C-7: fill == mid (1.50)           -> MID
+      C-8: ask <= bid (crossed/lock)    -> MID (guard)
+    """
+
+    BID = 1.00
+    ASK = 2.00
+    MID = 1.50
+
+    def test_c1_fill_at_ask(self):
+        """C-1: fill exactly at ask -> AT_ASK."""
+        assert classify_bid_ask(self.ASK, self.BID, self.ASK) == "AT_ASK"
+
+    def test_c2_fill_above_ask(self):
+        """C-2: fill above ask -> ABOVE_ASK."""
+        assert classify_bid_ask(2.01, self.BID, self.ASK) == "ABOVE_ASK"
+
+    def test_c3_fill_at_bid(self):
+        """C-3: fill exactly at bid -> AT_BID."""
+        assert classify_bid_ask(self.BID, self.BID, self.ASK) == "AT_BID"
+
+    def test_c4_fill_below_bid(self):
+        """C-4: fill below bid -> BELOW_BID."""
+        assert classify_bid_ask(0.99, self.BID, self.ASK) == "BELOW_BID"
+
+    def test_c5_fill_above_mid_inside_spread(self):
+        """
+        C-5: fill inside spread but above midpoint (1.80) -> AT_ASK.
+
+        Under the old ±10% logic this would have been MID for a wide spread,
+        or AT_ASK for a narrow spread depending on the tenth value.
+        Under the mid-split, any fill above mid that has not reached ask
+        is AT_ASK — unambiguously leaning toward the ask side.
+        """
+        assert classify_bid_ask(1.80, self.BID, self.ASK) == "AT_ASK"
+
+    def test_c6_fill_below_mid_inside_spread(self):
+        """
+        C-6: fill inside spread but below midpoint (1.20) -> AT_BID.
+
+        Symmetric to C-5. Fill is closer to the bid side — AT_BID.
+        """
+        assert classify_bid_ask(1.20, self.BID, self.ASK) == "AT_BID"
+
+    def test_c7_fill_at_exact_midpoint(self):
+        """
+        C-7: fill exactly at midpoint (1.50) -> MID.
+
+        This is the only true ambiguous case in the mid-split logic.
+        In practice this is a near-zero-probability event on a real tick
+        stream (exact float equality between fill and mid), but must be
+        covered to verify the MID path is reachable.
+        """
+        assert classify_bid_ask(self.MID, self.BID, self.ASK) == "MID"
+
+    def test_c8_crossed_spread_returns_mid(self):
+        """
+        C-8: ask <= bid (locked or crossed spread) -> MID guard.
+
+        A crossed spread means no valid reference points exist for
+        classification. The function returns MID immediately.
+        """
+        assert classify_bid_ask(1.50, 2.00, 1.00) == "MID"  # ask < bid
+        assert classify_bid_ask(1.50, 1.50, 1.50) == "MID"  # ask == bid (locked)
+
+    def test_tight_spread_no_false_mid(self):
+        """
+        Regression: old ±10% logic produced MID for fills near mid on
+        tight spreads. With bid=1.00, ask=1.05, tenth=0.005:
+          old logic: fill=1.025 -> mid of spread, old would classify as MID
+          new logic: fill=1.025 == mid -> MID (correct, matches old)
+          fill=1.026 > mid -> AT_ASK (new; old was also AT_ASK here)
+          fill=1.024 < mid -> AT_BID (new; old was also AT_BID here)
+
+        For fills at the exact midpoint of a tight spread the behavior is
+        identical between old and new. For fills slightly off mid, new is
+        stricter (no tolerance band), which is the desired change.
+        """
+        bid, ask = 1.00, 1.05
+        mid = 1.025
+        assert classify_bid_ask(mid, bid, ask) == "MID"
+        assert classify_bid_ask(1.026, bid, ask) == "AT_ASK"
+        assert classify_bid_ask(1.024, bid, ask) == "AT_BID"
 
 
 # ---------------------------------------------------------------------------

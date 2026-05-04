@@ -37,7 +37,54 @@ TradeType = Literal["ABOVE_ASK","AT_ASK","MID","AT_BID","BELOW_BID"]
 
 
 def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
-    """Return trade aggressiveness classification."""
+    """Return trade aggressiveness classification.
+
+    ING-006 SEMANTIC CHANGE (SA-PREMERGE-F1 deliberation record, 2026-05-03):
+    This implementation replaces the previous ±10%-of-spread tolerance bands:
+
+      OLD (pre-ING-006):
+        tenth = (ask - bid) * 0.1
+        fill >= ask + tenth  -> ABOVE_ASK
+        fill >= ask - tenth  -> AT_ASK
+        fill <= bid - tenth  -> BELOW_BID
+        fill <= bid + tenth  -> AT_BID
+        else                 -> MID
+
+      NEW (ING-006+):
+        fill >  ask  -> ABOVE_ASK
+        fill == ask  -> AT_ASK
+        fill <  bid  -> BELOW_BID
+        fill == bid  -> AT_BID
+        fill >  mid  -> AT_ASK   (inside spread, above midpoint)
+        fill <  mid  -> AT_BID   (inside spread, below midpoint)
+        fill == mid  -> MID
+
+    Why the change was made:
+      The ±10% tolerance bands were an approximation that created a
+      wide MID zone in the middle of the spread. For a typical options
+      market with a $0.10 spread, the tolerance was ±$0.01 — meaning
+      any fill from bid+0.01 to ask-0.01 classified as MID (passive).
+      This was intentional in the original design but produced false
+      passives for fills that clearly leaned toward one side of the spread.
+
+      The mid-split approach is exact and symmetric: every fill is
+      assigned to the side of the spread it is closest to. A fill at
+      exactly mid is the only true ambiguous case and returns MID.
+      This tightens the passive zone from ~80% of the spread to a
+      single point (fill == mid), which is effectively zero probability
+      on a real tick stream.
+
+    Behavioral delta (what changes in production):
+      Fills that previously landed in the ±10% tolerance band around
+      the bid or ask will now classify as AT_BID or AT_ASK instead of
+      MID. These fills were ambiguous under the old logic; they are now
+      treated as directional. This increases the count of events where
+      is_directionally_aggressive() returns True for AT_BID/AT_ASK fills,
+      which feeds directly into RepetitionEpisode.weighted_premium.
+
+    Test coverage: TestClassifyBidAsk in test_ing006_directional_aggression.py
+    covers the 8-case boundary table for this implementation.
+    """
     if ask <= bid:
         return "MID"
     mid = (bid + ask) / 2
