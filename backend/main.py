@@ -14,6 +14,7 @@ Startup sequence (post all fixes):
      e. start_flow_writer()          — DB flush loop
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
+     h. start_lookback_worker()      — async OI/IV lookback enrichment (ING-007)
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -35,6 +36,8 @@ Key architectural fixes:
                         FIRST so Tradier HTTP connections close cleanly before
                         the process exits, freeing session quota for the next
                         container start immediately.
+  ING-007 (main)      — start_lookback_worker(accumulator) spawned as background
+                        task in lifespan; cancelled and awaited on shutdown.
 """
 import asyncio
 import json
@@ -56,10 +59,12 @@ from routers import history
 from routers import admin
 from routers import health
 from core.auth import get_current_user
-from services.tradier_stream import stream_options_flow
+# ING-007: import accumulator for lookback worker wiring
+from services.tradier_stream import stream_options_flow, accumulator
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
-from services.flow_store import start_flow_writer
+# ING-007: start_lookback_worker added
+from services.flow_store import start_flow_writer, start_lookback_worker
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
@@ -224,43 +229,13 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
-# ---------------------------------------------------------------------------
-# M-3: post-build upsert with explicit two-phase error handling.
-#
-# Previously the entire function body was wrapped in a single
-# `except Exception: log.error("non-fatal")` block.  The problem:
-#   - If assign_tiers() raised, upsert_symbol_quotes() was silently skipped
-#     and the DB tier columns went stale with no observable signal.
-#   - There was no way to distinguish "tiers failed" from "upsert failed"
-#     in the logs.
-#
-# New behaviour:
-#   Phase 1 — quote assembly (non-fatal, returns early on failure).
-#   Phase 2 — assign_tiers() in its own try/except; on failure the error is
-#     logged at WARNING level and re-raised so the outer _background_build_
-#     and_upsert wrapper sees it and logs at ERROR.  upsert_symbol_quotes()
-#     is NOT called if assign_tiers() failed.
-#   Phase 3 — upsert_symbol_quotes() in its own try/except; failure logged
-#     at ERROR with exc_info so the full traceback appears in Railway logs.
-# ---------------------------------------------------------------------------
 async def _post_build_upsert(
     registry,
     stream_symbols: list[str],
     raw_quotes: Optional[dict[str, dict]] = None,
 ) -> None:
-    """
-    H1 fix: when raw_quotes is provided (passed from _background_build_and_upsert
-    after build() returns them), build SymbolQuote objects directly from that
-    dict instead of calling _fetch_batch_quotes() again.
-
-    M-3 fix: split into three explicit phases. assign_tiers() failure is
-    caught, logged, and re-raised so upsert_symbol_quotes() is never called
-    with a stale or empty tier map. Each phase has its own try/except so the
-    log clearly identifies which step failed.
-    """
     from services.symbols_loader import SymbolQuote
 
-    # ── Phase 1: assemble quotes ──────────────────────────────────────────
     try:
         if raw_quotes is not None:
             log.info(
@@ -319,9 +294,6 @@ async def _post_build_upsert(
         )
         return
 
-    # ── Phase 2: assign_tiers ─────────────────────────────────────────────
-    # M-3: assign_tiers() failure is re-raised so the caller
-    # (_background_build_and_upsert) logs it at ERROR and upsert is skipped.
     try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
@@ -337,9 +309,8 @@ async def _post_build_upsert(
             "DB tier columns NOT updated, upsert skipped: %s",
             exc, exc_info=True,
         )
-        raise  # M-3: propagate so _background_build_and_upsert logs ERROR
+        raise
 
-    # ── Phase 3: upsert to DB ─────────────────────────────────────────────
     try:
         await universe_store.upsert_symbol_quotes(quotes, tier_map)
         log.info("[post_build] upsert_symbol_quotes complete — DB columns now populated")
@@ -354,14 +325,11 @@ async def _post_build_upsert(
 async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
     log.info("[registry] Background build starting (server already live)")
     try:
-        count, raw_quotes = await registry.build()  # H1: unpack tuple
+        count, raw_quotes = await registry.build()
         log.info("[registry] Background build complete: %d OCC symbols", count)
     except Exception as exc:
         log.error("[registry] Background build failed: %s", exc, exc_info=True)
         return
-    # M-3: _post_build_upsert may raise (from Phase 2 assign_tiers failure).
-    # Wrap here so the background task itself does not crash the process,
-    # but log at ERROR so Railway surfaces it clearly.
     try:
         await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
     except Exception as exc:
@@ -461,7 +429,7 @@ async def _registry_prewarm_loop() -> None:
             if registry is None:
                 log.warning("[prewarm] Registry not initialised — skipping pre-warm")
                 continue
-            count, _ = await registry.build()  # H1: unpack tuple
+            count, _ = await registry.build()
             log.info(
                 "[prewarm] Registry warm: %d OCC contracts ready for market open",
                 count,
@@ -472,9 +440,8 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend…")
+    log.info("Starting Cipher backend\u2026")
 
-    # RC-3: validate ingestion config rows at startup — warns on missing DB keys
     await validate_ingestion_config()
 
     stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()
@@ -510,14 +477,14 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
+    # ING-007: async lookback enrichment worker — drains the enqueue_lookback queue
+    # populated by _process_trade() after each persisted episode.
+    lookback_task         = asyncio.create_task(start_lookback_worker(accumulator))
 
     yield
 
-    # STREAM-5: Cancel stream_task FIRST and await it so all Tradier HTTP
-    # streaming connections are closed cleanly before the process exits.
-    # This frees Tradier's session quota immediately, preventing the
-    # 400 Quota Violation on the next container start.
-    log.info("[shutdown] Closing Tradier stream connections first…")
+    # STREAM-5: Cancel stream_task FIRST so Tradier HTTP connections close cleanly.
+    log.info("[shutdown] Closing Tradier stream connections first\u2026")
     stream_task.cancel()
     try:
         await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
@@ -525,7 +492,7 @@ async def lifespan(app: FastAPI):
         pass
     log.info("[shutdown] Stream task stopped — Tradier session quota released")
 
-    # Cancel remaining tasks
+    lookback_task.cancel()
     build_task.cancel()
     refresh_task.cancel()
     prewarm_task.cancel()
@@ -533,6 +500,7 @@ async def lifespan(app: FastAPI):
     db_write_task.cancel()
     signal_write_task.cancel()
     for task in (
+        lookback_task,
         build_task,
         db_write_task,
         signal_write_task,
@@ -559,9 +527,9 @@ _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
 ]
 _origin_pattern = "|".join(filter(None, [
-    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
+    r"https://[a-zA-Z0-9\\-]+\\.vercel\\.app",
     r"http://localhost:(3000|3001)",
-    r"http://127\.0\.0\.1:3000",
+    r"http://127\\.0\\.0\\.1:3000",
 ] + _explicit_patterns))
 
 log.info("CORS allow_origin_regex: %s", _origin_pattern)
