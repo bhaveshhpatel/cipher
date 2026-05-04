@@ -14,7 +14,6 @@ Startup sequence (post all fixes):
      e. start_flow_writer()          — DB flush loop
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
-     h. start_lookback_worker()      — async OI/IV lookback enrichment (ING-007)
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -36,8 +35,6 @@ Key architectural fixes:
                         FIRST so Tradier HTTP connections close cleanly before
                         the process exits, freeing session quota for the next
                         container start immediately.
-  ING-007 (main)      — start_lookback_worker(accumulator) spawned as background
-                        task in lifespan; cancelled and awaited on shutdown.
 """
 import asyncio
 import json
@@ -59,12 +56,10 @@ from routers import history
 from routers import admin
 from routers import health
 from core.auth import get_current_user
-# ING-007: import accumulator for lookback worker wiring
-from services.tradier_stream import stream_options_flow, accumulator
+from services.tradier_stream import stream_options_flow
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
-# ING-007: start_lookback_worker added
-from services.flow_store import start_flow_writer, start_lookback_worker
+from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
@@ -477,13 +472,9 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
-    # ING-007: async lookback enrichment worker — drains the enqueue_lookback queue
-    # populated by _process_trade() after each persisted episode.
-    lookback_task         = asyncio.create_task(start_lookback_worker(accumulator))
 
     yield
 
-    # STREAM-5: Cancel stream_task FIRST so Tradier HTTP connections close cleanly.
     log.info("[shutdown] Closing Tradier stream connections first\u2026")
     stream_task.cancel()
     try:
@@ -492,7 +483,6 @@ async def lifespan(app: FastAPI):
         pass
     log.info("[shutdown] Stream task stopped — Tradier session quota released")
 
-    lookback_task.cancel()
     build_task.cancel()
     refresh_task.cancel()
     prewarm_task.cancel()
@@ -500,7 +490,6 @@ async def lifespan(app: FastAPI):
     db_write_task.cancel()
     signal_write_task.cancel()
     for task in (
-        lookback_task,
         build_task,
         db_write_task,
         signal_write_task,
@@ -527,9 +516,9 @@ _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
 ]
 _origin_pattern = "|".join(filter(None, [
-    r"https://[a-zA-Z0-9\\-]+\\.vercel\\.app",
+    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
     r"http://localhost:(3000|3001)",
-    r"http://127\\.0\\.0\\.1:3000",
+    r"http://127\.0\.0\.1:3000",
 ] + _explicit_patterns))
 
 log.info("CORS allow_origin_regex: %s", _origin_pattern)
