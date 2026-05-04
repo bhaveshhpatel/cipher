@@ -56,7 +56,7 @@ from routers import history
 from routers import admin
 from routers import health
 from core.auth import get_current_user
-from services.tradier_stream import stream_options_flow
+from services.flow_store import start_flow_writer, start_lookback_worker
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
 from services.flow_store import start_flow_writer
@@ -472,11 +472,15 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
+    lookback_task         = asyncio.create_task(
+        start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
+    )
 
     yield
 
     log.info("[shutdown] Closing Tradier stream connections first\u2026")
     stream_task.cancel()
+    lookback_task.cancel()
     try:
         await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -496,6 +500,7 @@ async def lifespan(app: FastAPI):
         refresh_task,
         registry_refresh_task,
         prewarm_task,
+        lookback_task,
     ):
         try:
             await task
