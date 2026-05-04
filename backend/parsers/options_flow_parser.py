@@ -11,6 +11,8 @@ ING-002: Hard per-event $10k premium floor.
   This is a clean data-quality drop — not a parse error.
   Counter: _stats["below_min_premium"] owned by this module (gate owns counter).
   Exposed via get_stats() — visible in /health/stream through tradier_stream.
+  Sampling log: every _BELOW_PREMIUM_SAMPLE_RATE-th drop emits a DEBUG line
+  with ticker + premium so the composition of this gate is observable.
   Future: wire through ingestion_config key "min_event_premium" with
   10_000 as hardcoded cold-start fallback (ING-002-CONFIG story).
 
@@ -40,12 +42,15 @@ ING-006: Directional aggression classification.
   is_aggressive is NOT yet persisted as a separate column in flow_events;
   that column is added in the ING-007 migration (SA-Q2 deliberation, 2026-05-03).
 """
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional, Union, Literal
 from parsers.bid_ask_classifier import classify_bid_ask, is_directionally_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
+
+logger = logging.getLogger(__name__)
 
 # Module-level import so tests can patch('parsers.options_flow_parser.get_registry', ...)
 try:
@@ -61,6 +66,14 @@ except Exception:  # pragma: no cover
 # fallback when admin config page is built (ING-002-CONFIG).
 # ---------------------------------------------------------------------------
 _MIN_EVENT_PREMIUM = 10_000
+
+# ---------------------------------------------------------------------------
+# ING-002: Sampling rate for the below_min_premium gate log.
+# Every Nth drop emits a DEBUG line: [below_premium] TICKER prem=$X (floor=$Y)
+# Set to 0 to disable sampling entirely (aggregate counter only).
+# Tune upward to reduce log volume in high-throughput sessions.
+# ---------------------------------------------------------------------------
+_BELOW_PREMIUM_SAMPLE_RATE = 500
 
 # ---------------------------------------------------------------------------
 # Parser-level stats.
@@ -201,8 +214,28 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
         # Gate fires after size==0 guard, after premium is known,
         # before OCC parsing and OptionsFlowEvent construction.
         # Counter incremented here — gate owns its counter.
+        # Sampling log: every _BELOW_PREMIUM_SAMPLE_RATE-th drop emits a DEBUG
+        # line so the ticker composition of this gate is observable in logs.
         if premium < _MIN_EVENT_PREMIUM:
             _stats["below_min_premium"] += 1
+            if (
+                _BELOW_PREMIUM_SAMPLE_RATE > 0
+                and _stats["below_min_premium"] % _BELOW_PREMIUM_SAMPLE_RATE == 0
+            ):
+                # Best-effort ticker extraction — OCC parse not yet run, use raw fields.
+                sample_ticker = (
+                    raw.get("underlying")
+                    or (symbol.split()[0] if symbol else symbol)
+                    or "UNKNOWN"
+                )
+                logger.debug(
+                    "[below_premium] %s prem=$%s (floor=$%s) sample=%d/total=%d",
+                    sample_ticker,
+                    f"{premium:,.0f}",
+                    f"{_MIN_EVENT_PREMIUM:,}",
+                    _BELOW_PREMIUM_SAMPLE_RATE,
+                    _stats["below_min_premium"],
+                )
             return "below_premium"
 
         ctype_raw = raw.get("option_type", "") or ""
