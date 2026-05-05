@@ -250,6 +250,23 @@ Fix (PBE-1 2026-05-04): reconcile is_multi_day_repeat threshold.
   _SIGNAL_EMIT_TTL_S (2h) cycle via _evict_lookback_result_cache() so
   the in-process dict does not grow unboundedly across the trading day
   (PBE-3 non-blocking finding, resolved inline).
+
+Fix (BUG-2 / ING-007 2026-05-05): await persist_flow_episode directly.
+  persist_flow_episode() was wrapped in asyncio.create_task(), making it
+  fire-and-forget. Two problems:
+    1. Tests: create_task schedules the coroutine but it hasn't run by the
+       time the assertion executes. mock_persist_ep.called is False on every
+       test — ~15 test failures.
+    2. Production: any httpx timeout or Supabase error from persist_flow_episode
+       was silently swallowed because no .add_done_callback() or error handler
+       was attached to the task. Episode write failures were invisible in logs.
+  Fix: replace create_task(persist_flow_episode(...)) with:
+    await asyncio.wait_for(persist_flow_episode(...), timeout=_PERSIST_EPISODE_TIMEOUT)
+  with a dedicated 3s timeout (separate constant from _PERSIST_TIMEOUT which
+  guards persist_flow_event). On TimeoutError: log.warning and continue —
+  episode write failure must never stall the stream hot path.
+  This matches the existing pattern for persist_flow_event (already guarded
+  by asyncio.wait_for + explicit TimeoutError handler).
 """
 import asyncio
 import logging
@@ -290,6 +307,9 @@ _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
 _PERSIST_TIMEOUT     = 2.0
+# BUG-2 fix: dedicated timeout for persist_flow_episode (separate from
+# _PERSIST_TIMEOUT which guards persist_flow_event with its own retry logic).
+_PERSIST_EPISODE_TIMEOUT = 3.0
 
 # How long to wait for the background build() to complete before
 # streaming starts. We poll every 500ms up to this limit.
@@ -670,6 +690,10 @@ async def _process_trade(raw: dict):
       as the canonical threshold, matching the async worker. Previously
       hardcoded >= 1 caused a transient split where the signal payload
       could carry is_repeat=True while the DB row was later patched False.
+
+    BUG-2 fix (2026-05-05):
+      persist_flow_episode() awaited directly via asyncio.wait_for() instead
+      of create_task(). See module docstring for full rationale.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -931,20 +955,35 @@ async def _process_trade(raw: dict):
 
     # EPISODE-FIX: persist before debounce gate.
     # ING-007: include is_multi_day_repeat in the episode row.
-    asyncio.create_task(persist_flow_episode({
-        "ticker":              sig_ep.ticker,
-        "direction":           direction,
-        "contract_type":       sig_ep.contract_type,
-        "strike":              sig_ep.strike,
-        "expiry":              sig_ep.expiry,
-        "total_premium":       sig_ep.total_premium,
-        "trade_count":         sig_ep.trade_count,
-        "alert_level":         alert_level,
-        "is_accelerating":     sig_ep.is_accelerating,
-        "is_multi_day_repeat": _is_multi_day_repeat,
-        "seed_episode":        ep_summary,
-        "timestamp":           ev.timestamp.isoformat(),
-    }))
+    # BUG-2 fix: await directly with wait_for instead of create_task so tests
+    # can observe the call and production errors surface in logs.
+    try:
+        await asyncio.wait_for(
+            persist_flow_episode({
+                "ticker":              sig_ep.ticker,
+                "direction":           direction,
+                "contract_type":       sig_ep.contract_type,
+                "strike":              sig_ep.strike,
+                "expiry":              sig_ep.expiry,
+                "total_premium":       sig_ep.total_premium,
+                "trade_count":         sig_ep.trade_count,
+                "alert_level":         alert_level,
+                "is_accelerating":     sig_ep.is_accelerating,
+                "is_multi_day_repeat": _is_multi_day_repeat,
+                "seed_episode":        ep_summary,
+                "timestamp":           ev.timestamp.isoformat(),
+            }),
+            timeout=_PERSIST_EPISODE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        _stats["errors"] += 1
+        log.warning(
+            "[stream] persist_flow_episode timed out after %.1fs for %s — "
+            "episode row may be missing. Check Supabase latency.",
+            _PERSIST_EPISODE_TIMEOUT, ev.ticker,
+        )
+        # Do NOT return — continue to signal bus publish. Episode persistence
+        # failure must not suppress the WebSocket signal.
 
     # SIG-DEBOUNCE
     now_ts = _time.time()
