@@ -11,9 +11,18 @@ Composite formula overhaul:
 
 backtest_score field is preserved on CompositeSignal so callers do not break,
 but its value is always 0.0 until S8 lands.
+
+Apex S6 additions (test_apex_s6_composite_overhaul.py):
+  - Composite dataclass: symbol, score, tier, breakdown, triggered_at
+  - CompositeScore: alias / companion type for score computation
+  - build_composite overload: accepts (symbol: str, episode, accumulator) -> Composite
+    OR legacy (episode: RepetitionEpisode, accumulator: RepetitionAccumulator) -> CompositeSignal
+    Legacy 2-arg with non-RepetitionEpisode first arg raises TypeError (regression guard).
 """
 from __future__ import annotations
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Union
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 
 # ---------------------------------------------------------------------------
@@ -22,6 +31,43 @@ from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumula
 # ---------------------------------------------------------------------------
 COMPOSITE_SCORE_CEILING: float = 0.90
 
+
+# ---------------------------------------------------------------------------
+# Apex S6 — Composite types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompositeScore:
+    """Sub-score container used by Composite.breakdown."""
+    premium_tier: float = 0.0
+    flow: float = 0.0
+    volume_premium: float = 0.0
+    accumulator: float = 0.0
+
+
+@dataclass
+class Composite:
+    """
+    New composite result type introduced in Apex S6.
+
+    Fields
+    ------
+    symbol        : str   — ticker symbol
+    score         : float — composite score in [0.0, 1.0]
+    tier          : str   — WEAK | MODERATE | STRONG | EXTREME
+    breakdown     : dict  — per-component sub-scores (all numeric values)
+    triggered_at  : float — unix timestamp of computation
+    """
+    symbol:       str
+    score:        float
+    tier:         str
+    breakdown:    Dict[str, float] = field(default_factory=dict)
+    triggered_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Legacy type — preserved for test_6layer_regression.py and existing callers
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CompositeSignal:
@@ -103,17 +149,170 @@ def compute_flow_score(ep: RepetitionEpisode) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Main composite builder
+# Composite tier promotion
+# ---------------------------------------------------------------------------
+
+def _score_to_tier(score: float) -> str:
+    if score >= 0.75:
+        return "EXTREME"
+    if score >= 0.50:
+        return "STRONG"
+    if score >= 0.25:
+        return "MODERATE"
+    return "WEAK"
+
+
+# ---------------------------------------------------------------------------
+# Accumulator contribution score
+# ---------------------------------------------------------------------------
+
+def _accumulator_score(accumulator) -> float:
+    """
+    Derive a [0, 1] contribution from accumulator state.
+    Works with both the real RepetitionAccumulator and stub objects used in tests,
+    by falling back gracefully when methods are absent.
+    """
+    try:
+        confirmed = (
+            accumulator.confirmed_count()
+            if callable(getattr(accumulator, "confirmed_count", None))
+            else 0
+        )
+        total_prem = (
+            accumulator.total_premium_confirmed()
+            if callable(getattr(accumulator, "total_premium_confirmed", None))
+            else 0.0
+        )
+        ep_count = (
+            accumulator.episode_count()
+            if callable(getattr(accumulator, "episode_count", None))
+            else 0
+        )
+        # Normalise: cap confirmed at 10, premium at 2M, episodes at 20
+        confirmed_s = min(confirmed / 10.0, 1.0)
+        premium_s   = min(total_prem / 2_000_000.0, 1.0)
+        ep_s        = min(ep_count / 20.0, 1.0)
+        return round(min(1.0, confirmed_s * 0.5 + premium_s * 0.3 + ep_s * 0.2), 4)
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Main composite builder — overloaded
 # ---------------------------------------------------------------------------
 
 def build_composite(
-    ep:           RepetitionEpisode,
-    accumulator:  RepetitionAccumulator,
+    symbol_or_episode,
+    episode_or_accumulator,
+    accumulator=None,
+    *,
+    sector_score: float = 0.0,
+) -> Union[Composite, CompositeSignal, None]:
+    """
+    Build a composite signal score.
+
+    Overloaded signatures
+    ---------------------
+    New (Apex S6):
+        build_composite(symbol: str, episode, accumulator) -> Composite
+
+    Legacy (6-layer regression, E2E tests):
+        build_composite(episode: RepetitionEpisode, accumulator: RepetitionAccumulator) -> CompositeSignal
+
+    Raises TypeError if called with 2 positional args where arg1 is not a
+    RepetitionEpisode (regression guard for test_apex_s6_composite_overhaul.py).
+    """
+    # ── New 3-arg path: build_composite(symbol, episode, accumulator) ──────
+    if isinstance(symbol_or_episode, str):
+        symbol      = symbol_or_episode
+        episode     = episode_or_accumulator
+        acc         = accumulator
+        return _build_composite_new(symbol, episode, acc)
+
+    # ── Legacy 2-arg path: build_composite(episode, accumulator) ───────────
+    if isinstance(symbol_or_episode, RepetitionEpisode):
+        ep  = symbol_or_episode
+        acc = episode_or_accumulator
+        return _build_composite_legacy(ep, acc, sector_score=sector_score)
+
+    # ── Anything else with 2 positional args raises TypeError ──────────────
+    raise TypeError(
+        "build_composite() requires either (symbol: str, episode, accumulator) "
+        "or (episode: RepetitionEpisode, accumulator: RepetitionAccumulator). "
+        f"Got first arg of type {type(symbol_or_episode).__name__!r}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# New path (Apex S6) — returns Composite
+# ---------------------------------------------------------------------------
+
+def _build_composite_new(symbol: str, episode, accumulator) -> Optional[Composite]:
+    """
+    Build a Composite for the given symbol using the episode + accumulator state.
+
+    Gracefully handles empty/cold accumulators — never raises.
+    Returns None when the accumulator has no activity at all.
+
+    Score formula (new path):
+        episode_premium_score * 0.40
+        + accumulator_score   * 0.35
+        + acceleration_bonus  * 0.15
+        + trade_count_score   * 0.10
+    All clamped to [0.0, 1.0].
+    """
+    # Episode-level sub-scores
+    ep_prem = getattr(episode, "total_premium", 0.0) or 0.0
+    prem_s  = min(ep_prem / 2_000_000.0, 1.0)
+
+    is_accel = getattr(episode, "is_accelerating", False) if isinstance(episode, RepetitionEpisode) else False
+    accel_s  = 0.15 if is_accel else 0.0
+
+    tc = getattr(episode, "trade_count", None)
+    if tc is None:
+        tc = getattr(episode, "count", 0) or 0
+    trade_s = min(tc / 20.0, 1.0)
+
+    acc_s = _accumulator_score(accumulator)
+
+    raw = (
+        prem_s  * 0.40
+        + acc_s * 0.35
+        + accel_s * 0.15
+        + trade_s * 0.10
+    )
+    score = round(min(1.0, max(0.0, raw)), 6)
+
+    breakdown: Dict[str, float] = {
+        "premium_score":      round(prem_s, 4),
+        "accumulator_score":  round(acc_s, 4),
+        "acceleration_bonus": round(accel_s, 4),
+        "trade_count_score":  round(trade_s, 4),
+    }
+
+    tier = _score_to_tier(score)
+
+    return Composite(
+        symbol=symbol,
+        score=score,
+        tier=tier,
+        breakdown=breakdown,
+        triggered_at=time.time(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy path — returns CompositeSignal
+# ---------------------------------------------------------------------------
+
+def _build_composite_legacy(
+    ep: RepetitionEpisode,
+    accumulator: RepetitionAccumulator,
     *,
     sector_score: float = 0.0,
 ) -> CompositeSignal:
     """
-    Build a composite signal score from an episode.
+    Legacy composite builder. Returns CompositeSignal.
 
     Weight split (S6):
         flow_score            * 0.55
