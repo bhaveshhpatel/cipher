@@ -13,6 +13,15 @@ Fix summary (2026-04-26):
     RepetitionAccumulator._key() and build_composite() work correctly.
   - All acc.ingest() / acc.ingest_tick() calls wrapped with asyncio.run()
     because RepetitionAccumulator methods are now async coroutines.
+
+Fix summary (chunk-5, 2026-05-05):
+  - test_parse_negative_fill_still_parses: parse_tradier_trade() returns the
+    ING-002 sentinel "below_premium" (not None) when premium < $10k floor,
+    which includes the negative-fill case (last=-1.0 * 100 * 100 = -10_000).
+    Assertion updated to accept None, "below_premium", or OptionsFlowEvent.
+  - TestLayer3Accumulator._accum: default DTE-tier floor for dte=30 is
+    500_000, far above the 60_000 total premium the three 20k-premium test
+    events accumulate.  Override with a flat 10_000 floor so Gate 2 passes.
 """
 import asyncio
 import pytest
@@ -148,10 +157,13 @@ class TestLayer1Parse:
         assert result is None
 
     def test_parse_negative_fill_still_parses(self):
+        """Negative fill price produces negative premium which is below the $10k ING-002
+        floor, so parse_tradier_trade() returns the 'below_premium' sentinel (not None
+        and not an OptionsFlowEvent).  Accept any of the three valid outcomes."""
         from parsers.options_flow_parser import parse_tradier_trade
         raw = _raw_trade(last=-1.0, bid=0.0, ask=0.0)
         result = parse_tradier_trade(raw)
-        assert result is None or isinstance(result, OptionsFlowEvent)
+        assert result is None or result == "below_premium" or isinstance(result, OptionsFlowEvent)
 
 
 # ===========================================================================
@@ -188,7 +200,16 @@ class TestLayer2Tier:
 class TestLayer3Accumulator:
     def _accum(self):
         from signals.repetition_accumulator import RepetitionAccumulator
-        return RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+        # Override DTE tiers with a flat 10_000 floor so test events with
+        # 20_000 premium each (60_000 total for 3 events) clear Gate 2.
+        # The default 30-day tier floor is 500_000 — far too high for unit
+        # test fixtures.  min_premium kwarg is accepted but silently ignored
+        # by the constructor (backward-compat shim only).
+        return RepetitionAccumulator(
+            window_minutes=30,
+            min_trades=3,
+            dte_premium_tiers=[(9999, {1: 10_000, 2: 10_000, 3: 10_000})],
+        )
 
     def test_below_threshold_returns_none(self):
         acc = self._accum()
@@ -400,7 +421,7 @@ class TestE2EPipeline:
             raw = _raw_trade(symbol=sym, underlying=ticker, size=100, last=5.0)
             ev = parse_tradier_trade(raw)
             if ev:
-                ev.influence_tier = _classify_tier(ev.premium)
+                ev.influence_tier = _classify_tier(ev.ticker if isinstance(ev, OptionsFlowEvent) else 0)
                 await fs.add_flow({"ticker": ev.ticker,
                                    "influence_tier": ev.influence_tier})
 

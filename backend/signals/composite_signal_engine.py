@@ -156,9 +156,30 @@ def premium_tier_score(ep) -> float:
 
 
 def compute_flow_score(ep) -> float:
-    prem   = min(ep.total_premium / 10_000_000, 1.0)
-    accel  = 0.15 if ep.is_accelerating else 0.0
-    trades = min(ep.trade_count / 20, 0.20)
+    """
+    Compute a [0, 1] flow score for an episode.
+
+    Trade-count cap (chunk-5 fix):
+      The premium contribution is normalised against *capped* trade count so
+      that 50 trades with the same per-trade premium as 20 trades score
+      identically.  Without this cap the premium component would keep growing
+      even after the trade-count signal saturates.
+
+      effective_tc   = min(trade_count, 20)
+      avg_premium    = total_premium / trade_count  (0 when no trades)
+      prem_component = min(effective_tc * avg_premium / 10_000_000, 1.0)
+
+    Formula:
+      score = clamp(prem_component * 0.65 + accel_bonus + trade_component, 1.0)
+      where accel_bonus     = 0.15 if is_accelerating else 0.0
+            trade_component = min(effective_tc / 20, 0.20)
+    """
+    raw_tc    = getattr(ep, "trade_count", 0) or 0
+    eff_tc    = min(raw_tc, 20)
+    avg_prem  = (ep.total_premium / raw_tc) if raw_tc > 0 else 0.0
+    prem      = min(eff_tc * avg_prem / 10_000_000, 1.0)
+    accel     = 0.15 if ep.is_accelerating else 0.0
+    trades    = min(eff_tc / 20, 0.20)
     return round(min(1.0, prem * 0.65 + accel + trades), 3)
 
 
