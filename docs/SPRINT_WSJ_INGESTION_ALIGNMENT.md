@@ -39,8 +39,9 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60, commit `d3c3f31`) |
 | 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ CLOSED — 2026-05-03 (PR #61, commit `252d75f`) |
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
-| 6 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅ | 🔓 UNBLOCKED — deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
-| 7 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔓 UNBLOCKED — deliberation required before implementation |
+| 6 | **ING-009** | Same-session flow episode upsert/merge | ING-002 ✅, ING-003 ✅, ING-006 ✅ | 🔴 Deliberation ✅ COMPLETE 2026-05-05 — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — **MUST ship before ING-007** |
+| 7 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009** | ⏳ BLOCKED on ING-009 — deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
+| 8 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔴 UNBLOCKED — deliberation required before implementation |
 
 ---
 
@@ -58,6 +59,7 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
 | [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
 | [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue |
+| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | **Blocking ING-007** | ING-009 canonical issue |
 
 ---
 
@@ -160,39 +162,6 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 - Supabase migration — insert 9 new rows into `ingestion_config` table
 - Frontend: new admin panel card (separate frontend story; backend ships first)
 
-#### Context
-`_DEFAULT_DTE_PREMIUM_TIERS` is hardcoded in `repetition_accumulator.py` as a module-level constant. There is no mechanism to change floors without a code deploy. This is low risk while the system is early, but as Cipher matures there are legitimate use cases for an operator to dial signal sensitivity up or down — e.g., switching to a permissive preset during low-volatility periods to capture smaller institutional positioning.
-
-The `_MIN_EVENT_PREMIUM` scalar from ING-002 also belongs in this story's scope — wire it together rather than adding a second partial config story later.
-
-**Why named presets, not raw field editing:**
-Eight interdependent DTE floors with no validation create a footgun. A misconfigured floor silently changes which episodes qualify, changing signal volume, which is hard to attribute without strong observability. Named presets constrain the decision surface: the operator chooses a validated methodology, not raw numbers. Custom mode exists for deliberate expert use with full awareness.
-
-#### Preset Definitions
-
-**WSJ-Strict (default — current hardcoded values):**
-```python
-_PRESET_WSJ_STRICT: Dict[int, Tuple[float, float]] = {
-    7:    (50_000,    25_000),
-    30:   (500_000,   100_000),
-    90:   (1_000_000, 500_000),
-    9999: (2_000_000, 1_000_000),
-}
-```
-
-**WSJ-Permissive (half the strict T1 floors; T2/T3 column = ~half of strict T2/T3):**
-```python
-_PRESET_WSJ_PERMISSIVE: Dict[int, Tuple[float, float]] = {
-    7:    (25_000,   10_000),
-    30:   (100_000,  50_000),
-    90:   (500_000,  250_000),
-    9999: (1_000_000, 500_000),
-}
-```
-Rationale: permissive T1 floors equal the current strict T2/T3 floors — consistent internal logic. Permissive T2/T3 floors are half again. SA deliberation required to confirm these values before hardcoding.
-
-**Custom:** resolves floor values from 8 individual `ingestion_config` keys (see below).
-
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
 
 ---
@@ -248,11 +217,107 @@ Rationale: permissive T1 floors equal the current strict T2/T3 floors — consis
 
 ---
 
+### ING-009 — Same-Session Flow Episode Upsert/Merge
+
+**Type:** Bug Fix / Data Model Correctness
+**Priority:** P0
+**Estimated Effort:** 1 day
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-005 ✅, ING-006 ✅
+**Blocks:** ING-007 — `get_contract_prior_days()` depends on `flow_episodes` being correctly aggregated
+**Files:**
+- `backend/services/flow_store.py` — `persist_flow_episode()` upsert logic + new `_stats` counters
+- `backend/tests/test_ing009_episode_upsert.py` — NEW: full test matrix
+**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75)
+**Branch:** `ing/s9-episode-upsert`
+
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-05)
+**All three roles signed off. Story cleared for implementation.**
+
+#### Problem
+
+`flow_episodes` is currently insert-only from the Signal Gate path, creating one new row per qualifying print instead of one row per logical same-session episode. This makes `flow_episodes` a near-duplicate of `flow_events` (26,906 vs 28,373 rows on 2026-05-05) rather than an aggregated episode table.
+
+The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBOUNCE to preserve `strike`/`expiry`, but in doing so exposed that `persist_flow_episode()` has no merge/upsert path — every Signal Gate crossing unconditionally inserts a new row.
+
+**Root cause:** ING-007's `get_contract_prior_days()` will query fragmented single-print episode rows and produce unreliable repeat-day counts. ING-009 must ship before ING-007 is implemented.
+
+#### Deliberation Outcomes
+
+**SA — DECIDED: Fix data model semantics, not the gate threshold**
+- `flow_events` = every qualifying classified tick
+- `flow_episodes` = one aggregated episode per contract per same-session window
+- Reintroducing a drop gate (e.g. `min_trade > N`) at the DB-write level hides data rather than models it correctly
+- Keep gate order: Signal Gate → `persist_flow_episode()` → SIG-DEBOUNCE. Do not re-tie to debounce.
+- Fix belongs in episode upsert/merge semantics inside `persist_flow_episode()` in `flow_store.py`
+
+**PBE — DECIDED: Insert-or-update in `persist_flow_episode()` keyed on contract identity + session window**
+- Add episode lookup via Supabase REST: query `flow_episodes` for open episode matching key with `signal_ts >= now() - _EPISODE_MERGE_WINDOW_S`
+- Episode merge key: `(ticker, direction, contract_type, strike, expiry)`
+- On match → PATCH: `trade_count += 1`, `total_premium += new_premium`, `signal_ts = new_ts`
+- On no match → INSERT (existing path unchanged)
+- Merge logic lives entirely in `flow_store.py` — not in `tradier_stream.py`, not in the accumulator
+- ING-007's multi-day repeat detection is a separate query layer on top of correctly merged episodes
+
+**QA — DECIDED: Full boundary test matrix required**
+- Must prove: two qualifying prints for same contract within window → one row, `trade_count = 2`
+- Must prove: print after window expiry → new episode row
+- Must prove: next-day repeat → new episode row (ING-007 repeat flag applies independently)
+- Window edge boundary tests required: at `_EPISODE_MERGE_WINDOW_S`, at `_EPISODE_MERGE_WINDOW_S + 1s`
+
+#### Acceptance Criteria
+
+- [ ] `flow_episodes` has exactly 1 row per same-session contract episode within the merge window
+- [ ] A subsequent qualifying print for an open episode updates the existing row — no new row inserted
+- [ ] `trade_count` increments by 1 on each merge
+- [ ] `total_premium` accumulates on merge
+- [ ] `signal_ts` updates to the latest qualifying print timestamp on merge
+- [ ] `strike` and `expiry` remain correctly populated from the raw signal path (EPISODE-FIX preserved)
+- [ ] No debounce regression — `persist_flow_episode()` still called before SIG-DEBOUNCE
+- [ ] ING-007 `get_contract_prior_days()` query is unaffected (separate concern)
+- [ ] Tests: first print (insert), second print within window (merge), print after window expiry (new episode), next-day (new episode)
+- [ ] Boundary tests: merge window edge cases
+- [ ] `_stats["created_episodes"]` and `_stats["merged_episodes"]` initialised at module level
+- [ ] Both counters visible in `/health/stream` from cold start
+- [ ] No TODO comments in implementation code
+- [ ] No DB reads on the hot path — lookup is async, does not block the stream tick
+
+#### Implementation Steps
+
+1. Define `_EPISODE_MERGE_WINDOW_S: int = 1800` (30 min) as module-level constant in `flow_store.py`
+2. Define episode merge key: `(ticker, direction, contract_type, strike, expiry)`
+3. Add `_lookup_open_episode(key_fields: dict, window_s: int) -> Optional[dict]` in `flow_store.py`
+   - Query `flow_episodes` via Supabase REST: `ticker=eq.X&direction=eq.X&contract_type=eq.X&strike=eq.X&expiry=eq.X&signal_ts=gte.{cutoff}&order=signal_ts.desc&limit=1`
+   - Return episode row dict if found, else `None`
+4. Refactor `persist_flow_episode(signal_data: dict)`:
+   - Call `_lookup_open_episode()` with merge key and window
+   - **No match →** INSERT (existing `_insert_rows("flow_episodes", [row])` path); increment `_stats["created_episodes"]`
+   - **Match found →** PATCH existing row id: `trade_count += 1`, `total_premium += new`, `signal_ts = new`; increment `_stats["merged_episodes"]`
+5. Add `"created_episodes": 0` and `"merged_episodes": 0` to module-level `_stats` init block
+6. Write `backend/tests/test_ing009_episode_upsert.py` covering full test matrix below
+
+#### QA Test Matrix
+
+| Case | Description | Expected |
+|---|---|---|
+| E-1 | First qualifying print for contract | INSERT — new episode row, `trade_count=1` |
+| E-2 | Second qualifying print, same contract, within window | PATCH — same row, `trade_count=2`, `total_premium` accumulated |
+| E-3 | Third qualifying print, same contract, within window | PATCH — same row, `trade_count=3` |
+| E-4 | Print for same contract after window expiry | INSERT — new episode row, `trade_count=1` |
+| E-5 | Print for different strike, same ticker | INSERT — new episode row (different key) |
+| E-6 | Print for different expiry, same strike+ticker | INSERT — new episode row (different key) |
+| E-7 | Next-day print for same contract | INSERT — new episode row (ING-007 repeat flag independent) |
+| E-8 | `_lookup_open_episode` Supabase error → fallback to INSERT | INSERT — episode not lost on lookup failure |
+| E-9 | `strike`/`expiry` correctly populated on both INSERT and PATCH paths | Both fields non-null |
+| E-10 | Window boundary — print at exactly `_EPISODE_MERGE_WINDOW_S` | PATCH (inclusive boundary) |
+| E-11 | Window boundary — print at `_EPISODE_MERGE_WINDOW_S + 1s` | INSERT (new episode) |
+
+---
+
 ### ING-007 — Multi-Day Repeat Window Lookback (DB + Cache)
 **Type:** Feature / Signal Enhancement
 **Priority:** P0
 **Estimated Effort:** 2 days
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅ — fully unblocked
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 (episode upsert — MUST merge first)**
 **Files:**
 - `backend/utils/contract_day_cache.py` — NEW: async TTL cache + DB fetch logic
 - `backend/signals/repetition_accumulator.py` — wire `prior_days_active`, `prior_days_aggressive`, `is_multi_day_repeat`, `otm_band` onto `RepetitionEpisode`; constructor params `require_multi_day`, `multi_day_min_days`
@@ -264,7 +329,7 @@ Rationale: permissive T1 floors equal the current strict T2/T3 floors — consis
 **Branch:** `ing/s7-multiday-repeat`
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
-**All three roles signed off. Story cleared for implementation.**
+**All three roles signed off. Story cleared for implementation. Blocked on ING-009.**
 
 ---
 
@@ -468,4 +533,4 @@ Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `
 
 ---
 
-*Last updated: 2026-05-04 (ING-007 3-way deliberation complete; branch `ing/s7-multiday-repeat` ready for implementation) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-05 (ING-009 3-way deliberation complete; Issue #75; branch `ing/s9-episode-upsert` ready for implementation — blocks ING-007) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
