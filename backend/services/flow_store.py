@@ -88,6 +88,15 @@ PRE-MERGE BLOCKER FIXES (2026-05-04):
       Step 2: PATCH ?id=eq.{id}
               → update exactly that row. Zero spurious multi-row overwrites.
 
+DELIBERATION INLINE FIXES (2026-05-04):
+  SA-F3: _update_episode_multiday GET-returns-empty-rows path was logged at
+    DEBUG (invisible in Railway). Elevated to INFO so cold-miss rate is
+    observable without lowering the global log level.
+
+  PBE-F5: start_lookback_worker() resolved min_premium per-key but never
+    logged it. Added log.debug line after resolution so Railway logs surface
+    which DTE-tier floor is being applied to each lookback fetch.
+
 ING-007 cold-cache note:
   The background asyncio.Queue pattern means lookback results are populated
   asynchronously after the first episode for a contract arrives. The first
@@ -133,7 +142,7 @@ _RETRY_DELAY_S = 1.0
 _LOOKBACK_QUEUE_MAX = 5_000  # PBE-Q3: 5000, not 500
 _lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=_LOOKBACK_QUEUE_MAX)
 _lookback_stats: Dict[str, int] = {
-    "lookback_queued":        0,
+    "lookback_queued":         0,
     "lookback_queue_overflow": 0,  # PBE-Q3: exact key name per deliberation
 }
 
@@ -425,6 +434,10 @@ async def _update_episode_multiday(
       Step 2: PATCH ?id=eq.{id}
               Update exactly that single row. No spurious multi-row overwrites.
 
+    SA-F3 fix (2026-05-04): empty GET response (race between INSERT commit
+    and queue worker) was logged at DEBUG — invisible in Railway. Elevated
+    to INFO so cold-miss rate is observable without changing global log level.
+
     Silently swallows errors — enrichment failure must never block the stream.
     """
     if not _is_configured():
@@ -471,11 +484,14 @@ async def _update_episode_multiday(
 
             rows = get_resp.json()
             if not rows:
-                # No matching episode yet — possible on the very first persist
-                # if the async worker races ahead of the INSERT commit.
-                log.debug(
-                    "[flow_store] _update_episode_multiday: no rows found for "
-                    "%s %s $%.0f %s — skipping PATCH",
+                # SA-F3: elevated from DEBUG to INFO — INSERT may not have
+                # committed yet (race between queue worker and DB write).
+                # Enrichment-only flag; skipping is safe but we want Railway
+                # visibility on how often this race fires.
+                log.info(
+                    "[flow_store] _update_episode_multiday: no episode row found yet for "
+                    "%s %s $%.0f %s — INSERT may not have committed; "
+                    "skipping PATCH (enrichment-only, not a gate)",
                     ticker, contract_type, strike, expiry,
                 )
                 return
@@ -538,6 +554,10 @@ async def start_lookback_worker(accumulator) -> None:
       TypeError. Fixed to use the correct attribute name and traverse the
       list-of-tuples structure to extract the minimum floor value.
 
+    PBE-F5 fix (2026-05-04):
+      min_premium resolved per-key but never logged. Added debug line so
+      Railway logs surface which DTE-tier floor is applied to each fetch.
+
     Cold-cache note: the first episode for any contract returns
     prior_days_active=0 (cache miss → DB fetch). Subsequent ticks within
     the 5-min TTL window use the cached result. This is acceptable —
@@ -579,6 +599,16 @@ async def start_lookback_worker(accumulator) -> None:
                     min_premium = 10_000.0
             except (ValueError, TypeError):
                 min_premium = 10_000.0
+
+            # PBE-F5 fix: log the resolved min_premium so Railway surfaces which
+            # DTE-tier floor is being applied to each lookback fetch. Regressions
+            # to the hardcoded fallback (SA-F1) will now be immediately visible.
+            log.debug(
+                "[lookback_worker] %s %s $%.0f %s — "
+                "min_premium=%.0f (dte_tiers_found=%s)",
+                ticker, contract_type, strike, expiry,
+                min_premium, bool(dte_tiers),
+            )
 
             try:
                 result = await get_lookback(key, min_premium)

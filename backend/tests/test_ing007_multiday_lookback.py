@@ -18,11 +18,17 @@ Test index:
   LAT  Latency benchmark — p99 < 5ms for 1000 _process_trade() calls
   OTM  otm_band wiring — known strike/underlying pair resolves correctly
 
+  QA-F3-A  _update_episode_multiday PATCHes by id= (GET→PATCH two-step path)
+  QA-F3-B  _update_episode_multiday skips PATCH when GET returns empty rows
+  QA-F4    get_lookback_stats() keys present and zero on fresh import (cold-start)
+
 Design notes:
   G-tests mock _fetch_from_db (not the real DB) to isolate cache + counting logic.
   TTL test patches time.monotonic to simulate expiry.
   LAT test drives _process_trade() with a mocked accumulator and measures wall time.
   OTM test calls RepetitionAccumulator.ingest_tick() directly with a real event.
+  QA-F3 tests mock httpx.AsyncClient to verify GET→PATCH URL construction.
+  QA-F4 test imports flow_store fresh and checks module-level stat key existence.
 """
 import asyncio
 import time
@@ -470,4 +476,181 @@ async def test_otm_band_wired_on_episode():
     stored = list(acc._episodes.values())
     assert stored[0].otm_band == "UNKNOWN", (
         f"Expected UNKNOWN for underlying_price=0, got {stored[0].otm_band}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# QA-F3-A: _update_episode_multiday PATCHes by id= (GET→PATCH two-step path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_update_episode_multiday_patches_by_id():
+    """
+    QA-F3-A: Regression guard for PBE-F2 fix (commit f47e625).
+
+    _update_episode_multiday() must:
+      1. Issue a GET request whose URL contains:
+           select=id
+           order=signal_ts.desc
+           limit=1
+           plus the (ticker, contract_type, strike, expiry) filter params
+      2. Extract the id from the GET response ([{"id": 42}])
+      3. Issue a PATCH request to ?id=eq.42 — not to the multi-filter pattern
+      4. PATCH payload must be {"is_multi_day_repeat": True}
+
+    If someone reverts to the old PATCH-with-order/limit pattern, all rows
+    matching the filter are silently overwritten. This test catches that.
+    """
+    import os
+    import services.flow_store as fs
+
+    # Ensure configured so the function doesn't early-return.
+    with patch.dict(os.environ, {
+        "SUPABASE_URL": "https://test.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "test-service-key",
+    }):
+        fs._SUPABASE_URL = "https://test.supabase.co"
+        fs._SUPABASE_KEY = "test-service-key"
+
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.json.return_value = [{"id": 42}]
+
+        patch_response = MagicMock()
+        patch_response.status_code = 204
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=get_response)
+        mock_client.patch = AsyncMock(return_value=patch_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
+            await fs._update_episode_multiday(
+                ticker="AAPL",
+                contract_type="CALL",
+                strike=150.0,
+                expiry="2026-06-20",
+                is_multi_day_repeat=True,
+            )
+
+    # Assert GET was called once.
+    assert mock_client.get.call_count == 1, "Expected exactly one GET call"
+    get_url = mock_client.get.call_args[0][0]
+
+    # Assert GET URL contains all required params.
+    assert "select=id" in get_url, (
+        f"GET URL must contain 'select=id' to retrieve only the row id. Got: {get_url}"
+    )
+    assert "order=signal_ts.desc" in get_url, (
+        f"GET URL must contain 'order=signal_ts.desc' to target latest row. Got: {get_url}"
+    )
+    assert "limit=1" in get_url, (
+        f"GET URL must contain 'limit=1'. Got: {get_url}"
+    )
+    assert "ticker=eq.AAPL" in get_url, f"GET URL must filter by ticker. Got: {get_url}"
+    assert "contract_type=eq.CALL" in get_url, f"GET URL must filter by contract_type. Got: {get_url}"
+
+    # Assert PATCH was called once with id=eq.42.
+    assert mock_client.patch.call_count == 1, "Expected exactly one PATCH call"
+    patch_url = mock_client.patch.call_args[0][0]
+    assert "id=eq.42" in patch_url, (
+        f"PATCH URL must target exact row by id=eq.42, not multi-filter pattern. Got: {patch_url}"
+    )
+    # Assert PATCH URL does NOT contain the old multi-filter + order pattern
+    # that would overwrite all matching rows.
+    assert "order=" not in patch_url, (
+        f"PATCH URL must not contain 'order=' — PostgREST ignores it and "
+        f"overwrites all matching rows. Got: {patch_url}"
+    )
+
+    # Assert PATCH payload.
+    patch_payload = mock_client.patch.call_args[1]["json"]
+    assert patch_payload == {"is_multi_day_repeat": True}, (
+        f"PATCH payload must be {{\"is_multi_day_repeat\": True}}. Got: {patch_payload}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# QA-F3-B: _update_episode_multiday skips PATCH when GET returns empty rows
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_update_episode_multiday_skips_patch_on_empty_get():
+    """
+    QA-F3-B: If GET returns [] (INSERT not yet committed — race window),
+    _update_episode_multiday must NOT call PATCH at all.
+
+    This is the SA-F3 race guard. The function must log at INFO and return
+    cleanly. The enrichment flag is skipped — acceptable per SA-Q1 (not a gate).
+    """
+    import os
+    import services.flow_store as fs
+
+    with patch.dict(os.environ, {
+        "SUPABASE_URL": "https://test.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "test-service-key",
+    }):
+        fs._SUPABASE_URL = "https://test.supabase.co"
+        fs._SUPABASE_KEY = "test-service-key"
+
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.json.return_value = []  # <-- empty: INSERT not yet committed
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=get_response)
+        mock_client.patch = AsyncMock()  # must NOT be called
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
+            await fs._update_episode_multiday(
+                ticker="TSLA",
+                contract_type="PUT",
+                strike=200.0,
+                expiry="2026-07-18",
+                is_multi_day_repeat=False,
+            )
+
+    # GET called once, PATCH must NOT have been called.
+    assert mock_client.get.call_count == 1, "Expected exactly one GET call"
+    assert mock_client.patch.call_count == 0, (
+        "PATCH must NOT be called when GET returns empty rows. "
+        "The INSERT may not have committed yet (race window — SA-F3)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# QA-F4: get_lookback_stats() keys present and zero on cold import
+# ---------------------------------------------------------------------------
+
+def test_lookback_stats_keys_present_on_cold_import():
+    """
+    QA-F4: get_lookback_stats() must return both expected keys with value 0
+    on a fresh module import, before any enqueue_lookback() calls.
+
+    Guards against KeyError on /health/stream from cold start.
+    Regression history: prior ING stories had _stats keys that were only
+    initialised conditionally on first use, causing KeyError on first
+    /health/stream poll after deploy.
+    """
+    import services.flow_store as fs
+
+    stats = fs.get_lookback_stats()
+
+    assert "lookback_queued" in stats, (
+        "'lookback_queued' must be present in get_lookback_stats() on cold start. "
+        "KeyError on /health/stream will surface immediately on first Railway poll."
+    )
+    assert "lookback_queue_overflow" in stats, (
+        "'lookback_queue_overflow' must be present in get_lookback_stats() on cold start. "
+        "KeyError on /health/stream will surface immediately on first Railway poll."
+    )
+    assert stats["lookback_queued"] == 0, (
+        f"lookback_queued must be 0 before any enqueue_lookback() calls. Got: {stats['lookback_queued']}"
+    )
+    assert stats["lookback_queue_overflow"] == 0, (
+        f"lookback_queue_overflow must be 0 before any enqueue_lookback() calls. "
+        f"Got: {stats['lookback_queue_overflow']}"
     )
