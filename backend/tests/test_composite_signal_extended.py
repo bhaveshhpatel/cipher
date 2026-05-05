@@ -9,7 +9,7 @@ Removals vs. pre-S0:
 Covers:
   - backtest_validator: dte buckets, score range, determinism, cache
   - midcap_screener: is_midcap, unusual_oi_ratio, is_unusual_activity
-  - RepetitionAccumulator.get_alert_level: all 4 alert levels
+  - RepetitionAccumulator.get_alert_level: all alert levels (episode path)
   - volume_weighted_premium_factor: zero OI, capped, empty events
   - compute_flow_score: zero premium, high premium, accel bonus, capped
   - build_composite: BUY/SELL/HOLD branches, reasoning, score range
@@ -153,24 +153,53 @@ class TestMidcapScreener:
 
 
 # ---------------------------------------------------------------------------
-# RepetitionAccumulator.get_alert_level
+# RepetitionAccumulator.get_alert_level (episode path)
 # ---------------------------------------------------------------------------
 class TestAlertLevels:
+    """
+    Episode path thresholds:
+      >= 2_000_000                  -> CONVICTION
+      accelerating + >= 1_000_000   -> CONVICTION
+      >= 1_000_000 (not accel.)     -> STRONG_SIGNAL
+      >= 250_000                    -> ALERT
+      >= 100_000                    -> LARGE
+      <  100_000                    -> WATCH
+    """
 
     def _make_ep_with_premium(self, premium: float, accelerating: bool = False) -> RepetitionEpisode:
         base_ts = datetime(2026, 4, 25, 10, 0, 0)
+        if accelerating:
+            # Strictly shrinking gaps: [30s, 10s] -> is_accelerating=True
+            timestamps = [
+                base_ts,
+                base_ts + timedelta(seconds=30),
+                base_ts + timedelta(seconds=40),
+            ]
+        else:
+            # Equal or growing gaps -> is_accelerating=False
+            timestamps = [
+                base_ts,
+                base_ts + timedelta(seconds=300),
+                base_ts + timedelta(seconds=600),
+            ]
         events = []
-        for i in range(3):
-            ts = base_ts + timedelta(seconds=i * (10 if accelerating else 300))
+        for ts in timestamps:
             ev = _make_event(premium=premium // 3, ts=ts)
             events.append(ev)
         ep = _make_episode(events)
         return ep
 
     def test_watch_level(self):
-        ep = self._make_ep_with_premium(200_000)
+        """< 100k -> WATCH. Use 75k total (25k/event * 3 events)."""
+        ep = self._make_ep_with_premium(75_000)
         acc = RepetitionAccumulator()
         assert acc.get_alert_level(ep) == "WATCH"
+
+    def test_large_level(self):
+        """>= 100k -> LARGE. 200k total."""
+        ep = self._make_ep_with_premium(200_000)
+        acc = RepetitionAccumulator()
+        assert acc.get_alert_level(ep) == "LARGE"
 
     def test_alert_level(self):
         ep = self._make_ep_with_premium(300_000)
@@ -188,6 +217,7 @@ class TestAlertLevels:
         assert acc.get_alert_level(ep) == "CONVICTION"
 
     def test_conviction_level_accelerating_with_1m_premium(self):
+        """Accelerating + >= 1M -> CONVICTION. Use strictly shrinking timestamps [0s, 30s, 40s]."""
         ep = self._make_ep_with_premium(1_200_000, accelerating=True)
         acc = RepetitionAccumulator()
         assert acc.get_alert_level(ep) == "CONVICTION"
@@ -240,10 +270,12 @@ class TestComputeFlowScore:
         assert score > 0.5
 
     def test_score_accelerating_adds_bonus(self):
+        """Strictly shrinking gaps [30s, 10s] -> is_accelerating=True."""
         base_ts = datetime(2026, 4, 25, 10, 0, 0)
         events_accel = [
-            _make_event(premium=100_000, ts=base_ts + timedelta(seconds=i * 10))
-            for i in range(3)
+            _make_event(premium=100_000, ts=base_ts),
+            _make_event(premium=100_000, ts=base_ts + timedelta(seconds=30)),
+            _make_event(premium=100_000, ts=base_ts + timedelta(seconds=40)),
         ]
         events_slow = [
             _make_event(premium=100_000, ts=base_ts + timedelta(seconds=i * 300))
