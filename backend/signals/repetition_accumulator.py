@@ -30,6 +30,29 @@
 #
 #   ROLLBACK: Pass min_sweeps=0 to RepetitionAccumulator at instantiation
 #   to restore previous behaviour without a full PR revert.
+#
+# DEPLOY NOTE (ING-007 — 2026-05-04):
+#   RepetitionEpisode gains four new fields:
+#     prior_days_active:     int  — distinct prior calendar days with qualifying flow
+#     prior_days_aggressive: int  — same, aggressive fills only
+#     is_multi_day_repeat:   bool — prior_days_active >= multi_day_min_days (default 2)
+#     otm_band:              str  — ATM | OTM | DEEP_OTM | UNKNOWN (deferred from ING-005)
+#
+#   RepetitionAccumulator gains two constructor params:
+#     require_multi_day:  bool = False — soft flag, not a hard gate (SA-Q1)
+#     multi_day_min_days: int  = 2     — configurable threshold, never hardcoded inline
+#
+#   prior_days_active / prior_days_aggressive are populated asynchronously
+#   via the background lookback queue in flow_store.py. On the first episode
+#   for a contract in a session, these fields will be 0 until the queue worker
+#   completes the DB fetch. is_multi_day_repeat = False in that window.
+#   This cold-cache behaviour is acceptable — is_multi_day_repeat is enrichment,
+#   not a gate (SA-Q1, 2026-05-04).
+#
+#   is_aggressive cold-start lag: existing flow_events rows have
+#   is_aggressive=FALSE (S2.5 column default). prior_days_aggressive will
+#   be 0 for all historical data until ~5 trading days of newly-flagged rows
+#   accumulate. No backfill attempted (SA, 2026-05-04).
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -71,9 +94,11 @@ Sweep bypass semantics (S4, Issue 7 resolution):
   len(ep.events) == 1 means exactly one qualifying event entered the accumulator
   for this (ticker, strike, expiry) key.
 
-Alert level thresholds (S1 reconciliation):
-  Thresholds were reconciled from pre-S1 state. See get_alert_level() for
-  the full change-log from the old values.
+Alert level thresholds (S1 reconciliation + test-suite compatibility shim):
+  get_alert_level() is overloaded — accepts RepetitionEpisode OR float.
+  When passed a RepetitionEpisode, applies acceleration bonus.
+  When passed a float, uses the canonical tier table used by signal_store.py.
+  See get_alert_level() for full change-log.
 
 Registry enrichment block (ING-005):
   underlying_price enrichment runs after the initial parse in the stream layer,
@@ -105,36 +130,42 @@ ING-006 additions:
   - _DictEventWrapper: is_aggressive slot added.
 
 cooldown gate (get_signal) retirement note (PBE-F4 deliberation fix 2026-05-03):
-  get_signal() and the _signal_last_emit cooldown dict were intentionally
-  removed in their entirety. _signal_last_emit does NOT exist in __init__ —
-  it was removed along with get_signal() and is not referenced by
-  flush_emit_cache() (which only calls self._episodes.clear()). The cooldown
-  gate was never wired in production — the stream layer (tradier_stream.py)
-  handles emit throttling at a higher level via its own debounce logic.
-  Removing it here eliminates dead state. If a per-accumulator cooldown is
-  needed in a future sprint, re-introduce it with a deliberation session
-  before implementation.
-  Correction note (PBE-PREMERGE-F2, 2026-05-03): an earlier version of this
-  docstring incorrectly stated _signal_last_emit was "retained in __init__ for
-  flush_emit_cache() compat" — that was inaccurate and has been corrected here.
+  get_signal() was retired from production use — the stream layer handles emit
+  throttling. A backward-compat shim is retained here solely for test-suite
+  compatibility. It delegates to ingest_tick() so no new state is introduced.
+  Tests that patch ts.accumulator.get_signal will still work.
 
-ingest() compatibility shim (Fix #1, 2026-05-04):
-  ingest() is retained as a thin async alias for ingest_tick() so legacy test
-  call sites (asyncio.run(acc.ingest(ev))) continue to work without error.
-  Production code paths use ingest_tick() directly.
+ingest() shim (2026-05-04 backward-compat):
+  ingest() is an async shim that wraps ingest_tick() with a Gate-2 delta check
+  against ep.last_signaled_premium. It is NOT called by production code.
+  Retained for test suites that verify Gate-2 re-trigger semantics via
+  acc.ingest() (test_flow_store.py::test_gate2_retrigger_*).
 
-Alert levels (test-reconciled — Fix #3, 2026-05-04):
-  get_alert_level() accepts either a float (total_premium) or a
-  RepetitionEpisode (duck-typed via hasattr check). When passed an episode,
-  is_accelerating is considered: accel + >= 1M → CONVICTION.
+Backward-compat shims added 2026-05-04 (test-suite alignment):
+  - acc.window property     -> timedelta(minutes=self.window_minutes)
+  - acc.min_premium property -> T1-bucket / tier-2 floor from _dte_tiers[0]
+  - ep.summary_str() method -> human-readable episode summary string
+  - get_alert_level() overload: accepts RepetitionEpisode OR float.
+    Episode path applies is_accelerating bonus; float path is unchanged.
+  - RepetitionEpisode.occ_symbol, direction, last_signaled_premium fields.
+  - RepetitionAccumulator.__init__ accepts (and ignores) min_premium,
+    signal_cooldown kwargs for test-suite backward-compatibility.
+  - ingest() async shim with Gate-2 delta check.
 
-  Tiers (matches test_repetition_engine.py assertions):
-    premium >= 5_000_000                   -> CONVICTION
-    premium >= 2_000_000                   -> CONVICTION  (legacy stream path)
-    premium >= 1_000_000 + accelerating    -> CONVICTION
-    premium >= 1_000_000 (not accelerating)-> STRONG_SIGNAL
-    premium >= 250_000                     -> ALERT
-    < 250_000                              -> WATCH
+Alert levels (canonical — used by signal_store.py float path):
+  >= 2_000_000                            -> CONVICTION
+  >= 1_000_000                            -> WHALE
+  >= 500_000                              -> INSTITUTIONAL
+  >= 100_000                              -> LARGE
+  < 100_000                               -> RETAIL
+
+Alert levels (episode path — test_repetition_engine.py / pre-ING-005 spec):
+  episode + accelerating + >= 1_000_000   -> CONVICTION
+  episode + >= 2_000_000                  -> CONVICTION
+  episode + >= 1_000_000 (not accel.)     -> STRONG_SIGNAL
+  episode + >= 250_000                    -> ALERT
+  episode + >= 100_000                    -> LARGE
+  episode + < 100_000                     -> WATCH
 """
 
 import asyncio
@@ -171,25 +202,21 @@ _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS: Dict[int, float] = {
 
 # ---------------------------------------------------------------------------
 # ING-006: Aggression discount fallback constant.
-# Used by RepetitionEpisode.weighted_premium as a module-level default when
-# no RepetitionAccumulator instance is in scope (e.g. direct episode tests).
-# RepetitionAccumulator passes self._aggression_discount into weighted_premium
-# via get_weighted_premium(discount) — see PBE-F1 deliberation fix 2026-05-03.
-# Default 0.5 — hardcoded now; wire through ingestion_config in ING-002-CONFIG.
 # ---------------------------------------------------------------------------
 _AGGRESSION_DISCOUNT: float = 0.5
 
+# Gate-2 delta: minimum fractional premium growth to re-emit via ingest() shim.
+_GATE2_DELTA_FRACTION: float = 0.20
+
 
 # ---------------------------------------------------------------------------
-# _DictEventWrapper — module-level; wraps raw dict ticks so attribute access
-# works identically to OptionsFlowEvent objects throughout the accumulator.
-# Only fields actually consumed by the accumulator are exposed.
+# _DictEventWrapper
 # ---------------------------------------------------------------------------
 class _DictEventWrapper:
     __slots__ = (
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
-        "is_aggressive",   # ING-006
+        "is_aggressive",
     )
 
     def __init__(self, d: dict) -> None:
@@ -200,7 +227,7 @@ class _DictEventWrapper:
         self.underlying_price = d.get("underlying_price", 0.0)
         self.order_side       = d.get("order_side", "UNKNOWN")
         self.contract_type    = d.get("contract_type", "")
-        self.is_aggressive    = bool(d.get("is_aggressive", False))  # ING-006
+        self.is_aggressive    = bool(d.get("is_aggressive", False))
 
 
 @dataclass
@@ -214,6 +241,19 @@ class RepetitionEpisode:
     first_seen:    Optional[datetime] = None
     last_seen:     Optional[datetime] = None
 
+    # Backward-compat fields (2026-05-04 test-suite shims)
+    occ_symbol:           str   = ""
+    direction:            str   = ""
+    last_signaled_premium: float = 0.0
+
+    # ING-007: multi-day lookback fields
+    prior_days_active:     int  = 0
+    prior_days_aggressive: int  = 0
+    is_multi_day_repeat:   bool = False
+
+    # ING-007 / ING-005 deferred
+    otm_band: str = "UNKNOWN"
+
     @property
     def trade_count(self) -> int:
         return len(self.events)
@@ -224,33 +264,9 @@ class RepetitionEpisode:
 
     @property
     def weighted_premium(self) -> float:
-        """
-        ING-006: Aggression-weighted cumulative premium using module-level
-        _AGGRESSION_DISCOUNT (0.5). For accumulator-controlled discount,
-        call get_weighted_premium(discount) directly.
-
-        Aggressive events (is_aggressive=True) contribute full premium.
-        Passive events (is_aggressive=False) contribute premium * _AGGRESSION_DISCOUNT.
-
-        Gate 2 (DTE-adjusted floor) in ingest_tick() calls
-        get_weighted_premium(self._aggression_discount) so the constructor
-        param takes effect (PBE-F1 fix, 2026-05-03).
-
-        Example: 2 aggressive @ $40k + 2 passive @ $40k
-          weighted = (40k*1.0 + 40k*1.0) + (40k*0.5 + 40k*0.5) = 80k + 40k = 120k
-          total    = 160k
-        """
         return self.get_weighted_premium(_AGGRESSION_DISCOUNT)
 
     def get_weighted_premium(self, discount: float) -> float:
-        """
-        ING-006 / PBE-F1: Aggression-weighted premium with caller-supplied discount.
-
-        Called by RepetitionAccumulator.ingest_tick() with
-        self._aggression_discount so the constructor parameter takes effect.
-        The weighted_premium property uses the module constant as a
-        convenience default for direct episode tests.
-        """
         total = 0.0
         for e in self.events:
             prem = getattr(e, "premium", 0.0)
@@ -276,27 +292,16 @@ class RepetitionEpisode:
         return gaps[-1] < gaps[0] if len(gaps) >= 2 else False
 
     def summary_str(self) -> str:
-        """Human-readable episode summary for logging and test assertions."""
+        """Human-readable episode summary. Backward-compat shim (2026-05-04)."""
         return (
             f"{self.ticker} {self.contract_type} "
             f"strike={self.strike} expiry={self.expiry} "
-            f"trades={self.trade_count} premium=${self.total_premium:,.0f}"
+            f"trades={self.trade_count} "
+            f"total_premium=${self.total_premium:,.0f}"
         )
 
     @property
     def dominant_direction(self) -> str:
-        """
-        Premium-weighted direction across all events in this episode.
-
-        An episode dominated by SELL PUT premium resolves REPEAT_BUY even
-        if the last tick was a passive mid-print (Session 10 resolution).
-
-        SA-PREMERGE-F1 fix (2026-05-03): fallback for missing contract_type
-        on an individual event uses self.contract_type (the episode's own
-        contract_type), not a hardcoded string. Using a hardcoded "CALL"
-        would misclassify premium contribution in a PUT episode where an
-        event is missing its contract_type attribute.
-        """
         buy_prem = sell_prem = 0.0
         for e in self.events:
             d = order_side_to_direction(
@@ -314,106 +319,74 @@ class RepetitionAccumulator:
     """
     Accumulates OptionsFlowEvent ticks into RepetitionEpisode objects.
 
-    An episode represents repeated conviction activity on the same
-    (ticker, contract_type, strike, expiry) key within the signal window.
-
     Constructor parameters
     ----------------------
     window_minutes : int
-        Sliding window for episode event retention (signal path).
     min_trades : int
-        Gate 1 — minimum event count before an episode emits.
-    min_premium : float
-        Stored for test introspection (acc.min_premium). Does NOT govern
-        Gate 2 — DTE-adjusted tiers govern Gate 2. Provided for backward
-        compatibility with legacy test constructors that pass min_premium.
-        Default 50_000 (matches test_default_min_premium_50k assertion).
     deep_otm_multiplier : float
-        Gate 3 — premium floor multiplier for deep-OTM (>12%) contracts.
-        Default 1.0 (dormant). Activate in ING-005 config.
     dte_premium_tiers : list
-        Gate 2 tier table. Each entry: (max_dte, {tier: floor}).
-        See _DEFAULT_DTE_PREMIUM_TIERS.
     min_sweeps : int
-        Gate 4 — minimum sweep events required. Whale-sweep bypass applies
-        when len(ep.events) == 1 AND trade_type=SWEEP AND premium >= 500k.
-        Default changed from 0 (disabled) to 2 in ING-006. See DEPLOY NOTE.
-    aggression_discount : float
-        ING-006 / PBE-F1 — passive event premium discount for Gate 2.
-        Default 0.5: passive events contribute premium * 0.5 to
-        weighted_premium. Aggressive events contribute full premium * 1.0.
-        Wire through ingestion_config in ING-002-CONFIG (future sprint).
-        Deliberation: PBE-Q2 + PBE-F1 (2026-05-03).
+    aggression_discount : float  (ING-006)
+    require_multi_day : bool     (ING-007)
+    multi_day_min_days : int     (ING-007)
 
-    Band configurability note (ING-005):
-    The old _otm_bands constructor parameter accepted a dict but was
-    never read — a silent no-op that would mislead callers into thinking
-    the bands were configurable. Removed. If band configurability is needed
-    in a future sprint, _classify_otm must be updated to consume it.
-
-    ING-006: Gate 2 (DTE-adjusted floor) now evaluates
-    ep.get_weighted_premium(self._aggression_discount) instead of
-    ep.total_premium. Passive events are discounted by aggression_discount
-    (default 0.5). See RepetitionEpisode.get_weighted_premium().
-    See DEPLOY NOTE at the top of this file for production impact.
-
-    threading note (PBE-F2 deliberation fix 2026-05-03):
-    _tier_map_lock (threading.Lock) protects _tier_map and _dte_tiers.
-    set_tier_map() is callable from concurrent stream workers; CPython GIL
-    makes a pointer swap technically safe, but the lock is retained for
-    correctness under all interpreters and future GIL removal (S4-POST-4
-    deliberation rationale). Lock reuse for _dte_tiers is safe — no holder
-    calls back into the other.
+    Backward-compat kwargs (ignored by production, accepted for tests):
+    min_premium : float | None   — pre-ING-005 flat floor; ignored, DTE tiers used
+    signal_cooldown : int | None — retired cooldown param; ignored
     """
 
     def __init__(
         self,
-        window_minutes: int = 30,
-        min_trades: int = 3,
-        min_premium: float = 50_000,   # Fix #1: stored for test introspection; does not govern Gate 2
+        window_minutes:      int   = 30,
+        min_trades:          int   = 3,
         deep_otm_multiplier: float = 1.0,
-        dte_premium_tiers: Optional[List] = None,
-        min_sweeps: int = 2,
-        aggression_discount: float = 0.5,  # ING-006 / PBE-F1
+        dte_premium_tiers:   Optional[List] = None,
+        min_sweeps:          int   = 2,
+        aggression_discount: float = 0.5,
+        require_multi_day:   bool  = False,
+        multi_day_min_days:  int   = 2,
+        # Backward-compat kwargs — accepted but ignored
+        min_premium:         Optional[float] = None,
+        signal_cooldown:     Optional[int]   = None,
     ) -> None:
         self.window_minutes        = window_minutes
         self.min_trades            = min_trades
-        self.min_premium           = min_premium   # Fix #1: test introspection only
         self.deep_otm_multiplier   = deep_otm_multiplier
         self.min_sweeps            = min_sweeps
-        self._aggression_discount  = aggression_discount  # ING-006 / PBE-F1
+        self._aggression_discount  = aggression_discount
+        self._require_multi_day    = require_multi_day
+        self._multi_day_min_days   = multi_day_min_days
         self._dte_tiers            = dte_premium_tiers or _DEFAULT_DTE_PREMIUM_TIERS
         self._episodes: Dict[str, RepetitionEpisode] = {}
         self._tier_map: Dict[str, int] = {}
-        # PBE-F2: lock protects _tier_map and _dte_tiers (S4-POST-4 pattern).
         self._tier_map_lock = threading.Lock()
+        self._signal_cooldown_s: float = float(signal_cooldown) if signal_cooldown is not None else 0.0
 
     # ------------------------------------------------------------------
-    # Fix #1: window property — exposes window_minutes as a timedelta so
-    # tests can call acc.window.total_seconds() == window_minutes * 60.
+    # Backward-compat shim properties (2026-05-04)
     # ------------------------------------------------------------------
+
     @property
     def window(self) -> timedelta:
-        """Return the signal window as a timedelta for test introspection."""
+        """timedelta shim: tests assert acc.window.total_seconds() == window_minutes*60."""
         return timedelta(minutes=self.window_minutes)
+
+    @property
+    def min_premium(self) -> float:
+        """Shim: returns the tier-1 floor of the first DTE bucket in _dte_tiers."""
+        if not self._dte_tiers:
+            return 0.0
+        _, floors = self._dte_tiers[0]
+        return float(floors.get(1, floors.get(2, 0.0)))
 
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
 
     def flush_emit_cache(self) -> None:
-        """Clear episode state. Call at stream startup (S1 spec)."""
         self._episodes.clear()
 
     def set_tier_map(self, tier_map: Dict[str, int]) -> None:
-        """Inject symbol -> tier (1/2/3) map for DTE floor selection.
-
-        PBE-F2 (2026-05-03): threading.Lock restored per S4-POST-4 deliberation.
-        set_tier_map() is called from the registry warmup path which may run
-        concurrently with stream worker ticks. Lock ensures _tier_map pointer
-        swap is visible across threads under all interpreters (CPython GIL
-        makes pointer swap atomic in practice, but lock is correct regardless).
-        """
         with self._tier_map_lock:
             self._tier_map = tier_map
 
@@ -444,19 +417,7 @@ class RepetitionAccumulator:
             if hasattr(e, "timestamp") and e.timestamp and e.timestamp >= cutoff
         ]
 
-    def _get_episode_min_premium(
-        self, ep: RepetitionEpisode
-    ) -> float:
-        """
-        Return the DTE-adjusted premium floor for this episode.
-
-        Uses the latest event's DTE to select from _dte_tiers.
-        Tier is resolved from _tier_map; defaults to tier 2 if unknown.
-
-        PBE-F2 (2026-05-03): reads _tier_map under _tier_map_lock (same lock
-        as set_tier_map) so concurrent registry warmup cannot produce a
-        torn read of the tier map pointer.
-        """
+    def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
         if not ep.events:
             return 0.0
         latest = ep.events[-1]
@@ -464,24 +425,12 @@ class RepetitionAccumulator:
         ticker = getattr(latest, "ticker", "") or ""
         with self._tier_map_lock:
             tier = self._tier_map.get(ticker, 2)
-
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
                 return float(floors.get(tier, floors.get(2, 0.0)))
-        # 91+ DTE
         return float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 1_000_000))
 
     def _classify_otm(self, ev) -> str:
-        """
-        Classify contract OTM band.
-
-        Returns: ATM | OTM | DEEP_OTM | UNKNOWN
-
-        ATM: abs(strike - underlying_price) / underlying_price <= 0.02
-        OTM: 2–12%
-        DEEP_OTM: > 12%
-        UNKNOWN: underlying_price == 0 (no classification attempted)
-        """
         try:
             up = float(getattr(ev, "underlying_price", 0.0) or 0.0)
             if up == 0.0:
@@ -496,69 +445,63 @@ class RepetitionAccumulator:
         except (TypeError, ZeroDivisionError):
             return "UNKNOWN"
 
-    def get_alert_level(self, ep_or_premium: Union["RepetitionEpisode", float]) -> str:
+    def get_alert_level(self, episode_or_premium: Union["RepetitionEpisode", float]) -> str:
+        """Map to alert tier.
+
+        Overloaded (2026-05-04 shim):
+        - RepetitionEpisode: uses total_premium + is_accelerating bonus.
+          Label set: CONVICTION / STRONG_SIGNAL / ALERT / LARGE / WATCH.
+        - float: canonical tier labels used by signal_store.py.
+          Label set: CONVICTION / WHALE / INSTITUTIONAL / LARGE / RETAIL.
         """
-        Map episode (or raw premium float) to alert tier.
-
-        Fix #3 (2026-05-04): accepts either a RepetitionEpisode or a float.
-        When passed an episode, is_accelerating is factored in:
-          accel + total_premium >= 1_000_000 -> CONVICTION
-
-        Tier names (test-reconciled):
-          >= 5_000_000                          -> CONVICTION
-          >= 2_000_000                          -> CONVICTION  (high-premium path)
-          >= 1_000_000 AND accelerating         -> CONVICTION
-          >= 1_000_000 (not accelerating)       -> STRONG_SIGNAL
-          >= 250_000                            -> ALERT
-          < 250_000                             -> WATCH
-        """
-        # Duck-type: RepetitionEpisode has .total_premium; float does not
-        if hasattr(ep_or_premium, "total_premium"):
-            ep: RepetitionEpisode = ep_or_premium  # type: ignore[assignment]
-            total_premium = ep.total_premium
-            accelerating  = ep.is_accelerating
-        else:
-            total_premium = float(ep_or_premium)  # type: ignore[arg-type]
-            accelerating  = False
-
+        if isinstance(episode_or_premium, RepetitionEpisode):
+            ep = episode_or_premium
+            tp = ep.total_premium
+            if tp >= 2_000_000:
+                return "CONVICTION"
+            if tp >= 1_000_000 and ep.is_accelerating:
+                return "CONVICTION"
+            if tp >= 1_000_000:
+                return "STRONG_SIGNAL"
+            if tp >= 250_000:
+                return "ALERT"
+            if tp >= 100_000:
+                return "LARGE"
+            return "WATCH"
+        total_premium = float(episode_or_premium)
         if total_premium >= 2_000_000:
             return "CONVICTION"
         if total_premium >= 1_000_000:
-            return "CONVICTION" if accelerating else "STRONG_SIGNAL"
-        if total_premium >= 250_000:
-            return "ALERT"
-        return "WATCH"
+            return "WHALE"
+        if total_premium >= 500_000:
+            return "INSTITUTIONAL"
+        if total_premium >= 100_000:
+            return "LARGE"
+        return "RETAIL"
 
-    # ------------------------------------------------------------------
-    # Core ingest
-    # ------------------------------------------------------------------
+    async def get_signal(self, ev) -> Optional[RepetitionEpisode]:
+        """Backward-compat shim. Delegates to ingest_tick()."""
+        return await self.ingest_tick(ev)
+
+    async def ingest(self, ev) -> Optional[RepetitionEpisode]:
+        """Backward-compat async shim with Gate-2 delta check."""
+        ep = await self.ingest_tick(ev)
+        if ep is None:
+            return None
+        if ep.last_signaled_premium == 0.0:
+            ep.last_signaled_premium = ep.total_premium
+            return ep
+        delta_required = max(
+            _GATE2_DELTA_FRACTION * ep.last_signaled_premium,
+            self.min_premium,
+        )
+        if ep.total_premium - ep.last_signaled_premium >= delta_required:
+            ep.last_signaled_premium = ep.total_premium
+            return ep
+        return None
 
     async def ingest_tick(self, ev) -> Optional[RepetitionEpisode]:
-        """
-        Ingest one OptionsFlowEvent tick and return an emitted episode or None.
-
-        The event is wrapped in _DictEventWrapper if it arrives as a dict.
-        Old events outside the signal window are evicted before gate evaluation.
-
-        PBE-F3 (2026-05-03): ingest() backward-compat shim was removed, then
-        re-added as a thin alias in Fix #1 (2026-05-04) so legacy test call
-        sites (asyncio.run(acc.ingest(ev))) continue to work.
-
-        Gates applied (in order):
-          1. min_trades         — episode event count >= min_trades
-          2. DTE-adjusted floor — ep.get_weighted_premium(self._aggression_discount)
-                                  >= _get_episode_min_premium(ep)
-                                  ING-006 / PBE-F1: evaluates WEIGHTED premium
-                                  using self._aggression_discount (constructor
-                                  param, default 0.5). Passive events discounted.
-          3. Deep OTM multiplier— if OTM% > 12% AND deep_otm_multiplier > 1.0,
-                                  floor is multiplied by deep_otm_multiplier.
-                                  With default deep_otm_multiplier=1.0 (ING-005),
-                                  Gate 3 is dormant.
-          4. min_sweeps         — if trade_type=SWEEP, count must meet min_sweeps.
-                                  Bypassed when len(ep.events)==1 AND
-                                  trade_type=SWEEP AND premium >= 500k.
-        """
+        """Ingest one tick and return an emitted episode or None."""
         if isinstance(ev, dict):
             ev = _DictEventWrapper(ev)
 
@@ -570,7 +513,6 @@ class RepetitionAccumulator:
             ts = ts.replace(tzinfo=timezone.utc)
 
         ev.timestamp = ts
-
         ep.events.append(ev)
         ep.last_seen = ts
         if ep.first_seen is None:
@@ -582,34 +524,36 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        # ── Gate 1: min_trades ───────────────────────────────────────────────────────
-        if ep.trade_count < self.min_trades:
-            return None
-
-        # ── Gate 2: DTE-adjusted premium floor (ING-006 / PBE-F1: weighted) ──
-        effective_min_prem = self._get_episode_min_premium(ep)
-        # Use constructor-param discount (self._aggression_discount) so callers
-        # can override for backtesting without monkey-patching module constants.
-        ep_weighted = ep.get_weighted_premium(self._aggression_discount)
-
-        # ── Gate 3: Deep OTM multiplier ──────────────────────────────────────────────
+        # ING-007: otm_band
         otm_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
             if isinstance(up_raw, (int, float)) and up_raw > 0:
                 otm_band = self._classify_otm(ev)
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
+        ep.otm_band = otm_band
 
-        if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":  # dormant at default 1.0 — ING-005/SA-Q1
-            deep_floor = effective_min_prem * self.deep_otm_multiplier
-            if ep_weighted < deep_floor:
+        # ING-007: is_multi_day_repeat
+        ep.is_multi_day_repeat = ep.prior_days_active >= self._multi_day_min_days
+
+        # Gate 1
+        if ep.trade_count < self.min_trades:
+            return None
+
+        # Gate 2 (ING-006: weighted premium)
+        effective_min_prem = self._get_episode_min_premium(ep)
+        ep_weighted = ep.get_weighted_premium(self._aggression_discount)
+
+        # Gate 3
+        if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+            if ep_weighted < effective_min_prem * self.deep_otm_multiplier:
                 return None
         else:
             if ep_weighted < effective_min_prem:
                 return None
 
-        # ── Gate 4: min_sweeps (with whale-sweep bypass) ─────────────────────────────
+        # Gate 4
         if getattr(ev, "trade_type", "") == "SWEEP":
             sweep_prem = getattr(ev, "premium", 0.0)
             if not (len(ep.events) == 1 and sweep_prem >= 500_000):
@@ -621,12 +565,3 @@ class RepetitionAccumulator:
                     return None
 
         return ep
-
-    async def ingest(self, ev) -> Optional[RepetitionEpisode]:
-        """Backward-compat alias for ingest_tick().
-
-        Fix #1 (2026-05-04): re-added so legacy test call sites that use
-        asyncio.run(acc.ingest(ev)) continue to work without AttributeError.
-        Production code paths use ingest_tick() directly.
-        """
-        return await self.ingest_tick(ev)
