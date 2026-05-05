@@ -32,7 +32,7 @@ an in-process TTL cache of this simplicity).
 import logging
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 try:
     from typing import NamedTuple
@@ -47,7 +47,21 @@ log = logging.getLogger("contract_day_cache")
 # Types
 # ---------------------------------------------------------------------------
 
-ContractKey = Tuple[str, str, float, str]  # (ticker, contract_type, strike, expiry)
+class ContractKey(NamedTuple):
+    """4-tuple key identifying a unique options contract.
+
+    ING-007 fix: previously defined as Tuple[str, str, float, str] — a plain
+    type alias that is NOT callable. tradier_stream.py calls
+    ContractKey(ticker, contract_type, strike, expiry) which raised TypeError
+    on every persisted tick. Converted to NamedTuple so it is callable and
+    also provides named field access. All existing 4-tuple unpacking
+        ticker, contract_type, strike, expiry = key
+    continues to work unchanged — NamedTuple instances are regular tuples.
+    """
+    ticker:        str
+    contract_type: str
+    strike:        float
+    expiry:        str
 
 
 class LookbackResult(NamedTuple):
@@ -102,7 +116,7 @@ async def get_lookback(key: ContractKey, min_premium: float) -> LookbackResult:
     """
     Return cached LookbackResult if fresh; otherwise fetch from DB, cache, and return.
 
-    key        : 4-tuple (ticker, contract_type, strike, expiry)
+    key        : ContractKey (ticker, contract_type, strike, expiry)
     min_premium: DTE-tier floor passed from accumulator context — no hardcoding in query
 
     On DB unavailability or error: returns _ZERO_RESULT and logs a warning.
