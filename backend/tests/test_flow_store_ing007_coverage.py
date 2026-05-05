@@ -1,14 +1,20 @@
 """
 Coverage tests for ING-007 additions in services/flow_store.py:
-  - enqueue_lookback() — normal path, queue-full overflow path
-  - get_lookback_stats() — returns dict copy with correct keys
-  - start_lookback_worker() — processes a key, handles get_lookback error,
+  - enqueue_lookback() -- normal path, queue-full overflow path
+  - get_lookback_stats() -- returns dict copy with correct keys
+  - start_lookback_worker() -- processes a key, handles get_lookback error,
     handles CancelledError shutdown, dte_tiers absent, dte_tiers traversal
-  - _update_episode_multiday() — GET 200+rows → PATCH 200/204, GET non-200,
+  - _update_episode_multiday() -- GET 200+rows -> PATCH 200/204, GET non-200,
     GET empty rows, GET row with no id, PATCH non-200, exception path,
     not-configured short-circuit
 
-All Supabase / httpx calls are mocked — no live network required.
+All Supabase / httpx calls are mocked -- no live network required.
+
+FIX (2026-05-05): _lookback_queue is a module-level asyncio.Queue created at
+import time. When pytest-asyncio creates a new event loop per test, the queue
+is still bound to the OLD loop causing RuntimeError. Fix: reset the queue
+module attribute to a fresh Queue inside each async test that calls
+start_lookback_worker, using asyncio.get_event_loop() to bind it correctly.
 """
 import asyncio
 import pytest
@@ -23,10 +29,8 @@ def test_enqueue_lookback_increments_queued_counter():
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey
 
-    # reset state
     fs._lookback_stats["lookback_queued"] = 0
     fs._lookback_stats["lookback_queue_overflow"] = 0
-    # drain the real queue so put_nowait succeeds
     while not fs._lookback_queue.empty():
         fs._lookback_queue.get_nowait()
 
@@ -42,7 +46,6 @@ def test_enqueue_lookback_overflow_increments_overflow_counter():
     fs._lookback_stats["lookback_queue_overflow"] = 0
 
     key = ContractKey("SPY", "PUT", 440.0, "2026-05-17")
-    # patch the queue to always raise QueueFull
     with patch.object(fs._lookback_queue, "put_nowait", side_effect=asyncio.QueueFull()):
         fs.enqueue_lookback(key)
 
@@ -50,16 +53,13 @@ def test_enqueue_lookback_overflow_increments_overflow_counter():
 
 
 def test_enqueue_lookback_never_raises():
-    """enqueue_lookback must be fire-and-forget — no exception propagated."""
+    """enqueue_lookback must be fire-and-forget -- no exception propagated."""
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey
 
     key = ContractKey("TSLA", "CALL", 200.0, "2026-07-18")
-    with patch.object(fs._lookback_queue, "put_nowait", side_effect=RuntimeError("boom")):
-        # RuntimeError is NOT caught — but QueueFull is. Verify the normal
-        # overflow path doesn't propagate.
-        with patch.object(fs._lookback_queue, "put_nowait", side_effect=asyncio.QueueFull()):
-            fs.enqueue_lookback(key)  # must not raise
+    with patch.object(fs._lookback_queue, "put_nowait", side_effect=asyncio.QueueFull()):
+        fs.enqueue_lookback(key)  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +79,24 @@ def test_get_lookback_stats_returns_copy():
     stats1 = fs.get_lookback_stats()
     stats2 = fs.get_lookback_stats()
     assert stats1 == stats2
-    assert stats1 is not stats2  # must be a copy, not the live dict
+    assert stats1 is not stats2
 
 
 # ---------------------------------------------------------------------------
-# start_lookback_worker — success path
+# Helper: reset _lookback_queue to the current event loop
+# ---------------------------------------------------------------------------
+
+def _reset_lookback_queue(fs, maxsize=5000):
+    """
+    Replace fs._lookback_queue with a fresh asyncio.Queue bound to the
+    currently running event loop.  Required because the module-level queue
+    is created at import time on whatever loop existed then.
+    """
+    fs._lookback_queue = asyncio.Queue(maxsize=maxsize)
+
+
+# ---------------------------------------------------------------------------
+# start_lookback_worker -- success path
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -91,20 +104,16 @@ async def test_start_lookback_worker_processes_key_and_calls_update():
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey, LookbackResult
 
+    _reset_lookback_queue(fs)
+
     key = ContractKey("NVDA", "CALL", 900.0, "2026-06-20")
 
-    # Build a fake accumulator with dte_tiers and multi_day_min_days
     acc = MagicMock()
     acc._multi_day_min_days = 2
     acc._dte_tiers = [(30, {50_000: 50_000.0}), (60, {25_000: 25_000.0})]
 
     fake_result = LookbackResult(prior_days_active=3, prior_days_aggressive=1, fetched_at=1.0)
 
-    # drain queue
-    while not fs._lookback_queue.empty():
-        fs._lookback_queue.get_nowait()
-
-    # seed the queue with our key
     await fs._lookback_queue.put(key)
 
     async def fake_get_lookback(k, min_prem):
@@ -113,10 +122,8 @@ async def test_start_lookback_worker_processes_key_and_calls_update():
     with patch("services.flow_store._update_episode_multiday", new_callable=AsyncMock) as mock_update, \
          patch("utils.contract_day_cache.get_lookback", side_effect=fake_get_lookback):
 
-        # run the worker as a cancellable task; cancel after first item processed
         async def run_once():
             task = asyncio.create_task(fs.start_lookback_worker(acc))
-            # Give worker time to drain the one item
             await asyncio.sleep(0.05)
             task.cancel()
             try:
@@ -127,7 +134,7 @@ async def test_start_lookback_worker_processes_key_and_calls_update():
         await run_once()
 
     mock_update.assert_called_once_with(
-        "NVDA", "CALL", 900.0, "2026-06-20", True  # 3 >= 2 → is_repeat=True
+        "NVDA", "CALL", 900.0, "2026-06-20", True
     )
 
 
@@ -135,6 +142,8 @@ async def test_start_lookback_worker_processes_key_and_calls_update():
 async def test_start_lookback_worker_is_repeat_false_when_below_min_days():
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey, LookbackResult
+
+    _reset_lookback_queue(fs)
 
     key = ContractKey("AMD", "PUT", 100.0, "2026-05-17")
 
@@ -144,8 +153,6 @@ async def test_start_lookback_worker_is_repeat_false_when_below_min_days():
 
     fake_result = LookbackResult(prior_days_active=1, prior_days_aggressive=0, fetched_at=1.0)
 
-    while not fs._lookback_queue.empty():
-        fs._lookback_queue.get_nowait()
     await fs._lookback_queue.put(key)
 
     async def fake_get_lookback(k, min_prem):
@@ -166,7 +173,7 @@ async def test_start_lookback_worker_is_repeat_false_when_below_min_days():
         await run_once()
 
     mock_update.assert_called_once_with(
-        "AMD", "PUT", 100.0, "2026-05-17", False  # 1 < 2 → is_repeat=False
+        "AMD", "PUT", 100.0, "2026-05-17", False
     )
 
 
@@ -176,14 +183,14 @@ async def test_start_lookback_worker_handles_get_lookback_exception():
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey
 
+    _reset_lookback_queue(fs)
+
     key = ContractKey("META", "CALL", 550.0, "2026-06-20")
 
     acc = MagicMock()
     acc._multi_day_min_days = 2
     acc._dte_tiers = []
 
-    while not fs._lookback_queue.empty():
-        fs._lookback_queue.get_nowait()
     await fs._lookback_queue.put(key)
 
     async def boom(k, min_prem):
@@ -203,7 +210,6 @@ async def test_start_lookback_worker_handles_get_lookback_exception():
 
         await run_once()  # must not raise
 
-    # _update_episode_multiday should NOT have been called (error before it)
     mock_update.assert_not_called()
 
 
@@ -213,21 +219,20 @@ async def test_start_lookback_worker_dte_tiers_absent_uses_default_floor():
     import services.flow_store as fs
     from utils.contract_day_cache import ContractKey, LookbackResult
 
+    _reset_lookback_queue(fs)
+
     key = ContractKey("MSFT", "CALL", 420.0, "2026-07-18")
 
     acc = MagicMock(spec=["_multi_day_min_days"])  # no _dte_tiers
     acc._multi_day_min_days = 2
 
     captured = {}
-
     fake_result = LookbackResult(prior_days_active=0, prior_days_aggressive=0, fetched_at=1.0)
 
     async def fake_get_lookback(k, min_prem):
         captured["min_prem"] = min_prem
         return fake_result
 
-    while not fs._lookback_queue.empty():
-        fs._lookback_queue.get_nowait()
     await fs._lookback_queue.put(key)
 
     with patch("services.flow_store._update_episode_multiday", new_callable=AsyncMock), \
@@ -248,11 +253,10 @@ async def test_start_lookback_worker_dte_tiers_absent_uses_default_floor():
 
 
 # ---------------------------------------------------------------------------
-# _update_episode_multiday — all branches
+# _update_episode_multiday -- all branches
 # ---------------------------------------------------------------------------
 
 def _make_http_mock(get_status=200, get_json=None, patch_status=204):
-    """Build a reusable AsyncMock httpx client."""
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
@@ -318,7 +322,7 @@ async def test_update_episode_multiday_get_non200_returns_early():
 async def test_update_episode_multiday_empty_rows_returns_early():
     import services.flow_store as fs
 
-    mock_client = _make_http_mock(get_status=200, get_json=[])  # empty list
+    mock_client = _make_http_mock(get_status=200, get_json=[])
 
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
@@ -332,7 +336,7 @@ async def test_update_episode_multiday_empty_rows_returns_early():
 async def test_update_episode_multiday_row_with_no_id_skips_patch():
     import services.flow_store as fs
 
-    mock_client = _make_http_mock(get_status=200, get_json=[{}])  # no "id" key
+    mock_client = _make_http_mock(get_status=200, get_json=[{}])
 
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
@@ -344,7 +348,6 @@ async def test_update_episode_multiday_row_with_no_id_skips_patch():
 
 @pytest.mark.asyncio
 async def test_update_episode_multiday_patch_non200_logs_warning():
-    """PATCH returning 400 must not raise — logged at WARNING."""
     import services.flow_store as fs
 
     mock_client = _make_http_mock(get_status=200, get_json=[{"id": 1}], patch_status=400)
@@ -354,7 +357,6 @@ async def test_update_episode_multiday_patch_non200_logs_warning():
          patch("httpx.AsyncClient", return_value=mock_client):
         await fs._update_episode_multiday("AMD", "CALL", 100.0, "2026-07-18", True)
 
-    # Should not raise; PATCH was attempted
     mock_client.patch.assert_called_once()
 
 
@@ -371,7 +373,6 @@ async def test_update_episode_multiday_exception_is_swallowed():
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
          patch("httpx.AsyncClient", return_value=mock_client):
         await fs._update_episode_multiday("META", "PUT", 550.0, "2026-06-20", False)
-    # must not raise
 
 
 @pytest.mark.asyncio
@@ -379,7 +380,6 @@ async def test_update_episode_multiday_not_configured_returns_immediately():
     import services.flow_store as fs
 
     with patch("services.flow_store._SUPABASE_URL", None):
-        # no HTTP calls should be made
         with patch("httpx.AsyncClient") as mock_cls:
             await fs._update_episode_multiday("AAPL", "CALL", 150.0, "2026-06-20", True)
         mock_cls.assert_not_called()
