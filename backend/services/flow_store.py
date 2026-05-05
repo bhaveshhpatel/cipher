@@ -104,6 +104,11 @@ ING-007 cold-cache note:
   is_multi_day_repeat=False until the queue worker completes the DB fetch
   and populates the cache. Acceptable — is_multi_day_repeat is enrichment,
   not a gate (SA-Q1, 2026-05-04).
+
+PBE-NEW-1 (2026-05-04): get_contract_prior_days() removed.
+  The sync RPC helper was superseded by the async queue + contract_day_cache
+  route before merge. No production call site exists. Removed to eliminate
+  dead code and the orphaned test coverage that accompanied it.
 """
 import asyncio
 import logging
@@ -333,52 +338,6 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         return False
 
 
-async def get_contract_prior_days(
-    ticker: str,
-    contract_type: str,
-    strike: float,
-    expiry: str,
-) -> int:
-    """
-    ING-007: Call the Supabase RPC function get_contract_prior_days() to
-    count the number of distinct prior trading days (ET) on which this
-    contract appeared in flow_episodes.
-
-    Returns 0 on any error so the stream degrades gracefully — a failed
-    RPC call never blocks a tick from being processed.
-
-    SQL function definition: backend/db/get_contract_prior_days.sql
-    """
-    if not _is_configured():
-        return 0
-
-    url = f"{_SUPABASE_URL}/rest/v1/rpc/get_contract_prior_days"
-    payload = {
-        "p_ticker":        ticker,
-        "p_contract_type": contract_type,
-        "p_strike":        strike,
-        "p_expiry":        expiry,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.post(url, headers=_headers(), json=payload)
-        if resp.status_code == 200:
-            return int(resp.json())
-        log.warning(
-            "[flow_store] get_contract_prior_days RPC failed: "
-            "%d -- %s (ticker=%s %s $%.0f %s)",
-            resp.status_code, resp.text[:200], ticker, contract_type, strike, expiry,
-        )
-        return 0
-    except Exception as e:
-        log.warning(
-            "[flow_store] get_contract_prior_days exception: %s "
-            "(ticker=%s %s $%.0f %s) — defaulting to 0",
-            e, ticker, contract_type, strike, expiry,
-        )
-        return 0
-
-
 async def persist_flow_episode(signal_data: dict):
     """
     Write one row to flow_episodes.
@@ -484,10 +443,6 @@ async def _update_episode_multiday(
 
             rows = get_resp.json()
             if not rows:
-                # SA-F3: elevated from DEBUG to INFO — INSERT may not have
-                # committed yet (race between queue worker and DB write).
-                # Enrichment-only flag; skipping is safe but we want Railway
-                # visibility on how often this race fires.
                 log.info(
                     "[flow_store] _update_episode_multiday: no episode row found yet for "
                     "%s %s $%.0f %s — INSERT may not have committed; "
@@ -584,9 +539,6 @@ async def start_lookback_worker(accumulator) -> None:
 
             # SA-F1 fix: correct attribute name (_dte_tiers, not _dte_premium_tiers)
             # and correct traversal for List[Tuple[int, Dict[int, float]]] structure.
-            # We use the minimum floor across all DTE bands and tiers as the lookback
-            # quality filter — we want prior days where ANY qualifying flow appeared,
-            # not just the current episode's specific DTE tier.
             try:
                 dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
                 if dte_tiers:
@@ -601,8 +553,7 @@ async def start_lookback_worker(accumulator) -> None:
                 min_premium = 10_000.0
 
             # PBE-F5 fix: log the resolved min_premium so Railway surfaces which
-            # DTE-tier floor is being applied to each lookback fetch. Regressions
-            # to the hardcoded fallback (SA-F1) will now be immediately visible.
+            # DTE-tier floor is being applied to each lookback fetch.
             log.debug(
                 "[lookback_worker] %s %s $%.0f %s — "
                 "min_premium=%.0f (dte_tiers_found=%s)",
@@ -612,7 +563,6 @@ async def start_lookback_worker(accumulator) -> None:
 
             try:
                 result = await get_lookback(key, min_premium)
-                # Use accumulator's configured threshold, not hardcoded value.
                 is_repeat = result.prior_days_active >= multi_day_min_days
                 await _update_episode_multiday(
                     ticker, contract_type, strike, expiry, is_repeat

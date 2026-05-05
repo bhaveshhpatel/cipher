@@ -2,96 +2,27 @@
 tests/test_multiday_repeat.py
 
 Unit tests for the ING-007 is_multi_day_repeat feature:
-  1. get_contract_prior_days() returns 0 for a first-day contract.
-  2. get_contract_prior_days() returns >= 1 for a repeat contract.
-  3. get_contract_prior_days() returns 0 (not raises) on RPC error.
-  4. _process_trade() sets is_multi_day_repeat=False when cache shows prior_days=0.
-  5. _process_trade() sets is_multi_day_repeat=True when cache shows prior_days>=1.
-  6. persist_flow_episode() receives is_multi_day_repeat in the row dict.
+  1. _process_trade() sets is_multi_day_repeat=False when cache shows prior_days=0.
+  2. _process_trade() sets is_multi_day_repeat=True when cache shows prior_days>=2.
+  3. persist_flow_episode() receives is_multi_day_repeat in the row dict.
 
 All external I/O (httpx, Supabase, bus) is mocked — no network calls.
 
 ING-007 wiring notes (2026-05-04):
-  Tests 4 & 5 patch utils.contract_day_cache._cache directly.
+  Tests 1 & 2 patch utils.contract_day_cache._cache directly.
   The stream reads _cache synchronously (non-blocking) to set is_multi_day_repeat
-  before the async lookback worker patches the DB row.  The old patch target
-  (services.tradier_stream.get_contract_prior_days) no longer exists — that
-  import was removed when the sync RPC call was replaced with the async queue.
+  before the async lookback worker patches the DB row.
+
+PBE-NEW-1 (2026-05-04):
+  Tests for get_contract_prior_days() (previously tests 1-3) removed.
+  That function was dead code — superseded by the async queue +
+  contract_day_cache route before merge. No production call site exists.
 """
 import asyncio
 import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# Tests 1-3: flow_store.get_contract_prior_days (RPC helper, unchanged)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_get_contract_prior_days_first_day():
-    """RPC returns 0 → first-day contract, no prior activity."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = 0
-
-    with patch("services.flow_store._SUPABASE_URL", "https://fake.supabase.co"), \
-         patch("services.flow_store._SUPABASE_KEY", "fake-key"), \
-         patch("httpx.AsyncClient") as mock_client_cls:
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client_cls.return_value = mock_client
-
-        from services.flow_store import get_contract_prior_days
-        result = await get_contract_prior_days("AAPL", "CALL", 150.0, "2026-06-20")
-
-    assert result == 0
-
-
-@pytest.mark.asyncio
-async def test_get_contract_prior_days_repeat():
-    """RPC returns 2 → contract seen on 2 prior days."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = 2
-
-    with patch("services.flow_store._SUPABASE_URL", "https://fake.supabase.co"), \
-         patch("services.flow_store._SUPABASE_KEY", "fake-key"), \
-         patch("httpx.AsyncClient") as mock_client_cls:
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client_cls.return_value = mock_client
-
-        from services.flow_store import get_contract_prior_days
-        result = await get_contract_prior_days("AAPL", "CALL", 150.0, "2026-06-20")
-
-    assert result >= 1
-
-
-@pytest.mark.asyncio
-async def test_get_contract_prior_days_rpc_error_returns_zero():
-    """Network failure must return 0 gracefully, never raise."""
-    with patch("services.flow_store._SUPABASE_URL", "https://fake.supabase.co"), \
-         patch("services.flow_store._SUPABASE_KEY", "fake-key"), \
-         patch("httpx.AsyncClient") as mock_client_cls:
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(side_effect=Exception("connection refused"))
-        mock_client_cls.return_value = mock_client
-
-        from services.flow_store import get_contract_prior_days
-        result = await get_contract_prior_days("AAPL", "CALL", 150.0, "2026-06-20")
-
-    assert result == 0
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +88,7 @@ def _make_cache_entry(prior_days_active: int, fresh: bool = True):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: cache miss / prior_days=0  →  is_multi_day_repeat=False
+# Test 1: cache miss / prior_days=0  →  is_multi_day_repeat=False
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -170,19 +101,15 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
     sig_ep = _make_mock_sig_ep()
     ev     = _make_mock_ev()
 
-    # Simulate a fresh cache entry with 0 prior days (first-day contract).
     cache_entry, _ = _make_cache_entry(prior_days_active=0)
-    fake_cache = {MagicMock(): cache_entry}  # key doesn't need to match; we patch .get()
 
     import services.tradier_stream as ts
     ts._signal_last_emit.clear()
     ts._lookback_result_cache.clear()
     ts._stats["ticks"] = 0
 
-    # Patch the contract_day_cache internals the stream reads synchronously.
-    # _cache.get() returns cache_entry; _is_fresh returns True.
     mock_cache = MagicMock()
-    mock_cache.get = MagicMock(return_value=cache_entry)  # prior_days_active=0
+    mock_cache.get = MagicMock(return_value=cache_entry)
 
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
@@ -217,13 +144,13 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: cache hit / prior_days=1  →  is_multi_day_repeat=True
+# Test 2: cache hit / prior_days>=2  →  is_multi_day_repeat=True
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive():
     """
-    Cache returns prior_days_active=1 (repeat contract).
+    Cache returns prior_days_active=2 (repeat contract, meets min_days=2 default).
     is_multi_day_repeat must be True in persist_flow_episode() payload
     AND in the signal bus message.
     enqueue_lookback() must be called exactly once.
@@ -231,8 +158,7 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     sig_ep = _make_mock_sig_ep()
     ev     = _make_mock_ev()
 
-    # Simulate a fresh cache entry with 1 prior day (repeat contract).
-    cache_entry, _ = _make_cache_entry(prior_days_active=1)
+    cache_entry, _ = _make_cache_entry(prior_days_active=2)
 
     published: list = []
 
@@ -242,7 +168,7 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     ts._stats["ticks"] = 0
 
     mock_cache = MagicMock()
-    mock_cache.get = MagicMock(return_value=cache_entry)  # prior_days_active=1
+    mock_cache.get = MagicMock(return_value=cache_entry)
 
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
@@ -281,7 +207,7 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
 
 
 # ---------------------------------------------------------------------------
-# Test 6: persist_flow_episode row contains is_multi_day_repeat
+# Test 3: persist_flow_episode row contains is_multi_day_repeat
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
