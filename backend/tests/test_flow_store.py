@@ -820,6 +820,7 @@ async def test_process_trade_persists_episode_before_debounce():
     sig_ep.total_premium = 186_000.0
     sig_ep.trade_count = 3           # >= _SIGNAL_MIN_TRADES (3)
     sig_ep.is_accelerating = False
+    sig_ep.dominant_direction = "REPEAT_BUY"
     sig_ep.summary_str.return_value = "AAPL CALL 3x $186k"
 
     persisted_episodes = []
@@ -880,6 +881,7 @@ async def test_process_trade_episode_direction_call_is_repeat_buy():
     sig_ep.strike = 900.0; sig_ep.expiry = "2026-06-20"
     sig_ep.total_premium = 75_000.0; sig_ep.trade_count = 3
     sig_ep.is_accelerating = False
+    sig_ep.dominant_direction = "REPEAT_BUY"
     sig_ep.summary_str.return_value = "NVDA CALL 3x $75k"
 
     persisted_episodes = []
@@ -926,6 +928,7 @@ async def test_process_trade_episode_direction_put_is_repeat_sell():
     sig_ep.strike = 500.0; sig_ep.expiry = "2026-05-17"
     sig_ep.total_premium = 60_000.0; sig_ep.trade_count = 4
     sig_ep.is_accelerating = True
+    sig_ep.dominant_direction = "REPEAT_SELL"
     sig_ep.summary_str.return_value = "SPY PUT 4x $60k"
 
     persisted_episodes = []

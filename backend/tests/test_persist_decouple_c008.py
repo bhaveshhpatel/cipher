@@ -104,6 +104,7 @@ def _make_ep(trade_count=3, total_premium=300_000.0):
     ep.trade_count = trade_count
     ep.total_premium = total_premium
     ep.is_accelerating = False
+    ep.dominant_direction = "REPEAT_BUY"
     ep.summary_str.return_value = "AAPL CALL x3"
     return ep
 
@@ -266,6 +267,7 @@ class TestC008IngestShim:
             ev.strike = 500.0
             ev.expiry = "2026-05-16"
             ev.premium = prem
+            ev.dte = 21
             ev.timestamp = ts
             return ev
 
@@ -294,6 +296,7 @@ class TestC008IngestTickIgnoresCooldown:
             ev.strike = 900.0
             ev.expiry = "2026-05-16"
             ev.premium = 20_000.0
+            ev.dte = 21
             ev.timestamp = ts
             return ev
 
@@ -323,6 +326,7 @@ class TestC008GetSignalCooldown:
             ev.strike = 550.0
             ev.expiry = "2026-05-16"
             ev.premium = 20_000.0
+            ev.dte = 21
             ev.timestamp = ts
             return ev
 
@@ -330,15 +334,17 @@ class TestC008GetSignalCooldown:
         for i in range(3):
             ep = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(seconds=i * 10))))
 
-        sig1 = asyncio.run(acc.get_signal(base_ts + timedelta(seconds=20), ep))
+        cooldown = timedelta(minutes=5)
+
+        sig1 = asyncio.run(acc.get_signal(base_ts + timedelta(seconds=20), cooldown, ep))
         assert sig1 is not None
 
         ep2 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=1))))
-        sig2 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=1), ep2))
+        sig2 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=1), cooldown, ep2))
         assert sig2 is None, "get_signal should return None during cooldown"
 
         ep3 = asyncio.run(acc.ingest_tick(_ev(base_ts + timedelta(minutes=6))))
-        sig3 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=6), ep3))
+        sig3 = asyncio.run(acc.get_signal(base_ts + timedelta(minutes=6), cooldown, ep3))
         assert sig3 is not None, "get_signal should fire after cooldown expires"
 
 
