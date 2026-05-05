@@ -216,7 +216,7 @@ class _DictEventWrapper:
     __slots__ = (
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
-        "is_aggressive", "ticker", "strike", "expiry",
+        "is_aggressive",
     )
 
     def __init__(self, d: dict) -> None:
@@ -228,9 +228,6 @@ class _DictEventWrapper:
         self.order_side       = d.get("order_side", "UNKNOWN")
         self.contract_type    = d.get("contract_type", "")
         self.is_aggressive    = bool(d.get("is_aggressive", False))
-        self.ticker           = d.get("ticker", "")
-        self.strike           = float(d.get("strike", 0.0))
-        self.expiry           = d.get("expiry", "")
 
 
 @dataclass
@@ -427,7 +424,7 @@ class RepetitionAccumulator:
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
         with self._tier_map_lock:
-            tier = self._tier_map.get(ticker, 2)
+            tier = self._tier_map.get(ticker, 1)
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
                 return float(floors.get(tier, floors.get(2, 0.0)))
