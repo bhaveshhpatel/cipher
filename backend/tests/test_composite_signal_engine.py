@@ -6,6 +6,14 @@ Removals vs. pre-S0:
   - build_composite_async import removed
   - All swarm field assertions removed
   - test_build_composite_async_* tests removed (covered by test_apex_s0_swarm_cleanup.py)
+
+Fix (2026-05-05):
+  - _fake_episode(accelerating=True) previously placed the last 3 events at
+    base+3600+i*15s offsets, producing equal 15s gaps -> is_accelerating False.
+    Fix: use offsets [0, 30, 40]s from the 3600s base so gaps are [30s, 10s]
+    (strictly shrinking) -> is_accelerating True.
+  - ep.first_seen / ep.last_seen assignment guarded against empty events list
+    to fix IndexError in TestVolumeWeightedPremiumFactor.test_no_events_returns_half.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -51,6 +59,11 @@ def _fake_event(
     return ev
 
 
+# Strictly-shrinking gap offsets used for the last 3 events when accelerating=True.
+# gaps = [30s, 10s] -> is_accelerating True.
+_ACCEL_OFFSETS = [0, 30, 40]
+
+
 def _fake_episode(
     ticker="AAPL",
     contract_type="CALL",
@@ -71,7 +84,10 @@ def _fake_episode(
     base_ts = datetime(2026, 4, 25, 10, 0, 0)
     for i in range(n_events):
         if accelerating and i >= n_events - 3:
-            ts = base_ts + timedelta(seconds=3600 + i * 15)
+            # Use strictly-shrinking gaps so is_accelerating returns True.
+            # Offset index within the last-3 window: 0, 1, 2.
+            accel_idx = i - (n_events - 3)
+            ts = base_ts + timedelta(seconds=3600 + _ACCEL_OFFSETS[accel_idx])
         else:
             ts = base_ts + timedelta(minutes=i * 5)
         ev = _fake_event(
@@ -85,8 +101,10 @@ def _fake_episode(
             timestamp=ts,
         )
         ep.events.append(ev)
-    ep.first_seen = ep.events[0].timestamp
-    ep.last_seen  = ep.events[-1].timestamp
+    # Guard: only set first_seen/last_seen when events are present.
+    if ep.events:
+        ep.first_seen = ep.events[0].timestamp
+        ep.last_seen  = ep.events[-1].timestamp
     return ep
 
 

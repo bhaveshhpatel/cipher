@@ -17,7 +17,7 @@ Apex S6 additions (test_apex_s6_composite_overhaul.py):
   - CompositeScore: alias / companion type for score computation
   - build_composite overload: accepts (symbol: str, episode, accumulator) -> Composite
     OR legacy (episode: RepetitionEpisode, accumulator: RepetitionAccumulator) -> CompositeSignal
-    Legacy 2-arg with non-RepetitionEpisode first arg raises TypeError (regression guard).
+    Legacy 2-arg with non-episode-duck-typed first arg raises TypeError (regression guard).
 """
 from __future__ import annotations
 import time
@@ -85,12 +85,13 @@ class CompositeSignal:
 # Influence tier — episode-level, not event-level
 # ---------------------------------------------------------------------------
 
-def episode_influence_tier(ep: RepetitionEpisode) -> str:
+def episode_influence_tier(ep) -> str:
     """
     Map episode total_premium to an influence tier label.
 
     Uses episode premium, never the event-level influence_tier field, so the
     label reflects the full accumulated flow rather than any single print.
+    Accepts both RepetitionEpisode and duck-typed episode objects.
     """
     prem = ep.total_premium
     if prem >= 2_000_000:
@@ -103,10 +104,23 @@ def episode_influence_tier(ep: RepetitionEpisode) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Duck-type episode check
+# ---------------------------------------------------------------------------
+
+def _is_episode_duck(obj) -> bool:
+    """Return True if obj looks like an episode (has .events, .total_premium, .ticker)."""
+    return (
+        hasattr(obj, "events")
+        and hasattr(obj, "total_premium")
+        and hasattr(obj, "ticker")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scoring helpers
 # ---------------------------------------------------------------------------
 
-def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
+def volume_weighted_premium_factor(ep) -> float:
     """min(1.0, premium / (oi * 100)). Returns 0.5 when OI is zero."""
     if not ep.events:
         return 0.5
@@ -118,7 +132,7 @@ def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     return round(min(1.0, premium / (latest_oi * 100)), 4)
 
 
-def premium_tier_score(ep: RepetitionEpisode) -> float:
+def premium_tier_score(ep) -> float:
     """
     Normalise episode total_premium to a [0, 1] score.
 
@@ -141,7 +155,7 @@ def premium_tier_score(ep: RepetitionEpisode) -> float:
     return 0.0
 
 
-def compute_flow_score(ep: RepetitionEpisode) -> float:
+def compute_flow_score(ep) -> float:
     prem   = min(ep.total_premium / 10_000_000, 1.0)
     accel  = 0.15 if ep.is_accelerating else 0.0
     trades = min(ep.trade_count / 20, 0.20)
@@ -216,29 +230,31 @@ def build_composite(
     New (Apex S6):
         build_composite(symbol: str, episode, accumulator) -> Composite
 
-    Legacy (6-layer regression, E2E tests):
-        build_composite(episode: RepetitionEpisode, accumulator: RepetitionAccumulator) -> CompositeSignal
+    Legacy (6-layer regression, E2E tests, and stub-based tests):
+        build_composite(episode, accumulator) -> CompositeSignal
+        where episode is RepetitionEpisode OR any duck-typed object with
+        .events, .total_premium, and .ticker attributes.
 
-    Raises TypeError if called with 2 positional args where arg1 is not a
-    RepetitionEpisode (regression guard for test_apex_s6_composite_overhaul.py).
+    Raises TypeError if called with 2 positional args where arg1 is not
+    a str and does not duck-type as an episode object.
     """
     # ── New 3-arg path: build_composite(symbol, episode, accumulator) ──────
     if isinstance(symbol_or_episode, str):
-        symbol      = symbol_or_episode
-        episode     = episode_or_accumulator
-        acc         = accumulator
+        symbol  = symbol_or_episode
+        episode = episode_or_accumulator
+        acc     = accumulator
         return _build_composite_new(symbol, episode, acc)
 
-    # ── Legacy 2-arg path: build_composite(episode, accumulator) ───────────
-    if isinstance(symbol_or_episode, RepetitionEpisode):
+    # ── Legacy 2-arg path: RepetitionEpisode OR duck-typed episode stub ────
+    if isinstance(symbol_or_episode, RepetitionEpisode) or _is_episode_duck(symbol_or_episode):
         ep  = symbol_or_episode
         acc = episode_or_accumulator
         return _build_composite_legacy(ep, acc, sector_score=sector_score)
 
-    # ── Anything else with 2 positional args raises TypeError ──────────────
+    # ── Anything else raises TypeError (regression guard) ──────────────────
     raise TypeError(
         "build_composite() requires either (symbol: str, episode, accumulator) "
-        "or (episode: RepetitionEpisode, accumulator: RepetitionAccumulator). "
+        "or (episode, accumulator) where episode has .events/.total_premium/.ticker. "
         f"Got first arg of type {type(symbol_or_episode).__name__!r}."
     )
 
@@ -261,11 +277,11 @@ def _build_composite_new(symbol: str, episode, accumulator) -> Optional[Composit
         + trade_count_score   * 0.10
     All clamped to [0.0, 1.0].
     """
-    # Episode-level sub-scores
+    # Episode-level sub-scores — accept duck-typed episodes too
     ep_prem = getattr(episode, "total_premium", 0.0) or 0.0
     prem_s  = min(ep_prem / 2_000_000.0, 1.0)
 
-    is_accel = getattr(episode, "is_accelerating", False) if isinstance(episode, RepetitionEpisode) else False
+    is_accel = getattr(episode, "is_accelerating", False)
     accel_s  = 0.15 if is_accel else 0.0
 
     tc = getattr(episode, "trade_count", None)
@@ -306,13 +322,14 @@ def _build_composite_new(symbol: str, episode, accumulator) -> Optional[Composit
 # ---------------------------------------------------------------------------
 
 def _build_composite_legacy(
-    ep: RepetitionEpisode,
-    accumulator: RepetitionAccumulator,
+    ep,
+    accumulator,
     *,
     sector_score: float = 0.0,
 ) -> CompositeSignal:
     """
     Legacy composite builder. Returns CompositeSignal.
+    Accepts RepetitionEpisode or any duck-typed episode stub.
 
     Weight split (S6):
         flow_score            * 0.55
