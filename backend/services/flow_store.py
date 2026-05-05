@@ -63,6 +63,31 @@ Bug fixes applied:
      fetches the lookback result from contract_day_cache, then PATCHes the
      most-recent flow_episodes row for that contract with is_multi_day_repeat.
 
+PRE-MERGE BLOCKER FIXES (2026-05-04):
+  SA-F1: start_lookback_worker() was calling
+    getattr(accumulator, "_dte_premium_tiers", None)
+    The attribute is named "_dte_tiers" on RepetitionAccumulator — not
+    "_dte_premium_tiers". getattr always returned None, so dte_tiers was always
+    empty and min_premium always fell back to the hardcoded 10_000.0 floor,
+    permanently decoupling the lookback quality filter from the DTE-tier floors
+    used by Gate 2. Additionally, _dte_tiers is a List[Tuple[int, Dict[int,
+    float]]], not a flat dict, so min(dte_tiers.values()) would have raised
+    TypeError even if the attr name were correct.
+    Fix: correct attr name + traverse list-of-tuples:
+      min(floor for _, floors in dte_tiers for floor in floors.values())
+
+  PBE-F2: _update_episode_multiday() was constructing a PostgREST PATCH URL
+    with &order=signal_ts.desc&limit=1 appended. PostgREST silently ignores
+    order/limit modifiers on PATCH requests — ALL rows matching the
+    (ticker, contract_type, strike, expiry) filter were being updated, not
+    just the most recent one. On a high-frequency contract this overwrote
+    is_multi_day_repeat on all prior flow_episodes rows on every new episode.
+    Fix: two-step GET+PATCH by id:
+      Step 1: GET ?...&order=signal_ts.desc&limit=1&select=id
+              → retrieve the bigserial id of the target row.
+      Step 2: PATCH ?id=eq.{id}
+              → update exactly that row. Zero spurious multi-row overwrites.
+
 ING-007 cold-cache note:
   The background asyncio.Queue pattern means lookback results are populated
   asynchronously after the first episode for a contract arrives. The first
@@ -391,38 +416,97 @@ async def _update_episode_multiday(
     ING-007: PATCH the most-recent flow_episodes row for this contract
     to set is_multi_day_repeat after the async lookback fetch completes.
 
-    Uses PostgREST ordering + limit to target the single latest row.
+    PBE-F2 fix (2026-05-04): PostgREST silently ignores &order= and &limit=
+    on PATCH requests — all rows matching the filter predicate are updated,
+    not just the most recent one. Fixed with a two-step GET+PATCH by id:
+
+      Step 1: GET ?...&order=signal_ts.desc&limit=1&select=id
+              Retrieve the bigserial id of the target (most recent) row.
+      Step 2: PATCH ?id=eq.{id}
+              Update exactly that single row. No spurious multi-row overwrites.
+
     Silently swallows errors — enrichment failure must never block the stream.
     """
     if not _is_configured():
         return
 
-    url = (
-        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-        f"?ticker=eq.{quote(ticker)}"
-        f"&contract_type=eq.{quote(contract_type)}"
-        f"&strike=eq.{strike}"
-        f"&expiry=eq.{quote(expiry)}"
-        f"&order=signal_ts.desc"
-        f"&limit=1"
-    )
+    get_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Accept":        "application/json",
+    }
     patch_headers = {
         "apikey":        _SUPABASE_KEY,
         "Authorization": f"Bearer {_SUPABASE_KEY}",
         "Content-Type":  "application/json",
         "Prefer":        "return=minimal",
     }
-    payload = {"is_multi_day_repeat": is_multi_day_repeat}
+
+    filter_qs = (
+        f"?ticker=eq.{quote(ticker)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+    )
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(url, headers=patch_headers, json=payload)
-        if resp.status_code not in (200, 204):
-            log.warning(
-                "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
-                "(ticker=%s %s $%.0f %s)",
-                resp.status_code, resp.text[:200],
-                ticker, contract_type, strike, expiry,
+            # Step 1: GET the id of the most-recent matching row.
+            get_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"{filter_qs}"
+                f"&order=signal_ts.desc"
+                f"&limit=1"
+                f"&select=id"
             )
+            get_resp = await client.get(get_url, headers=get_headers)
+            if get_resp.status_code != 200:
+                log.warning(
+                    "[flow_store] _update_episode_multiday GET failed: %d -- %s "
+                    "(ticker=%s %s $%.0f %s)",
+                    get_resp.status_code, get_resp.text[:200],
+                    ticker, contract_type, strike, expiry,
+                )
+                return
+
+            rows = get_resp.json()
+            if not rows:
+                # No matching episode yet — possible on the very first persist
+                # if the async worker races ahead of the INSERT commit.
+                log.debug(
+                    "[flow_store] _update_episode_multiday: no rows found for "
+                    "%s %s $%.0f %s — skipping PATCH",
+                    ticker, contract_type, strike, expiry,
+                )
+                return
+
+            row_id = rows[0].get("id")
+            if row_id is None:
+                log.warning(
+                    "[flow_store] _update_episode_multiday: GET returned row with "
+                    "no id field (ticker=%s %s $%.0f %s) — skipping PATCH",
+                    ticker, contract_type, strike, expiry,
+                )
+                return
+
+            # Step 2: PATCH exactly that row by its id.
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{row_id}"
+            )
+            patch_resp = await client.patch(
+                patch_url,
+                headers=patch_headers,
+                json={"is_multi_day_repeat": is_multi_day_repeat},
+            )
+            if patch_resp.status_code not in (200, 204):
+                log.warning(
+                    "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
+                    "(id=%s ticker=%s %s $%.0f %s)",
+                    patch_resp.status_code, patch_resp.text[:200],
+                    row_id, ticker, contract_type, strike, expiry,
+                )
+
     except Exception as exc:
         log.warning(
             "[flow_store] _update_episode_multiday exception: %s "
@@ -445,6 +529,14 @@ async def start_lookback_worker(accumulator) -> None:
              prior_days_active >= accumulator._multi_day_min_days
          ).
          Uses the accumulator's configured threshold — never hardcoded.
+
+    SA-F1 fix (2026-05-04):
+      Previously called getattr(accumulator, "_dte_premium_tiers", None) which
+      always returned None because the attribute is stored as "_dte_tiers" on
+      RepetitionAccumulator. Also, _dte_tiers is a List[Tuple[int, Dict[int,
+      float]]], not a flat dict, so min(dte_tiers.values()) would have raised
+      TypeError. Fixed to use the correct attribute name and traverse the
+      list-of-tuples structure to extract the minimum floor value.
 
     Cold-cache note: the first episode for any contract returns
     prior_days_active=0 (cache miss → DB fetch). Subsequent ticks within
@@ -470,19 +562,27 @@ async def start_lookback_worker(accumulator) -> None:
             key = await _lookback_queue.get()
             ticker, contract_type, strike, expiry = key
 
-            # Resolve DTE-tier min_premium from accumulator if available.
+            # SA-F1 fix: correct attribute name (_dte_tiers, not _dte_premium_tiers)
+            # and correct traversal for List[Tuple[int, Dict[int, float]]] structure.
+            # We use the minimum floor across all DTE bands and tiers as the lookback
+            # quality filter — we want prior days where ANY qualifying flow appeared,
+            # not just the current episode's specific DTE tier.
             try:
-                dte_tiers = getattr(accumulator, "_dte_premium_tiers", None) or {}
-                # Use the lowest tier floor as the lookback floor — we want
-                # prior days where ANY qualifying flow appeared, not just the
-                # current episode's tier. Fallback to $10k if no tiers set.
-                min_premium = min(dte_tiers.values()) if dte_tiers else 10_000.0
-            except Exception:
+                dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+                if dte_tiers:
+                    min_premium = min(
+                        floor
+                        for _, floors in dte_tiers
+                        for floor in floors.values()
+                    )
+                else:
+                    min_premium = 10_000.0
+            except (ValueError, TypeError):
                 min_premium = 10_000.0
 
             try:
                 result = await get_lookback(key, min_premium)
-                # PBE-F3 fix: use accumulator's configured threshold, not hardcoded 1.
+                # Use accumulator's configured threshold, not hardcoded value.
                 is_repeat = result.prior_days_active >= multi_day_min_days
                 await _update_episode_multiday(
                     ticker, contract_type, strike, expiry, is_repeat
