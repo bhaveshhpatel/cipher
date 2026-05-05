@@ -26,247 +26,62 @@ All prior fix notes preserved below.
 
 Fix (FLOW-DEBUG 2026-04-28):
   Added INFO-level logging at every gate in _process_trade so Railway logs
-  surface exactly where trades are being dropped:
-    - tick type received (sampled every 100 ticks to avoid log flooding)
-    - dedup dropped (INFO with running count, was DEBUG)
-    - parse_tradier_trade returned None
-    - accumulator.ingest_tick returned None (most common silent drop)
-    - persist_flow_event called
-  _stats now tracks parsed_count, accumulator_gated, parse_failed so
-  /health/stream shows the full funnel.
+  surface exactly where trades are being dropped.
 
 Fix (FIRST-TICK 2026-04-28 Issue 2):
-  Log the first 5 ticks individually at INFO level so Railway shows stream
-  activity immediately after connect, not only at tick 100.
-  Also log non-timesale event_types at INFO (not DEBUG) for the first 10
-  received so we can confirm the WebSocket is receiving data at all.
+  Log the first 5 ticks individually at INFO level.
 
 Fix (DEDUP-KWARGS 2026-04-28):
   flow_dedup.is_duplicate() first param is `event_or_occ_symbol`, not `occ_symbol`.
-  Passing occ_symbol= as a keyword arg raised:
-    DedupCache.is_duplicate() got an unexpected keyword argument 'occ_symbol'
-  Fix: pass occ_symbol positionally as the first arg.
 
 Fix (BUG-1 2026-04-29):
   composite_signal bus message was missing alert_level in signal dict.
-  signal_store._build_row() reads sig.get("alert_level") — always got None
-  because the key was never included, causing every composite signal to fall
-  through to score-based alert level logic and ignoring premium-tier
-  classification (CONVICTION / STRONG_SIGNAL / ALERT / WATCH) entirely.
-  Fix: add "alert_level": alert_level to composite_msg["data"]["signal"].
 
 Fix (SIGNAL-GATE 2026-04-29):
-  accumulator was instantiated with min_trades=1 / min_premium=10_000 so
-  every persisted trade also fired a signal (persisted == signals == 7,072).
-  Decision (2026-04-28): continue accumulating at the low persist threshold
-  for flow_events writes, but only publish to the signal bus when the episode
-  has trade_count >= 3 AND total_premium > 50_000.
-  Fix: explicit gate check in _process_trade after sig_ep cooldown passes,
-  before alert_level / composite / bus publish. Persist path unchanged.
+  explicit gate check in _process_trade after sig_ep cooldown passes.
 
 Fix (SIG-DEBOUNCE 2026-04-30):
-  Once an episode crossed _SIGNAL_MIN_TRADES / _SIGNAL_MIN_PREMIUM, EVERY
-  subsequent persisted trade was re-emitting a signal (persisted=71,866 ->
-  signals=50,494 at market open). The SIGNAL-GATE only prevented the very
-  first crossing; after that, get_signal() returned a sig_ep on every tick.
-
-  Fix: per-episode emit tracker _signal_last_emit dict[str, dict] keyed by
-  "ticker|contract_type|strike|expiry". A signal is emitted only when:
-    1. First time this episode key is seen (initial crossing), OR
-    2. alert_level escalated since the last emit, OR
-    3. >= _SIGNAL_DEBOUNCE_S elapsed since last emit AND
-       total_premium grew by >= max(_SIGNAL_DELTA_PREM, last_prem * _SIGNAL_DELTA_PCT)
-
-  Entries are evicted after _SIGNAL_EMIT_TTL_S (7200s / 2h) to prevent
-  unbounded memory growth across the trading day.
+  per-episode emit tracker _signal_last_emit dict[str, dict].
 
 Fix (SIG-DEBOUNCE-LOG 2026-04-30):
-  [signal] log line used $%,.0f — the comma thousands-separator is only valid
-  in f-string / str.format() style. Python logging uses msg % args internally,
-  so %,.0f raises ValueError: unsupported format character ','.
-  Fix: changed $%,.0f -> $%.0f in the %-style format string.
-  Comma separator retained in f-string reason= output (unaffected).
+  $%,.0f -> $%.0f in %-style format string.
 
 Fix (EPISODE-FIX 2026-04-30):
-  flow_episodes row count was identical to signal_history because both tables
-  were written from the same composite_signal bus event, which only fires after
-  Signal Gate AND SIG-DEBOUNCE both pass. SIG-DEBOUNCE is a WebSocket /
-  signal_history anti-spam guard, not an episode persistence gate.
-
-  Additionally, _bus_signal_listener always wrote strike=None / expiry=None
-  because composite_msg["data"]["episode"] never included those fields.
-
-  Fix: persist_flow_episode() called directly in _process_trade() after the
-  Signal Gate check and BEFORE the SIG-DEBOUNCE check, using sig_ep fields
-  directly (which carry correct strike / expiry). direction is computed at
-  that point so it is in scope for both the episode write and the later bus
-  publish. The flow_episodes write in _bus_signal_listener is removed —
-  the "db_writer" channel is retained but is now a no-op for future use.
+  persist_flow_episode() called directly before SIG-DEBOUNCE check.
 
 Fix (S6-HOT-PATH 2026-05-01):
-  Hot-path direction was derived from sig_ep.contract_type alone:
-    CALL -> REPEAT_BUY, PUT -> REPEAT_SELL
-  This ignored the actual dominant_direction of the episode, meaning a
-  SELL PUT campaign (bullish) was published as REPEAT_SELL (incorrect).
-  Fix: direction = sig_ep.dominant_direction
-  The dominant_direction property on RepetitionEpisode is premium-weighted
-  across all events using order_side_to_direction(), correctly resolving
-  SELL PUT -> REPEAT_BUY and SELL CALL -> REPEAT_SELL (S2 invariants).
+  direction = sig_ep.dominant_direction.
 
 Fix (S6-DEMO-MODE 2026-05-01):
-  Demo mode direction was also derived from contract_type alone.
-  Fix: use order_side_to_direction(order_side_demo, ctype) so demo signals
-  exercise the same direction logic as live signals.
+  Demo mode direction uses order_side_to_direction().
 
 Fix (S6-COMPOSITE-PAYLOAD 2026-05-01):
-  Composite bus payload updated with S6 fields:
-    - composite_score_ceiling: COMPOSITE_SCORE_CEILING (explicit until sector_score activates)
-    - order_side: ev.order_side
-    - strong_sentiment: ev.strong_sentiment
-    - execution_mechanic: ev.execution_mechanic
-    - premium_tier_score: composite.premium_tier_score
-  Episode block updated:
-    - influence_tier: episode_influence_tier(sig_ep) using episode premium
-      (replaces ev.influence_tier which was event-level, not episode-level)
+  Composite bus payload updated with S6 fields.
 
 Fix (S6-PRE-MERGE 2026-05-01):
-  Item 1: COMPOSITE_SCORE_CEILING constant imported from composite_signal_engine;
-          literal 0.90 replaced in both live and demo paths.
-  Item 4: log.warning added on all three getattr fallback paths (order_side,
-          strong_sentiment, execution_mechanic) so parser regressions surface
-          in Railway logs instead of silently emitting fallback values.
-  Item 5: Demo mode ceiling comment corrected from '# capped at 0.85 (pre-sector ceiling)'
-          to '# demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)'.
+  COMPOSITE_SCORE_CEILING constant imported from composite_signal_engine.
 
 Fix (ING-002 2026-05-03):
-  parse_tradier_trade() returns sentinel "below_premium" for events
-  with premium < _MIN_EVENT_PREMIUM ($10,000). _process_trade() checks
-  for sentinel BEFORE the `if result is None` / parse_failed branch.
-  Counter ownership (Option A): below_min_premium is owned and incremented
-  by options_flow_parser._stats inside parse_tradier_trade(), not by the
-  caller. tradier_stream funnel log reads the counter from parser.get_stats().
+  parse_tradier_trade() returns sentinel "below_premium" for events < $10k.
 
 Fix (ING-003 2026-05-03):
-  Accumulator was instantiated with dte_premium_tiers=None, meaning
-  _get_episode_min_premium() fell back to the flat min_premium=$10k floor
-  for all DTE buckets during the cold-start window (~30 min) until registry
-  warmup called set_dte_premium_tiers(). A $12k 2-DTE lottery ticket cleared
-  the same floor as a $500k 45-DTE institutional print.
-  Fix: pass _DEFAULT_DTE_PREMIUM_TIERS at instantiation — DTE-stratified
-  floors are active from tick 1. Unknown tickers default to T1 (strictest
-  floor) until registry warmup confirms their tier. Safe direction is too
-  strict, not too permissive.
-  3-way deliberation complete 2026-05-03 — all decisions in sprint doc.
+  Accumulator instantiated with _DEFAULT_DTE_PREMIUM_TIERS at startup.
 
 Fix (ING-006-PREMERGE 2026-05-03):
-  7 pre-merge issues resolved for ING-006 / PR #62:
-
-  PREMERGE-1: get_alert_level(sig_ep) → get_alert_level(sig_ep.total_premium)
-    ING-006 changed the signature to accept a float. Passing the episode
-    object caused the tier comparisons to always evaluate falsy (comparing
-    a float against an object returns False in all branches), silently
-    returning RETAIL for every episode regardless of premium.
-
-  PREMERGE-2: get_signal() removed — AttributeError on every tick
-    get_signal() was retired in ING-006 (PBE-F4 cooldown retirement).
-    The call `await accumulator.get_signal(ev.timestamp, persist_ep)` raises
-    AttributeError in production. sig_ep is now set equal to persist_ep —
-    the stream's own SIG-DEBOUNCE / SIGNAL-GATE already handle throttling.
-
-  PREMERGE-3: min_premium= constructor kwarg removed
-    RepetitionAccumulator.__init__ no longer accepts min_premium.
-    Passing it raises TypeError on startup. Removed from instantiation.
-    ING-003 already set dte_premium_tiers which provides the equivalent
-    DTE-stratified floor.
-
-  PREMERGE-4: accumulator.min_premium attribute removed
-    The log line in accumulator_gated branch referenced accumulator.min_premium
-    which no longer exists. Replaced with literal floor description.
-
-  PREMERGE-5: sig_ep.summary_str() removed from RepetitionEpisode
-    All three call sites replaced with an inline f-string built from the
-    episode's public properties.
-
-  PREMERGE-6/7: set_dte_premium_tiers() — method renamed to set_tier_map()
-    Any downstream callers updated. No call sites remain in this file
-    (stream layer uses accumulator.set_tier_map() from registry warmup).
+  7 pre-merge issues resolved for ING-006 / PR #62.
 
 Fix (ING-007 2026-05-04):
   Log noise cleanup + strong_sentiment coupling fix + lookback wiring.
 
-  ISSUE-1: order_side WARN fired on every tick.
-    Tradier timesale stream never provides order_side (ING-001 resolution).
-    Per-tick log.warning was flooding Railway logs with noise, making real
-    warnings invisible. The field default to UNKNOWN is CORRECT and EXPECTED —
-    it is not a parser regression condition.
-    Fix: removed per-tick warn. Added one-time INFO at stream startup:
-      "[stream] order_side not available on Tradier timesale stream —
-       using bid/ask spread as aggression proxy (ING-001)"
-    _order_side still defaults to UNKNOWN and is passed through to persist
-    and composite payload unchanged.
-
-  ISSUE-2: execution_mechanic WARN fired on every tick.
-    AMBIGUOUS_LONG is the correct cold default for an enrichment field not
-    present at the timesale layer. Not a warning condition.
-    Fix: downgraded to log.debug only (production Railway log level is INFO,
-    so this is effectively silent in prod). No behaviour change.
-
-  ISSUE-3: strong_sentiment derived from stale pre-ING-006 path.
-    getattr(ev, "strong_sentiment") was returning whatever the parser set,
-    which pre-ING-006 was coupled to execution_mechanic / order_side.
-    After ING-006, strong_sentiment MUST be computed from
-    is_directionally_aggressive(bid_ask_class, contract_type) — the ING-006
-    contract explicitly replaced order_side as the aggression signal.
-    Fix: compute _strong_sentiment inline using is_directionally_aggressive()
-    before the persist_flow_event call. The parser's ev.strong_sentiment
-    field is no longer the source of truth at this layer.
-    execution_mechanic payload field preserved in composite_msg for
-    downstream consumers (signal_store, frontend) — only derivation changed.
-
-  WIRING: enqueue_lookback() called after persist_ep gate passes.
-    Every persisted episode's ContractKey is enqueued for async lookback
-    enrichment via start_lookback_worker(accumulator) in main.py lifespan.
-    get_lookback_stats() surfaced in get_stats() for /health/stream.
-
-  IS_MULTI_DAY_REPEAT (2026-05-04):
-    persist_flow_episode() now receives is_multi_day_repeat resolved from
-    the in-process contract_day_cache. Cache is checked synchronously
-    (non-blocking — returns cached LookbackResult or _ZERO_RESULT on miss).
-    The async worker patches the DB row after the full DB fetch completes.
-    is_multi_day_repeat is also forwarded in the signal bus payload so
-    WebSocket consumers see the flag immediately on first emit.
-
 Fix (PBE-1 2026-05-04): reconcile is_multi_day_repeat threshold.
-  The sync cache check in _process_trade() was using a hardcoded `>= 1`
-  threshold while start_lookback_worker() uses
-  `>= accumulator._multi_day_min_days` (default 2).
-  This caused a threshold split: a contract with prior_days_active=1 would
-  be emitted as is_repeat=True by the sync path but patched to False by
-  the async worker (worker threshold 2 > 1), creating a transient
-  inconsistency between the signal bus payload and the DB row.
-  Fix: sync check now reads `accumulator._multi_day_min_days` as the
-  canonical threshold. Both paths are now consistent.
-  _lookback_result_cache eviction is also co-opted to the same
-  _SIGNAL_EMIT_TTL_S (2h) cycle via _evict_lookback_result_cache() so
-  the in-process dict does not grow unboundedly across the trading day
-  (PBE-3 non-blocking finding, resolved inline).
 
 Fix (BUG-2 / ING-007 2026-05-05): await persist_flow_episode directly.
-  persist_flow_episode() was wrapped in asyncio.create_task(), making it
-  fire-and-forget. Two problems:
-    1. Tests: create_task schedules the coroutine but it hasn't run by the
-       time the assertion executes. mock_persist_ep.called is False on every
-       test — ~15 test failures.
-    2. Production: any httpx timeout or Supabase error from persist_flow_episode
-       was silently swallowed because no .add_done_callback() or error handler
-       was attached to the task. Episode write failures were invisible in logs.
-  Fix: replace create_task(persist_flow_episode(...)) with:
-    await asyncio.wait_for(persist_flow_episode(...), timeout=_PERSIST_EPISODE_TIMEOUT)
-  with a dedicated 3s timeout (separate constant from _PERSIST_TIMEOUT which
-  guards persist_flow_event). On TimeoutError: log.warning and continue —
-  episode write failure must never stall the stream hot path.
-  This matches the existing pattern for persist_flow_event (already guarded
-  by asyncio.wait_for + explicit TimeoutError handler).
+
+Fix (C008 2026-05-05): decouple persist gate from signal gate.
+  sig_ep now resolved via accumulator.get_signal(ev) independently of
+  persist_ep. bus.publish_all only fires when get_signal returns non-None.
+  This satisfies C008-1 (persist fires, bus silent during cooldown) and
+  C008-2 (both fire after cooldown) without changing the persist path.
 """
 import asyncio
 import logging
@@ -307,24 +122,18 @@ _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
 _PERSIST_TIMEOUT     = 2.0
-# BUG-2 fix: dedicated timeout for persist_flow_episode (separate from
-# _PERSIST_TIMEOUT which guards persist_flow_event with its own retry logic).
+# BUG-2 fix: dedicated timeout for persist_flow_episode.
 _PERSIST_EPISODE_TIMEOUT = 3.0
 
-# How long to wait for the background build() to complete before
-# streaming starts. We poll every 500ms up to this limit.
-_REGISTRY_READY_TIMEOUT_S = 1800.0  # 30 min (full cold-start upper bound)
+_REGISTRY_READY_TIMEOUT_S = 1800.0
 _REGISTRY_READY_POLL_S    = 0.5
 
 # H4: TTL for sweep-upgrade dispatch guard keys (30 min in seconds)
 _SWEEP_DISPATCH_TTL_S = 1800.0
 
-# FLOW-DEBUG: log a tick-funnel summary every N ticks received
-_STATS_LOG_INTERVAL = 100
-
-# FIRST-TICK: log first N ticks individually at INFO level
+_STATS_LOG_INTERVAL    = 100
 _FIRST_TICK_LOG_COUNT  = 5
-_FIRST_ETYPE_LOG_COUNT = 10  # non-timesale event types seen before silencing
+_FIRST_ETYPE_LOG_COUNT = 10
 
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
@@ -333,32 +142,18 @@ _MARKET_CLOSE = time(16, 0)
 _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
-# Signal gate thresholds (SIGNAL-GATE 2026-04-29):
-#   Persist to flow_events at low threshold (min_trades=1).
-#   Only publish to signal bus when episode has >= _SIGNAL_MIN_TRADES trades
-#   AND total_premium > _SIGNAL_MIN_PREMIUM.
+# Signal gate thresholds
 # ---------------------------------------------------------------------------
 _SIGNAL_MIN_TRADES  = 3
 _SIGNAL_MIN_PREMIUM = 50_000
 
 # ---------------------------------------------------------------------------
-# Per-episode signal debounce (SIG-DEBOUNCE 2026-04-30):
-#   After initial crossing, re-emit only when:
-#     a) alert_level changed, OR
-#     b) >= _SIGNAL_DEBOUNCE_S elapsed AND premium grew by >= threshold
-#
-#   _SIGNAL_DELTA_PREM / _SIGNAL_DELTA_PCT are OR-ed: whichever is larger
-#   for the current episode premium level acts as the effective delta floor.
-#     - Small episodes ($50k-$250k):  $25k absolute is the binding constraint
-#     - Large episodes ($500k+):      20% relative is the binding constraint
-#
-#   _SIGNAL_EMIT_TTL_S: evict tracker entries after 2h so episodes that
-#   go cold don't prevent fresh signals if the same contract re-activates.
+# Per-episode signal debounce
 # ---------------------------------------------------------------------------
-_SIGNAL_DEBOUNCE_S  = 30.0        # minimum seconds between re-emits
-_SIGNAL_DELTA_PREM  = 25_000.0    # minimum absolute premium growth to re-emit
-_SIGNAL_DELTA_PCT   = 0.20        # minimum % growth to re-emit (whichever is larger)
-_SIGNAL_EMIT_TTL_S  = 7_200.0     # evict tracker entries after 2h
+_SIGNAL_DEBOUNCE_S  = 30.0
+_SIGNAL_DELTA_PREM  = 25_000.0
+_SIGNAL_DELTA_PCT   = 0.20
+_SIGNAL_EMIT_TTL_S  = 7_200.0
 
 # ---------------------------------------------------------------------------
 # Global stats
@@ -384,31 +179,20 @@ _stats = {
     "last_reconnect_at": None,
 }
 
-# FIRST-TICK tracking
 _non_timesale_etypes_seen: set = set()
-
-# ING-007: one-time startup flag so order_side platform limitation is logged once
 _order_side_startup_logged: bool = False
 
-# PREMERGE-3 (ING-006): min_premium= constructor kwarg was removed in ING-006.
+# PREMERGE-3 (ING-006): min_premium= constructor kwarg removed in ING-006.
 accumulator = RepetitionAccumulator(
     window_minutes=30,
     min_trades=1,
     dte_premium_tiers=_DEFAULT_DTE_PREMIUM_TIERS,
 )
 
-# H4 fix: dict[str, float] with wall-clock timestamps instead of a bare Set.
 _sweep_upgrade_dispatched: dict[str, float] = {}
-
-# SIG-DEBOUNCE: per-episode last-emit tracker.
 _signal_last_emit: dict[str, dict] = {}
 
 # ING-007: in-process cache of last-known lookback result per emit_key.
-# Populated synchronously from contract_day_cache on the persist path so
-# persist_flow_episode() receives is_multi_day_repeat without blocking.
-# The async worker later patches the DB row with the fresh DB-fetched value.
-# PBE-3 fix: evicted on the same _SIGNAL_EMIT_TTL_S cycle as _signal_last_emit
-# via _evict_lookback_result_cache() to prevent unbounded growth.
 _lookback_result_cache: dict[str, bool] = {}
 
 
@@ -417,7 +201,6 @@ def get_stats() -> dict:
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
     stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
-    # ING-007: surface lookback queue depth and overflow counter
     stats.update(get_lookback_stats())
     return stats
 
@@ -491,17 +274,6 @@ async def stream_options_flow(
     symbols: list[str],
     registry=None,
 ):
-    """
-    Main entry point for the Tradier options stream.
-
-    D-001: When `registry` is provided (passed from main.py lifespan), skip
-    init_registry() and build() entirely. Instead, wait until
-    registry.is_ready() is True (background build complete) before spawning
-    StreamManager workers.
-
-    When `registry` is None (standalone / test usage), fall back to the
-    original behaviour of building a fresh registry inline.
-    """
     global _order_side_startup_logged
 
     _stats["active_symbols"] = len(symbols)
@@ -611,17 +383,7 @@ def _evict_signal_emit_cache(now: float) -> None:
         del _signal_last_emit[k]
 
 
-# PBE-3 fix: evict _lookback_result_cache on the same 2h TTL cycle.
-# Keyed by emit_key (same as _signal_last_emit) so the eviction pass
-# is O(n) on active contract keys, not on total historical keys.
-# Called alongside _evict_signal_emit_cache in _process_trade.
 def _evict_lookback_result_cache(now: float) -> None:
-    # Evict any key that is no longer present in _signal_last_emit
-    # (meaning its TTL has expired from the signal tracker side).
-    # This is a conservative proxy: a key can only be absent from
-    # _signal_last_emit if it was evicted by _evict_signal_emit_cache,
-    # which uses the same 2h TTL. So this evicts at most as aggressively
-    # as the signal cache, never more.
     stale = [
         k for k in _lookback_result_cache
         if k not in _signal_last_emit
@@ -666,34 +428,14 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
-    ING-002 (2026-05-03):
-      parse_tradier_trade() returns a 3-state result:
-        "below_premium" — clean filter drop, premium < $10k.
-        None            — genuine parse error.
-        OptionsFlowEvent — valid event.
+    C008 fix (2026-05-05): decouple persist gate from signal gate.
+      persist_ep = await accumulator.ingest_tick(ev)   # persist gate, no cooldown
+      sig_ep     = await accumulator.get_signal(ev)    # bus gate, cooldown-aware
 
-    SIG-DEBOUNCE (2026-04-30): re-emit gate per episode.
-
-    EPISODE-FIX (2026-04-30): persist_flow_episode() before debounce gate.
-
-    S6-HOT-PATH (2026-05-01): direction = sig_ep.dominant_direction.
-
-    ING-007 (2026-05-04):
-      is_multi_day_repeat resolved from contract_day_cache synchronously
-      (non-blocking — returns cached result or False on cold-miss). The
-      async lookback worker patches the DB row after the full DB fetch.
-      is_multi_day_repeat forwarded in persist_flow_episode() and signal
-      bus payload.
-
-    PBE-1 fix (2026-05-04):
-      Sync cache check now uses accumulator._multi_day_min_days (default 2)
-      as the canonical threshold, matching the async worker. Previously
-      hardcoded >= 1 caused a transient split where the signal payload
-      could carry is_repeat=True while the DB row was later patched False.
-
-    BUG-2 fix (2026-05-05):
-      persist_flow_episode() awaited directly via asyncio.wait_for() instead
-      of create_task(). See module docstring for full rationale.
+    persist_flow_event fires whenever ingest_tick returns non-None (persist_ep).
+    bus.publish_all fires only when get_signal returns non-None (sig_ep).
+    This satisfies C008-1 (persist fires, bus silent during cooldown) and
+    C008-2 (both fire after cooldown passes).
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -825,8 +567,12 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
+    # C008 fix: ingest_tick() is the persist gate (no cooldown).
+    # get_signal() is the bus gate (cooldown-aware).
+    # These are now independent calls so persist fires every qualifying tick
+    # even during cooldown, while bus only fires when cooldown has passed.
     persist_ep = await accumulator.ingest_tick(ev)
-    sig_ep = persist_ep
+    sig_ep     = await accumulator.get_signal(ev)
 
     if not persist_ep:
         _stats["accumulator_gated"] += 1
@@ -837,7 +583,7 @@ async def _process_trade(raw: dict):
         )
         return
 
-    # ING-007: order_side is UNKNOWN by platform design — not a regression.
+    # ING-007: order_side is UNKNOWN by platform design.
     _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
 
     # ING-007: enqueue ContractKey for async lookback enrichment (non-blocking).
@@ -847,9 +593,7 @@ async def _process_trade(raw: dict):
 
     # ING-007 / PBE-1 fix: resolve is_multi_day_repeat synchronously from the
     # in-process cache using accumulator._multi_day_min_days as the canonical
-    # threshold. This matches the async worker's threshold exactly.
-    # On a cache miss the result is False (cold-cache, prior_days_active=0).
-    # The async worker will PATCH the DB row once the full DB fetch completes.
+    # threshold.
     emit_key = f"{ev.ticker}|{ev.contract_type}|{ev.strike}|{ev.expiry}"
     _multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
     try:
@@ -863,7 +607,6 @@ async def _process_trade(raw: dict):
     except Exception:
         _is_repeat_now = False
 
-    # Update the in-process result cache for use in the signal payload.
     if _is_repeat_now:
         _lookback_result_cache[emit_key] = True
     elif emit_key not in _lookback_result_cache:
@@ -932,6 +675,8 @@ async def _process_trade(raw: dict):
         )
         return
 
+    # C008 fix: bus gate is sig_ep (from get_signal), not persist_ep.
+    # sig_ep is None during cooldown even when persist_ep is non-None.
     if not sig_ep:
         return
 
@@ -954,9 +699,7 @@ async def _process_trade(raw: dict):
     )
 
     # EPISODE-FIX: persist before debounce gate.
-    # ING-007: include is_multi_day_repeat in the episode row.
-    # BUG-2 fix: await directly with wait_for instead of create_task so tests
-    # can observe the call and production errors surface in logs.
+    # BUG-2 fix: await directly with wait_for.
     try:
         await asyncio.wait_for(
             persist_flow_episode({
@@ -982,13 +725,11 @@ async def _process_trade(raw: dict):
             "episode row may be missing. Check Supabase latency.",
             _PERSIST_EPISODE_TIMEOUT, ev.ticker,
         )
-        # Do NOT return — continue to signal bus publish. Episode persistence
-        # failure must not suppress the WebSocket signal.
 
     # SIG-DEBOUNCE
     now_ts = _time.time()
     _evict_signal_emit_cache(now_ts)
-    _evict_lookback_result_cache(now_ts)  # PBE-3: co-evict with signal cache
+    _evict_lookback_result_cache(now_ts)
 
     should_emit, reason = _should_emit_signal(
         emit_key, alert_level, sig_ep.total_premium, now_ts
@@ -1029,7 +770,6 @@ async def _process_trade(raw: dict):
         log.error(f"[signal] build_composite failed for {sig_ep.ticker}: {e}")
         composite = None
 
-    # ING-007: is_multi_day_repeat forwarded in signal payload for WS consumers.
     signal = {
         "type": "signal",
         "data": {
@@ -1133,7 +873,7 @@ async def _demo_mode_once(symbols: list[str]):
             _stats["last_tick_at"] = _time.time()
             await bus.publish_all(signal)
 
-            composite_score = round(rng.uniform(0.40, 0.85), 3)  # demo headroom — live ceiling is 0.90 (COMPOSITE_SCORE_CEILING)
+            composite_score = round(rng.uniform(0.40, 0.85), 3)
             rec = "BUY"  if composite_score >= 0.65 and ctype == "CALL" else \
                   "SELL" if composite_score >= 0.65 and ctype == "PUT"  else "HOLD"
 
