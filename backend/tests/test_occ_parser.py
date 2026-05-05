@@ -50,6 +50,7 @@ Covers:
   38. is_golden_sweep True for qualifying sweep
   39. Registry enrichment overrides ticker/strike when registry ready
   40. Registry failure is non-fatal (event still returned)
+  41. ING-002: below $10k premium floor returns sentinel "below_premium"
 """
 import sys
 from pathlib import Path
@@ -192,11 +193,11 @@ def test_parse_timestamp_garbage_returns_datetime():
 def _raw(
     symbol="AAPL  260620C00180000",
     underlying="AAPL",
-    last=3.50,
+    last=5.00,       # bumped from 3.50 — ING-002: $10k floor requires fill*size*100 > 10_000
     price=None,
-    bid=3.40,
-    ask=3.60,
-    size=10,
+    bid=4.90,        # bumped from 3.40 to track last
+    ask=5.10,        # bumped from 3.60 to track last
+    size=25,         # bumped from 10 — 5.00 * 25 * 100 = $12,500 > $10k floor
     option_type="CALL",
     strike=180.0,
     expiration_date="2026-06-20",
@@ -258,13 +259,15 @@ def test_parse_last_field_primary_fill(monkeypatch):
 
 # 21
 def test_parse_price_field_fallback_fill():
-    ev = parse_tradier_trade(_raw(last=None, price=4.25))
+    # last=None, price=4.25, size=25 → 4.25 * 25 * 100 = $10,625 > floor
+    ev = parse_tradier_trade(_raw(last=None, price=4.25, size=25))
     assert ev.fill_price == pytest.approx(4.25)
 
 
 # 22
 def test_parse_mid_fill_when_no_last_or_price():
-    ev = parse_tradier_trade(_raw(last=None, price=None, bid=3.0, ask=5.0))
+    # mid = (3.0 + 5.0) / 2 = 4.0, size=30 → 4.0 * 30 * 100 = $12,000 > floor
+    ev = parse_tradier_trade(_raw(last=None, price=None, bid=3.0, ask=5.0, size=30))
     assert ev.fill_price == pytest.approx(4.0)
 
 
@@ -312,20 +315,20 @@ def test_parse_dte_auto_calculated():
 
 # 28
 def test_parse_is_synthetic_quote_true_when_bid_ask_zero():
-    ev = parse_tradier_trade(_raw(bid=0, ask=0, last=3.50))
+    ev = parse_tradier_trade(_raw(bid=0, ask=0, last=5.00))
     assert ev.is_synthetic_quote is True
 
 
 # 29
 def test_parse_is_synthetic_quote_false_when_real_bid_ask():
-    ev = parse_tradier_trade(_raw(bid=3.40, ask=3.60, last=3.50))
+    ev = parse_tradier_trade(_raw(bid=4.90, ask=5.10, last=5.00))
     assert ev.is_synthetic_quote is False
 
 
 # 30
 def test_parse_premium_formula():
-    ev = parse_tradier_trade(_raw(last=3.50, size=10))
-    assert ev.premium == pytest.approx(3.50 * 10 * 100)
+    ev = parse_tradier_trade(_raw(last=5.00, size=25))
+    assert ev.premium == pytest.approx(5.00 * 25 * 100)
 
 
 # 31
@@ -362,8 +365,8 @@ def test_parse_influence_tier_large():
 
 # 36
 def test_parse_influence_tier_retail():
-    # 3500: fill=3.50 * size=10 * 100 = 3_500
-    ev = parse_tradier_trade(_raw(last=3.50, size=10, bid=3.40, ask=3.60))
+    # 12,250: fill=3.50 * size=35 * 100 = 12_250 — above $10k floor, below $100k LARGE threshold
+    ev = parse_tradier_trade(_raw(last=3.50, size=35, bid=3.40, ask=3.60))
     assert ev.influence_tier == "RETAIL"
 
 
@@ -410,3 +413,17 @@ def test_parse_registry_failure_non_fatal():
         ev = parse_tradier_trade(_raw())
     assert ev is not None
     assert ev.ticker == "AAPL"
+
+
+# 41 — ING-002: below_premium sentinel
+def test_parse_below_premium_floor_returns_sentinel():
+    """
+    ING-002: events with premium < $10k floor return the sentinel string
+    'below_premium', not None and not an OptionsFlowEvent.
+    Caller (tradier_stream) must NOT increment parse_failed for this path.
+    """
+    # fill=1.00 * size=5 * 100 = $500 — well below $10k floor
+    result = parse_tradier_trade(_raw(last=1.00, size=5))
+    assert result == "below_premium", (
+        f"Expected sentinel 'below_premium' for sub-floor premium, got: {result!r}"
+    )
