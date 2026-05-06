@@ -316,6 +316,28 @@ class RepetitionEpisode:
         return self.get_weighted_premium(_AGGRESSION_DISCOUNT)
 
     def get_weighted_premium(self, discount: float) -> float:
+        # ING-011b WARNING: is_aggressive on each event is set by
+        # is_directionally_aggressive(bid_ask_class, contract_type) in
+        # bid_ask_classifier.py (ING-006). That function is moneyness-blind:
+        # AT_BID PUT always returns True regardless of ITM/OTM band.
+        #
+        # ING-011's dominant_direction override correctly identifies ITM PUT
+        # AT_BID fills as *buyers* (not put writers) at the episode level —
+        # but is_aggressive on those per-event objects is still True, so they
+        # receive full premium weight here (×1.0) instead of the discount
+        # (×0.5) that a genuinely passive buyer-side fill should carry.
+        #
+        # Net effect: weighted_premium is overstated for ITM PUT AT_BID
+        # episodes by up to 2× relative to what ING-011's buyer model implies.
+        # This does not cause incorrect direction (ING-011 handles that) but
+        # can allow an ITM-put-buyer episode to clear Gate 2 that should not.
+        #
+        # Fix tracked in GitHub issue ING-011b. Resolution requires a 3-way
+        # deliberation (SA / PBE / QA) on whether is_directionally_aggressive()
+        # should accept an otm_band parameter, or whether this site should
+        # apply a separate ITM-buyer discount keyed on ep.otm_band == "ATM"
+        # and bid_ask_class in ("AT_BID", "BELOW_BID") and contract_type == "PUT".
+        # Do NOT patch this site unilaterally — see ING-011b deliberation record.
         total = 0.0
         for e in self.events:
             prem = getattr(e, "premium", 0.0)
