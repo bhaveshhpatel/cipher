@@ -46,6 +46,7 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-009 | ING-002, ING-003, ING-006 | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35`. **Shipped before ING-007.** |
 | ING-007 | ING-002, ING-003, ING-006, **ING-009** | ✅ ING-009 merged — deliberation COMPLETE 2026-05-04 — **UNBLOCKED. Ready to implement.** Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
 | ING-008 | ING-004, ING-005 | 🔴 Deliberation required |
+| ING-010 | ING-002, ING-003 | 🔴 Deliberation required — parallel track to ING-007/ING-008. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
 
 ---
 
@@ -68,9 +69,10 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-009 | ✅ COMPLETE (2026-05-05) — all decisions recorded in sprint doc. **MERGED PR #76 commit `9ceee35` (2026-05-06).** Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed. |
 | ING-007 | ✅ COMPLETE (2026-05-04) — all decisions recorded in sprint doc. Branch `ing/s7-multiday-repeat` ready. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70). ✅ **UNBLOCKED — ING-009 merged 2026-05-06.** |
 | ING-008 | 🔴 NOT STARTED — blocked on ING-005 ✅ + deliberation required |
+| ING-010 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78). Parallel track — does NOT block ING-007. |
 
 > For ING-002 through ING-009: deliberation is complete. Do not re-litigate any decisions.
-> For ING-008: read the open deliberation questions in the sprint doc before writing a single line of code.
+> For ING-008 and ING-010: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
 
@@ -121,6 +123,7 @@ Always: branch → commits → PR → deliberation → merge.
 - `ing/s6-directional-aggression` → ING-006
 - `ing/s9-episode-upsert` → ING-009
 - `ing/s7-multiday-repeat` → ING-007
+- `ing/s10-tier-floor` → ING-010
 
 ### PR Body Must Include
 
@@ -187,6 +190,7 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 7. **ING-007 Supabase migration is a hard prerequisite.** Run `EXPLAIN ANALYZE` and confirm index hit before writing any Python for the lookback query.
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
 9. **ING-009 merged 2026-05-06 (PR #76 commit `9ceee35`).** `flow_episodes` is correctly aggregated. ING-007 implementation may now begin.
+10. **ING-010 deliberation is a hard prerequisite.** D1 (option selection), D2 (Tier 3 floor value), and D3 (`average_volume = 0` handling) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. Option D (per-ticker debug logging at `belowminpremium`) ships first regardless of D1/D2/D3 outcome.
 
 ---
 
@@ -200,6 +204,11 @@ Immediately after an ING PR merges:
 4. **Update `docs/FIXES.md`**: add Option decision record if story required a choice (e.g. ING-005 Option A/B/C)
 5. If new GitHub Issues were filed from panel findings — confirm they are open and linked in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md`
 6. If story adds new gates — update `docs/ARCHITECTURE.md` gate structure section
+
+**ING-010 specific post-merge steps (in addition to the above):**
+- Confirm GDYN and PENG flow events are now appearing in `flow_events` on the next live session (manual spot-check)
+- Confirm Tier 1/2 signal counts are unchanged (no noise regression on NVDA/SPY/AMD/AAPL)
+- Update `docs/FIXES.md` with the D1/D2/D3 option decisions
 
 ---
 
@@ -278,8 +287,9 @@ POST-MERGE
 | ING-009 | Same-session flow episode upsert/merge | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed | `ing/s9-episode-upsert` |
 | ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ UNBLOCKED 2026-05-06 — Deliberation COMPLETE 2026-05-04 — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ready to implement | `ing/s7-multiday-repeat` |
 | ING-008 | Volume vs. OI gate | 🔴 Deliberation required | `ing/s8-vol-oi-gate` |
+| ING-010 | Tier-aware min-premium floor + OI-relative bypass gate | 🔴 Deliberation required (D1/D2/D3 open) — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-007 | `ing/s10-tier-floor` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-009 merged PR #76 commit `9ceee35`; Issue #75 closed; ING-007 unblocked — ready to implement) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-009 merged PR #76 commit `9ceee35`; Issue #75 closed; ING-007 unblocked — ready to implement; ING-010 added — Issue #78 filed, deliberation required, parallel track to ING-007) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
