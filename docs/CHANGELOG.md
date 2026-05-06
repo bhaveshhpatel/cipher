@@ -9,6 +9,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Migration 012 — Catch-up Schema Delta] — 2026-05-06
+
+### Summary
+
+Closed schema drift between `supabase/migrations/` and the live Supabase production DB
+(`cipher-database`). All DDL in this entry was applied directly to Supabase after migration
+`011_unique_constraints.sql` without a corresponding migration file. This migration codifies
+the full delta so that fresh environments, Supabase branches, and DB resets reproduce the
+exact live schema.
+
+Closes GitHub issues [#67](https://github.com/bhaveshhpatel/cipher/issues/67) and
+[#69](https://github.com/bhaveshhpatel/cipher/issues/69) (S2.5 `is_aggressive` migration
+tracking).
+
+### Added
+
+#### `flow_events` — 9 columns codified
+
+| Column | Type | Default | Origin |
+|---|---|---|---|
+| `is_aggressive` | `BOOLEAN NOT NULL` | `false` | ING-006 / S2.5 (#67, #69) |
+| `is_golden_sweep` | `BOOLEAN NOT NULL` | `false` | ING-005 golden sweep gate |
+| `occ_symbol` | `TEXT` | `NULL` | Contract identity string |
+| `is_synthetic_quote` | `BOOLEAN NOT NULL` | `false` | Quote provenance |
+| `quote_source` | `TEXT NOT NULL` | `'live'` | Quote provenance |
+| `miax_normalized_exchange_count` | `INTEGER NOT NULL` | `1` | MIAX dedup normalization |
+| `order_side` | `TEXT NOT NULL` | `'UNKNOWN'` | ING-006 order_side_classifier |
+| `strong_sentiment` | `BOOLEAN NOT NULL` | `false` | ING-006 high-conviction flag |
+| `execution_mechanic` | `TEXT NOT NULL` | `'AMBIGUOUS_LONG'` | ING-006/007 mechanic enum |
+
+#### `flow_episodes` — 2 columns codified
+
+| Column | Type | Default | Origin |
+|---|---|---|---|
+| `is_multi_day_repeat` | `BOOLEAN NOT NULL` | `false` | S12 dual-window engine |
+| `is_aggressive` | `BOOLEAN NOT NULL` | `false` | ING-006 episode-level aggression |
+
+#### Indexes
+- `idx_flow_events_is_aggressive` — ING-007 lookback stratification on `(ticker, is_aggressive, created_at DESC)`
+- `idx_flow_events_contract_day` — ING-007 compound contract-day query on `(ticker, contract_type, strike, expiry, created_at DESC)`
+- `idx_flow_events_order_side` — order-side classifier queries on `(ticker, order_side, created_at DESC)`
+- `idx_flow_episodes_is_aggressive` — S8 backtest stratification on `(ticker, is_aggressive, created_at DESC)`
+
+### Notes
+- All statements are `IF NOT EXISTS` guarded — running against the live DB is a full no-op
+- Migration verified against live schema via `information_schema.columns` inspection on 2026-05-06
+- File: [`supabase/migrations/012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql)
+
+---
+
 ## [Ingestion Pipeline Stability] — 2026-04-28
 
 ### Summary
