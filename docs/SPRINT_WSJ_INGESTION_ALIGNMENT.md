@@ -51,17 +51,54 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 
 The following issues were filed during ING-006 deliberation and are tracked separately.
 
-| Issue | Title | Blocking? | Sprint Slot |
-|-------|-------|-----------|-------------|
-| [#63](https://github.com/bhaveshhpatel/cipher/issues/63) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Not blocking ING-006 merge. Blocking ING-007/008 callers importing from `bid_ask_classifier.py` | SA-F1 post-ING-006 |
-| [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | SA-F1: Persist `is_aggressive` flag to `flow_events` for ING-007 pattern quality scoring | P1 — required before ING-007 pattern quality scoring is meaningful | ING-007 prerequisite |
-| [#65](https://github.com/bhaveshhpatel/cipher/issues/65) | ING-007 story issue — Multi-day repeat window lookback | — | ING-007 |
-| [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | ING-006 SA-F1: Migrate `is_directionally_aggressive()` out of `bid_ask_classifier.py` | Not blocking ING-006. Blocking for ING-007/008 signal-layer import path | SA-F1 post-ING-006 |
-| [#67](https://github.com/bhaveshhpatel/cipher/issues/67) | ING-007 prereq (SA-F2): Add `is_aggressive` boolean column to `flow_events` | **Blocking for ING-007 and S8 backtest work** | ING-007 S2.5 migration |
-| [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
-| [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
-| [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue — ✅ CLOSED 2026-05-06 |
-| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | ✅ MERGED PR #76 2026-05-06 | ING-009 canonical issue — ✅ CLOSED |
+| Issue | Title | Blocking? | Sprint Slot | Status |
+|-------|-------|-----------|-------------|--------|
+| [#63](https://github.com/bhaveshhpatel/cipher/issues/63) | Migrate `is_directionally_aggressive()` to dedicated aggression module | Not blocking ING-006 merge. Blocking ING-007/008 callers importing from `bid_ask_classifier.py` | SA-F1 post-ING-006 | 🟡 Open |
+| [#64](https://github.com/bhaveshhpatel/cipher/issues/64) | SA-F1: Persist `is_aggressive` flag to `flow_events` for ING-007 pattern quality scoring | P1 — required before ING-007 pattern quality scoring is meaningful | ING-007 prerequisite | ✅ **CLOSED 2026-05-06** — superseded by #67/#69; delivered by [`012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) |
+| [#65](https://github.com/bhaveshhpatel/cipher/issues/65) | ING-007 story issue — Multi-day repeat window lookback | — | ING-007 | ✅ CLOSED |
+| [#66](https://github.com/bhaveshhpatel/cipher/issues/66) | ING-006 SA-F1: Migrate `is_directionally_aggressive()` out of `bid_ask_classifier.py` | Not blocking ING-006. Blocking for ING-007/008 signal-layer import path | SA-F1 post-ING-006 | 🟡 Open |
+| [#67](https://github.com/bhaveshhpatel/cipher/issues/67) | ING-007 prereq (SA-F2): Add `is_aggressive` boolean column to `flow_events` | **Blocking for ING-007 and S8 backtest work** | ING-007 S2.5 migration | ✅ **CLOSED 2026-05-06** — delivered by [`012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) |
+| [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup | 🟡 Open |
+| [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 | ✅ **CLOSED 2026-05-06** — delivered by [`012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) |
+| [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue | ✅ CLOSED 2026-05-06 |
+| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | ✅ MERGED PR #76 2026-05-06 | ING-009 canonical issue | ✅ CLOSED |
+
+---
+
+## Schema Drift Resolution — 2026-05-06
+
+**Migration:** [`supabase/migrations/012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) — committed 2026-05-06 (commit `33aaed2`).
+
+All DDL in `012` was applied directly to the live Supabase project (`cipher-database`, ref: `kpajucxqlrteckfuafvq`) after migration `011_unique_constraints.sql` without a corresponding migration file. The `012` catch-up migration closes the repo schema drift so that fresh environments, branches, and resets reproduce the exact live schema.
+
+**Columns codified in `flow_events`:**
+
+| Column | Type | Default | Origin |
+|--------|------|---------|--------|
+| `is_aggressive` | `BOOLEAN NOT NULL` | `false` | ING-006 / S2.5 (#67, #69) |
+| `is_golden_sweep` | `BOOLEAN NOT NULL` | `false` | ING-005 golden sweep gate |
+| `occ_symbol` | `TEXT` | `NULL` | Contract identity string |
+| `is_synthetic_quote` | `BOOLEAN NOT NULL` | `false` | Quote provenance |
+| `quote_source` | `TEXT NOT NULL` | `'live'` | Quote provenance |
+| `miax_normalized_exchange_count` | `INTEGER NOT NULL` | `1` | MIAX dedup normalization |
+| `order_side` | `TEXT NOT NULL` | `'UNKNOWN'` | ING-006 order_side_classifier |
+| `strong_sentiment` | `BOOLEAN NOT NULL` | `false` | ING-006 high-conviction flag |
+| `execution_mechanic` | `TEXT NOT NULL` | `'AMBIGUOUS_LONG'` | ING-006/007 mechanic enum |
+
+**Columns codified in `flow_episodes`:**
+
+| Column | Type | Default | Origin |
+|--------|------|---------|--------|
+| `is_multi_day_repeat` | `BOOLEAN NOT NULL` | `false` | S12 dual-window engine |
+| `is_aggressive` | `BOOLEAN NOT NULL` | `false` | ING-006 episode-level aggression |
+
+**Indexes added:**
+- `idx_flow_events_is_aggressive` on `(ticker, is_aggressive, created_at DESC)` — ING-007 lookback stratification
+- `idx_flow_events_contract_day` on `(ticker, contract_type, strike, expiry, created_at DESC)` — ING-007 compound lookback
+- `idx_flow_events_order_side` on `(ticker, order_side, created_at DESC)` — order-side classifier queries
+- `idx_flow_episodes_is_aggressive` on `(ticker, is_aggressive, created_at DESC)` — S8 backtest stratification
+
+**Issues closed by this migration:** [#64](https://github.com/bhaveshhpatel/cipher/issues/64) (superseded), [#67](https://github.com/bhaveshhpatel/cipher/issues/67), [#69](https://github.com/bhaveshhpatel/cipher/issues/69)
 
 ---
 
@@ -568,4 +605,4 @@ PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh 
 
 ---
 
-*Last updated: 2026-05-06 (Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) tracked as ING-011 — ITM misclassification bug, blocks ING-008, deliberation required; Sprint Order updated to insert ING-011 before ING-008; ING-007 ✅ MERGED PR #74 commit `b70d9b0`; ING-008 and ING-010 remain open) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-06 (Schema drift resolved — migration [`012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) committed; issues [#64](https://github.com/bhaveshhpatel/cipher/issues/64), [#67](https://github.com/bhaveshhpatel/cipher/issues/67), [#69](https://github.com/bhaveshhpatel/cipher/issues/69) closed; post-ING-006 findings table updated with ✅ status; Schema Drift Resolution section added; ING-011 [#77] blocks ING-008, deliberation required; ING-010 [#78] parallel track, deliberation required) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
