@@ -39,8 +39,8 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 3 | ~~**ING-004**~~ | ~~Fallback `underlying_price` from registry~~ | — | ✅ MERGED — 2026-05-03 (PR #60, commit `d3c3f31`) |
 | 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ CLOSED — 2026-05-03 (PR #61, commit `252d75f`) |
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
-| 6 | **ING-009** | Same-session flow episode upsert/merge | ING-002 ✅, ING-003 ✅, ING-006 ✅ | 🔴 Deliberation ✅ COMPLETE 2026-05-05 — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — **MUST ship before ING-007** |
-| 7 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009** | ⏳ BLOCKED on ING-009 — deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
+| 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
+| 7 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 ✅** | ✅ UNBLOCKED — ING-009 merged 2026-05-06. Deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — **ready to implement** |
 | 8 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔴 UNBLOCKED — deliberation required before implementation |
 
 ---
@@ -59,7 +59,17 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
 | [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
 | [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue |
-| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | **Blocking ING-007** | ING-009 canonical issue |
+| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | ~~**Blocking ING-007**~~ ✅ MERGED PR #76 2026-05-06 | ING-009 canonical issue — CLOSED |
+
+---
+
+## Post-ING-009-Merge Findings (GitHub Issues Filed)
+
+The following observation was noted during the ING-009 pre-merge deliberation (2026-05-06). It does not block ING-007 implementation.
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| Filed post-merge | `_lookup_open_episode` exception branch has no isolated unit test — the E-8 test mocks the entire function; the internal `except` block in the implementation is not independently exercised | Not blocking ING-007 | Post ING-009 cleanup |
 
 ---
 
@@ -227,19 +237,25 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 **Files:**
 - `backend/services/flow_store.py` — `persist_flow_episode()` upsert logic + new `_stats` counters
 - `backend/tests/test_ing009_episode_upsert.py` — NEW: full test matrix
-**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75)
+**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — ✅ CLOSED 2026-05-06
 **Branch:** `ing/s9-episode-upsert`
+**PR:** [#76](https://github.com/bhaveshhpatel/cipher/pull/76) — ✅ **MERGED 2026-05-06** (squash commit `9ceee35`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-05)
 **All three roles signed off. Story cleared for implementation.**
 
+#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
+**SA verdict:** PASS — gate order preserved, layer boundaries respected, ING-007 PATCH path untouched, deliberation alignment confirmed. Post-merge observation filed: `_lookup_open_episode` float strike in URL not URL-encoded (consistent with existing pattern in `_update_episode_multiday`; non-blocking).
+**PBE verdict:** PASS — upsert logic correct, `or 1` / `or 0.0` guards sound, PATCH early-return path correct, PATCH failure does not silently increment counter, `_episode_stats` init at module level cold-start safe, `httpx.AsyncClient` 5s timeout async non-blocking.
+**QA verdict:** PASS — E-1 through E-11 full matrix present and passing, counter invariants verified, cold-start safety confirmed, `get_episode_stats()` accessor present for `/health/stream`.
+
 #### Problem
 
-`flow_episodes` is currently insert-only from the Signal Gate path, creating one new row per qualifying print instead of one row per logical same-session episode. This makes `flow_episodes` a near-duplicate of `flow_events` (26,906 vs 28,373 rows on 2026-05-05) rather than an aggregated episode table.
+`flow_episodes` was insert-only from the Signal Gate path, creating one new row per qualifying print instead of one row per logical same-session episode. This made `flow_episodes` a near-duplicate of `flow_events` (26,906 vs 28,373 rows on 2026-05-05) rather than an aggregated episode table.
 
-The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBOUNCE to preserve `strike`/`expiry`, but in doing so exposed that `persist_flow_episode()` has no merge/upsert path — every Signal Gate crossing unconditionally inserts a new row.
+The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBOUNCE to preserve `strike`/`expiry`, but in doing so exposed that `persist_flow_episode()` had no merge/upsert path — every Signal Gate crossing unconditionally inserted a new row.
 
-**Root cause:** ING-007's `get_contract_prior_days()` will query fragmented single-print episode rows and produce unreliable repeat-day counts. ING-009 must ship before ING-007 is implemented.
+**Root cause:** ING-007's `get_contract_prior_days()` would query fragmented single-print episode rows and produce unreliable repeat-day counts. ING-009 must ship before ING-007 is implemented.
 
 #### Deliberation Outcomes
 
@@ -266,20 +282,20 @@ The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBO
 
 #### Acceptance Criteria
 
-- [ ] `flow_episodes` has exactly 1 row per same-session contract episode within the merge window
-- [ ] A subsequent qualifying print for an open episode updates the existing row — no new row inserted
-- [ ] `trade_count` increments by 1 on each merge
-- [ ] `total_premium` accumulates on merge
-- [ ] `signal_ts` updates to the latest qualifying print timestamp on merge
-- [ ] `strike` and `expiry` remain correctly populated from the raw signal path (EPISODE-FIX preserved)
-- [ ] No debounce regression — `persist_flow_episode()` still called before SIG-DEBOUNCE
-- [ ] ING-007 `get_contract_prior_days()` query is unaffected (separate concern)
-- [ ] Tests: first print (insert), second print within window (merge), print after window expiry (new episode), next-day (new episode)
-- [ ] Boundary tests: merge window edge cases
-- [ ] `_stats["created_episodes"]` and `_stats["merged_episodes"]` initialised at module level
-- [ ] Both counters visible in `/health/stream` from cold start
-- [ ] No TODO comments in implementation code
-- [ ] No DB reads on the hot path — lookup is async, does not block the stream tick
+- [x] `flow_episodes` has exactly 1 row per same-session contract episode within the merge window
+- [x] A subsequent qualifying print for an open episode updates the existing row — no new row inserted
+- [x] `trade_count` increments by 1 on each merge
+- [x] `total_premium` accumulates on merge
+- [x] `signal_ts` updates to the latest qualifying print timestamp on merge
+- [x] `strike` and `expiry` remain correctly populated from the raw signal path (EPISODE-FIX preserved)
+- [x] No debounce regression — `persist_flow_episode()` still called before SIG-DEBOUNCE
+- [x] ING-007 `get_contract_prior_days()` query is unaffected (separate concern)
+- [x] Tests: first print (insert), second print within window (merge), print after window expiry (new episode), next-day (new episode)
+- [x] Boundary tests: merge window edge cases
+- [x] `_stats["created_episodes"]` and `_stats["merged_episodes"]` initialised at module level
+- [x] Both counters visible in `/health/stream` from cold start
+- [x] No TODO comments in implementation code
+- [x] No DB reads on the hot path — lookup is async, does not block the stream tick
 
 #### Implementation Steps
 
@@ -317,7 +333,7 @@ The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBO
 **Type:** Feature / Signal Enhancement
 **Priority:** P0
 **Estimated Effort:** 2 days
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 (episode upsert — MUST merge first)**
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 ✅ MERGED 2026-05-06**
 **Files:**
 - `backend/utils/contract_day_cache.py` — NEW: async TTL cache + DB fetch logic
 - `backend/signals/repetition_accumulator.py` — wire `prior_days_active`, `prior_days_aggressive`, `is_multi_day_repeat`, `otm_band` onto `RepetitionEpisode`; constructor params `require_multi_day`, `multi_day_min_days`
@@ -329,7 +345,7 @@ The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBO
 **Branch:** `ing/s7-multiday-repeat`
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
-**All three roles signed off. Story cleared for implementation. Blocked on ING-009.**
+**All three roles signed off. Story cleared for implementation. ✅ UNBLOCKED — ING-009 merged 2026-05-06.**
 
 ---
 
@@ -533,4 +549,4 @@ Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `
 
 ---
 
-*Last updated: 2026-05-05 (ING-009 3-way deliberation complete; Issue #75; branch `ing/s9-episode-upsert` ready for implementation — blocks ING-007) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-06 (ING-009 ✅ MERGED PR #76 commit `9ceee35`; Issue #75 closed; ING-007 ✅ UNBLOCKED — ready to implement) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
