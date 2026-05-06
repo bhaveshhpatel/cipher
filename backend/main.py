@@ -472,6 +472,13 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
+    # SA-F1 (ING-007): registry.accumulator is passed here but may be None if the
+    # SymbolRegistry implementation does not expose an .accumulator attribute.
+    # start_lookback_worker() handles None gracefully (defaults to 10_000.0 floor).
+    # NOTE: The production accumulator used by the streaming hot path is the
+    # module-level `accumulator` in services/tradier_stream.py — not this registry
+    # attribute. The worker's accumulator reference is used only to resolve the
+    # DTE-tier min_premium floor for lookback DB queries; it does NOT gate flow.
     lookback_task         = asyncio.create_task(
         start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
     )

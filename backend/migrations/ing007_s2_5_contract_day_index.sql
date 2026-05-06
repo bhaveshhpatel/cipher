@@ -17,13 +17,24 @@
 --   and created_at the range scan column, which is the optimal access pattern
 --   for the DATE_TRUNC ceiling + 5-day window query.
 --
--- EXPLAIN ANALYZE results (2026-05-04, pre-migration):
+-- SA-F2 NOTE (ING-007 pre-merge deliberation, 2026-05-06):
+--   The EXPLAIN ANALYZE results below were measured against flow_events,
+--   NOT against flow_episodes. The ING-007 RPC function get_contract_prior_days()
+--   queries the flow_episodes table (one row per signal threshold crossing),
+--   not flow_events (one row per raw trade tick).
+--
+--   This index (idx_flow_events_contract_day) directly speeds up any future
+--   lookback queries against flow_events (e.g. event-level day counting), and
+--   is retained as a prerequisite for S2.5 at scale. The RPC on flow_episodes
+--   benefits from a separate index on that table (covered by ING-009 schema).
+--
+-- EXPLAIN ANALYZE results (2026-05-04, pre-migration, on flow_events):
 --   Index used:      idx_flow_events_ticker_contract
 --   Execution time:  3.683 ms
 --   Planning time:   32.856 ms
 --   strike/expiry:   post-index filter
 --
--- EXPLAIN ANALYZE results (2026-05-04, post-migration):
+-- EXPLAIN ANALYZE results (2026-05-04, post-migration, on flow_events):
 --   Index used:      idx_flow_events_ticker_contract (planner choice on empty table)
 --   Execution time:  0.225 ms  (16x improvement due to plan cache warm)
 --   Planning time:   2.654 ms
