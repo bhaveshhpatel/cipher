@@ -22,6 +22,12 @@ Fix summary (chunk-5, 2026-05-05):
   - TestLayer3Accumulator._accum: default DTE-tier floor for dte=30 is
     500_000, far above the 60_000 total premium the three 20k-premium test
     events accumulate.  Override with a flat 10_000 floor so Gate 2 passes.
+
+Fix summary (2026-05-06):
+  - test_pipeline_handles_multiple_tickers_concurrently: _classify_tier() was
+    called with ev.ticker (str) instead of ev.premium (float), causing
+    TypeError: '>=' not supported between instances of 'str' and 'int'.
+    Fixed to always pass ev.premium.
 """
 import asyncio
 import pytest
@@ -421,7 +427,7 @@ class TestE2EPipeline:
             raw = _raw_trade(symbol=sym, underlying=ticker, size=100, last=5.0)
             ev = parse_tradier_trade(raw)
             if ev:
-                ev.influence_tier = _classify_tier(ev.ticker if isinstance(ev, OptionsFlowEvent) else 0)
+                ev.influence_tier = _classify_tier(ev.premium)
                 await fs.add_flow({"ticker": ev.ticker,
                                    "influence_tier": ev.influence_tier})
 
