@@ -149,7 +149,9 @@ def test_lat1_p99_process_trade_under_threshold():
                 await ts._process_trade(raw)
                 timings.append((time.perf_counter() - t0) * 1000)  # ms
 
-    asyncio.get_event_loop().run_until_complete(run_benchmark())
+    # asyncio.run() is the correct pattern in Python 3.10+ —
+    # get_event_loop() raises RuntimeError when no loop exists in the thread.
+    asyncio.run(run_benchmark())
 
     timings.sort()
     p99_ms = timings[int(N * 0.99) - 1]
