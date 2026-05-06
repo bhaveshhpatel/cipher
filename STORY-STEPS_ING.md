@@ -45,8 +45,9 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-006 | ING-002 | ✅ MERGED |
 | ING-009 | ING-002, ING-003, ING-006 | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` |
 | ING-007 | ING-002, ING-003, ING-006, ING-009 | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0`. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
-| ING-008 | ING-004, ING-005 | 🔴 Deliberation required |
-| ING-010 | ING-002, ING-003 | 🔴 Deliberation required — parallel track to ING-008. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
+| ING-011 | ING-006 ✅, ING-007 ✅ | 🔴 Deliberation required — **must resolve before ING-008**. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77). |
+| ING-008 | ING-004 ✅, ING-005 ✅, **ING-011** | 🔴 Deliberation required — blocked on ING-011 (directional classification must be correct first) |
+| ING-010 | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — parallel track to ING-011/ING-008. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
 
 ---
 
@@ -68,11 +69,12 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-006 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #62 commit `501b170`** |
 | ING-009 | ✅ COMPLETE (2026-05-05) — all decisions recorded in sprint doc. **MERGED PR #76 commit `9ceee35` (2026-05-06).** Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed. |
 | ING-007 | ✅ COMPLETE (2026-05-04) — pre-merge panel deliberation COMPLETE (2026-05-06). **MERGED PR #74 commit `b70d9b0` (2026-05-06).** Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
-| ING-008 | 🔴 NOT STARTED — blocked on deliberation required |
-| ING-010 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78). Parallel track — does NOT block ING-008. |
+| ING-011 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77). **Blocks ING-008.** |
+| ING-008 | 🔴 NOT STARTED — blocked on ING-011. Do not begin deliberation until ING-011 is merged. |
+| ING-010 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78). Parallel track — does NOT block ING-011 or ING-008. |
 
 > For ING-002 through ING-007 and ING-009: deliberation is complete. Do not re-litigate any decisions.
-> For ING-008 and ING-010: read the open deliberation questions in the sprint doc before writing a single line of code.
+> For ING-011, ING-008, and ING-010: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
 
@@ -123,6 +125,7 @@ Always: branch → commits → PR → deliberation → merge.
 - `ing/s6-directional-aggression` → ING-006
 - `ing/s9-episode-upsert` → ING-009
 - `ing/s7-multiday-repeat` → ING-007 ✅ MERGED PR #74
+- `ing/s11-itm-classification` → ING-011 (Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77))
 - `ing/s10-tier-floor` → ING-010
 
 ### PR Body Must Include
@@ -190,7 +193,8 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 7. **ING-007 Supabase migration is a hard prerequisite.** ✅ SHIPPED — S2.5 migration applied (index + `order_side` + `is_aggressive` columns on `flow_events`). ING-007 MERGED PR #74 commit `b70d9b0` 2026-05-06.
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
 9. **ING-009 merged 2026-05-06 (PR #76 commit `9ceee35`).** `flow_episodes` is correctly aggregated.
-10. **ING-010 deliberation is a hard prerequisite.** D1 (option selection), D2 (Tier 3 floor value), and D3 (`average_volume = 0` handling) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. Option D (per-ticker debug logging at `belowminpremium`) ships first regardless of D1/D2/D3 outcome.
+10. **ING-011 deliberation is a hard prerequisite for ING-008.** D1 (ITM threshold), D2 (partial vs full override), and D3 (`otm_band` extension vs separate `itm_band` field) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. ING-008 is **blocked** until ING-011 merges. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77).
+11. **ING-010 deliberation is a hard prerequisite.** D1 (option selection), D2 (Tier 3 floor value), and D3 (`average_volume = 0` handling) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. Option D (per-ticker debug logging at `belowminpremium`) ships first regardless of D1/D2/D3 outcome.
 
 ---
 
@@ -211,6 +215,13 @@ Immediately after an ING PR merges:
 - ✅ `STORY-STEPS_ING.md` updated — dependency chain and deliberation tables marked ✅
 - Post-merge findings (SA-F1, SA-F2, PBE-F4, QA-F1, QA-F2) logged in sprint doc — confirm `docs/FIXES.md` updated if applicable
 - Confirm `docs/ARCHITECTURE.md` updated if new gates were added by ING-007
+
+**ING-011 specific post-merge steps (in addition to the above):**
+- Confirm TMDX $105P scenario re-run produces correct `BEARISH` direction on the next live session
+- Confirm existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour is unchanged — no OTM regression
+- Update `docs/FIXES.md` with the D1/D2/D3 option decisions
+- Confirm `docs/ARCHITECTURE.md` updated if `otm_band` enum extended or new `itm_band` field added
+- Unblock ING-008 deliberation — update ING-008 row in this file from 🔴 to ⏳
 
 **ING-010 specific post-merge steps (in addition to the above):**
 - Confirm GDYN and PENG flow events are now appearing in `flow_events` on the next live session (manual spot-check)
@@ -293,10 +304,11 @@ POST-MERGE
 | ING-006 | Directional aggression weighting on premium floor | ✅ MERGED 2026-05-04 — PR #62 commit `501b170` | `ing/s6-directional-aggression` |
 | ING-009 | Same-session flow episode upsert/merge | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed | `ing/s9-episode-upsert` |
 | ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0` — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed | `ing/s7-multiday-repeat` |
-| ING-008 | Volume vs. OI gate | 🔴 Deliberation required | `ing/s8-vol-oi-gate` |
-| ING-010 | Tier-aware min-premium floor + OI-relative bypass gate | 🔴 Deliberation required (D1/D2/D3 open) — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-008 | `ing/s10-tier-floor` |
+| ING-011 | ITM put/call misclassification fix | 🔴 Deliberation required — **blocks ING-008** — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | `ing/s11-itm-classification` |
+| ING-008 | Volume vs. OI gate | 🔴 Deliberation required — **blocked on ING-011** | `ing/s8-vol-oi-gate` |
+| ING-010 | Tier-aware min-premium floor + OI-relative bypass gate | 🔴 Deliberation required (D1/D2/D3 open) — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 | `ing/s10-tier-floor` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-007 ✅ MERGED PR #74 commit `b70d9b0`; Issue #70 closed; post-merge findings SA-F1/SA-F2/PBE-F4/QA-F1/QA-F2 logged in sprint doc; ING-008 and ING-010 remain open — deliberation required) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-011 added — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) ITM put/call misclassification, deliberation required, blocks ING-008; ING-008 now blocked on ING-011; Rule 6 constraint 10 added; ING-011 post-merge steps added to Rule 7; Quick Reference updated) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
