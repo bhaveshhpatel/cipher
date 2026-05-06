@@ -88,6 +88,14 @@ Fix (ING-007-PATCH-B 2026-05-05): hoist _lbc/_lbc_fresh/ContractKey to module le
   local variables invisible to patch(). patch("services.tradier_stream.X")
   requires X to be a module-level attribute. Moving the imports to module scope
   fixes AttributeError in the multiday_repeat tests.
+
+Fix (PBE-2 2026-05-06): self-contained TTL eviction for _lookback_result_cache.
+  Previous _evict_lookback_result_cache() piggybacked on _signal_last_emit key
+  namespace — any emit_key absent from _signal_last_emit was evicted, meaning
+  contracts that never crossed the signal gate leaked entries forever.
+  Fix: _lookback_result_cache is now dict[str, tuple[bool, float]] where the
+  float is time.time() at write time. _evict_lookback_result_cache(now) evicts
+  entries older than _LBC_TTL_S (7200s) independently of _signal_last_emit.
 """
 import asyncio
 import logging
@@ -169,6 +177,11 @@ _SIGNAL_DELTA_PREM  = 25_000.0
 _SIGNAL_DELTA_PCT   = 0.20
 _SIGNAL_EMIT_TTL_S  = 7_200.0
 
+# PBE-2: TTL for _lookback_result_cache entries. Matches _SIGNAL_EMIT_TTL_S
+# so both caches age out on the same 2-hour cycle. Self-contained — eviction
+# has no dependency on _signal_last_emit.
+_LBC_TTL_S = 7_200.0
+
 # ---------------------------------------------------------------------------
 # Global stats
 # ---------------------------------------------------------------------------
@@ -206,8 +219,10 @@ accumulator = RepetitionAccumulator(
 _sweep_upgrade_dispatched: dict[str, float] = {}
 _signal_last_emit: dict[str, dict] = {}
 
-# ING-007: in-process cache of last-known lookback result per emit_key.
-_lookback_result_cache: dict[str, bool] = {}
+# ING-007 / PBE-2: in-process cache of last-known lookback result per emit_key.
+# dict[emit_key, tuple[is_multi_day_repeat: bool, stamped_at: float]]
+# Eviction is self-contained via _evict_lookback_result_cache() using _LBC_TTL_S.
+_lookback_result_cache: dict[str, tuple[bool, float]] = {}
 
 
 def get_stats() -> dict:
@@ -398,9 +413,21 @@ def _evict_signal_emit_cache(now: float) -> None:
 
 
 def _evict_lookback_result_cache(now: float) -> None:
+    """
+    PBE-2 fix: self-contained TTL eviction keyed on stamped_at.
+
+    Previous implementation evicted entries where emit_key was absent from
+    _signal_last_emit — piggybacking on the wrong namespace. Contracts that
+    never crossed the signal gate (and therefore never wrote to
+    _signal_last_emit) would accumulate entries indefinitely.
+
+    Now: _lookback_result_cache values are (bool, float) tuples where
+    float is time.time() at write time. Evict entries older than _LBC_TTL_S.
+    Fully independent of _signal_last_emit.
+    """
     stale = [
-        k for k in _lookback_result_cache
-        if k not in _signal_last_emit
+        k for k, (_, stamped_at) in _lookback_result_cache.items()
+        if now - stamped_at > _LBC_TTL_S
     ]
     for k in stale:
         del _lookback_result_cache[k]
@@ -617,11 +644,14 @@ async def _process_trade(raw: dict):
     except Exception:
         _is_repeat_now = False
 
+    # PBE-2 fix: stamp wall-clock time so _evict_lookback_result_cache() can
+    # age entries out independently of _signal_last_emit.
+    _now = _time.time()
     if _is_repeat_now:
-        _lookback_result_cache[emit_key] = True
+        _lookback_result_cache[emit_key] = (True, _now)
     elif emit_key not in _lookback_result_cache:
-        _lookback_result_cache[emit_key] = False
-    _is_multi_day_repeat: bool = _lookback_result_cache[emit_key]
+        _lookback_result_cache[emit_key] = (False, _now)
+    _is_multi_day_repeat: bool = _lookback_result_cache[emit_key][0]
 
     # ING-007: strong_sentiment computed from is_directionally_aggressive().
     _strong_sentiment = is_directionally_aggressive(
