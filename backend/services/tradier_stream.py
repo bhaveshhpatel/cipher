@@ -82,6 +82,12 @@ Fix (C008 2026-05-05): decouple persist gate from signal gate.
   persist_ep. bus.publish_all only fires when get_signal returns non-None.
   This satisfies C008-1 (persist fires, bus silent during cooldown) and
   C008-2 (both fire after cooldown) without changing the persist path.
+
+Fix (ING-007-PATCH-B 2026-05-05): hoist _lbc/_lbc_fresh/ContractKey to module level.
+  These were previously imported inline inside _process_trade(), making them
+  local variables invisible to patch(). patch("services.tradier_stream.X")
+  requires X to be a module-level attribute. Moving the imports to module scope
+  fixes AttributeError in the multiday_repeat tests.
 """
 import asyncio
 import logging
@@ -108,6 +114,14 @@ from services.flow_store import (
 from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
+# ING-007-PATCH-B: hoisted to module level so tests can patch these names via
+# patch("services.tradier_stream._lbc") etc. Inline imports inside
+# _process_trade() bind to local variables that patch() cannot reach.
+from utils.contract_day_cache import (
+    _cache as _lbc,
+    _is_fresh as _lbc_fresh,
+    ContractKey as _ContractKey,
+)
 
 log = logging.getLogger("tradier_stream")
 
@@ -569,8 +583,6 @@ async def _process_trade(raw: dict):
 
     # C008 fix: ingest_tick() is the persist gate (no cooldown).
     # get_signal() is the bus gate (cooldown-aware).
-    # These are now independent calls so persist fires every qualifying tick
-    # even during cooldown, while bus only fires when cooldown has passed.
     persist_ep = await accumulator.ingest_tick(ev)
     sig_ep     = await accumulator.get_signal(ev)
 
@@ -587,7 +599,6 @@ async def _process_trade(raw: dict):
     _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
 
     # ING-007: enqueue ContractKey for async lookback enrichment (non-blocking).
-    from utils.contract_day_cache import ContractKey as _ContractKey
     _contract_key = _ContractKey(ev.ticker, ev.contract_type, ev.strike, ev.expiry)
     enqueue_lookback(_contract_key)
 
@@ -597,7 +608,6 @@ async def _process_trade(raw: dict):
     emit_key = f"{ev.ticker}|{ev.contract_type}|{ev.strike}|{ev.expiry}"
     _multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
     try:
-        from utils.contract_day_cache import _cache as _lbc, _is_fresh as _lbc_fresh
         _lbc_entry = _lbc.get(_contract_key)
         _is_repeat_now: bool = (
             _lbc_entry is not None
@@ -676,7 +686,6 @@ async def _process_trade(raw: dict):
         return
 
     # C008 fix: bus gate is sig_ep (from get_signal), not persist_ep.
-    # sig_ep is None during cooldown even when persist_ep is non-None.
     if not sig_ep:
         return
 
