@@ -8,40 +8,22 @@ Unit tests for the ING-007 is_multi_day_repeat feature:
 
 All external I/O (httpx, Supabase, bus) is mocked — no network calls.
 
-ING-007 wiring notes (2026-05-04):
-  Tests 1 & 2 patch utils.contract_day_cache._cache directly.
-  The stream reads _cache synchronously (non-blocking) to set is_multi_day_repeat
-  before the async lookback worker patches the DB row.
-
-PBE-NEW-1 (2026-05-04):
-  Tests for get_contract_prior_days() (previously tests 1-3) removed.
-  That function was dead code — superseded by the async queue +
-  contract_day_cache route before merge. No production call site exists.
-
 FIX (2026-05-05 chunk-1):
   Both process_trade tests now patch mock_acc.get_signal as AsyncMock.
-  _process_trade() awaits accumulator.get_signal(ev) at line 575;
-  leaving it as a plain MagicMock raised:
-    TypeError: object MagicMock can't be used in 'await' expression
 
 FIX (2026-05-05 chunk-2):
-  Two bugs caused is_multi_day_repeat to always be False in Test 2:
+  Bug A — fetched_at MagicMock TypeError: set entry.fetched_at = time.monotonic().
+  Bug B — _is_fresh patch misses import-site binding: patch
+           "services.tradier_stream._lbc_fresh" directly.
 
-  Bug A — fetched_at MagicMock TypeError:
-    _make_cache_entry() left entry.fetched_at as a MagicMock (auto-attr).
-    The real _is_fresh() does: time.monotonic() - result.fetched_at
-    A MagicMock is not subtractable from a float → TypeError.
-    The broad `except Exception` in _process_trade caught it silently
-    and set _is_repeat_now = False.
-    Fix: set entry.fetched_at = time.monotonic() (a real float).
-
-  Bug B — _is_fresh patch misses the import-site binding:
-    tradier_stream.py imports _is_fresh by value:
-      from utils.contract_day_cache import _is_fresh as _lbc_fresh
-    Patching utils.contract_day_cache._is_fresh replaces the attribute on
-    the module object but does NOT update tradier_stream._lbc_fresh, which
-    already holds a reference to the original function.
-    Fix: patch "services.tradier_stream._lbc_fresh" directly.
+FIX (2026-05-05 chunk-3):
+  Bug C — _lbc patch misses import-site binding:
+    tradier_stream.py imports _cache by value:
+      from utils.contract_day_cache import _cache as _lbc
+    Patching utils.contract_day_cache._cache replaces the module attr but
+    tradier_stream._lbc still points to the original dict object.
+    _lbc.get(_contract_key) therefore returns None, _is_repeat_now stays False.
+    Fix: patch "services.tradier_stream._lbc" directly (same pattern as _lbc_fresh).
 """
 import asyncio
 import datetime
@@ -100,24 +82,21 @@ def _make_mock_ev():
     return ev
 
 
-def _make_cache_entry(prior_days_active: int, fresh: bool = True):
+def _make_cache_entry(prior_days_active: int):
     """
-    Build a minimal LookbackResult-like stub that contract_day_cache._cache
-    would hold.  The stream reads:
-      entry.prior_days_active  (int)
-      entry.fetched_at         (float) — used by _is_fresh()
-    FIX: entry.fetched_at must be a real float so _is_fresh() can compute
+    Build a minimal LookbackResult-like stub.
+    fetched_at must be a real float so _is_fresh() can compute
     (time.monotonic() - entry.fetched_at) without raising TypeError.
     """
     entry = MagicMock()
     entry.prior_days_active = prior_days_active
     entry.prior_days_aggressive = prior_days_active
-    entry.fetched_at = time.monotonic()   # FIX: real float, not MagicMock auto-attr
-    return entry, fresh
+    entry.fetched_at = time.monotonic()
+    return entry
 
 
 # ---------------------------------------------------------------------------
-# Test 1: cache miss / prior_days=0  →  is_multi_day_repeat=False
+# Test 1: cache hit / prior_days=0  ->  is_multi_day_repeat=False
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -125,25 +104,20 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
     """
     Cache returns prior_days_active=0 (first-day contract).
     is_multi_day_repeat must be False in persist_flow_episode() payload.
-    enqueue_lookback() must be called exactly once.
     """
     sig_ep = _make_mock_sig_ep()
     ev     = _make_mock_ev()
-
-    cache_entry, _ = _make_cache_entry(prior_days_active=0)
+    cache_entry = _make_cache_entry(prior_days_active=0)
 
     import services.tradier_stream as ts
     ts._signal_last_emit.clear()
     ts._lookback_result_cache.clear()
     ts._stats["ticks"] = 0
 
-    mock_cache = MagicMock()
-    mock_cache.get = MagicMock(return_value=cache_entry)
+    # FIX (chunk-3): patch _lbc at the tradier_stream import site.
+    mock_lbc = MagicMock()
+    mock_lbc.get = MagicMock(return_value=cache_entry)
 
-    # FIX: patch _lbc_fresh at the tradier_stream import site, not at the
-    # contract_day_cache module, since it was imported by value (by-reference
-    # patching of utils.contract_day_cache._is_fresh does not reach the
-    # already-bound name _lbc_fresh in tradier_stream).
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
@@ -152,8 +126,8 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
          patch("services.tradier_stream.flow_dedup") as mock_dedup, \
          patch("services.tradier_stream.build_composite", return_value=None), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
-         patch("utils.contract_day_cache._cache", mock_cache), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):  # FIX
+         patch("services.tradier_stream._lbc", mock_lbc), \
+         patch("services.tradier_stream._lbc_fresh", return_value=True):
 
         mock_bus.publish_all = AsyncMock()
         mock_acc.ingest_tick     = AsyncMock(return_value=sig_ep)
@@ -178,7 +152,7 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: cache hit / prior_days>=2  →  is_multi_day_repeat=True
+# Test 2: cache hit / prior_days>=2  ->  is_multi_day_repeat=True
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -187,12 +161,10 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     Cache returns prior_days_active=2 (repeat contract, meets min_days=2 default).
     is_multi_day_repeat must be True in persist_flow_episode() payload
     AND in the signal bus message.
-    enqueue_lookback() must be called exactly once.
     """
     sig_ep = _make_mock_sig_ep()
     ev     = _make_mock_ev()
-
-    cache_entry, _ = _make_cache_entry(prior_days_active=2)
+    cache_entry = _make_cache_entry(prior_days_active=2)
 
     published: list = []
 
@@ -201,10 +173,10 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     ts._lookback_result_cache.clear()
     ts._stats["ticks"] = 0
 
-    mock_cache = MagicMock()
-    mock_cache.get = MagicMock(return_value=cache_entry)
+    # FIX (chunk-3): patch _lbc at the tradier_stream import site.
+    mock_lbc = MagicMock()
+    mock_lbc.get = MagicMock(return_value=cache_entry)
 
-    # FIX: patch _lbc_fresh at the tradier_stream import site.
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
@@ -213,8 +185,8 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
          patch("services.tradier_stream.flow_dedup") as mock_dedup, \
          patch("services.tradier_stream.build_composite", return_value=None), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
-         patch("utils.contract_day_cache._cache", mock_cache), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):  # FIX
+         patch("services.tradier_stream._lbc", mock_lbc), \
+         patch("services.tradier_stream._lbc_fresh", return_value=True):
 
         mock_bus.publish_all = AsyncMock(side_effect=lambda m: published.append(m))
         mock_acc.ingest_tick     = AsyncMock(return_value=sig_ep)
