@@ -190,7 +190,9 @@ class TestC007AlertLevelRegression:
                 ep.events.append(ev)
             return ep
 
-        assert acc.get_alert_level(_ep_with_premium(100_000))   == "WATCH"
+        # Canonical table: >= 100_000 -> LARGE, < 100_000 -> WATCH.
+        # Use 99_000 to probe below the LARGE boundary.
+        assert acc.get_alert_level(_ep_with_premium(99_000))    == "WATCH"
         assert acc.get_alert_level(_ep_with_premium(300_000))   == "ALERT"
         assert acc.get_alert_level(_ep_with_premium(1_500_000)) == "STRONG_SIGNAL"
         assert acc.get_alert_level(_ep_with_premium(6_000_000)) == "CONVICTION"
