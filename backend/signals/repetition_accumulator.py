@@ -173,14 +173,13 @@ get_signal() call forms (C-008-7 fix — 2026-05-06):
   self._signal_cooldown_s for this call only. When cooldown is None,
   self._signal_cooldown_s is used (full backward-compat).
 
-_min_premium_override semantics (2026-05-06 fix — E05/E07 regression):
-  _min_premium_override is a FLOOR BASELINE, not a DTE-tier bypass.
-  When dte_premium_tiers are present, the effective floor is:
-    max(_min_premium_override, dte_tier_floor)
-  This means the override can only raise the floor, never suppress the
-  DTE-tier gate. Legacy callers that pass min_premium without
-  dte_premium_tiers still receive the override directly (no tier to
-  compare against). See _get_episode_min_premium() for implementation.
+_min_premium_override semantics (2026-05-06 fix — C008-5/6 + E05/E07 regression):
+  _min_premium_override is a FLOOR BASELINE.
+  When _tiers_explicit is False (caller did not pass dte_premium_tiers),
+  the override is used directly — the default tier table is not consulted.
+  When _tiers_explicit is True, effective floor = max(override, dte_tier_floor).
+  This preserves the max() behaviour for callers that explicitly pass tiers
+  while allowing shim tests that set only min_premium to get the override they expect.
 
 is_accelerating semantics (2026-05-06 fix):
   True when the last 3 events all occur within a 60-second window.
@@ -389,9 +388,11 @@ class RepetitionAccumulator:
     multi_day_min_days : int     (ING-007)
 
     Backward-compat kwargs (stored and used by ingest() shim):
-    min_premium : float | None   — floor baseline; effective floor is
-                                    max(min_premium, dte_tier_floor) when
-                                    dte_premium_tiers are present.
+    min_premium : float | None   — floor baseline; when _tiers_explicit is False
+                                    (caller did not pass dte_premium_tiers), the
+                                    override is used directly as the floor.
+                                    When _tiers_explicit is True, effective floor
+                                    is max(min_premium, dte_tier_floor).
     signal_cooldown : int | None — cooldown minutes used by ingest() shim
     """
 
@@ -415,6 +416,10 @@ class RepetitionAccumulator:
         self._aggression_discount  = aggression_discount
         self._require_multi_day    = require_multi_day
         self._multi_day_min_days   = multi_day_min_days
+        # Track whether caller explicitly provided tiers.
+        # When False and _min_premium_override is set, use override directly
+        # without comparing to default tier floors (C008-5/6 shim compat).
+        self._tiers_explicit: bool = dte_premium_tiers is not None
         self._dte_tiers            = dte_premium_tiers or _DEFAULT_DTE_PREMIUM_TIERS
         self._episodes: Dict[str, RepetitionEpisode] = {}
         self._tier_map: Dict[str, int] = {}
@@ -469,9 +474,20 @@ class RepetitionAccumulator:
         """
         Return the effective premium floor for this episode.
 
-        _min_premium_override is a FLOOR BASELINE, not a DTE-tier bypass.
-        Effective floor = max(override, dte_tier_floor) when tiers are present.
+        When _tiers_explicit is False (caller did not pass dte_premium_tiers)
+        AND _min_premium_override is set: use the override directly.
+        The default tier table is not consulted — shim callers that pass
+        only min_premium must not have their floor silently raised by the
+        default T2/T1 tier floors.
+
+        When _tiers_explicit is True: effective floor = max(override, dte_tier_floor).
+        This preserves the strict behaviour for production callers that wire tiers
+        explicitly.
         """
+        # Shim path: no explicit tiers, just a min_premium override.
+        if not self._tiers_explicit and self._min_premium_override is not None:
+            return float(self._min_premium_override)
+
         if not ep.events:
             return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
         if not self._dte_tiers:
@@ -644,7 +660,14 @@ class RepetitionAccumulator:
         if hasattr(ts, 'replace') and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        ev.timestamp = ts
+        # Guard: only write timestamp back onto the event if it is a mutable
+        # object that supports attribute assignment. datetime objects (passed
+        # directly via the get_signal legacy path) are C-level and read-only.
+        try:
+            ev.timestamp = ts
+        except (AttributeError, TypeError):
+            pass
+
         ep.events.append(ev)
         ep.last_seen = ts
         if ep.first_seen is None:
