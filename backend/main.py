@@ -59,11 +59,11 @@ from core.auth import get_current_user
 from services.flow_store import start_flow_writer, start_lookback_worker
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
-from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
+from services.tradier_stream import stream_options_flow
 
 
 class _JsonFormatter(logging.Formatter):
@@ -517,9 +517,6 @@ app = FastAPI(
 )
 
 # SA-2 fix: single-escape raw strings are correct for regex in Python.
-# r"\-" is a literal hyphen, r"\." is a literal dot.
-# Double-escaping (r"\\-", r"\\.") in a raw string produces the two-char
-# sequences \\ and \\. which never match - or . — breaking Vercel CORS.
 _explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
