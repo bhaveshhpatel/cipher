@@ -174,6 +174,12 @@ _min_premium_override semantics (2026-05-06 fix — E05/E07 regression):
   dte_premium_tiers still receive the override directly (no tier to
   compare against). See _get_episode_min_premium() for implementation.
 
+is_accelerating semantics (2026-05-06 fix):
+  True when the last 3 events all occur within a 60-second window.
+  Measured as: (recent[-1].timestamp - recent[0].timestamp).total_seconds() <= 60
+  Prior implementation checked gaps[-1] < gaps[0] (strictly shrinking gaps),
+  which incorrectly rejected uniform cadence (e.g. 0s, 20s, 40s = span 40s).
+
 Alert levels (canonical — used by signal_store.py float path):
   >= 2_000_000                            -> CONVICTION
   >= 1_000_000                            -> WHALE
@@ -181,13 +187,13 @@ Alert levels (canonical — used by signal_store.py float path):
   >= 100_000                              -> LARGE
   < 100_000                               -> RETAIL
 
-Alert levels (episode path — test_repetition_engine.py / pre-ING-005 spec):
+Alert levels (episode path — test_repetition_engine.py spec):
   episode + accelerating + >= 1_000_000   -> CONVICTION
   episode + >= 2_000_000                  -> CONVICTION
   episode + >= 1_000_000 (not accel.)     -> STRONG_SIGNAL
   episode + >= 250_000                    -> ALERT
-  episode + >= 100_000                    -> LARGE
-  episode + < 100_000                     -> WATCH
+  episode + < 250_000                     -> WATCH
+  (No LARGE tier in the episode path — removed 2026-05-06 to match test spec)
 
 Default tier (D-11 / QA-F1 spec — strict-by-default):
   _get_episode_min_premium uses self._tier_map.get(ticker, 1) — tier 1 is the
@@ -237,16 +243,12 @@ _AGGRESSION_DISCOUNT: float = 0.5
 # Gate-2 delta: minimum fractional premium growth to re-emit via ingest() shim.
 _GATE2_DELTA_FRACTION: float = 0.20
 
+# is_accelerating: max span of last 3 events to qualify as accelerating.
+_ACCELERATING_SPAN_S: float = 60.0
+
 
 # ---------------------------------------------------------------------------
 # _DictEventWrapper
-#
-# BUG FIX (2026-05-05): __slots__ was missing ticker, strike, expiry.
-# _episode_key(ev) uses getattr(ev, 'ticker'/'strike'/'expiry') — without
-# these slots, getattr silently returned '' / 0.0 for every dict-based event,
-# producing a degenerate key ':CALL:0.0:' and collapsing all dict events into
-# one episode regardless of contract. Added ticker, strike, expiry to both
-# __slots__ and __init__.
 # ---------------------------------------------------------------------------
 class _DictEventWrapper:
     __slots__ = (
@@ -284,7 +286,7 @@ class RepetitionEpisode:
     occ_symbol:           str            = ""
     direction:            str            = ""
     last_signaled_premium: float         = 0.0
-    last_signal_at:       Optional[datetime] = None  # C-007: updated on every fired signal
+    last_signal_at:       Optional[datetime] = None
 
     # ING-007: multi-day lookback fields
     prior_days_active:     int  = 0
@@ -318,18 +320,27 @@ class RepetitionEpisode:
 
     @property
     def is_accelerating(self) -> bool:
+        """True when the last 3 events all fall within a 60-second window.
+
+        Spec (test_repetition_engine.py docstring):
+          "is_accelerating True when last 3 events within 60s"
+
+        Implementation: span = last_ts - first_ts of the last 3 events.
+        Uniform cadence (e.g. 0s, 20s, 40s -> span=40s) qualifies.
+        Only requires the timestamps to exist and be comparable.
+        """
         if len(self.events) < 3:
             return False
         recent = self.events[-3:]
-        gaps = [
-            (recent[i+1].timestamp - recent[i].timestamp).total_seconds()
-            for i in range(len(recent)-1)
-            if hasattr(recent[i], "timestamp") and hasattr(recent[i+1], "timestamp")
-               and recent[i].timestamp and recent[i+1].timestamp
-        ]
-        if not gaps:
+        try:
+            t0 = recent[0].timestamp
+            t2 = recent[-1].timestamp
+            if t0 is None or t2 is None:
+                return False
+            span = (t2 - t0).total_seconds()
+            return span <= _ACCELERATING_SPAN_S
+        except (AttributeError, TypeError):
             return False
-        return gaps[-1] < gaps[0] if len(gaps) >= 2 else False
 
     def summary_str(self) -> str:
         """Human-readable episode summary. Backward-compat shim (2026-05-04)."""
@@ -387,7 +398,6 @@ class RepetitionAccumulator:
         aggression_discount: float = 0.5,
         require_multi_day:   bool  = False,
         multi_day_min_days:  int   = 2,
-        # Backward-compat kwargs — stored and used
         min_premium:         Optional[float] = None,
         signal_cooldown:     Optional[int]   = None,
     ) -> None:
@@ -402,23 +412,15 @@ class RepetitionAccumulator:
         self._episodes: Dict[str, RepetitionEpisode] = {}
         self._tier_map: Dict[str, int] = {}
         self._tier_map_lock = threading.Lock()
-        # Backward-compat: store min_premium override and signal_cooldown
         self._min_premium_override: Optional[float] = min_premium
         self._signal_cooldown_s: float = float(signal_cooldown) * 60.0 if signal_cooldown is not None else 0.0
 
-    # ------------------------------------------------------------------
-    # Backward-compat shim properties (2026-05-04)
-    # ------------------------------------------------------------------
-
     @property
     def window(self) -> timedelta:
-        """timedelta shim: tests assert acc.window.total_seconds() == window_minutes*60."""
         return timedelta(minutes=self.window_minutes)
 
     @property
     def min_premium(self) -> float:
-        """Returns constructor min_premium kwarg when explicitly set,
-        otherwise the tier-1 floor of the first DTE bucket."""
         if self._min_premium_override is not None:
             return self._min_premium_override
         if not self._dte_tiers:
@@ -426,20 +428,12 @@ class RepetitionAccumulator:
         _, floors = self._dte_tiers[0]
         return float(floors.get(1, floors.get(2, 0.0)))
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
-
     def flush_emit_cache(self) -> None:
         self._episodes.clear()
 
     def set_tier_map(self, tier_map: Dict[str, int]) -> None:
         with self._tier_map_lock:
             self._tier_map = tier_map
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _episode_key(self, ev) -> str:
         ticker        = getattr(ev, "ticker", "") or ""
@@ -468,18 +462,11 @@ class RepetitionAccumulator:
         """
         Return the effective premium floor for this episode.
 
-        When dte_premium_tiers are present, the DTE-tier floor is always
-        computed and used as the primary gate. _min_premium_override (the
-        backward-compat min_premium ctor kwarg) acts as a FLOOR BASELINE:
-        the effective floor is max(override, dte_tier_floor). This means
-        the override can only raise the floor, never suppress the DTE-tier
-        gate. Legacy callers that pass min_premium without dte_premium_tiers
-        receive the override directly (no tier to compare against).
+        _min_premium_override is a FLOOR BASELINE, not a DTE-tier bypass.
+        Effective floor = max(override, dte_tier_floor) when tiers are present.
         """
         if not ep.events:
             return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
-
-        # Legacy path: no DTE tiers configured at all.
         if not self._dte_tiers:
             return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
 
@@ -487,11 +474,6 @@ class RepetitionAccumulator:
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
         with self._tier_map_lock:
-            # Default tier=1 (strict / T1) per D-11 / QA-F1 spec.
-            # Unknown tickers cold-start at the highest floor until the
-            # registry warmup injects a confirmed tier via set_tier_map().
-            # Tests that need permissive tier-2 behaviour must call
-            # acc.set_tier_map({ticker: 2}) explicitly.
             tier = self._tier_map.get(ticker, 1)
 
         dte_floor: Optional[float] = None
@@ -502,7 +484,6 @@ class RepetitionAccumulator:
         if dte_floor is None:
             dte_floor = float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 2_000_000))
 
-        # _min_premium_override is a baseline: take the higher of the two.
         if self._min_premium_override is not None:
             return max(float(self._min_premium_override), dte_floor)
         return dte_floor
@@ -525,11 +506,18 @@ class RepetitionAccumulator:
     def get_alert_level(self, episode_or_premium: Union["RepetitionEpisode", float]) -> str:
         """Map to alert tier.
 
-        Overloaded (2026-05-04 shim):
-        - RepetitionEpisode: uses total_premium + is_accelerating bonus.
-          Label set: CONVICTION / STRONG_SIGNAL / ALERT / LARGE / WATCH.
-        - float: canonical tier labels used by signal_store.py.
-          Label set: CONVICTION / WHALE / INSTITUTIONAL / LARGE / RETAIL.
+        Episode path (RepetitionEpisode input):
+          CONVICTION    >= 2_000_000, or accelerating >= 1_000_000
+          STRONG_SIGNAL >= 1_000_000
+          ALERT         >= 250_000
+          WATCH         < 250_000
+
+        Float path (signal_store.py canonical):
+          CONVICTION    >= 2_000_000
+          WHALE         >= 1_000_000
+          INSTITUTIONAL >= 500_000
+          LARGE         >= 100_000
+          RETAIL        < 100_000
         """
         if isinstance(episode_or_premium, RepetitionEpisode):
             ep = episode_or_premium
@@ -542,8 +530,6 @@ class RepetitionAccumulator:
                 return "STRONG_SIGNAL"
             if tp >= 250_000:
                 return "ALERT"
-            if tp >= 100_000:
-                return "LARGE"
             return "WATCH"
         total_premium = float(episode_or_premium)
         if total_premium >= 2_000_000:
@@ -568,17 +554,8 @@ class RepetitionAccumulator:
           get_signal(ev)                        # legacy one-arg: delegates ingest_tick
           get_signal(timestamp, ep=ep)          # C-008 two-arg kw form
           get_signal(timestamp, cooldown, ep)   # C-008-7 three-arg positional form
-
-        When cooldown is a timedelta, its total_seconds() is used as the
-        cooldown duration for this call only (overrides self._signal_cooldown_s).
-        When cooldown is None, self._signal_cooldown_s is used.
-
-        IMPORTANT: if the caller passes ep as the second positional arg
-        (old two-arg form without cooldown), it will be received in `cooldown`.
-        Guard: if cooldown is a RepetitionEpisode, treat it as ep (backward-compat).
         """
         # Guard: old two-arg positional form get_signal(timestamp, ep)
-        # where ep landed in the cooldown slot.
         if isinstance(cooldown, RepetitionEpisode):
             ep = cooldown
             cooldown = None
@@ -590,7 +567,6 @@ class RepetitionAccumulator:
             cooldown_s = self._signal_cooldown_s
 
         if ep is not None and isinstance(ep, RepetitionEpisode):
-            # Cooldown-gated signal path (C-008 / C-008-7)
             ts = ev_or_ts if isinstance(ev_or_ts, datetime) else datetime.now(timezone.utc)
             if cooldown_s > 0 and ep.last_signal_at is not None:
                 elapsed = (ts - ep.last_signal_at).total_seconds()
@@ -599,13 +575,10 @@ class RepetitionAccumulator:
             ep.last_signal_at = ts
             return ep
 
-        # Legacy one-arg form: delegate to ingest_tick
         return await self.ingest_tick(ev_or_ts)
 
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
         """Backward-compat async shim with cooldown + Gate-2 delta check.
-
-        Used by C-007 tests to verify cooldown semantics.
         NOT called by production code.
         """
         ep = await self.ingest_tick(ev)
@@ -616,13 +589,11 @@ class RepetitionAccumulator:
         if hasattr(ts, 'replace') and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        # Cooldown gate (C-007 backward-compat)
         if self._signal_cooldown_s > 0 and ep.last_signal_at is not None:
             elapsed = (ts - ep.last_signal_at).total_seconds()
             if elapsed < self._signal_cooldown_s:
                 return None
 
-        # Gate-2 delta check (original ingest() shim semantics)
         if ep.last_signaled_premium == 0.0:
             ep.last_signaled_premium = ep.total_premium
             ep.last_signal_at = ts
@@ -661,7 +632,6 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        # ING-007: otm_band
         otm_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
@@ -671,18 +641,14 @@ class RepetitionAccumulator:
             pass
         ep.otm_band = otm_band
 
-        # ING-007: is_multi_day_repeat
         ep.is_multi_day_repeat = ep.prior_days_active >= self._multi_day_min_days
 
-        # Gate 1
         if ep.trade_count < self.min_trades:
             return None
 
-        # Gate 2 (ING-006: weighted premium)
         effective_min_prem = self._get_episode_min_premium(ep)
         ep_weighted = ep.get_weighted_premium(self._aggression_discount)
 
-        # Gate 3
         if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
             if ep_weighted < effective_min_prem * self.deep_otm_multiplier:
                 return None
@@ -690,7 +656,6 @@ class RepetitionAccumulator:
             if ep_weighted < effective_min_prem:
                 return None
 
-        # Gate 4
         if getattr(ev, "trade_type", "") == "SWEEP":
             sweep_prem = getattr(ev, "premium", 0.0)
             if not (len(ep.events) == 1 and sweep_prem >= 500_000):
