@@ -195,13 +195,13 @@ Alert levels (canonical — used by signal_store.py float path):
   >= 100_000                              -> LARGE
   < 100_000                               -> RETAIL
 
-Alert levels (episode path — test_repetition_engine.py spec):
+Alert levels (episode path):
   episode + accelerating + >= 1_000_000   -> CONVICTION
   episode + >= 2_000_000                  -> CONVICTION
   episode + >= 1_000_000 (not accel.)     -> STRONG_SIGNAL
   episode + >= 250_000                    -> ALERT
-  episode + < 250_000                     -> WATCH
-  (No LARGE tier in the episode path — removed 2026-05-06 to match test spec)
+  episode + >= 100_000                    -> LARGE
+  episode + < 100_000                     -> WATCH
 
 Default tier (D-11 / QA-F1 spec — strict-by-default):
   _get_episode_min_premium uses self._tier_map.get(ticker, 1) — tier 1 is the
@@ -517,7 +517,8 @@ class RepetitionAccumulator:
           CONVICTION    >= 2_000_000, or accelerating >= 1_000_000
           STRONG_SIGNAL >= 1_000_000
           ALERT         >= 250_000
-          WATCH         < 250_000
+          LARGE         >= 100_000
+          WATCH         < 100_000
 
         Float path (signal_store.py canonical):
           CONVICTION    >= 2_000_000
@@ -537,6 +538,8 @@ class RepetitionAccumulator:
                 return "STRONG_SIGNAL"
             if tp >= 250_000:
                 return "ALERT"
+            if tp >= 100_000:
+                return "LARGE"
             return "WATCH"
         total_premium = float(episode_or_premium)
         if total_premium >= 2_000_000:
