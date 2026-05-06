@@ -24,20 +24,21 @@ Counter invariants verified throughout:
   - created_episodes increments on INSERT only
   - merged_episodes increments on PATCH only
   - Neither counter increments on lookup failure fallback (E-8 inserts, counts as created)
+
+NOTE — import discipline:
+  All module-level names (_episode_stats, _lookup_open_episode,
+  persist_flow_episode, _EPISODE_MERGE_WINDOW_S) are accessed via the
+  `fs` module reference, never via direct `from ... import` bindings.
+  This ensures patch.object(fs, ...), _reset_episode_stats(), and all
+  assertions operate on the same live object, regardless of how pytest
+  caches sys.modules between test runs.
 """
-import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import services.flow_store as fs
-from services.flow_store import (
-    _EPISODE_MERGE_WINDOW_S,
-    _episode_stats,
-    _lookup_open_episode,
-    persist_flow_episode,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +73,8 @@ def _make_signal(
 
 
 def _reset_episode_stats():
-    _episode_stats["created_episodes"] = 0
-    _episode_stats["merged_episodes"]  = 0
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
 
 
 # ---------------------------------------------------------------------------
@@ -87,10 +88,10 @@ async def test_e1_first_print_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +115,12 @@ async def test_e2_second_print_merges():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=existing_row)), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["merged_episodes"]  == 1
-    assert _episode_stats["created_episodes"] == 0
+    assert fs._episode_stats["merged_episodes"]  == 1
+    assert fs._episode_stats["created_episodes"] == 0
 
-    patch_call_kwargs = mock_client.patch.call_args
-    sent_payload = patch_call_kwargs.kwargs["json"]
+    sent_payload = mock_client.patch.call_args.kwargs["json"]
     assert sent_payload["trade_count"]   == 2
     assert sent_payload["total_premium"] == pytest.approx(35000.0)
 
@@ -146,9 +146,9 @@ async def test_e3_third_print_trade_count_3():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=existing_row)), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["merged_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"] == 1
     sent_payload = mock_client.patch.call_args.kwargs["json"]
     assert sent_payload["trade_count"]   == 3
     assert sent_payload["total_premium"] == pytest.approx(45000.0)
@@ -165,10 +165,10 @@ async def test_e4_after_window_expiry_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +182,10 @@ async def test_e5_different_strike_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal_210)
+        await fs.persist_flow_episode(signal_210)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +199,10 @@ async def test_e6_different_expiry_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal_sep)
+        await fs.persist_flow_episode(signal_sep)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +216,10 @@ async def test_e7_next_day_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -231,17 +231,14 @@ async def test_e8_lookup_error_fallback_to_insert():
     _reset_episode_stats()
     signal = _make_signal()
 
-    async def _lookup_raises(*args, **kwargs):
-        raise Exception("Supabase connection timeout")
-
     insert_mock = AsyncMock(return_value=True)
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=insert_mock):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
     insert_mock.assert_called_once()
 
 
@@ -258,10 +255,9 @@ async def test_e9_strike_expiry_populated_on_insert():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=insert_mock):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    call_args = insert_mock.call_args
-    rows = call_args.args[1]
+    rows = insert_mock.call_args.args[1]
     assert rows[0]["strike"] == 195.0
     assert rows[0]["expiry"] == "2026-07-18"
 
@@ -285,12 +281,11 @@ async def test_e9_strike_expiry_in_lookup_key_on_patch():
 
     with patch.object(fs, "_lookup_open_episode", new=lookup_mock), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
     lookup_call = lookup_mock.call_args
-    assert lookup_call.args[2] == 195.0 or lookup_call.kwargs.get("strike") == 195.0 or \
-           195.0 in lookup_call.args
-    assert _episode_stats["merged_episodes"] == 1
+    assert 195.0 in lookup_call.args
+    assert fs._episode_stats["merged_episodes"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +313,10 @@ async def test_e10_boundary_at_window_patches():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=existing_row)), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["merged_episodes"]  == 1
-    assert _episode_stats["created_episodes"] == 0
+    assert fs._episode_stats["merged_episodes"]  == 1
+    assert fs._episode_stats["created_episodes"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +334,10 @@ async def test_e11_boundary_past_window_inserts():
 
     with patch.object(fs, "_lookup_open_episode", new=AsyncMock(return_value=None)), \
          patch.object(fs, "_insert_rows", new=AsyncMock(return_value=True)):
-        await persist_flow_episode(signal)
+        await fs.persist_flow_episode(signal)
 
-    assert _episode_stats["created_episodes"] == 1
-    assert _episode_stats["merged_episodes"]  == 0
+    assert fs._episode_stats["created_episodes"] == 1
+    assert fs._episode_stats["merged_episodes"]  == 0
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +347,7 @@ async def test_e11_boundary_past_window_inserts():
 @pytest.mark.asyncio
 async def test_lookup_returns_none_when_not_configured():
     with patch.object(fs, "_SUPABASE_URL", None):
-        result = await _lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
+        result = await fs._lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
     assert result is None
 
 
@@ -370,7 +365,7 @@ async def test_lookup_returns_none_on_http_error():
     with patch.object(fs, "_SUPABASE_URL", "https://fake.supabase.co"), \
          patch.object(fs, "_SUPABASE_KEY", "fake-key"), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        result = await _lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
+        result = await fs._lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
 
     assert result is None
 
@@ -389,7 +384,7 @@ async def test_lookup_returns_none_when_empty_rows():
     with patch.object(fs, "_SUPABASE_URL", "https://fake.supabase.co"), \
          patch.object(fs, "_SUPABASE_KEY", "fake-key"), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        result = await _lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
+        result = await fs._lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
 
     assert result is None
 
@@ -409,7 +404,7 @@ async def test_lookup_returns_row_when_found():
     with patch.object(fs, "_SUPABASE_URL", "https://fake.supabase.co"), \
          patch.object(fs, "_SUPABASE_KEY", "fake-key"), \
          patch("services.flow_store.httpx.AsyncClient", return_value=mock_client):
-        result = await _lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
+        result = await fs._lookup_open_episode("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
 
     assert result == expected_row
 
@@ -419,19 +414,18 @@ async def test_lookup_returns_row_when_found():
 # ---------------------------------------------------------------------------
 
 def test_episode_stats_initialised_at_module_level():
-    assert "created_episodes" in _episode_stats
-    assert "merged_episodes"  in _episode_stats
-    assert isinstance(_episode_stats["created_episodes"], int)
-    assert isinstance(_episode_stats["merged_episodes"],  int)
+    assert "created_episodes" in fs._episode_stats
+    assert "merged_episodes"  in fs._episode_stats
+    assert isinstance(fs._episode_stats["created_episodes"], int)
+    assert isinstance(fs._episode_stats["merged_episodes"],  int)
 
 
 def test_get_episode_stats_returns_copy():
-    from services.flow_store import get_episode_stats
-    stats = get_episode_stats()
+    stats = fs.get_episode_stats()
     assert "created_episodes" in stats
     assert "merged_episodes"  in stats
     stats["created_episodes"] = 9999
-    assert _episode_stats["created_episodes"] != 9999
+    assert fs._episode_stats["created_episodes"] != 9999
 
 
 # ---------------------------------------------------------------------------
@@ -439,4 +433,4 @@ def test_get_episode_stats_returns_copy():
 # ---------------------------------------------------------------------------
 
 def test_episode_merge_window_is_1800():
-    assert _EPISODE_MERGE_WINDOW_S == 1800
+    assert fs._EPISODE_MERGE_WINDOW_S == 1800
