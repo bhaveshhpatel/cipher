@@ -13,17 +13,23 @@ FIX (2026-05-05 chunk-1):
 
 FIX (2026-05-05 chunk-2):
   Bug A — fetched_at MagicMock TypeError: set entry.fetched_at = time.monotonic().
-  Bug B — _is_fresh patch misses import-site binding: patch
-           "services.tradier_stream._lbc_fresh" directly.
+  Bug B — _is_fresh patch misses import-site binding:
+           patch "services.tradier_stream._lbc_fresh" directly.
 
 FIX (2026-05-05 chunk-3):
   Bug C — _lbc patch misses import-site binding:
-    tradier_stream.py imports _cache by value:
-      from utils.contract_day_cache import _cache as _lbc
-    Patching utils.contract_day_cache._cache replaces the module attr but
-    tradier_stream._lbc still points to the original dict object.
-    _lbc.get(_contract_key) therefore returns None, _is_repeat_now stays False.
-    Fix: patch "services.tradier_stream._lbc" directly (same pattern as _lbc_fresh).
+           patch "services.tradier_stream._lbc" directly.
+
+FIX (2026-05-05 chunk-4):
+  Bug D — accumulator MagicMock auto-creates _multi_day_min_days:
+    _process_trade does:
+      _multi_day_min_days = getattr(accumulator, "_multi_day_min_days", 2)
+    When accumulator is a MagicMock, getattr() succeeds (MagicMock auto-
+    creates any attribute), returning another MagicMock instead of 2.
+    The default fallback value is never used.
+    Then:  cache_entry.prior_days_active >= MagicMock()  → TypeError
+    Caught by `except Exception` → _is_repeat_now = False.
+    Fix: set mock_acc._multi_day_min_days = 2 explicitly in both tests.
 """
 import asyncio
 import datetime
@@ -114,7 +120,6 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
     ts._lookback_result_cache.clear()
     ts._stats["ticks"] = 0
 
-    # FIX (chunk-3): patch _lbc at the tradier_stream import site.
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
@@ -130,11 +135,12 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
          patch("services.tradier_stream._lbc_fresh", return_value=True):
 
         mock_bus.publish_all = AsyncMock()
-        mock_acc.ingest_tick     = AsyncMock(return_value=sig_ep)
-        mock_acc.get_signal      = AsyncMock(return_value=sig_ep)
-        mock_acc.get_alert_level = MagicMock(return_value="CONVICTION")
-        mock_dedup.is_duplicate  = MagicMock(return_value=False)
-        mock_dedup.is_sweep      = MagicMock(return_value=False)
+        mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
+        mock_acc.get_signal        = AsyncMock(return_value=sig_ep)
+        mock_acc.get_alert_level   = MagicMock(return_value="CONVICTION")
+        mock_acc._multi_day_min_days = 2  # FIX: prevent MagicMock auto-attr from hiding the int
+        mock_dedup.is_duplicate    = MagicMock(return_value=False)
+        mock_dedup.is_sweep        = MagicMock(return_value=False)
 
         raw = {"type": "timesale", "timesale": {
             "symbol": "AAPL260620C00150000",
@@ -173,7 +179,6 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     ts._lookback_result_cache.clear()
     ts._stats["ticks"] = 0
 
-    # FIX (chunk-3): patch _lbc at the tradier_stream import site.
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
@@ -189,11 +194,12 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
          patch("services.tradier_stream._lbc_fresh", return_value=True):
 
         mock_bus.publish_all = AsyncMock(side_effect=lambda m: published.append(m))
-        mock_acc.ingest_tick     = AsyncMock(return_value=sig_ep)
-        mock_acc.get_signal      = AsyncMock(return_value=sig_ep)
-        mock_acc.get_alert_level = MagicMock(return_value="CONVICTION")
-        mock_dedup.is_duplicate  = MagicMock(return_value=False)
-        mock_dedup.is_sweep      = MagicMock(return_value=False)
+        mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
+        mock_acc.get_signal        = AsyncMock(return_value=sig_ep)
+        mock_acc.get_alert_level   = MagicMock(return_value="CONVICTION")
+        mock_acc._multi_day_min_days = 2  # FIX: prevent MagicMock auto-attr from hiding the int
+        mock_dedup.is_duplicate    = MagicMock(return_value=False)
+        mock_dedup.is_sweep        = MagicMock(return_value=False)
 
         raw = {"type": "timesale", "timesale": {
             "symbol": "AAPL260620C00150000",
