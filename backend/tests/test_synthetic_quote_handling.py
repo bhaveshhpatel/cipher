@@ -118,10 +118,18 @@ def test_real_above_ask_still_classified():
 
 
 def test_real_at_bid_still_classified():
+    """Fill at bid on a real CALL quote.
+
+    ING-001 resolution (SPRINT_WSJ_INGESTION_ALIGNMENT.md):
+      AT_BID / BELOW_BID on CALL -> is_aggressive = True
+      (call seller writing at bid = conviction bearish position writer)
+
+    Pre-ING-006 tests expected False here. Updated for ING-006 semantics.
+    """
     ev = parse_tradier_trade(_real_quote(last=3.40, bid=3.40, ask=3.60))
     assert ev is not None
     assert ev.bid_ask_class == "AT_BID"
-    assert ev.is_aggressive is False
+    assert ev.is_aggressive is True   # ING-006: AT_BID on CALL = conviction bearish
     assert ev.is_synthetic_quote is False
 
 
