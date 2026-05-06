@@ -53,6 +53,30 @@
 #   is_aggressive=FALSE (S2.5 column default). prior_days_aggressive will
 #   be 0 for all historical data until ~5 trading days of newly-flagged rows
 #   accumulate. No backfill attempted (SA, 2026-05-04).
+#
+# DEPLOY NOTE (ING-011 — 2026-05-06):
+#   _classify_otm() replaced by _classify_moneyness_band() which covers the
+#   full moneyness spectrum:
+#     DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN
+#   Thresholds (symmetric with ING-005 ATM band — D1 deliberation 2026-05-06):
+#     DEEP_ITM: PUT strike > underlying * 1.10  |  CALL strike < underlying * 0.90
+#     ITM:      PUT strike > underlying * 1.02  |  CALL strike < underlying * 0.98
+#     ATM:      abs(strike - underlying) / underlying <= 0.02
+#     OTM:      2% < pct <= 12%
+#     DEEP_OTM: pct > 12%
+#     UNKNOWN:  underlying_price == 0 or any error
+#
+#   dominant_direction override for ITM puts (D2 deliberation 2026-05-06):
+#     When contract_type == PUT and otm_band in ('ITM', 'DEEP_ITM'):
+#       AT_BID fill = buyer paying near-intrinsic in wide spread, NOT put writer
+#       Force direction = REPEAT_BUY, sentiment = BEARISH regardless of
+#       order_side_to_direction() result.
+#     ITM CALL AT_BID is unchanged — call seller = bearish already correct.
+#
+#   otm_band enum extended (D3 deliberation 2026-05-06):
+#     Values: 'ATM' | 'OTM' | 'DEEP_OTM' | 'ITM' | 'DEEP_ITM' | 'UNKNOWN'
+#     No DB migration required — flow_events.otm_band is TEXT (not a PG enum).
+#     Existing consumers checking for 'OTM' / 'DEEP_OTM' are unaffected.
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -76,16 +100,29 @@ unset_dte_floor (S4):
     or DTE unknown are passed through with no DTE floor rather than rejected.
     Same-day expirations (0DTE) are high-signal events and must not be gated out.
 
-OTM classification (S4):
-  - ATM band: abs(strike - underlying_price) / underlying_price <= 0.02
-  - Standard OTM: 2–12%
-  - Deep OTM: > 12% — subject to deep_otm_multiplier
-  - No underlying_price (== 0): standard floor, no OTM classification attempted
+Moneyness classification (ING-011 — replaces OTM-only classification from S4/ING-005):
+  Full spectrum: DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN
+  Symmetric thresholds (mirrors ING-005 ATM ±2% band):
+    DEEP_ITM: PUT strike > underlying * 1.10  |  CALL strike < underlying * 0.90
+    ITM:      PUT strike > underlying * 1.02  |  CALL strike < underlying * 0.98
+    ATM:      abs(strike - underlying) / underlying <= 0.02
+    OTM:      2% < moneyness_pct <= 12%
+    DEEP_OTM: moneyness_pct > 12%
+    UNKNOWN:  underlying_price == 0 or any calculation error
 
 ATM threshold deliberation note (Architect + Principal Engineer, 2026-04-30):
   ±2% was selected as the working threshold. Absolute dollar amounts break
   across underlying price regimes; percentage is the only portable definition.
-  Events with underlying_price == 0 fall back to standard floor.
+  Events with underlying_price == 0 fall back to UNKNOWN with no classification.
+
+ITM override in dominant_direction (ING-011 D2 — 2026-05-06):
+  Deeply ITM puts filling AT_BID represent a buyer paying near-intrinsic value
+  in a wide spread — NOT a put writer initiating a sell. The existing
+  order_side_to_direction() mapping was designed for OTM puts where AT_BID
+  reliably signals writer intent. For ITM puts the spread dynamics are
+  fundamentally different. Override: PUT in ITM/DEEP_ITM band with AT_BID fill
+  -> REPEAT_BUY (bearish). ITM CALL AT_BID is unchanged (call seller = bearish
+  already correct per existing logic).
 
 Sweep bypass semantics (S4, Issue 7 resolution):
   len(ep.events) == 1 is the episode event count — number of OptionsFlowEvent
@@ -110,6 +147,7 @@ dominant_direction property (S2 spec):
   Premium-weighted direction across all events in the episode. An episode
   dominated by SELL PUT premium resolves to REPEAT_BUY even if the last
   tick was a passive mid-print. See RepetitionEpisode.dominant_direction.
+  ING-011: ITM put override applied post-resolution — see property docstring.
 
 order_side enrichment (ING-005):
   - dominant_direction property on RepetitionEpisode (premium-weighted)
@@ -253,6 +291,13 @@ _GATE2_DELTA_FRACTION: float = 0.20
 # is_accelerating: max span of last 3 events to qualify as accelerating.
 _ACCELERATING_SPAN_S: float = 60.0
 
+# ---------------------------------------------------------------------------
+# ING-011: Moneyness band thresholds (symmetric with ING-005 ATM ±2% band).
+# D1 deliberation 2026-05-06: reuse ING-005 thresholds exactly.
+# ---------------------------------------------------------------------------
+_ITM_THRESHOLD: float = 0.02   # >2% in-the-money -> ITM
+_DEEP_ITM_THRESHOLD: float = 0.10  # >10% in-the-money -> DEEP_ITM
+
 
 # ---------------------------------------------------------------------------
 # _DictEventWrapper
@@ -262,6 +307,7 @@ class _DictEventWrapper:
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
         "is_aggressive", "ticker", "strike", "expiry",
+        "bid_ask_class",
     )
 
     def __init__(self, d: dict) -> None:
@@ -276,6 +322,7 @@ class _DictEventWrapper:
         self.ticker           = d.get("ticker", "") or ""
         self.strike           = float(d.get("strike", 0.0) or 0.0)
         self.expiry           = d.get("expiry", "") or ""
+        self.bid_ask_class    = d.get("bid_ask_class", "UNKNOWN")
 
 
 @dataclass
@@ -300,7 +347,8 @@ class RepetitionEpisode:
     prior_days_aggressive: int  = 0
     is_multi_day_repeat:   bool = False
 
-    # ING-007 / ING-005 deferred
+    # ING-007 / ING-005 deferred / ING-011 extended
+    # Values: 'ATM' | 'OTM' | 'DEEP_OTM' | 'ITM' | 'DEEP_ITM' | 'UNKNOWN'
     otm_band: str = "UNKNOWN"
 
     @property
@@ -359,6 +407,23 @@ class RepetitionEpisode:
 
     @property
     def dominant_direction(self) -> str:
+        """Premium-weighted dominant direction for the episode.
+
+        ING-011 override (D2 deliberation 2026-05-06):
+          When contract_type == PUT and otm_band in ('ITM', 'DEEP_ITM'),
+          an AT_BID fill reflects a buyer paying near-intrinsic value in a
+          wide spread — NOT a put writer. Force REPEAT_BUY (bearish) for the
+          entire episode regardless of what order_side_to_direction() resolves.
+
+          Trigger condition: the most recent event's bid_ask_class is AT_BID
+          or BELOW_BID, AND the episode's otm_band is ITM or DEEP_ITM.
+
+          ITM CALL AT_BID is NOT overridden — call seller = bearish (REPEAT_SELL)
+          is already the correct existing output from order_side_to_direction().
+
+          underlying_price == 0 (otm_band == 'UNKNOWN'): no override, existing
+          order_side_to_direction() result stands.
+        """
         buy_prem = sell_prem = 0.0
         for e in self.events:
             d = order_side_to_direction(
@@ -369,7 +434,29 @@ class RepetitionEpisode:
                 buy_prem += getattr(e, "premium", 0.0)
             else:
                 sell_prem += getattr(e, "premium", 0.0)
-        return "REPEAT_BUY" if buy_prem >= sell_prem else "REPEAT_SELL"
+        base_direction = "REPEAT_BUY" if buy_prem >= sell_prem else "REPEAT_SELL"
+
+        # ING-011: ITM PUT override — AT_BID on ITM put = buyer, not writer.
+        if (
+            self.contract_type.upper() == "PUT"
+            and self.otm_band in ("ITM", "DEEP_ITM")
+        ):
+            # Inspect the dominant bid_ask_class across events.
+            # If the majority of premium came from AT_BID / BELOW_BID fills,
+            # this is an ITM put buyer — force REPEAT_BUY (bearish).
+            bid_side_prem = 0.0
+            ask_side_prem = 0.0
+            for e in self.events:
+                bac = getattr(e, "bid_ask_class", "UNKNOWN")
+                prem = getattr(e, "premium", 0.0)
+                if bac in ("AT_BID", "BELOW_BID"):
+                    bid_side_prem += prem
+                elif bac in ("AT_ASK", "ABOVE_ASK"):
+                    ask_side_prem += prem
+            if bid_side_prem > ask_side_prem:
+                return "REPEAT_BUY"
+
+        return base_direction
 
 
 class RepetitionAccumulator:
@@ -511,19 +598,58 @@ class RepetitionAccumulator:
             return max(float(self._min_premium_override), dte_floor)
         return dte_floor
 
-    def _classify_otm(self, ev) -> str:
+    def _classify_moneyness_band(self, ev) -> str:
+        """Classify contract moneyness into the full band spectrum.
+
+        ING-011 (D1 deliberation 2026-05-06) — replaces _classify_otm().
+        Symmetric thresholds mirror ING-005 ATM ±2% band exactly.
+
+        Returns one of: 'DEEP_ITM' | 'ITM' | 'ATM' | 'OTM' | 'DEEP_OTM' | 'UNKNOWN'
+
+        Thresholds:
+          DEEP_ITM: PUT strike > underlying * 1.10  |  CALL strike < underlying * 0.90
+          ITM:      PUT strike > underlying * 1.02  |  CALL strike < underlying * 0.98
+          ATM:      abs(strike - underlying) / underlying <= 0.02
+          OTM:      2% < moneyness_pct <= 12%  (same as previous _classify_otm OTM band)
+          DEEP_OTM: moneyness_pct > 12%         (same as previous _classify_otm DEEP_OTM)
+          UNKNOWN:  underlying_price == 0 or any calculation error
+
+        underlying_price == 0: returns 'UNKNOWN', no classification attempted.
+        """
         try:
             up = float(getattr(ev, "underlying_price", 0.0) or 0.0)
             if up == 0.0:
                 return "UNKNOWN"
             strike = float(getattr(ev, "strike", 0.0) or 0.0)
-            pct    = abs(strike - up) / up
-            if pct <= 0.02:
+            contract_type = str(getattr(ev, "contract_type", "") or "").upper()
+
+            # Determine raw moneyness percentage (unsigned distance from ATM)
+            pct = abs(strike - up) / up
+
+            # ATM band: ±2% symmetric (same as ING-005)
+            if pct <= _ITM_THRESHOLD:
                 return "ATM"
-            if pct <= 0.12:
+
+            # Determine if contract is in-the-money or out-of-the-money
+            if contract_type == "PUT":
+                in_the_money = strike > up
+            elif contract_type == "CALL":
+                in_the_money = strike < up
+            else:
+                # Unknown contract type: fall back to unsigned OTM/DEEP_OTM
+                if pct <= 0.12:
+                    return "OTM"
+                return "DEEP_OTM"
+
+            if in_the_money:
+                if pct > _DEEP_ITM_THRESHOLD:
+                    return "DEEP_ITM"
+                return "ITM"
+            else:
+                if pct > 0.12:
+                    return "DEEP_OTM"
                 return "OTM"
-            return "DEEP_OTM"
-        except (TypeError, ZeroDivisionError):
+        except (TypeError, ZeroDivisionError, ValueError):
             return "UNKNOWN"
 
     def get_alert_level(self, episode_or_premium: Union["RepetitionEpisode", float]) -> str:
@@ -679,14 +805,15 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        otm_band = "UNKNOWN"
+        # ING-011: classify full moneyness spectrum (replaces _classify_otm)
+        moneyness_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
             if isinstance(up_raw, (int, float)) and up_raw > 0:
-                otm_band = self._classify_otm(ev)
+                moneyness_band = self._classify_moneyness_band(ev)
         except Exception:
             pass
-        ep.otm_band = otm_band
+        ep.otm_band = moneyness_band
 
         ep.is_multi_day_repeat = ep.prior_days_active >= self._multi_day_min_days
 
@@ -696,7 +823,7 @@ class RepetitionAccumulator:
         effective_min_prem = self._get_episode_min_premium(ep)
         ep_weighted = ep.get_weighted_premium(self._aggression_discount)
 
-        if self.deep_otm_multiplier > 1.0 and otm_band == "DEEP_OTM":
+        if self.deep_otm_multiplier > 1.0 and moneyness_band == "DEEP_OTM":
             if ep_weighted < effective_min_prem * self.deep_otm_multiplier:
                 return None
         else:
