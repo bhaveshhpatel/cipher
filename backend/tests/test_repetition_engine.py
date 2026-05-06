@@ -24,7 +24,7 @@ Covers:
   15. is_accelerating + premium >= 1_000_000 -> CONVICTION
   16. premium >= 1_000_000 (not accelerating) -> STRONG_SIGNAL
   17. premium >= 250_000 -> ALERT
-  18. premium < 250_000 -> WATCH
+  18. premium < 100_000 -> WATCH
 
   RepetitionAccumulator -- init
   19. Default window is 30 minutes
@@ -240,7 +240,9 @@ def test_alert_level_alert():
 
 
 def test_alert_level_watch():
-    ep  = _ep_with(100_000, accelerating=False)
+    # Canonical table: >= 100_000 -> LARGE, < 100_000 -> WATCH.
+    # Use 99_000 to probe below the LARGE boundary.
+    ep  = _ep_with(99_000, accelerating=False)
     acc = RepetitionAccumulator()
     assert acc.get_alert_level(ep) == "WATCH"
 
