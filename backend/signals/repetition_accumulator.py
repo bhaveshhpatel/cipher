@@ -170,10 +170,12 @@ Alert levels (episode path — test_repetition_engine.py / pre-ING-005 spec):
   episode + >= 100_000                    -> LARGE
   episode + < 100_000                     -> WATCH
 
-Default tier (ING-006 spec — permissive-by-default):
-  _get_episode_min_premium uses self._tier_map.get(ticker, 2) — tier 2 is the
-  permissive default. Tests that need strict (tier-1) behaviour must explicitly
-  set acc._tier_map[ticker] = 1 or call acc.set_tier_map({ticker: 1}).
+Default tier (D-11 / QA-F1 spec — strict-by-default):
+  _get_episode_min_premium uses self._tier_map.get(ticker, 1) — tier 1 is the
+  strict default for unregistered tickers (cold-start). This ensures unknown
+  flow is held to the highest premium floor until the registry warmup injects
+  a confirmed tier via set_tier_map(). Tests that need permissive tier-2
+  behaviour must explicitly call acc.set_tier_map({ticker: 2}).
 """
 
 import asyncio
@@ -451,14 +453,16 @@ class RepetitionAccumulator:
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
         with self._tier_map_lock:
-            # Default tier=2 (permissive) per ING-006 spec.
-            # Tests that need strict tier-1 behaviour must explicitly set
-            # acc._tier_map[ticker] = 1 or call acc.set_tier_map({ticker: 1}).
-            tier = self._tier_map.get(ticker, 2)
+            # Default tier=1 (strict / T1) per D-11 / QA-F1 spec.
+            # Unknown tickers cold-start at the highest floor until the
+            # registry warmup injects a confirmed tier via set_tier_map().
+            # Tests that need permissive tier-2 behaviour must call
+            # acc.set_tier_map({ticker: 2}) explicitly.
+            tier = self._tier_map.get(ticker, 1)
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
-                return float(floors.get(tier, floors.get(2, 0.0)))
-        return float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 1_000_000))
+                return float(floors.get(tier, floors.get(1, 0.0)))
+        return float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 2_000_000))
 
     def _classify_otm(self, ev) -> str:
         try:
