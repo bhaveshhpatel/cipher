@@ -4,7 +4,83 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
-## Fix 6 — `signal_store.py`: Raw `sentiment` / `alert_level` Passthrough Caused 23514 CHECK Violations
+## ING-009 — Same-Session Flow Episode Upsert/Merge
+
+**Date:** 2026-05-06
+**Severity:** P0 — data model correctness; `flow_episodes` was insert-only, producing near-duplicate rows per qualifying print instead of one aggregated episode per session
+**PR:** [#76](https://github.com/bhaveshhpatel/cipher/pull/76) — squash merged 2026-05-06 (commit `9ceee35`)
+**Branch:** `ing/s9-episode-upsert`
+**Files:** `backend/services/flow_store.py`, `backend/tests/test_ing009_episode_upsert.py`
+
+### Root Cause
+
+`persist_flow_episode()` in `flow_store.py` had no upsert/merge path. Every call to the function unconditionally ran `_insert_rows("flow_episodes", [row])`, creating one new `flow_episodes` row per Signal Gate crossing regardless of whether an open episode for that contract already existed in the current session.
+
+The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBOUNCE to preserve `strike`/`expiry`. In doing so it exposed this pre-existing insert-only behaviour: with the SIG-DEBOUNCE gate removed from the write path, every qualifying print now reached `persist_flow_episode()` directly, producing one row per print rather than one row per session episode.
+
+On 2026-05-05 the symptom was confirmed in Supabase: `flow_episodes` had 26,906 rows vs. `flow_events` 28,373 rows — near-1:1 ratio instead of the expected aggregated ratio. `ING-007`'s `get_contract_prior_days()` query depends on `flow_episodes` being correctly aggregated, making ING-009 a hard prerequisite.
+
+### Option Decision — PBE Deliberation (2026-05-05)
+
+**Option A (chosen): Insert-or-PATCH upsert in `persist_flow_episode()` keyed on contract identity + session window**
+- Lookup open episode via Supabase REST: `flow_episodes WHERE (ticker, direction, contract_type, strike, expiry) AND signal_ts >= now() - 1800s ORDER BY signal_ts DESC LIMIT 1`
+- **Match found →** PATCH: `trade_count += 1`, `total_premium += new_premium`, `signal_ts = new_ts`; increment `_stats["merged_episodes"]`
+- **No match →** INSERT (existing path); increment `_stats["created_episodes"]`
+- Merge logic entirely in `flow_store.py` — not in `tradier_stream.py`, not in the accumulator
+
+**Option B (rejected): Tie episode write back to SIG-DEBOUNCE gate**
+- Rejected: loses `strike`/`expiry` on non-debounce-qualifying episodes (reverts the EPISODE-FIX). Hides data rather than models it correctly.
+
+**Option C (rejected): Add a `min_trade_count > N` drop gate before DB write**
+- Rejected: hides data, same root objection as Option B. A 3-print episode is genuinely different from a 30-print episode — suppressing the former destroys information the signal layer needs.
+
+### Fix
+
+**`backend/services/flow_store.py`:**
+```python
+_EPISODE_MERGE_WINDOW_S: int = 1800  # 30 min — module-level constant
+
+async def _lookup_open_episode(key_fields: dict, window_s: int) -> Optional[dict]:
+    # Query flow_episodes for open episode matching merge key within window
+    # Returns episode row dict if found, else None
+
+async def persist_flow_episode(signal_data: dict) -> None:
+    # Build merge key: (ticker, direction, contract_type, strike, expiry)
+    # existing = await _lookup_open_episode(key_fields, _EPISODE_MERGE_WINDOW_S)
+    # if existing:
+    #     PATCH id: trade_count += 1, total_premium += new, signal_ts = new_ts
+    #     _stats["merged_episodes"] += 1
+    # else:
+    #     INSERT (existing path)
+    #     _stats["created_episodes"] += 1
+```
+
+**New `_stats` counters (module-level init):**
+```python
+"created_episodes": 0,   # INSERT path — new session episode
+"merged_episodes":  0,   # PATCH path — existing episode updated
+```
+
+Both counters exposed in `/health/stream` from cold start.
+
+### Tests Added (`backend/tests/test_ing009_episode_upsert.py`)
+
+11 test cases covering the full matrix: E-1 (first insert), E-2/E-3 (merge within window, `trade_count` accumulation), E-4 (new episode after window expiry), E-5/E-6 (different strike/expiry → separate episode), E-7 (next-day → new episode), E-8 (`_lookup_open_episode` error → fallback INSERT), E-9 (`strike`/`expiry` fields on both paths), E-10/E-11 (window boundary inclusive/exclusive).
+
+### Acceptance Criteria
+- [x] `flow_episodes` has exactly 1 row per same-session contract episode within the merge window
+- [x] Subsequent qualifying print for open episode → PATCH (no new row); `trade_count` increments; `total_premium` accumulates; `signal_ts` updates
+- [x] Print after window expiry → INSERT (new episode row)
+- [x] `strike` and `expiry` correctly populated on both INSERT and PATCH paths
+- [x] No debounce regression — `persist_flow_episode()` still called before SIG-DEBOUNCE
+- [x] `_stats["created_episodes"]` and `_stats["merged_episodes"]` at module-level init; both in `/health/stream`
+- [x] E-1 through E-11 full test matrix passing
+- [x] No TODO comments in implementation code
+- [x] No DB reads on the hot path — lookup is async, non-blocking
+
+
+---
+
 
 **Date:** 2026-05-04
 **Severity:** P1 — every composite signal insert was rejected by Postgres when upstream emitted lowercase/mixed-case or aliased sentiment values (e.g. `"bullish"`, `"STRONG_BULLISH"`)
