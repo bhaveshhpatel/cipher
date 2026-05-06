@@ -29,8 +29,8 @@ Covers:
   RepetitionAccumulator -- init
   19. Default window is 30 minutes
   20. Default min_trades is 3
-  21. Default min_premium is 50_000
-  22. Custom params respected
+  21. Default min_premium is 50_000 (tier-1 DTE floor)
+  22. Custom params respected — window, min_trades, min_premium override all stored
 """
 import asyncio
 import sys
@@ -260,11 +260,13 @@ def test_default_min_trades_3():
 
 
 def test_default_min_premium_50k():
+    """No min_premium kwarg -> shim returns tier-1 DTE floor (50_000)."""
     acc = RepetitionAccumulator()
     assert acc.min_premium == pytest.approx(50_000)
 
 
 def test_custom_params_respected():
+    """Explicit min_premium kwarg is stored and returned by the shim."""
     acc = RepetitionAccumulator(window_minutes=10, min_trades=5, min_premium=200_000)
     assert acc.window.total_seconds() == 10 * 60
     assert acc.min_trades   == 5

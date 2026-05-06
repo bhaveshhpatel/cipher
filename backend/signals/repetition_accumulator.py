@@ -136,21 +136,24 @@ cooldown gate (get_signal) retirement note (PBE-F4 deliberation fix 2026-05-03):
   Tests that patch ts.accumulator.get_signal will still work.
 
 ingest() shim (2026-05-04 backward-compat):
-  ingest() is an async shim that wraps ingest_tick() with a Gate-2 delta check
-  against ep.last_signaled_premium. It is NOT called by production code.
-  Retained for test suites that verify Gate-2 re-trigger semantics via
-  acc.ingest() (test_flow_store.py::test_gate2_retrigger_*).
+  ingest() is an async shim that wraps ingest_tick() with a cooldown check
+  against ep.last_signal_at and a Gate-2 delta check against
+  ep.last_signaled_premium. It is NOT called by production code.
+  Retained for test suites that verify cooldown / Gate-2 re-trigger semantics
+  via acc.ingest() (test_signal_cooldown_c007.py, test_flow_store.py).
 
 Backward-compat shims added 2026-05-04 (test-suite alignment):
   - acc.window property     -> timedelta(minutes=self.window_minutes)
-  - acc.min_premium property -> T1-bucket / tier-2 floor from _dte_tiers[0]
+  - acc.min_premium property -> stored _min_premium_override when set by
+    constructor kwarg, otherwise T1-bucket floor from _dte_tiers[0]
   - ep.summary_str() method -> human-readable episode summary string
   - get_alert_level() overload: accepts RepetitionEpisode OR float.
     Episode path applies is_accelerating bonus; float path is unchanged.
-  - RepetitionEpisode.occ_symbol, direction, last_signaled_premium fields.
-  - RepetitionAccumulator.__init__ accepts (and ignores) min_premium,
-    signal_cooldown kwargs for test-suite backward-compatibility.
-  - ingest() async shim with Gate-2 delta check.
+  - RepetitionEpisode.occ_symbol, direction, last_signaled_premium,
+    last_signal_at fields.
+  - RepetitionAccumulator.__init__ accepts min_premium, signal_cooldown
+    kwargs for test-suite backward-compatibility (both stored and used).
+  - ingest() async shim with cooldown + Gate-2 delta check.
 
 Alert levels (canonical — used by signal_store.py float path):
   >= 2_000_000                            -> CONVICTION
@@ -242,9 +245,10 @@ class RepetitionEpisode:
     last_seen:     Optional[datetime] = None
 
     # Backward-compat fields (2026-05-04 test-suite shims)
-    occ_symbol:           str   = ""
-    direction:            str   = ""
-    last_signaled_premium: float = 0.0
+    occ_symbol:           str            = ""
+    direction:            str            = ""
+    last_signaled_premium: float         = 0.0
+    last_signal_at:       Optional[datetime] = None  # C-007: updated on every fired signal
 
     # ING-007: multi-day lookback fields
     prior_days_active:     int  = 0
@@ -330,9 +334,9 @@ class RepetitionAccumulator:
     require_multi_day : bool     (ING-007)
     multi_day_min_days : int     (ING-007)
 
-    Backward-compat kwargs (ignored by production, accepted for tests):
-    min_premium : float | None   — pre-ING-005 flat floor; ignored, DTE tiers used
-    signal_cooldown : int | None — retired cooldown param; ignored
+    Backward-compat kwargs (stored and used by ingest() shim):
+    min_premium : float | None   — when set, overrides min_premium property shim
+    signal_cooldown : int | None — cooldown minutes used by ingest() shim
     """
 
     def __init__(
@@ -345,7 +349,7 @@ class RepetitionAccumulator:
         aggression_discount: float = 0.5,
         require_multi_day:   bool  = False,
         multi_day_min_days:  int   = 2,
-        # Backward-compat kwargs — accepted but ignored
+        # Backward-compat kwargs — stored and used
         min_premium:         Optional[float] = None,
         signal_cooldown:     Optional[int]   = None,
     ) -> None:
@@ -360,7 +364,9 @@ class RepetitionAccumulator:
         self._episodes: Dict[str, RepetitionEpisode] = {}
         self._tier_map: Dict[str, int] = {}
         self._tier_map_lock = threading.Lock()
-        self._signal_cooldown_s: float = float(signal_cooldown) if signal_cooldown is not None else 0.0
+        # Backward-compat: store min_premium override and signal_cooldown
+        self._min_premium_override: Optional[float] = min_premium
+        self._signal_cooldown_s: float = float(signal_cooldown) * 60.0 if signal_cooldown is not None else 0.0
 
     # ------------------------------------------------------------------
     # Backward-compat shim properties (2026-05-04)
@@ -373,7 +379,10 @@ class RepetitionAccumulator:
 
     @property
     def min_premium(self) -> float:
-        """Shim: returns the tier-1 floor of the first DTE bucket in _dte_tiers."""
+        """Returns constructor min_premium kwarg when explicitly set,
+        otherwise the tier-1 floor of the first DTE bucket."""
+        if self._min_premium_override is not None:
+            return self._min_premium_override
         if not self._dte_tiers:
             return 0.0
         _, floors = self._dte_tiers[0]
@@ -418,6 +427,9 @@ class RepetitionAccumulator:
         ]
 
     def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
+        # When min_premium was explicitly set via ctor kwarg, use it directly.
+        if self._min_premium_override is not None:
+            return self._min_premium_override
         if not ep.events:
             return 0.0
         latest = ep.events[-1]
@@ -479,24 +491,56 @@ class RepetitionAccumulator:
             return "LARGE"
         return "RETAIL"
 
-    async def get_signal(self, ev) -> Optional[RepetitionEpisode]:
-        """Backward-compat shim. Delegates to ingest_tick()."""
-        return await self.ingest_tick(ev)
+    async def get_signal(self, ev_or_ts=None, ep: Optional[RepetitionEpisode] = None) -> Optional[RepetitionEpisode]:
+        """Backward-compat shim.
+
+        C-008 two-arg form: get_signal(timestamp, ep) -> ep if cooldown passed else None.
+        Legacy one-arg form: get_signal(ev) -> delegates to ingest_tick(ev).
+        """
+        if ep is not None and isinstance(ep, RepetitionEpisode):
+            # Two-arg C-008 form: apply cooldown check
+            ts = ev_or_ts if isinstance(ev_or_ts, datetime) else datetime.now(timezone.utc)
+            if self._signal_cooldown_s > 0 and ep.last_signal_at is not None:
+                elapsed = (ts - ep.last_signal_at).total_seconds()
+                if elapsed < self._signal_cooldown_s:
+                    return None
+            ep.last_signal_at = ts
+            return ep
+        # Legacy one-arg form
+        return await self.ingest_tick(ev_or_ts)
 
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
-        """Backward-compat async shim with Gate-2 delta check."""
+        """Backward-compat async shim with cooldown + Gate-2 delta check.
+
+        Used by C-007 tests to verify cooldown semantics.
+        NOT called by production code.
+        """
         ep = await self.ingest_tick(ev)
         if ep is None:
             return None
+
+        ts = getattr(ev, "timestamp", None) or datetime.now(timezone.utc)
+        if hasattr(ts, 'replace') and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        # Cooldown gate (C-007 backward-compat)
+        if self._signal_cooldown_s > 0 and ep.last_signal_at is not None:
+            elapsed = (ts - ep.last_signal_at).total_seconds()
+            if elapsed < self._signal_cooldown_s:
+                return None
+
+        # Gate-2 delta check (original ingest() shim semantics)
         if ep.last_signaled_premium == 0.0:
             ep.last_signaled_premium = ep.total_premium
+            ep.last_signal_at = ts
             return ep
         delta_required = max(
             _GATE2_DELTA_FRACTION * ep.last_signaled_premium,
-            self.min_premium,
+            self._get_episode_min_premium(ep),
         )
         if ep.total_premium - ep.last_signaled_premium >= delta_required:
             ep.last_signaled_premium = ep.total_premium
+            ep.last_signal_at = ts
             return ep
         return None
 
