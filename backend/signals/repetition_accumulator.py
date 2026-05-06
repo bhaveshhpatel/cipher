@@ -142,6 +142,14 @@ ingest() shim (2026-05-04 backward-compat):
   Retained for test suites that verify cooldown / Gate-2 re-trigger semantics
   via acc.ingest() (test_signal_cooldown_c007.py, test_flow_store.py).
 
+  Emit decision logic (2026-05-06 fix — C007-3 / C007-6):
+    1. Cooldown expired (elapsed >= cooldown_s): always emit. Reset
+       last_signaled_premium to current total for a fresh Gate-2 baseline.
+    2. First emit (last_signaled_premium == 0): emit, set baseline.
+    3. Incremental within first cooldown window: Gate-2 delta applies.
+  Gate-2 delta must not block post-cooldown re-fires; it exists only to
+  suppress continuous sub-threshold premium spam within a single cooldown window.
+
 Backward-compat shims added 2026-05-04 (test-suite alignment):
   - acc.window property     -> timedelta(minutes=self.window_minutes)
   - acc.min_premium property -> stored _min_premium_override when set by
@@ -327,7 +335,6 @@ class RepetitionEpisode:
 
         Implementation: span = last_ts - first_ts of the last 3 events.
         Uniform cadence (e.g. 0s, 20s, 40s -> span=40s) qualifies.
-        Only requires the timestamps to exist and be comparable.
         """
         if len(self.events) < 3:
             return False
@@ -555,7 +562,6 @@ class RepetitionAccumulator:
           get_signal(timestamp, ep=ep)          # C-008 two-arg kw form
           get_signal(timestamp, cooldown, ep)   # C-008-7 three-arg positional form
         """
-        # Guard: old two-arg positional form get_signal(timestamp, ep)
         if isinstance(cooldown, RepetitionEpisode):
             ep = cooldown
             cooldown = None
@@ -580,6 +586,12 @@ class RepetitionAccumulator:
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
         """Backward-compat async shim with cooldown + Gate-2 delta check.
         NOT called by production code.
+
+        Emit decision (three mutually exclusive paths):
+          1. Cooldown has elapsed since last signal: always emit, reset
+             last_signaled_premium baseline to current total.
+          2. First emit (last_signaled_premium == 0): emit, set baseline.
+          3. Within first cooldown window: Gate-2 delta check applies.
         """
         ep = await self.ingest_tick(ev)
         if ep is None:
@@ -589,15 +601,24 @@ class RepetitionAccumulator:
         if hasattr(ts, 'replace') and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
+        # Path 1: cooldown has elapsed — emit unconditionally, reset baseline.
         if self._signal_cooldown_s > 0 and ep.last_signal_at is not None:
             elapsed = (ts - ep.last_signal_at).total_seconds()
             if elapsed < self._signal_cooldown_s:
+                # Still within cooldown window — suppress.
                 return None
+            # Cooldown expired: emit and reset Gate-2 baseline for next window.
+            ep.last_signaled_premium = ep.total_premium
+            ep.last_signal_at = ts
+            return ep
 
+        # Path 2: first emit.
         if ep.last_signaled_premium == 0.0:
             ep.last_signaled_premium = ep.total_premium
             ep.last_signal_at = ts
             return ep
+
+        # Path 3: incremental within first cooldown window — Gate-2 delta.
         delta_required = max(
             _GATE2_DELTA_FRACTION * ep.last_signaled_premium,
             self._get_episode_min_premium(ep),
