@@ -41,6 +41,18 @@ Fix 7 (2026-05-04):
       <  0.55 -> LARGE           (was WATCH)
     _normalise_alert_level() fallback changed to 'LARGE' (was 'WATCH').
 
+QA-3 (ING-007 pre-merge 2026-05-06):
+  - is_multi_day_repeat is present in the bus signal payload
+    (data.signal.is_multi_day_repeat) as of ING-007. _build_row() does NOT
+    read or forward this key to signal_history because the column does not
+    exist in signal_history yet. This is intentional — the column migration
+    is gated on ING-009 merge. _build_row() only reads explicit keys via
+    sig.get()/ep.get(), so unknown keys are silently ignored and the
+    Supabase REST insert succeeds cleanly. No write error occurs.
+    When ING-009 lands and the column migration runs, add
+    "is_multi_day_repeat": ep.get("is_multi_day_repeat", False)
+    to the _build_row() return dict.
+
 Public API (for tests):
   save_signal(signal: dict | object) -> bool
   get_signals(ticker: str | None, limit: int) -> list[dict]         [async]
@@ -320,6 +332,12 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
         episode.get("influence_tier") or sig.get("influence_tier", "")
     )
 
+    # QA-3 note: is_multi_day_repeat (ING-007) is intentionally NOT included here.
+    # The signal_history column does not exist until the ING-009-gated migration
+    # runs. _build_row() uses explicit .get() reads — unknown keys in sig/ep are
+    # ignored and the REST insert succeeds cleanly without the field.
+    # TODO(ING-009): add "is_multi_day_repeat": ep.get("is_multi_day_repeat", False)
+    # to this return dict after the column migration lands.
     return {
         "ticker":                sig.get("ticker"),
         "recommendation":        sig.get("recommendation"),

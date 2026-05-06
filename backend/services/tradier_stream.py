@@ -96,6 +96,19 @@ Fix (PBE-2 2026-05-06): self-contained TTL eviction for _lookback_result_cache.
   Fix: _lookback_result_cache is now dict[str, tuple[bool, float]] where the
   float is time.time() at write time. _evict_lookback_result_cache(now) evicts
   entries older than _LBC_TTL_S (7200s) independently of _signal_last_emit.
+
+Fix (PBE-BLOCKING-1 2026-05-06): revert persist_flow_episode to fire-and-forget.
+  BUG-2 introduced await asyncio.wait_for(persist_flow_episode(...), timeout=3s)
+  which blocks _process_trade on the hot path for up to 3s on every qualifying
+  episode. Under SPY/QQQ open-volume conditions this is unacceptable — a single
+  Supabase hiccup serialises the entire stream worker for 3s per episode.
+  Decision (Option A): revert to asyncio.create_task() (fire-and-forget).
+  Rationale: persist_flow_episode writes the episode row; is_multi_day_repeat
+  enrichment happens asynchronously via the lookback queue worker
+  (_update_episode_multiday). The episode write is not a gate for signal
+  emission — the bus fires regardless. A missed/late episode row is an
+  acceptable enrichment loss; a stalled hot path is not.
+  _PERSIST_EPISODE_TIMEOUT constant removed (no longer referenced).
 """
 import asyncio
 import logging
@@ -125,6 +138,8 @@ from utils.dedup import flow_dedup
 # ING-007-PATCH-B: hoisted to module level so tests can patch these names via
 # patch("services.tradier_stream._lbc") etc. Inline imports inside
 # _process_trade() bind to local variables that patch() cannot reach.
+# NOTE: _cache and _is_fresh are imported under aliases _lbc / _lbc_fresh here.
+# Do not rename those symbols in contract_day_cache.py without updating these imports.
 from utils.contract_day_cache import (
     _cache as _lbc,
     _is_fresh as _lbc_fresh,
@@ -144,8 +159,8 @@ _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
 _PERSIST_TIMEOUT     = 2.0
-# BUG-2 fix: dedicated timeout for persist_flow_episode.
-_PERSIST_EPISODE_TIMEOUT = 3.0
+# PBE-BLOCKING-1: _PERSIST_EPISODE_TIMEOUT removed. persist_flow_episode is
+# fire-and-forget (asyncio.create_task) — see fix note in module docstring.
 
 _REGISTRY_READY_TIMEOUT_S = 1800.0
 _REGISTRY_READY_POLL_S    = 0.5
@@ -477,6 +492,12 @@ async def _process_trade(raw: dict):
     bus.publish_all fires only when get_signal returns non-None (sig_ep).
     This satisfies C008-1 (persist fires, bus silent during cooldown) and
     C008-2 (both fire after cooldown passes).
+
+    PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
+      Episode write does not block the signal emit path. The queue worker
+      (_update_episode_multiday) enriches the DB row asynchronously.
+      A missed episode row is an acceptable enrichment loss under Supabase
+      pressure; a 3s stall on the hot path is not.
     """
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
@@ -738,32 +759,26 @@ async def _process_trade(raw: dict):
     )
 
     # EPISODE-FIX: persist before debounce gate.
-    # BUG-2 fix: await directly with wait_for.
-    try:
-        await asyncio.wait_for(
-            persist_flow_episode({
-                "ticker":              sig_ep.ticker,
-                "direction":           direction,
-                "contract_type":       sig_ep.contract_type,
-                "strike":              sig_ep.strike,
-                "expiry":              sig_ep.expiry,
-                "total_premium":       sig_ep.total_premium,
-                "trade_count":         sig_ep.trade_count,
-                "alert_level":         alert_level,
-                "is_accelerating":     sig_ep.is_accelerating,
-                "is_multi_day_repeat": _is_multi_day_repeat,
-                "seed_episode":        ep_summary,
-                "timestamp":           ev.timestamp.isoformat(),
-            }),
-            timeout=_PERSIST_EPISODE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        _stats["errors"] += 1
-        log.warning(
-            "[stream] persist_flow_episode timed out after %.1fs for %s — "
-            "episode row may be missing. Check Supabase latency.",
-            _PERSIST_EPISODE_TIMEOUT, ev.ticker,
-        )
+    # PBE-BLOCKING-1 fix: fire-and-forget via create_task — does NOT block the
+    # hot path. Episode enrichment is asynchronous (queue worker patches DB row).
+    # A missed episode row under Supabase pressure is an acceptable enrichment
+    # loss. Timeout errors on the hot path are not.
+    asyncio.create_task(
+        persist_flow_episode({
+            "ticker":              sig_ep.ticker,
+            "direction":           direction,
+            "contract_type":       sig_ep.contract_type,
+            "strike":              sig_ep.strike,
+            "expiry":              sig_ep.expiry,
+            "total_premium":       sig_ep.total_premium,
+            "trade_count":         sig_ep.trade_count,
+            "alert_level":         alert_level,
+            "is_accelerating":     sig_ep.is_accelerating,
+            "is_multi_day_repeat": _is_multi_day_repeat,
+            "seed_episode":        ep_summary,
+            "timestamp":           ev.timestamp.isoformat(),
+        })
+    )
 
     # SIG-DEBOUNCE
     now_ts = _time.time()
@@ -821,6 +836,13 @@ async def _process_trade(raw: dict):
             "trade_count":         sig_ep.trade_count,
             "alert_level":         alert_level,
             "is_accelerating":     sig_ep.is_accelerating,
+            # QA-3: is_multi_day_repeat is present in the bus payload so downstream
+            # consumers (e.g. frontend WebSocket handlers) receive it. It is NOT
+            # forwarded to signal_history by signal_store._build_row() because the
+            # column does not exist in signal_history yet. _build_row() reads only
+            # explicit keys via .get() — unknown keys are silently ignored and the
+            # Supabase REST insert succeeds cleanly without the field.
+            # The signal_history column migration is gated on ING-009 merge.
             "is_multi_day_repeat": _is_multi_day_repeat,
             "seed_episode":        ep_summary,
             "timestamp":           ev.timestamp.isoformat(),
