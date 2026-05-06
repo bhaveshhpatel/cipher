@@ -127,8 +127,7 @@ ING-006 additions:
     Rationale: mid-spread fills represent uncertain directional intent.
     Discounting them increases signal-to-noise without dropping the event.
   - RepetitionEpisode.weighted_premium property.
-  - _DictEventWrapper: ticker, strike, expiry slots added (fix: these were
-    missing, causing _episode_key() to return ':CALL:0.0:' for all dict events).
+  - _DictEventWrapper: is_aggressive slot added.
 
 cooldown gate (get_signal) retirement note (PBE-F4 deliberation fix 2026-05-03):
   get_signal() was retired from production use — the stream layer handles emit
@@ -171,11 +170,10 @@ Alert levels (episode path — test_repetition_engine.py / pre-ING-005 spec):
   episode + >= 100_000                    -> LARGE
   episode + < 100_000                     -> WATCH
 
-Default tier (ING-006 spec):
-  The tier map default is 2 (permissive). Tickers not present in the tier_map
-  injected via set_tier_map() are treated as T2. Explicitly set T1 via
-  acc._tier_map[ticker] = 1 in tests that require the strict T1 floor.
-  (_get_episode_min_premium uses _tier_map.get(ticker, 2) — not 1.)
+Default tier (ING-006 spec — permissive-by-default):
+  _get_episode_min_premium uses self._tier_map.get(ticker, 2) — tier 2 is the
+  permissive default. Tests that need strict (tier-1) behaviour must explicitly
+  set acc._tier_map[ticker] = 1 or call acc.set_tier_map({ticker: 1}).
 """
 
 import asyncio
@@ -221,16 +219,15 @@ _GATE2_DELTA_FRACTION: float = 0.20
 
 # ---------------------------------------------------------------------------
 # _DictEventWrapper
+#
+# BUG FIX (2026-05-05): __slots__ was missing ticker, strike, expiry.
+# _episode_key(ev) uses getattr(ev, 'ticker'/'strike'/'expiry') — without
+# these slots, getattr silently returned '' / 0.0 for every dict-based event,
+# producing a degenerate key ':CALL:0.0:' and collapsing all dict events into
+# one episode regardless of contract. Added ticker, strike, expiry to both
+# __slots__ and __init__.
 # ---------------------------------------------------------------------------
 class _DictEventWrapper:
-    """
-    Lightweight wrapper that exposes dict options-flow event fields as attributes.
-
-    __slots__ must include ALL fields accessed by _episode_key(), _get_or_create_episode(),
-    and _get_episode_min_premium() — specifically ticker, strike, and expiry in addition
-    to the processing fields. Missing these slots caused getattr() to silently return
-    '' / 0.0, producing episode keys of ':CALL:0.0:' for all dict events.
-    """
     __slots__ = (
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
@@ -454,8 +451,9 @@ class RepetitionAccumulator:
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
         with self._tier_map_lock:
-            # Default tier is 2 (permissive) per ING-006 spec.
-            # Use acc._tier_map[ticker] = 1 explicitly in tests requiring T1 strict floor.
+            # Default tier=2 (permissive) per ING-006 spec.
+            # Tests that need strict tier-1 behaviour must explicitly set
+            # acc._tier_map[ticker] = 1 or call acc.set_tier_map({ticker: 1}).
             tier = self._tier_map.get(ticker, 2)
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
