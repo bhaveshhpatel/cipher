@@ -155,6 +155,15 @@ Backward-compat shims added 2026-05-04 (test-suite alignment):
     kwargs for test-suite backward-compatibility (both stored and used).
   - ingest() async shim with cooldown + Gate-2 delta check.
 
+_min_premium_override semantics (2026-05-06 fix — E05/E07 regression):
+  _min_premium_override is a FLOOR BASELINE, not a DTE-tier bypass.
+  When dte_premium_tiers are present, the effective floor is:
+    max(_min_premium_override, dte_tier_floor)
+  This means the override can only raise the floor, never suppress the
+  DTE-tier gate. Legacy callers that pass min_premium without
+  dte_premium_tiers still receive the override directly (no tier to
+  compare against). See _get_episode_min_premium() for implementation.
+
 Alert levels (canonical — used by signal_store.py float path):
   >= 2_000_000                            -> CONVICTION
   >= 1_000_000                            -> WHALE
@@ -352,7 +361,9 @@ class RepetitionAccumulator:
     multi_day_min_days : int     (ING-007)
 
     Backward-compat kwargs (stored and used by ingest() shim):
-    min_premium : float | None   — when set, overrides min_premium property shim
+    min_premium : float | None   — floor baseline; effective floor is
+                                    max(min_premium, dte_tier_floor) when
+                                    dte_premium_tiers are present.
     signal_cooldown : int | None — cooldown minutes used by ingest() shim
     """
 
@@ -444,11 +455,25 @@ class RepetitionAccumulator:
         ]
 
     def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
-        # When min_premium was explicitly set via ctor kwarg, use it directly.
-        if self._min_premium_override is not None:
-            return self._min_premium_override
+        """
+        Return the effective premium floor for this episode.
+
+        When dte_premium_tiers are present, the DTE-tier floor is always
+        computed and used as the primary gate. _min_premium_override (the
+        backward-compat min_premium ctor kwarg) acts as a FLOOR BASELINE:
+        the effective floor is max(override, dte_tier_floor). This means
+        the override can only raise the floor, never suppress the DTE-tier
+        gate. Legacy callers that pass min_premium without dte_premium_tiers
+        receive the override directly (no tier to compare against).
+        """
         if not ep.events:
-            return 0.0
+            # No events: override is all we have, or 0 if unset.
+            return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
+
+        # Legacy path: no DTE tiers configured at all.
+        if not self._dte_tiers:
+            return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
+
         latest = ep.events[-1]
         dte    = int(getattr(latest, "dte", 0) or 0)
         ticker = getattr(latest, "ticker", "") or ""
@@ -459,10 +484,19 @@ class RepetitionAccumulator:
             # Tests that need permissive tier-2 behaviour must call
             # acc.set_tier_map({ticker: 2}) explicitly.
             tier = self._tier_map.get(ticker, 1)
+
+        dte_floor: Optional[float] = None
         for max_dte, floors in self._dte_tiers:
             if dte <= max_dte:
-                return float(floors.get(tier, floors.get(1, 0.0)))
-        return float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 2_000_000))
+                dte_floor = float(floors.get(tier, floors.get(1, 0.0)))
+                break
+        if dte_floor is None:
+            dte_floor = float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 2_000_000))
+
+        # _min_premium_override is a baseline: take the higher of the two.
+        if self._min_premium_override is not None:
+            return max(float(self._min_premium_override), dte_floor)
+        return dte_floor
 
     def _classify_otm(self, ev) -> str:
         try:
