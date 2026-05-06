@@ -28,6 +28,14 @@ Fix summary (2026-05-06):
     called with ev.ticker (str) instead of ev.premium (float), causing
     TypeError: '>=' not supported between instances of 'str' and 'int'.
     Fixed to always pass ev.premium.
+  - test_raw_trade_to_signal_no_crash: RepetitionAccumulator constructed with
+    only min_premium=50_000 still applies _DEFAULT_DTE_PREMIUM_TIERS. The
+    ~45 DTE expiry falls into the 90-day bucket (floor=1_000_000 tier-1).
+    _min_premium_override is a FLOOR BASELINE so effective floor becomes
+    max(50_000, 1_000_000) = 1_000_000. Three 200_000-premium passive events
+    yield weighted_premium ~300_000 < 1_000_000 -> Gate 2 blocks -> None.
+    Fix: pass dte_premium_tiers with a flat 50_000 floor, consistent with
+    the pattern already used in TestLayer3Accumulator._accum().
 """
 import asyncio
 import pytest
@@ -380,7 +388,20 @@ class TestE2EPipeline:
         import services.flow_store as fs
 
         await fs.clear_flows()
-        accum = RepetitionAccumulator(window_minutes=30, min_trades=3, min_premium=50_000)
+        # Use a flat DTE-tier override so Gate 2 clears at 50_000.
+        # _raw_trade() uses expiry=2026-06-20 (~45 DTE), which falls into
+        # the 90-day default tier bucket (floor=1_000_000 tier-1). Passing
+        # only min_premium=50_000 without dte_premium_tiers still produces
+        # effective floor = max(50_000, 1_000_000) = 1_000_000 — Gate 2
+        # blocks three 200_000-premium events (weighted ~300_000 at 0.5
+        # aggression discount). Explicit dte_premium_tiers is the correct
+        # pattern for unit tests that need a custom floor without fighting
+        # the production tier table (see TestLayer3Accumulator._accum).
+        accum = RepetitionAccumulator(
+            window_minutes=30,
+            min_trades=3,
+            dte_premium_tiers=[(9999, {1: 50_000, 2: 50_000, 3: 50_000})],
+        )
 
         ep = None
         for i in range(3):
