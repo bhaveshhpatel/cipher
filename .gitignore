@@ -38,3 +38,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Coverage artefacts — SA-2: never commit these to the index
+.coverage
+coverage.json
+coverage.xml
