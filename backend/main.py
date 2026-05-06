@@ -56,14 +56,14 @@ from routers import history
 from routers import admin
 from routers import health
 from core.auth import get_current_user
-from services.tradier_stream import stream_options_flow
+from services.flow_store import start_flow_writer, start_lookback_worker
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
-from services.flow_store import start_flow_writer
 from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
+from services.tradier_stream import stream_options_flow
 
 
 class _JsonFormatter(logging.Formatter):
@@ -472,11 +472,22 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
+    # SA-F1 (ING-007): registry.accumulator is passed here but may be None if the
+    # SymbolRegistry implementation does not expose an .accumulator attribute.
+    # start_lookback_worker() handles None gracefully (defaults to 10_000.0 floor).
+    # NOTE: The production accumulator used by the streaming hot path is the
+    # module-level `accumulator` in services/tradier_stream.py — not this registry
+    # attribute. The worker's accumulator reference is used only to resolve the
+    # DTE-tier min_premium floor for lookback DB queries; it does NOT gate flow.
+    lookback_task         = asyncio.create_task(
+        start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
+    )
 
     yield
 
     log.info("[shutdown] Closing Tradier stream connections first\u2026")
     stream_task.cancel()
+    lookback_task.cancel()
     try:
         await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -496,6 +507,7 @@ async def lifespan(app: FastAPI):
         refresh_task,
         registry_refresh_task,
         prewarm_task,
+        lookback_task,
     ):
         try:
             await task
@@ -511,6 +523,7 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
+# SA-2 fix: single-escape raw strings are correct for regex in Python.
 _explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"

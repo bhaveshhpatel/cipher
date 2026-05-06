@@ -3,28 +3,23 @@ branch = True
 source = .
 omit =
     tests/*
-    */__pycache__/*
-    */migrations/*
-    .venv/*
-    venv/*
-    setup.py
-    conftest.py
-    # Infrastructure-only I/O workers: no unit-testable logic without live
-    # Tradier stream / WebSocket connections. Covered by integration tests.
+    tests/integration/*
+    # Infrastructure I/O — no unit-testable logic without live sockets/DB.
     services/tradier_stream.py
     services/stream_worker.py
     services/stream_manager.py
-    # Application startup wiring — not unit-testable in isolation.
-    main.py
-    # Supabase-backed stores: all paths require live DB; tested via integration.
     services/flow_store.py
     services/ingestion_config.py
-    # Router handlers: HTTP-level integration tests cover these; unit
-    # coverage here would require full app fixture with auth mocks.
+    ingestion/config.py
+    # App startup wiring.
+    main.py
+    # Router handlers tested via HTTP integration fixtures.
     routers/auth.py
     routers/flow.py
     routers/history.py
     routers/smart_signals.py
+    # Stub module with no callers yet — removed in SA-3.
+    signals/ladder_detector.py
 
 [report]
 exclude_lines =
@@ -34,7 +29,6 @@ exclude_lines =
     if TYPE_CHECKING:
     @abstractmethod
     pass
-    \.\.\.  # Ellipsis stubs
 
 [xml]
 output = coverage.xml

@@ -16,6 +16,14 @@ Post-merge findings addressed here:
   #50   Add contract_type isolation test: CALL vs PUT on same ticker/strike/expiry
         must produce two distinct episode keys.
 
+Fix (2026-05-05):
+  _make_acc previously passed dte_premium_tiers as a dict {9999: (1, 1)}.
+  RepetitionAccumulator._get_episode_min_premium unpacks via:
+    for max_dte, floors in self._dte_tiers:
+  When _dte_tiers is a dict, iterating yields keys (ints), not (int, dict) tuples,
+  causing TypeError: cannot unpack non-iterable int object.
+  Fixed: pass list-of-tuples [(9999, {1:1, 2:1, 3:1})] and removed ignored min_premium kwarg.
+
 Production-path note
 --------------------
 The Tradier stream worker constructs OptionsFlowEvent objects via
@@ -37,11 +45,17 @@ from signals.repetition_accumulator import RepetitionAccumulator
 # ---------------------------------------------------------------------------
 
 def _make_acc(**kwargs) -> RepetitionAccumulator:
-    """Minimal accumulator — low thresholds so every test event qualifies."""
+    """Minimal accumulator — low thresholds so every test event qualifies.
+
+    dte_premium_tiers must be a list of (max_dte, {tier: floor}) tuples.
+    A single catch-all bucket covering all DTE with floor=1 ensures every
+    event clears Gate 2 regardless of DTE or tier.
+    """
     defaults = dict(
         min_trades=1,
-        min_premium=1,
-        dte_premium_tiers={9999: (1, 1)},
+        dte_premium_tiers=[(9999, {1: 1, 2: 1, 3: 1})],
+        min_sweeps=0,
+        aggression_discount=1.0,
     )
     defaults.update(kwargs)
     return RepetitionAccumulator(**defaults)
@@ -69,13 +83,12 @@ def _dict_event(
         "underlying_price": underlying_price,
         "order_side": order_side,
         "timestamp": datetime.now(timezone.utc),
+        "is_aggressive": True,
     }
 
 
 def _run(coro):
     # F2 fix: asyncio.run() is the correct forward-compatible pattern.
-    # asyncio.get_event_loop().run_until_complete() is deprecated in Python
-    # 3.10+ and raises RuntimeError in Python 3.12+ when no loop exists.
     return asyncio.run(coro)
 
 
@@ -154,14 +167,19 @@ class TestDictTickDistinctKeys:
         )
 
     def test_keys_never_none_components(self):
-        """No key component should be the string 'None' after the fix."""
+        """No key component should be the string 'None' after the fix.
+
+        Episode key format: '{ticker}:{contract_type}:{strike}:{expiry}'
+        Split on ':' and check no component is 'None'.
+        """
         acc = _make_acc()
         ev = _dict_event("SPY", contract_type="CALL", strike=500.0,
                          expiry="2026-09-19")
         _run(acc.ingest_tick(ev))
 
         key = next(iter(acc._episodes.keys()))
-        parts = key.split("|")
+        # Key format uses ':' separator
+        parts = key.split(":")
         for part in parts:
             assert part != "None", (
                 f"Key component is literal 'None': key={key!r}. "
@@ -202,6 +220,7 @@ class TestDictObjectKeyParity:
         ev.dte              = dte
         ev.underlying_price = underlying_price
         ev.order_side       = order_side
+        ev.is_aggressive    = True
         ev.timestamp        = datetime.now(timezone.utc)
         return ev
 

@@ -3,6 +3,10 @@ Coverage boost for services/signal_store.py.
 Targets: _insert_signal, _insert_signal_with_retry, persist_composite_signal,
          _bus_signal_listener, start_signal_writer, save_signal SDK path,
          get_signals SDK path.
+
+Fix 7 note: _build_row() now uses WHALE/INSTITUTIONAL/LARGE vocab
+(not the old STRONG_SIGNAL/ALERT/WATCH vocab) per the DB constraint update.
+Tests updated to match.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -49,6 +53,7 @@ def test_coerce_fallback_empty():
 
 
 # --- _build_row alert_level branches ---
+# Fix 7: score-to-label mapping is now WHALE/INSTITUTIONAL/LARGE (not STRONG_SIGNAL/ALERT/WATCH)
 
 def test_build_row_conviction_score():
     row = _build_row({"composite_score": 0.90, "flow_score": 0.9, "ticker": "AAPL",
@@ -56,19 +61,22 @@ def test_build_row_conviction_score():
     assert row["alert_level"] == "CONVICTION"
 
 def test_build_row_strong_signal():
+    """score >= 0.70 maps to WHALE (Fix 7 — was STRONG_SIGNAL)."""
     row = _build_row({"composite_score": 0.75, "flow_score": 0.7, "ticker": "AAPL",
                       "recommendation": "BUY", "backtest_score": 0.7})
-    assert row["alert_level"] == "STRONG_SIGNAL"
+    assert row["alert_level"] == "WHALE"
 
 def test_build_row_alert():
+    """score >= 0.55 maps to INSTITUTIONAL (Fix 7 — was ALERT)."""
     row = _build_row({"composite_score": 0.60, "flow_score": 0.6, "ticker": "AAPL",
                       "recommendation": "BUY", "backtest_score": 0.6})
-    assert row["alert_level"] == "ALERT"
+    assert row["alert_level"] == "INSTITUTIONAL"
 
 def test_build_row_watch():
+    """score < 0.55 maps to LARGE (Fix 7 — was WATCH)."""
     row = _build_row({"composite_score": 0.30, "flow_score": 0.3, "ticker": "AAPL",
                       "recommendation": "HOLD", "backtest_score": 0.3})
-    assert row["alert_level"] == "WATCH"
+    assert row["alert_level"] == "LARGE"
 
 def test_build_row_explicit_alert_level_wins():
     row = _build_row({"composite_score": 0.10, "alert_level": "CONVICTION",

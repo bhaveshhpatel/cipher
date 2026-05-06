@@ -233,7 +233,7 @@ async def test_golden_sweep_flag_preserved():
 async def test_concurrent_add_flow_no_data_loss():
     import services.flow_store as fs
     await fs.clear_flows()
-    tickers = ["AAPL", "TSLA", "NVDA", "SPY", "QQQ"]
+    tickers = ["AAPL", "TSLA","NVDA", "SPY", "QQQ"]
     await asyncio.gather(*[fs.add_flow(_flow(t)) for t in tickers])
     for t in tickers:
         flows = await fs.get_flows(t)
@@ -820,6 +820,7 @@ async def test_process_trade_persists_episode_before_debounce():
     sig_ep.total_premium = 186_000.0
     sig_ep.trade_count = 3           # >= _SIGNAL_MIN_TRADES (3)
     sig_ep.is_accelerating = False
+    sig_ep.dominant_direction = "REPEAT_BUY"
     sig_ep.summary_str.return_value = "AAPL CALL 3x $186k"
 
     persisted_episodes = []
@@ -880,6 +881,7 @@ async def test_process_trade_episode_direction_call_is_repeat_buy():
     sig_ep.strike = 900.0; sig_ep.expiry = "2026-06-20"
     sig_ep.total_premium = 75_000.0; sig_ep.trade_count = 3
     sig_ep.is_accelerating = False
+    sig_ep.dominant_direction = "REPEAT_BUY"
     sig_ep.summary_str.return_value = "NVDA CALL 3x $75k"
 
     persisted_episodes = []
@@ -926,6 +928,7 @@ async def test_process_trade_episode_direction_put_is_repeat_sell():
     sig_ep.strike = 500.0; sig_ep.expiry = "2026-05-17"
     sig_ep.total_premium = 60_000.0; sig_ep.trade_count = 4
     sig_ep.is_accelerating = True
+    sig_ep.dominant_direction = "REPEAT_SELL"
     sig_ep.summary_str.return_value = "SPY PUT 4x $60k"
 
     persisted_episodes = []
@@ -997,12 +1000,21 @@ def test_repetition_accumulator_has_last_signaled_premium():
 @pytest.mark.asyncio
 async def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
     """
-    NOTE: Gate-2 delta is NOT applied in ingest_tick — it lives in ingest() only.
-    ingest_tick is Gate-1 only and returns ep on every qualifying tick.
-    This test verifies ingest() (the full shim with Gate-2) suppresses small ticks.
+    Verifies ingest_tick Gate-1/Gate-2 pass-through for aggressive ticks.
+
+    ING-006: Gate 2 in ingest_tick evaluates ep.weighted_premium (not
+    total_premium). Passive ticks (is_aggressive=False) are discounted by
+    aggression_discount (default 0.5), so a passive-only episode needs 2x
+    the raw floor to clear. To ensure Gate-2 is crossed cleanly and ingest_tick
+    returns a non-None result, ticks must be marked is_aggressive=True so
+    weighted_premium == total_premium.
+
+    DTE floor for dte=0 (hits tier <= 7): 50_000 for tier-1.
+    4 aggressive ticks x 15_000 = 60_000 weighted >= 50_000 -> Gate-2 clears.
+    5th tick (100 premium) brings total to 60_100 -> still >= 50_000 -> non-None.
     """
     from signals.repetition_accumulator import RepetitionAccumulator
-    acc = RepetitionAccumulator(signal_cooldown=0)  # no cooldown so only Gate-2 tested
+    acc = RepetitionAccumulator(signal_cooldown=0)
 
     base_tick = {
         "occ_symbol": "AAPL240620C00180000",
@@ -1011,21 +1023,15 @@ async def test_gate2_retrigger_threshold_blocks_re_emission_below_delta():
         "direction": "BULLISH",
         "premium": 15_000.0,
         "sentiment": "BULLISH",
+        "is_aggressive": True,   # ING-006: must be True so weighted_premium == total_premium
     }
-    # Cross Gate-1 (3 ticks x 15k = 45k... need 50k min)
-    # Use 4 ticks to cross: 4 x 15k = 60k
-    results = []
-    for i in range(4):
-        result = await acc.ingest({**base_tick})
-        results.append(result)
+    # 4 ticks x 15k = 60k weighted >= 50k floor -> crosses Gate-1 (min_trades=3) and Gate-2
+    for _ in range(4):
+        await acc.ingest({**base_tick})
 
-    # Now ingest() has fired and last_signal_at is set.
-    # A tiny additional tick (100) adds <50k delta -> should be suppressed by cooldown
-    # (since signal_cooldown=0, get_signal always returns ep on any call).
-    # Gate-2 delta is not in ingest_tick, so we just verify ingest_tick returns ep:
+    # 5th ingest_tick: episode has 5 events, weighted_premium = 60_100 >= 50_000 -> non-None
     result = await acc.ingest_tick({**base_tick, "premium": 100.0})
-    # ingest_tick has no Gate-2, so it should return ep (Gate-1 still crossed)
-    assert result is not None, "ingest_tick should not apply Gate-2 delta"
+    assert result is not None, "ingest_tick should pass Gate-2 for aggressive ticks above floor"
 
 
 @pytest.mark.asyncio

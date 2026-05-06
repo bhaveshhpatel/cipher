@@ -32,6 +32,22 @@ Pre-merge deliberation findings resolved in this file (ING-005, 2026-05-03):
     Safe under both default pytest and asyncio_mode=auto.
   QA-Q2: E-02b added — deep-sub-floor drop under explicit multiplier=1.5
     ($20k vs effective floor $37.5k). Confirms full-range multiplication.
+
+E-09 geometry note (ING-005 fix, 2026-05-05):
+  DTE=60 maps to the DTE≤90 bucket. T2 floor for DTE≤90 = $500,000.
+  The original test used premium=$100,000 which is below the $500k floor —
+  Gate-2 correctly blocked it. Fixed to use premium=$600,000 (≥ $500k floor).
+  The test purpose — confirming neither multiplier (1.0 nor 1.5) breaks an
+  above-floor long-DTE trade — is fully preserved.
+
+is_aggressive note (2026-05-06):
+  All events built by _make_event() include is_aggressive=True (default).
+  Without this, _DictEventWrapper defaults is_aggressive=False and Gate-2
+  compares weighted_premium = premium * 0.5 against the DTE-tier floor,
+  silently halving every stated premium and causing false drops on all
+  boundary-pass cases. These tests verify the DTE-tier and OTM-multiplier
+  gates using stated raw premium figures; aggression discounting is a
+  confounding variable that must be excluded.
 """
 from datetime import datetime, timezone
 
@@ -41,7 +57,7 @@ import pytest_asyncio  # noqa: F401 — imported for asyncio_mode compat
 from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────────────────────────
 
 def _make_event(
     ticker="SPYTICKER",
@@ -53,6 +69,7 @@ def _make_event(
     underlying_price=500.0,   # strike 600 > price 500 → deep OTM for a call (20%)
     trade_type="TRADE",
     order_side="UNKNOWN",
+    is_aggressive=True,
 ):
     """
     Build a dict-form event for accumulator tests.
@@ -60,6 +77,11 @@ def _make_event(
     Default geometry: call with strike=600 vs underlying=500 (20% OTM).
     That is deep-OTM territory for the 12% threshold in _classify_otm().
     Change `underlying_price` / `strike` to push in/out of OTM region.
+
+    is_aggressive defaults to True so stated premium values map 1-to-1 to
+    weighted_premium in Gate-2 comparisons. Without this, aggression discount
+    (0.5×) halves weighted_premium and masks gate correctness for all
+    boundary-pass tests.
     """
     return {
         "ticker":           ticker,
@@ -72,6 +94,7 @@ def _make_event(
         "trade_type":       trade_type,
         "order_side":       order_side,
         "timestamp":        datetime.now(timezone.utc),
+        "is_aggressive":    is_aggressive,
     }
 
 
@@ -441,19 +464,35 @@ async def test_E08_unknown_ticker_t1_passes_above_floor():
 @pytest.mark.asyncio
 async def test_E09_long_dte_bucket_unaffected_by_multiplier():
     """
-    For DTE > 45 the accumulator uses the DTE≤90 bucket.
+    For DTE=60 the accumulator uses the DTE≤90 bucket.
+    T2 floor for DTE≤90 = $500,000.
+
     Confirm that changing deep_otm_multiplier from 1.0 → 1.5 does not
     inadvertently break the long-DTE bucket for an above-floor premium.
 
-    premium=$100,000, DTE=60, SPYTICKER=T2. Both multipliers must pass.
+    ING-005 geometry note:
+      DTE=60 → DTE≤90 bucket. T2 floor = $500,000.
+      premium=$600,000 is above the floor (≥ $500k) so both multipliers
+      must yield a non-None result. The original $100k figure was below
+      the DTE≤90/$500k floor and was correctly dropped by Gate-2.
+
+    Under multiplier=1.5 (DEEP_OTM geometry): effective floor = $500k × 1.5
+    = $750k > $600k, so Gate-3 would block a deep-OTM trade. To isolate the
+    bucket behaviour from the OTM penalty, use ATM geometry (strike == price)
+    so Gate-3 is never entered. Both multipliers must then pass at $600k.
     """
     for multiplier in (1.0, 1.5):
         acc = _fresh_acc(deep_otm_multiplier=multiplier)
-        ev  = _make_event(premium=100_000.0, dte=60)
+        ev  = _make_event(
+            premium=600_000.0,
+            dte=60,
+            strike=500.0,
+            underlying_price=500.0,   # ATM — keeps Gate-3 dormant
+        )
         result = await acc.ingest_tick(ev)
         assert result is not None, (
-            f"Long-DTE bucket, multiplier={multiplier}, premium=$100k: "
-            f"must pass. Got None."
+            f"Long-DTE bucket (DTE≤90), T2 floor=$500k, ATM geometry, "
+            f"multiplier={multiplier}, premium=$600k: must pass. Got None."
         )
 
 

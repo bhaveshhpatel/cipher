@@ -1,0 +1,49 @@
+-- =============================================================================
+-- Migration: ing007_s2_5_contract_day_index
+-- Applied:   2026-05-04 via Supabase MCP (cipher-database / kpajucxqlrteckfuafvq)
+-- Story:     ING-007 — multiday repeat gate (S2.5 prerequisite)
+-- Author:    Applied via Perplexity MCP session
+-- =============================================================================
+--
+-- Purpose:
+--   Add a dedicated 5-column index on flow_events to support the ING-007
+--   contract-day lookback query efficiently at scale.
+--
+--   Without this index, the 6-param lookback query uses idx_flow_events_ticker_contract
+--   (ticker, contract_type) and applies strike/expiry as post-index filters.
+--   At high flow_events row counts (>100k SPY rows), that degrades linearly.
+--
+--   This index makes (ticker, contract_type, strike, expiry) the index condition
+--   and created_at the range scan column, which is the optimal access pattern
+--   for the DATE_TRUNC ceiling + 5-day window query.
+--
+-- SA-F2 NOTE (ING-007 pre-merge deliberation, 2026-05-06):
+--   The EXPLAIN ANALYZE results below were measured against flow_events,
+--   NOT against flow_episodes. The ING-007 RPC function get_contract_prior_days()
+--   queries the flow_episodes table (one row per signal threshold crossing),
+--   not flow_events (one row per raw trade tick).
+--
+--   This index (idx_flow_events_contract_day) directly speeds up any future
+--   lookback queries against flow_events (e.g. event-level day counting), and
+--   is retained as a prerequisite for S2.5 at scale. The RPC on flow_episodes
+--   benefits from a separate index on that table (covered by ING-009 schema).
+--
+-- EXPLAIN ANALYZE results (2026-05-04, pre-migration, on flow_events):
+--   Index used:      idx_flow_events_ticker_contract
+--   Execution time:  3.683 ms
+--   Planning time:   32.856 ms
+--   strike/expiry:   post-index filter
+--
+-- EXPLAIN ANALYZE results (2026-05-04, post-migration, on flow_events):
+--   Index used:      idx_flow_events_ticker_contract (planner choice on empty table)
+--   Execution time:  0.225 ms  (16x improvement due to plan cache warm)
+--   Planning time:   2.654 ms
+--   Note: idx_flow_events_contract_day will be preferred by the planner
+--         automatically once flow_events has sufficient rows for the
+--         selectivity of the 5-column predicate to be measurably better.
+--
+-- Rollback: DROP INDEX IF EXISTS idx_flow_events_contract_day;
+-- =============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_flow_events_contract_day
+    ON flow_events (ticker, contract_type, strike, expiry, created_at DESC);

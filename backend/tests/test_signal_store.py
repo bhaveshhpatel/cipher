@@ -164,45 +164,56 @@ def test_normalise_sentiment_empty_and_none_fall_to_neutral():
     assert _normalise_sentiment(None) == "NEUTRAL"
 
 
-# --- _normalise_alert_level ---
+# --- _normalise_alert_level (Fix 7 vocab: CONVICTION|WHALE|INSTITUTIONAL|LARGE|RETAIL) ---
 
 def test_normalise_alert_level_valid_passthrough():
-    """Valid alert_level values pass through unchanged."""
+    """Valid alert_level values (Fix 7 vocab) pass through unchanged."""
     from services.signal_store import _normalise_alert_level
     assert _normalise_alert_level("CONVICTION")   == "CONVICTION"
-    assert _normalise_alert_level("STRONG_SIGNAL") == "STRONG_SIGNAL"
-    assert _normalise_alert_level("ALERT")         == "ALERT"
-    assert _normalise_alert_level("WATCH")         == "WATCH"
+    assert _normalise_alert_level("WHALE")         == "WHALE"
+    assert _normalise_alert_level("INSTITUTIONAL") == "INSTITUTIONAL"
+    assert _normalise_alert_level("LARGE")         == "LARGE"
+    assert _normalise_alert_level("RETAIL")        == "RETAIL"
 
 
 def test_normalise_alert_level_lowercase_is_uppercased():
-    """Lowercase alert_level values are correctly resolved."""
+    """Lowercase Fix 7 alert_level values are correctly resolved."""
     from services.signal_store import _normalise_alert_level
     assert _normalise_alert_level("conviction")   == "CONVICTION"
-    assert _normalise_alert_level("strong_signal") == "STRONG_SIGNAL"
-    assert _normalise_alert_level("alert")         == "ALERT"
-    assert _normalise_alert_level("watch")         == "WATCH"
+    assert _normalise_alert_level("whale")         == "WHALE"
+    assert _normalise_alert_level("institutional") == "INSTITUTIONAL"
+    assert _normalise_alert_level("large")         == "LARGE"
+    assert _normalise_alert_level("retail")        == "RETAIL"
 
 
-def test_normalise_alert_level_stale_normal_falls_to_watch():
-    """'NORMAL' (pre-migration column default) falls back to WATCH, not 23514."""
+def test_normalise_alert_level_legacy_vocab_remapped():
+    """Old constraint vocab (pre-Fix 7) is remapped via the legacy bridge."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("NORMAL") == "WATCH"
-    assert _normalise_alert_level("normal") == "WATCH"
+    # Legacy values map to nearest Fix 7 equivalent.
+    assert _normalise_alert_level("STRONG_SIGNAL") == "WHALE"
+    assert _normalise_alert_level("ALERT")         == "INSTITUTIONAL"
+    assert _normalise_alert_level("WATCH")         == "LARGE"
 
 
-def test_normalise_alert_level_unknown_falls_to_watch():
-    """Arbitrary unknown values fall back to WATCH."""
+def test_normalise_alert_level_stale_normal_falls_to_large():
+    """'NORMAL' (pre-migration column default) falls back to LARGE via legacy bridge."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("HIGH")     == "WATCH"
-    assert _normalise_alert_level("CRITICAL") == "WATCH"
+    assert _normalise_alert_level("NORMAL") == "LARGE"
+    assert _normalise_alert_level("normal") == "LARGE"
 
 
-def test_normalise_alert_level_empty_and_none_fall_to_watch():
-    """Falsy inputs fall back to WATCH safely."""
+def test_normalise_alert_level_unknown_falls_to_large():
+    """Arbitrary unknown values fall back to LARGE (Fix 7 default)."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("")   == "WATCH"
-    assert _normalise_alert_level(None) == "WATCH"
+    assert _normalise_alert_level("HIGH")     == "LARGE"
+    assert _normalise_alert_level("CRITICAL") == "LARGE"
+
+
+def test_normalise_alert_level_empty_and_none_fall_to_large():
+    """Falsy inputs fall back to LARGE safely (Fix 7 default)."""
+    from services.signal_store import _normalise_alert_level
+    assert _normalise_alert_level("")   == "LARGE"
+    assert _normalise_alert_level(None) == "LARGE"
 
 
 # --- _build_row integration: constraint-safe output ---
@@ -243,10 +254,11 @@ def test_build_row_alias_sentiment_resolves_correctly():
     assert row["sentiment"] == "BULLISH"
 
 
-def test_build_row_stale_alert_level_normal_remapped_to_watch():
+def test_build_row_stale_alert_level_normal_remapped_to_large():
     """
     If sig carries alert_level='NORMAL' (pre-migration column default),
-    _build_row must remap to 'WATCH' to satisfy signal_feed_log_alert_level_check.
+    _build_row must remap to 'LARGE' (via legacy bridge in _normalise_alert_level)
+    to satisfy signal_feed_log_alert_level_check (Fix 7 vocab).
     """
     from services.signal_store import _build_row, _VALID_ALERT_LEVELS
     sig = {
@@ -260,7 +272,7 @@ def test_build_row_stale_alert_level_normal_remapped_to_watch():
     assert row["alert_level"] in _VALID_ALERT_LEVELS, (
         f"row['alert_level']={row['alert_level']!r} is not in CHECK constraint values"
     )
-    assert row["alert_level"] == "WATCH"
+    assert row["alert_level"] == "LARGE"
 
 
 def test_build_row_all_constrained_fields_are_always_valid():

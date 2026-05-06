@@ -11,8 +11,9 @@ ING-006 rewrite changes that affect this file:
   - sweep_bypass_premium= constructor kwarg removed
   - _classify_otm() is now an instance method (not static); pass self=acc_instance
   - STANDARD_OTM label renamed to OTM
-  - Default tier changed from 1 (strict) to 2 (permissive); force tier=1
-    explicitly via acc._tier_map[ticker] = 1 when testing strict floor
+  - Default tier changed from 2 (permissive) to 1 (strict) per D-11/QA-F1.
+    Tests that need tier-2 behaviour MUST call acc.set_tier_map({ticker: 2})
+    explicitly — the old implicit default no longer applies.
   - DTE overflow (DTE > max tier key) now falls through to
     _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS keyed by tier, not the last custom bucket
 
@@ -35,7 +36,7 @@ from signals.repetition_accumulator import (
 )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 def _ts(offset_seconds=0):
     return datetime(2026, 4, 26, 14, 30, tzinfo=timezone.utc) + timedelta(seconds=offset_seconds)
@@ -64,7 +65,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# ── set_tier_map + T2 floor path ───────────────────────────────────────────────
+# ── set_tier_map + T2 floor path ─────────────────────────────────────────────────────────────
 
 def test_set_tier_map_updates_internal_map():
     acc = RepetitionAccumulator(
@@ -99,7 +100,7 @@ def test_t1_ticker_blocked_by_higher_floor():
         window_minutes=60, min_trades=3,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000}), (9999, {1: 2_000_000, 2: 1_000_000})],
     )
-    # ING-006: default tier is 2 (permissive). Force tier=1 (strict) explicitly.
+    # D-11: default tier is 1 (strict). Force explicitly for clarity.
     acc._tier_map["AAPL"] = 1
     ep = None
     for i in range(3):
@@ -107,7 +108,7 @@ def test_t1_ticker_blocked_by_higher_floor():
     assert ep is None, "T1 ticker should be blocked by the higher DTE floor"
 
 
-# ── _classify_otm branches ────────────────────────────────────────────────────
+# ── _classify_otm branches ──────────────────────────────────────────────────────────────────
 # ING-006: _classify_otm(ev) is now an instance method.
 # Call via an accumulator instance: acc._classify_otm(ev)
 
@@ -175,7 +176,7 @@ def test_deep_otm_multiplier_passes_high_premium():
     assert ep is not None
 
 
-# ── dominant_direction REPEAT_SELL + mixed ────────────────────────────────────
+# ── dominant_direction REPEAT_SELL + mixed ────────────────────────────────────────────
 
 def test_dominant_direction_repeat_sell_buy_put():
     ep = RepetitionEpisode(ticker="SPY", contract_type="PUT")
@@ -211,7 +212,7 @@ def test_dominant_direction_mixed_sell_wins():
     assert ep.dominant_direction == "REPEAT_SELL"
 
 
-# ── DTE overflow / custom tiers fallback ──────────────────────────────────────
+# ── DTE overflow / custom tiers fallback ─────────────────────────────────────────────────
 # NOTE: dte_premium_tiers must be a list of (max_dte, {tier: floor}) tuples.
 # DTE > all tier keys overflows to _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.
 
@@ -219,12 +220,13 @@ def test_get_episode_min_premium_dte_overflow_t1():
     """
     Custom tiers with max_dte=30. DTE=60 exceeds all keys.
     Overflow -> _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS[tier=2] = 1_000_000.
-    Tier defaults to 2 (no set_tier_map call).
+    Explicitly set tier=2 via set_tier_map (D-11: default is tier=1, not 2).
     """
     acc = RepetitionAccumulator(
         min_trades=1,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
+    acc.set_tier_map({"AAPL": 2})  # D-11: must be explicit; default is tier=1
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
     ev = SimpleNamespace(premium=100_000, dte=60, underlying_price=200.0,
                          order_side="BUY", trade_type="SWEEP", timestamp=_ts(),
@@ -236,23 +238,24 @@ def test_get_episode_min_premium_dte_overflow_t1():
 
 def test_get_episode_min_premium_dte_overflow_t2():
     """
-    Same scenario, tier=2 explicitly — same overflow result since
+    Same scenario with tier=2 set explicitly.
     _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS tier=2 is 1_000_000.
     """
     acc = RepetitionAccumulator(
         min_trades=1,
         dte_premium_tiers=[(30, {1: 500_000, 2: 100_000})],
     )
+    acc.set_tier_map({"AAPL": 2})  # D-11: must be explicit; default is tier=1
     ep = RepetitionEpisode(ticker="AAPL", contract_type="CALL")
     ev = SimpleNamespace(premium=100_000, dte=60, underlying_price=200.0,
                          order_side="BUY", trade_type="SWEEP", timestamp=_ts(),
                          ticker="AAPL")
     ep.events = [ev]
     floor = acc._get_episode_min_premium(ep)
-    assert floor == 1_000_000  # 91+ DTE overflow, tier=2 default
+    assert floor == 1_000_000  # 91+ DTE overflow, tier=2 explicit
 
 
-# ── min_sweeps gate suppression ───────────────────────────────────────────────
+# ── min_sweeps gate suppression ─────────────────────────────────────────────────────────────
 
 def test_min_sweeps_gate_suppresses_non_sweep():
     """
@@ -303,7 +306,7 @@ def test_min_sweeps_gate_passes_when_enough_sweeps():
     assert ep is not None
 
 
-# ── whale sweep bypass fires episode ──────────────────────────────────────────
+# ── whale sweep bypass fires episode ──────────────────────────────────────────────────────────
 
 def test_whale_sweep_bypass_fires_on_single_large_sweep():
     """

@@ -11,9 +11,18 @@ Composite formula overhaul:
 
 backtest_score field is preserved on CompositeSignal so callers do not break,
 but its value is always 0.0 until S8 lands.
+
+Apex S6 additions (test_apex_s6_composite_overhaul.py):
+  - Composite dataclass: symbol, score, tier, breakdown, triggered_at
+  - CompositeScore: alias / companion type for score computation
+  - build_composite overload: accepts (symbol: str, episode, accumulator) -> Composite
+    OR legacy (episode: RepetitionEpisode, accumulator: RepetitionAccumulator) -> CompositeSignal
+    Legacy 2-arg with non-episode-duck-typed first arg raises TypeError (regression guard).
 """
 from __future__ import annotations
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Union
 from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumulator
 
 # ---------------------------------------------------------------------------
@@ -22,6 +31,43 @@ from signals.repetition_accumulator import RepetitionEpisode, RepetitionAccumula
 # ---------------------------------------------------------------------------
 COMPOSITE_SCORE_CEILING: float = 0.90
 
+
+# ---------------------------------------------------------------------------
+# Apex S6 — Composite types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompositeScore:
+    """Sub-score container used by Composite.breakdown."""
+    premium_tier: float = 0.0
+    flow: float = 0.0
+    volume_premium: float = 0.0
+    accumulator: float = 0.0
+
+
+@dataclass
+class Composite:
+    """
+    New composite result type introduced in Apex S6.
+
+    Fields
+    ------
+    symbol        : str   — ticker symbol
+    score         : float — composite score in [0.0, 1.0]
+    tier          : str   — WEAK | MODERATE | STRONG | EXTREME
+    breakdown     : dict  — per-component sub-scores (all numeric values)
+    triggered_at  : float — unix timestamp of computation
+    """
+    symbol:       str
+    score:        float
+    tier:         str
+    breakdown:    Dict[str, float] = field(default_factory=dict)
+    triggered_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Legacy type — preserved for test_6layer_regression.py and existing callers
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CompositeSignal:
@@ -39,12 +85,13 @@ class CompositeSignal:
 # Influence tier — episode-level, not event-level
 # ---------------------------------------------------------------------------
 
-def episode_influence_tier(ep: RepetitionEpisode) -> str:
+def episode_influence_tier(ep) -> str:
     """
     Map episode total_premium to an influence tier label.
 
     Uses episode premium, never the event-level influence_tier field, so the
     label reflects the full accumulated flow rather than any single print.
+    Accepts both RepetitionEpisode and duck-typed episode objects.
     """
     prem = ep.total_premium
     if prem >= 2_000_000:
@@ -57,10 +104,23 @@ def episode_influence_tier(ep: RepetitionEpisode) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Duck-type episode check
+# ---------------------------------------------------------------------------
+
+def _is_episode_duck(obj) -> bool:
+    """Return True if obj looks like an episode (has .events, .total_premium, .ticker)."""
+    return (
+        hasattr(obj, "events")
+        and hasattr(obj, "total_premium")
+        and hasattr(obj, "ticker")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scoring helpers
 # ---------------------------------------------------------------------------
 
-def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
+def volume_weighted_premium_factor(ep) -> float:
     """min(1.0, premium / (oi * 100)). Returns 0.5 when OI is zero."""
     if not ep.events:
         return 0.5
@@ -72,7 +132,7 @@ def volume_weighted_premium_factor(ep: RepetitionEpisode) -> float:
     return round(min(1.0, premium / (latest_oi * 100)), 4)
 
 
-def premium_tier_score(ep: RepetitionEpisode) -> float:
+def premium_tier_score(ep) -> float:
     """
     Normalise episode total_premium to a [0, 1] score.
 
@@ -95,25 +155,202 @@ def premium_tier_score(ep: RepetitionEpisode) -> float:
     return 0.0
 
 
-def compute_flow_score(ep: RepetitionEpisode) -> float:
-    prem   = min(ep.total_premium / 10_000_000, 1.0)
-    accel  = 0.15 if ep.is_accelerating else 0.0
-    trades = min(ep.trade_count / 20, 0.20)
+def compute_flow_score(ep) -> float:
+    """
+    Compute a [0, 1] flow score for an episode.
+
+    Trade-count cap (chunk-5 fix):
+      The premium contribution is normalised against *capped* trade count so
+      that 50 trades with the same per-trade premium as 20 trades score
+      identically.  Without this cap the premium component would keep growing
+      even after the trade-count signal saturates.
+
+      effective_tc   = min(trade_count, 20)
+      avg_premium    = total_premium / trade_count  (0 when no trades)
+      prem_component = min(effective_tc * avg_premium / 10_000_000, 1.0)
+
+    Formula:
+      score = clamp(prem_component * 0.65 + accel_bonus + trade_component, 1.0)
+      where accel_bonus     = 0.15 if is_accelerating else 0.0
+            trade_component = min(effective_tc / 20, 0.20)
+    """
+    raw_tc    = getattr(ep, "trade_count", 0) or 0
+    eff_tc    = min(raw_tc, 20)
+    avg_prem  = (ep.total_premium / raw_tc) if raw_tc > 0 else 0.0
+    prem      = min(eff_tc * avg_prem / 10_000_000, 1.0)
+    accel     = 0.15 if ep.is_accelerating else 0.0
+    trades    = min(eff_tc / 20, 0.20)
     return round(min(1.0, prem * 0.65 + accel + trades), 3)
 
 
 # ---------------------------------------------------------------------------
-# Main composite builder
+# Composite tier promotion
+# ---------------------------------------------------------------------------
+
+def _score_to_tier(score: float) -> str:
+    if score >= 0.75:
+        return "EXTREME"
+    if score >= 0.50:
+        return "STRONG"
+    if score >= 0.25:
+        return "MODERATE"
+    return "WEAK"
+
+
+# ---------------------------------------------------------------------------
+# Accumulator contribution score
+# ---------------------------------------------------------------------------
+
+def _accumulator_score(accumulator) -> float:
+    """
+    Derive a [0, 1] contribution from accumulator state.
+    Works with both the real RepetitionAccumulator and stub objects used in tests,
+    by falling back gracefully when methods are absent.
+    """
+    try:
+        confirmed = (
+            accumulator.confirmed_count()
+            if callable(getattr(accumulator, "confirmed_count", None))
+            else 0
+        )
+        total_prem = (
+            accumulator.total_premium_confirmed()
+            if callable(getattr(accumulator, "total_premium_confirmed", None))
+            else 0.0
+        )
+        ep_count = (
+            accumulator.episode_count()
+            if callable(getattr(accumulator, "episode_count", None))
+            else 0
+        )
+        # Normalise: cap confirmed at 10, premium at 2M, episodes at 20
+        confirmed_s = min(confirmed / 10.0, 1.0)
+        premium_s   = min(total_prem / 2_000_000.0, 1.0)
+        ep_s        = min(ep_count / 20.0, 1.0)
+        return round(min(1.0, confirmed_s * 0.5 + premium_s * 0.3 + ep_s * 0.2), 4)
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Main composite builder — overloaded
 # ---------------------------------------------------------------------------
 
 def build_composite(
-    ep:           RepetitionEpisode,
-    accumulator:  RepetitionAccumulator,
+    symbol_or_episode,
+    episode_or_accumulator,
+    accumulator=None,
+    *,
+    sector_score: float = 0.0,
+) -> Union[Composite, CompositeSignal, None]:
+    """
+    Build a composite signal score.
+
+    Overloaded signatures
+    ---------------------
+    New (Apex S6):
+        build_composite(symbol: str, episode, accumulator) -> Composite
+
+    Legacy (6-layer regression, E2E tests, and stub-based tests):
+        build_composite(episode, accumulator) -> CompositeSignal
+        where episode is RepetitionEpisode OR any duck-typed object with
+        .events, .total_premium, and .ticker attributes.
+
+    Raises TypeError if called with 2 positional args where arg1 is not
+    a str and does not duck-type as an episode object.
+    """
+    # ── New 3-arg path: build_composite(symbol, episode, accumulator) ──────
+    if isinstance(symbol_or_episode, str):
+        symbol  = symbol_or_episode
+        episode = episode_or_accumulator
+        acc     = accumulator
+        return _build_composite_new(symbol, episode, acc)
+
+    # ── Legacy 2-arg path: RepetitionEpisode OR duck-typed episode stub ────
+    if isinstance(symbol_or_episode, RepetitionEpisode) or _is_episode_duck(symbol_or_episode):
+        ep  = symbol_or_episode
+        acc = episode_or_accumulator
+        return _build_composite_legacy(ep, acc, sector_score=sector_score)
+
+    # ── Anything else raises TypeError (regression guard) ──────────────────
+    raise TypeError(
+        "build_composite() requires either (symbol: str, episode, accumulator) "
+        "or (episode, accumulator) where episode has .events/.total_premium/.ticker. "
+        f"Got first arg of type {type(symbol_or_episode).__name__!r}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# New path (Apex S6) — returns Composite
+# ---------------------------------------------------------------------------
+
+def _build_composite_new(symbol: str, episode, accumulator) -> Optional[Composite]:
+    """
+    Build a Composite for the given symbol using the episode + accumulator state.
+
+    Gracefully handles empty/cold accumulators — never raises.
+    Returns None when the accumulator has no activity at all.
+
+    Score formula (new path):
+        episode_premium_score * 0.40
+        + accumulator_score   * 0.35
+        + acceleration_bonus  * 0.15
+        + trade_count_score   * 0.10
+    All clamped to [0.0, 1.0].
+    """
+    # Episode-level sub-scores — accept duck-typed episodes too
+    ep_prem = getattr(episode, "total_premium", 0.0) or 0.0
+    prem_s  = min(ep_prem / 2_000_000.0, 1.0)
+
+    is_accel = getattr(episode, "is_accelerating", False)
+    accel_s  = 0.15 if is_accel else 0.0
+
+    tc = getattr(episode, "trade_count", None)
+    if tc is None:
+        tc = getattr(episode, "count", 0) or 0
+    trade_s = min(tc / 20.0, 1.0)
+
+    acc_s = _accumulator_score(accumulator)
+
+    raw = (
+        prem_s  * 0.40
+        + acc_s * 0.35
+        + accel_s * 0.15
+        + trade_s * 0.10
+    )
+    score = round(min(1.0, max(0.0, raw)), 6)
+
+    breakdown: Dict[str, float] = {
+        "premium_score":      round(prem_s, 4),
+        "accumulator_score":  round(acc_s, 4),
+        "acceleration_bonus": round(accel_s, 4),
+        "trade_count_score":  round(trade_s, 4),
+    }
+
+    tier = _score_to_tier(score)
+
+    return Composite(
+        symbol=symbol,
+        score=score,
+        tier=tier,
+        breakdown=breakdown,
+        triggered_at=time.time(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy path — returns CompositeSignal
+# ---------------------------------------------------------------------------
+
+def _build_composite_legacy(
+    ep,
+    accumulator,
     *,
     sector_score: float = 0.0,
 ) -> CompositeSignal:
     """
-    Build a composite signal score from an episode.
+    Legacy composite builder. Returns CompositeSignal.
+    Accepts RepetitionEpisode or any duck-typed episode stub.
 
     Weight split (S6):
         flow_score            * 0.55

@@ -15,11 +15,19 @@ Semantics (S2 invariant):
                   else → REPEAT_BUY  (safe default)
 
 All comparisons are case-insensitive and stripped.
+
+Re-exports:
+  is_directionally_aggressive — source of truth is bid_ask_classifier.py
+  (ING-006). Re-exported here so callers importing from this module
+  resolve correctly. Issues #63 and #66 track long-term migration to a
+  dedicated aggression module.
 """
 
 from __future__ import annotations
 
-__all__ = ["order_side_to_direction"]
+from parsers.bid_ask_classifier import is_directionally_aggressive  # noqa: F401  re-export
+
+__all__ = ["order_side_to_direction", "is_directionally_aggressive"]
 
 _REPEAT_BUY = "REPEAT_BUY"
 _REPEAT_SELL = "REPEAT_SELL"

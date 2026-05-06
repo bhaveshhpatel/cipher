@@ -89,11 +89,17 @@ def _make_event(
     dte=5,
     underlying_price=500.0,
     trade_type="TRADE",
+    is_aggressive=True,
 ):
     """
     Build a minimal OptionsFlowEvent-compatible dict for accumulator tests.
     Uses a dict (not OptionsFlowEvent) so tests have no dependency on the
     parser layer and directly exercise the accumulator's _DictEventWrapper path.
+
+    is_aggressive defaults to True so that stated premium values map 1-to-1
+    to weighted_premium in Gate-2 comparisons. D-11 through D-13 test the
+    DTE-tier boundary using raw premium figures; passive discounting (0.5x)
+    would halve weighted_premium and mask gate correctness.
     """
     return {
         "ticker":           ticker,
@@ -106,6 +112,7 @@ def _make_event(
         "trade_type":       trade_type,
         "order_side":       "UNKNOWN",
         "timestamp":        datetime.now(timezone.utc),
+        "is_aggressive":    is_aggressive,
     }
 
 
@@ -332,11 +339,11 @@ def test_D11_accumulator_cold_start_T1_drops_30k():
     Setup:
       - Fresh accumulator with _DEFAULT_DTE_PREMIUM_TIERS (as wired by ING-003).
       - No tier_map injected → unknown ticker defaults to T1 (strict).
-      - DTE=5, premium=$30,000.
+      - DTE=5, premium=$30,000, is_aggressive=True.
 
     _DEFAULT_DTE_PREMIUM_TIERS[7] = (50_000, 25_000).
     T1 floor for DTE≤7 = $50,000.
-    $30,000 < $50,000 → Gate-2 drops the tick.
+    weighted_premium = $30,000 (aggressive, full weight) < $50,000 → Gate-2 drops.
 
     Expected: ingest_tick() returns None.
 
@@ -363,10 +370,10 @@ def test_D12_accumulator_cold_start_T1_passes_60k():
 
     Setup:
       - Same fresh accumulator, same unknown ticker → T1 default.
-      - DTE=5, premium=$60,000.
+      - DTE=5, premium=$60,000, is_aggressive=True.
 
     T1 floor for DTE≤7 = $50,000.
-    $60,000 >= $50,000 → Gate-2 passes.
+    weighted_premium = $60,000 (aggressive, full weight) >= $50,000 → Gate-2 passes.
 
     Expected: ingest_tick() returns a RepetitionEpisode (not None).
 
@@ -397,11 +404,11 @@ def test_D13_accumulator_post_warmup_tier_override_passes_30k():
       - Fresh accumulator with _DEFAULT_DTE_PREMIUM_TIERS.
       - Call set_tier_map({"TESTTICKER": 2}) — simulates registry warmup
         assigning TESTTICKER to T2.
-      - DTE=5, premium=$30,000.
+      - DTE=5, premium=$30,000, is_aggressive=True.
 
     _DEFAULT_DTE_PREMIUM_TIERS[7] = (50_000, 25_000).
-    T2 floor for DTE≤7 = $25,000 (col 1).
-    $30,000 >= $25,000 → Gate-2 passes after tier injection.
+    T2 floor for DTE≤7 = $25,000.
+    weighted_premium = $30,000 (aggressive, full weight) >= $25,000 → Gate-2 passes.
 
     Expected: ingest_tick() returns a RepetitionEpisode (not None).
 
