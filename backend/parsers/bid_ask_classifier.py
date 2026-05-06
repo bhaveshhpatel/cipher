@@ -4,18 +4,23 @@ based on fill price relative to the bid/ask spread.
 
 ING-006: Added is_directionally_aggressive() which replaces is_aggressive()
   in the parser hot path. The new function considers both bid_ask_class AND
-  contract_type so that put selling at the bid is correctly identified
+  contract_type so that put/call selling at the bid is correctly identified
   as conviction directional flow — not passive.
 
-  AT_ASK / ABOVE_ASK           -> True  (buyer paying up, unconditional)
-  AT_BID / BELOW_BID  on PUT   -> True  (put seller writing at bid is confirmed
-                                          bullish positioning — sell put = agree
-                                          to buy at strike, intent unambiguous)
-  AT_BID / BELOW_BID  on CALL  -> False (ambiguous — Tradier timesale carries no
-                                          order-side data; AT_BID CALL is equally
-                                          a passive limit buy or a seller writing;
-                                          cannot flag aggressive without confirmation)
-  MID                          -> False (passive / ambiguous)
+  Aggression classification per ING-001 resolution
+  (SPRINT_WSJ_INGESTION_ALIGNMENT.md § ING-001):
+
+    AT_ASK / ABOVE_ASK              -> True  (buyer paying up, unconditional)
+    AT_BID / BELOW_BID  on PUT      -> True  (put seller writing at bid =
+                                              conviction bullish; sell put =
+                                              agree to buy at strike)
+    AT_BID / BELOW_BID  on CALL     -> True  (call seller writing at bid =
+                                              conviction bearish; write call =
+                                              agree to sell at strike)
+    MID                             -> False (passive / ambiguous)
+    AT_BID / BELOW_BID  on other    -> False (empty/None/unknown ctype —
+                                              cannot assign directional meaning
+                                              without confirmed contract type)
 
   is_aggressive(trade_type) is retained as a deprecated shim.
   Do not remove until all callers are audited (ING-006 AC).
@@ -85,7 +90,7 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
       MID. These fills were ambiguous under the old logic; they are now
       treated as directional. This increases the count of events where
       is_directionally_aggressive() returns True for AT_ASK fills and
-      AT_BID PUT fills, which feeds directly into
+      AT_BID PUT/CALL fills, which feeds directly into
       RepetitionEpisode.weighted_premium.
 
     Test coverage: TestClassifyBidAsk in test_ing006_directional_aggression.py
@@ -110,26 +115,29 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     ING-006: Directional aggression classification.
 
     Replaces is_aggressive(trade_type) in the parser hot path.
-    Considers bid_ask_class AND contract_type:
+    Considers bid_ask_class AND contract_type per ING-001 deliberation
+    sign-off (SPRINT_WSJ_INGESTION_ALIGNMENT.md § ING-001):
 
-      AT_ASK / ABOVE_ASK           -> True  unconditionally (buyer paying up)
-      AT_BID / BELOW_BID  on PUT   -> True  (put seller at bid = confirmed bullish
-                                              position writer; sell put = agree to
-                                              buy at strike; intent unambiguous)
-      AT_BID / BELOW_BID  on CALL  -> False (ambiguous; Tradier timesale has no
-                                              order-side data; could be passive
-                                              limit buy or seller writing — cannot
-                                              assert aggression without confirmation)
-      MID                          -> False (passive / ambiguous)
+      AT_ASK / ABOVE_ASK            -> True  unconditionally (buyer paying up)
+      AT_BID / BELOW_BID on PUT     -> True  (put seller writing at/below bid =
+                                              conviction bullish; sell put =
+                                              agree to buy at strike)
+      AT_BID / BELOW_BID on CALL    -> True  (call seller writing at/below bid =
+                                              conviction bearish; write call =
+                                              agree to sell at strike)
+      MID                           -> False (passive / ambiguous)
+      AT_BID / BELOW_BID on other   -> False (empty/None/unknown ctype —
+                                              no confirmed contract type means
+                                              no directional classification;
+                                              safe default per QA-F1)
 
-    Rationale for PUT-only AT_BID aggression:
-      Tradier timesale events do not expose order-side (buyer-initiated vs
-      seller-initiated). For PUT contracts, a fill at bid has a single coherent
-      directional interpretation: a put seller writing at bid is bullish (agreeing
-      to buy the underlying at strike). For CALL contracts the same fill placement
-      is genuinely ambiguous — it could be a limit buyer whose order was met or a
-      call writer — so we default to False and require explicit order-side data
-      (S2 order_side_classifier scope) before flagging CALL AT_BID as aggressive.
+    PUT and CALL are symmetric at the bid:
+      A put seller writing at bid has one coherent directional interpretation
+      (bullish). A call seller writing at bid is the symmetric bearish case.
+      Both are conviction position writers, not passive limit-order buyers.
+      Both are flagged True. Only genuinely ambiguous or unresolved contract
+      types (empty string, None, SPREAD, UNKNOWN, etc.) return False —
+      directional meaning cannot be assigned without a confirmed ctype.
 
     No size threshold here — ING-002 $10k per-event floor is the correct
     upstream guard. By the time this runs the event has already cleared $10k
@@ -144,9 +152,12 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     if ba in ("AT_ASK", "ABOVE_ASK"):
         # Buyer paying at or above ask — always aggressive regardless of contract type.
         return True
-    if ba in ("AT_BID", "BELOW_BID") and ctype == "PUT":
-        # Put seller writing at or below bid — confirmed bullish position writer.
-        # CALL at bid is intentionally excluded (ambiguous without order-side data).
+    if ba in ("AT_BID", "BELOW_BID") and ctype in ("PUT", "CALL"):
+        # Seller writing at or below bid — conviction directional position writer.
+        # PUT seller at bid = bullish (agree to buy at strike).
+        # CALL seller at bid = bearish (agree to sell at strike).
+        # Symmetric cases per ING-001 resolution sign-off.
+        # Empty/None/unknown ctype excluded: no contract type = no directional meaning.
         return True
     return False
 
