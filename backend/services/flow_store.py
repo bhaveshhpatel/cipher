@@ -12,10 +12,11 @@ Usage — call once at startup from main.py lifespan:
 
 Tables written:
   - flow_events   : one row per classified tick (batched every 500ms or 100 rows)
-  - flow_episodes : one row per Signal Gate crossing, written directly from
-                    _process_trade() in tradier_stream.py BEFORE the SIG-DEBOUNCE
-                    check. This decouples episode persistence from the debounce
-                    gate (which is only for WebSocket / signal_history anti-spam).
+  - flow_episodes : one row per same-session episode (upsert — ING-009)
+                    Written directly from _process_trade() in tradier_stream.py
+                    BEFORE the SIG-DEBOUNCE check. This decouples episode
+                    persistence from the debounce gate (which is only for
+                    WebSocket / signal_history anti-spam).
 
 NOTE: Neither table receives an `id` field — Postgres generates it
       (uuid default for flow_events, bigserial for flow_episodes).
@@ -64,6 +65,13 @@ Bug fixes applied:
      most-recent flow_episodes row for that contract with is_multi_day_repeat.
   6. LOG-FORMAT (2026-05-05): prem=$%,.0f used %-style format which does not
      support the comma thousands-separator. Pre-formatted as f-string instead.
+  7. ING-009 (2026-05-06): persist_flow_episode() is now an upsert.
+     _lookup_open_episode() queries flow_episodes for an open same-session
+     episode matching (ticker, direction, contract_type, strike, expiry)
+     within _EPISODE_MERGE_WINDOW_S. On match: PATCH (trade_count +=1,
+     total_premium +=, signal_ts = new). On no match: INSERT (existing path).
+     _stats gains "created_episodes" and "merged_episodes" counters.
+     Both counters initialised at module level and visible in /health/stream.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -111,6 +119,14 @@ PBE-NEW-1 (2026-05-04): get_contract_prior_days() removed.
   The sync RPC helper was superseded by the async queue + contract_day_cache
   route before merge. No production call site exists. Removed to eliminate
   dead code and the orphaned test coverage that accompanied it.
+
+ING-009 episode merge semantics:
+  flow_episodes = one aggregated episode per contract per same-session window.
+  flow_events   = every qualifying classified tick (unchanged — insert-only).
+  A subsequent qualifying print for an open episode within
+  _EPISODE_MERGE_WINDOW_S updates the existing row rather than inserting a
+  new one. This ensures ING-007's get_contract_prior_days() query operates
+  on correctly aggregated episode rows, not per-print duplicates.
 """
 import asyncio
 import logging
@@ -141,6 +157,14 @@ _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
 # ---------------------------------------------------------------------------
+# ING-009: same-session episode merge window
+#   Two qualifying prints for the same contract within this window are merged
+#   into a single flow_episodes row (PATCH) rather than inserting a new row.
+#   30 minutes (1800s) is the WSJ same-session accumulation window.
+# ---------------------------------------------------------------------------
+_EPISODE_MERGE_WINDOW_S: int = 1800
+
+# ---------------------------------------------------------------------------
 # ING-007: async lookback enrichment queue
 #   Bounded at _LOOKBACK_QUEUE_MAX (5000 — PBE-Q3 deliberation 2026-05-04)
 #   to prevent unbounded memory growth on a very active trading day.
@@ -152,6 +176,21 @@ _lookback_stats: Dict[str, int] = {
     "lookback_queued":         0,
     "lookback_queue_overflow": 0,  # PBE-Q3: exact key name per deliberation
 }
+
+# ---------------------------------------------------------------------------
+# ING-009: episode upsert stats
+#   Both counters must be in the module-level init block so /health/stream
+#   never raises KeyError on cold start before the first episode is written.
+# ---------------------------------------------------------------------------
+_episode_stats: Dict[str, int] = {
+    "created_episodes": 0,
+    "merged_episodes":  0,
+}
+
+
+def get_episode_stats() -> Dict[str, int]:
+    """Return a copy of episode upsert stats for /health/stream surfacing."""
+    return dict(_episode_stats)
 
 
 def enqueue_lookback(key) -> None:
@@ -340,39 +379,174 @@ async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) 
         return False
 
 
+async def _lookup_open_episode(
+    ticker: str,
+    direction: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+    window_s: int = _EPISODE_MERGE_WINDOW_S,
+) -> Optional[dict]:
+    """
+    ING-009: Query flow_episodes for an open same-session episode matching
+    the merge key within the given window.
+
+    Merge key: (ticker, direction, contract_type, strike, expiry)
+    Window:    signal_ts >= now() - window_s seconds
+
+    Returns the episode row dict (with at minimum 'id', 'trade_count',
+    'total_premium') if found, else None.
+
+    On any Supabase error: logs a warning and returns None so the caller
+    falls back to INSERT — no episode is ever lost due to a lookup failure.
+    This satisfies E-8 in the QA test matrix.
+    """
+    if not _is_configured():
+        return None
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=window_s)
+    ).isoformat()
+
+    get_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Accept":        "application/json",
+    }
+
+    url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+        f"?ticker=eq.{quote(ticker)}"
+        f"&direction=eq.{quote(direction)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+        f"&signal_ts=gte.{quote(cutoff)}"
+        f"&order=signal_ts.desc"
+        f"&limit=1"
+        f"&select=id,trade_count,total_premium"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers=get_headers)
+        if resp.status_code != 200:
+            log.warning(
+                "[flow_store] _lookup_open_episode GET failed: %d -- %s "
+                "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
+                resp.status_code, resp.text[:200],
+                ticker, direction, contract_type, strike, expiry,
+            )
+            return None
+        rows = resp.json()
+        return rows[0] if rows else None
+    except Exception as exc:
+        log.warning(
+            "[flow_store] _lookup_open_episode exception: %s "
+            "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
+            exc, ticker, direction, contract_type, strike, expiry,
+        )
+        return None
+
+
 async def persist_flow_episode(signal_data: dict):
     """
-    Write one row to flow_episodes.
+    ING-009: Upsert one episode into flow_episodes.
 
-    ING-007: now accepts is_multi_day_repeat (BOOLEAN, default False).
-    Requires migration add_is_multi_day_repeat_to_flow_episodes.sql.
+    On first qualifying print for a contract within the session window:
+      INSERT a new episode row. Increments _episode_stats["created_episodes"].
+
+    On subsequent qualifying print for an open episode within
+    _EPISODE_MERGE_WINDOW_S:
+      PATCH the existing row:
+        trade_count  += 1
+        total_premium += new_premium
+        signal_ts     = new timestamp
+      Increments _episode_stats["merged_episodes"].
+
+    Gate order is preserved: called from _process_trade() after Signal Gate,
+    before SIG-DEBOUNCE. Do not tie back to debounce.
+
+    ING-007: still accepts and writes is_multi_day_repeat (BOOLEAN, default
+    False). The ING-007 lookback worker PATCHes this field asynchronously
+    after the upsert completes — that path is unchanged.
     """
-    expiry = signal_data.get("expiry") or None
+    ticker        = signal_data.get("ticker")
+    direction     = signal_data.get("direction")
+    contract_type = signal_data.get("contract_type")
+    strike        = signal_data.get("strike")
+    expiry        = signal_data.get("expiry") or None
+    new_premium   = signal_data.get("total_premium") or 0.0
+    new_ts        = signal_data.get("timestamp")
+
+    existing = await _lookup_open_episode(
+        ticker, direction, contract_type, strike, expiry
+    )
+
+    if existing:
+        row_id        = existing["id"]
+        trade_count   = (existing.get("trade_count") or 1) + 1
+        total_premium = (existing.get("total_premium") or 0.0) + new_premium
+
+        patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
+        patch_headers = {
+            "apikey":        _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=minimal",
+        }
+        payload = {
+            "trade_count":   trade_count,
+            "total_premium": total_premium,
+            "signal_ts":     new_ts,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.patch(patch_url, headers=patch_headers, json=payload)
+            if resp.status_code in (200, 204):
+                _episode_stats["merged_episodes"] += 1
+                prem_str = f"${total_premium:,.0f}"
+                log.info(
+                    "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
+                    "trade_count=%d prem=%s (id=%s)",
+                    ticker, contract_type, strike, expiry,
+                    trade_count, prem_str, row_id,
+                )
+            else:
+                log.warning(
+                    "[flow_store] flow_episode PATCH failed: %d -- %s "
+                    "(id=%s ticker=%s %s) — episode count may be inaccurate",
+                    resp.status_code, resp.text[:200], row_id, ticker, contract_type,
+                )
+        except Exception as exc:
+            log.warning(
+                "[flow_store] flow_episode PATCH exception: %s (id=%s ticker=%s)",
+                exc, row_id, ticker,
+            )
+        return
 
     row = {
-        "ticker":              signal_data.get("ticker"),
-        "direction":           signal_data.get("direction"),
-        "contract_type":       signal_data.get("contract_type"),
-        "strike":              signal_data.get("strike"),
+        "ticker":              ticker,
+        "direction":           direction,
+        "contract_type":       contract_type,
+        "strike":              strike,
         "expiry":              expiry,
-        "total_premium":       signal_data.get("total_premium"),
+        "total_premium":       new_premium,
         "trade_count":         signal_data.get("trade_count"),
         "alert_level":         signal_data.get("alert_level"),
         "is_accelerating":     signal_data.get("is_accelerating", False),
         "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
         "seed_episode":        signal_data.get("seed_episode"),
-        "signal_ts":           signal_data.get("timestamp"),
+        "signal_ts":           new_ts,
     }
     ok = await _insert_rows("flow_episodes", [row])
     if ok:
-        # LOG-FORMAT fix (2026-05-05): %-style does not support comma thousands-separator.
-        # Pre-format total_premium as an f-string before passing to log.info.
-        prem_str = f"${row['total_premium'] or 0:,.0f}"
+        _episode_stats["created_episodes"] += 1
+        prem_str = f"${new_premium:,.0f}"
         log.info(
-            "[flow_store] flow_episode saved: %s %s strike=%s expiry=%s "
+            "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
             "alert=%s prem=%s multi_day=%s",
-            row["ticker"], row["contract_type"],
-            row["strike"], row["expiry"],
+            ticker, contract_type, strike, expiry,
             row["alert_level"], prem_str,
             row["is_multi_day_repeat"],
         )
@@ -428,7 +602,6 @@ async def _update_episode_multiday(
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            # Step 1: GET the id of the most-recent matching row.
             get_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"{filter_qs}"
@@ -465,7 +638,6 @@ async def _update_episode_multiday(
                 )
                 return
 
-            # Step 2: PATCH exactly that row by its id.
             patch_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"?id=eq.{row_id}"
@@ -526,10 +698,8 @@ async def start_lookback_worker(accumulator) -> None:
     Runs as a persistent background task spawned from main.py lifespan.
     Cancelled cleanly on shutdown via lookback_task.cancel().
     """
-    # Deferred import to avoid circular dependency at module load time.
     from utils.contract_day_cache import get_lookback
 
-    # Resolve multi_day_min_days from accumulator (default 2 per SA deliberation).
     multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
 
     log.info(
@@ -542,8 +712,6 @@ async def start_lookback_worker(accumulator) -> None:
             key = await _lookback_queue.get()
             ticker, contract_type, strike, expiry = key
 
-            # SA-F1 fix: correct attribute name (_dte_tiers, not _dte_premium_tiers)
-            # and correct traversal for List[Tuple[int, Dict[int, float]]] structure.
             try:
                 dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
                 if dte_tiers:
@@ -557,8 +725,6 @@ async def start_lookback_worker(accumulator) -> None:
             except (ValueError, TypeError):
                 min_premium = 10_000.0
 
-            # PBE-F5 fix: log the resolved min_premium so Railway surfaces which
-            # DTE-tier floor is being applied to each lookback fetch.
             log.debug(
                 "[lookback_worker] %s %s $%.0f %s — "
                 "min_premium=%.0f (dte_tiers_found=%s)",
