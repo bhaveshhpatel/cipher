@@ -39,6 +39,15 @@ E-09 geometry note (ING-005 fix, 2026-05-05):
   Gate-2 correctly blocked it. Fixed to use premium=$600,000 (≥ $500k floor).
   The test purpose — confirming neither multiplier (1.0 nor 1.5) breaks an
   above-floor long-DTE trade — is fully preserved.
+
+is_aggressive note (2026-05-06):
+  All events built by _make_event() include is_aggressive=True (default).
+  Without this, _DictEventWrapper defaults is_aggressive=False and Gate-2
+  compares weighted_premium = premium * 0.5 against the DTE-tier floor,
+  silently halving every stated premium and causing false drops on all
+  boundary-pass cases. These tests verify the DTE-tier and OTM-multiplier
+  gates using stated raw premium figures; aggression discounting is a
+  confounding variable that must be excluded.
 """
 from datetime import datetime, timezone
 
@@ -48,7 +57,7 @@ import pytest_asyncio  # noqa: F401 — imported for asyncio_mode compat
 from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_PREMIUM_TIERS
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────────────────────────
 
 def _make_event(
     ticker="SPYTICKER",
@@ -60,6 +69,7 @@ def _make_event(
     underlying_price=500.0,   # strike 600 > price 500 → deep OTM for a call (20%)
     trade_type="TRADE",
     order_side="UNKNOWN",
+    is_aggressive=True,
 ):
     """
     Build a dict-form event for accumulator tests.
@@ -67,6 +77,11 @@ def _make_event(
     Default geometry: call with strike=600 vs underlying=500 (20% OTM).
     That is deep-OTM territory for the 12% threshold in _classify_otm().
     Change `underlying_price` / `strike` to push in/out of OTM region.
+
+    is_aggressive defaults to True so stated premium values map 1-to-1 to
+    weighted_premium in Gate-2 comparisons. Without this, aggression discount
+    (0.5×) halves weighted_premium and masks gate correctness for all
+    boundary-pass tests.
     """
     return {
         "ticker":           ticker,
@@ -79,6 +94,7 @@ def _make_event(
         "trade_type":       trade_type,
         "order_side":       order_side,
         "timestamp":        datetime.now(timezone.utc),
+        "is_aggressive":    is_aggressive,
     }
 
 
