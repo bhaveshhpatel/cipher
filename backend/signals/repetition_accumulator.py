@@ -155,6 +155,16 @@ Backward-compat shims added 2026-05-04 (test-suite alignment):
     kwargs for test-suite backward-compatibility (both stored and used).
   - ingest() async shim with cooldown + Gate-2 delta check.
 
+get_signal() call forms (C-008-7 fix — 2026-05-06):
+  get_signal() now accepts an optional cooldown timedelta as a second
+  positional argument:
+    get_signal(ev)                       # legacy one-arg: delegates ingest_tick
+    get_signal(timestamp, ep=ep)         # two-arg kw: C-008 original form
+    get_signal(timestamp, cooldown, ep)  # three-arg positional: C-008-7 form
+  When cooldown is a timedelta, its total_seconds() overrides
+  self._signal_cooldown_s for this call only. When cooldown is None,
+  self._signal_cooldown_s is used (full backward-compat).
+
 _min_premium_override semantics (2026-05-06 fix — E05/E07 regression):
   _min_premium_override is a FLOOR BASELINE, not a DTE-tier bypass.
   When dte_premium_tiers are present, the effective floor is:
@@ -467,7 +477,6 @@ class RepetitionAccumulator:
         receive the override directly (no tier to compare against).
         """
         if not ep.events:
-            # No events: override is all we have, or 0 if unset.
             return float(self._min_premium_override) if self._min_premium_override is not None else 0.0
 
         # Legacy path: no DTE tiers configured at all.
@@ -547,22 +556,50 @@ class RepetitionAccumulator:
             return "LARGE"
         return "RETAIL"
 
-    async def get_signal(self, ev_or_ts=None, ep: Optional[RepetitionEpisode] = None) -> Optional[RepetitionEpisode]:
+    async def get_signal(
+        self,
+        ev_or_ts=None,
+        cooldown: Optional[timedelta] = None,
+        ep: Optional["RepetitionEpisode"] = None,
+    ) -> Optional["RepetitionEpisode"]:
         """Backward-compat shim.
 
-        C-008 two-arg form: get_signal(timestamp, ep) -> ep if cooldown passed else None.
-        Legacy one-arg form: get_signal(ev) -> delegates to ingest_tick(ev).
+        Supported call forms:
+          get_signal(ev)                        # legacy one-arg: delegates ingest_tick
+          get_signal(timestamp, ep=ep)          # C-008 two-arg kw form
+          get_signal(timestamp, cooldown, ep)   # C-008-7 three-arg positional form
+
+        When cooldown is a timedelta, its total_seconds() is used as the
+        cooldown duration for this call only (overrides self._signal_cooldown_s).
+        When cooldown is None, self._signal_cooldown_s is used.
+
+        IMPORTANT: if the caller passes ep as the second positional arg
+        (old two-arg form without cooldown), it will be received in `cooldown`.
+        Guard: if cooldown is a RepetitionEpisode, treat it as ep (backward-compat).
         """
+        # Guard: old two-arg positional form get_signal(timestamp, ep)
+        # where ep landed in the cooldown slot.
+        if isinstance(cooldown, RepetitionEpisode):
+            ep = cooldown
+            cooldown = None
+
+        cooldown_s: float
+        if isinstance(cooldown, timedelta):
+            cooldown_s = cooldown.total_seconds()
+        else:
+            cooldown_s = self._signal_cooldown_s
+
         if ep is not None and isinstance(ep, RepetitionEpisode):
-            # Two-arg C-008 form: apply cooldown check
+            # Cooldown-gated signal path (C-008 / C-008-7)
             ts = ev_or_ts if isinstance(ev_or_ts, datetime) else datetime.now(timezone.utc)
-            if self._signal_cooldown_s > 0 and ep.last_signal_at is not None:
+            if cooldown_s > 0 and ep.last_signal_at is not None:
                 elapsed = (ts - ep.last_signal_at).total_seconds()
-                if elapsed < self._signal_cooldown_s:
+                if elapsed < cooldown_s:
                     return None
             ep.last_signal_at = ts
             return ep
-        # Legacy one-arg form
+
+        # Legacy one-arg form: delegate to ingest_tick
         return await self.ingest_tick(ev_or_ts)
 
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
