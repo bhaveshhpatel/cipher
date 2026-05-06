@@ -43,8 +43,8 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-004 | Nothing | ✅ MERGED |
 | ING-005 | ING-004 | ✅ MERGED |
 | ING-006 | ING-002 | ✅ MERGED |
-| ING-009 | ING-002, ING-003, ING-006 | ✅ Deliberation COMPLETE 2026-05-05 — cleared for implementation. **Ships before ING-007.** |
-| ING-007 | ING-002, ING-003, ING-006, **ING-009** | ⏳ BLOCKED on ING-009 — deliberation COMPLETE 2026-05-04 |
+| ING-009 | ING-002, ING-003, ING-006 | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35`. **Shipped before ING-007.** |
+| ING-007 | ING-002, ING-003, ING-006, **ING-009** | ✅ ING-009 merged — deliberation COMPLETE 2026-05-04 — **UNBLOCKED. Ready to implement.** Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) |
 | ING-008 | ING-004, ING-005 | 🔴 Deliberation required |
 
 ---
@@ -65,8 +65,8 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-004 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #60 commit `d3c3f31`** |
 | ING-005 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #61 commit `252d75f`** |
 | ING-006 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #62 commit `501b170`** |
-| ING-009 | ✅ COMPLETE (2026-05-05) — all decisions recorded in sprint doc. Branch `ing/s9-episode-upsert` ready. Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75). **MUST ship before ING-007.** |
-| ING-007 | ✅ COMPLETE (2026-05-04) — all decisions recorded in sprint doc. Branch `ing/s7-multiday-repeat` ready. Issue #70. ⏳ **BLOCKED on ING-009 merge.** |
+| ING-009 | ✅ COMPLETE (2026-05-05) — all decisions recorded in sprint doc. **MERGED PR #76 commit `9ceee35` (2026-05-06).** Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed. |
+| ING-007 | ✅ COMPLETE (2026-05-04) — all decisions recorded in sprint doc. Branch `ing/s7-multiday-repeat` ready. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70). ✅ **UNBLOCKED — ING-009 merged 2026-05-06.** |
 | ING-008 | 🔴 NOT STARTED — blocked on ING-005 ✅ + deliberation required |
 
 > For ING-002 through ING-009: deliberation is complete. Do not re-litigate any decisions.
@@ -186,7 +186,7 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 6. **Hardcoded floors are safe defaults, not tech debt.** ING-002's `_MIN_EVENT_PREMIUM = 10_000` is intentional architecture. Do not move to DB config until ING-002-CONFIG is in scope.
 7. **ING-007 Supabase migration is a hard prerequisite.** Run `EXPLAIN ANALYZE` and confirm index hit before writing any Python for the lookback query.
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
-9. **ING-009 must merge before ING-007 implementation begins.** `flow_episodes` must be correctly aggregated before `get_contract_prior_days()` is reliable.
+9. **ING-009 merged 2026-05-06 (PR #76 commit `9ceee35`).** `flow_episodes` is correctly aggregated. ING-007 implementation may now begin.
 
 ---
 
@@ -275,11 +275,11 @@ POST-MERGE
 | ING-004 | Fallback `underlying_price` from registry | ✅ MERGED 2026-05-03 — PR #60 commit `d3c3f31` | `ing/s4-underlying-price-fallback` |
 | ING-005 | Align OTM band thresholds | ✅ MERGED 2026-05-03 — PR #61 commit `252d75f` | `ing/s5-otm-threshold-align` |
 | ING-006 | Directional aggression weighting on premium floor | ✅ MERGED 2026-05-04 — PR #62 commit `501b170` | `ing/s6-directional-aggression` |
-| ING-009 | Same-session flow episode upsert/merge | 🔴 Deliberation COMPLETE 2026-05-05 — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — ready for implementation | `ing/s9-episode-upsert` |
-| ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ⏳ BLOCKED on ING-009 — Deliberation COMPLETE 2026-05-04 — Issue #70 | `ing/s7-multiday-repeat` |
+| ING-009 | Same-session flow episode upsert/merge | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed | `ing/s9-episode-upsert` |
+| ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ UNBLOCKED 2026-05-06 — Deliberation COMPLETE 2026-05-04 — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ready to implement | `ing/s7-multiday-repeat` |
 | ING-008 | Volume vs. OI gate | 🔴 Deliberation required | `ing/s8-vol-oi-gate` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-05 (ING-009 3-way deliberation complete; Issue #75; branch `ing/s9-episode-upsert` ready — ING-007 blocked on ING-009 merge) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-009 merged PR #76 commit `9ceee35`; Issue #75 closed; ING-007 unblocked — ready to implement) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
