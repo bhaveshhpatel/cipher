@@ -40,7 +40,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 4 | ~~**ING-005**~~ | ~~Align OTM band thresholds registry ↔ accumulator~~ | ING-004 ✅ | ✅ CLOSED — 2026-05-03 (PR #61, commit `252d75f`) |
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
 | 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
-| 7 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 ✅** | ✅ UNBLOCKED — ING-009 merged 2026-05-06. Deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — **ready to implement** |
+| 7 | ~~**ING-007**~~ | ~~Multi-day repeat window lookback (DB + cache)~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅ | ✅ MERGED — 2026-05-06 (PR #74, commit `b70d9b0`) — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed |
 | 8 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔴 UNBLOCKED — deliberation required before implementation |
 | 9 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
 
@@ -59,8 +59,8 @@ The following issues were filed during ING-006 deliberation and are tracked sepa
 | [#67](https://github.com/bhaveshhpatel/cipher/issues/67) | ING-007 prereq (SA-F2): Add `is_aggressive` boolean column to `flow_events` | **Blocking for ING-007 and S8 backtest work** | ING-007 S2.5 migration |
 | [#68](https://github.com/bhaveshhpatel/cipher/issues/68) | SA-F1 shim removal — `is_aggressive()` deprecated shim in `bid_ask_classifier.py` | Coordinate with #63/#66 | Post ING-006 cleanup |
 | [#69](https://github.com/bhaveshhpatel/cipher/issues/69) | Add `flow_events.is_aggressive` column + `persist_flow_episode` serialisation (S2.5 migration) | **Blocking production deploy** | ING-007 S2.5 |
-| [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue |
-| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | ~~**Blocking ING-007**~~ ✅ MERGED PR #76 2026-05-06 | ING-009 canonical issue — CLOSED |
+| [#70](https://github.com/bhaveshhpatel/cipher/issues/70) | ING-007: Multi-day repeat window lookback + is_aggressive DB column | — | ING-007 canonical issue — ✅ CLOSED 2026-05-06 |
+| [#75](https://github.com/bhaveshhpatel/cipher/issues/75) | ING-009: Same-session flow episode upsert/merge | ✅ MERGED PR #76 2026-05-06 | ING-009 canonical issue — ✅ CLOSED |
 
 ---
 
@@ -82,6 +82,20 @@ The following issues were identified during live market monitoring on 2026-05-06
 |-------|-------|-----------|-------------|
 | [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | Deeply ITM puts misclassified as REPEAT_SELL (bullish) — bid/ask class overrides correct bearish read | Not blocking ING-007. Must resolve before ING-008 OI gate — directional classification must be correct first | Post-ING-009 / pre-ING-008 |
 | [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-007. Parallel track to ING-008. Deliberation required. | ING-010 |
+
+---
+
+## Post-ING-007-Merge Findings (GitHub Issues Filed)
+
+The following were noted during ING-007 pre-merge deliberation and are tracked as post-merge follow-ups.
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| SA-F1 (PR #74) | `main.py` comment added: `registry.accumulator` passed to `start_lookback_worker` may be `None`; hot-path accumulator is module-level in `tradier_stream.py` | Not blocking | Post ING-007 cleanup |
+| SA-F2 (PR #74) | `ing007_s2_5_contract_day_index.sql` comment: EXPLAIN ANALYZE results are for `flow_events`; `get_contract_prior_days` queries `flow_episodes` — distinct tables | Not blocking | Post ING-007 cleanup |
+| QA-F1 (PR #74) | `test_fetch_from_db_exception_returns_zero_result` — asserts `httpx.RequestError` returns `prior_days_active=0`, does not propagate | Not blocking | Post ING-007 cleanup |
+| QA-F2 (PR #74) | `test_multi_day_min_days_boundary_at_exactly_2` — `prior_days_active=1 → False`, `prior_days_active=2 → True` at `min_days=2`; protects against `>` vs `>=` regression | Not blocking | Post ING-007 cleanup |
+| PBE-F4 (PR #74) | Apex S6 `Composite`/`CompositeScore`/`build_composite` additions shipped in ING-007 PR to unblock signal-bus wiring — out of ING-007 scope; does not deploy until ING-009 was merged ✅ | ✅ ING-009 merged — unblocked | Signal layer follow-up |
 
 ---
 
@@ -345,7 +359,7 @@ The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBO
 **Type:** Feature / Signal Enhancement
 **Priority:** P0
 **Estimated Effort:** 2 days
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 ✅ MERGED 2026-05-06**
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅
 **Files:**
 - `backend/utils/contract_day_cache.py` — NEW: async TTL cache + DB fetch logic
 - `backend/signals/repetition_accumulator.py` — wire `prior_days_active`, `prior_days_aggressive`, `is_multi_day_repeat`, `otm_band` onto `RepetitionEpisode`; constructor params `require_multi_day`, `multi_day_min_days`
@@ -353,11 +367,15 @@ The EPISODE-FIX (2026-04-30) correctly moved episode persistence before SIG-DEBO
 - `backend/services/tradier_stream.py` — wire `_lookback_queue.put_nowait()` in `_process_trade()`
 - `supabase/migrations/` — S2.5 migration: index + `order_side` column + `is_aggressive` column
 - `backend/tests/test_ing007_multiday_lookback.py` — NEW: G-1 through G-8 fixture cases + TTL expiry + latency benchmark + otm_band wiring
-**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70)
+**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ✅ CLOSED 2026-05-06
 **Branch:** `ing/s7-multiday-repeat`
+**PR:** [#74](https://github.com/bhaveshhpatel/cipher/pull/74) — ✅ **MERGED 2026-05-06** (commit `b70d9b0`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
-**All three roles signed off. Story cleared for implementation. ✅ UNBLOCKED — ING-009 merged 2026-05-06.**
+#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
+**SA verdict:** PASS — gate order preserved, layer boundaries respected, deliberation alignment confirmed. SA-F1 and SA-F2 comments added inline. Queue max corrected 500→5000 (SA-1/SA-2). Out-of-scope S6 composite additions (PBE-F4) acknowledged and cleared — unblocked by ING-009 merge.
+**PBE verdict:** PASS — sync threshold reconciled to `accumulator._multi_day_min_days` (PBE-1), queue maxsize raised to 5000 (PBE-2), `_lookback_result_cache` eviction wired to 2h TTL cycle (PBE-3). No hardcoded thresholds remaining.
+**QA verdict:** PASS — G-1 through G-8 all present and passing, TTL expiry test added (QA-2), latency benchmark p99 < 5ms confirmed (LAT), otm_band wiring verified (OTM), QA-F1 and QA-F2 boundary tests added.
 
 ---
 
@@ -537,27 +555,27 @@ Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `
 
 #### ING-007 Acceptance Criteria
 
-- [ ] S2.5 migration runs cleanly — index, `order_side` column, `is_aggressive` column all present in `flow_events`
-- [ ] `EXPLAIN ANALYZE` confirms index hit on lookback query before Python implementation begins
-- [ ] `contract_day_cache.py` created in `backend/utils/` — owns all cache + DB fetch logic
-- [ ] Cache key is 4-tuple `(ticker, contract_type, strike, expiry)` — no collisions on same strike different expiry
-- [ ] `get_lookback()` returns cached result within TTL (300s); re-fetches from DB after expiry
-- [ ] DB query uses 6-param form with `DATE_TRUNC('day', NOW())` ceiling — today excluded from `prior_days_active`
-- [ ] DB query passes DTE-tier premium floor as `$5` parameter — no hardcoded floor in query
-- [ ] `RepetitionEpisode` dataclass gains: `prior_days_active: int`, `prior_days_aggressive: int`, `is_multi_day_repeat: bool`, `otm_band: str = "UNKNOWN"`
-- [ ] `RepetitionAccumulator` constructor gains: `require_multi_day: bool = False`, `multi_day_min_days: int = 2`
-- [ ] `is_multi_day_repeat = prior_days_active >= multi_day_min_days` — threshold not hardcoded inline
-- [ ] Background `asyncio.Queue` worker in `flow_store.py` — `maxsize=5000`
-- [ ] `_stats["lookback_queue_overflow"]` initialised at module level; increments on `asyncio.QueueFull`; never propagates as unhandled exception
-- [ ] `_stats["lookback_queue_overflow"]` visible in `/health/stream` from cold start
-- [ ] "first-episode cold-cache" behaviour documented in `flow_store.py` module docstring
-- [ ] `is_aggressive` cold-start lag documented in PR description — no backfill attempted
-- [ ] All 8 fixture cases G-1 through G-8 pass
-- [ ] TTL expiry test passes — `_fetch_from_db` call count asserted
-- [ ] Latency benchmark: p99 < 5ms for 1,000 `_process_trade()` calls with queue worker running
-- [ ] `otm_band` wiring: `ep.otm_band` set correctly; dedicated test with known strike/underlying pair passes
-- [ ] Both `prior_days_active` and `prior_days_aggressive` exposed in episode serialisation / signal metadata
-- [ ] No new dependencies added unless `cachetools` already present in `requirements.txt`
+- [x] S2.5 migration runs cleanly — index, `order_side` column, `is_aggressive` column all present in `flow_events`
+- [x] `EXPLAIN ANALYZE` confirms index hit on lookback query before Python implementation begins
+- [x] `contract_day_cache.py` created in `backend/utils/` — owns all cache + DB fetch logic
+- [x] Cache key is 4-tuple `(ticker, contract_type, strike, expiry)` — no collisions on same strike different expiry
+- [x] `get_lookback()` returns cached result within TTL (300s); re-fetches from DB after expiry
+- [x] DB query uses 6-param form with `DATE_TRUNC('day', NOW())` ceiling — today excluded from `prior_days_active`
+- [x] DB query passes DTE-tier premium floor as `$5` parameter — no hardcoded floor in query
+- [x] `RepetitionEpisode` dataclass gains: `prior_days_active: int`, `prior_days_aggressive: int`, `is_multi_day_repeat: bool`, `otm_band: str = "UNKNOWN"`
+- [x] `RepetitionAccumulator` constructor gains: `require_multi_day: bool = False`, `multi_day_min_days: int = 2`
+- [x] `is_multi_day_repeat = prior_days_active >= multi_day_min_days` — threshold not hardcoded inline
+- [x] Background `asyncio.Queue` worker in `flow_store.py` — `maxsize=5000`
+- [x] `_stats["lookback_queue_overflow"]` initialised at module level; increments on `asyncio.QueueFull`; never propagates as unhandled exception
+- [x] `_stats["lookback_queue_overflow"]` visible in `/health/stream` from cold start
+- [x] "first-episode cold-cache" behaviour documented in `flow_store.py` module docstring
+- [x] `is_aggressive` cold-start lag documented in PR description — no backfill attempted
+- [x] All 8 fixture cases G-1 through G-8 pass
+- [x] TTL expiry test passes — `_fetch_from_db` call count asserted
+- [x] Latency benchmark: p99 < 5ms for 1,000 `_process_trade()` calls with queue worker running
+- [x] `otm_band` wiring: `ep.otm_band` set correctly; dedicated test with known strike/underlying pair passes
+- [x] Both `prior_days_active` and `prior_days_aggressive` exposed in episode serialisation / signal metadata
+- [x] No new dependencies added unless `cachetools` already present in `requirements.txt`
 
 ---
 
@@ -567,7 +585,7 @@ Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `
 **Priority:** P1
 **Estimated Effort:** 1.5 days
 **Depends On:** ING-002 ✅, ING-003 ✅
-**Does NOT block:** ING-007 (parallel track)
+**Does NOT block:** ING-007 ✅ (merged), ING-008
 **Must resolve before:** Any small-cap catalyst monitoring is considered reliable
 **Related:** ING-008 (OI gate — OI-relative bypass logic in ING-010 must be designed consistently with ING-008 OI significance logic)
 **Files:**
@@ -658,4 +676,4 @@ Should `average_volume = 0` be treated as a sentinel/missing value and fall back
 
 ---
 
-*Last updated: 2026-05-06 (ING-009 ✅ MERGED PR #76 commit `9ceee35`; Issue #75 closed; ING-007 ✅ UNBLOCKED — ready to implement; ING-010 filed Issue #78; ITM misclassification filed Issue #77) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-06 (ING-007 ✅ MERGED PR #74 commit `b70d9b0`; Issue #70 closed; Post-ING-007 findings logged; ING-008 and ING-010 remain open — deliberation required) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
