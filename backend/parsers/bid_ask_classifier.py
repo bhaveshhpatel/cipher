@@ -4,13 +4,18 @@ based on fill price relative to the bid/ask spread.
 
 ING-006: Added is_directionally_aggressive() which replaces is_aggressive()
   in the parser hot path. The new function considers both bid_ask_class AND
-  contract_type so that put/call selling at the bid is correctly identified
+  contract_type so that put selling at the bid is correctly identified
   as conviction directional flow — not passive.
 
-  AT_ASK / ABOVE_ASK  -> True  (buyer paying up, unconditional)
-  AT_BID / BELOW_BID  -> True  (seller writing at bid — conviction on both
-                                 PUT and CALL sides per ING-001 resolution)
-  MID                 -> False (passive / ambiguous)
+  AT_ASK / ABOVE_ASK           -> True  (buyer paying up, unconditional)
+  AT_BID / BELOW_BID  on PUT   -> True  (put seller writing at bid is confirmed
+                                          bullish positioning — sell put = agree
+                                          to buy at strike, intent unambiguous)
+  AT_BID / BELOW_BID  on CALL  -> False (ambiguous — Tradier timesale carries no
+                                          order-side data; AT_BID CALL is equally
+                                          a passive limit buy or a seller writing;
+                                          cannot flag aggressive without confirmation)
+  MID                          -> False (passive / ambiguous)
 
   is_aggressive(trade_type) is retained as a deprecated shim.
   Do not remove until all callers are audited (ING-006 AC).
@@ -79,8 +84,9 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
       the bid or ask will now classify as AT_BID or AT_ASK instead of
       MID. These fills were ambiguous under the old logic; they are now
       treated as directional. This increases the count of events where
-      is_directionally_aggressive() returns True for AT_BID/AT_ASK fills,
-      which feeds directly into RepetitionEpisode.weighted_premium.
+      is_directionally_aggressive() returns True for AT_ASK fills and
+      AT_BID PUT fills, which feeds directly into
+      RepetitionEpisode.weighted_premium.
 
     Test coverage: TestClassifyBidAsk in test_ing006_directional_aggression.py
     covers the 8-case boundary table for this implementation.
@@ -104,14 +110,26 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     ING-006: Directional aggression classification.
 
     Replaces is_aggressive(trade_type) in the parser hot path.
-    Considers bid_ask_class AND contract_type per ING-001 resolution:
+    Considers bid_ask_class AND contract_type:
 
-      AT_ASK / ABOVE_ASK  -> True  unconditionally (buyer paying up)
-      AT_BID / BELOW_BID  -> True  on PUT: put seller writing at bid
-                                          = conviction bullish positioning
-                             True  on CALL: call seller writing at bid
-                                          = conviction bearish positioning
-      MID                 -> False (passive / ambiguous)
+      AT_ASK / ABOVE_ASK           -> True  unconditionally (buyer paying up)
+      AT_BID / BELOW_BID  on PUT   -> True  (put seller at bid = confirmed bullish
+                                              position writer; sell put = agree to
+                                              buy at strike; intent unambiguous)
+      AT_BID / BELOW_BID  on CALL  -> False (ambiguous; Tradier timesale has no
+                                              order-side data; could be passive
+                                              limit buy or seller writing — cannot
+                                              assert aggression without confirmation)
+      MID                          -> False (passive / ambiguous)
+
+    Rationale for PUT-only AT_BID aggression:
+      Tradier timesale events do not expose order-side (buyer-initiated vs
+      seller-initiated). For PUT contracts, a fill at bid has a single coherent
+      directional interpretation: a put seller writing at bid is bullish (agreeing
+      to buy the underlying at strike). For CALL contracts the same fill placement
+      is genuinely ambiguous — it could be a limit buyer whose order was met or a
+      call writer — so we default to False and require explicit order-side data
+      (S2 order_side_classifier scope) before flagging CALL AT_BID as aggressive.
 
     No size threshold here — ING-002 $10k per-event floor is the correct
     upstream guard. By the time this runs the event has already cleared $10k
@@ -120,22 +138,15 @@ def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
     TEMPORARY LOCATION: This function belongs in order_side_classifier.py
     (S2 scope). Migration tracked in GitHub Issue filed 2026-05-03 and
     SPRINT_WSJ_INGESTION_ALIGNMENT.md ING-006 SA-F1 resolution row.
-    Do not add TODO comments here — the issue is the tracking mechanism
-    (Rule 6 Constraint 3, SA-F1 deliberation fix 2026-05-03).
     """
     ba    = (bid_ask_class or "").strip().upper()
     ctype = (contract_type or "").strip().upper()
     if ba in ("AT_ASK", "ABOVE_ASK"):
-        # PBE-F2 (2026-05-03): AT_ASK/ABOVE_ASK are unconditional — a buyer
-        # paying up (or above) the ask is directionally aggressive regardless
-        # of contract type. ctype is intentionally not checked here.
+        # Buyer paying at or above ask — always aggressive regardless of contract type.
         return True
-    if ba in ("AT_BID", "BELOW_BID") and ctype in ("PUT", "CALL"):
-        # Seller writing at or below bid on a known contract type.
-        # ctype="" / unknown safely falls through to return False below —
-        # we require a confirmed PUT or CALL before flagging seller-side
-        # aggression, since an unknown contract type has no directional meaning.
-        # (PBE-F2 intentional safe default, 2026-05-03)
+    if ba in ("AT_BID", "BELOW_BID") and ctype == "PUT":
+        # Put seller writing at or below bid — confirmed bullish position writer.
+        # CALL at bid is intentionally excluded (ambiguous without order-side data).
         return True
     return False
 
