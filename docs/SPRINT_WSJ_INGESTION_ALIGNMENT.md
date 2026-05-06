@@ -42,6 +42,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
 | 7 | **ING-007** | Multi-day repeat window lookback (DB + cache) | ING-002 ✅, ING-003 ✅, ING-006 ✅, **ING-009 ✅** | ✅ UNBLOCKED — ING-009 merged 2026-05-06. Deliberation ✅ COMPLETE 2026-05-04. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — **ready to implement** |
 | 8 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅ | 🔴 UNBLOCKED — deliberation required before implementation |
+| 9 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
 
 ---
 
@@ -70,6 +71,17 @@ The following observation was noted during the ING-009 pre-merge deliberation (2
 | Issue | Title | Blocking? | Sprint Slot |
 |-------|-------|-----------|-------------|
 | Filed post-merge | `_lookup_open_episode` exception branch has no isolated unit test — the E-8 test mocks the entire function; the internal `except` block in the implementation is not independently exercised | Not blocking ING-007 | Post ING-009 cleanup |
+
+---
+
+## Post-ING-009 Live Session Findings (2026-05-06)
+
+The following issues were identified during live market monitoring on 2026-05-06 after ING-009 merged.
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | Deeply ITM puts misclassified as REPEAT_SELL (bullish) — bid/ask class overrides correct bearish read | Not blocking ING-007. Must resolve before ING-008 OI gate — directional classification must be correct first | Post-ING-009 / pre-ING-008 |
+| [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-007. Parallel track to ING-008. Deliberation required. | ING-010 |
 
 ---
 
@@ -549,4 +561,101 @@ Dedicated test required: seed a known `strike`/`underlying_price` pair, assert `
 
 ---
 
-*Last updated: 2026-05-06 (ING-009 ✅ MERGED PR #76 commit `9ceee35`; Issue #75 closed; ING-007 ✅ UNBLOCKED — ready to implement) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+### ING-010 — Tier-Aware Min-Premium Floor + OI-Relative Bypass Gate
+
+**Type:** Feature / Signal Quality
+**Priority:** P1
+**Estimated Effort:** 1.5 days
+**Depends On:** ING-002 ✅, ING-003 ✅
+**Does NOT block:** ING-007 (parallel track)
+**Must resolve before:** Any small-cap catalyst monitoring is considered reliable
+**Related:** ING-008 (OI gate — OI-relative bypass logic in ING-010 must be designed consistently with ING-008 OI significance logic)
+**Files:**
+- `backend/parsers/options_flow_parser.py` — tier-aware floor lookup + OI-relative bypass gate
+- `backend/services/options_universe.py` (or equivalent) — expose `tier`, `open_interest`, `average_volume` per symbol to parser
+- `backend/tests/test_ing010_tier_floor.py` — NEW: full test matrix
+**GitHub Issue:** [#78](https://github.com/bhaveshhpatel/cipher/issues/78)
+**Branch:** `ing/s10-tier-floor` *(not yet created)*
+
+#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION (SA · PBE · QA)
+
+#### Problem
+
+The flat DTE-adjusted min-premium floor silently drops **all** options prints for low-price and low-OI tickers before they reach the accumulator. These tickers are `stream_eligible = true` in `options_universe_symbols` and are actively subscribed on the Tradier stream, but zero events are persisted or gated — they vanish at the `belowminpremium` funnel counter with no per-ticker logging.
+
+**Observed instances (2026-05-06):**
+
+| Ticker | last_price | open_interest | avg_volume | tier | Flow today |
+|--------|-----------|---------------|------------|------|------------|
+| GDYN   | $6.10     | 380           | 1,613,139  | 3    | 0 events   |
+| PENG   | $36.45    | 1,422         | 0 (bug)    | 3    | 0 events   |
+
+A 100-lot on GDYN = 26% of total open interest — a WSJ Steamroom-level signal by any relative measure. The current system cannot see it.
+
+**Logging gap:** `belowminpremium` is an opaque aggregate counter. There is no per-ticker logging at this drop stage. It is impossible to confirm from current logs whether any specific ticker is being dropped here or simply absent from the tape.
+
+#### Proposed Options
+
+**Option A — Tier-Based Floor Override** *(lowest risk — ship first)*
+```python
+TIER_FLOORS = {
+    1: 50_000,   # large-cap
+    2: 25_000,   # mid-cap
+    3: 5_000,    # small-cap — GDYN, PENG land here
+}
+min_floor = TIER_FLOORS.get(symbol_tier, DEFAULT_FLOOR)
+```
+Uses existing `tier` field. Zero impact on Tier 1/2 signal quality.
+
+**Option B — OI-Relative Bypass Gate** *(most signal-accurate — medium-term)*
+```python
+OI_SIGNIFICANCE_THRESHOLD = 0.05  # 5% of total OI
+if open_interest > 0 and (size / open_interest) >= OI_SIGNIFICANCE_THRESHOLD:
+    bypass_premium_floor = True
+```
+For GDYN (380 OI): any 20-lot passes. For NVDA (millions OI): threshold never triggers.
+
+**Option C — Relative Premium Floor** *(most generalizable)*
+```python
+min_premium = max(
+    BASE_FLOOR,
+    underlying_price * size * RELATIVE_MULTIPLIER
+)
+```
+Eliminates structural disadvantage for cheap stocks without manual tier calibration.
+
+**Option D — Per-Ticker Debug Logging at Drop Stage** *(prerequisite for all)*
+```python
+if premium < min_premium_floor:
+    logger.debug(f"belowminpremium {ticker} {contract_type} {strike} dte{dte} prem{premium} floor{min_premium_floor}")
+```
+Gate behind `DEBUG` level or configured watchlist. Required to validate any fix.
+
+**Option E — Fix `average_volume = 0` Bug for PENG**
+PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh failure. If DTE-adjusted floor uses `average_volume` in its calculation, a zero value may produce an undefined or inflated floor for this name. Needs investigation independent of the broader floor logic.
+
+#### Deliberations Required (3-Way: SA · PBE · QA)
+
+**D1 — Which options to implement, and in what order?**
+Option A (tier-based floor) is lowest risk and immediately actionable. Options B and C are more principled but require more validation. Recommendation is A as fast-follow, B as medium-term gate — but this needs sign-off on whether A alone is sufficient or if B must ship together to avoid Tier 3 noise flooding the accumulator on volatile penny-option names (meme stocks).
+
+**D2 — Tier 3 floor value:**
+`$5,000` is the proposed starting point. Needs validation against historical Tier 3 tape data. The OI-relative gate (Option B) may be a required co-guard to prevent meme stock noise if the floor is lowered without a size-relative check.
+
+**D3 — `average_volume = 0` handling:**
+Should `average_volume = 0` be treated as a sentinel/missing value and fall back to a safe default floor, or should it block `stream_eligible` until fixed? If the DTE-adjusted floor calculation multiplies or divides by `average_volume`, a zero value could produce incorrect floors silently for any ticker with a refresh failure.
+
+#### Acceptance Criteria
+
+- [ ] D1, D2, D3 deliberations resolved and documented inline (SA + PBE + QA sign-off)
+- [ ] Option D (per-ticker debug logging at `belowminpremium`) shipped as prerequisite
+- [ ] At least one of Options A/B/C implemented per D1 resolution
+- [ ] GDYN and PENG flow events begin appearing in `flow_events` after fix (manual verification on a live session)
+- [ ] `average_volume = 0` sentinel handling added to universe refresh and/or floor calculation
+- [ ] Existing Tier 1/2 signal quality unaffected — no new noise on NVDA, AMD, AAPL, SPY
+- [ ] Unit tests: Tier 3 print below flat floor but above tier floor (should pass); OI bypass gate at 5% threshold; `average_volume = 0` fallback behaviour
+- [ ] All new `_stats` keys initialised at module level — cold-start safe
+
+---
+
+*Last updated: 2026-05-06 (ING-009 ✅ MERGED PR #76 commit `9ceee35`; Issue #75 closed; ING-007 ✅ UNBLOCKED — ready to implement; ING-010 filed Issue #78; ITM misclassification filed Issue #77) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
