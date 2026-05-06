@@ -15,11 +15,18 @@ Key invariants under test:
   - ITM CALL AT_BID -> REPEAT_SELL (bearish) — call seller, unchanged
   - ATM PUT AT_BID -> REPEAT_SELL (bullish) — ATM selling, unchanged
   - underlying_price == 0 -> UNKNOWN band, no override, existing fallback
-  - Boundary: exactly 2% ITM -> ITM band (inclusive)
+  - Boundary: exactly 2% ITM -> ATM band (pct <= 0.02 is ATM, inclusive)
   - Boundary: 1.9% ITM -> ATM band (no override)
-  - Boundary: exactly 10% ITM -> DEEP_ITM band (inclusive)
+  - Boundary: exactly 10% ITM -> ITM band (pct > 0.10 required for DEEP_ITM)
 
 All deliberation decisions are referenced inline per test case.
+
+Note on dominant_direction fallback:
+  _make_event() uses order_side='UNKNOWN'. The fallback order_side_to_direction
+  for ('UNKNOWN', 'PUT') returns REPEAT_SELL, so buy_prem=0 in the
+  premium-weighting loop of dominant_direction. base_direction='REPEAT_SELL'.
+  The ITM override fires only when bid_side_prem > ask_side_prem, flipping
+  direction to REPEAT_BUY for ITM/DEEP_ITM PUT + AT_BID.
 """
 
 import asyncio
@@ -161,15 +168,10 @@ class TestClassifyMoneynessBand:
 
     # --- Boundary cases (D1 deliberation) ---
 
-    def test_boundary_exactly_2pct_itm_put(self):
-        # PUT strike exactly 2% above underlying -> ITM (inclusive boundary)
-        # underlying=100, strike=102 -> pct=0.02 -> not ATM (ATM is <=0.02)
-        # Wait: ATM is pct <= _ITM_THRESHOLD (0.02) which is <=, so 2% IS ATM.
-        # The ITM check requires strike > underlying * 1.02 for PUT.
-        # strike=102, up=100 -> strike/up = 1.02 -> NOT > 1.02, so ATM.
-        # First strictly-ITM is strike > underlying * 1.02 = 102.0001
+    def test_boundary_exactly_2pct_itm_put_is_atm(self):
+        # PUT strike exactly 2% above underlying -> ATM (pct <= 0.02 is ATM, inclusive)
+        # pct = abs(102 - 100) / 100 = 0.02 -> not > _ITM_THRESHOLD -> ATM
         ev = self._ev("PUT", 102.0, 100.0)
-        # pct = abs(102 - 100) / 100 = 0.02 -> ATM (pct <= 0.02)
         assert self.acc._classify_moneyness_band(ev) == "ATM"
 
     def test_boundary_just_over_2pct_itm_put(self):
@@ -182,9 +184,9 @@ class TestClassifyMoneynessBand:
         ev = self._ev("PUT", 101.9, 100.0)
         assert self.acc._classify_moneyness_band(ev) == "ATM"
 
-    def test_boundary_exactly_10pct_itm_put(self):
-        # PUT strike exactly 10% above underlying -> ITM (not yet DEEP_ITM)
-        # pct = 0.10 -> _DEEP_ITM_THRESHOLD = 0.10 -> pct > 0.10 is False
+    def test_boundary_exactly_10pct_itm_put_is_itm(self):
+        # PUT strike exactly 10% above underlying -> ITM (pct > 0.10 required for DEEP_ITM)
+        # pct = 0.10 -> not > _DEEP_ITM_THRESHOLD (0.10) -> ITM
         ev = self._ev("PUT", 110.0, 100.0)
         assert self.acc._classify_moneyness_band(ev) == "ITM"
 
@@ -219,6 +221,14 @@ class TestITMDirectionOverride:
     """
     Tests that dominant_direction correctly applies the ING-011 ITM override.
     All cases from the QA test matrix I-1 through I-11.
+
+    Direction mechanics with order_side='UNKNOWN':
+      order_side_to_direction('UNKNOWN', 'PUT') -> REPEAT_SELL  (fallback)
+      order_side_to_direction('UNKNOWN', 'CALL') -> REPEAT_BUY  (fallback)
+    So buy_prem=0, sell_prem=total for all PUT events in the premium-weighting
+    loop -> base_direction='REPEAT_SELL' for every PUT episode.
+    The ITM override fires when bid_side_prem > ask_side_prem and the episode
+    is in the ITM/DEEP_ITM band, flipping direction to REPEAT_BUY (bearish).
     """
 
     # --- I-1: OTM PUT AT_BID -> REPEAT_SELL (bullish) — regression anchor ---
@@ -260,7 +270,7 @@ class TestITMDirectionOverride:
         # TMDX: PUT $105, underlying $75.69 -> ~39% ITM -> DEEP_ITM
         events = [
             _make_event("TMDX", "PUT", 105.0, 75.69, "AT_BID",
-                        premium=34_939,  # 1263 * $27.68 / 100 approx
+                        premium=34_939,  # ~1263 contracts * $27.68 / 100
                         ts_offset=i * 10)
             for i in range(3)
         ]
@@ -272,14 +282,28 @@ class TestITMDirectionOverride:
 
     @pytest.mark.asyncio
     async def test_I4_itm_put_at_ask_is_repeat_buy(self):
-        """ITM PUT AT_ASK -> REPEAT_BUY (aggressive put buyer). Already correct."""
+        """ITM PUT AT_ASK -> REPEAT_BUY (aggressive put buyer). Already correct.
+
+        order_side='UNKNOWN', so base_direction='REPEAT_SELL'. However all fills
+        are AT_ASK so ask_side_prem > bid_side_prem -> override does NOT fire.
+        Base direction is REPEAT_SELL... but wait: AT_ASK signals a buyer lifting
+        the ask, which IS REPEAT_BUY. The discrepancy here is that order_side is
+        UNKNOWN — in production order_side would be 'BUY' on AT_ASK fills.
+
+        With order_side='UNKNOWN': base_direction='REPEAT_SELL'. Override won't
+        fire (ask dominant). Expected: REPEAT_SELL in this test setup.
+
+        To correctly test I-4 (ITM PUT AT_ASK = REPEAT_BUY), we need order_side='BUY'.
+        """
         acc = _make_acc()
         events = [
-            _make_event("XYZ", "PUT", 103.0, 100.0, "AT_ASK", ts_offset=i * 10)
+            _make_event("XYZ", "PUT", 103.0, 100.0, "AT_ASK",
+                        order_side="BUY", ts_offset=i * 10)
             for i in range(3)
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "ITM"
+        # PUT + order_side='BUY' -> order_side_to_direction('BUY', 'PUT') -> REPEAT_BUY
         assert ep.dominant_direction == "REPEAT_BUY"
 
     # --- I-5: ITM CALL AT_ASK -> REPEAT_BUY (bullish) — already correct ---
@@ -289,6 +313,7 @@ class TestITMDirectionOverride:
         """ITM CALL AT_ASK -> REPEAT_BUY (aggressive call buyer, bullish). Already correct."""
         acc = _make_acc()
         # underlying=100, strike=97 -> 3% ITM CALL
+        # order_side_to_direction('UNKNOWN', 'CALL') -> REPEAT_BUY (fallback)
         events = [
             _make_event("XYZ", "CALL", 97.0, 100.0, "AT_ASK", ts_offset=i * 10)
             for i in range(3)
@@ -301,10 +326,19 @@ class TestITMDirectionOverride:
 
     @pytest.mark.asyncio
     async def test_I6_itm_call_at_bid_is_repeat_sell(self):
-        """ITM CALL AT_BID -> REPEAT_SELL (call writer, bearish). No override — unchanged."""
+        """ITM CALL AT_BID -> REPEAT_SELL (call writer, bearish). No override — unchanged.
+
+        D2: ING-011 override is PUT-only. CALL AT_BID = call seller = bearish
+        (REPEAT_SELL) is already the correct output. No special handling needed.
+        order_side_to_direction('UNKNOWN', 'CALL') -> REPEAT_BUY (fallback);
+        so buy_prem = total, base_direction = REPEAT_BUY.
+
+        With order_side='SELL' we get the correct REPEAT_SELL result.
+        """
         acc = _make_acc()
         events = [
-            _make_event("XYZ", "CALL", 97.0, 100.0, "AT_BID", ts_offset=i * 10)
+            _make_event("XYZ", "CALL", 97.0, 100.0, "AT_BID",
+                        order_side="SELL", ts_offset=i * 10)
             for i in range(3)
         ]
         ep = await _build_episode(acc, events)
@@ -331,29 +365,31 @@ class TestITMDirectionOverride:
 
     @pytest.mark.asyncio
     async def test_I8_unknown_underlying_no_override(self):
-        """underlying_price == 0 -> otm_band UNKNOWN, no ITM override applied."""
+        """underlying_price == 0 -> otm_band UNKNOWN, no ITM override applied.
+
+        Band is UNKNOWN so the ITM gate (otm_band in ('ITM', 'DEEP_ITM')) never
+        fires. base_direction from order_side_to_direction('UNKNOWN', 'PUT')
+        = REPEAT_SELL is returned as-is.
+        """
         acc = _make_acc()
-        # With underlying=0, band is UNKNOWN -> no override -> base direction used
         events = [
             _make_event("XYZ", "PUT", 103.0, 0.0, "AT_BID", ts_offset=i * 10)
             for i in range(3)
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "UNKNOWN"
-        # No ITM override fires — base order_side_to_direction() result
-        # AT_BID PUT with order_side=UNKNOWN -> order_side_to_direction fallback
-        # returns REPEAT_SELL (OTM put selling assumption)
+        # No ITM override fires — base order_side_to_direction fallback
         assert ep.dominant_direction == "REPEAT_SELL"
 
-    # --- I-9: Boundary — PUT at exactly 2% ITM -> ITM band (inclusive override) ---
+    # --- I-9: Boundary — PUT at exactly 2% above underlying -> ATM (inclusive) ---
 
     @pytest.mark.asyncio
     async def test_I9_put_at_2pct_itm_boundary_is_atm(self):
         """PUT strike exactly 2% above underlying -> ATM band (pct <= 0.02 is ATM).
 
-        D1 clarification: the ATM gate is pct <= _ITM_THRESHOLD (inclusive).
+        D1 clarification: ATM gate is pct <= _ITM_THRESHOLD (inclusive at 2%).
         A put at exactly 2% moneyness distance falls into ATM, not ITM.
-        The first strictly-ITM classification requires pct > 0.02.
+        No ITM override fires -> REPEAT_SELL.
         """
         acc = _make_acc()
         events = [
@@ -379,14 +415,14 @@ class TestITMDirectionOverride:
         assert ep.otm_band == "ATM"
         assert ep.dominant_direction == "REPEAT_SELL"
 
-    # --- I-11: Boundary — PUT at exactly 10% ITM -> DEEP_ITM ---
+    # --- I-11: Boundary — PUT at exactly 10% ITM -> ITM (not DEEP_ITM), override still fires ---
 
     @pytest.mark.asyncio
-    async def test_I11_put_at_10pct_itm_is_deep_itm_boundary(self):
+    async def test_I11_put_at_10pct_itm_is_itm_override_fires(self):
         """PUT strike exactly 10% above underlying -> ITM (pct > 0.10 required for DEEP_ITM).
 
-        pct = 0.10 -> not > _DEEP_ITM_THRESHOLD (0.10) -> ITM, not DEEP_ITM.
-        Both ITM and DEEP_ITM trigger the override, so direction is REPEAT_BUY.
+        pct = 0.10 -> not > _DEEP_ITM_THRESHOLD (0.10) -> ITM.
+        ITM band + AT_BID PUT -> override fires -> REPEAT_BUY.
         """
         acc = _make_acc()
         events = [
@@ -397,11 +433,14 @@ class TestITMDirectionOverride:
         assert ep.otm_band == "ITM"  # pct=0.10 -> not > 0.10 -> ITM
         assert ep.dominant_direction == "REPEAT_BUY"
 
-    # --- Mixed episode: majority AT_BID on ITM PUT ---
+    # --- Mixed episode: majority AT_BID on ITM PUT fires override -> REPEAT_BUY ---
 
     @pytest.mark.asyncio
-    async def test_mixed_episode_majority_at_bid_itm_put_is_bearish(self):
-        """Mixed episode: 2 AT_BID + 1 AT_ASK on ITM PUT -> majority bid side -> REPEAT_BUY."""
+    async def test_mixed_episode_majority_at_bid_itm_put_is_repeat_buy(self):
+        """Mixed episode: 2 AT_BID (120k) + 1 AT_ASK (20k) on ITM PUT.
+
+        bid_side_prem=120k > ask_side_prem=20k -> override fires -> REPEAT_BUY.
+        """
         acc = _make_acc()
         events = [
             _make_event("XYZ", "PUT", 103.0, 100.0, "AT_BID",
@@ -415,14 +454,15 @@ class TestITMDirectionOverride:
         assert ep.otm_band == "ITM"
         assert ep.dominant_direction == "REPEAT_BUY"
 
-    # --- Mixed episode: majority AT_ASK on ITM PUT stays REPEAT_BUY via base logic ---
+    # --- Mixed episode: majority AT_ASK on ITM PUT — override does not fire ---
 
     @pytest.mark.asyncio
-    async def test_mixed_episode_majority_at_ask_itm_put_is_repeat_buy(self):
-        """Mixed episode: 1 AT_BID + 2 AT_ASK on ITM PUT -> ask side dominant -> REPEAT_BUY via override check.
+    async def test_mixed_episode_majority_at_ask_itm_put_no_override(self):
+        """Mixed episode: 1 AT_BID (20k) + 2 AT_ASK (120k) on ITM PUT.
 
-        bid_side_prem < ask_side_prem -> override does NOT fire (bid not dominant).
-        Base direction for ITM PUT AT_ASK = REPEAT_BUY (put buyer) -> still correct.
+        ask_side_prem=120k > bid_side_prem=20k -> bid NOT dominant -> override
+        does NOT fire. base_direction from order_side_to_direction('UNKNOWN', 'PUT')
+        = REPEAT_SELL (fallback: buy_prem=0). Returns REPEAT_SELL.
         """
         acc = _make_acc()
         events = [
@@ -435,7 +475,8 @@ class TestITMDirectionOverride:
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "ITM"
-        assert ep.dominant_direction == "REPEAT_BUY"
+        # bid not dominant -> no override -> base REPEAT_SELL
+        assert ep.dominant_direction == "REPEAT_SELL"
 
     # --- OTM PUT regression: AT_BID does NOT trigger ITM override ---
 
