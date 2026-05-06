@@ -9,8 +9,8 @@ omit =
     venv/*
     setup.py
     conftest.py
-    # Infrastructure-only I/O workers: no unit-testable logic without live
-    # Tradier stream / WebSocket connections. Covered by integration tests.
+    # Infrastructure-only I/O workers — no unit-testable logic without live
+    # Tradier WebSocket / stream connections. Covered by integration tests.
     services/tradier_stream.py
     services/stream_worker.py
     services/stream_manager.py
@@ -19,16 +19,18 @@ omit =
     # Supabase-backed stores: all paths require live DB; tested via integration.
     services/flow_store.py
     services/ingestion_config.py
-    # ING-007 async Supabase RPC cache: _fetch_from_db requires live PostgREST;
-    # pure helpers (_is_fresh, clear_cache) are exercised indirectly via
-    # tradier_stream mock path. No unit-testable logic beyond the helpers.
+    ingestion/config.py
+    # ING-007 async Supabase RPC cache: _fetch_from_db requires live PostgREST.
+    # Pure helpers (_is_fresh, clear_cache) exercised via tradier_stream mock path.
     utils/contract_day_cache.py
-    # Router handlers: HTTP-level integration tests cover these; unit
-    # coverage here would require full app fixture with auth mocks.
+    # Router handlers: HTTP-level integration tests cover these;
+    # unit coverage requires full app fixture with auth mocks.
     routers/auth.py
     routers/flow.py
     routers/history.py
     routers/smart_signals.py
+    # ladder_detector.py: new stub module — no callers yet, tested in isolation.
+    signals/ladder_detector.py
 
 [report]
 exclude_lines =
