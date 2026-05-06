@@ -121,12 +121,28 @@ async def get_lookback(key: ContractKey, min_premium: float) -> LookbackResult:
 
     On DB unavailability or error: returns _ZERO_RESULT and logs a warning.
     The caller (flow_store queue worker) does not propagate exceptions.
+
+    QA-F1 fix (2026-05-06): guard _fetch_from_db call with try/except here.
+    _fetch_from_db has an internal except Exception, but tests that patch
+    _fetch_from_db with a raising side_effect bypass that internal handler
+    entirely — the replacement raises before the real handler runs.
+    Wrapping the call here ensures any exception (real or test-injected)
+    always degrades to _ZERO_RESULT and never reaches _process_trade().
     """
     cached = _cache.get(key)
     if cached is not None and _is_fresh(cached):
         return cached
 
-    result = await _fetch_from_db(key, min_premium)
+    try:
+        result = await _fetch_from_db(key, min_premium)
+    except Exception as exc:
+        log.warning("[contract_day_cache] get_lookback: _fetch_from_db raised: %s", exc)
+        result = LookbackResult(
+            prior_days_active=0,
+            prior_days_aggressive=0,
+            fetched_at=time.monotonic(),
+        )
+
     _cache[key] = result
     return result
 
