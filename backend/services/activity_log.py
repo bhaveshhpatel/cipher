@@ -16,6 +16,9 @@ import asyncio
 import logging
 from typing import Any
 
+from supabase import create_client
+from config import settings
+
 log = logging.getLogger("activity_log")
 
 
@@ -24,8 +27,6 @@ log = logging.getLogger("activity_log")
 # ---------------------------------------------------------------------------
 
 def _insert(email: str, action: str, detail: dict, ip: str | None) -> None:
-    from supabase import create_client
-    from config import settings
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     sb.table("admin_activity_log").insert({
         "admin_email": email,
@@ -48,8 +49,6 @@ def _query(
     Uses PostgREST count='exact' so the client can paginate without a
     separate COUNT(*) round-trip.
     """
-    from supabase import create_client
-    from config import settings
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     q = (
         sb.table("admin_activity_log")
