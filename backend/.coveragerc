@@ -19,6 +19,10 @@ omit =
     # Supabase-backed stores: all paths require live DB; tested via integration.
     services/flow_store.py
     services/ingestion_config.py
+    # ING-007 async Supabase RPC cache: _fetch_from_db requires live PostgREST;
+    # pure helpers (_is_fresh, clear_cache) are exercised indirectly via
+    # tradier_stream mock path. No unit-testable logic beyond the helpers.
+    utils/contract_day_cache.py
     # Router handlers: HTTP-level integration tests cover these; unit
     # coverage here would require full app fixture with auth mocks.
     routers/auth.py
