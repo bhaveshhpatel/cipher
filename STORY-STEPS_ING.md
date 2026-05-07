@@ -45,9 +45,9 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-006 | ING-002 | ✅ MERGED |
 | ING-009 | ING-002, ING-003, ING-006 | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` |
 | ING-007 | ING-002, ING-003, ING-006, ING-009 | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0`. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
-| ING-011 | ING-006 ✅, ING-007 ✅ | 🔴 Deliberation required — **must resolve before ING-008**. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77). |
+| ING-011 | ING-006 ✅, ING-007 ✅ | ✅ MERGED 2026-05-07 — PR #81 commit `8d68ed1`. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed. |
 | ING-011b | ING-011 (moneyness band must exist on events before aggression fix is meaningful) | 🔴 Deliberation required — **do NOT patch `get_weighted_premium()` or `bid_ask_classifier.py` unilaterally**. Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80). Parallel to ING-008. |
-| ING-008 | ING-004 ✅, ING-005 ✅, **ING-011** | 🔴 Deliberation required — blocked on ING-011 (directional classification must be correct first) |
+| ING-008 | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Ready for deliberation — ING-011 blocker cleared. Deliberation required before implementation. |
 | ING-010 | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — parallel track to ING-011/ING-008. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
 
 ---
@@ -70,13 +70,13 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-006 | ✅ COMPLETE (2026-05-03) — all decisions recorded in sprint doc. **MERGED PR #62 commit `501b170`** |
 | ING-009 | ✅ COMPLETE (2026-05-05) — all decisions recorded in sprint doc. **MERGED PR #76 commit `9ceee35` (2026-05-06).** Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed. |
 | ING-007 | ✅ COMPLETE (2026-05-04) — pre-merge panel deliberation COMPLETE (2026-05-06). **MERGED PR #74 commit `b70d9b0` (2026-05-06).** Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
-| ING-011 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77). **Blocks ING-008.** |
+| ING-011 | ✅ COMPLETE (2026-05-06) — D1/D2/D3 resolved. Pre-merge panel deliberation COMPLETE (2026-05-06). All panel findings (SA-F1, QA-F1/QA-F3) resolved inline. **MERGED PR #81 commit `8d68ed1` (2026-05-07).** Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed. |
 | ING-011b | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). Three candidate options (A/B/C) in Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80). Do not patch `get_weighted_premium()` or `bid_ask_classifier.is_directionally_aggressive()` without this record closed. Parallel to ING-008. |
-| ING-008 | 🔴 NOT STARTED — blocked on ING-011. Do not begin deliberation until ING-011 is merged. |
+| ING-008 | ⏳ Ready for deliberation — ING-011 blocker cleared (MERGED 2026-05-07). Deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Do not begin implementation until deliberation is complete. |
 | ING-010 | 🔴 NOT STARTED — deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78). Parallel track — does NOT block ING-011 or ING-008. |
 
-> For ING-002 through ING-007 and ING-009: deliberation is complete. Do not re-litigate any decisions.
-> For ING-011, ING-011b, ING-008, and ING-010: read the open deliberation questions in the sprint doc before writing a single line of code.
+> For ING-002 through ING-007, ING-009, and ING-011: deliberation is complete. Do not re-litigate any decisions.
+> For ING-011b, ING-008, and ING-010: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
 
@@ -127,7 +127,7 @@ Always: branch → commits → PR → deliberation → merge.
 - `ing/s6-directional-aggression` → ING-006
 - `ing/s9-episode-upsert` → ING-009
 - `ing/s7-multiday-repeat` → ING-007 ✅ MERGED PR #74
-- `ing/s11-itm-classification` → ING-011 (Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77))
+- `ing/s11-itm-classification` → ING-011 ✅ MERGED PR #81
 - `ing/s11b-itm-aggression-weight` → ING-011b (Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80))
 - `ing/s10-tier-floor` → ING-010
 
@@ -196,7 +196,7 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 7. **ING-007 Supabase migration is a hard prerequisite.** ✅ SHIPPED — S2.5 migration applied (index + `order_side` + `is_aggressive` columns on `flow_events`). ING-007 MERGED PR #74 commit `b70d9b0` 2026-05-06.
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
 9. **ING-009 merged 2026-05-06 (PR #76 commit `9ceee35`).** `flow_episodes` is correctly aggregated.
-10. **ING-011 deliberation is a hard prerequisite for ING-008.** D1 (ITM threshold), D2 (partial vs full override), and D3 (`otm_band` extension vs separate `itm_band` field) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. ING-008 is **blocked** until ING-011 merges. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77).
+10. **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`).** ✅ `_classify_moneyness_band()` is live on main. `otm_band` TEXT column extended to cover `ITM | DEEP_ITM`. ING-008 deliberation is now unblocked.
 11. **ING-010 deliberation is a hard prerequisite.** D1 (option selection), D2 (Tier 3 floor value), and D3 (`average_volume = 0` handling) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. Option D (per-ticker debug logging at `belowminpremium`) ships first regardless of D1/D2/D3 outcome.
 12. **ING-011b deliberation is a hard prerequisite.** Do NOT patch `get_weighted_premium()` in `repetition_accumulator.py` or `is_directionally_aggressive()` in `bid_ask_classifier.py` for moneyness-aware aggression without the Option A/B/C deliberation outcome recorded and Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed. Patching either function unilaterally risks breaking ING-006 test suite and `prior_days_aggressive` semantics in ING-007.
 
@@ -220,13 +220,15 @@ Immediately after an ING PR merges:
 - Post-merge findings (SA-F1, SA-F2, PBE-F4, QA-F1, QA-F2) logged in sprint doc — confirm `docs/FIXES.md` updated if applicable
 - Confirm `docs/ARCHITECTURE.md` updated if new gates were added by ING-007
 
-**ING-011 specific post-merge steps (in addition to the above):**
-- Confirm TMDX $105P scenario re-run produces correct `BEARISH` direction on the next live session
-- Confirm existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour is unchanged — no OTM regression
-- Update `docs/FIXES.md` with the D1/D2/D3 option decisions
-- Confirm `docs/ARCHITECTURE.md` updated if `otm_band` enum extended or new `itm_band` field added
-- Unblock ING-008 deliberation — update ING-008 row in this file from 🔴 to ⏳
-- Confirm ING-011b (#80) is still open and flagged as the next deliberation item
+**ING-011 specific post-merge steps:**
+- ✅ Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed (state: completed)
+- ✅ `STORY-STEPS_ING.md` updated — dependency chain, deliberation table, Rule 6 constraint 10, Quick Reference all marked ✅. ING-008 unblocked to ⏳.
+- ☐ `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` — mark ING-011 ✅ MERGED, update Quick Reference, record D1/D2/D3 decisions and panel verdicts
+- ☐ `docs/FIXES.md` — add D1/D2/D3 option decisions (ITM threshold=0.02, override PUT-only, otm_band extended in-place)
+- ☐ `docs/ARCHITECTURE.md` — confirm `otm_band` enum extension (`ITM | DEEP_ITM` added) is documented
+- ☐ Confirm TMDX $105P scenario re-run produces correct `BEARISH` direction on next live session
+- ☐ Confirm existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour is unchanged — no OTM regression
+- ☐ Confirm ING-011b (#80) is still open and flagged as next deliberation item
 
 **ING-011b specific post-merge steps (in addition to the above):**
 - Confirm `weighted_premium` for a 3-event ITM PUT AT_BID episode at $200k total premium clears Gate 2 at the same rate as a $100k OTM PUT AT_ASK episode (discount correctly applied)
@@ -317,12 +319,12 @@ POST-MERGE
 | ING-006 | Directional aggression weighting on premium floor | ✅ MERGED 2026-05-04 — PR #62 commit `501b170` | `ing/s6-directional-aggression` |
 | ING-009 | Same-session flow episode upsert/merge | ✅ MERGED 2026-05-06 — PR #76 commit `9ceee35` — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed | `ing/s9-episode-upsert` |
 | ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0` — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed | `ing/s7-multiday-repeat` |
-| ING-011 | ITM put/call misclassification fix | 🔴 Deliberation required — **blocks ING-008** — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | `ing/s11-itm-classification` |
+| ING-011 | ITM put/call moneyness classification + direction override | ✅ MERGED 2026-05-07 — PR #81 commit `8d68ed1` — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed | `ing/s11-itm-classification` |
 | ING-011b | `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | 🔴 Deliberation required — Options A/B/C open — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — parallel to ING-008 | `ing/s11b-itm-aggression-weight` |
-| ING-008 | Volume vs. OI gate | 🔴 Deliberation required — **blocked on ING-011** | `ing/s8-vol-oi-gate` |
+| ING-008 | Volume vs. OI gate | ⏳ Ready for deliberation — ING-011 blocker cleared 2026-05-07 | `ing/s8-vol-oi-gate` |
 | ING-010 | Tier-aware min-premium floor + OI-relative bypass gate | 🔴 Deliberation required (D1/D2/D3 open) — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 | `ing/s10-tier-floor` |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-06 (ING-011b added — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) `is_aggressive` moneyness-blindness for ITM PUT AT_BID episodes, deliberation required, Options A/B/C, parallel to ING-008; Rule 6 constraint 12 added; ING-011b post-merge steps added to Rule 7; Quick Reference updated; branch name `ing/s11b-itm-aggression-weight` reserved) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-07 (ING-011 MERGED PR #81 commit `8d68ed1` — Issue #77 closed; dependency chain updated ✅; deliberation table updated ✅; Rule 6 constraint 10 updated to reflect merge; ING-008 unblocked ⏳; Quick Reference updated ✅) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
