@@ -438,7 +438,9 @@ async def get_activity_log(
 #         guard (raised here before any DB I/O), PATCHes the DB row, writes
 #         an audit record, then hot-reloads the in-memory store via
 #         GateConfigStore.update().
-#         Returns the old value, new value, and current epoch.
+#         Returns the old value, new value, current epoch, AND bounds
+#         (min_value, max_value) so the UI can update its slider range
+#         without a second GET round-trip.
 #
 #         428 Precondition Required:
 #           Returned when confirm_market_hours=false (the safe UI default)
@@ -503,17 +505,33 @@ _GATE_BOUNDS: dict[str, tuple[float, float]] = {
     "dedup_window_ms":      (500.0,     60_000.0),
     "require_oi":           (0.0,       1.0),
     "signal_debounce_ms":   (1_000.0,   600_000.0),
+    # alias — resolves to signal_debounce_ms bounds
+    "debounce_ms":          (1_000.0,   600_000.0),
 }
 
 
+def _gate_bounds(gate_store: Any, gate_name: str) -> tuple[float, float]:
+    """
+    Resolve the (min, max) bounds for a gate name.
+
+    Priority:
+      1. Live _bounds_cache on the store (populated by store.load() from DB)
+      2. Router-local _GATE_BOUNDS fallback (covers no-DB mode + pre-load)
+
+    Handles the 'debounce_ms' alias transparently — both the alias and the
+    canonical 'signal_debounce_ms' resolve to the same bounds.
+    """
+    live = getattr(gate_store, "_bounds_cache", {})
+    if gate_name in live:
+        return live[gate_name]
+    return _GATE_BOUNDS.get(gate_name, (0.0, float("inf")))
+
+
 def _build_config_matrix(gate_store: Any) -> list[dict]:
-    """Snapshot the live store into a list of {gate_name, tier, value, min, max} dicts."""
+    """Snapshot the live store into a list of {gate_name, tier, value, min_value, max_value} dicts."""
     rows = []
     for gate in _ALL_GATES:
-        lo, hi = _GATE_BOUNDS.get(gate, (0.0, float("inf")))
-        live_bounds = getattr(gate_store, "_bounds_cache", {})
-        if gate in live_bounds:
-            lo, hi = live_bounds[gate]
+        lo, hi = _gate_bounds(gate_store, gate)
         for tier in (1, 2, 3):
             rows.append({
                 "gate_name": gate,
@@ -583,6 +601,8 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
 
     ``epoch`` is the store's monotonic change counter — the admin UI can
     poll this to detect when another session has mutated the config.
+    Each gate row includes ``min_value`` and ``max_value`` so the UI can
+    render sliders without a separate bounds lookup.
     """
     from services.gate_config_store import store as gate_store
 
@@ -627,13 +647,14 @@ async def patch_gate_config(
 
     All other validation errors (unknown gate, bad tier, out-of-bounds
     value) return 422 Unprocessable Entity regardless of market hours.
+
+    Response shape includes ``min_value`` and ``max_value`` so the UI
+    can update its slider range in a single round-trip without a
+    subsequent GET /gate-config.
     """
     from services.gate_config_store import store as gate_store, _is_market_open
 
     # --- 428 Precondition Required: market-hours guard ---------------------
-    # Checked before any DB I/O so the round-trip is free.
-    # confirm_market_hours=False means "block if market is open" (safe UI
-    # default); True means the admin has explicitly acknowledged the risk.
     if not body.confirm_market_hours and _is_market_open():
         raise HTTPException(
             status_code=428,
@@ -664,6 +685,8 @@ async def patch_gate_config(
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    lo, hi = _gate_bounds(gate_store, body.gate_name)
+
     log.info(
         "[admin] gate-config updated by %s: %s[T%d] %s -> %s (epoch=%d)",
         admin.email,
@@ -693,6 +716,8 @@ async def patch_gate_config(
         "tier":      body.tier,
         "old_value": result["old_value"],
         "new_value": result["new_value"],
+        "min_value": lo,
+        "max_value": hi,
         "epoch":     gate_store.epoch,
         "note":      "Hot-reloaded. Workers will observe the new value on their next poll tick.",
     }
