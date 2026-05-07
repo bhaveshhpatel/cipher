@@ -118,6 +118,15 @@ Fix (ING-010 2026-05-07): Tier-aware configurable ingestion gate system.
   Epoch-change detection: when gate_config_store.epoch changes between ticks,
   an INFO log fires so ops can confirm hot-reload propagated to the stream.
   _stats["gate_epoch"] exposed in get_stats().
+
+Fix (ING-010-GATES 2026-05-07): wire signal_debounce_ms + signal_min_premium.
+  _should_emit_signal() reads signal_debounce_ms live from gate_config_store
+  (T1 tier, ms -> s) instead of hardcoded _SIGNAL_DEBOUNCE_S=30s.
+  _SIGNAL_DEBOUNCE_S retained as cold-start fallback when store returns None.
+  Signal gate in _process_trade reads signal_min_premium live from
+  gate_config_store (T1 tier) instead of hardcoded _SIGNAL_MIN_PREMIUM=50_000.
+  _SIGNAL_MIN_PREMIUM retained as cold-start fallback.
+  Both lookups are O(1) in-memory reads — zero async I/O on hot path.
 """
 import asyncio
 import logging
@@ -185,15 +194,20 @@ _MARKET_CLOSE = time(16, 0)
 _PROCESSABLE_TYPES = {"timesale"}
 
 # ---------------------------------------------------------------------------
-# Signal gate thresholds
+# Signal gate thresholds — cold-start fallbacks.
+# ING-010-GATES: live values are read from gate_config_store at point-of-use.
+# These constants are only used when the store has not yet loaded (epoch == 0).
 # ---------------------------------------------------------------------------
 _SIGNAL_MIN_TRADES  = 3
-_SIGNAL_MIN_PREMIUM = 50_000
+_SIGNAL_MIN_PREMIUM = 50_000   # fallback; live value from gate_config_store
 
 # ---------------------------------------------------------------------------
-# Per-episode signal debounce
+# Per-episode signal debounce — cold-start fallbacks.
+# ING-010-GATES: _SIGNAL_DEBOUNCE_S is the fallback when
+# gate_config_store.get("signal_debounce_ms", 1) returns None.
+# Live value is read per-call in _should_emit_signal().
 # ---------------------------------------------------------------------------
-_SIGNAL_DEBOUNCE_S  = 30.0
+_SIGNAL_DEBOUNCE_S  = 30.0     # fallback; live value from gate_config_store
 _SIGNAL_DELTA_PREM  = 25_000.0
 _SIGNAL_DELTA_PCT   = 0.20
 _SIGNAL_EMIT_TTL_S  = 7_200.0
@@ -307,6 +321,50 @@ def _resolve_min_premium(ticker: str) -> int:
     except Exception:
         # Absolute fallback — module-level constant from options_flow_parser
         return 10_000
+
+
+# ---------------------------------------------------------------------------
+# ING-010-GATES: live signal_debounce_ms resolver
+# ---------------------------------------------------------------------------
+def _resolve_signal_debounce_s() -> float:
+    """
+    Read signal_debounce_ms from gate_config_store (T1 tier) and convert to
+    seconds. T1 is used because debounce applies uniformly across all tiers —
+    the gate_config_store schema stores it per-tier but the debounce window
+    is a single global setting; T1 row is canonical.
+
+    Returns _SIGNAL_DEBOUNCE_S (30.0s) when the store has not yet loaded
+    (epoch == 0 / cold start) or when the value is None/zero.
+    Never raises. O(1) in-memory read — safe on the hot path.
+    """
+    try:
+        raw_ms = gate_config_store.get("signal_debounce_ms", 1)
+        if raw_ms is not None and raw_ms > 0:
+            return float(raw_ms) / 1000.0
+    except Exception:
+        pass
+    return _SIGNAL_DEBOUNCE_S
+
+
+# ---------------------------------------------------------------------------
+# ING-010-GATES: live signal_min_premium resolver
+# ---------------------------------------------------------------------------
+def _resolve_signal_min_premium() -> float:
+    """
+    Read signal_min_premium from gate_config_store (T1 tier — canonical row).
+    This is the minimum total episode premium required before the signal bus
+    fires — distinct from the per-tick min_premium parse gate.
+
+    Returns _SIGNAL_MIN_PREMIUM (50_000) on cold start or any error.
+    Never raises. O(1) in-memory read — safe on the hot path.
+    """
+    try:
+        val = gate_config_store.get("signal_min_premium", 1)
+        if val is not None and val > 0:
+            return float(val)
+    except Exception:
+        pass
+    return float(_SIGNAL_MIN_PREMIUM)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +565,11 @@ def _should_emit_signal(
     total_premium: float,
     now: float,
 ) -> tuple[bool, str]:
+    """
+    ING-010-GATES: debounce window is read live from gate_config_store so
+    ops can tune it without a deploy. Falls back to _SIGNAL_DEBOUNCE_S (30s)
+    when the store has not yet loaded.
+    """
     last = _signal_last_emit.get(emit_key)
 
     if last is None:
@@ -515,8 +578,11 @@ def _should_emit_signal(
     if last["alert_level"] != alert_level:
         return True, f"alert_escalation:{last['alert_level']}->{alert_level}"
 
+    # ING-010-GATES: live debounce window (O(1) read, never raises).
+    debounce_s = _resolve_signal_debounce_s()
+
     elapsed = now - last["ts"]
-    if elapsed >= _SIGNAL_DEBOUNCE_S:
+    if elapsed >= debounce_s:
         delta      = total_premium - last["premium"]
         pct_floor  = last["premium"] * _SIGNAL_DELTA_PCT
         threshold  = max(_SIGNAL_DELTA_PREM, pct_floor)
@@ -524,7 +590,7 @@ def _should_emit_signal(
             return True, f"premium_growth:+${delta:,.0f} (>= ${threshold:,.0f})"
 
     return False, (
-        f"debounced: elapsed={elapsed:.1f}s "
+        f"debounced: elapsed={elapsed:.1f}s/{debounce_s:.0f}s "
         f"delta=${total_premium - last['premium']:,.0f} "
         f"alert={alert_level}"
     )
@@ -543,6 +609,9 @@ async def _process_trade(raw: dict):
       premium floor via _resolve_min_premium(). This is a O(1) dict
       lookup after the registry tier string is known — zero async I/O.
       The resolved floor is passed as min_premium= to parse_tradier_trade().
+
+    ING-010-GATES addition: signal_min_premium resolved live per-tick from
+      gate_config_store (T1 canonical row). Fallback: _SIGNAL_MIN_PREMIUM.
 
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
@@ -801,12 +870,15 @@ async def _process_trade(raw: dict):
     if not sig_ep:
         return
 
-    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _SIGNAL_MIN_PREMIUM:
+    # ING-010-GATES: signal_min_premium read live from store (O(1), never raises).
+    _live_signal_min_premium = _resolve_signal_min_premium()
+
+    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _live_signal_min_premium:
         log.debug(
             "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
             sig_ep.ticker, sig_ep.contract_type,
             sig_ep.trade_count, _SIGNAL_MIN_TRADES,
-            sig_ep.total_premium, _SIGNAL_MIN_PREMIUM,
+            sig_ep.total_premium, _live_signal_min_premium,
         )
         return
 
