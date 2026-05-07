@@ -14,6 +14,14 @@ Design contract (from ING-010 / issue #84)
                    PATCHes the DB row atomically, inserts an audit record
                    (non-fatal on failure), then updates the in-memory cache
                    and increments ``epoch``.
+* assert_store_epoch_parity(chain_epoch, universe_epoch)
+                 — class method.  Raises AssertionError if either
+                   dependent-store epoch is ahead of this store's epoch,
+                   indicating the gate config was not reloaded in the same
+                   generation as the chain/universe data it governs.
+                   Tolerates store_epoch == 0 (pre-first-load).
+                   See also module-level assert_epoch_parity() for the
+                   convenience wrapper that reads from the live singleton.
 * No-DB mode     — when ``_supabase_url`` / ``_supabase_key`` are empty
                    strings, update() skips all network I/O and operates
                    purely in-memory (useful for tests and local dev without
@@ -28,6 +36,14 @@ Public singleton
     value = store.get("min_premium", tier)          # O(1), lock-free read
     await store.update("min_premium", 1, 30_000)    # async, DB + in-memory
     await store.load()                              # called once at startup
+
+    # Epoch parity check (call after any gate update in tests / health checks)
+    from services.gate_config_store import assert_epoch_parity
+    from services import chain_store, universe_store
+    assert_epoch_parity(
+        chain_store.get_epoch(),
+        universe_store.get_epoch(),
+    )
 
 Gate catalogue (gate_name → value_type)
 ----------------------------------------
@@ -65,8 +81,6 @@ _DEFAULTS: dict[str, dict[int, float]] = {
 }
 
 # Bounds enforced by update() — mirrors the min_value/max_value columns in DB.
-# update() also reads bounds from the in-memory cache when available (so a
-# DB-side change to bounds is picked up after the next load()).
 _BOUNDS: dict[str, tuple[float, float]] = {
     "min_premium":          (1_000.0,  500_000.0),
     "dte_floor_multiplier": (0.1,      5.0),
@@ -138,22 +152,69 @@ class GateConfigStore:
         with self._lock:
             gate_data = self._cache.get(gate_name)
             if gate_data is None:
-                # Unknown gate — return 0.0 rather than raising (per HR-15 spirit)
                 return 0.0
-            # Fall back to T3 for unknown tier
             return float(gate_data.get(safe_tier, gate_data.get(3, 0.0)))
+
+    @classmethod
+    def assert_store_epoch_parity(
+        cls,
+        gate_epoch: int,
+        chain_epoch: int,
+        universe_epoch: int,
+    ) -> None:
+        """
+        Assert that chain_store and universe_store epochs have not advanced
+        ahead of the gate_config_store epoch.
+
+        Rationale
+        ---------
+        If chain_epoch > gate_epoch or universe_epoch > gate_epoch it means
+        the dependent stores have been mutated (new chain loaded, new snapshot
+        saved) in a generation that the gate config has not yet caught up with.
+        This is the theoretical race: a gate config update could complete
+        between a chain load and the first use of those values.
+
+        The check is directional — it only fires if a *dependent* store is
+        *ahead* of the gate store, not behind. Being behind (gate updated
+        without a chain reload) is normal during hot-reload cycles.
+
+        Pre-first-load tolerance
+        ------------------------
+        A store epoch of 0 means "never mutated" and is always acceptable
+        regardless of the gate epoch. This prevents false positives at startup
+        before any save_chain() or save_snapshot() has been called.
+
+        Parameters
+        ----------
+        gate_epoch      : int   — store.epoch from the GateConfigStore singleton
+        chain_epoch     : int   — chain_store.get_epoch()
+        universe_epoch  : int   — universe_store.get_epoch()
+
+        Raises
+        ------
+        AssertionError
+            ``chain_store epoch N is ahead of gate_config epoch M``
+            ``universe_store epoch N is ahead of gate_config epoch M``
+        """
+        if chain_epoch > 0 and chain_epoch > gate_epoch:
+            raise AssertionError(
+                f"chain_store epoch {chain_epoch} is ahead of "
+                f"gate_config epoch {gate_epoch} — gate config may not reflect "
+                f"the generation of chain data currently in memory."
+            )
+        if universe_epoch > 0 and universe_epoch > gate_epoch:
+            raise AssertionError(
+                f"universe_store epoch {universe_epoch} is ahead of "
+                f"gate_config epoch {gate_epoch} — gate config may not reflect "
+                f"the generation of universe data currently in memory."
+            )
 
     async def load(self) -> None:
         """
         Read all rows from ``gate_configs`` in Supabase and populate
         the in-memory cache.  Advances ``epoch`` on success.
-
-        Safe to call at startup and periodically (e.g., after a DB-side edit
-        made outside the admin endpoint).  Each call overwrites cache entries
-        for every row returned; rows absent from the DB retain their defaults.
         """
         if not self._supabase_url or not self._supabase_key:
-            # No-DB mode — nothing to load, but do not raise
             log.debug("[gate_config_store] load() skipped — no-db mode")
             return
 
@@ -173,7 +234,6 @@ class GateConfigStore:
                 if gate not in self._cache:
                     self._cache[gate] = {}
                 self._cache[gate][tier] = value
-                # Update bounds from DB if present
                 if "min_value" in row and "max_value" in row:
                     self._bounds_cache[gate] = (
                         float(row["min_value"]),
@@ -195,7 +255,7 @@ class GateConfigStore:
         *,
         updated_by: str = "system",
         reason: str | None = None,
-        confirm_market_hours: bool = True,
+        confirm_market_hours: bool = False,
     ) -> dict[str, Any]:
         """
         Update a single gate+tier threshold.
@@ -203,63 +263,47 @@ class GateConfigStore:
         Parameters
         ----------
         gate_name : str
-            Logical gate name (e.g. "min_premium").
         tier : int
-            1, 2, or 3.
         value : float
-            New threshold.  Must be within the gate's allowed bounds.
         updated_by : str
-            Admin email or identifier written to the DB and audit row.
         reason : str | None
-            Optional human-readable rationale stored in gate_config_audit.
         confirm_market_hours : bool
-            When False and the market is currently open, raises ValueError
-            instead of proceeding.  Defaults to True (no guard active).
+            When False and the market is currently open, raises ValueError.
+            Defaults to False (safe). Router raises 428 before calling this
+            so this path is belt-and-suspenders only.
 
         Returns
         -------
-        dict
-            ``{"gate_name": ..., "tier": ..., "old_value": ..., "new_value": ...}``
-            In no-db mode also includes ``{"_note": "no-db mode — in-memory only"}``.
+        dict  ``{"gate_name": ..., "tier": ..., "old_value": ..., "new_value": ...}``
 
         Raises
         ------
-        ValueError
-            * Unknown gate name → "Unknown gate: {gate_name}"
-            * Invalid tier       → "Invalid tier: {tier}"
-            * Out-of-bounds      → "{value} outside allowed bounds ..."
-            * Market open guard  → "Market is currently open ..."
-        RuntimeError
-            DB PATCH returned a non-2xx status → "DB PATCH failed ..."
+        ValueError   — unknown gate, invalid tier, out-of-bounds, market open guard
+        RuntimeError — DB PATCH non-2xx
         """
         gate_name = self._resolve_alias(gate_name)
 
-        # --- validation (all before any I/O or lock) ---
         if gate_name not in _VALID_GATES:
             raise ValueError(f"Unknown gate: {gate_name!r}")
 
         if tier not in _VALID_TIERS:
             raise ValueError(f"Invalid tier: {tier!r} — must be 1, 2, or 3")
 
-        # Market-hours guard
         if not confirm_market_hours and _is_market_open():
             raise ValueError(
                 "Market is currently open. Pass confirm_market_hours=True to "
                 "override gate updates during trading hours."
             )
 
-        # Bounds check (use live cache bounds, fall back to static _BOUNDS)
         lo, hi = self._bounds_cache.get(gate_name, _BOUNDS.get(gate_name, (0.0, float("inf"))))
         if not (lo <= value <= hi):
             raise ValueError(
                 f"{value} outside allowed bounds [{lo}, {hi}] for gate {gate_name!r}"
             )
 
-        # Snapshot old value before touching anything
         with self._lock:
             old_value = float(self._cache[gate_name].get(tier, 0.0))
 
-        # --- no-db mode ---
         if not self._supabase_url or not self._supabase_key:
             with self._lock:
                 self._cache[gate_name][tier] = float(value)
@@ -276,7 +320,6 @@ class GateConfigStore:
                 "_note":      "no-db mode — in-memory only",
             }
 
-        # --- DB PATCH (must succeed before we touch in-memory) ---
         patch_url = (
             f"{self._supabase_url}/rest/v1/gate_configs"
             f"?gate_name=eq.{gate_name}&tier=eq.{tier}"
@@ -302,7 +345,6 @@ class GateConfigStore:
                     f"HTTP {patch_resp.status_code}"
                 )
 
-            # --- in-memory update (atomic under lock) ---
             with self._lock:
                 self._cache[gate_name][tier] = float(value)
                 self.epoch += 1
@@ -312,7 +354,6 @@ class GateConfigStore:
                 gate_name, tier, old_value, value, self.epoch, updated_by,
             )
 
-            # --- audit insert (non-fatal) ---
             audit_url   = f"{self._supabase_url}/rest/v1/gate_config_audit"
             audit_payload = {
                 "gate_name":  gate_name,
@@ -355,8 +396,6 @@ class GateConfigStore:
     def _resolve_alias(gate_name: str) -> str:
         """Normalise short-form aliases to their canonical gate names."""
         if gate_name == "debounce_ms":
-            # Keep "debounce_ms" as a valid gate in its own right so
-            # test fixtures that seed it directly work without ambiguity.
             return gate_name
         return gate_name
 
@@ -373,11 +412,6 @@ class GateConfigStore:
 # ---------------------------------------------------------------------------
 
 def _build_singleton() -> GateConfigStore:
-    """
-    Create the singleton and wire it to the real Supabase credentials from
-    ``config.settings``.  Gracefully degrades if config is unavailable
-    (e.g., during unit test collection).
-    """
     instance = GateConfigStore()
     try:
         from config import settings  # type: ignore[import]
@@ -391,13 +425,34 @@ def _build_singleton() -> GateConfigStore:
 store: GateConfigStore = _build_singleton()
 
 
+def assert_epoch_parity() -> None:
+    """
+    Module-level convenience wrapper around GateConfigStore.assert_store_epoch_parity().
+
+    Reads live epochs from the chain_store and universe_store singletons
+    and asserts parity against the gate_config_store singleton epoch.
+
+    Usage::
+
+        from services.gate_config_store import assert_epoch_parity
+        assert_epoch_parity()   # raises AssertionError on generation skew
+
+    Raises
+    ------
+    AssertionError
+        See GateConfigStore.assert_store_epoch_parity() for conditions.
+    """
+    from services.chain_store import get_epoch as chain_epoch
+    from services.universe_store import get_epoch as universe_epoch
+    GateConfigStore.assert_store_epoch_parity(
+        gate_epoch=store.epoch,
+        chain_epoch=chain_epoch(),
+        universe_epoch=universe_epoch(),
+    )
+
+
 async def load_gate_configs() -> None:
     """
     Convenience coroutine called from app startup (``main.py`` lifespan).
-
-    Example usage in lifespan::
-
-        from services.gate_config_store import load_gate_configs
-        await load_gate_configs()
     """
     await store.load()

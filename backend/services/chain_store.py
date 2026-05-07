@@ -17,6 +17,11 @@ load_chain(snapshot_id, max_age_hours)  -> dict[str, ContractMeta] | None
     has rows AND is within max_age_hours (default 24) (C-2 fix).
     Returns None on DB error, empty dict if no fresh chains exist.
 
+get_epoch() -> int
+    Return the current mutation epoch counter.  Incremented on every
+    successful save_chain() call.  Used by assert_epoch_parity() in
+    gate_config_store to detect generation skew between stores.
+
 Design notes
 ------------
 - Uses service_role key (bypasses RLS) for writes.
@@ -46,6 +51,11 @@ FIX C-2 (2026-04-27):
   _find_latest_cached_snapshot() now accepts max_age_hours and filters
   inserted_at >= (now - max_age_hours) before selecting. Stale snapshots
   older than 24h are ignored, forcing a fresh build() instead.
+
+FIX EPOCH (2026-05-07):
+  Added module-level _epoch counter incremented on every successful
+  save_chain(). Exposed via get_epoch() for parity assertions with
+  gate_config_store.assert_epoch_parity().
 """
 import asyncio
 import logging
@@ -64,6 +74,17 @@ _TABLE      = "options_chain_cache"
 _BATCH_SIZE = 500
 _PAGE_SIZE  = 1000
 _DEFAULT_MAX_AGE_HOURS = 24
+
+# ---------------------------------------------------------------------------
+# Epoch counter — incremented on every successful save_chain().
+# Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
+# ---------------------------------------------------------------------------
+_epoch: int = 0
+
+
+def get_epoch() -> int:
+    """Return the current chain_store mutation epoch (incremented per save_chain success)."""
+    return _epoch
 
 
 def _client() -> Client:
@@ -89,7 +110,11 @@ async def save_chain(
     sequential batch write.
 
     Wall time improvement: ~5.8s (sequential) → ~300ms (concurrent).
+
+    Increments the module-level _epoch counter on success.
     """
+    global _epoch
+
     if not registry_dict:
         log.info("[chain_store] save_chain: empty registry — nothing to persist")
         return True
@@ -130,9 +155,10 @@ async def save_chain(
         await asyncio.gather(
             *[_upsert_batch(batch, i + 1) for i, batch in enumerate(batches)]
         )
+        _epoch += 1
         log.info(
-            "[chain_store] save_chain: persisted %d OCC contracts for snapshot %s",
-            total, snapshot_id,
+            "[chain_store] save_chain: persisted %d OCC contracts for snapshot %s (epoch=%d)",
+            total, snapshot_id, _epoch,
         )
         return True
     except Exception as exc:
