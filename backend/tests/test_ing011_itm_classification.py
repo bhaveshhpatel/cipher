@@ -4,7 +4,8 @@ test_ing011_itm_classification.py
 ING-011: ITM put/call misclassification fix.
 D1/D2/D3 deliberation resolved 2026-05-06.
 
-Test matrix covers cases I-1 through I-11 (QA matrix from deliberation).
+Test matrix covers cases I-1 through I-12 (QA matrix from deliberation +
+QA-F1 panel finding).
 
 Key invariants under test:
   - OTM PUT AT_BID -> REPEAT_SELL (bullish) — unchanged regression anchor
@@ -19,6 +20,8 @@ Key invariants under test:
   - Boundary: exactly 2% ITM -> ATM band (pct <= 0.02 is ATM, inclusive)
   - Boundary: 1.9% ITM -> ATM band (no override)
   - Boundary: exactly 10% ITM -> ITM band (pct > 0.10 required for DEEP_ITM)
+  - SA-F1: UNKNOWN final tick does NOT suppress ITM override when prior
+    ticks established a clear ITM/DEEP_ITM premium majority
 
 All deliberation decisions are referenced inline per test case.
 
@@ -227,7 +230,7 @@ class TestClassifyMoneynessBand:
 class TestITMDirectionOverride:
     """
     Tests that dominant_direction correctly applies the ING-011 ITM override.
-    All cases from the QA test matrix I-1 through I-11.
+    All cases from the QA test matrix I-1 through I-12.
 
     Direction mechanics with order_side='UNKNOWN':
       order_side_to_direction('UNKNOWN', 'PUT') -> REPEAT_SELL  (fallback)
@@ -384,11 +387,21 @@ class TestITMDirectionOverride:
 
     @pytest.mark.asyncio
     async def test_I8_unknown_underlying_no_override(self):
-        """underlying_price == 0 -> otm_band UNKNOWN, no ITM override applied.
+        """underlying_price == 0 on ALL events -> no ITM override applied.
 
-        Band is UNKNOWN so the ITM gate (otm_band in ('ITM', 'DEEP_ITM')) never
-        fires. base_direction from order_side_to_direction('UNKNOWN', 'PUT')
+        SA-F1 / _majority_itm_band() mechanism:
+          All events have underlying_price == 0, so every event is skipped
+          in _majority_itm_band() (UNKNOWN events contribute 0 to both sides).
+          itm_prem == non_itm_prem == 0.0; 0.0 > 0.0 is False.
+          _majority_itm_band() returns False -> override gate never fires.
+
+        base_direction from order_side_to_direction('UNKNOWN', 'PUT')
         = REPEAT_SELL is returned as-is.
+
+        Note: ep.otm_band reflects the last-tick classification (SA-6). Since
+        the final tick has underlying_price == 0, ep.otm_band == 'UNKNOWN'.
+        The override is not gated on ep.otm_band — it is gated on
+        _majority_itm_band() which independently confirms no ITM premium exists.
         """
         acc = _make_acc()
         events = [
@@ -397,7 +410,7 @@ class TestITMDirectionOverride:
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "UNKNOWN"
-        # No ITM override fires — base order_side_to_direction fallback
+        # _majority_itm_band() returns False (0.0 > 0.0) -> no ITM override fires
         assert ep.dominant_direction == "REPEAT_SELL"
 
     # --- I-9: Boundary — PUT at exactly 2% above underlying -> ATM (inclusive) ---
@@ -450,6 +463,60 @@ class TestITMDirectionOverride:
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "ITM"  # pct=0.10 -> not > 0.10 -> ITM
+        assert ep.dominant_direction == "REPEAT_BUY"
+
+    # --- I-12: SA-F1 — UNKNOWN final tick does NOT suppress ITM override ---
+
+    @pytest.mark.asyncio
+    async def test_I12_unknown_final_tick_does_not_suppress_itm_override(self):
+        """SA-F1 canonical scenario: 2 DEEP_ITM events + 1 final UNKNOWN-underlying event.
+
+        SA-F1 fix (panel finding 2026-05-06):
+          self.otm_band reflects ONLY the last tick (SA-6 Phase 1 accepted
+          limitation). If the final tick has underlying_price == 0, self.otm_band
+          would be 'UNKNOWN'. If the override were gated on self.otm_band, a
+          final UNKNOWN tick would silently suppress REPEAT_BUY even when all
+          prior ticks were clearly DEEP_ITM.
+
+          The fix: dominant_direction calls self._majority_itm_band() which
+          computes a premium-weighted majority across ALL episode events.
+          UNKNOWN events (underlying_price == 0) contribute 0 weight to both
+          sides — they are neutral, not suppressive.
+
+        Episode structure:
+          Event 1: TMDX PUT $105, underlying $75.69, AT_BID, premium $34,939 -> DEEP_ITM
+          Event 2: TMDX PUT $105, underlying $75.69, AT_BID, premium $34,939 -> DEEP_ITM
+          Event 3: TMDX PUT $105, underlying $0.00,  AT_BID, premium $34,939 -> UNKNOWN (final)
+
+        _majority_itm_band() accumulation:
+          itm_prem     = 34,939 + 34,939 = 69,878  (events 1 and 2)
+          non_itm_prem = 0.0                        (event 3 skipped — UNKNOWN)
+          69,878 > 0.0 -> True -> ITM majority confirmed
+
+        Override fires: contract_type=PUT, _majority_itm_band()=True,
+        bid_side_prem (104,817) > ask_side_prem (0) -> REPEAT_BUY.
+
+        ep.otm_band reflects the last tick (underlying_price=0) -> 'UNKNOWN'.
+        This is correct and expected per SA-6 — otm_band is the reported field,
+        not the override gate input.
+        """
+        acc = _make_acc()
+        events = [
+            _make_event("TMDX", "PUT", 105.0, 75.69, "AT_BID",
+                        premium=34_939, ts_offset=0),
+            _make_event("TMDX", "PUT", 105.0, 75.69, "AT_BID",
+                        premium=34_939, ts_offset=10),
+            # Final tick: underlying_price=0 -> UNKNOWN band -> ep.otm_band='UNKNOWN'
+            # _majority_itm_band() skips this event (neutral) — prior ITM premium
+            # still dominates. Override must still fire.
+            _make_event("TMDX", "PUT", 105.0, 0.0, "AT_BID",
+                        premium=34_939, ts_offset=20),
+        ]
+        ep = await _build_episode(acc, events)
+        # ep.otm_band = last-tick classification (SA-6) -> UNKNOWN (underlying_price=0)
+        assert ep.otm_band == "UNKNOWN"
+        # _majority_itm_band() returns True (69,878 ITM prem > 0 non-ITM) ->
+        # override fires despite UNKNOWN last tick -> REPEAT_BUY (bearish)
         assert ep.dominant_direction == "REPEAT_BUY"
 
     # --- Mixed episode: majority AT_BID on ITM PUT fires override -> REPEAT_BUY ---
