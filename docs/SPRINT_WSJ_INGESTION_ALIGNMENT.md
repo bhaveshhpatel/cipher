@@ -42,6 +42,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
 | 7 | ~~**ING-007**~~ | ~~Multi-day repeat window lookback (DB + cache)~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅ | ✅ MERGED — 2026-05-06 (PR #74, commit `b70d9b0`) — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed |
 | 8 | **ING-011** | ITM put/call misclassification fix | ING-006 ✅, ING-007 ✅ | 🔴 Deliberation required — **must resolve before ING-008** — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) |
+| 8b | **ING-011b** | `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | ING-011 (moneyness band must exist on events) | 🔴 Deliberation required — **do NOT patch without deliberation outcome** — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — parallel to ING-008 |
 | 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011** | 🔴 Deliberation required — blocked on ING-011 (directional classification must be correct first) |
 | 10 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 |
 
@@ -118,6 +119,7 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 |-------|-------|-----------|-------------|
 | [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | BUG: Deeply ITM puts misclassified as REPEAT_SELL (bullish) — AT_BID logic ignoring intrinsic value | **Blocks ING-008** — directional classification must be correct before OI gate logic ships | ING-011 — deliberation required |
 | [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-011 or ING-008. Parallel track. Deliberation required. | ING-010 |
+| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-011 merge. Follow-on to ING-011. Deliberation required before any patch to `get_weighted_premium()` or `bid_ask_classifier.is_directionally_aggressive()`. | ING-011b — parallel to ING-008 |
 
 ---
 
@@ -506,6 +508,142 @@ ING-007 established `otm_band` as a string enum on `RepetitionEpisode`. Should I
 
 ---
 
+### ING-011b — `is_aggressive` Moneyness-Blindness Inflates `weighted_premium` for ITM PUT AT_BID Episodes
+
+**Type:** Bug Fix / Signal Correctness
+**Priority:** P1
+**Estimated Effort:** 0.5–1 day
+**Depends On:** ING-011 (moneyness band classification must exist on events before aggression fix is meaningful)
+**Does NOT block:** ING-008, ING-010 (parallel tracks)
+**Filed:** 2026-05-06 — annotation commit [`a82f3967`](https://github.com/bhaveshhpatel/cipher/commit/a82f3967fb37a07af180caadefbbcb50e041aae2)
+**Files:**
+- `backend/signals/repetition_accumulator.py` — `get_weighted_premium()` (Option B) or unchanged (Option A/C)
+- `backend/parsers/bid_ask_classifier.py` — `is_directionally_aggressive()` (Option A) or unchanged (Option B/C)
+- `backend/tests/test_ing011b_itm_aggression_weight.py` — NEW: full test matrix
+**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80)
+**Branch:** `ing/s11b-itm-aggression-weight` *(not yet created — deliberation required first)*
+
+#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION (SA · PBE · QA)
+
+#### Problem Statement
+
+`get_weighted_premium()` in `RepetitionEpisode` discounts passive events by `aggression_discount` (0.5) and passes aggressive events at full weight (×1.0). This is semantically correct for mid-spread fills vs. AT_ASK buyer fills.
+
+However, **`is_aggressive` is set at parse-time** by `is_directionally_aggressive(bid_ask_class, contract_type)` in `bid_ask_classifier.py` — a function that is **moneyness-blind**. Specifically:
+
+```python
+# bid_ask_classifier.py (ING-006 impl)
+def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
+    if contract_type.upper() == "PUT" and bid_ask_class == "AT_BID":
+        return True  # ← moneyness-blind: always True regardless of ITM/OTM status
+    ...
+```
+
+`AT_BID PUT` → `is_aggressive = True` for **all** moneyness bands (ATM, OTM, DEEP_OTM, ITM, DEEP_ITM).
+
+#### Where the Semantic Gap Lives
+
+**ING-011's episode-level `dominant_direction` correctly handles this:** an ITM PUT AT_BID fill is correctly classified as `REPEAT_BUY` (buyer paying to open a bearish position via a deep ITM put) at the episode aggregation level.
+
+But `get_weighted_premium()` still sees `is_aggressive=True` on those same events and weights them at ×1.0. This means:
+
+- **`dominant_direction`** says: *REPEAT_BUY, buyer-driven*
+- **`weighted_premium`** says: *full weight, highly aggressive*
+
+They're logically consistent in direction, but the aggression weight is semantically wrong — an ITM PUT AT_BID buyer isn't exhibiting the same urgency as an AT_ASK call buyer. The discount should apply.
+
+#### Blast Radius
+
+| Component | Impact |
+|---|---|
+| `Gate 2` in `ingest_tick()` | `ep_weighted` may clear the DTE-adjusted floor when it should not, because ITM PUT AT_BID events get ×1.0 instead of ×0.5 |
+| `deep_otm_multiplier` gate | Same — `ep_weighted` overstated for DEEP_OTM puts with AT_BID fills |
+| Signal emit rate | Potentially +N% false positives for put-heavy flow sessions |
+| `prior_days_aggressive` (ING-007) | Not affected — this counts events, not premium weight |
+| `order_side_classifier.py` | Not affected — directional logic is correct |
+
+#### Candidate Fixes — Deliberation Required
+
+**Option A — Moneyness-aware `is_directionally_aggressive()`**
+
+Add `otm_band: str = "UNKNOWN"` parameter to `bid_ask_classifier.is_directionally_aggressive()`:
+
+```python
+def is_directionally_aggressive(bid_ask_class, contract_type, otm_band="UNKNOWN"):
+    if contract_type.upper() == "PUT" and bid_ask_class == "AT_BID":
+        # ITM/DEEP_ITM PUT AT_BID = buyer opening a position, NOT an aggressive writer
+        if otm_band in ("ITM", "DEEP_ITM"):  # ING-011b deliberation outcome
+            return False
+        return True
+    ...
+```
+
+**Pros:** Fixes `is_aggressive` at source — `weighted_premium`, `prior_days_aggressive`, and any future consumers automatically correct.
+**Cons:** Requires `otm_band` to be available at parse-time. Currently `otm_band` is computed in `RepetitionAccumulator._classify_moneyness_band()` *after* ingestion. Parser-layer enrichment would need `underlying_price` pre-populated, which ING-005 already provides for the stream layer but may not be guaranteed for all ingestion paths.
+
+**Option B — ITM-buyer discount at `get_weighted_premium()` call site**
+
+Apply a secondary discount inside `get_weighted_premium()` for events that match the ITM PUT AT_BID buyer pattern:
+
+```python
+def get_weighted_premium(self, discount: float) -> float:
+    total = 0.0
+    for e in self.events:
+        prem = getattr(e, "premium", 0.0)
+        if getattr(e, "is_aggressive", False):
+            contract  = getattr(e, "contract_type", "").upper()
+            bid_ask   = getattr(e, "bid_ask_class", "")
+            otm_band  = getattr(self, "otm_band", "UNKNOWN")  # episode-level band
+            if contract == "PUT" and bid_ask in ("AT_BID", "BELOW_BID") and otm_band in ("ITM", "DEEP_ITM"):
+                total += prem * discount  # re-apply discount for ITM buyer
+            else:
+                total += prem
+        else:
+            total += prem * discount
+    return total
+```
+
+**Pros:** Isolated fix, no change to `bid_ask_classifier.py` interface.
+**Cons:** Uses episode-level `otm_band` (self) rather than per-event band. Adds logic to an already dense call site. Treats a symptom rather than the root cause.
+
+**Option C — Accept current overstatement, document it, close as Won't Fix**
+
+The episode correctly emits `REPEAT_BUY` direction. The Gate-2 false-positive risk is bounded (requires real premium). Moneyness-aware aggression is a refinement, not a correctness issue.
+
+**Pros:** Zero risk, no new complexity.
+**Cons:** `prior_days_aggressive` will always include ITM PUT AT_BID buyers as aggressive, which may skew multi-day aggression metrics in ING-007.
+
+#### Deliberations Required (3-Way: SA · PBE · QA)
+
+**SA:** Which option preserves the cleanest separation of concerns? Option A centralises the fix but adds a parse-time dependency. Option B adds episode-band coupling to a per-event loop. Is Option C acceptable risk-tolerance given ING-011 already fixes the direction?
+
+**PBE:** Is `otm_band` available at parse-time in `tradier_stream.py` for Option A? Does `underlying_price` arrive before `is_aggressive` is stamped? What is the cold-start behaviour if `underlying_price` is missing at parse time?
+
+**QA:** Which option has testable, non-brittle assertions? Option A needs new unit tests for `bid_ask_classifier.py`. Option B needs the episode-level `otm_band` to be set before `get_weighted_premium()` is called in the test — is this guaranteed in the test harness? Option C needs a regression test asserting current overstatement is bounded (Gate-2 false-positive rate < X%).
+
+#### Acceptance Criteria
+
+- [ ] Deliberation outcome (A / B / C) recorded in this issue with rationale from all three voices
+- [ ] If A or B: `weighted_premium` for a 3-event ITM PUT AT_BID episode at $200k total premium clears Gate 2 at the same rate as a $100k OTM PUT AT_ASK episode (i.e., discount correctly applied)
+- [ ] If A or B: `prior_days_aggressive` no longer increments for ITM PUT AT_BID buyer events (Option A only — Option B does not affect `is_aggressive` flag)
+- [ ] No regression on existing ING-006 test suite (`test_ing006_*.py`)
+- [ ] No regression on ING-007 multi-day lookback tests
+- [ ] All QA matrix cases W-1 through W-7 pass
+
+#### QA Test Matrix
+
+| Case | Contract | `bid_ask_class` | `otm_band` | `is_aggressive` (input) | Expected `weighted_premium` weight |
+|---|---|---|---|---|---|
+| W-1 | OTM PUT | AT_BID | OTM | True | ×1.0 — OTM put writer, correct aggression |
+| W-2 | ITM PUT | AT_BID | ITM | True | ×0.5 — ITM buyer, discount applies (Option A or B) |
+| W-3 | DEEP_ITM PUT | AT_BID | DEEP_ITM | True | ×0.5 — DEEP_ITM buyer, discount applies (Option A or B) |
+| W-4 | ITM PUT | AT_ASK | ITM | True | ×1.0 — aggressive AT_ASK buyer, full weight always |
+| W-5 | ITM CALL | AT_BID | ITM | True | ×1.0 — call writer, correct aggression, no change |
+| W-6 | OTM PUT | MID | OTM | False | ×0.5 — passive mid-fill, unchanged |
+| W-7 | ITM PUT | AT_BID | UNKNOWN | True | ×1.0 — band unknown, no discount applied (safe fallback) |
+
+---
+
 ### ING-010 — Tier-Aware Min-Premium Floor + OI-Relative Bypass Gate
 
 **Type:** Feature / Signal Quality
@@ -605,4 +743,4 @@ PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh 
 
 ---
 
-*Last updated: 2026-05-06 (Schema drift resolved — migration [`012_catch_up_schema_delta.sql`](https://github.com/bhaveshhpatel/cipher/blob/main/supabase/migrations/012_catch_up_schema_delta.sql) committed; issues [#64](https://github.com/bhaveshhpatel/cipher/issues/64), [#67](https://github.com/bhaveshhpatel/cipher/issues/67), [#69](https://github.com/bhaveshhpatel/cipher/issues/69) closed; post-ING-006 findings table updated with ✅ status; Schema Drift Resolution section added; ING-011 [#77] blocks ING-008, deliberation required; ING-010 [#78] parallel track, deliberation required) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-06 (ING-011b [#80] added — `is_aggressive` moneyness-blindness for ITM PUT AT_BID episodes; Sprint Order table row 8b added; Post-ING-009 Live Session Findings table updated with #80 row; full ING-011b story section added with problem statement, blast radius, Options A/B/C, deliberation checkpoints, AC, QA test matrix W-1 through W-7; branch `ing/s11b-itm-aggression-weight` reserved) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*

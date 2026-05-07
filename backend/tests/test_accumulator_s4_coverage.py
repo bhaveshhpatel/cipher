@@ -9,7 +9,7 @@ ING-006 rewrite changes that affect this file:
   - cleanup_expired() removed (episode cleanup is now inline in ingest_tick)
   - _is_single_whale_sweep() removed; whale-sweep bypass is inline in ingest_tick
   - sweep_bypass_premium= constructor kwarg removed
-  - _classify_otm() is now an instance method (not static); pass self=acc_instance
+  - _classify_moneyness_band() is now an instance method (not static); pass self=acc_instance
   - STANDARD_OTM label renamed to OTM
   - Default tier changed from 2 (permissive) to 1 (strict) per D-11/QA-F1.
     Tests that need tier-2 behaviour MUST call acc.set_tier_map({ticker: 2})
@@ -17,9 +17,14 @@ ING-006 rewrite changes that affect this file:
   - DTE overflow (DTE > max tier key) now falls through to
     _DEFAULT_DTE_PREMIUM_TIERS_91_PLUS keyed by tier, not the last custom bucket
 
+ING-011 changes that affect this file:
+  - _classify_otm() renamed to _classify_moneyness_band() — full moneyness
+    spectrum (DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN)
+  - All acc._classify_otm() call sites updated to acc._classify_moneyness_band()
+
 Line groups covered:
   144-155  set_tier_map / T2 tier floor path (_get_episode_min_premium)
-  248,268  _classify_otm OTM and DEEP_OTM branches
+  248,268  _classify_moneyness_band OTM and DEEP_OTM branches
   367-369  dominant_direction REPEAT_SELL branch
   390-394  dominant_direction MIXED (sell_prem > buy_prem)
   440      DTE overflow fallback in _get_episode_min_premium
@@ -56,9 +61,18 @@ def _ev(
     )
 
 
-def _otm_ev(strike, underlying_price):
-    """Minimal event object for _classify_otm tests (ING-006 instance method)."""
-    return SimpleNamespace(strike=strike, underlying_price=underlying_price)
+def _otm_ev(strike, underlying_price, contract_type="CALL"):
+    """Minimal event object for _classify_moneyness_band tests (ING-011 instance method).
+
+    ING-011: _classify_otm() renamed to _classify_moneyness_band().
+    contract_type defaults to 'CALL' so OTM/DEEP_OTM cases exercise the real
+    directional path rather than the unknown-contract-type fallback.
+    """
+    return SimpleNamespace(
+        strike=strike,
+        underlying_price=underlying_price,
+        contract_type=contract_type,
+    )
 
 
 def run(coro):
@@ -108,30 +122,32 @@ def test_t1_ticker_blocked_by_higher_floor():
     assert ep is None, "T1 ticker should be blocked by the higher DTE floor"
 
 
-# ── _classify_otm branches ──────────────────────────────────────────────────────────────────
-# ING-006: _classify_otm(ev) is now an instance method.
-# Call via an accumulator instance: acc._classify_otm(ev)
+# ── _classify_moneyness_band branches (ING-011: renamed from _classify_otm) ──────────────────
+# ING-011: _classify_moneyness_band(ev) is an instance method.
+# Call via an accumulator instance: acc._classify_moneyness_band(ev)
 
 def test_classify_otm_atm():
     acc = RepetitionAccumulator()
-    assert acc._classify_otm(_otm_ev(200.0, 200.0)) == "ATM"
+    assert acc._classify_moneyness_band(_otm_ev(200.0, 200.0)) == "ATM"
 
 
 def test_classify_otm_standard_otm():
     # strike=220, underlying=200 -> pct=0.10 -> OTM (renamed from STANDARD_OTM in ING-006)
+    # CALL: strike > underlying -> OTM (not ITM for a call)
     acc = RepetitionAccumulator()
-    assert acc._classify_otm(_otm_ev(220.0, 200.0)) == "OTM"
+    assert acc._classify_moneyness_band(_otm_ev(220.0, 200.0)) == "OTM"
 
 
 def test_classify_otm_deep_otm():
     # strike=240, underlying=200 -> pct=0.20 -> DEEP_OTM
+    # CALL: strike > underlying -> OTM/DEEP_OTM (not ITM)
     acc = RepetitionAccumulator()
-    assert acc._classify_otm(_otm_ev(240.0, 200.0)) == "DEEP_OTM"
+    assert acc._classify_moneyness_band(_otm_ev(240.0, 200.0)) == "DEEP_OTM"
 
 
 def test_classify_otm_unknown_when_zero_price():
     acc = RepetitionAccumulator()
-    assert acc._classify_otm(_otm_ev(200.0, 0.0)) == "UNKNOWN"
+    assert acc._classify_moneyness_band(_otm_ev(200.0, 0.0)) == "UNKNOWN"
 
 
 def test_deep_otm_multiplier_blocks_low_premium():
