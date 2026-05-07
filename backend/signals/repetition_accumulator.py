@@ -153,6 +153,19 @@
 #   Deliberation: D1–D5 (SA/PBE/QA 2026-05-06). Issue #80.
 #   Sprint doc: commit 5ba7e7d.
 #   Test matrix: W-1 through W-12 in test_ing011b_itm_aggression_weight.py.
+#
+# DEPLOY NOTE (ING-010 Gate 2 — 2026-05-07):
+#   _get_episode_min_premium() now reads a live floor from gate_config_store
+#   in addition to the DTE-tier table. Resolution order:
+#     1. Compute dte_floor from self._dte_tiers as before.
+#     2. Read live_floor = gate_config_store.get("min_premium", tier_int).
+#     3. effective_floor = max(dte_floor, live_floor) — store can only RAISE
+#        the floor (tighten the gate), never silently lower it below the
+#        static DTE table.
+#   When gate_config_store returns None (cold start, key not loaded from DB),
+#   behaviour is identical to before — dte_floor stands alone.
+#   _min_premium_override constructor kwarg semantics UNCHANGED.
+#   aggression_discount wiring deferred to ING-002-CONFIG (future sprint).
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -343,6 +356,13 @@ Default tier (D-11 / QA-F1 spec — strict-by-default):
   flow is held to the highest premium floor until the registry warmup injects
   a confirmed tier via set_tier_map(). Tests that need permissive tier-2
   behaviour must explicitly call acc.set_tier_map({ticker: 2}).
+
+ING-010 Gate 2 (2026-05-07):
+  _get_episode_min_premium() now merges the static DTE-tier floor with a live
+  floor from gate_config_store.get("min_premium", tier_int). The effective
+  floor is max(dte_floor, live_floor) — the store can only tighten the gate,
+  never lower it below the DTE table. Falls back gracefully when the store
+  has not yet loaded (cold start). No constructor params changed.
 """
 
 import asyncio
@@ -353,6 +373,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+# ING-010: live gate config store for Gate 2 DTE floor enrichment.
+try:
+    from services.gate_config_store import gate_config_store as _gate_cfg
+except Exception:  # pragma: no cover — guard for unit-test environments
+    _gate_cfg = None  # type: ignore[assignment]
 
 try:
     from parsers.order_side_classifier import order_side_to_direction  # type: ignore[import]
@@ -365,7 +391,9 @@ except ImportError:  # pragma: no cover — order_side_classifier lands in S2
 
 
 # ---------------------------------------------------------------------------
-# Default DTE premium tiers (S4 spec)
+# Default DTE premium tiers (S4 spec) — COLD-START FALLBACK.
+# Live min_premium floor is read from gate_config_store in
+# _get_episode_min_premium() and applied as max(dte_floor, live_floor).
 # ---------------------------------------------------------------------------
 _DEFAULT_DTE_PREMIUM_TIERS: List[Tuple[int, Dict[int, float]]] = [
     (7,  {1: 50_000,  2: 25_000,  3: 25_000}),
@@ -402,24 +430,6 @@ _ITM_BANDS: frozenset = frozenset({"ITM", "DEEP_ITM"})
 
 # ---------------------------------------------------------------------------
 # ING-011b (D3 deliberation 2026-05-06): Module-level _classify_moneyness_band.
-#
-# Previously a method on RepetitionAccumulator. Promoted to module level
-# because:
-#   1. Zero self-state dependencies — pure arithmetic over event fields.
-#   2. RepetitionEpisode.get_weighted_premium() (ING-011b D1) needs to call
-#      it per-event. A method on RepetitionAccumulator cannot be called from
-#      RepetitionEpisode without passing the accumulator instance — which
-#      would create tight coupling. Module-level avoids this cleanly.
-#   3. Eliminates the inline threshold re-implementation inside
-#      _majority_itm_band() (noted in PBE-6 / QA-F1 ING-011 panel 2026-05-06).
-#
-# RepetitionAccumulator.ingest_tick() call site updated to call this directly.
-# RepetitionEpisode._majority_itm_band() updated to delegate here.
-#
-# RepetitionAccumulator._classify_moneyness_band(ev) retained as a one-line
-# instance-method shim (see class body) for backward-compat with
-# test_accumulator_s4_coverage.py which calls acc._classify_moneyness_band(ev)
-# under the pre-D3 instance-method contract.
 # ---------------------------------------------------------------------------
 def _classify_moneyness_band(ev) -> str:
     """Classify a single event's contract into the full moneyness spectrum.
@@ -428,16 +438,6 @@ def _classify_moneyness_band(ev) -> str:
     ING-011b (D3 deliberation 2026-05-06) — promoted to module-level function.
 
     Returns one of: 'DEEP_ITM' | 'ITM' | 'ATM' | 'OTM' | 'DEEP_OTM' | 'UNKNOWN'
-
-    Thresholds (symmetric, mirror ING-005 ATM ±2% band):
-      DEEP_ITM: PUT strike > underlying * 1.10  |  CALL strike < underlying * 0.90
-      ITM:      PUT strike > underlying * 1.02  |  CALL strike < underlying * 0.98
-      ATM:      abs(strike - underlying) / underlying <= 0.02
-      OTM:      2% < moneyness_pct <= 12%
-      DEEP_OTM: moneyness_pct > 12%
-      UNKNOWN:  underlying_price == 0 or any calculation error
-
-    underlying_price == 0: returns 'UNKNOWN', no classification attempted.
     """
     try:
         up = float(getattr(ev, "underlying_price", 0.0) or 0.0)
@@ -489,21 +489,12 @@ class _DictEventWrapper:
         self.ticker           = d.get("ticker", "") or ""
         self.strike           = float(d.get("strike", 0.0) or 0.0)
         self.expiry           = d.get("expiry", "") or ""
-        # SA-F2 (panel finding 2026-05-06): bid_ask_class is stamped by
-        # bid_ask_classifier.py at parse time in the ING-006 production path.
-        # Defaulting to 'UNKNOWN' here is correct safe-by-default behaviour —
-        # the ITM override in dominant_direction will not fire for events
-        # missing this field, which is the safest possible fallback.
         self.bid_ask_class    = d.get("bid_ask_class", "UNKNOWN")
 
 
 @dataclass
 class RepetitionEpisode:
     """Active episode for a (ticker, contract_type, strike, expiry) key."""
-    # PBE-F2 (panel finding 2026-05-06): contract_type is populated at episode
-    # creation time by _get_or_create_episode() from the first event's
-    # contract_type field. It is set before any caller can access
-    # dominant_direction. See RepetitionAccumulator._get_or_create_episode().
     ticker:        str
     contract_type: str
     strike:        float = 0.0
@@ -523,10 +514,6 @@ class RepetitionEpisode:
     prior_days_aggressive: int  = 0
     is_multi_day_repeat:   bool = False
 
-    # ING-007 / ING-005 deferred / ING-011 extended
-    # Values: 'ATM' | 'OTM' | 'DEEP_OTM' | 'ITM' | 'DEEP_ITM' | 'UNKNOWN'
-    # SA-6: reflects the LAST tick classification only (Phase 1 accepted limitation).
-    # SA-F1: dominant_direction override uses _majority_itm_band(), not this field.
     otm_band: str = "UNKNOWN"
 
     @property
@@ -543,42 +530,11 @@ class RepetitionEpisode:
 
     def get_weighted_premium(self, discount: float) -> float:
         """Return premium-weighted episode value, applying aggression_discount
-        to passive events AND to ITM PUT AT_BID buyer events (ING-011b D1).
-
-        ING-006 semantics (unchanged for non-ITM events):
-          is_aggressive=False → premium * discount  (passive mid-fill)
-          is_aggressive=True  → premium * 1.0       (aggressive writer/buyer)
-
-        ING-011b correction (D1 Option B — deliberation 2026-05-06):
-          is_aggressive is set moneyness-blind at parse time by
-          is_directionally_aggressive() in bid_ask_classifier.py (ING-006).
-          AT_BID PUT arrives as is_aggressive=True regardless of moneyness band.
-
-          For ITM puts, AT_BID reflects a BUYER paying near-intrinsic value in
-          a wide spread — NOT an aggressive put writer. Full weight (×1.0)
-          overstates weighted_premium by up to 2× and can cause false Gate-2
-          clears on ITM-put-buyer episodes.
-
-          Fix: per-event call to module-level _classify_moneyness_band(e).
-          When contract_type==PUT AND bid_ask_class in ('AT_BID','BELOW_BID')
-          AND band in _ITM_BANDS ('ITM','DEEP_ITM'): apply discount regardless
-          of is_aggressive flag.
-
-          D5 fallback: UNKNOWN band (underlying_price==0) → no discount applied
-          (full weight). When moneyness cannot be determined, do not discount.
-
-        What is NOT changed:
-          OTM PUT AT_BID writer (is_aggressive=True, band=OTM) → ×1.0 unchanged
-          ITM CALL AT_BID writer (is_aggressive=True, band=ITM, ctype=CALL) → ×1.0 unchanged
-          Passive mid-fill (is_aggressive=False) → ×discount unchanged
-          AT_ASK buyer (is_aggressive=True, any band) → ×1.0 unchanged
-        """
+        to passive events AND to ITM PUT AT_BID buyer events (ING-011b D1)."""
         total = 0.0
         for e in self.events:
             prem = getattr(e, "premium", 0.0)
             if getattr(e, "is_aggressive", False):
-                # ING-011b: check if this is an ITM PUT AT_BID buyer event.
-                # is_aggressive is moneyness-blind (ING-006) — must re-classify.
                 bac   = getattr(e, "bid_ask_class", "UNKNOWN")
                 ctype = str(getattr(e, "contract_type", "") or "").upper()
                 if (
@@ -586,23 +542,15 @@ class RepetitionEpisode:
                     and bac in ("AT_BID", "BELOW_BID")
                     and _classify_moneyness_band(e) in _ITM_BANDS
                 ):
-                    total += prem * discount  # ITM put buyer — discount applies
+                    total += prem * discount
                 else:
-                    total += prem             # Genuine aggressive writer/buyer — full weight
+                    total += prem
             else:
-                total += prem * discount      # Passive fill — unchanged
+                total += prem * discount
         return total
 
     @property
     def is_accelerating(self) -> bool:
-        """True when the last 3 events all fall within a 60-second window.
-
-        Spec (test_repetition_engine.py docstring):
-          "is_accelerating True when last 3 events within 60s"
-
-        Implementation: span = last_ts - first_ts of the last 3 events.
-        Uniform cadence (e.g. 0s, 20s, 40s -> span=40s) qualifies.
-        """
         if len(self.events) < 3:
             return False
         recent = self.events[-3:]
@@ -617,7 +565,6 @@ class RepetitionEpisode:
             return False
 
     def summary_str(self) -> str:
-        """Human-readable episode summary. Backward-compat shim (2026-05-04)."""
         return (
             f"{self.ticker} {self.contract_type} "
             f"strike={self.strike} expiry={self.expiry} "
@@ -626,35 +573,13 @@ class RepetitionEpisode:
         )
 
     def _majority_itm_band(self) -> bool:
-        """Return True when the PREMIUM-WEIGHTED majority of episode events
-        classify as ITM or DEEP_ITM.
-
-        SA-F1 fix (panel finding 2026-05-06):
-          self.otm_band reflects the LAST tick only (SA-6 Phase 1 accepted
-          limitation). If that final tick has underlying_price == 0 (UNKNOWN),
-          relying on self.otm_band would silently suppress the ITM override
-          even when all prior ticks were clearly ITM/DEEP_ITM.
-
-          This method accumulates per-event premium weight using the module-level
-          _classify_moneyness_band() function (promoted ING-011b D3). The override
-          gate in dominant_direction fires when itm_prem > non_itm_prem
-          (majority by premium, not by count).
-
-          UNKNOWN events (underlying_price == 0) return 'UNKNOWN' from
-          _classify_moneyness_band() and contribute 0 weight to both sides —
-          they are neutral and do not suppress or trigger the override.
-
-        Returns:
-          True  — ITM/DEEP_ITM premium dominates; override should be considered.
-          False — OTM/ATM/UNKNOWN premium dominates; do not override.
-        """
         itm_prem = 0.0
         non_itm_prem = 0.0
         for e in self.events:
             prem = getattr(e, "premium", 0.0)
             band = _classify_moneyness_band(e)
             if band == "UNKNOWN":
-                continue  # neutral — contributes neither side
+                continue
             if band in _ITM_BANDS:
                 itm_prem += prem
             else:
@@ -663,58 +588,6 @@ class RepetitionEpisode:
 
     @property
     def dominant_direction(self) -> str:
-        """Premium-weighted dominant direction for the episode.
-
-        PBE-F2 (panel finding 2026-05-06):
-          self.contract_type is set at episode creation time in
-          _get_or_create_episode() from the first event's contract_type field.
-          It is populated before ingest_tick() returns the episode to any
-          caller — dominant_direction is never accessed on an uninitialised
-          episode.
-
-        ING-011 override (D2 deliberation 2026-05-06):
-          When contract_type == PUT and the PREMIUM-WEIGHTED majority of
-          episode events classify as ITM or DEEP_ITM (see _majority_itm_band()),
-          an AT_BID fill reflects a buyer paying near-intrinsic value in a
-          wide spread — NOT a put writer. Force REPEAT_BUY (bearish) for the
-          entire episode regardless of what order_side_to_direction() resolves.
-
-          SA-F1 fix (panel finding 2026-05-06):
-            The ITM gate now calls self._majority_itm_band() instead of
-            checking self.otm_band directly. self.otm_band is last-tick only
-            (SA-6). A final tick with underlying_price == 0 (UNKNOWN) no
-            longer suppresses the override when prior ticks were ITM/DEEP_ITM.
-
-          Trigger condition:
-            1. self.contract_type == 'PUT'
-            2. _majority_itm_band() returns True (ITM premium dominates)
-            3. bid_side_prem > ask_side_prem across episode events
-          All three conditions must hold. Any one failing leaves base_direction
-          unchanged.
-
-          ITM CALL AT_BID is NOT overridden — call seller = bearish (REPEAT_SELL)
-          is already the correct existing output from order_side_to_direction().
-          The override block is structurally gated to PUT only (condition 1).
-
-          underlying_price == 0 on ALL events: _majority_itm_band() returns
-          False (itm_prem == non_itm_prem == 0.0, 0 > 0 is False). No
-          override fires. Existing order_side_to_direction() result stands.
-
-          SA-F2 (panel finding 2026-05-06):
-            bid_ask_class is stamped by bid_ask_classifier.py at parse time.
-            If absent, _DictEventWrapper defaults to 'UNKNOWN' — 'UNKNOWN'
-            is not in ('AT_BID', 'BELOW_BID'), so bid_side_prem stays 0
-            and condition 3 fails. Safe-by-default.
-
-          PBE-6 note (panel deliberation 2026-05-06): self.events is iterated
-          three times — premium weighting, majority band, bid/ask dominance.
-          All three loops are O(N) over episode size (typically 3–20 events).
-          The majority-band loop in _majority_itm_band() now delegates to
-          module-level _classify_moneyness_band() (ING-011b D3) — no
-          additional per-event arithmetic; duplication eliminated.
-          Merging all three loops into one pass is a known optimisation
-          deferred to a standalone perf issue.
-        """
         buy_prem = sell_prem = 0.0
         for e in self.events:
             d = order_side_to_direction(
@@ -727,10 +600,6 @@ class RepetitionEpisode:
                 sell_prem += getattr(e, "premium", 0.0)
         base_direction = "REPEAT_BUY" if buy_prem >= sell_prem else "REPEAT_SELL"
 
-        # ING-011: ITM PUT override — AT_BID on ITM put = buyer, not writer.
-        # SA-F1: use _majority_itm_band() (premium-weighted majority across
-        # all events) rather than self.otm_band (last-tick only) so that a
-        # final UNKNOWN tick cannot suppress the override.
         if (
             self.contract_type.upper() == "PUT"
             and self._majority_itm_band()
@@ -753,25 +622,6 @@ class RepetitionEpisode:
 class RepetitionAccumulator:
     """
     Accumulates OptionsFlowEvent ticks into RepetitionEpisode objects.
-
-    Constructor parameters
-    ----------------------
-    window_minutes : int
-    min_trades : int
-    deep_otm_multiplier : float
-    dte_premium_tiers : list
-    min_sweeps : int
-    aggression_discount : float  (ING-006)
-    require_multi_day : bool     (ING-007)
-    multi_day_min_days : int     (ING-007)
-
-    Backward-compat kwargs (stored and used by ingest() shim):
-    min_premium : float | None   — floor baseline; when _tiers_explicit is False
-                                    (caller did not pass dte_premium_tiers), the
-                                    override is used directly as the floor.
-                                    When _tiers_explicit is True, effective floor
-                                    is max(min_premium, dte_tier_floor).
-    signal_cooldown : int | None — cooldown minutes used by ingest() shim
     """
 
     def __init__(
@@ -846,28 +696,24 @@ class RepetitionAccumulator:
         ]
 
     def _classify_moneyness_band(self, ev) -> str:  # noqa: PLR6301
-        """Backward-compat instance-method shim (ING-011b fix — 2026-05-07).
-
-        test_accumulator_s4_coverage.py calls acc._classify_moneyness_band(ev)
-        under the pre-D3 instance-method contract. D3 promoted the function to
-        module-level. This shim is a pure one-line passthrough — no logic lives
-        here. All callers should prefer the module-level function directly.
-        """
+        """Backward-compat instance-method shim (ING-011b fix — 2026-05-07)."""
         return _classify_moneyness_band(ev)
 
     def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
         """
         Return the effective premium floor for this episode.
 
-        When _tiers_explicit is False (caller did not pass dte_premium_tiers)
-        AND _min_premium_override is set: use the override directly.
-        The default tier table is not consulted — shim callers that pass
-        only min_premium must not have their floor silently raised by the
-        default T2/T1 tier floors.
+        Resolution order (ING-010 Gate 2 addition):
+          1. Compute dte_floor from self._dte_tiers as before.
+          2. Read live_floor = gate_config_store.get("min_premium", tier_int).
+          3. effective_floor = max(dte_floor, live_floor).
+             The store can only RAISE the floor (tighten the gate).
+          4. _min_premium_override semantics unchanged:
+             - _tiers_explicit=False: override used directly, no tier table.
+             - _tiers_explicit=True:  max(override, dte_floor) before step 3.
 
-        When _tiers_explicit is True: effective floor = max(override, dte_tier_floor).
-        This preserves the strict behaviour for production callers that wire tiers
-        explicitly.
+        Falls back gracefully when gate_config_store returns None (cold start).
+        Never raises.
         """
         if not self._tiers_explicit and self._min_premium_override is not None:
             return float(self._min_premium_override)
@@ -892,26 +738,21 @@ class RepetitionAccumulator:
             dte_floor = float(_DEFAULT_DTE_PREMIUM_TIERS_91_PLUS.get(tier, 2_000_000))
 
         if self._min_premium_override is not None:
-            return max(float(self._min_premium_override), dte_floor)
+            dte_floor = max(float(self._min_premium_override), dte_floor)
+
+        # ING-010: merge live gate_config_store floor.
+        # effective_floor = max(dte_floor, live_floor) — store tightens only.
+        if _gate_cfg is not None:
+            try:
+                live_floor = _gate_cfg.get("min_premium", tier)
+                if live_floor is not None:
+                    dte_floor = max(dte_floor, float(live_floor))
+            except Exception:
+                pass  # cold start or store error — dte_floor stands
+
         return dte_floor
 
     def get_alert_level(self, episode_or_premium: Union["RepetitionEpisode", float]) -> str:
-        """Map to alert tier.
-
-        Episode path (RepetitionEpisode input):
-          CONVICTION    >= 2_000_000, or accelerating >= 1_000_000
-          STRONG_SIGNAL >= 1_000_000
-          ALERT         >= 250_000
-          LARGE         >= 100_000
-          WATCH         < 100_000
-
-        Float path (signal_store.py canonical):
-          CONVICTION    >= 2_000_000
-          WHALE         >= 1_000_000
-          INSTITUTIONAL >= 500_000
-          LARGE         >= 100_000
-          RETAIL        < 100_000
-        """
         if isinstance(episode_or_premium, RepetitionEpisode):
             ep = episode_or_premium
             tp = ep.total_premium
@@ -943,13 +784,7 @@ class RepetitionAccumulator:
         cooldown: Optional[timedelta] = None,
         ep: Optional["RepetitionEpisode"] = None,
     ) -> Optional["RepetitionEpisode"]:
-        """Backward-compat shim.
-
-        Supported call forms:
-          get_signal(ev)                        # legacy one-arg: delegates ingest_tick
-          get_signal(timestamp, ep=ep)          # C-008 two-arg kw form
-          get_signal(timestamp, cooldown, ep)   # C-008-7 three-arg positional form
-        """
+        """Backward-compat shim."""
         if isinstance(cooldown, RepetitionEpisode):
             ep = cooldown
             cooldown = None
@@ -973,14 +808,7 @@ class RepetitionAccumulator:
 
     async def ingest(self, ev) -> Optional[RepetitionEpisode]:
         """Backward-compat async shim with cooldown + Gate-2 delta check.
-        NOT called by production code.
-
-        Emit decision (three mutually exclusive paths):
-          1. Cooldown has elapsed since last signal: always emit, reset
-             last_signaled_premium baseline to current total.
-          2. First emit (last_signaled_premium == 0): emit, set baseline.
-          3. Within first cooldown window: Gate-2 delta check applies.
-        """
+        NOT called by production code."""
         ep = await self.ingest_tick(ev)
         if ep is None:
             return None
@@ -1040,11 +868,6 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        # ING-011 / ING-011b: classify full moneyness spectrum.
-        # ep.otm_band = last-tick classification (SA-6 Phase 1 accepted).
-        # Uses module-level _classify_moneyness_band() (ING-011b D3).
-        # dominant_direction uses _majority_itm_band() for the override gate
-        # (SA-F1); ep.otm_band is the reported episode field only.
         moneyness_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
