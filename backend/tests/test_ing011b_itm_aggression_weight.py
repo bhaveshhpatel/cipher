@@ -405,7 +405,7 @@ class TestW6PassiveMidFill:
         ep = _episode_with_events(ev)
         assert ep.get_weighted_premium(DISCOUNT) == pytest.approx(100_000 * DISCOUNT)
 
-    def test_passive_discount_is_ite_006_compliant(self):
+    def test_passive_discount_is_ing_006_compliant(self):
         """Verify the discount amount is exactly _AGGRESSION_DISCOUNT (0.5)."""
         ev = _Ev(premium=80_000, is_aggressive=False, bid_ask_class="AT_MID",
                  contract_type="PUT", underlying_price=500.0, strike=480.0)
