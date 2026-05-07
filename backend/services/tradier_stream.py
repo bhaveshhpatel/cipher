@@ -133,6 +133,15 @@ Fix (ING-010-DUP 2026-05-07): remove duplicate gate_config_store.load() call.
   on every invocation (including reconnects). ING-010 already calls load() at
   lifespan step 0 in main.py before any service starts. The duplicate is dead
   code and has been removed.
+
+Fix (ING-010-DEDUP 2026-05-07): thread tier_int into flow_dedup.is_duplicate().
+  DedupCache.is_duplicate() now accepts an optional tier_int kwarg (dedup.py
+  ING-010 fix). _process_trade() resolves ev.influence_tier -> tier_int via
+  _INFLUENCE_TIER_TO_INT after parse (ev is available) and passes it to
+  is_duplicate(). This enables DedupCache to read dedup_window_ms per tier
+  from gate_config_store instead of using the flat 5.0s construction default.
+  Zero additional registry lookups — O(1) dict access on the already-available
+  ev.influence_tier string.
 """
 import asyncio
 import logging
@@ -312,12 +321,9 @@ def _resolve_min_premium(ticker: str) -> int:
 
         tier_str = "RETAIL"  # safe default
         if reg is not None and reg.is_ready():
-            # influence_tier_string() returns e.g. "WHALE", "INSTITUTIONAL", etc.
-            # Falls back to "RETAIL" if ticker not in registry or method absent.
             try:
                 tier_str = reg.influence_tier_string(ticker) or "RETAIL"
             except AttributeError:
-                # Registry version predating influence_tier_string() — use RETAIL
                 tier_str = "RETAIL"
             except Exception:
                 tier_str = "RETAIL"
@@ -325,7 +331,6 @@ def _resolve_min_premium(ticker: str) -> int:
         tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, _DEFAULT_TIER_INT)
         return gate_config_store.get("min_premium", tier_int)
     except Exception:
-        # Absolute fallback — module-level constant from options_flow_parser
         return 10_000
 
 
@@ -333,16 +338,6 @@ def _resolve_min_premium(ticker: str) -> int:
 # ING-010-GATES: live signal_debounce_ms resolver
 # ---------------------------------------------------------------------------
 def _resolve_signal_debounce_s() -> float:
-    """
-    Read signal_debounce_ms from gate_config_store (T1 tier) and convert to
-    seconds. T1 is used because debounce applies uniformly across all tiers —
-    the gate_config_store schema stores it per-tier but the debounce window
-    is a single global setting; T1 row is canonical.
-
-    Returns _SIGNAL_DEBOUNCE_S (30.0s) when the store has not yet loaded
-    (epoch == 0 / cold start) or when the value is None/zero.
-    Never raises. O(1) in-memory read — safe on the hot path.
-    """
     try:
         raw_ms = gate_config_store.get("signal_debounce_ms", 1)
         if raw_ms is not None and raw_ms > 0:
@@ -356,14 +351,6 @@ def _resolve_signal_debounce_s() -> float:
 # ING-010-GATES: live signal_min_premium resolver
 # ---------------------------------------------------------------------------
 def _resolve_signal_min_premium() -> float:
-    """
-    Read signal_min_premium from gate_config_store (T1 tier — canonical row).
-    This is the minimum total episode premium required before the signal bus
-    fires — distinct from the per-tick min_premium parse gate.
-
-    Returns _SIGNAL_MIN_PREMIUM (50_000) on cold start or any error.
-    Never raises. O(1) in-memory read — safe on the hot path.
-    """
     try:
         val = gate_config_store.get("signal_min_premium", 1)
         if val is not None and val > 0:
@@ -571,11 +558,6 @@ def _should_emit_signal(
     total_premium: float,
     now: float,
 ) -> tuple[bool, str]:
-    """
-    ING-010-GATES: debounce window is read live from gate_config_store so
-    ops can tune it without a deploy. Falls back to _SIGNAL_DEBOUNCE_S (30s)
-    when the store has not yet loaded.
-    """
     last = _signal_last_emit.get(emit_key)
 
     if last is None:
@@ -584,7 +566,6 @@ def _should_emit_signal(
     if last["alert_level"] != alert_level:
         return True, f"alert_escalation:{last['alert_level']}->{alert_level}"
 
-    # ING-010-GATES: live debounce window (O(1) read, never raises).
     debounce_s = _resolve_signal_debounce_s()
 
     elapsed = now - last["ts"]
@@ -619,6 +600,9 @@ async def _process_trade(raw: dict):
     ING-010-GATES addition: signal_min_premium resolved live per-tick from
       gate_config_store (T1 canonical row). Fallback: _SIGNAL_MIN_PREMIUM.
 
+    ING-010-DEDUP addition: ev.influence_tier -> tier_int threaded into
+      flow_dedup.is_duplicate() so DedupCache reads dedup_window_ms per tier.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -630,7 +614,7 @@ async def _process_trade(raw: dict):
     # ING-010: detect gate config hot-reload — log once per epoch change.
     current_epoch = gate_config_store.epoch
     if current_epoch != _last_gate_epoch:
-        if _last_gate_epoch >= 0:  # skip the initial -1 -> 0 transition at startup
+        if _last_gate_epoch >= 0:
             log.info(
                 "[ING-010] gate_config_store epoch changed %d -> %d — "
                 "tier-aware floors updated on hot path",
@@ -682,8 +666,6 @@ async def _process_trade(raw: dict):
         trade_payload = raw
 
     # ING-010: resolve tier-aware premium floor before parse.
-    # Quick ticker extraction from raw payload — OCC parse not run yet.
-    # Falls back to T3 floor (10_000) on any error.
     _raw_ticker = (
         trade_payload.get("underlying")
         or trade_payload.get("symbol", "").split()[0]
@@ -714,17 +696,25 @@ async def _process_trade(raw: dict):
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
 
+    # ING-010-DEDUP: derive tier_int from ev.influence_tier (set by parser from
+    # OCC metadata — more accurate than the pre-parse _raw_ticker quick-extract).
+    # Passed to is_duplicate() so DedupCache uses the per-tier dedup_window_ms.
+    _ev_tier_int: int = _INFLUENCE_TIER_TO_INT.get(
+        getattr(ev, "influence_tier", ""), _DEFAULT_TIER_INT
+    )
+
     if flow_dedup.is_duplicate(
         occ_symbol,
         size=ev.size,
         fill=ev.fill_price,
         exchange=exchange,
         ts=arrival_ts,
+        tier_int=_ev_tier_int,
     ):
         _stats["deduped"] += 1
         log.info(
-            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s",
-            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange,
+            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s tier=%d",
+            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange, _ev_tier_int,
         )
 
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
@@ -876,7 +866,6 @@ async def _process_trade(raw: dict):
     if not sig_ep:
         return
 
-    # ING-010-GATES: signal_min_premium read live from store (O(1), never raises).
     _live_signal_min_premium = _resolve_signal_min_premium()
 
     if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _live_signal_min_premium:
