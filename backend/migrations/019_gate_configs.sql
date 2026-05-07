@@ -4,8 +4,8 @@
 -- gate_configs holds the live per-gate per-tier threshold values.
 -- gate_config_audit is an append-only log of every mutation.
 --
--- After applying this migration run the seed INSERT below to populate
--- default values for all 6 gates × 3 tiers (18 rows).
+-- Seed defaults mirror _DEFAULTS in services/gate_config_store.py exactly.
+-- Any deviation between this file and that dict is a bug — keep them in sync.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS gate_configs (
 );
 
 COMMENT ON TABLE  gate_configs                IS 'Live per-gate per-tier threshold values (ING-010)';
-COMMENT ON COLUMN gate_configs.gate_name      IS 'One of: min_premium, dte_floor_multiplier, dedup_window_ms, debounce_ms, require_oi, signal_debounce_ms';
+COMMENT ON COLUMN gate_configs.gate_name      IS 'One of: min_premium, dte_floor_multiplier, dedup_window_ms, require_oi, signal_debounce_ms';
 COMMENT ON COLUMN gate_configs.tier           IS '1=Tier-1 (large-cap), 2=Tier-2 (mid-cap), 3=Tier-3 (small-cap)';
 COMMENT ON COLUMN gate_configs.value          IS 'Current live value for this gate × tier combo';
 COMMENT ON COLUMN gate_configs.min_value      IS 'Inclusive lower bound used by admin UI slider and PATCH validator';
@@ -100,47 +100,53 @@ CREATE TRIGGER trg_gate_configs_updated_at
     FOR EACH ROW EXECUTE FUNCTION _set_gate_configs_updated_at();
 
 -- ---------------------------------------------------------------------------
--- 5. Seed data — default values for all 6 gates × 3 tiers (18 rows)
+-- 5. Seed data — default values for all 5 gates × 3 tiers (15 rows)
+--
+--    Values MUST match _DEFAULTS in services/gate_config_store.py exactly.
+--    Any deviation is a bug.
 --
 --  Gate                   | T1 default   | T2 default   | T3 default
 --  -----------------------+--------------+--------------+--------------
---  min_premium            | 25 000       | 15 000       | 5 000
---  dte_floor_multiplier   | 0.5          | 0.75         | 1.0
+--  min_premium ($)        | 25 000       | 15 000       | 10 000
+--  dte_floor_multiplier   | 1.5          | 1.0          | 0.75
 --  dedup_window_ms        | 5 000        | 5 000        | 5 000
---  debounce_ms            | 2 000        | 2 000        | 2 000
---  require_oi             | 1.0 (true)   | 1.0          | 0.0 (false)
---  signal_debounce_ms     | 30 000       | 30 000       | 60 000
+--  require_oi             | 0.0 (off)    | 0.0 (off)    | 0.0 (off)
+--  signal_debounce_ms     | 30 000       | 60 000       | 120 000
+--
+--  Note: 'debounce_ms' is a code-layer alias for 'signal_debounce_ms'
+--  resolved by GateConfigStore._resolve_alias(). It is NOT a DB gate
+--  and must NOT have seed rows here.
 -- ---------------------------------------------------------------------------
 INSERT INTO gate_configs
     (gate_name,              tier, value,      min_value,   max_value,  updated_by)
 VALUES
-    -- min_premium  ($/contract × 100, i.e. premium_paid * 100)
+    -- min_premium  (option premium in $, i.e. fill_price * size * 100)
     ('min_premium',             1,  25000.0,    1000.0,   500000.0, 'migration'),
     ('min_premium',             2,  15000.0,    1000.0,   500000.0, 'migration'),
-    ('min_premium',             3,   5000.0,    1000.0,   500000.0, 'migration'),
+    ('min_premium',             3,  10000.0,    1000.0,   500000.0, 'migration'),
 
-    -- dte_floor_multiplier  (multiplier applied to per-tier DTE floor)
-    ('dte_floor_multiplier',    1,     0.5,       0.1,        5.0, 'migration'),
-    ('dte_floor_multiplier',    2,    0.75,       0.1,        5.0, 'migration'),
-    ('dte_floor_multiplier',    3,     1.0,       0.1,        5.0, 'migration'),
+    -- dte_floor_multiplier  (multiplier on per-tier DTE floor curve)
+    -- T1 is TIGHTEST (1.5×) — liquid mega-cap names face a stricter accumulator gate.
+    -- T3 is most RELAXED (0.75×) — illiquid names need a lower bar to capture flow.
+    ('dte_floor_multiplier',    1,     1.5,       0.1,        5.0, 'migration'),
+    ('dte_floor_multiplier',    2,     1.0,       0.1,        5.0, 'migration'),
+    ('dte_floor_multiplier',    3,    0.75,       0.1,        5.0, 'migration'),
 
     -- dedup_window_ms  (duplicate-suppression window in milliseconds)
     ('dedup_window_ms',         1,  5000.0,     500.0,    60000.0, 'migration'),
     ('dedup_window_ms',         2,  5000.0,     500.0,    60000.0, 'migration'),
     ('dedup_window_ms',         3,  5000.0,     500.0,    60000.0, 'migration'),
 
-    -- debounce_ms  (per-symbol fire-rate limiter in milliseconds)
-    ('debounce_ms',             1,  2000.0,     500.0,    60000.0, 'migration'),
-    ('debounce_ms',             2,  2000.0,     500.0,    60000.0, 'migration'),
-    ('debounce_ms',             3,  2000.0,     500.0,    60000.0, 'migration'),
-
-    -- require_oi  (0.0 = disabled, 1.0 = enabled — treated as boolean)
-    ('require_oi',              1,     1.0,       0.0,        1.0, 'migration'),
-    ('require_oi',              2,     1.0,       0.0,        1.0, 'migration'),
+    -- require_oi  (0.0 = gate OFF, 1.0 = gate ON — all tiers off by default)
+    -- Gate is toggled via admin API; default-off preserves S2 stream behaviour.
+    ('require_oi',              1,     0.0,       0.0,        1.0, 'migration'),
+    ('require_oi',              2,     0.0,       0.0,        1.0, 'migration'),
     ('require_oi',              3,     0.0,       0.0,        1.0, 'migration'),
 
     -- signal_debounce_ms  (cooldown between signals on the same symbol)
+    -- T1 tightest (30s), T3 widest (120s) to reduce noise on illiquid names.
     ('signal_debounce_ms',      1,  30000.0,   1000.0,   600000.0, 'migration'),
-    ('signal_debounce_ms',      2,  30000.0,   1000.0,   600000.0, 'migration'),
-    ('signal_debounce_ms',      3,  60000.0,   1000.0,   600000.0, 'migration')
+    ('signal_debounce_ms',      2,  60000.0,   1000.0,   600000.0, 'migration'),
+    ('signal_debounce_ms',      3, 120000.0,   1000.0,   600000.0, 'migration')
+
 ON CONFLICT (gate_name, tier) DO NOTHING;
