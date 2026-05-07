@@ -333,14 +333,25 @@ class TestITMDirectionOverride:
 
     @pytest.mark.asyncio
     async def test_I6_itm_call_at_bid_is_repeat_sell(self):
-        """ITM CALL AT_BID -> REPEAT_SELL (call writer, bearish). No override — unchanged.
+        """ITM CALL AT_BID -> REPEAT_SELL (call writer, bearish). No ING-011 override.
 
-        D2: ING-011 override is PUT-only. CALL AT_BID = call seller = bearish
-        (REPEAT_SELL) is already the correct output. No special handling needed.
-        order_side_to_direction('UNKNOWN', 'CALL') -> REPEAT_BUY (fallback);
-        so buy_prem = total, base_direction = REPEAT_BUY.
+        Two independent reasons REPEAT_SELL is produced — both must be understood:
 
-        With order_side='SELL' we get the correct REPEAT_SELL result.
+        Reason 1 — ING-011 override is structurally gated out by contract type:
+          dominant_direction checks `self.contract_type.upper() == 'PUT'` before
+          entering the ITM bid-dominance block. A CALL episode never reaches that
+          block regardless of bid_ask_class or otm_band. The override is PUT-only
+          by design (D2 deliberation 2026-05-06).
+
+        Reason 2 — order_side_to_direction produces the correct result independently:
+          order_side='SELL' + contract_type='CALL' -> REPEAT_SELL (call writer,
+          bearish). This is the correct existing cipher semantic and requires no
+          override. order_side='SELL' is used here to manufacture this path;
+          with order_side='UNKNOWN' the fallback would return REPEAT_BUY (call
+          buyer), which would be the wrong direction for a call writer scenario.
+
+        The test uses order_side='SELL' to exercise Reason 2. Reason 1 is
+        structural and holds for any order_side value on any CALL episode.
         """
         acc = _make_acc()
         events = [
@@ -350,7 +361,8 @@ class TestITMDirectionOverride:
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "ITM"
-        # Call AT_BID = call seller = bearish = REPEAT_SELL. No ING-011 override for calls.
+        # contract_type=CALL -> ING-011 override structurally absent (Reason 1).
+        # order_side='SELL' + CALL -> REPEAT_SELL via order_side_to_direction (Reason 2).
         assert ep.dominant_direction == "REPEAT_SELL"
 
     # --- I-7: ATM PUT AT_BID -> REPEAT_SELL (bullish) — ATM selling, unchanged ---

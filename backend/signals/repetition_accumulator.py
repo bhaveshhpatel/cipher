@@ -77,6 +77,14 @@
 #     Values: 'ATM' | 'OTM' | 'DEEP_OTM' | 'ITM' | 'DEEP_ITM' | 'UNKNOWN'
 #     No DB migration required — flow_events.otm_band is TEXT (not a PG enum).
 #     Existing consumers checking for 'OTM' / 'DEEP_OTM' are unaffected.
+#
+#   SA-6 note (panel deliberation 2026-05-06):
+#     ep.otm_band reflects the classification of the LAST tick in the episode
+#     window, not a representative or majority band across all events. This is
+#     the same per-tick approach used by the former _classify_otm(). Accepted
+#     for Phase 1 — do NOT treat ep.otm_band as an episode-aggregate field.
+#     A future story may introduce majority-band aggregation if drift within a
+#     30-minute window proves material.
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -423,6 +431,12 @@ class RepetitionEpisode:
 
           underlying_price == 0 (otm_band == 'UNKNOWN'): no override, existing
           order_side_to_direction() result stands.
+
+          PBE-6 note (panel deliberation 2026-05-06): self.events is iterated
+          twice — once for base buy/sell premium weighting, once for the ITM
+          bid/ask dominance check. Both loops are O(N) over episode size
+          (typically 3–20 events). Merging into a single pass is a known
+          optimization deferred to ING-011b or a standalone perf issue.
         """
         buy_prem = sell_prem = 0.0
         for e in self.events:
