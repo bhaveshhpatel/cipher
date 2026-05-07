@@ -16,12 +16,15 @@ Endpoints:
   GET   /api/admin/tier-distribution     — tier counts + samples for active snapshot [4A / B-020]
   POST  /api/admin/registry/prewarm      — trigger registry.build() on demand (background task)
   GET   /api/admin/activity-log          — paginated admin audit log  [STORY-BE-001]
+  GET   /api/admin/gate-config           — full gate config matrix from live GateConfigStore  [ING-010]
+  PATCH /api/admin/gate-config           — update one gate+tier threshold, hot-reload  [ING-010]
+  GET   /api/admin/gate-config/history   — paginated gate_config_audit log  [ING-010]
 """
 import asyncio
 import logging
 import time
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Any
 from core.auth import get_current_user, TokenData
 from config import settings
@@ -43,6 +46,18 @@ _ALLOWED_TIER_COLUMNS = {
     "t3_min_volume", "t3_min_last_price", "t3_min_oi", "t3_atm_pct", "t3_max_dte",
 }
 _TIER_THRESHOLD_COLUMNS = _ALLOWED_TIER_COLUMNS  # alias
+
+# Valid gate names — mirrors _VALID_GATES in gate_config_store.
+# Duplicated here so the router validates before hitting the store,
+# producing a clean 422 rather than a 500 ValueError from the service layer.
+_VALID_GATE_NAMES = frozenset({
+    "min_premium",
+    "dte_floor_multiplier",
+    "dedup_window_ms",
+    "debounce_ms",
+    "require_oi",
+    "signal_debounce_ms",
+})
 
 
 def _get_ip(request: Request) -> str | None:
@@ -386,7 +401,8 @@ async def get_activity_log(
 
     Known action strings:
       demo.start | demo.stop | ingestion_config.update |
-      tier_thresholds.update | registry.prewarm
+      tier_thresholds.update | registry.prewarm |
+      gate_config.update
     """
     rows, total = await fetch_logs(
         limit=limit,
@@ -399,6 +415,301 @@ async def get_activity_log(
     log.info(
         "[admin] activity-log fetched by %s (limit=%d offset=%d action=%s email=%s since=%s before=%s count=%d total=%d)",
         admin.email, limit, offset, action, admin_email, since, before, len(rows), total,
+    )
+    return {
+        "limit":  limit,
+        "offset": offset,
+        "total":  total,
+        "count":  len(rows),
+        "items":  rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ING-010: Gate config — GET / PATCH / history
+#
+#   GET   /api/admin/gate-config
+#         Returns the full 5×3 config matrix from the live GateConfigStore
+#         singleton (in-memory, not a DB read), plus current epoch and the
+#         bounds for every gate so the UI can render sliders.
+#
+#   PATCH /api/admin/gate-config
+#         Updates one gate+tier in-place: validates bounds + optional
+#         market-hours guard, PATCHes the DB row, writes an audit record,
+#         then hot-reloads the in-memory store — all via GateConfigStore.update().
+#         Returns the old value, new value, and current epoch.
+#
+#   GET   /api/admin/gate-config/history
+#         Paginated read of gate_config_audit (newest first), filterable
+#         by gate_name and tier.
+# ---------------------------------------------------------------------------
+
+# --- Pydantic models -------------------------------------------------------
+
+class GateConfigUpdate(BaseModel):
+    gate_name:             str
+    tier:                  int
+    value:                 float
+    reason:                str | None = None
+    confirm_market_hours:  bool       = True
+
+    @field_validator("gate_name")
+    @classmethod
+    def _validate_gate_name(cls, v: str) -> str:
+        if v not in _VALID_GATE_NAMES:
+            raise ValueError(
+                f"Unknown gate_name {v!r}. "
+                f"Valid values: {sorted(_VALID_GATE_NAMES)}"
+            )
+        return v
+
+    @field_validator("tier")
+    @classmethod
+    def _validate_tier(cls, v: int) -> int:
+        if v not in (1, 2, 3):
+            raise ValueError(f"tier must be 1, 2, or 3 — got {v!r}")
+        return v
+
+
+# --- Helpers ---------------------------------------------------------------
+
+_ALL_GATES = [
+    "min_premium",
+    "dte_floor_multiplier",
+    "dedup_window_ms",
+    "require_oi",
+    "signal_debounce_ms",
+]
+
+_GATE_BOUNDS: dict[str, tuple[float, float]] = {
+    "min_premium":          (1_000.0,   500_000.0),
+    "dte_floor_multiplier": (0.1,       5.0),
+    "dedup_window_ms":      (500.0,     60_000.0),
+    "require_oi":           (0.0,       1.0),
+    "signal_debounce_ms":   (1_000.0,   600_000.0),
+}
+
+
+def _build_config_matrix(gate_store: Any) -> list[dict]:
+    """Snapshot the live store into a list of {gate_name, tier, value, min, max} dicts."""
+    rows = []
+    for gate in _ALL_GATES:
+        lo, hi = _GATE_BOUNDS.get(gate, (0.0, float("inf")))
+        # Also pull live bounds from the store's _bounds_cache if available
+        live_bounds = getattr(gate_store, "_bounds_cache", {})
+        if gate in live_bounds:
+            lo, hi = live_bounds[gate]
+        for tier in (1, 2, 3):
+            rows.append({
+                "gate_name": gate,
+                "tier":      tier,
+                "value":     gate_store.get(gate, tier),
+                "min_value": lo,
+                "max_value": hi,
+            })
+    return rows
+
+
+def _fetch_audit_rows(
+    limit: int,
+    offset: int,
+    gate_name: str | None,
+    tier: int | None,
+) -> tuple[list[dict], int]:
+    """
+    Synchronous DB read of gate_config_audit — run via run_in_executor.
+    Returns (rows, total_count).
+    """
+    from supabase import create_client
+    sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+
+    # Count query
+    count_q = sb.table("gate_config_audit").select("id", count="exact")
+    if gate_name:
+        count_q = count_q.eq("gate_name", gate_name)
+    if tier is not None:
+        count_q = count_q.eq("tier", tier)
+    count_result = count_q.execute()
+    total = count_result.count or 0
+
+    # Data query
+    data_q = (
+        sb.table("gate_config_audit")
+        .select("id, gate_name, tier, old_value, new_value, changed_by, reason, changed_at")
+        .order("changed_at", desc=True)
+        .range(offset, offset + limit - 1)
+    )
+    if gate_name:
+        data_q = data_q.eq("gate_name", gate_name)
+    if tier is not None:
+        data_q = data_q.eq("tier", tier)
+    data_result = data_q.execute()
+
+    return data_result.data or [], total
+
+
+# --- GET /api/admin/gate-config --------------------------------------------
+
+@router.get("/gate-config")
+async def get_gate_config(admin: TokenData = Depends(_require_admin)):
+    """
+    Return the full gate config matrix from the live in-memory GateConfigStore.
+
+    Response shape::
+
+        {
+          "epoch": 4,
+          "gates": [
+            {"gate_name": "min_premium", "tier": 1, "value": 25000.0,
+             "min_value": 1000.0, "max_value": 500000.0},
+            ...
+          ]
+        }
+
+    ``epoch`` is the store's monotonic change counter — the admin UI can
+    poll this to detect when another session has mutated the config.
+    """
+    from services.gate_config_store import store as gate_store
+
+    matrix = _build_config_matrix(gate_store)
+    log.info("[admin] gate-config read by %s (epoch=%d)", admin.email, gate_store.epoch)
+    return {
+        "epoch": gate_store.epoch,
+        "gates": matrix,
+    }
+
+
+# --- PATCH /api/admin/gate-config ------------------------------------------
+
+@router.patch("/gate-config")
+async def patch_gate_config(
+    body:    GateConfigUpdate,
+    request: Request,
+    admin:   TokenData = Depends(_require_admin),
+):
+    """
+    Update one gate+tier threshold.  Hot-reloads immediately — no restart.
+
+    Request body::
+
+        {
+          "gate_name": "min_premium",
+          "tier": 1,
+          "value": 30000.0,
+          "reason": "Tightening T1 floor for earnings week",   // optional
+          "confirm_market_hours": true                          // default true
+        }
+
+    ``confirm_market_hours=false`` raises 422 if the market is currently open.
+    """
+    from services.gate_config_store import store as gate_store
+
+    try:
+        result = await gate_store.update(
+            gate_name=body.gate_name,
+            tier=body.tier,
+            value=body.value,
+            updated_by=admin.email,
+            reason=body.reason,
+            confirm_market_hours=body.confirm_market_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # DB PATCH failed — surface as 502 (upstream dependency failure)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    log.info(
+        "[admin] gate-config updated by %s: %s[T%d] %s -> %s (epoch=%d)",
+        admin.email,
+        body.gate_name,
+        body.tier,
+        result["old_value"],
+        result["new_value"],
+        gate_store.epoch,
+    )
+
+    await log_action(
+        admin.email,
+        "gate_config.update",
+        {
+            "gate_name": body.gate_name,
+            "tier":      body.tier,
+            "old_value": result["old_value"],
+            "new_value": result["new_value"],
+            "reason":    body.reason,
+        },
+        _get_ip(request),
+    )
+
+    return {
+        "ok":        True,
+        "gate_name": body.gate_name,
+        "tier":      body.tier,
+        "old_value": result["old_value"],
+        "new_value": result["new_value"],
+        "epoch":     gate_store.epoch,
+        "note":      "Hot-reloaded. Workers will observe the new value on their next poll tick.",
+    }
+
+
+# --- GET /api/admin/gate-config/history ------------------------------------
+
+@router.get("/gate-config/history")
+async def get_gate_config_history(
+    limit:     int        = Query(50,  ge=1, le=200,
+                                  description="Rows per page (1–200, default 50)"),
+    offset:    int        = Query(0,   ge=0,
+                                  description="Pagination offset"),
+    gate_name: str | None = Query(None,
+                                  description="Filter by gate name e.g. 'min_premium'"),
+    tier:      int | None = Query(None, ge=1, le=3,
+                                  description="Filter by tier (1, 2, or 3)"),
+    admin:     TokenData  = Depends(_require_admin),
+):
+    """
+    Return a paginated, newest-first audit log of gate config changes.
+
+    Filters (all optional, combinable):
+      gate_name — exact match on gate_name column
+      tier      — exact match on tier column (1, 2, or 3)
+
+    Response shape::
+
+        {
+          "limit": 50, "offset": 0, "total": 12, "count": 12,
+          "items": [
+            {
+              "id": "uuid",
+              "gate_name": "min_premium",
+              "tier": 1,
+              "old_value": 25000.0,
+              "new_value": 30000.0,
+              "changed_by": "admin@cipher.io",
+              "reason": "earnings week",
+              "changed_at": "2026-05-07T17:00:00+00:00"
+            },
+            ...
+          ]
+        }
+    """
+    if not settings.SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
+
+    loop = asyncio.get_event_loop()
+    rows, total = await loop.run_in_executor(
+        None,
+        _fetch_audit_rows,
+        limit,
+        offset,
+        gate_name,
+        tier,
+    )
+
+    log.info(
+        "[admin] gate-config/history fetched by %s "
+        "(limit=%d offset=%d gate=%s tier=%s count=%d total=%d)",
+        admin.email, limit, offset, gate_name, tier, len(rows), total,
     )
     return {
         "limit":  limit,
