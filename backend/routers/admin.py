@@ -18,6 +18,9 @@ Endpoints:
   GET   /api/admin/activity-log          — paginated admin audit log  [STORY-BE-001]
   GET   /api/admin/gate-config           — full gate config matrix from live GateConfigStore  [ING-010]
   PATCH /api/admin/gate-config           — update one gate+tier threshold, hot-reload  [ING-010]
+                                           Accepts gate_name='exclude_indices' (ING-011 Gate 6)
+                                           to toggle index ETF option filtering live.
+                                           value=1.0 → filter ON, value=0.0 → filter OFF.
   GET   /api/admin/gate-config/history   — paginated gate_config_audit log  [ING-010]
 """
 import asyncio
@@ -50,6 +53,7 @@ _TIER_THRESHOLD_COLUMNS = _ALLOWED_TIER_COLUMNS  # alias
 # Valid gate names — mirrors _VALID_GATES in gate_config_store.
 # Duplicated here so the router validates before hitting the store,
 # producing a clean 422 rather than a 500 ValueError from the service layer.
+# ING-011: 'exclude_indices' added for Gate 6 (boolean toggle, 0.0/1.0).
 _VALID_GATE_NAMES = frozenset({
     "min_premium",
     "dte_floor_multiplier",
@@ -57,6 +61,7 @@ _VALID_GATE_NAMES = frozenset({
     "debounce_ms",
     "require_oi",
     "signal_debounce_ms",
+    "exclude_indices",      # ING-011: Gate 6 — index ETF option filter toggle
 })
 
 
@@ -429,9 +434,10 @@ async def get_activity_log(
 # ING-010: Gate config — GET / PATCH / history
 #
 #   GET   /api/admin/gate-config
-#         Returns the full 5×3 config matrix from the live GateConfigStore
+#         Returns the full gate config matrix from the live GateConfigStore
 #         singleton (in-memory, not a DB read), plus current epoch and the
 #         bounds for every gate so the UI can render sliders.
+#         ING-011: matrix now includes exclude_indices rows (tiers 1/2/3).
 #
 #   PATCH /api/admin/gate-config
 #         Updates one gate+tier in-place: validates bounds + 428 market-hours
@@ -441,6 +447,12 @@ async def get_activity_log(
 #         Returns the old value, new value, current epoch, AND bounds
 #         (min_value, max_value) so the UI can update its slider range
 #         without a second GET round-trip.
+#
+#         ING-011 usage — toggle index filter:
+#           PATCH /api/admin/gate-config
+#           { "gate_name": "exclude_indices", "tier": 1, "value": 0.0,
+#             "reason": "allow SPY flow for macro event",
+#             "confirm_market_hours": true }
 #
 #         428 Precondition Required:
 #           Returned when confirm_market_hours=false (the safe UI default)
@@ -491,12 +503,15 @@ class GateConfigUpdate(BaseModel):
 
 # --- Helpers ---------------------------------------------------------------
 
+# ING-011: 'exclude_indices' added — boolean gate, included in the config matrix
+# so GET /gate-config surfaces it alongside all numeric gates.
 _ALL_GATES = [
     "min_premium",
     "dte_floor_multiplier",
     "dedup_window_ms",
     "require_oi",
     "signal_debounce_ms",
+    "exclude_indices",      # ING-011: Gate 6 — index ETF filter toggle
 ]
 
 _GATE_BOUNDS: dict[str, tuple[float, float]] = {
@@ -507,6 +522,8 @@ _GATE_BOUNDS: dict[str, tuple[float, float]] = {
     "signal_debounce_ms":   (1_000.0,   600_000.0),
     # alias — resolves to signal_debounce_ms bounds
     "debounce_ms":          (1_000.0,   600_000.0),
+    # ING-011: boolean gate — 0.0 (filter OFF) / 1.0 (filter ON)
+    "exclude_indices":      (0.0,       1.0),
 }
 
 
@@ -596,6 +613,9 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
             {"gate_name": "min_premium", "tier": 1, "value": 25000.0,
              "min_value": 1000.0, "max_value": 500000.0},
             ...
+            {"gate_name": "exclude_indices", "tier": 1, "value": 1.0,
+             "min_value": 0.0, "max_value": 1.0},
+            ...
           ]
         }
 
@@ -603,6 +623,7 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
     poll this to detect when another session has mutated the config.
     Each gate row includes ``min_value`` and ``max_value`` so the UI can
     render sliders without a separate bounds lookup.
+    ING-011: matrix includes all 3 exclude_indices tier rows.
     """
     from services.gate_config_store import store as gate_store
 
@@ -633,6 +654,16 @@ async def patch_gate_config(
           "value": 30000.0,
           "reason": "Tightening T1 floor for earnings week",   // optional
           "confirm_market_hours": false                         // default false
+        }
+
+    ING-011 example — disable index filter during a macro event::
+
+        {
+          "gate_name": "exclude_indices",
+          "tier": 1,
+          "value": 0.0,
+          "reason": "allow SPY/QQQ flow for FOMC",
+          "confirm_market_hours": true
         }
 
     ``confirm_market_hours`` controls the 428 precondition guard:
