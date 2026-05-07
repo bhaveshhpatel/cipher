@@ -4,6 +4,95 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## ING-011b — ITM PUT AT_BID Buyer Episodes Were Overcounted as Full-Weight Aggressive Premium
+
+**Date:** 2026-05-07
+**Severity:** P1 — signal correctness; ITM/DEEP_ITM PUT fills at `AT_BID`/`BELOW_BID` were counted at full `weighted_premium` because `is_aggressive` is moneyness-blind, inflating Gate 2 clears and downstream conviction on bearish put-buyer episodes
+**PR:** [#82](https://github.com/bhaveshhpatel/cipher/pull/82) — squash merged 2026-05-07 (commit `5e9dd22`)
+**Branch:** `ing/s11b-itm-aggression-weight`
+**Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing011b_itm_aggression_weight.py`
+**Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — closed 2026-05-07
+
+### Root Cause
+
+ING-006 introduced `weighted_premium` using `event.is_aggressive` to decide whether a fill should receive full weight (`×1.0`) or discounted weight (`×0.5`). That works for genuine aggressive writer/buyer cases, but `is_aggressive` is computed at parse time from `bid_ask_class + contract_type` only — it does **not** know the contract's moneyness.
+
+That blind spot became incorrect after ING-011 fixed direction for ITM puts. An ITM or DEEP_ITM PUT filling `AT_BID` is often a bearish buyer paying near intrinsic value, not a bullish put writer. Direction was corrected by ING-011, but `weighted_premium` still treated the same event as aggressive and granted full weight, overstating episode conviction.
+
+**Failure mode:**
+- `contract_type = PUT`
+- `bid_ask_class in {AT_BID, BELOW_BID}`
+- `is_aggressive = True` (from ING-006 parse-time logic)
+- `otm_band in {ITM, DEEP_ITM}` (from ING-011 moneyness classification)
+- Result before fix: full-weight premium on an ITM put buyer episode that should have been discounted
+
+### Deliberation Decisions (3-way panel, 2026-05-06)
+
+**D1 — Option B chosen: fix weighting in `get_weighted_premium()`**
+- Apply `_AGGRESSION_DISCOUNT` to ITM/DEEP_ITM PUT `AT_BID`/`BELOW_BID` fills per-event inside `get_weighted_premium()`.
+- Option A rejected — patching `is_directionally_aggressive()` would pull signal-layer moneyness logic back into the parser path and invert the dependency graph.
+- Option C rejected — changing stored DB `is_aggressive` semantics would skew ING-007 `prior_days_aggressive` history and blur the meaning of the parse-time column.
+
+**D2 — Per-event classification chosen over episode-level `self.otm_band`**
+- `self.otm_band` is effectively last-tick state and is not safe for applying discounts to all prior events in an episode.
+- The fix must classify each event individually during `get_weighted_premium()` iteration.
+
+**D3 — `_classify_moneyness_band()` promoted to module level**
+- The function is pure arithmetic over event fields and has no `self` dependency.
+- Promotion removes duplication and lets both `ingest_tick()` and `get_weighted_premium()` use the same classifier.
+- A backward-compat shim was retained on `RepetitionAccumulator` for pre-D3 callers/tests.
+
+**D4 — `prior_days_aggressive` accepted as a known gap**
+- `flow_events.is_aggressive` remains parse-time and moneyness-blind.
+- ING-011b intentionally fixes **episode weighting**, not historical DB aggression counts.
+- A follow-up story is only needed if multi-day aggression metrics show material skew after several live sessions.
+
+**D5 — `UNKNOWN` band fallback: no discount**
+- If `underlying_price == 0`, `_classify_moneyness_band()` returns `UNKNOWN`.
+- `UNKNOWN` is not part of `_ITM_BANDS`, so the event receives full weight.
+- Safe default: when moneyness cannot be proven, do not discount.
+
+### Fix
+
+**`backend/signals/repetition_accumulator.py`:**
+- Promoted `_classify_moneyness_band()` to module-level function
+- Added `_ITM_BANDS = frozenset({"ITM", "DEEP_ITM"})`
+- Updated `_majority_itm_band()` to delegate to the shared module-level classifier
+- Updated `get_weighted_premium()` so ITM/DEEP_ITM PUT `AT_BID`/`BELOW_BID` fills receive `_AGGRESSION_DISCOUNT` even when `is_aggressive=True`
+- Kept all other aggression paths unchanged: OTM PUT writers, ITM CALL writers, `AT_ASK` buyers, and passive MID fills preserve prior behaviour
+
+### Panel Findings (resolved inline before merge)
+
+- **SA-1:** Non-blocking architecture note — module-level classifier promotion is the right boundary; resolved inline
+- **PBE-1:** Non-blocking implementation note — preserve backward-compat shim while promoting classifier; resolved inline
+- **PBE-2:** Non-blocking regression note — `_majority_itm_band()` must call the shared classifier to avoid duplicated threshold logic; resolved inline
+- **QA-1:** Boundary coverage around W-4b required — added inline before merge
+- **QA-2:** Test typo fix (`ite_006` → `ing_006` in W-6 method name) committed inline before merge
+
+### Tests Added (`backend/tests/test_ing011b_itm_aggression_weight.py`)
+
+30 assertions across W-1 through W-12 covering OTM writer regressions, ITM/DEEP_ITM PUT buyer discounting, ITM CALL no-change behaviour, passive MID-fill retention, mixed-event episodes, `UNKNOWN` fallback, and `weighted_premium` property delegation.
+
+**Regression guards explicitly preserved:**
+- W-1 / W-11: OTM PUT `AT_BID` writer keeps full weight (`×1.0`)
+- W-5: ITM CALL `AT_BID` writer unchanged (`×1.0`)
+- W-6: OTM PUT `MID` passive fill remains discounted (`×0.5`)
+
+### Acceptance Criteria
+- [x] D1–D5 deliberations resolved and documented
+- [x] `_classify_moneyness_band()` promoted to module-level function
+- [x] `_majority_itm_band()` delegates to shared module-level classifier
+- [x] `get_weighted_premium()` updated per Option B
+- [x] `weighted_premium` property delegates to updated weighting logic
+- [x] ITM/DEEP_ITM PUT `AT_BID`/`BELOW_BID` events are discounted to `×0.5`
+- [x] OTM PUT writer full-weight behaviour unchanged
+- [x] ITM CALL `AT_BID` writer behaviour unchanged
+- [x] `underlying_price == 0` / `UNKNOWN` fallback receives full weight
+- [x] 30 assertions across W-1 through W-12 passing
+- [x] No regression on ING-006, ING-007, or ING-011 behaviour
+
+---
+
 ## ING-011 — ITM Put/Call Moneyness Classification + Direction Override
 
 **Date:** 2026-05-07
