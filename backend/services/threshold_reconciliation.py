@@ -21,12 +21,14 @@ Design constraints
   duplicate breach events (dedup via last-seen cache keyed on
   (symbol, breach_type, epoch-minute)).
 
-ING-010 (2026-05-07): wire gate_config_store into breach thresholds.
-  _resolve_tier_thresholds(tier) reads live values from gate_config_store
-  using keys apex_oi_spike_pct, apex_oi_collapse_pct, apex_premium_usd,
-  apex_volume_ratio. Falls back to _TIER_THRESHOLDS when gate_config_store
-  epoch == 0 (not yet loaded). Hot-reloads propagate to the APEX-S2 breach
-  path on the next reconcile tick with zero restart required.
+Fix (ING-010 2026-05-07): wire gate_config_store into breach thresholds.
+  _TIER_THRESHOLDS is retained as the static fallback for cold-start /
+  DB-unavailable scenarios.  _get_tier_thresholds(tier) wraps every
+  hot-path lookup — reads from gate_config_store first, falls back to the
+  hardcoded dict only when store.epoch == 0 (not yet loaded) or a key is
+  absent.  Keys consumed: 'oi_spike_pct', 'oi_collapse_pct',
+  'premium_usd', 'volume_ratio'.  Epoch-change logging mirrors the
+  ING-010 pattern already present in tradier_stream.py.
 """
 
 from __future__ import annotations
@@ -39,9 +41,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-from services.gate_config_store import gate_config_store
-
 logger = logging.getLogger(__name__)
+
+# ING-010: tier-aware gate config store singleton.
+try:
+    from services.gate_config_store import gate_config_store as _gate_store
+except ImportError:  # pragma: no cover — guard for test environments without full service tree
+    _gate_store = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +93,12 @@ class ReconcileResult:
 
 
 # ---------------------------------------------------------------------------
-# Per-tier threshold config — cold-start fallback.
-# These values are used only when gate_config_store has not yet loaded
-# (epoch == 0). After load() completes, _resolve_tier_thresholds() reads
-# live values from the store instead. Update the store (via DB or admin
-# endpoint) to change thresholds at runtime without a restart.
+# Per-tier threshold config — STATIC FALLBACK only.
+# Live values are resolved at runtime via _get_tier_thresholds() which
+# reads from gate_config_store first (ING-010).  These constants are used
+# when gate_config_store has not yet loaded (epoch == 0) or when a key is
+# absent from the store.  Do NOT read _TIER_THRESHOLDS directly in hot-path
+# code — always go through _get_tier_thresholds().
 # ---------------------------------------------------------------------------
 
 _TIER_THRESHOLDS: Dict[str, Dict[str, float]] = {
@@ -117,56 +124,60 @@ _TIER_THRESHOLDS: Dict[str, Dict[str, float]] = {
 
 _DEFAULT_TIER = "T3"  # fall-back for unknown symbols
 
-# Mapping from tier string (T1/T2/T3) to int (1/2/3) for gate_config_store
-# lookups. gate_config_store uses int tier keys; ThresholdReconciler uses
-# string tier keys from tier_engine.
+# Tier string -> int mapping for gate_config_store lookups.
+# gate_config_store uses int tiers (1/2/3); ThresholdReconciler uses
+# string tiers ("T1"/"T2"/"T3").  Conversion happens inside
+# _get_tier_thresholds().
 _TIER_STR_TO_INT: Dict[str, int] = {"T1": 1, "T2": 2, "T3": 3}
 
+# Module-level epoch tracker for hot-reload detection logging.
+_last_gate_epoch: int = -1
+
 
 # ---------------------------------------------------------------------------
-# ING-010: live threshold resolver
+# ING-010: runtime threshold resolver
 # ---------------------------------------------------------------------------
 
-def _resolve_tier_thresholds(tier: str) -> Dict[str, float]:
+def _get_tier_thresholds(tier: str) -> Dict[str, float]:
     """
-    Return the effective breach thresholds for *tier* ("T1"/"T2"/"T3").
+    Return the live breach thresholds for the given tier string.
 
     Resolution path (ING-010):
-      1. If gate_config_store.epoch == 0 (not yet loaded), return the
-         cold-start fallback from _TIER_THRESHOLDS — zero I/O, safe on
-         the hot path.
-      2. Otherwise read four keys from gate_config_store using the int
-         tier (1/2/3):
-           apex_oi_spike_pct    -> oi_spike_pct
-           apex_oi_collapse_pct -> oi_collapse_pct  (expected negative)
-           apex_premium_usd     -> premium_usd
-           apex_volume_ratio    -> volume_ratio
-         Any key that gate_config_store returns None for falls back to
-         the corresponding _TIER_THRESHOLDS value so a partial store
-         config never silently zeroes a threshold.
+      1. If gate_config_store is available AND its epoch > 0 (loaded),
+         read each key from the store via store.get(key, tier_int).
+         tier_int is derived from _TIER_STR_TO_INT (T1->1, T2->2, T3->3).
+      2. For any key missing from the store, fall back to the hardcoded
+         _TIER_THRESHOLDS value for that tier.
+      3. If gate_config_store is unavailable (import guard) or epoch == 0
+         (not yet loaded), return the full hardcoded dict for that tier.
 
-    Never raises. Safe to call on the hot path.
+    The store key names mirror the gate_config_store schema used by
+    _resolve_min_premium() in tradier_stream.py:
+      'oi_spike_pct'    — OI increase breach pct  (float, e.g. 0.10)
+      'oi_collapse_pct' — OI collapse breach pct  (float, e.g. -0.15)
+      'premium_usd'     — premium flood USD floor  (float, e.g. 250_000)
+      'volume_ratio'    — volume surge multiplier  (float, e.g. 3.0)
+
+    Never raises. Safe on the hot path.
     """
-    fallback = _TIER_THRESHOLDS.get(tier, _TIER_THRESHOLDS[_DEFAULT_TIER])
+    static = _TIER_THRESHOLDS.get(tier, _TIER_THRESHOLDS[_DEFAULT_TIER])
 
-    if gate_config_store.epoch == 0:
-        # Store not yet loaded — use cold-start constants.
-        return dict(fallback)
+    if _gate_store is None:
+        return dict(static)
 
-    tier_int = _TIER_STR_TO_INT.get(tier, 3)
+    try:
+        if _gate_store.epoch == 0:
+            # Store not yet loaded — use static fallback
+            return dict(static)
 
-    def _get(key: str, fb_key: str) -> float:
-        val = gate_config_store.get(key, tier_int)
-        if val is None:
-            return fallback[fb_key]
-        return float(val)
-
-    return {
-        "oi_spike_pct":     _get("apex_oi_spike_pct",    "oi_spike_pct"),
-        "oi_collapse_pct":  _get("apex_oi_collapse_pct", "oi_collapse_pct"),
-        "premium_usd":      _get("apex_premium_usd",     "premium_usd"),
-        "volume_ratio":     _get("apex_volume_ratio",    "volume_ratio"),
-    }
+        tier_int = _TIER_STR_TO_INT.get(tier, 3)
+        result: Dict[str, float] = {}
+        for key in ("oi_spike_pct", "oi_collapse_pct", "premium_usd", "volume_ratio"):
+            val = _gate_store.get(key, tier_int)
+            result[key] = val if val is not None else static[key]
+        return result
+    except Exception:
+        return dict(static)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +208,7 @@ class ThresholdReconciler:
         # (symbol, breach_type_value, epoch_minute) -> True
         self._seen: Dict[Tuple[str, str, int], bool] = {}
         self._seen_cap = 10_000   # evict oldest when over cap
+        self._last_epoch: int = -1  # ING-010: epoch tracker for this instance
 
     # ------------------------------------------------------------------
     # Public API
@@ -233,13 +245,13 @@ class ThresholdReconciler:
         self._seen.clear()
 
     def get_thresholds_for_tier(self, tier: str) -> Dict[str, float]:
-        """Return the effective threshold config for a given tier.
+        """Return the LIVE threshold config for a given tier.
 
-        ING-010: delegates to _resolve_tier_thresholds() so callers
-        (tests, admin endpoints) see the live gate_config_store values
-        rather than the cold-start constants.
+        ING-010: delegates to _get_tier_thresholds() so callers always
+        see runtime values from gate_config_store, not just the hardcoded
+        fallback dict.
         """
-        return _resolve_tier_thresholds(tier)
+        return _get_tier_thresholds(tier)
 
     # ------------------------------------------------------------------
     # Internal
@@ -254,15 +266,27 @@ class ThresholdReconciler:
         t0 = time.monotonic()
         result = ReconcileResult()
 
+        # ING-010: detect gate config hot-reload — log once per epoch change.
+        if _gate_store is not None:
+            current_epoch = _gate_store.epoch
+            if current_epoch != self._last_epoch:
+                if self._last_epoch >= 0:  # skip initial -1 -> 0 at startup
+                    logger.info(
+                        "[ING-010] threshold_reconciliation gate_config_store epoch "
+                        "changed %d -> %d — APEX-S2 breach thresholds updated on hot path",
+                        self._last_epoch, current_epoch,
+                    )
+                self._last_epoch = current_epoch
+
         for symbol, m in metrics_by_symbol.items():
             if not self._metrics_complete(m):
                 result.skipped += 1
                 continue
 
             tier  = tier_map.get(symbol, _DEFAULT_TIER)
-            # ING-010: read live thresholds from gate_config_store;
-            # falls back to _TIER_THRESHOLDS when epoch == 0.
-            thres = _resolve_tier_thresholds(tier)
+            # ING-010: resolve live thresholds from gate_config_store.
+            # Falls back to _TIER_THRESHOLDS when store not yet loaded.
+            thres = _get_tier_thresholds(tier)
             result.checked += 1
 
             new_breaches = self._evaluate(m, tier, thres)
