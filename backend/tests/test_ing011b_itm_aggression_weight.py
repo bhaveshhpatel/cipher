@@ -10,6 +10,7 @@ W-1   OTM PUT AT_BID writer — full weight unchanged (ING-006 regression guard)
 W-2   ITM PUT AT_BID buyer — discount applies (D1 Option B)
 W-3   DEEP_ITM PUT AT_BID buyer — discount applies (D1 Option B)
 W-4   ATM PUT AT_BID — NOT discounted (ATM not in _ITM_BANDS)
+W-4b  Exact 2% ITM boundary — get_weighted_premium full weight at _ITM_THRESHOLD (QA-1)
 W-5   ITM CALL AT_BID writer — full weight unchanged (D1 scope gate: PUT only)
 W-6   Passive mid-fill (is_aggressive=False) — discount unchanged (ING-006)
 W-7   AT_ASK buyer (is_aggressive=True, ITM PUT) — NOT discounted
@@ -242,6 +243,95 @@ class TestW4AtmPutAtBid:
             strike=501.0,
         )
         assert _classify_moneyness_band(ev) == "ATM"
+
+
+# ---------------------------------------------------------------------------
+# W-4b: Exact 2% ITM boundary — full weight at _ITM_THRESHOLD (QA-1 finding)
+# ---------------------------------------------------------------------------
+class TestW4bExact2PctBoundary:
+    """
+    QA-1 pre-merge panel finding: no boundary test existed on get_weighted_premium()
+    at exactly the _ITM_THRESHOLD (2%) boundary.
+
+    strike=510.0, underlying=500.0 → (510 - 500) / 500 = 2.0% exactly.
+    _classify_moneyness_band uses exclusive threshold: ITM requires > 2%, not >=.
+    At exactly 2%, band returns 'ATM' → not in _ITM_BANDS → no D1 discount.
+    get_weighted_premium() must return full 100_000.0.
+    """
+
+    def test_exact_2pct_boundary_classify_returns_atm(self):
+        """Boundary value: 2.0% ITM → classify returns 'ATM', not 'ITM'."""
+        ev = _Ev(
+            premium=100_000,
+            is_aggressive=True,
+            bid_ask_class="AT_BID",
+            contract_type="PUT",
+            underlying_price=500.0,
+            strike=510.0,  # (510-500)/500 = 2.0% exactly
+        )
+        assert _classify_moneyness_band(ev) == "ATM"
+
+    def test_exact_2pct_boundary_not_in_itm_bands(self):
+        """ATM result at 2.0% boundary must not be in _ITM_BANDS."""
+        ev = _Ev(
+            premium=100_000,
+            is_aggressive=True,
+            bid_ask_class="AT_BID",
+            contract_type="PUT",
+            underlying_price=500.0,
+            strike=510.0,
+        )
+        band = _classify_moneyness_band(ev)
+        assert band not in _ITM_BANDS
+
+    def test_exact_2pct_boundary_get_weighted_premium_full_weight(self):
+        """
+        Core QA-1 assertion: get_weighted_premium() returns full weight at the
+        2.0% boundary — no D1 discount fires because band == 'ATM'.
+        """
+        ev = _Ev(
+            premium=100_000,
+            is_aggressive=True,
+            bid_ask_class="AT_BID",
+            contract_type="PUT",
+            underlying_price=500.0,
+            strike=510.0,
+        )
+        ep = _episode_with_events(ev)
+        assert ep.get_weighted_premium(DISCOUNT) == pytest.approx(100_000.0)
+
+    def test_just_above_2pct_boundary_triggers_discount(self):
+        """
+        One tick above the boundary: strike=510.1, underlying=500.0
+        → 2.02% ITM → band='ITM' → D1 discount fires.
+        Confirms the boundary is exclusive (> not >=).
+        """
+        ev = _Ev(
+            premium=100_000,
+            is_aggressive=True,
+            bid_ask_class="AT_BID",
+            contract_type="PUT",
+            underlying_price=500.0,
+            strike=510.1,  # 2.02% → just above threshold → ITM
+        )
+        ep = _episode_with_events(ev)
+        assert ep.get_weighted_premium(DISCOUNT) == pytest.approx(100_000 * DISCOUNT)
+
+    def test_just_below_2pct_boundary_no_discount(self):
+        """
+        One tick below the boundary: strike=509.9, underlying=500.0
+        → 1.98% ITM → band='ATM' → no D1 discount.
+        """
+        ev = _Ev(
+            premium=100_000,
+            is_aggressive=True,
+            bid_ask_class="AT_BID",
+            contract_type="PUT",
+            underlying_price=500.0,
+            strike=509.9,  # 1.98% → just below threshold → ATM
+        )
+        ep = _episode_with_events(ev)
+        assert ep.get_weighted_premium(DISCOUNT) == pytest.approx(100_000.0)
 
 
 # ---------------------------------------------------------------------------
