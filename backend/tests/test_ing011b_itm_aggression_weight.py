@@ -568,9 +568,7 @@ class TestW11EndToEndIngestTick:
         acc.set_tier_map({"SPY": 2})
         ep = None
         for i in range(3):
-            ep = asyncio.get_event_loop().run_until_complete(
-                acc.ingest_tick(self._make_tick(i))
-            )
+            ep = asyncio.run(acc.ingest_tick(self._make_tick(i)))
         assert ep is not None, "Episode should emit with floor=25_000"
         assert ep.get_weighted_premium(0.5) == pytest.approx(90_000.0)
 
@@ -587,9 +585,7 @@ class TestW11EndToEndIngestTick:
         )
         ep = None
         for i in range(3):
-            ep = asyncio.get_event_loop().run_until_complete(
-                acc.ingest_tick(self._make_tick(i))
-            )
+            ep = asyncio.run(acc.ingest_tick(self._make_tick(i)))
         assert ep is None, (
             "Episode should NOT emit: discounted weighted_premium (90_000) < floor (150_000). "
             "Before ING-011b, total_premium (180_000) would have passed falsely."
@@ -622,9 +618,7 @@ class TestW11EndToEndIngestTick:
 
         ep = None
         for i in range(3):
-            ep = asyncio.get_event_loop().run_until_complete(
-                acc.ingest_tick(_otm_tick(i))
-            )
+            ep = asyncio.run(acc.ingest_tick(_otm_tick(i)))
         assert ep is not None, "OTM PUT writer episode should still emit (W-1 regression)"
         assert ep.get_weighted_premium(0.5) == pytest.approx(180_000.0)
 
