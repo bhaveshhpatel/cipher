@@ -85,6 +85,28 @@
 #     for Phase 1 — do NOT treat ep.otm_band as an episode-aggregate field.
 #     A future story may introduce majority-band aggregation if drift within a
 #     30-minute window proves material.
+#
+#   SA-F1 fix (panel finding 2026-05-06):
+#     dominant_direction ITM override gate now uses a MAJORITY band computed
+#     inline across all episode events, NOT self.otm_band (last-tick only).
+#     self.otm_band is preserved as the reported episode field (per SA-6),
+#     but the override gate itself uses _majority_itm_band() so that a final
+#     tick with underlying_price == 0 (UNKNOWN) cannot silently suppress the
+#     override when prior ticks established a clear ITM/DEEP_ITM majority.
+#
+#   SA-F2 fix (panel finding 2026-05-06):
+#     bid_ask_class is stamped on every event dict by bid_ask_classifier.py
+#     at parse time in the ING-006 production path (tradier_stream.py).
+#     _DictEventWrapper.bid_ask_class defaults to 'UNKNOWN' when the field is
+#     absent — override will not fire on events missing the field. This is
+#     correct safe-by-default behaviour; no production events should reach
+#     the accumulator without bid_ask_class set.
+#
+#   PBE-F2 fix (panel finding 2026-05-06):
+#     self.contract_type in dominant_direction is populated at episode
+#     creation time by _get_or_create_episode() from the first event's
+#     contract_type field. It is never None or empty for a valid episode.
+#     See RepetitionEpisode dataclass field: contract_type: str.
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -131,6 +153,11 @@ ITM override in dominant_direction (ING-011 D2 — 2026-05-06):
   fundamentally different. Override: PUT in ITM/DEEP_ITM band with AT_BID fill
   -> REPEAT_BUY (bearish). ITM CALL AT_BID is unchanged (call seller = bearish
   already correct per existing logic).
+
+  SA-F1 (panel finding 2026-05-06): The ITM override gate uses a majority
+  band computed inline from all episode events — not self.otm_band (last-tick).
+  This prevents a final UNKNOWN tick from silently suppressing the override
+  when the majority of premium-weighted events are ITM/DEEP_ITM.
 
 Sweep bypass semantics (S4, Issue 7 resolution):
   len(ep.events) == 1 is the episode event count — number of OptionsFlowEvent
@@ -306,6 +333,9 @@ _ACCELERATING_SPAN_S: float = 60.0
 _ITM_THRESHOLD: float = 0.02   # >2% in-the-money -> ITM
 _DEEP_ITM_THRESHOLD: float = 0.10  # >10% in-the-money -> DEEP_ITM
 
+# ITM band set used by dominant_direction override gate and _majority_itm_band().
+_ITM_BANDS: frozenset = frozenset({"ITM", "DEEP_ITM"})
+
 
 # ---------------------------------------------------------------------------
 # _DictEventWrapper
@@ -330,12 +360,21 @@ class _DictEventWrapper:
         self.ticker           = d.get("ticker", "") or ""
         self.strike           = float(d.get("strike", 0.0) or 0.0)
         self.expiry           = d.get("expiry", "") or ""
+        # SA-F2 (panel finding 2026-05-06): bid_ask_class is stamped by
+        # bid_ask_classifier.py at parse time in the ING-006 production path.
+        # Defaulting to 'UNKNOWN' here is correct safe-by-default behaviour —
+        # the ITM override in dominant_direction will not fire for events
+        # missing this field, which is the safest possible fallback.
         self.bid_ask_class    = d.get("bid_ask_class", "UNKNOWN")
 
 
 @dataclass
 class RepetitionEpisode:
     """Active episode for a (ticker, contract_type, strike, expiry) key."""
+    # PBE-F2 (panel finding 2026-05-06): contract_type is populated at episode
+    # creation time by _get_or_create_episode() from the first event's
+    # contract_type field. It is set before any caller can access
+    # dominant_direction. See RepetitionAccumulator._get_or_create_episode().
     ticker:        str
     contract_type: str
     strike:        float = 0.0
@@ -357,6 +396,8 @@ class RepetitionEpisode:
 
     # ING-007 / ING-005 deferred / ING-011 extended
     # Values: 'ATM' | 'OTM' | 'DEEP_OTM' | 'ITM' | 'DEEP_ITM' | 'UNKNOWN'
+    # SA-6: reflects the LAST tick classification only (Phase 1 accepted limitation).
+    # SA-F1: dominant_direction override uses _majority_itm_band(), not this field.
     otm_band: str = "UNKNOWN"
 
     @property
@@ -413,31 +454,112 @@ class RepetitionEpisode:
             f"total_premium=${self.total_premium:,.0f}"
         )
 
+    def _majority_itm_band(self) -> bool:
+        """Return True when the PREMIUM-WEIGHTED majority of episode events
+        classify as ITM or DEEP_ITM.
+
+        SA-F1 fix (panel finding 2026-05-06):
+          self.otm_band reflects the LAST tick only (SA-6 Phase 1 accepted
+          limitation). If that final tick has underlying_price == 0 (UNKNOWN),
+          relying on self.otm_band would silently suppress the ITM override
+          even when all prior ticks were clearly ITM/DEEP_ITM.
+
+          This method computes a per-event moneyness band inline using the
+          same _ITM_THRESHOLD / _DEEP_ITM_THRESHOLD constants and accumulates
+          premium weight. The override gate in dominant_direction fires when
+          itm_prem > non_itm_prem (majority by premium, not by count).
+
+          UNKNOWN events (underlying_price == 0) contribute 0 weight to both
+          sides — they are neutral and do not suppress or trigger the override.
+
+        Returns:
+          True  — ITM/DEEP_ITM premium dominates; override should be considered.
+          False — OTM/ATM/UNKNOWN premium dominates; do not override.
+        """
+        itm_prem = 0.0
+        non_itm_prem = 0.0
+        for e in self.events:
+            prem = getattr(e, "premium", 0.0)
+            up = float(getattr(e, "underlying_price", 0.0) or 0.0)
+            if up == 0.0:
+                # UNKNOWN — contributes neither side (neutral)
+                continue
+            strike = float(getattr(e, "strike", 0.0) or 0.0)
+            ct = str(getattr(e, "contract_type", "") or "").upper()
+            try:
+                pct = abs(strike - up) / up
+            except ZeroDivisionError:
+                continue
+            if pct <= _ITM_THRESHOLD:
+                # ATM — not ITM
+                non_itm_prem += prem
+                continue
+            if ct == "PUT":
+                in_the_money = strike > up
+            elif ct == "CALL":
+                in_the_money = strike < up
+            else:
+                non_itm_prem += prem
+                continue
+            if in_the_money:
+                itm_prem += prem
+            else:
+                non_itm_prem += prem
+        return itm_prem > non_itm_prem
+
     @property
     def dominant_direction(self) -> str:
         """Premium-weighted dominant direction for the episode.
 
+        PBE-F2 (panel finding 2026-05-06):
+          self.contract_type is set at episode creation time in
+          _get_or_create_episode() from the first event's contract_type field.
+          It is populated before ingest_tick() returns the episode to any
+          caller — dominant_direction is never accessed on an uninitialised
+          episode.
+
         ING-011 override (D2 deliberation 2026-05-06):
-          When contract_type == PUT and otm_band in ('ITM', 'DEEP_ITM'),
+          When contract_type == PUT and the PREMIUM-WEIGHTED majority of
+          episode events classify as ITM or DEEP_ITM (see _majority_itm_band()),
           an AT_BID fill reflects a buyer paying near-intrinsic value in a
           wide spread — NOT a put writer. Force REPEAT_BUY (bearish) for the
           entire episode regardless of what order_side_to_direction() resolves.
 
-          Trigger condition: the most recent event's bid_ask_class is AT_BID
-          or BELOW_BID, AND the episode's otm_band is ITM or DEEP_ITM.
+          SA-F1 fix (panel finding 2026-05-06):
+            The ITM gate now calls self._majority_itm_band() instead of
+            checking self.otm_band directly. self.otm_band is last-tick only
+            (SA-6). A final tick with underlying_price == 0 (UNKNOWN) no
+            longer suppresses the override when prior ticks were ITM/DEEP_ITM.
+
+          Trigger condition:
+            1. self.contract_type == 'PUT'
+            2. _majority_itm_band() returns True (ITM premium dominates)
+            3. bid_side_prem > ask_side_prem across episode events
+          All three conditions must hold. Any one failing leaves base_direction
+          unchanged.
 
           ITM CALL AT_BID is NOT overridden — call seller = bearish (REPEAT_SELL)
           is already the correct existing output from order_side_to_direction().
+          The override block is structurally gated to PUT only (condition 1).
 
-          underlying_price == 0 (otm_band == 'UNKNOWN'): no override, existing
-          order_side_to_direction() result stands.
+          underlying_price == 0 on ALL events: _majority_itm_band() returns
+          False (itm_prem == non_itm_prem == 0.0, 0 > 0 is False). No
+          override fires. Existing order_side_to_direction() result stands.
+
+          SA-F2 (panel finding 2026-05-06):
+            bid_ask_class is stamped by bid_ask_classifier.py at parse time.
+            If absent, _DictEventWrapper defaults to 'UNKNOWN' — 'UNKNOWN'
+            is not in ('AT_BID', 'BELOW_BID'), so bid_side_prem stays 0
+            and condition 3 fails. Safe-by-default.
 
           PBE-6 note (panel deliberation 2026-05-06): self.events is iterated
-          twice — once for base buy/sell premium weighting, once for the ITM
-          bid/ask dominance check. Both loops are O(N) over episode size
-          (typically 3–20 events). Merging into a single pass is a known
-          optimization deferred to ING-011b or a standalone perf issue.
+          three times — premium weighting, majority band, bid/ask dominance.
+          All three loops are O(N) over episode size (typically 3–20 events).
+          Merging into a single pass is a known optimisation deferred to
+          ING-011b or a standalone perf issue.
         """
+        # PBE-F2: self.contract_type guaranteed non-empty — set at episode
+        # creation in _get_or_create_episode() before any emit path is reached.
         buy_prem = sell_prem = 0.0
         for e in self.events:
             d = order_side_to_direction(
@@ -451,9 +573,12 @@ class RepetitionEpisode:
         base_direction = "REPEAT_BUY" if buy_prem >= sell_prem else "REPEAT_SELL"
 
         # ING-011: ITM PUT override — AT_BID on ITM put = buyer, not writer.
+        # SA-F1: use _majority_itm_band() (premium-weighted majority across
+        # all events) rather than self.otm_band (last-tick only) so that a
+        # final UNKNOWN tick cannot suppress the override.
         if (
             self.contract_type.upper() == "PUT"
-            and self.otm_band in ("ITM", "DEEP_ITM")
+            and self._majority_itm_band()
         ):
             # Inspect the dominant bid_ask_class across events.
             # If the majority of premium came from AT_BID / BELOW_BID fills,
@@ -819,7 +944,10 @@ class RepetitionAccumulator:
         if len(ep.events) == 0:
             return None
 
-        # ING-011: classify full moneyness spectrum (replaces _classify_otm)
+        # ING-011: classify full moneyness spectrum (replaces _classify_otm).
+        # ep.otm_band = last-tick classification (SA-6 Phase 1 accepted).
+        # dominant_direction uses _majority_itm_band() for the override gate
+        # (SA-F1 fix) — ep.otm_band is the reported field only.
         moneyness_band = "UNKNOWN"
         try:
             up_raw = getattr(ev, "underlying_price", 0.0)
