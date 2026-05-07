@@ -142,6 +142,13 @@ Fix (ING-010-DEDUP 2026-05-07): thread tier_int into flow_dedup.is_duplicate().
   from gate_config_store instead of using the flat 5.0s construction default.
   Zero additional registry lookups — O(1) dict access on the already-available
   ev.influence_tier string.
+
+Fix (ING-010-IMPORT 2026-05-07): import store as gate_config_store.
+  The previous import `from services.gate_config_store import gate_config_store`
+  referenced a symbol that does not exist — the module exports `store`, not
+  `gate_config_store`. This caused an ImportError at startup so every
+  _resolve_signal_debounce_s() call fell back to the hardcoded constant.
+  Fix: `from services.gate_config_store import store as gate_config_store`.
 """
 import asyncio
 import logging
@@ -176,7 +183,8 @@ from utils.contract_day_cache import (
     ContractKey as _ContractKey,
 )
 # ING-010: tier-aware gate config store singleton.
-from services.gate_config_store import gate_config_store
+# The module exports `store`; aliased here so all internal references remain unchanged.
+from services.gate_config_store import store as gate_config_store
 
 log = logging.getLogger("tradier_stream")
 
