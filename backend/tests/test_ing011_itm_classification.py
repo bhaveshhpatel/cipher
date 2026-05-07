@@ -10,7 +10,8 @@ Key invariants under test:
   - OTM PUT AT_BID -> REPEAT_SELL (bullish) — unchanged regression anchor
   - ITM PUT AT_BID -> REPEAT_BUY (bearish) — ING-011 fix
   - DEEP_ITM PUT AT_BID -> REPEAT_BUY (bearish) — ING-011 fix (TMDX scenario)
-  - ITM PUT AT_ASK -> REPEAT_BUY (bearish) — already correct, unchanged
+  - ITM PUT AT_ASK + order_side='BUY' -> REPEAT_SELL (bearish) — cipher
+    semantic: BUY PUT = REPEAT_SELL; override does not fire (ask dominant)
   - ITM CALL AT_ASK -> REPEAT_BUY (bullish) — already correct, unchanged
   - ITM CALL AT_BID -> REPEAT_SELL (bearish) — call seller, unchanged
   - ATM PUT AT_BID -> REPEAT_SELL (bullish) — ATM selling, unchanged
@@ -27,6 +28,12 @@ Note on dominant_direction fallback:
   premium-weighting loop of dominant_direction. base_direction='REPEAT_SELL'.
   The ITM override fires only when bid_side_prem > ask_side_prem, flipping
   direction to REPEAT_BUY for ITM/DEEP_ITM PUT + AT_BID.
+
+Cipher direction semantics (see order_side_classifier.py):
+  BUY  + CALL -> REPEAT_BUY    (bullish)
+  SELL + PUT  -> REPEAT_BUY    (put-selling = bullish positioning)
+  BUY  + PUT  -> REPEAT_SELL   (put-buying = bearish)
+  SELL + CALL -> REPEAT_SELL   (call-selling = bearish/capped)
 """
 
 import asyncio
@@ -278,22 +285,22 @@ class TestITMDirectionOverride:
         assert ep.otm_band == "DEEP_ITM"
         assert ep.dominant_direction == "REPEAT_BUY"
 
-    # --- I-4: ITM PUT AT_ASK -> REPEAT_BUY (bearish) — already correct ---
+    # --- I-4: ITM PUT AT_ASK + order_side='BUY' -> REPEAT_SELL ---
 
     @pytest.mark.asyncio
-    async def test_I4_itm_put_at_ask_is_repeat_buy(self):
-        """ITM PUT AT_ASK -> REPEAT_BUY (aggressive put buyer). Already correct.
+    async def test_I4_itm_put_at_ask_is_repeat_sell(self):
+        """ITM PUT AT_ASK with order_side='BUY' -> REPEAT_SELL (bearish).
 
-        order_side='UNKNOWN', so base_direction='REPEAT_SELL'. However all fills
-        are AT_ASK so ask_side_prem > bid_side_prem -> override does NOT fire.
-        Base direction is REPEAT_SELL... but wait: AT_ASK signals a buyer lifting
-        the ask, which IS REPEAT_BUY. The discrepancy here is that order_side is
-        UNKNOWN — in production order_side would be 'BUY' on AT_ASK fills.
+        Cipher direction semantic (order_side_classifier.py):
+          BUY + PUT -> REPEAT_SELL  (put-buying = bearish positioning)
 
-        With order_side='UNKNOWN': base_direction='REPEAT_SELL'. Override won't
-        fire (ask dominant). Expected: REPEAT_SELL in this test setup.
+        The ITM bid-dominance override also does NOT fire here because all
+        fills are AT_ASK: ask_side_prem dominates, so the
+        bid_side_prem > ask_side_prem condition is false.
 
-        To correctly test I-4 (ITM PUT AT_ASK = REPEAT_BUY), we need order_side='BUY'.
+        Two independent reasons both produce REPEAT_SELL:
+          1. order_side_to_direction('BUY', 'PUT') -> REPEAT_SELL
+          2. ask_side dominant -> override gate fails
         """
         acc = _make_acc()
         events = [
@@ -303,8 +310,8 @@ class TestITMDirectionOverride:
         ]
         ep = await _build_episode(acc, events)
         assert ep.otm_band == "ITM"
-        # PUT + order_side='BUY' -> order_side_to_direction('BUY', 'PUT') -> REPEAT_BUY
-        assert ep.dominant_direction == "REPEAT_BUY"
+        # BUY PUT = bearish = REPEAT_SELL in cipher semantics
+        assert ep.dominant_direction == "REPEAT_SELL"
 
     # --- I-5: ITM CALL AT_ASK -> REPEAT_BUY (bullish) — already correct ---
 
