@@ -20,6 +20,15 @@ Design constraints
 - Idempotent: calling reconcile twice with identical state emits zero
   duplicate breach events (dedup via last-seen cache keyed on
   (symbol, breach_type, epoch-minute)).
+
+ING-010 (2026-05-07): Wire premium_usd threshold to gate_config_store.
+  _TIER_THRESHOLDS dict removed. Replaced by _get_tier_thresholds(tier_str)
+  which builds a threshold snapshot on each reconcile pass from:
+    gate_config_store.get("min_premium", tier_int)  -> premium_usd
+  OI and volume thresholds retain module-level fallback constants until
+  dedicated gate_config_store keys are added in a future ING-010b story.
+  Zero behaviour change when DB is unavailable — gate_config_store falls
+  back to _FALLBACK values which match the former hardcoded constants.
 """
 
 from __future__ import annotations
@@ -33,6 +42,9 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ING-010: gate_config_store singleton — O(1) in-memory reads on hot path.
+from services.gate_config_store import gate_config_store
 
 
 # ---------------------------------------------------------------------------
@@ -78,31 +90,52 @@ class ReconcileResult:
 
 
 # ---------------------------------------------------------------------------
-# Per-tier threshold config  (tunable via Settings in a future pass)
+# ING-010: Per-tier static fallbacks for OI / volume thresholds.
+# These gates have no gate_config_store keys yet (future ING-010b story).
+# Values match the former _TIER_THRESHOLDS hardcoded constants exactly so
+# behaviour is unchanged on first deploy.
 # ---------------------------------------------------------------------------
 
-_TIER_THRESHOLDS: Dict[str, Dict[str, float]] = {
-    "T1": {
-        "oi_spike_pct":      0.10,   # 10 % OI increase = breach
-        "oi_collapse_pct":  -0.15,   # 15 % OI decrease
-        "premium_usd":    250_000,   # $250 k single-event premium
-        "volume_ratio":       3.0,   # 3\u00d7 avg volume
-    },
-    "T2": {
-        "oi_spike_pct":      0.20,
-        "oi_collapse_pct":  -0.25,
-        "premium_usd":    100_000,
-        "volume_ratio":       4.0,
-    },
-    "T3": {
-        "oi_spike_pct":      0.35,
-        "oi_collapse_pct":  -0.40,
-        "premium_usd":     50_000,
-        "volume_ratio":       6.0,
-    },
+_OI_SPIKE_PCT: Dict[str, float] = {
+    "T1": 0.10,
+    "T2": 0.20,
+    "T3": 0.35,
+}
+_OI_COLLAPSE_PCT: Dict[str, float] = {
+    "T1": -0.15,
+    "T2": -0.25,
+    "T3": -0.40,
+}
+_VOLUME_RATIO: Dict[str, float] = {
+    "T1": 3.0,
+    "T2": 4.0,
+    "T3": 6.0,
 }
 
-_DEFAULT_TIER = "T3"  # fall-back for unknown symbols
+# Tier string -> int for gate_config_store lookups.
+_TIER_STR_TO_INT: Dict[str, int] = {"T1": 1, "T2": 2, "T3": 3}
+
+_DEFAULT_TIER     = "T3"
+_DEFAULT_TIER_INT = 3
+
+
+def _get_tier_thresholds(tier: str) -> Dict[str, float]:
+    """
+    Build a threshold snapshot for one tier.
+
+    ING-010: premium_usd is sourced live from gate_config_store so that
+    admin hot-reloads propagate to APEX-S2 breach detection without a
+    redeploy.  OI and volume keys are static pending ING-010b.
+
+    Never raises — gate_config_store.get() always returns a safe fallback.
+    """
+    tier_int = _TIER_STR_TO_INT.get(tier, _DEFAULT_TIER_INT)
+    return {
+        "oi_spike_pct":   _OI_SPIKE_PCT.get(tier,     _OI_SPIKE_PCT[_DEFAULT_TIER]),
+        "oi_collapse_pct": _OI_COLLAPSE_PCT.get(tier, _OI_COLLAPSE_PCT[_DEFAULT_TIER]),
+        "premium_usd":    float(gate_config_store.get("min_premium", tier_int)),
+        "volume_ratio":   _VOLUME_RATIO.get(tier,     _VOLUME_RATIO[_DEFAULT_TIER]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +202,12 @@ class ThresholdReconciler:
         self._seen.clear()
 
     def get_thresholds_for_tier(self, tier: str) -> Dict[str, float]:
-        """Return the threshold config for a given tier (read-only copy)."""
-        return dict(_TIER_THRESHOLDS.get(tier, _TIER_THRESHOLDS[_DEFAULT_TIER]))
+        """Return a live threshold snapshot for the given tier.
+
+        ING-010: delegates to _get_tier_thresholds() so premium_usd
+        reflects the current gate_config_store value, not a stale constant.
+        """
+        return _get_tier_thresholds(tier)
 
     # ------------------------------------------------------------------
     # Internal
@@ -191,7 +228,8 @@ class ThresholdReconciler:
                 continue
 
             tier  = tier_map.get(symbol, _DEFAULT_TIER)
-            thres = _TIER_THRESHOLDS.get(tier, _TIER_THRESHOLDS[_DEFAULT_TIER])
+            # ING-010: build threshold snapshot live from gate_config_store.
+            thres = _get_tier_thresholds(tier)
             result.checked += 1
 
             new_breaches = self._evaluate(m, tier, thres)
