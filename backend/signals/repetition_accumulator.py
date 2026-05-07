@@ -117,6 +117,13 @@
 #   function — eliminates the inline threshold re-implementation noted in
 #   PBE-6 / QA-F1 (ING-011 panel 2026-05-06).
 #
+#   BACKWARD-COMPAT SHIM (ING-011b fix — 2026-05-07):
+#     RepetitionAccumulator._classify_moneyness_band(ev) retained as an
+#     instance-method shim that delegates to the module-level function.
+#     Required for test_accumulator_s4_coverage.py which calls
+#     acc._classify_moneyness_band(ev) under the pre-D3 contract.
+#     Shim is a pure passthrough — no logic duplication.
+#
 #   get_weighted_premium() updated (D1 Option B — deliberation 2026-05-06):
 #     is_aggressive is set moneyness-blind at parse time (ING-006). ITM PUT
 #     AT_BID / BELOW_BID fills arrive with is_aggressive=True even though
@@ -183,6 +190,9 @@ Moneyness classification (ING-011 — replaces OTM-only classification from S4/I
   to module-level function. Zero self-state dependencies — pure arithmetic.
   Callable from RepetitionEpisode.get_weighted_premium() and
   RepetitionAccumulator.ingest_tick() without circular dependency.
+
+  Instance-method shim retained on RepetitionAccumulator for backward-compat
+  with test_accumulator_s4_coverage.py (pre-D3 call contract).
 
 ATM threshold deliberation note (Architect + Principal Engineer, 2026-04-30):
   ±2% was selected as the working threshold. Absolute dollar amounts break
@@ -405,6 +415,11 @@ _ITM_BANDS: frozenset = frozenset({"ITM", "DEEP_ITM"})
 #
 # RepetitionAccumulator.ingest_tick() call site updated to call this directly.
 # RepetitionEpisode._majority_itm_band() updated to delegate here.
+#
+# RepetitionAccumulator._classify_moneyness_band(ev) retained as a one-line
+# instance-method shim (see class body) for backward-compat with
+# test_accumulator_s4_coverage.py which calls acc._classify_moneyness_band(ev)
+# under the pre-D3 instance-method contract.
 # ---------------------------------------------------------------------------
 def _classify_moneyness_band(ev) -> str:
     """Classify a single event's contract into the full moneyness spectrum.
@@ -829,6 +844,16 @@ class RepetitionAccumulator:
             e for e in ep.events
             if hasattr(e, "timestamp") and e.timestamp and e.timestamp >= cutoff
         ]
+
+    def _classify_moneyness_band(self, ev) -> str:  # noqa: PLR6301
+        """Backward-compat instance-method shim (ING-011b fix — 2026-05-07).
+
+        test_accumulator_s4_coverage.py calls acc._classify_moneyness_band(ev)
+        under the pre-D3 instance-method contract. D3 promoted the function to
+        module-level. This shim is a pure one-line passthrough — no logic lives
+        here. All callers should prefer the module-level function directly.
+        """
+        return _classify_moneyness_band(ev)
 
     def _get_episode_min_premium(self, ep: RepetitionEpisode) -> float:
         """
