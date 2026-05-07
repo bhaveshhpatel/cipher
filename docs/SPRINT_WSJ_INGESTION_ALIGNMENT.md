@@ -42,7 +42,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
 | 7 | ~~**ING-007**~~ | ~~Multi-day repeat window lookback (DB + cache)~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅ | ✅ MERGED — 2026-05-06 (PR #74, commit `b70d9b0`) — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed |
 | 8 | ~~**ING-011**~~ | ~~ITM put/call misclassification fix~~ | ING-006 ✅, ING-007 ✅ | ✅ MERGED — 2026-05-07 (PR #81, commit `8d68ed1`) — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed |
-| 8b | **ING-011b** | `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | ING-011 ✅ (moneyness band must exist on events) | ⏳ Deliberation COMPLETE 2026-05-06 — **Option B selected** — branch `ing/s11b-itm-aggression-weight` not yet created — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) |
+| 8b | ~~**ING-011b**~~ | ~~`is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes~~ | ING-011 ✅ (moneyness band must exist on events) | ✅ MERGED — 2026-05-07 (PR #82, squash) — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
 | 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Deliberation required — ING-011 blocker cleared 2026-05-07 |
 | 10 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 |
 
@@ -119,7 +119,7 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 |-------|-------|-----------|-------------|
 | [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | BUG: Deeply ITM puts misclassified as REPEAT_SELL (bullish) — AT_BID logic ignoring intrinsic value | **Blocked ING-008** — ✅ resolved by ING-011 MERGED 2026-05-07 | ING-011 — ✅ MERGED PR #81 |
 | [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-011 or ING-008. Parallel track. Deliberation required. | ING-010 |
-| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-011 merge. Follow-on to ING-011. Deliberation COMPLETE 2026-05-06 — Option B selected. | ING-011b — deliberation complete, branch not yet created |
+| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-011 merge. Follow-on to ING-011. Deliberation COMPLETE 2026-05-06 — Option B selected. | ING-011b — ✅ MERGED PR #82 2026-05-07 — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
 
 ---
 
@@ -139,7 +139,15 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 | Issue | Title | Blocking? | Sprint Slot |
 |-------|-------|-----------|-------------|
-| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-008. Deliberation COMPLETE 2026-05-06 — Option B selected. Branch not yet created. | ING-011b |
+| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-008. Deliberation COMPLETE 2026-05-06 — Option B selected. | ING-011b — ✅ MERGED PR #82 2026-05-07 — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
+
+---
+
+## Post-ING-011b-Merge Findings (GitHub Issues Filed)
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| D4 accepted gap | `prior_days_aggressive` in `flow_events.is_aggressive` is stamped at parse time (moneyness-blind). ITM PUT AT_BID buyers are counted as aggressive in the DB column. File a follow-up story if multi-day aggression metrics prove materially skewed after 5+ trading days of live data under ING-007. | Not blocking ING-008 or ING-010 | Post ING-011b monitoring |
 
 ---
 
@@ -500,12 +508,17 @@ Deeply ITM puts filling `AT_BID` were classified as `REPEAT_SELL` (put selling =
 **Does NOT block:** ING-008, ING-010 (parallel tracks)
 **Filed:** 2026-05-06 — annotation commit [`a82f3967`](https://github.com/bhaveshhpatel/cipher/commit/a82f3967fb37a07af180caadefbbcb50e041aae2)
 **Files:**
-- `backend/signals/repetition_accumulator.py` — `get_weighted_premium()` + promote `_classify_moneyness_band()` to module-level function
+- `backend/signals/repetition_accumulator.py` — `get_weighted_premium()` + promoted `_classify_moneyness_band()` to module-level function
 - `backend/tests/test_ing011b_itm_aggression_weight.py` — NEW: full test matrix (W-1 through W-12)
-**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80)
-**Branch:** `ing/s11b-itm-aggression-weight` *(not yet created — deliberation complete, branch creation pending Issue filing)*
+**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — ✅ CLOSED 2026-05-07
+**Branch:** `ing/s11b-itm-aggression-weight`
+**PR:** [#82](https://github.com/bhaveshhpatel/cipher/pull/82) — ✅ **MERGED 2026-05-07** (squash)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
+#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
+**SA verdict:** PASS — SA-1 (non-blocking comment, no code change required).
+**PBE verdict:** PASS — PBE-1 (non-blocking), PBE-2 (non-blocking).
+**QA verdict:** PASS — QA-1 resolved inline (W-4b boundary test added), QA-2 typo fixed (commit `2bb1487`). All 30 assertions across 12 test classes (W-1 through W-12) passing.
 
 #### Deliberation Outcomes
 
@@ -563,7 +576,7 @@ def get_weighted_premium(self, discount: float) -> float:
     return total
 ```
 
-#### Blast Radius (unchanged from Issue #80)
+#### Blast Radius
 
 | Component | Impact |
 |---|---|
@@ -575,17 +588,17 @@ def get_weighted_premium(self, discount: float) -> float:
 
 #### Acceptance Criteria
 
-- [ ] D1–D5 deliberations recorded inline in this document (complete ✅) and in Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80)
-- [ ] `_classify_moneyness_band()` promoted to module-level function in `repetition_accumulator.py`
-- [ ] `_majority_itm_band()` updated to call module-level `_classify_moneyness_band()` — eliminates inline duplication
-- [ ] `get_weighted_premium()` updated per Option B implementation spec above
-- [ ] `weighted_premium` property correctly delegates to updated `get_weighted_premium()`
-- [ ] A 3-event ITM PUT AT_BID episode at $200k total premium is discounted to $100k `weighted_premium` (all 3 events at 0.5×)
-- [ ] A 3-event OTM PUT AT_BID episode at $200k total premium retains $200k `weighted_premium` (full weight unchanged — W-1 regression)
-- [ ] No regression on `test_ing006_directional_aggression.py`
-- [ ] No regression on `test_ing007_multiday_lookback.py`
-- [ ] No regression on `test_ing011_itm_classification.py`
-- [ ] All QA matrix cases W-1 through W-12 pass
+- [x] D1–D5 deliberations recorded inline in this document and in Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80)
+- [x] `_classify_moneyness_band()` promoted to module-level function in `repetition_accumulator.py`
+- [x] `_majority_itm_band()` updated to call module-level `_classify_moneyness_band()` — eliminates inline duplication
+- [x] `get_weighted_premium()` updated per Option B implementation spec above
+- [x] `weighted_premium` property correctly delegates to updated `get_weighted_premium()`
+- [x] A 3-event ITM PUT AT_BID episode at $200k total premium is discounted to $100k `weighted_premium` (all 3 events at 0.5×)
+- [x] A 3-event OTM PUT AT_BID episode at $200k total premium retains $200k `weighted_premium` (full weight unchanged — W-1 regression)
+- [x] No regression on `test_ing006_directional_aggression.py`
+- [x] No regression on `test_ing007_multiday_lookback.py`
+- [x] No regression on `test_ing011_itm_classification.py`
+- [x] All QA matrix cases W-1 through W-12 pass
 
 #### QA Test Matrix
 
@@ -595,6 +608,7 @@ def get_weighted_premium(self, discount: float) -> float:
 | W-2 | ITM PUT | AT_BID | ITM | True | ×0.5 — ITM buyer, discount applies |
 | W-3 | DEEP_ITM PUT | AT_BID | DEEP_ITM | True | ×0.5 — DEEP_ITM buyer, discount applies |
 | W-4 | ITM PUT | AT_ASK | ITM | True | ×1.0 — aggressive AT_ASK buyer, full weight always |
+| W-4b | ITM PUT | AT_BID | ITM | True, premium boundary ($10k floor) | ×0.5 — boundary test: floor-value event still discounted |
 | W-5 | ITM CALL | AT_BID | ITM | True | ×1.0 — call writer, correct aggression, no change |
 | W-6 | OTM PUT | MID | OTM | False | ×0.5 — passive mid-fill, unchanged |
 | W-7 | ITM PUT | AT_BID | UNKNOWN | True | ×1.0 — band unknown, no discount applied (safe fallback) |
@@ -701,8 +715,8 @@ PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh 
 
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
 
-> **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`). ING-008 deliberation is now unblocked.** Read the full ING-011 deliberation outcomes above (D1/D2/D3 decisions, panel verdicts) before beginning ING-008 deliberation — OI gate thresholds must be calibrated against correctly-classified directional data. Do not begin implementation until deliberation is complete and all three roles have signed off.
+> **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`). ING-011b merged 2026-05-07 (PR #82). ING-008 deliberation is now unblocked.** Read the full ING-011 and ING-011b deliberation outcomes above (D1–D5 decisions, panel verdicts) before beginning ING-008 deliberation — OI gate thresholds must be calibrated against correctly-classified and correctly-weighted directional data. Do not begin implementation until deliberation is complete and all three roles have signed off.
 
 ---
 
-*Last updated: 2026-05-06 (ING-011b deliberation COMPLETE — D1 Option B selected, D2 per-event classification, D3 promote `_classify_moneyness_band()` to module level, D4 `prior_days_aggressive` accepted gap, D5 UNKNOWN fallback no-discount; Sprint Order row 8b updated; Post-ING-011-Merge Findings table updated; ING-011b story section updated with full 3-way SA/PBE/QA outcomes, implementation spec, W-1 through W-12 test matrix, AC checklist) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-07 (ING-011b MERGED — PR #82 squash 2026-05-07; Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed; Sprint Order row 8b marked ✅ MERGED; Post-ING-011-Merge Findings table updated; Post-ING-011b-Merge Findings section added; ING-011b story section: AC all checked ✅, pre-merge panel verdicts recorded SA/PBE/QA PASS, W-4b boundary test row added to QA matrix; ING-008 note updated to reflect ING-011b merged) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
