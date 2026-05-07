@@ -4,6 +4,73 @@ Chronological record of all bugs found and fixed. Each entry includes root cause
 
 ---
 
+## ING-011 — ITM Put/Call Moneyness Classification + Direction Override
+
+**Date:** 2026-05-07
+**Severity:** P0 — signal correctness; deeply ITM puts filling AT_BID were classified as REPEAT_SELL (bullish/put-writing) when the correct read is bearish put buying
+**PR:** [#81](https://github.com/bhaveshhpatel/cipher/pull/81) — squash merged 2026-05-07 (commit `8d68ed1`)
+**Branch:** `ing/s11-itm-classification`
+**Files:** `backend/signals/repetition_accumulator.py`, `backend/tests/test_ing011_itm_classification.py`
+**Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77) — closed 2026-05-07
+
+### Root Cause
+
+`dominant_direction` in `RepetitionAccumulator` mapped `AT_BID PUT fill → REPEAT_SELL` (put writing = bullish). This is correct for OTM puts where AT_BID means a seller initiating. For ITM puts, AT_BID simply reflects a buyer paying near-intrinsic value in a wide spread — not a put writer. The existing `_classify_otm()` method only classified OTM/ATM bands; ITM contracts fell to `UNKNOWN` with no override logic, allowing the incorrect AT_BID=seller assumption to propagate.
+
+**Live example — TMDX 2026-05-06 13:43:50 UTC:**
+- PUT $105 · May 15 · underlying $75.69 · size 1,263 · fill $27.68 · bid $26.70 · ask $29.50
+- `bid_ask_class = AT_BID` → system: `REPEAT_SELL` (bullish) — **incorrect**
+- Actual: strike ~39% above underlying = deeply ITM put buyer = bearish
+
+### Deliberation Decisions (3-way panel, 2026-05-06)
+
+**D1 — ITM threshold: DECIDED — reuse ING-005 ATM band (±2%) exactly**
+- `_ITM_THRESHOLD = 0.02` — symmetric with ING-005 ATM ±2% band
+- `_DEEP_ITM_THRESHOLD = 0.10` — symmetric with existing `DEEP_OTM` boundary
+- Rationale: reusing the ING-005 threshold ensures consistent moneyness classification across the full band spectrum. No new magic numbers introduced.
+- Options B (tighter 1%) and C (wider 5%) both rejected — no empirical basis to deviate from the established ±2% regime.
+
+**D2 — Override scope: DECIDED — ALL ITM (not just DEEP_ITM), PUT-only**
+- Override applies to both `ITM` and `DEEP_ITM` bands for PUTs
+- ITM CALL AT_BID unchanged — call seller writing at bid is correctly bearish already
+- Mildly ITM puts (2–10% ITM) can legitimately represent put writing in slow markets, but the deliberation concluded the signal correctness gain on institutional ITM put buyers outweighs the edge-case risk on mild ITM sellers
+- Option A (DEEP_ITM only, >10%) rejected — misses the 2–10% ITM band where most institutional hedges and synthetic short positions land
+
+**D3 — Schema: DECIDED — extend `otm_band` enum in-place, no DB migration**
+- `ITM` and `DEEP_ITM` added to existing `otm_band` TEXT column values on `RepetitionEpisode`
+- `_classify_otm()` replaced by `_classify_moneyness_band()` — full spectrum: `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN`
+- No DB migration required — `otm_band` column is TEXT, not a Postgres enum type
+- Option B (separate `itm_band` field) rejected — adds schema surface with no benefit; the existing `otm_band` field already semantically covers the full moneyness spectrum
+
+### Fix
+
+**`backend/signals/repetition_accumulator.py`:**
+- `_classify_otm()` replaced by `_classify_moneyness_band()` — full spectrum classification
+- `_ITM_THRESHOLD = 0.02` and `_DEEP_ITM_THRESHOLD = 0.10` added at module level
+- `dominant_direction` override: `contract_type == PUT AND otm_band in (ITM, DEEP_ITM) AND bid_side_prem > ask_side_prem` → force `REPEAT_BUY` (bearish)
+
+### Panel Findings (resolved inline before merge)
+
+- **SA-F1:** `_majority_itm_band()` helper needed UNKNOWN-tick suppression — resolved with test I-12 added
+- **QA-F1:** Test I-12 (UNKNOWN-band suppression) added to test matrix — resolved
+- **QA-F3:** I-8 docstring clarified (`underlying_price == 0` fallback) — resolved
+
+### Tests Added (`backend/tests/test_ing011_itm_classification.py`)
+
+34 tests across 3 classes: `TestClassifyMoneynessBand` (unit tests for `_classify_moneyness_band()` directly), `TestITMDirectionOverride` (full episode integration tests for QA matrix cases I-1 through I-11), `TestThresholdConstants` (sanity checks on `_ITM_THRESHOLD == 0.02` and `_DEEP_ITM_THRESHOLD == 0.10`).
+
+### Acceptance Criteria
+- [x] D1, D2, D3 deliberations resolved and documented
+- [x] `_classify_moneyness_band()` replaces `_classify_otm()` — full band spectrum
+- [x] `dominant_direction` for ITM/DEEP_ITM puts resolves to `REPEAT_BUY` (bearish) regardless of `bid_ask_class`
+- [x] TMDX $105P scenario re-run produces correct `BEARISH` direction
+- [x] Existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour unchanged
+- [x] `underlying_price == 0` fallback: no ITM classification attempted, `UNKNOWN` preserved
+- [x] 34 tests added, all passing
+- [x] No regression on ING-006 or ING-007 test suites
+
+---
+
 ## ING-009 — Same-Session Flow Episode Upsert/Merge
 
 **Date:** 2026-05-06
