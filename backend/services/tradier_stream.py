@@ -149,6 +149,16 @@ Fix (ING-010-IMPORT 2026-05-07): import store as gate_config_store.
   `gate_config_store`. This caused an ImportError at startup so every
   _resolve_signal_debounce_s() call fell back to the hardcoded constant.
   Fix: `from services.gate_config_store import store as gate_config_store`.
+
+Fix (ING-011 2026-05-07): exclude_indices Gate 6 — index options filter.
+  _INDEX_SYMBOLS frozenset defines the 10 high-volume index ETF tickers whose
+  options generate noise-level flow that obscures single-stock signals.
+  _resolve_exclude_indices() reads gate_config_store.get("exclude_indices", 1)
+  (tier-1 canonical row); safe fallback = True (filter ON) on any error.
+  Gate check fires in _process_trade() immediately after _raw_ticker extract,
+  before parse_tradier_trade() — no parse cost incurred for filtered ticks.
+  _stats["index_filtered"] counter tracks suppressed index ticks; wired into
+  flow-funnel log line (every 100 ticks).
 """
 import asyncio
 import logging
@@ -216,6 +226,15 @@ _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
 
+# ING-011: High-volume index ETF tickers whose options generate noise-level
+# flow that obscures single-stock signals.  Filtered when exclude_indices
+# gate is active (gate_config_store.get("exclude_indices", 1) == 1.0).
+_INDEX_SYMBOLS: frozenset[str] = frozenset({
+    "SPY", "QQQ", "IWM", "DIA",
+    "VXX", "GLD", "TLT", "HYG",
+    "EEM", "SLV",
+})
+
 # ---------------------------------------------------------------------------
 # Signal gate thresholds — cold-start fallbacks.
 # ING-010-GATES: live values are read from gate_config_store at point-of-use.
@@ -278,6 +297,8 @@ _stats = {
     "last_reconnect_at": None,
     # ING-010: gate config epoch — increments on every hot-reload update
     "gate_epoch":        0,
+    # ING-011: ticks dropped by exclude_indices gate
+    "index_filtered":    0,
 }
 
 _non_timesale_etypes_seen: set = set()
@@ -366,6 +387,25 @@ def _resolve_signal_min_premium() -> float:
     except Exception:
         pass
     return float(_SIGNAL_MIN_PREMIUM)
+
+
+# ---------------------------------------------------------------------------
+# ING-011: live exclude_indices resolver
+# ---------------------------------------------------------------------------
+def _resolve_exclude_indices() -> bool:
+    """
+    Return True if the exclude_indices gate is active (1.0), False if disabled (0.0).
+
+    Reads gate_config_store.get("exclude_indices", 1) — tier=1 is the
+    canonical row for this tier-independent gate.  Safe fallback is True
+    (filter ON) so index noise is suppressed even before the store loads.
+    Never raises.
+    """
+    try:
+        val = gate_config_store.get("exclude_indices", 1)
+        return bool(val >= 0.5)
+    except Exception:
+        return True  # safe fallback: filter ON
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +651,13 @@ async def _process_trade(raw: dict):
     ING-010-DEDUP addition: ev.influence_tier -> tier_int threaded into
       flow_dedup.is_duplicate() so DedupCache reads dedup_window_ms per tier.
 
+    ING-011 addition: exclude_indices gate.
+      After _raw_ticker is extracted (pre-parse), if _resolve_exclude_indices()
+      returns True and _raw_ticker is in _INDEX_SYMBOLS, the tick is dropped
+      immediately. No parse cost is incurred. _stats["index_filtered"] is
+      incremented and a DEBUG log fires. Gate can be toggled live via the
+      PATCH /gates/exclude_indices/1 admin endpoint without stream restart.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -641,12 +688,13 @@ async def _process_trade(raw: dict):
         _parser_stats = get_parser_stats()
         log.info(
             "[flow-funnel] ticks=%d parsed=%d parse_failed=%d below_min_premium=%d "
-            "deduped=%d classified=%d accumulator_gated=%d "
+            "index_filtered=%d deduped=%d classified=%d accumulator_gated=%d "
             "persisted=%d signals=%d sig_debounced=%d gate_epoch=%d",
             tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
             _parser_stats["below_min_premium"],
+            _stats["index_filtered"],
             _stats["deduped"],
             _stats["classified"],
             _stats["accumulator_gated"],
@@ -679,6 +727,16 @@ async def _process_trade(raw: dict):
         or trade_payload.get("symbol", "").split()[0]
         or ""
     )
+
+    # ING-011: exclude_indices gate — drop index ETF flow before parse.
+    if _raw_ticker and _raw_ticker.upper() in _INDEX_SYMBOLS and _resolve_exclude_indices():
+        _stats["index_filtered"] += 1
+        log.debug(
+            "[ING-011] index_filtered ticker=%s tick=%d (total_filtered=%d)",
+            _raw_ticker, tick_n, _stats["index_filtered"],
+        )
+        return
+
     _tier_min_premium = _resolve_min_premium(_raw_ticker) if _raw_ticker else None
 
     result = parse_tradier_trade(trade_payload, min_premium=_tier_min_premium)
