@@ -1,310 +1,366 @@
+"""
+services/gate_config_store.py — ING-010: Tier-aware ingestion gate control plane.
+
+Design
+------
+- Singleton GateConfigStore loaded at startup from `gate_configs` Supabase table.
+- All gate value reads are O(1) in-memory dict lookups — zero DB calls on the
+  tick hot path.
+- update() writes to DB atomically, persists a full audit row, then refreshes
+  the in-memory dict under a threading.Lock.
+- Unknown tiers default safely to T3 (most conservative floor).
+- Bounds validation rejects unsafe values (e.g. min_premium=0) before any write.
+
+Gates managed
+-------------
+  min_premium          — parser belowminpremium floor ($)
+  dte_floor_multiplier — DTE-adjusted accumulator floor scale factor
+  require_oi           — per-tier OI gate boolean (stored as 0/1)
+  debounce_ms          — signal debounce window (ms)
+  dedup_window_ms      — dedup cache window (ms)
+"""
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timezone, time as dt_time
-from typing import Optional
+import os
+import threading
+import time
+from typing import Any, Optional
 
-log = logging.getLogger(__name__)
+import httpx
 
-# ---------------------------------------------------------------------------
-# Gate name constants — single source of truth for callers
-# ---------------------------------------------------------------------------
-GATE_MIN_PREMIUM = "min_premium"
-GATE_DTE_FLOOR_MULTIPLIER = "dte_floor_multiplier"
-GATE_REQUIRE_OI = "require_oi"
-GATE_SIGNAL_DEBOUNCE_MS = "signal_debounce_ms"
-GATE_DEDUP_WINDOW_MS = "dedup_window_ms"  # seeded; Python wiring deferred
+log = logging.getLogger("gate_config_store")
 
 # ---------------------------------------------------------------------------
-# Hardcoded fallback defaults — cold-start guard only.
-# Primary source of truth is the gate_configs DB table (seeded in 013 migration).
+# Safe hardcoded fallbacks — used when DB is unavailable or row is missing.
+# Keyed by (gate_name, tier).  tier is int 1/2/3.
 # ---------------------------------------------------------------------------
-_FALLBACK_DEFAULTS: dict[str, float] = {
-    GATE_MIN_PREMIUM: 10_000.0,
-    GATE_DTE_FLOOR_MULTIPLIER: 1.0,
-    GATE_REQUIRE_OI: 0.0,
-    GATE_SIGNAL_DEBOUNCE_MS: 60_000.0,
-    GATE_DEDUP_WINDOW_MS: 5_000.0,
+_FALLBACK: dict[tuple[str, int], Any] = {
+    ("min_premium",          1): 25_000,
+    ("min_premium",          2): 15_000,
+    ("min_premium",          3): 10_000,
+    ("dte_floor_multiplier", 1): 1.5,
+    ("dte_floor_multiplier", 2): 1.0,
+    ("dte_floor_multiplier", 3): 0.75,
+    ("require_oi",           1): False,
+    ("require_oi",           2): False,
+    ("require_oi",           3): False,
+    ("debounce_ms",          1): 30_000,
+    ("debounce_ms",          2): 60_000,
+    ("debounce_ms",          3): 120_000,
+    ("dedup_window_ms",      1): 5_000,
+    ("dedup_window_ms",      2): 5_000,
+    ("dedup_window_ms",      3): 5_000,
 }
 
-# ---------------------------------------------------------------------------
-# Validation bounds — hardcoded per deliberation (D3 / PBE).
-# Move to a DB table in a follow-on story if runtime-configurable bounds are needed.
-# ---------------------------------------------------------------------------
-_GATE_BOUNDS: dict[str, tuple[float, float]] = {
-    GATE_MIN_PREMIUM:          (1_000.0,   500_000.0),
-    GATE_DTE_FLOOR_MULTIPLIER: (0.1,       5.0),
-    GATE_REQUIRE_OI:           (0.0,       1.0),
-    GATE_SIGNAL_DEBOUNCE_MS:   (1_000.0,   3_600_000.0),
-    GATE_DEDUP_WINDOW_MS:      (500.0,     60_000.0),
+# Validation bounds for each gate (min_val, max_val inclusive)
+_BOUNDS: dict[str, tuple[Any, Any]] = {
+    "min_premium":          (1_000,  500_000),
+    "dte_floor_multiplier": (0.1,    5.0),
+    "require_oi":           (0,      1),
+    "debounce_ms":          (1_000,  600_000),
+    "dedup_window_ms":      (500,    60_000),
 }
 
-# Market hours guard — ET (UTC-4 summer / UTC-5 winter). Use UTC comparison.
-_MARKET_OPEN_ET  = dt_time(13, 30)   # 09:30 ET = 13:30 UTC
-_MARKET_CLOSE_ET = dt_time(20, 0)    # 16:00 ET = 20:00 UTC
-
-# ---------------------------------------------------------------------------
-# Module-level stats — cold-start safe (initialised before first tick)
-# ---------------------------------------------------------------------------
-_stats: dict[str, int] = {
-    "db_loads": 0,
-    "updates": 0,
-    "db_write_failures": 0,
-    "retry_queue_flushes": 0,
-}
-
-
-class GateConfigValidationError(ValueError):
-    """Raised when a submitted gate config value violates bounds."""
-
-
-class MarketHoursConfirmationRequired(Exception):
-    """Raised when a market-hours change is submitted without confirm_market_hours=True."""
+_SAFE_DEFAULT_TIER = 3
+_VALID_TIERS = frozenset({1, 2, 3})
 
 
 class GateConfigStore:
     """
-    Thread-safe in-memory config store for ingestion gate thresholds.
+    Thread-safe in-memory gate configuration store.
 
-    Loaded at startup from DB. Updated via admin API without process restart.
-    Workers hold a reference to the process-level singleton and read live values
-    on every gate check via get_threshold().
+    Usage
+    -----
+    Instantiate once at app startup, call await store.load() to populate
+    from DB. Pass the singleton to any service that needs gate values.
 
-    Single-process Railway deployment: in-memory singleton is sufficient.
-    Multi-replica follow-on: add Supabase Realtime subscription that calls
-    load_from_db() on any gate_configs UPDATE event.
+    All per-tick reads call store.get(gate_name, tier) — O(1) dict lookup,
+    no locks, no DB I/O.
     """
 
-    _instance: Optional["GateConfigStore"] = None
-
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        # Keyed by (gate_name, tier) -> float
-        self._configs: dict[tuple[str, int], float] = {}
-        self._last_loaded: Optional[datetime] = None
-        # Failed DB writes are queued for async retry
-        self._retry_queue: list[dict] = []
+        self._data: dict[tuple[str, int], Any] = dict(_FALLBACK)
+        self._lock = threading.Lock()
+        self._epoch: int = 0
+        self._loaded: bool = False
 
-    # ------------------------------------------------------------------
-    # Singleton accessor
-    # ------------------------------------------------------------------
-    @classmethod
-    def get(cls) -> "GateConfigStore":
-        if cls._instance is None:
-            cls._instance = GateConfigStore()
-        return cls._instance
-
-    @classmethod
-    def reset_for_testing(cls) -> None:
-        """Reset singleton state. Only call from tests."""
-        cls._instance = None
-
-    # ------------------------------------------------------------------
-    # Startup load
-    # ------------------------------------------------------------------
-    async def load_from_db(self, db) -> None:
-        """
-        Load all gate_configs rows from Supabase into memory.
-        Called at startup and by admin PATCH after a successful write.
-        On failure: logs error, leaves existing in-memory state intact.
-        """
-        try:
-            result = await db.table("gate_configs").select(
-                "gate_name, tier, value"
-            ).execute()
-            new_configs: dict[tuple[str, int], float] = {
-                (row["gate_name"], int(row["tier"])): float(row["value"])
-                for row in (result.data or [])
-            }
-            async with self._lock:
-                self._configs = new_configs
-                self._last_loaded = datetime.now(timezone.utc)
-            _stats["db_loads"] += 1
-            log.info(
-                "gate_config_store loaded %d rows from db",
-                len(new_configs),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.error("gate_config_store: load_from_db failed: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Hot read — called on every tick, must not block
-    # ------------------------------------------------------------------
-    def get_threshold(self, gate_name: str, symbol: str) -> float:
-        """
-        Return the gate threshold for (gate_name, symbol).
-        Tier is resolved from tier_engine with T3 as safe default.
-        Never performs I/O — pure in-memory dict lookup.
-        """
-        tier = self._resolve_tier(symbol)
-        value = self._configs.get((gate_name, tier))
-        if value is None:
-            value = _FALLBACK_DEFAULTS.get(gate_name, 0.0)
-            log.debug(
-                "gate_config_store: fallback for gate=%s symbol=%s tier=%d value=%s",
-                gate_name,
-                symbol,
-                tier,
-                value,
-            )
-        return value
-
-    def get_threshold_for_tier(self, gate_name: str, tier: int) -> float:
-        """Direct tier lookup — used by admin GET and tests."""
-        value = self._configs.get((gate_name, tier))
-        if value is None:
-            return _FALLBACK_DEFAULTS.get(gate_name, 0.0)
-        return value
-
-    # ------------------------------------------------------------------
-    # Admin write — called by PATCH /api/admin/gate-config
-    # ------------------------------------------------------------------
-    async def update(
-        self,
-        gate_name: str,
-        tier: int,
-        value: float,
-        updated_by: str,
-        reason: str,
-        db,
-        confirm_market_hours: bool = False,
-    ) -> dict:
-        """
-        Validate, update in-memory, persist to DB.
-        Returns a dict with old_value, new_value, propagated_at.
-        Raises GateConfigValidationError on bound violations.
-        Raises MarketHoursConfirmationRequired when confirm_market_hours is missing.
-        """
-        self._validate(gate_name, value)
-        self._check_market_hours(confirm_market_hours)
-
-        old_value = self._configs.get((gate_name, tier))
-
-        async with self._lock:
-            self._configs[(gate_name, tier)] = value
-
-        _stats["updates"] += 1
-        propagated_at = datetime.now(timezone.utc)
-
-        payload = {
-            "gate_name": gate_name,
-            "tier": tier,
-            "value": value,
-            "updated_by": updated_by,
-            "previous_value": old_value,
-            "reason": reason,
-            "updated_at": propagated_at.isoformat(),
-        }
-
-        await self._persist_or_queue(payload, db)
-
-        log.info(
-            "gate_config updated gate=%s tier=%d old=%s new=%s by=%s",
-            gate_name,
-            tier,
-            old_value,
-            value,
-            updated_by,
+        self._supabase_url: Optional[str] = os.environ.get("SUPABASE_URL")
+        self._supabase_key: Optional[str] = (
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            or os.environ.get("SUPABASE_SERVICE_KEY")
         )
-
-        return {
-            "gate_name": gate_name,
-            "tier": tier,
-            "old_value": old_value,
-            "new_value": value,
-            "propagated_at": propagated_at.isoformat(),
-        }
-
-    # ------------------------------------------------------------------
-    # Admin read helpers
-    # ------------------------------------------------------------------
-    def get_all(self) -> dict[tuple[str, int], float]:
-        """Return a snapshot of the full config map. Used by GET endpoint."""
-        return dict(self._configs)
-
-    def get_bounds(self) -> dict[str, dict]:
-        """Return validation bounds per gate. Included in GET response for admin UI."""
-        return {
-            name: {"min": lo, "max": hi}
-            for name, (lo, hi) in _GATE_BOUNDS.items()
-        }
-
-    def get_stats(self) -> dict:
-        return dict(_stats)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _resolve_tier(self, symbol: str) -> int:
+
+    def _headers(self) -> dict:
+        return {
+            "apikey":        self._supabase_key or "",
+            "Authorization": f"Bearer {self._supabase_key or ''}",
+            "Content-Type":  "application/json",
+        }
+
+    @staticmethod
+    def _cast(gate_name: str, raw: Any) -> Any:
+        """Cast raw DB value to correct Python type for this gate."""
+        if gate_name == "require_oi":
+            return bool(int(float(raw)))
+        if gate_name in ("min_premium", "debounce_ms", "dedup_window_ms"):
+            return int(float(raw))
+        if gate_name == "dte_floor_multiplier":
+            return float(raw)
+        return raw
+
+    # ------------------------------------------------------------------
+    # Startup load
+    # ------------------------------------------------------------------
+
+    async def load(self) -> None:
         """
-        Resolve symbol to tier via tier_engine.
-        Returns 3 (T3) as safe default for unknown symbols.
-        Import is deferred inside the method to avoid circular imports at
-        module load time — tier_engine may import from services.
+        Load all gate_configs rows from DB into memory.
+        Falls back to _FALLBACK silently on any DB error.
+        Safe to call multiple times (idempotent).
         """
+        if not self._supabase_url or not self._supabase_key:
+            log.warning("[gate_config_store] Supabase not configured — using fallback defaults")
+            self._loaded = True
+            return
+
+        url = (
+            f"{self._supabase_url}/rest/v1/gate_configs"
+            "?select=gate_name,tier,value&is_active=eq.true"
+        )
         try:
-            from backend.services.tier_engine import get_symbol_tier  # noqa: PLC0415
-            tier = get_symbol_tier(symbol)
-            if tier not in (1, 2, 3):
-                return 3
-            return tier
-        except Exception:  # noqa: BLE001
-            return 3
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=self._headers())
+            if resp.status_code == 200:
+                rows = resp.json()
+                new_data: dict[tuple[str, int], Any] = dict(_FALLBACK)
+                loaded_count = 0
+                for row in rows:
+                    gate = row.get("gate_name", "")
+                    tier = int(row.get("tier", 0))
+                    val  = row.get("value")
+                    if gate and tier in _VALID_TIERS and val is not None:
+                        new_data[(gate, tier)] = self._cast(gate, val)
+                        loaded_count += 1
+                with self._lock:
+                    self._data = new_data
+                    self._epoch += 1
+                self._loaded = True
+                log.info(
+                    "[gate_config_store] Loaded %d gate config rows (epoch %d)",
+                    loaded_count, self._epoch,
+                )
+                return
+            log.warning(
+                "[gate_config_store] DB load failed HTTP %d — using fallback defaults",
+                resp.status_code,
+            )
+        except Exception as exc:
+            log.warning("[gate_config_store] DB load error: %s — using fallback defaults", exc)
+        self._loaded = True
 
-    def _validate(self, gate_name: str, value: float) -> None:
-        bounds = _GATE_BOUNDS.get(gate_name)
-        if bounds is None:
-            raise GateConfigValidationError(f"Unknown gate: {gate_name!r}")
-        lo, hi = bounds
-        if not (lo <= value <= hi):
-            raise GateConfigValidationError(
-                f"Gate {gate_name!r} value {value} out of bounds [{lo}, {hi}]"
+    # ------------------------------------------------------------------
+    # Per-tick read (hot path — lock-free)
+    # ------------------------------------------------------------------
+
+    def get(self, gate_name: str, tier: int) -> Any:
+        """
+        Return the configured value for (gate_name, tier).
+        Falls back to T3 default for unknown tiers.
+        Never raises — always returns a safe value.
+        """
+        safe_tier = tier if tier in _VALID_TIERS else _SAFE_DEFAULT_TIER
+        return self._data.get(
+            (gate_name, safe_tier),
+            _FALLBACK.get((gate_name, _SAFE_DEFAULT_TIER)),
+        )
+
+    @property
+    def epoch(self) -> int:
+        """Monotonically incrementing counter — callers can detect config changes."""
+        return self._epoch
+
+    # ------------------------------------------------------------------
+    # Admin read — full snapshot
+    # ------------------------------------------------------------------
+
+    def get_all(self) -> list[dict]:
+        """
+        Return all current gate config values with bounds metadata.
+        Used by GET /api/admin/gate-config.
+        """
+        rows = []
+        seen: set[tuple[str, int]] = set()
+        for (gate, tier), value in sorted(self._data.items()):
+            seen.add((gate, tier))
+            lo, hi = _BOUNDS.get(gate, (None, None))
+            rows.append({
+                "gate_name":  gate,
+                "tier":       tier,
+                "value":      value,
+                "min_bound":  lo,
+                "max_bound":  hi,
+            })
+        # Include fallback rows that may not yet be in DB
+        for (gate, tier), value in sorted(_FALLBACK.items()):
+            if (gate, tier) not in seen:
+                lo, hi = _BOUNDS.get(gate, (None, None))
+                rows.append({
+                    "gate_name":  gate,
+                    "tier":       tier,
+                    "value":      value,
+                    "min_bound":  lo,
+                    "max_bound":  hi,
+                    "_source":    "fallback",
+                })
+        return rows
+
+    # ------------------------------------------------------------------
+    # Admin write — hot-reload update
+    # ------------------------------------------------------------------
+
+    async def update(
+        self,
+        gate_name: str,
+        tier: int,
+        new_value: Any,
+        updated_by: str = "admin",
+        reason: str = "",
+        confirm_market_hours: bool = False,
+    ) -> dict:
+        """
+        Validate → persist to DB → update in-memory dict → return result.
+
+        Returns dict with keys: gate_name, tier, old_value, new_value,
+        propagated_at, epoch.
+
+        Raises ValueError on validation failure.
+        Raises RuntimeError on DB write failure.
+        """
+        # --- Tier validation ---
+        if tier not in _VALID_TIERS:
+            raise ValueError(f"Invalid tier {tier!r}. Must be one of {sorted(_VALID_TIERS)}.")
+
+        # --- Gate existence check ---
+        if gate_name not in _BOUNDS:
+            raise ValueError(
+                f"Unknown gate {gate_name!r}. Valid gates: {sorted(_BOUNDS)}"
             )
 
-    def _check_market_hours(self, confirmed: bool) -> None:
-        now_utc = datetime.now(timezone.utc).time()
-        if _MARKET_OPEN_ET <= now_utc <= _MARKET_CLOSE_ET and not confirmed:
-            raise MarketHoursConfirmationRequired(
-                "Config change during market hours requires confirm_market_hours=true"
+        # --- Bounds validation ---
+        lo, hi = _BOUNDS[gate_name]
+        cast_value = self._cast(gate_name, new_value)
+        numeric_check = int(cast_value) if gate_name == "require_oi" else cast_value
+        if not (lo <= numeric_check <= hi):
+            raise ValueError(
+                f"Value {new_value!r} for gate '{gate_name}' is outside allowed "
+                f"bounds [{lo}, {hi}]."
             )
 
-    async def _persist_or_queue(self, payload: dict, db) -> None:
+        # --- Market-hours guard ---
+        import datetime
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        is_market_hours = (
+            now_utc.weekday() < 5
+            and datetime.time(13, 30) <= now_utc.time() <= datetime.time(20, 0)
+        )
+        if is_market_hours and not confirm_market_hours:
+            raise ValueError(
+                "Market is currently open. Pass confirm_market_hours=true to proceed."
+            )
+
+        old_value = self.get(gate_name, tier)
+
+        if not self._supabase_url or not self._supabase_key:
+            # No DB — update in-memory only (dev/test mode)
+            with self._lock:
+                self._data[(gate_name, tier)] = cast_value
+                self._epoch += 1
+            return {
+                "gate_name":      gate_name,
+                "tier":           tier,
+                "old_value":      old_value,
+                "new_value":      cast_value,
+                "propagated_at":  now_utc.isoformat(),
+                "epoch":          self._epoch,
+                "_note":          "no-db mode — in-memory only",
+            }
+
+        # --- DB PATCH ---
+        patch_url = (
+            f"{self._supabase_url}/rest/v1/gate_configs"
+            f"?gate_name=eq.{gate_name}&tier=eq.{tier}"
+        )
+        patch_payload = {
+            "value":      str(cast_value),
+            "updated_by": updated_by,
+            "updated_at": now_utc.isoformat(),
+        }
+        headers_patch = {**self._headers(), "Prefer": "return=minimal"}
+
+        # --- DB INSERT audit row ---
+        audit_url = f"{self._supabase_url}/rest/v1/gate_config_audit"
+        audit_payload = {
+            "gate_name":      gate_name,
+            "tier":           tier,
+            "old_value":      str(old_value),
+            "new_value":      str(cast_value),
+            "updated_by":     updated_by,
+            "reason":         reason,
+            "changed_at":     now_utc.isoformat(),
+            "was_market_hours": is_market_hours,
+        }
+
         try:
-            await db.table("gate_configs").upsert(
-                payload, on_conflict="gate_name,tier"
-            ).execute()
-        except Exception as exc:  # noqa: BLE001
-            log.error(
-                "gate_config_store: DB write failed for %s tier=%d, queuing for retry: %s",
-                payload["gate_name"],
-                payload["tier"],
-                exc,
-            )
-            _stats["db_write_failures"] += 1
-            self._retry_queue.append(payload)
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                patch_resp = await client.patch(
+                    patch_url, headers=headers_patch, json=patch_payload
+                )
+                audit_resp = await client.post(
+                    audit_url, headers=self._headers(), json=audit_payload
+                )
 
-    async def flush_retry_queue(self, db) -> int:
-        """
-        Attempt to persist any queued failed writes.
-        Returns the count of successfully flushed items.
-        Call this from a background task or after the next successful DB connection.
-        """
-        if not self._retry_queue:
-            return 0
-        flushed = 0
-        remaining = []
-        for payload in self._retry_queue:
-            try:
-                await db.table("gate_configs").upsert(
-                    payload, on_conflict="gate_name,tier"
-                ).execute()
-                flushed += 1
-            except Exception as exc:  # noqa: BLE001
-                log.warning("gate_config_store: retry flush failed for %s: %s", payload, exc)
-                remaining.append(payload)
-        self._retry_queue = remaining
-        if flushed:
-            _stats["retry_queue_flushes"] += flushed
-            log.info("gate_config_store: flushed %d queued writes", flushed)
-        return flushed
+            if patch_resp.status_code not in (200, 204):
+                raise RuntimeError(
+                    f"DB PATCH failed for ({gate_name}, tier={tier}): "
+                    f"HTTP {patch_resp.status_code} {patch_resp.text[:200]}"
+                )
+            if audit_resp.status_code not in (200, 201):
+                log.warning(
+                    "[gate_config_store] Audit insert failed HTTP %d — gate was updated",
+                    audit_resp.status_code,
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"DB write error for ({gate_name}, tier={tier}): {exc}") from exc
+
+        # --- In-memory update (atomic under lock) ---
+        with self._lock:
+            self._data[(gate_name, tier)] = cast_value
+            self._epoch += 1
+
+        propagated_at = time.monotonic()
+        log.info(
+            "[gate_config_store] Updated %s tier=%d: %r → %r by %s (epoch %d)",
+            gate_name, tier, old_value, cast_value, updated_by, self._epoch,
+        )
+
+        return {
+            "gate_name":      gate_name,
+            "tier":           tier,
+            "old_value":      old_value,
+            "new_value":      cast_value,
+            "propagated_at":  now_utc.isoformat(),
+            "epoch":          self._epoch,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — import and use this everywhere.
+# ---------------------------------------------------------------------------
+gate_config_store = GateConfigStore()
