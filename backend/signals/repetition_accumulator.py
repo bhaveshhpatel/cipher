@@ -166,6 +166,22 @@
 #   behaviour is identical to before — dte_floor stands alone.
 #   _min_premium_override constructor kwarg semantics UNCHANGED.
 #   aggression_discount wiring deferred to ING-002-CONFIG (future sprint).
+#
+# DEPLOY NOTE (ING-010-OI — 2026-05-07):
+#   ingest_tick() now enforces a per-tier open_interest floor (Gate 3 / OI gate).
+#   Resolution:
+#     tier_int = self._tier_map.get(ticker, 1)  (same path as _get_episode_min_premium)
+#     oi_floor = gate_config_store.get("require_oi", tier_int)  (default 0.0 all tiers)
+#   When oi_floor > 0, any event whose open_interest < oi_floor is dropped
+#   BEFORE the event is appended to the episode — the tick never influences
+#   trade_count, weighted_premium, or episode state.
+#   When oi_floor == 0 (default), the gate is a no-op — zero behaviour change
+#   at default config.
+#   ev.open_interest is None-safe: None / missing OI is treated as 0 for
+#   comparison purposes. A floor of 0 always passes, so missing OI is only
+#   rejected when an operator explicitly sets require_oi > 0.
+#   Falls back gracefully when _gate_cfg is None (unit-test environments,
+#   no-db mode, cold start).
 # ============================================================================
 """
 Repetition-based episode accumulator for the Cipher options flow pipeline.
@@ -363,6 +379,16 @@ ING-010 Gate 2 (2026-05-07):
   floor is max(dte_floor, live_floor) — the store can only tighten the gate,
   never lower it below the DTE table. Falls back gracefully when the store
   has not yet loaded (cold start). No constructor params changed.
+
+ING-010-OI (2026-05-07):
+  ingest_tick() enforces a per-tier open_interest floor (require_oi gate).
+  Default is 0 for all tiers — gate is a no-op at default config.
+  Resolution: tier_int = self._tier_map.get(ticker, 1),
+              oi_floor = gate_config_store.get("require_oi", tier_int).
+  When oi_floor > 0, events with ev.open_interest < oi_floor are dropped
+  BEFORE the event is appended — tick never touches episode state.
+  ev.open_interest None → treated as 0 (conservative: rejects if floor > 0).
+  Falls back to oi_floor = 0.0 when _gate_cfg is None.
 """
 
 import asyncio
@@ -374,7 +400,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-# ING-010: live gate config store for Gate 2 DTE floor enrichment.
+# ING-010: live gate config store for Gate 2 DTE floor enrichment + OI gate.
 try:
     from services.gate_config_store import gate_config_store as _gate_cfg
 except Exception:  # pragma: no cover — guard for unit-test environments
@@ -474,7 +500,7 @@ class _DictEventWrapper:
         "premium", "timestamp", "trade_type", "dte",
         "underlying_price", "order_side", "contract_type",
         "is_aggressive", "ticker", "strike", "expiry",
-        "bid_ask_class",
+        "bid_ask_class", "open_interest",
     )
 
     def __init__(self, d: dict) -> None:
@@ -490,6 +516,7 @@ class _DictEventWrapper:
         self.strike           = float(d.get("strike", 0.0) or 0.0)
         self.expiry           = d.get("expiry", "") or ""
         self.bid_ask_class    = d.get("bid_ask_class", "UNKNOWN")
+        self.open_interest    = d.get("open_interest")  # None if absent
 
 
 @dataclass
@@ -844,6 +871,37 @@ class RepetitionAccumulator:
         """Ingest one tick and return an emitted episode or None."""
         if isinstance(ev, dict):
             ev = _DictEventWrapper(ev)
+
+        # ------------------------------------------------------------------
+        # ING-010-OI: per-tier open_interest gate.
+        # Evaluated BEFORE appending to episode so rejected ticks never
+        # influence trade_count, weighted_premium, or episode state.
+        # Default oi_floor == 0.0 (all tiers) — gate is a no-op by default.
+        # ------------------------------------------------------------------
+        if _gate_cfg is not None:
+            try:
+                ticker_for_oi = getattr(ev, "ticker", "") or ""
+                with self._tier_map_lock:
+                    tier_for_oi = self._tier_map.get(ticker_for_oi, 1)
+                oi_floor = _gate_cfg.get("require_oi", tier_for_oi)
+                if oi_floor > 0.0:
+                    ev_oi = getattr(ev, "open_interest", None)
+                    ev_oi_val = float(ev_oi) if ev_oi is not None else 0.0
+                    if ev_oi_val < oi_floor:
+                        logger.debug(
+                            "[oi-gate] dropped %s %s $%.0f dte=%d "
+                            "oi=%s < floor=%.0f (tier=%d)",
+                            getattr(ev, "ticker", "?"),
+                            getattr(ev, "contract_type", "?"),
+                            getattr(ev, "strike", 0),
+                            getattr(ev, "dte", 0),
+                            ev_oi,
+                            oi_floor,
+                            tier_for_oi,
+                        )
+                        return None
+            except Exception:
+                pass  # cold start or store error — gate passes
 
         key = self._episode_key(ev)
         ep  = self._get_or_create_episode(key, ev)
