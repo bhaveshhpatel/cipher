@@ -47,6 +47,7 @@ from unittest.mock import patch
 from signals.repetition_accumulator import (
     RepetitionAccumulator,
     RepetitionEpisode,
+    _classify_moneyness_band,
     _ITM_THRESHOLD,
     _DEEP_ITM_THRESHOLD,
 )
@@ -112,14 +113,15 @@ async def _build_episode(
 
 
 # ---------------------------------------------------------------------------
-# _classify_moneyness_band unit tests (pure function — no accumulator needed)
+# _classify_moneyness_band unit tests (pure function — module-level, ING-011b D3)
 # ---------------------------------------------------------------------------
 
 class TestClassifyMoneynessBand:
-    """Direct tests of _classify_moneyness_band() via RepetitionAccumulator."""
+    """Direct tests of the module-level _classify_moneyness_band() function.
 
-    def setup_method(self):
-        self.acc = _make_acc()
+    ING-011b (D3): function promoted to module level. No accumulator instance
+    required — call _classify_moneyness_band(ev) directly.
+    """
 
     def _ev(self, contract_type, strike, underlying_price):
         """Minimal dict wrapper for band classification."""
@@ -137,44 +139,44 @@ class TestClassifyMoneynessBand:
     def test_deep_otm_put(self):
         # PUT strike 20% below underlying -> deep OTM PUT
         ev = self._ev("PUT", 80.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "DEEP_OTM"
+        assert _classify_moneyness_band(ev) == "DEEP_OTM"
 
     def test_otm_put(self):
         # PUT strike 5% below underlying -> OTM
         ev = self._ev("PUT", 95.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "OTM"
+        assert _classify_moneyness_band(ev) == "OTM"
 
     def test_atm_put(self):
         # PUT strike exactly at underlying -> ATM
         ev = self._ev("PUT", 100.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ATM"
+        assert _classify_moneyness_band(ev) == "ATM"
 
     def test_atm_put_within_2pct(self):
         # PUT strike 1.9% below underlying -> ATM band
         ev = self._ev("PUT", 98.1, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ATM"
+        assert _classify_moneyness_band(ev) == "ATM"
 
     # --- ITM cases ---
 
     def test_itm_put_3pct(self):
         # PUT strike 3% above underlying -> ITM (D1: >2% = ITM)
         ev = self._ev("PUT", 103.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ITM"
+        assert _classify_moneyness_band(ev) == "ITM"
 
     def test_deep_itm_put_39pct(self):
         # TMDX scenario: PUT $105 vs underlying $75.69 -> ~39% ITM -> DEEP_ITM
         ev = self._ev("PUT", 105.0, 75.69)
-        assert self.acc._classify_moneyness_band(ev) == "DEEP_ITM"
+        assert _classify_moneyness_band(ev) == "DEEP_ITM"
 
     def test_itm_call_3pct(self):
         # CALL strike 3% below underlying -> ITM
         ev = self._ev("CALL", 97.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ITM"
+        assert _classify_moneyness_band(ev) == "ITM"
 
     def test_deep_itm_call_15pct(self):
         # CALL strike 15% below underlying -> DEEP_ITM
         ev = self._ev("CALL", 85.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "DEEP_ITM"
+        assert _classify_moneyness_band(ev) == "DEEP_ITM"
 
     # --- Boundary cases (D1 deliberation) ---
 
@@ -182,34 +184,34 @@ class TestClassifyMoneynessBand:
         # PUT strike exactly 2% above underlying -> ATM (pct <= 0.02 is ATM, inclusive)
         # pct = abs(102 - 100) / 100 = 0.02 -> not > _ITM_THRESHOLD -> ATM
         ev = self._ev("PUT", 102.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ATM"
+        assert _classify_moneyness_band(ev) == "ATM"
 
     def test_boundary_just_over_2pct_itm_put(self):
         # PUT strike 2.1% above underlying -> ITM
         ev = self._ev("PUT", 102.1, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ITM"
+        assert _classify_moneyness_band(ev) == "ITM"
 
     def test_boundary_1_9pct_itm_put_is_atm(self):
         # PUT strike 1.9% above underlying -> ATM (inside band)
         ev = self._ev("PUT", 101.9, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ATM"
+        assert _classify_moneyness_band(ev) == "ATM"
 
     def test_boundary_exactly_10pct_itm_put_is_itm(self):
         # PUT strike exactly 10% above underlying -> ITM (pct > 0.10 required for DEEP_ITM)
         # pct = 0.10 -> not > _DEEP_ITM_THRESHOLD (0.10) -> ITM
         ev = self._ev("PUT", 110.0, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "ITM"
+        assert _classify_moneyness_band(ev) == "ITM"
 
     def test_boundary_just_over_10pct_itm_put(self):
         # PUT strike 10.1% above underlying -> DEEP_ITM
         ev = self._ev("PUT", 110.1, 100.0)
-        assert self.acc._classify_moneyness_band(ev) == "DEEP_ITM"
+        assert _classify_moneyness_band(ev) == "DEEP_ITM"
 
     # --- Zero underlying price guard ---
 
     def test_unknown_when_underlying_zero(self):
         ev = self._ev("PUT", 105.0, 0.0)
-        assert self.acc._classify_moneyness_band(ev) == "UNKNOWN"
+        assert _classify_moneyness_band(ev) == "UNKNOWN"
 
     def test_unknown_when_underlying_none(self):
         from signals.repetition_accumulator import _DictEventWrapper
@@ -220,7 +222,7 @@ class TestClassifyMoneynessBand:
             "premium": 1.0,
             "bid_ask_class": "AT_BID",
         })
-        assert self.acc._classify_moneyness_band(ev) == "UNKNOWN"
+        assert _classify_moneyness_band(ev) == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
