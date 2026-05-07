@@ -40,6 +40,14 @@ Key architectural fixes:
   ING-010 (main)      — gate_config_store.load() is step 0 in startup so all
                         tier gate values are hot in memory before any service
                         (stream, accumulator, parser) runs its first tick.
+  ACC-TIER (main)     — _post_build_upsert now calls
+                        tradier_stream.accumulator.set_tier_map(tier_map)
+                        after registry.set_tier_map(). The hot-path accumulator
+                        in tradier_stream.py is a module-level singleton — the
+                        registry's own .accumulator attribute is a different
+                        object. Without this call the stream accumulator kept
+                        _tier_map={} and defaulted all tickers to tier 1 (strict
+                        floor) regardless of actual tier assignment.
 """
 import asyncio
 import json
@@ -298,8 +306,15 @@ async def _post_build_upsert(
     try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
+        # ACC-TIER: also push the tier_map to the module-level accumulator in
+        # tradier_stream.py.  That singleton is the actual hot-path object —
+        # distinct from any accumulator attribute on the registry.  Without
+        # this call it keeps _tier_map={} and defaults every ticker to tier 1.
+        import services.tradier_stream as _ts
+        _ts.accumulator.set_tier_map(tier_map)
         log.info(
-            "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
+            "[post_build] Tier map updated — T1=%d T2=%d T3=%d "
+            "(registry + stream accumulator)",
             sum(1 for t in tier_map.values() if t == 1),
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
@@ -371,9 +386,13 @@ async def _universe_refresh_loop():
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
+                    # ACC-TIER: keep the stream accumulator in sync on every
+                    # 24h universe refresh, same as _post_build_upsert does.
+                    import services.tradier_stream as _ts
+                    _ts.accumulator.set_tier_map(tier_map)
                     log.info(
-                        "[universe] Background refresh: registry tier_map updated "
-                        "(T1=%d T2=%d T3=%d)",
+                        "[universe] Background refresh: registry + stream accumulator "
+                        "tier_map updated (T1=%d T2=%d T3=%d)",
                         sum(1 for t in tier_map.values() if t == 1),
                         sum(1 for t in tier_map.values() if t == 2),
                         sum(1 for t in tier_map.values() if t == 3),
@@ -497,6 +516,8 @@ async def lifespan(app: FastAPI):
     # module-level `accumulator` in services/tradier_stream.py — not this registry
     # attribute. The worker's accumulator reference is used only to resolve the
     # DTE-tier min_premium floor for lookback DB queries; it does NOT gate flow.
+    # ACC-TIER: set_tier_map() on that module-level accumulator is handled in
+    # _post_build_upsert() and _universe_refresh_loop() — see those functions.
     lookback_task         = asyncio.create_task(
         start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
     )
