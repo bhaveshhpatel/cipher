@@ -1,6 +1,7 @@
 # Cipher — Architecture & Data Flow
 
-> Last updated: 2026-05-06 (ING-009 — flow_episodes insert-or-PATCH upsert/merge;
+> Last updated: 2026-05-07 (ING-011 — ITM put/call moneyness classification + direction override;
+> ING-009 — flow_episodes insert-or-PATCH upsert/merge;
 > STREAM-ELIGIBLE fix — upsert_symbol_quotes no longer writes
 > stream_eligible, preventing warm-restart wipeout of eligible symbols; DEDUP-2 —
 > _SNAPSHOT_REUSE_DRIFT_PCT raised 10% → 30%, _KEEP_SNAPSHOTS reduced 7 → 3;
@@ -269,6 +270,46 @@ very few symbols on the next restart.
 │  Episode key: (ticker, contract_type, strike, expiry)            │
 │  Episode window: 30 minutes of inactivity before reset.          │
 │                                                                  │
+│  ING-011 — ITM Moneyness Classification (2026-05-07):            │
+│  _classify_otm() replaced by _classify_moneyness_band() —        │
+│  full spectrum: DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN  │
+│                                                                  │
+│  Band thresholds (D1 — ING-011):                                 │
+│    _DEEP_ITM_THRESHOLD = 0.10  (>10% ITM)                        │
+│    _ITM_THRESHOLD      = 0.02  (2–10% ITM; symmetric w/ ING-005) │
+│    ATM band            = ±2%   (reused from ING-005)             │
+│    OTM band            = 2–12% OTM                               │
+│    DEEP_OTM            = >12% OTM                                │
+│    UNKNOWN             = underlying_price == 0 or parse failure  │
+│                                                                  │
+│  ITM direction override (D2 — ING-011):                          │
+│  For PUT contracts where otm_band ∈ {ITM, DEEP_ITM}:            │
+│    dominant_direction is forced to REPEAT_BUY (bearish)          │
+│    regardless of bid_ask_class.                                  │
+│  Rationale: ITM puts filling AT_BID reflect a buyer paying       │
+│  near-intrinsic value in a wide spread, not a put writer. The    │
+│  AT_BID=seller heuristic is only valid for OTM/ATM puts.         │
+│  ITM CALL AT_BID unchanged — call writing at bid is correctly    │
+│  bearish and requires no override.                               │
+│  Live example: TMDX $105P May15, underlying $75.69 (39% ITM),   │
+│  AT_BID fill → was REPEAT_SELL (bullish), now REPEAT_BUY (bear). │
+│                                                                  │
+│  Schema — otm_band (D3 — ING-011):                               │
+│  ITM and DEEP_ITM added as valid values to the otm_band field    │
+│  on RepetitionEpisode. No DB migration required — otm_band is a  │
+│  TEXT column, not a Postgres enum. _classify_moneyness_band()    │
+│  retained for episode enrichment, downstream signal metadata,    │
+│  and ING-007 pattern scoring (same role as prior _classify_otm).  │
+│                                                                  │
+│  ING-005 — Deep OTM Multiplier Default = 1.0 (2026-05-03):      │
+│  deep_otm_multiplier default changed 1.5 → 1.0.                  │
+│  Registry OTM pre-filter is the authoritative moneyness gate      │
+│  post-ING-004. Accumulator penalty was double-gating on the same │
+│  axis with an inconsistent 12% threshold (registry allows up to  │
+│  ~20% OTM for T1). Gate 3 logic block unchanged structurally —   │
+│  the > 1.0 guard is never true at the new default. Callers that  │
+│  explicitly pass deep_otm_multiplier=1.5 still work as before.   │
+│                                                                  │
 │  Gate 1 — Persist threshold (OR logic):                          │
 │    trade_count >= min_trades (default 1), OR                     │
 │    total_premium >= min_premium (default $10,000)                │
@@ -478,6 +519,9 @@ very few symbols on the next restart.
 | Episode window | 30 minutes inactivity | RepetitionAccumulator |
 | Episode merge window | 1800 seconds / 30 min (ING-009) | flow_store._EPISODE_MERGE_WINDOW_S |
 | Acceleration threshold | ≥3 events within 60 seconds | RepetitionEpisode.is_accelerating |
+| ITM threshold | 0.02 (±2%, symmetric w/ ING-005 ATM band) — ING-011 | repetition_accumulator._ITM_THRESHOLD |
+| Deep ITM threshold | 0.10 (>10% ITM, symmetric w/ DEEP_OTM) — ING-011 | repetition_accumulator._DEEP_ITM_THRESHOLD |
+| Deep OTM multiplier default | 1.0 (changed from 1.5 — ING-005) | RepetitionAccumulator.deep_otm_multiplier |
 | DB write pattern | 500ms flush OR 100-row early flush | flow_store._flush_flow_events |
 | DB retry | 3 attempts, 1s delay | flow_store._insert_rows_with_retry |
 | Persist timeout | 2 seconds per event | tradier_stream._process_trade |
@@ -512,6 +556,29 @@ Tier assignment is done in `services/tier_engine.py`. The tier map is seeded fro
 `assign_tiers()` and `_classify()` enforce the OI gate only when called with `require_oi=True`.
 The default `require_oi=False` skips the OI gate (used for preliminary pass). `build()` calls
 `assign_tiers(require_oi=True)` for the final tier assignment.
+
+---
+
+## Moneyness Band Classification (ING-011)
+
+`_classify_moneyness_band(strike, underlying_price, contract_type)` in
+`signals/repetition_accumulator.py` replaces the former `_classify_otm()`. It covers the full
+moneyness spectrum and is the authoritative band classification for both episode enrichment and
+the ITM direction override.
+
+| Band | Condition (PUT example) | Notes |
+|---|---|---|
+| `DEEP_ITM` | strike > underlying × 1.10 | >10% ITM |
+| `ITM` | strike > underlying × 1.02 | 2–10% ITM |
+| `ATM` | strike within ±2% of underlying | Reuses ING-005 ATM band |
+| `OTM` | strike < underlying × 0.98, > × 0.88 | 2–12% OTM |
+| `DEEP_OTM` | strike < underlying × 0.88 | >12% OTM |
+| `UNKNOWN` | underlying_price == 0 or parse failure | No classification attempted |
+
+ITM direction override applies when `contract_type == PUT AND otm_band ∈ {ITM, DEEP_ITM}`:
+`dominant_direction` is forced to `REPEAT_BUY` (bearish) regardless of `bid_ask_class`.
+The `otm_band` TEXT field on `RepetitionEpisode` now accepts all six values — no DB migration
+required.
 
 ---
 
@@ -570,13 +637,17 @@ upsert (ING-009, 2026-05-06): subsequent qualifying prints for the same contract
 `_stats["created_episodes"]` counts INSERT path; `_stats["merged_episodes"]` counts PATCH path.
 Both are exposed on `/health/stream`.
 
+The `otm_band` TEXT column accepts `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN` (ING-011,
+2026-05-07) — no migration required.
+
 ```sql
 ticker, direction, contract_type, strike, expiry,
 total_premium, trade_count, alert_level, is_accelerating,
-seed_episode, signal_ts,
+seed_episode, signal_ts, otm_band,
 created_at (default now())
 -- id: bigserial generated by Postgres
 -- Merge key: (ticker, direction, contract_type, strike, expiry) within 30-min window
+-- otm_band: TEXT — full spectrum DEEP_ITM..DEEP_OTM (ING-011)
 ```
 
 ### signal_history
@@ -638,4 +709,29 @@ via `registry.load_from_db(snapshot_id)` before the full `build()` completes.
 6. Parallel background tasks launched:
    a. _background_build_and_upsert   — calls registry.build() (incremental/full OCC)
       └─ build() returns (count, raw_quotes)
-      └─ _post_build_upsert(regi
+      └─ _post_build_upsert(raw_quotes) — assembles SymbolQuote, calls upsert_symbol_quotes()
+         (stream_eligible NOT written here — STREAM-ELIGIBLE fix)
+      └─ sets registry._build_complete = True → unblocks stream workers
+   b. stream_options_flow(symbols, registry=registry)
+      └─ polls registry.is_ready() at 500ms (D-001 fix — no second build())
+      └─ on ready: hands symbols to StreamManager, starts workers
+   c. _universe_refresh_loop         — 24h cycle, full cold-start pipeline
+   d. _registry_prewarm_loop         — fires 9:15 AM ET weekdays
+   e. _background_signal_scoring     — async signal scoring pipeline
+```
+
+---
+
+## Test Coverage Targets
+
+| Suite | Target | Notes |
+|---|---|---|
+| Overall | ≥ 92% | CI enforced via CircleCI |
+| `test_ing011_itm_classification.py` | 34 tests | ING-011: TestClassifyMoneynessBand, TestITMDirectionOverride, TestThresholdConstants |
+| `test_ing009_episode_upsert.py` | 11 tests | ING-009: E-1 through E-11 |
+| `test_ing003_dte_floors.py` | D-11–D-13 | ING-003 cold-start DTE floor |
+| `test_stream_worker_b008.py` | 5 tests (SW-01–05) | B-008 health counter propagation |
+| `test_signal_store.py` | 17 tests | ING-008 sentiment/alert_level normalisation |
+| `test_occ_parser.py` | 40 tests | Layer 3 full parse paths |
+| `test_classifier.py` | 24 tests | All 4 influence tiers, synthetic quote detection |
+| `test_repetition_engine.py` | 22 tests | Gate 1/2, alert levels, episode isolation |
