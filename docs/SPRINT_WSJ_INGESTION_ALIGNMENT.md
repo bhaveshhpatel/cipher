@@ -41,9 +41,9 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 5 | ~~**ING-006**~~ | ~~Directional aggression weighting on premium floor~~ | ING-001 resolved ✅ | ✅ MERGED — 2026-05-04 (PR #62, commit `501b170`) |
 | 6 | ~~**ING-009**~~ | ~~Same-session flow episode upsert/merge~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅ | ✅ MERGED — 2026-05-06 (PR #76, commit `9ceee35`) — Issue [#75](https://github.com/bhaveshhpatel/cipher/issues/75) closed |
 | 7 | ~~**ING-007**~~ | ~~Multi-day repeat window lookback (DB + cache)~~ | ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅ | ✅ MERGED — 2026-05-06 (PR #74, commit `b70d9b0`) — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed |
-| 8 | **ING-011** | ITM put/call misclassification fix | ING-006 ✅, ING-007 ✅ | 🔴 Deliberation required — **must resolve before ING-008** — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) |
+| 8 | ~~**ING-011**~~ | ~~ITM put/call misclassification fix~~ | ING-006 ✅, ING-007 ✅ | ✅ MERGED — 2026-05-07 (PR #81, commit `8d68ed1`) — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed |
 | 8b | **ING-011b** | `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | ING-011 (moneyness band must exist on events) | 🔴 Deliberation required — **do NOT patch without deliberation outcome** — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — parallel to ING-008 |
-| 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011** | 🔴 Deliberation required — blocked on ING-011 (directional classification must be correct first) |
+| 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Deliberation required — ING-011 blocker cleared 2026-05-07 |
 | 10 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 |
 
 ---
@@ -117,7 +117,7 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 | Issue | Title | Blocking? | Sprint Slot |
 |-------|-------|-----------|-------------|
-| [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | BUG: Deeply ITM puts misclassified as REPEAT_SELL (bullish) — AT_BID logic ignoring intrinsic value | **Blocks ING-008** — directional classification must be correct before OI gate logic ships | ING-011 — deliberation required |
+| [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | BUG: Deeply ITM puts misclassified as REPEAT_SELL (bullish) — AT_BID logic ignoring intrinsic value | **Blocked ING-008** — ✅ resolved by ING-011 MERGED 2026-05-07 | ING-011 — ✅ MERGED PR #81 |
 | [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-011 or ING-008. Parallel track. Deliberation required. | ING-010 |
 | [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-011 merge. Follow-on to ING-011. Deliberation required before any patch to `get_weighted_premium()` or `bid_ask_classifier.is_directionally_aggressive()`. | ING-011b — parallel to ING-008 |
 
@@ -132,6 +132,14 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 | QA-F1 (PR #74) | `test_fetch_from_db_exception_returns_zero_result` — asserts `httpx.RequestError` returns `prior_days_active=0`, does not propagate | Not blocking | Post ING-007 cleanup |
 | QA-F2 (PR #74) | `test_multi_day_min_days_boundary_at_exactly_2` — `prior_days_active=1 → False`, `prior_days_active=2 → True` at `min_days=2`; protects against `>` vs `>=` regression | Not blocking | Post ING-007 cleanup |
 | PBE-F4 (PR #74) | Apex S6 `Composite`/`CompositeScore`/`build_composite` additions shipped in ING-007 PR to unblock signal-bus wiring — out of ING-007 scope; unblocked by ING-009 merge ✅ | ✅ Unblocked | Signal layer follow-up |
+
+---
+
+## Post-ING-011-Merge Findings (GitHub Issues Filed)
+
+| Issue | Title | Blocking? | Sprint Slot |
+|-------|-------|-----------|-------------|
+| [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-008. Deliberation required before any patch. | ING-011b — parallel to ING-008 |
 
 ---
 
@@ -416,82 +424,57 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 **Blocks:** ING-008 — OI gate logic depends on correct directional classification
 **Does NOT block:** ING-010 (parallel track)
 **Files:**
-- `backend/signals/repetition_accumulator.py` — ITM band classification + `dominant_direction` override
-- `backend/tests/test_ing011_itm_classification.py` — NEW: full test matrix
-**GitHub Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77)
-**Branch:** `ing/s11-itm-classification` *(not yet created)*
+- `backend/signals/repetition_accumulator.py` — `_classify_moneyness_band()` + `dominant_direction` ITM override
+- `backend/tests/test_ing011_itm_classification.py` — NEW: 34 tests across 3 classes
+**GitHub Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77) — ✅ CLOSED 2026-05-07
+**Branch:** `ing/s11-itm-classification`
+**PR:** [#81](https://github.com/bhaveshhpatel/cipher/pull/81) — ✅ **MERGED 2026-05-07** (commit `8d68ed1`)
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION (SA · PBE · QA)
+#### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
+#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
+**SA verdict:** PASS — SA-F1 (`_majority_itm_band()` UNKNOWN-tick suppression) resolved with test I-12 added inline.
+**PBE verdict:** PASS.
+**QA verdict:** PASS — QA-F1 (test I-12 added), QA-F3 (I-8 docstring clarified). All 34 tests passing.
 
-#### Problem
+#### Deliberation Outcomes
 
-Deeply ITM puts filling `AT_BID` are being classified as `REPEAT_SELL` (put selling = bullish) when the correct economic read is bearish put buying. The bid/ask classification logic is correct for OTM puts but breaks for ITM contracts where the fill price reflects intrinsic value, not directional seller intent.
+**D1 — ITM threshold — DECIDED: Reuse ING-005 ATM band exactly**
+- `_ITM_THRESHOLD = 0.02` — symmetric with ING-005 ATM ±2% band
+- `_DEEP_ITM_THRESHOLD = 0.10`
+- Thresholds apply symmetrically to puts and calls (PUT: strike > underlying × (1 + threshold); CALL: strike < underlying × (1 − threshold))
+
+**D2 — Override scope — DECIDED: PUT-only override; applies to ALL ITM (not just DEEP_ITM)**
+- Override applies to `otm_band in ('ITM', 'DEEP_ITM')` for PUT contracts
+- ITM CALL AT_BID is unchanged — call seller at bid = bearish, already correct
+- Rationale: mildly ITM put AT_BID buyers are economically meaningful enough to override; DEEP_ITM-only cutoff misses legitimate institutional hedges in the 2–10% ITM band
+
+**D3 — `otm_band` extension — DECIDED: Extend in-place; no DB migration required**
+- `otm_band` TEXT column extended to cover `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN`
+- No DB migration required — column is TEXT, no enum constraint
+- `_classify_otm()` replaced by `_classify_moneyness_band()` — full spectrum classification
+
+#### Problem (recorded for posterity)
+
+Deeply ITM puts filling `AT_BID` were classified as `REPEAT_SELL` (put selling = bullish) when the correct economic read is bearish put buying. The bid/ask classification logic was correct for OTM puts but broke for ITM contracts where the fill price reflects intrinsic value, not directional seller intent.
 
 **Live example — TMDX 2026-05-06 13:43:50 UTC:**
 - PUT $105 · May 15 · underlying price $75.69 · size 1,263 · fill $27.68 · bid $26.70 · ask $29.50
-- `bid_ask_class = AT_BID` → system classifies as `REPEAT_SELL` → `direction = REPEAT_SELL` (bullish)
+- `bid_ask_class = AT_BID` → system classified as `REPEAT_SELL` → `direction = REPEAT_SELL` (bullish)
 - Actual: strike ($105) is ~39% above underlying ($75.69) — deeply ITM put buyer, economically bearish
-- Episode emitted as `CONVICTION` bullish signal — **incorrect**
-
-#### Root Cause
-
-`dominant_direction` in `repetition_accumulator.py` maps:
-```
-AT_BID put fill → REPEAT_SELL (put writing = bullish)
-AT_ASK put fill → REPEAT_BUY (put buying = bearish)
-```
-
-This mapping is correct for OTM puts where `AT_BID` means a seller is initiating. For deeply ITM puts, `AT_BID` simply reflects a buyer paying near-intrinsic in a wide spread — not a put writer. The system has no ITM classification to override this path.
-
-#### Impact
-
-- Whale/institutional bearish ITM put hedges and synthetic shorts are emitted as bullish conviction signals
-- WSJ-style repeat flow analysis is inverted for this pattern — one of the more common institutional positioning structures
-- `otm_band` field (ING-007) only classifies OTM depth (`ATM | OTM | DEEP_OTM | UNKNOWN`) — ITM contracts fall to `UNKNOWN` with no override logic
-
-#### Proposed Fix
-
-Add ITM band classification symmetric to the existing OTM bands:
-
-```
-ITM:      PUT strike > underlying_price * 1.02  (CALL: strike < underlying * 0.98)
-DEEP_ITM: PUT strike > underlying_price * 1.10  (CALL: strike < underlying * 0.90)
-```
-
-Apply override in `dominant_direction` / sentiment classification:
-```python
-# In repetition_accumulator.py — direction/sentiment resolution
-if contract_type == 'PUT' and itm_band in ('ITM', 'DEEP_ITM'):
-    # AT_BID for ITM puts = buyer paying intrinsic, not put writer
-    # Force bearish regardless of bid_ask_class
-    force_sentiment = BEARISH
-    # direction → REPEAT_BUY (of puts)
-```
-
-Symmetric logic applies to deeply ITM calls:
-- ITM call `AT_ASK` = call buyer (bullish) ✅ already correct
-- ITM call `AT_BID` = possible call seller — verify this path during deliberation
-
-#### Deliberations Required (3-Way: SA · PBE · QA)
-
-**D1 — ITM threshold:**
-Should the ITM boundary reuse the ±2% ATM threshold from ING-005 (making `>2% ITM = ITM`, `>10% ITM = DEEP_ITM`) or adopt a tighter threshold? The ±2% ATM band was set for OTM classification portability across underlying price regimes — the same reasoning applies here but consensus is needed.
-
-**D2 — Partial ITM override vs full override:**
-Should the override apply only to `DEEP_ITM` (>10%) or to all ITM contracts? Mildly ITM puts (e.g. 3–5% ITM) in a fast-moving market may legitimately represent put writing. A hard cutoff at `DEEP_ITM` only is safer but may miss moderately ITM institutional flows.
-
-**D3 — `otm_band` extension vs separate `itm_band` field:**
-ING-007 established `otm_band` as a string enum on `RepetitionEpisode`. Should ITM values be added to the same enum (`ATM | OTM | DEEP_OTM | ITM | DEEP_ITM | UNKNOWN`) or introduced as a separate `itm_band` field? Adding to `otm_band` is simpler but semantically awkward. A separate field is cleaner but adds schema surface.
+- Episode emitted as `CONVICTION` bullish signal — **incorrect; fixed by this PR**
 
 #### Acceptance Criteria
 
-- [ ] D1, D2, D3 deliberations resolved and documented inline (SA + PBE + QA sign-off)
-- [ ] `otm_band` extended or separate `itm_band` field added per D3 resolution
-- [ ] `dominant_direction` for deeply ITM puts resolves to bearish regardless of `bid_ask_class`
-- [ ] TMDX $105P scenario re-run produces correct `BEARISH` direction
-- [ ] Existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour unchanged
-- [ ] Unit tests covering: OTM put `AT_BID`, ITM put `AT_BID`, DEEP_ITM put `AT_BID`, ITM call `AT_ASK`
-- [ ] `underlying_price == 0` fallback: no ITM classification attempted, existing `UNKNOWN` behaviour preserved
+- [x] D1, D2, D3 deliberations resolved and documented inline (SA + PBE + QA sign-off)
+- [x] `_classify_moneyness_band()` replaces `_classify_otm()` — full spectrum: `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN`
+- [x] `_ITM_THRESHOLD = 0.02` and `_DEEP_ITM_THRESHOLD = 0.10` defined at module level
+- [x] `dominant_direction` for ITM/DEEP_ITM puts with `bid_side_prem > ask_side_prem` resolves to `REPEAT_BUY` (bearish)
+- [x] ITM CALL AT_BID behaviour unchanged
+- [x] TMDX $105P scenario produces correct `BEARISH` direction
+- [x] Existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour unchanged
+- [x] `underlying_price == 0` fallback: `UNKNOWN` band, no classification attempted
+- [x] 34 tests across `TestClassifyMoneynessBand`, `TestITMDirectionOverride`, `TestThresholdConstants` — all passing
+- [x] No DB migration required — `otm_band` TEXT column extended in-place
 
 #### QA Test Matrix
 
@@ -502,7 +485,7 @@ ING-007 established `otm_band` as a string enum on `RepetitionEpisode`. Should I
 | I-3 | DEEP_ITM PUT | AT_BID | DEEP_ITM | REPEAT_BUY | BEARISH (institutional hedge) |
 | I-4 | ITM PUT | AT_ASK | ITM | REPEAT_BUY | BEARISH (aggressive buyer — already correct) |
 | I-5 | ITM CALL | AT_ASK | ITM | REPEAT_BUY | BULLISH (already correct) |
-| I-6 | ITM CALL | AT_BID | ITM | per D2 deliberation outcome | per D2 |
+| I-6 | ITM CALL | AT_BID | ITM | REPEAT_SELL | BEARISH (call seller — unchanged) |
 | I-7 | ATM PUT | AT_BID | ATM | REPEAT_SELL | BULLISH (ATM selling — unchanged) |
 | I-8 | `underlying_price == 0` | any | UNKNOWN | no classification attempted | existing fallback preserved |
 
@@ -732,15 +715,15 @@ PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh 
 **Type:** Feature / Gate Addition
 **Priority:** P0
 **Estimated Effort:** TBD — pending deliberation
-**Depends On:** ING-004 ✅, ING-005 ✅, **ING-011** (directional classification must be correct first)
+**Depends On:** ING-004 ✅, ING-005 ✅, **ING-011 ✅**
 **Files:** TBD — pending deliberation
 **GitHub Issue:** TBD
 **Branch:** `ing/s8-vol-oi-gate` *(not yet created)*
 
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
 
-> **Blocked on ING-011.** Do not begin ING-008 deliberation until Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) is resolved and merged. OI gate logic also depends on correct directional classification — if ITM puts are mislabelled as bullish, OI gate thresholds calibrated against that data will be wrong.
+> **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`). ING-008 deliberation is now unblocked.** Read the full ING-011 deliberation outcomes above (D1/D2/D3 decisions, panel verdicts) before beginning ING-008 deliberation — OI gate thresholds must be calibrated against correctly-classified directional data. Do not begin implementation until deliberation is complete and all three roles have signed off.
 
 ---
 
-*Last updated: 2026-05-06 (ING-011b [#80] added — `is_aggressive` moneyness-blindness for ITM PUT AT_BID episodes; Sprint Order table row 8b added; Post-ING-009 Live Session Findings table updated with #80 row; full ING-011b story section added with problem statement, blast radius, Options A/B/C, deliberation checkpoints, AC, QA test matrix W-1 through W-7; branch `ing/s11b-itm-aggression-weight` reserved) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-07 (ING-011 MERGED PR #81 commit `8d68ed1` — Issue #77 closed; Sprint Order row 8 marked ✅ MERGED; ING-008 row unblocked ⏳; ING-011 story section updated with D1/D2/D3 decisions, panel verdicts, AC all checked ✅; Post-ING-011-Merge Findings table added; ING-008 story blocked note replaced with unblock note) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
