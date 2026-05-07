@@ -44,7 +44,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 8 | ~~**ING-011**~~ | ~~ITM put/call misclassification fix~~ | ING-006 ✅, ING-007 ✅ | ✅ MERGED — 2026-05-07 (PR #81, commit `8d68ed1`) — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed |
 | 8b | ~~**ING-011b**~~ | ~~`is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes~~ | ING-011 ✅ (moneyness band must exist on events) | ✅ MERGED — 2026-05-07 (PR #82, squash) — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
 | 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Deliberation required — ING-011 blocker cleared 2026-05-07 |
-| 10 | **ING-010** | Tier-aware min-premium floor + OI-relative bypass gate | ING-002 ✅, ING-003 ✅ | 🔴 Deliberation required — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-011/ING-008 |
+| 10 | **ING-010** | Tier-aware configurable ingestion gate system + hot-reload admin control | ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-006 ✅ | 🔴 Deliberation documented, implementation not started — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) |
 
 ---
 
@@ -118,8 +118,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 | Issue | Title | Blocking? | Sprint Slot |
 |-------|-------|-----------|-------------|
 | [#77](https://github.com/bhaveshhpatel/cipher/issues/77) | BUG: Deeply ITM puts misclassified as REPEAT_SELL (bullish) — AT_BID logic ignoring intrinsic value | **Blocked ING-008** — ✅ resolved by ING-011 MERGED 2026-05-07 | ING-011 — ✅ MERGED PR #81 |
-| [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | ING-010: Tier-aware min-premium floor + OI-relative bypass gate — small-cap flow (GDYN, PENG) silently dropped at `belowminpremium` | Not blocking ING-011 or ING-008. Parallel track. Deliberation required. | ING-010 |
+| [#78](https://github.com/bhaveshhpatel/cipher/issues/78) | Superseded by ING-010 revamp scope — original tier-aware min-premium floor + OI-relative bypass gate framing | No longer canonical | Historical |
 | [#80](https://github.com/bhaveshhpatel/cipher/issues/80) | ING-011b: `is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes | Not blocking ING-011 merge. Follow-on to ING-011. Deliberation COMPLETE 2026-05-06 — Option B selected. | ING-011b — ✅ MERGED PR #82 2026-05-07 — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
+| [#84](https://github.com/bhaveshhpatel/cipher/issues/84) | ING-010: Tier-aware configurable ingestion gate system + hot-reload admin control | **Canonical ING-010 issue**. Replaces the narrow floor-only framing with a full gate control-plane revamp. | ING-010 |
 
 ---
 
@@ -156,12 +157,12 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-002 — Hard Per-Event $10k Premium Floor at Parser
-**Type:** Feature / Gate Addition
-**Priority:** P0
-**Estimated Effort:** 0.5 day
-**Depends On:** Nothing — ship immediately
-**Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`
-**GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)
+**Type:** Feature / Gate Addition  
+**Priority:** P0  
+**Estimated Effort:** 0.5 day  
+**Depends On:** Nothing — ship immediately  
+**Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`  
+**GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)  
 **PR:** [#58](https://github.com/bhaveshhpatel/cipher/pull/58) — ✅ **MERGED 2026-05-03** (commit `a38f837`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -238,10 +239,10 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-002-CONFIG — DTE Premium Tier Presets: Admin-Configurable via Named Presets
-**Type:** Feature / Admin Configuration
-**Priority:** P2 — quality of life; not blocking signal quality
-**Estimated Effort:** 2.5 days
-**Depends On:** ING-002 (merged ✅), ING-003 (DTE tiers wired ✅ before this story is needed)
+**Type:** Feature / Admin Configuration  
+**Priority:** P2 — quality of life; not blocking signal quality  
+**Estimated Effort:** 2.5 days  
+**Depends On:** ING-002 (merged ✅), ING-003 (DTE tiers wired ✅ before this story is needed)  
 **Files:**
 - `backend/signals/repetition_accumulator.py` — add preset dicts + `_DEFAULT_PRESET` alias
 - `backend/services/ingestion_config.py` — add `DTE_TIER_PRESET` + 8 custom floor keys to `_DEFAULTS` + `_EXPECTED_DB_KEYS`; add `get_dte_premium_tiers()` loader
@@ -255,9 +256,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-003 — Wire `_DEFAULT_DTE_PREMIUM_TIERS` at Accumulator Init
-**Type:** Bug Fix / Wiring
-**Priority:** P0
-**GitHub Issue:** [#59](https://github.com/bhaveshhpatel/cipher/issues/59)
+**Type:** Bug Fix / Wiring  
+**Priority:** P0  
+**GitHub Issue:** [#59](https://github.com/bhaveshhpatel/cipher/issues/59)  
 **PR:** [#59](https://github.com/bhaveshhpatel/cipher/pull/59) — ✅ **MERGED 2026-05-03** (commit `62b159f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -265,9 +266,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-004 — Fallback `underlying_price` from Registry
-**Type:** Bug Fix
-**Priority:** P0
-**GitHub Issue:** [#60](https://github.com/bhaveshhpatel/cipher/issues/60)
+**Type:** Bug Fix  
+**Priority:** P0  
+**GitHub Issue:** [#60](https://github.com/bhaveshhpatel/cipher/issues/60)  
 **PR:** [#60](https://github.com/bhaveshhpatel/cipher/pull/60) — ✅ **MERGED 2026-05-03** (commit `d3c3f31`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -275,9 +276,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-005 — Align OTM Band Thresholds Registry ↔ Accumulator
-**Type:** Threshold Alignment
-**Priority:** P0
-**GitHub Issue:** [#61](https://github.com/bhaveshhpatel/cipher/issues/61)
+**Type:** Threshold Alignment  
+**Priority:** P0  
+**GitHub Issue:** [#61](https://github.com/bhaveshhpatel/cipher/issues/61)  
 **PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **MERGED 2026-05-03** (commit `252d75f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -290,9 +291,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-006 — Directional Aggression Weighting on Premium Floor
-**Type:** Feature / Signal Enhancement
-**Priority:** P0
-**GitHub Issue:** [#62](https://github.com/bhaveshhpatel/cipher/issues/62)
+**Type:** Feature / Signal Enhancement  
+**Priority:** P0  
+**GitHub Issue:** [#62](https://github.com/bhaveshhpatel/cipher/issues/62)  
 **PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **MERGED 2026-05-04** (commit `501b170`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -307,16 +308,16 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 ### ING-009 — Same-Session Flow Episode Upsert/Merge
 
-**Type:** Bug Fix / Data Model Correctness
-**Priority:** P0
-**Estimated Effort:** 1 day
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-005 ✅, ING-006 ✅
-**Blocks:** ING-007 — `get_contract_prior_days()` depends on `flow_episodes` being correctly aggregated
+**Type:** Bug Fix / Data Model Correctness  
+**Priority:** P0  
+**Estimated Effort:** 1 day  
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-005 ✅, ING-006 ✅  
+**Blocks:** ING-007 — `get_contract_prior_days()` depends on `flow_episodes` being correctly aggregated  
 **Files:**
 - `backend/services/flow_store.py` — `persist_flow_episode()` upsert logic + new `_stats` counters
 - `backend/tests/test_ing009_episode_upsert.py` — NEW: full test matrix
-**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — ✅ CLOSED 2026-05-06
-**Branch:** `ing/s9-episode-upsert`
+**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — ✅ CLOSED 2026-05-06  
+**Branch:** `ing/s9-episode-upsert`  
 **PR:** [#76](https://github.com/bhaveshhpatel/cipher/pull/76) — ✅ **MERGED 2026-05-06** (squash commit `9ceee35`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-05)
@@ -380,10 +381,10 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-007 — Multi-Day Repeat Window Lookback (DB + Cache)
-**Type:** Feature / Signal Enhancement
-**Priority:** P0
-**Estimated Effort:** 2 days
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅
+**Type:** Feature / Signal Enhancement  
+**Priority:** P0  
+**Estimated Effort:** 2 days  
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅  
 **Files:**
 - `backend/utils/contract_day_cache.py` — NEW
 - `backend/signals/repetition_accumulator.py`
@@ -391,14 +392,14 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 - `backend/services/tradier_stream.py`
 - `supabase/migrations/` — S2.5 migration
 - `backend/tests/test_ing007_multiday_lookback.py` — NEW
-**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ✅ CLOSED 2026-05-06
-**Branch:** `ing/s7-multiday-repeat`
+**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ✅ CLOSED 2026-05-06  
+**Branch:** `ing/s7-multiday-repeat`  
 **PR:** [#74](https://github.com/bhaveshhpatel/cipher/pull/74) — ✅ **MERGED 2026-05-06** (commit `b70d9b0`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
 #### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-F1/SA-F2 comments added. Queue max corrected 500→5000.
-**PBE verdict:** PASS — sync threshold reconciled to `accumulator._multi_day_min_days` (PBE-1), `_lookback_result_cache` eviction wired (PBE-3).
+**SA verdict:** PASS — SA-F1/SA-F2 comments added. Queue max corrected 500→5000.  
+**PBE verdict:** PASS — sync threshold reconciled to `accumulator._multi_day_min_days` (PBE-1), `_lookback_result_cache` eviction wired (PBE-3).  
 **QA verdict:** PASS — G-1 through G-8 passing, TTL expiry test added, p99 < 5ms confirmed, otm_band wiring verified.
 
 #### ING-007 Acceptance Criteria
@@ -425,23 +426,23 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 ### ING-011 — ITM Put/Call Misclassification Fix
 
-**Type:** Bug Fix / Signal Correctness
-**Priority:** P0
-**Estimated Effort:** 1 day
-**Depends On:** ING-006 ✅, ING-007 ✅ (`otm_band` field established on `RepetitionEpisode`)
-**Blocks:** ING-008 — OI gate logic depends on correct directional classification
-**Does NOT block:** ING-010 (parallel track)
+**Type:** Bug Fix / Signal Correctness  
+**Priority:** P0  
+**Estimated Effort:** 1 day  
+**Depends On:** ING-006 ✅, ING-007 ✅ (`otm_band` field established on `RepetitionEpisode`)  
+**Blocks:** ING-008 — OI gate logic depends on correct directional classification  
+**Does NOT block:** ING-010 (parallel track)  
 **Files:**
 - `backend/signals/repetition_accumulator.py` — `_classify_moneyness_band()` + `dominant_direction` ITM override
 - `backend/tests/test_ing011_itm_classification.py` — NEW: 34 tests across 3 classes
-**GitHub Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77) — ✅ CLOSED 2026-05-07
-**Branch:** `ing/s11-itm-classification`
+**GitHub Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77) — ✅ CLOSED 2026-05-07  
+**Branch:** `ing/s11-itm-classification`  
 **PR:** [#81](https://github.com/bhaveshhpatel/cipher/pull/81) — ✅ **MERGED 2026-05-07** (commit `8d68ed1`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
 #### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-F1 (`_majority_itm_band()` UNKNOWN-tick suppression) resolved with test I-12 added inline.
-**PBE verdict:** PASS.
+**SA verdict:** PASS — SA-F1 (`_majority_itm_band()` UNKNOWN-tick suppression) resolved with test I-12 added inline.  
+**PBE verdict:** PASS.  
 **QA verdict:** PASS — QA-F1 (test I-12 added), QA-F3 (I-8 docstring clarified). All 34 tests passing.
 
 #### Deliberation Outcomes
@@ -501,23 +502,23 @@ Deeply ITM puts filling `AT_BID` were classified as `REPEAT_SELL` (put selling =
 
 ### ING-011b — `is_aggressive` Moneyness-Blindness Inflates `weighted_premium` for ITM PUT AT_BID Episodes
 
-**Type:** Bug Fix / Signal Correctness
-**Priority:** P1
-**Estimated Effort:** 0.5–1 day
-**Depends On:** ING-011 ✅ (moneyness band classification must exist on events before aggression fix is meaningful)
-**Does NOT block:** ING-008, ING-010 (parallel tracks)
-**Filed:** 2026-05-06 — annotation commit [`a82f3967`](https://github.com/bhaveshhpatel/cipher/commit/a82f3967fb37a07af180caadefbbcb50e041aae2)
+**Type:** Bug Fix / Signal Correctness  
+**Priority:** P1  
+**Estimated Effort:** 0.5–1 day  
+**Depends On:** ING-011 ✅ (moneyness band classification must exist on events before aggression fix is meaningful)  
+**Does NOT block:** ING-008, ING-010 (parallel tracks)  
+**Filed:** 2026-05-06 — annotation commit [`a82f3967`](https://github.com/bhaveshhpatel/cipher/commit/a82f3967fb37a07af180caadefbbcb50e041aae2)  
 **Files:**
 - `backend/signals/repetition_accumulator.py` — `get_weighted_premium()` + promoted `_classify_moneyness_band()` to module-level function
 - `backend/tests/test_ing011b_itm_aggression_weight.py` — NEW: full test matrix (W-1 through W-12)
-**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — ✅ CLOSED 2026-05-07
-**Branch:** `ing/s11b-itm-aggression-weight`
+**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — ✅ CLOSED 2026-05-07  
+**Branch:** `ing/s11b-itm-aggression-weight`  
 **PR:** [#82](https://github.com/bhaveshhpatel/cipher/pull/82) — ✅ **MERGED 2026-05-07** (squash)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
 #### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-1 (non-blocking comment, no code change required).
-**PBE verdict:** PASS — PBE-1 (non-blocking), PBE-2 (non-blocking).
+**SA verdict:** PASS — SA-1 (non-blocking comment, no code change required).  
+**PBE verdict:** PASS — PBE-1 (non-blocking), PBE-2 (non-blocking).  
 **QA verdict:** PASS — QA-1 resolved inline (W-4b boundary test added), QA-2 typo fixed (commit `2bb1487`). All 30 assertions across 12 test classes (W-1 through W-12) passing.
 
 #### Deliberation Outcomes
@@ -620,97 +621,308 @@ def get_weighted_premium(self, discount: float) -> float:
 
 ---
 
-### ING-010 — Tier-Aware Min-Premium Floor + OI-Relative Bypass Gate
+### ING-010 — Tier-Aware Configurable Ingestion Gate System + Hot-Reload Admin Control
 
-**Type:** Feature / Signal Quality
-**Priority:** P1
-**Estimated Effort:** 1.5 days
-**Depends On:** ING-002 ✅, ING-003 ✅
-**Does NOT block:** ING-011, ING-008 (parallel track)
-**Must resolve before:** Any small-cap catalyst monitoring is considered reliable
-**Related:** ING-008 (OI gate — OI-relative bypass logic in ING-010 must be designed consistently with ING-008 OI significance logic)
+**Type:** Feature / Ingestion Architecture Revamp  
+**Priority:** P0  
+**Estimated Effort:** 20 story points  
+**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-006 ✅  
+**Does NOT block:** ING-008 deliberation, but should land before any claim that ingestion flow quality is operationally tunable  
+**Related:** Original floor-only framing in [#78](https://github.com/bhaveshhpatel/cipher/issues/78) is superseded by canonical issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84)  
 **Files:**
-- `backend/parsers/options_flow_parser.py` — tier-aware floor lookup + OI-relative bypass gate
-- `backend/services/options_universe.py` (or equivalent) — expose `tier`, `open_interest`, `average_volume` per symbol to parser
-- `backend/tests/test_ing010_tier_floor.py` — NEW: full test matrix
-**GitHub Issue:** [#78](https://github.com/bhaveshhpatel/cipher/issues/78)
-**Branch:** `ing/s10-tier-floor` *(not yet created)*
+- `services/gate_config_store.py` — NEW
+- `db/migrations/add_gate_configs.sql` — NEW
+- `services/accumulator.py` — MODIFY
+- `services/tradierstream.py` — MODIFY
+- `services/streamworker.py` — MODIFY
+- `routers/admin.py` — CREATE/MODIFY
+- `services/symbol_registry.py` — MODIFY
+- `tests/test_gate_config_store.py` — NEW
+- `tests/test_gates_tiered.py` — NEW
+- `tests/integration/test_gate_hotreload.py` — NEW
+**GitHub Issue:** [#84](https://github.com/bhaveshhpatel/cipher/issues/84)  
+**Branch:** `ing/s10-tiered-gate-control-plane` *(not yet created)*
 
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION (SA · PBE · QA)
+#### ⚠️ 3-Way Deliberation — COMPLETE, IMPLEMENTATION NOT STARTED
 
 #### Problem
 
-The flat DTE-adjusted min-premium floor silently drops **all** options prints for low-price and low-OI tickers before they reach the accumulator. These tickers are `stream_eligible = true` in `options_universe_symbols` and are actively subscribed on the Tradier stream, but zero events are persisted or gated — they vanish at the `belowminpremium` funnel counter with no per-ticker logging.
+The current ingestion layer still applies most hard gates as flat, tier-blind rules even though the symbol universe itself is already tiered. A T3 small-cap print and a T1 mega-cap print encounter the same parser premium gate, the same DTE-adjusted accumulator floor shape, and the same debounce behavior, which is the wrong control model for a flow engine that explicitly tier-classifies symbols upstream.
 
-**Observed instances (2026-05-06):**
+The bigger flaw is operational: these gates are effectively hardcoded. You cannot tune them intraday, cannot tighten or relax one tier without touching code, and cannot expose them cleanly to an admin page later without refactoring the ingestion layer into a real control plane.
 
-| Ticker | last_price | open_interest | avg_volume | tier | Flow today |
-|--------|-----------|---------------|------------|------|------------|
-| GDYN   | $6.10     | 380           | 1,613,139  | 3    | 0 events   |
-| PENG   | $36.45    | 1,422         | 0 (bug)    | 3    | 0 events   |
+#### Current Observed Gates
 
-**Logging gap:** `belowminpremium` is an opaque aggregate counter. There is no per-ticker logging at this drop stage.
+The live ingestion funnel and logs show the following gate/control points:
 
-#### Proposed Options
+1. **Symbol registry no-stock-price drop**
+   - Tickers with no resolvable stock price are skipped before streaming.
 
-**Option A — Tier-Based Floor Override** *(lowest risk — ship first)*
+2. **`belowminpremium`**
+   - A flat per-event minimum premium drop at parse time.
+   - This is currently the largest-volume rejection stage.
+
+3. **Accumulator DTE-adjusted premium floor**
+   - Dynamic by DTE, but not by tier.
+
+4. **Deduplication**
+   - Exact-match duplicate suppression.
+
+5. **`require_oi`**
+   - Currently global/session-scoped behavior, not per-tier.
+
+6. **Signal debounce**
+   - Post-persist signal suppression window, currently uniform.
+
+#### Design Goal
+
+Convert the ingestion layer from flat hardcoded gates into a **tier-aware, runtime-configurable gate system** with:
+- per-tier thresholds for all major gates,
+- a thread-safe in-memory config store,
+- an admin API that updates values without restart,
+- full audit logging of config changes,
+- zero DB reads on the tick hot path.
+
+#### 3-Way Deliberation Outcomes
+
+### Topic 1 — Hot Reload Strategy
+
+**Senior Architect**
+- In-process singleton works for one replica but becomes wrong the moment multiple app replicas exist.
+- Preferred design is distributed fan-out from day one via Supabase Realtime subscription on `gate_configs`.
+
+**Principal Backend Engineer**
+- Realtime adds a new failure mode during market hours and is not needed for the current single-process deployment.
+- Ship the singleton first; keep the distributed fan-out path as a follow-on when multi-replica is actually real.
+
+**Lead QA**
+- Singleton is much easier to test deterministically.
+- Realtime-first would force brittle websocket-heavy integration coverage before the business logic is even stable.
+
+**Decision**
+- Ship **singleton + explicit reload/update path now**.
+- Document Supabase Realtime fan-out as the next-step design for multi-replica deployments.
+
+### Topic 2 — Tier Lookup at Gate Time
+
+**Senior Architect**
+- Tier lookup must be in-memory only, never DB-backed per tick.
+- Dict lookup overhead is negligible; DB round-trips would be unacceptable.
+
+**Principal Backend Engineer**
+- Raw lookup cost is not the risk; stale tier state is.
+- Need epoch/version tagging so a tier refresh and config refresh never produce partial mixed reads.
+
+**Lead QA**
+- Requires a test where a symbol changes tiers mid-session and the next tick uses the new thresholds.
+- Unknown-tier symbols must fall back safely, not explode worker state.
+
+**Decision**
+- Tier lookup is O(1) from in-memory `symbol_registry`.
+- `get_tier()` returns **T3 as safe default** for unknown symbols.
+- Add **epoch/versioning** to tier registry and config store coordination.
+
+### Topic 3 — Admin Guardrails and Auditability
+
+**Senior Architect**
+- Every change must persist who/what/when/old/new.
+- Unsafe values like `min_premium = 0` cannot be allowed.
+
+**Principal Backend Engineer**
+- Bounds should live in validation code first, not in a new limits table.
+- Market-hours changes need a deliberate confirmation flag.
+
+**Lead QA**
+- Admin GET responses should include bounds so the future UI can render valid controls without another API.
+- Invalid changes need explicit 422 behavior; market-hours missing confirmation should fail separately.
+
+**Decision**
+- Hardcode bounds in validation for this story.
+- Require `confirm_market_hours=true` for mid-session changes.
+- Include bounds in `GET /api/admin/gate-config`.
+- Persist a full audit trail with `reason`.
+
+#### Proposed Architecture
+
+### 1. `gate_configs` table
+
+```sql
+CREATE TABLE gate_configs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    gate_name       TEXT NOT NULL,
+    tier            INTEGER NOT NULL,
+    value           NUMERIC NOT NULL,
+    value_type      TEXT NOT NULL,
+    description     TEXT,
+    updated_by      TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ DEFAULT now(),
+    previous_value  NUMERIC,
+    UNIQUE (gate_name, tier)
+);
+```
+
+### 2. `GateConfigStore`
+
 ```python
-TIER_FLOORS = {
-    1: 50_000,   # large-cap
-    2: 25_000,   # mid-cap
-    3: 5_000,    # small-cap — GDYN, PENG land here
+class GateConfigStore:
+    """
+    Thread-safe in-memory config store.
+    Loaded at startup from DB. Updated via admin API without restart.
+    Workers hold a reference to the singleton and always read live values.
+    """
+```
+
+Responsibilities:
+- load gate rows from DB at startup,
+- hold all gate values in memory keyed by `(gate_name, tier)`,
+- update atomically on admin write,
+- expose safe fallback values,
+- never perform DB reads on per-tick execution.
+
+### 3. Gates to Convert
+
+#### Gate A — Parser `belowminpremium`
+Current state:
+- Flat absolute premium floor.
+
+Target state:
+- Tier-aware floor by ticker tier.
+
+Suggested seed defaults:
+- T1: 25,000
+- T2: 15,000
+- T3: 10,000
+
+#### Gate B — Accumulator DTE-adjusted floor
+Current state:
+- DTE-scaled but tier-blind.
+
+Target state:
+- Existing DTE curve multiplied by a per-tier multiplier.
+
+Suggested seed defaults:
+- T1: 1.5x
+- T2: 1.0x
+- T3: 0.75x
+
+#### Gate C — `require_oi`
+Current state:
+- Global/session behavior.
+
+Target state:
+- Per-tier boolean behavior.
+
+Suggested seed defaults:
+- T1: off
+- T2: off
+- T3: off
+
+#### Gate D — Signal debounce
+Current state:
+- Uniform debounce window.
+
+Target state:
+- Per-tier debounce windows.
+
+Suggested seed defaults:
+- T1: 30,000 ms
+- T2: 60,000 ms
+- T3: 120,000 ms
+
+#### Gate E — Dedup window
+Current state:
+- Implicit/static.
+
+Target state:
+- Config-backed dedup timing window even if initial values remain the same.
+
+Suggested seed defaults:
+- T1/T2/T3: 5,000 ms
+
+#### Admin API Contract
+
+### `PATCH /api/admin/gate-config`
+
+Request:
+```json
+{
+  "gate_name": "min_premium",
+  "tier": 3,
+  "value": 12000,
+  "reason": "Reducing T3 floor for catalyst week",
+  "confirm_market_hours": true
 }
-min_floor = TIER_FLOORS.get(symbol_tier, DEFAULT_FLOOR)
 ```
 
-**Option B — OI-Relative Bypass Gate** *(most signal-accurate — medium-term)*
-```python
-OI_SIGNIFICANCE_THRESHOLD = 0.05  # 5% of total OI
-if open_interest > 0 and (size / open_interest) >= OI_SIGNIFICANCE_THRESHOLD:
-    bypass_premium_floor = True
+Response:
+```json
+{
+  "gate_name": "min_premium",
+  "tier": 3,
+  "old_value": 10000,
+  "new_value": 12000,
+  "propagated_at": "2026-05-07T08:00:00Z",
+  "workers_notified": 100
+}
 ```
 
-**Option C — Relative Premium Floor** *(most generalizable)*
-```python
-min_premium = max(BASE_FLOOR, underlying_price * size * RELATIVE_MULTIPLIER)
-```
-
-**Option D — Per-Ticker Debug Logging at Drop Stage** *(prerequisite for all)*
-```python
-if premium < min_premium_floor:
-    logger.debug(f"belowminpremium {ticker} {contract_type} {strike} dte{dte} prem{premium} floor{min_premium_floor}")
-```
-
-**Option E — Fix `average_volume = 0` Bug for PENG**
-PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh failure.
-
-#### Deliberations Required (3-Way: SA · PBE · QA)
-
-**D1 — Which options to implement, and in what order?**
-**D2 — Tier 3 floor value:** `$5,000` proposed. Needs validation against historical Tier 3 tape data.
-**D3 — `average_volume = 0` handling:** Sentinel/fallback or block `stream_eligible` until fixed?
+Additional endpoints:
+- `GET /api/admin/gate-config`
+- `GET /api/admin/gate-config/history`
 
 #### Acceptance Criteria
 
-- [ ] D1, D2, D3 deliberations resolved and documented inline (SA + PBE + QA sign-off)
-- [ ] Option D (per-ticker debug logging at `belowminpremium`) shipped as prerequisite
-- [ ] At least one of Options A/B/C implemented per D1 resolution
-- [ ] GDYN and PENG flow events begin appearing in `flow_events` after fix (manual verification on a live session)
-- [ ] `average_volume = 0` sentinel handling added to universe refresh and/or floor calculation
-- [ ] Existing Tier 1/2 signal quality unaffected — no new noise on NVDA, AMD, AAPL, SPY
-- [ ] Unit tests: Tier 3 print below flat floor but above tier floor; OI bypass gate at 5% threshold; `average_volume = 0` fallback
-- [ ] All new `_stats` keys initialised at module level — cold-start safe
+- [ ] All major ingestion gates are represented as per-tier config rows in `gate_configs`
+- [ ] `GateConfigStore` loads all gate configs at startup with safe hardcoded fallbacks
+- [ ] Gate lookups read from in-memory config, not hardcoded constants
+- [ ] Parser `belowminpremium` is tier-aware
+- [ ] Accumulator DTE floor is tier-aware via multiplier
+- [ ] `require_oi` is tier-aware
+- [ ] Signal debounce is tier-aware
+- [ ] Dedup window is config-backed
+- [ ] `PATCH /api/admin/gate-config` updates values with no process restart
+- [ ] Updates propagate to live workers within 5 seconds
+- [ ] Every config change persists audit fields: who, what, when, old value, new value, reason
+- [ ] `GET /api/admin/gate-config` returns current values plus validation bounds
+- [ ] Market-hours config changes require explicit confirmation
+- [ ] Invalid config values return 422 with bounds context
+- [ ] Unknown symbol tier defaults safely to T3
+- [ ] Unit coverage on gate logic and config store is at least 95%
+- [ ] Integration tests prove live hot-reload behavior without restart
+- [ ] Future admin page is unblocked by this API contract
+
+#### QA Test Matrix
+
+| Case | Description | Expected |
+|---|---|---|
+| TGC-1 | Update T3 `min_premium` via admin API | New T3 value used on next eligible tick without restart |
+| TGC-2 | Update T1 DTE multiplier mid-session | Accumulator applies new multiplier within 5 seconds |
+| TGC-3 | Invalid `min_premium=0` | 422 with validation bounds |
+| TGC-4 | Market-hours change without `confirm_market_hours` | Request rejected |
+| TGC-5 | Unknown symbol tier | Safe T3 fallback, no exception |
+| TGC-6 | Tier refresh from T3 → T2 mid-session | Subsequent tick uses T2 thresholds |
+| TGC-7 | Config update persisted | Audit row contains old/new/user/reason |
+| TGC-8 | Cold start with missing DB rows | Hardcoded fallback values load cleanly |
+| TGC-9 | `/health/stream` after config introduction | No missing `_stats` keys, cold-start safe |
+| TGC-10 | Existing Tier 1 names after rollout | No unexpected noise increase on NVDA/SPY/AAPL/AMD |
+
+#### Out of Scope
+
+- Admin frontend UI implementation
+- Supabase Realtime multi-replica fan-out
+- Per-symbol overrides
+- Rollback/versioning UI for config changes
 
 ---
 
 ### ING-008 — Volume vs. OI Gate via Registry Injection
 
-**Type:** Feature / Gate Addition
-**Priority:** P0
-**Estimated Effort:** TBD — pending deliberation
-**Depends On:** ING-004 ✅, ING-005 ✅, **ING-011 ✅**
-**Files:** TBD — pending deliberation
-**GitHub Issue:** TBD
+**Type:** Feature / Gate Addition  
+**Priority:** P0  
+**Estimated Effort:** TBD — pending deliberation  
+**Depends On:** ING-004 ✅, ING-005 ✅, **ING-011 ✅**  
+**Files:** TBD — pending deliberation  
+**GitHub Issue:** TBD  
 **Branch:** `ing/s8-vol-oi-gate` *(not yet created)*
 
 #### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
@@ -719,4 +931,4 @@ PENG's `average_volume = 0` in `options_universe_symbols` is a universe refresh 
 
 ---
 
-*Last updated: 2026-05-07 (ING-011b MERGED — PR #82 squash 2026-05-07; Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed; Sprint Order row 8b marked ✅ MERGED; Post-ING-011-Merge Findings table updated; Post-ING-011b-Merge Findings section added; ING-011b story section: AC all checked ✅, pre-merge panel verdicts recorded SA/PBE/QA PASS, W-4b boundary test row added to QA matrix; ING-008 note updated to reflect ING-011b merged) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-07 (ING-010 reframed to canonical ingestion gate revamp issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84); Sprint Order updated; Post-ING-009 live findings updated to mark [#78](https://github.com/bhaveshhpatel/cipher/issues/78) as superseded; new full ING-010 story section added with 3-way deliberation outcomes, acceptance criteria, QA matrix, admin hot-reload architecture, and gate-config schema) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
