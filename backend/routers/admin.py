@@ -434,10 +434,16 @@ async def get_activity_log(
 #         bounds for every gate so the UI can render sliders.
 #
 #   PATCH /api/admin/gate-config
-#         Updates one gate+tier in-place: validates bounds + optional
-#         market-hours guard, PATCHes the DB row, writes an audit record,
-#         then hot-reloads the in-memory store — all via GateConfigStore.update().
+#         Updates one gate+tier in-place: validates bounds + 428 market-hours
+#         guard (raised here before any DB I/O), PATCHes the DB row, writes
+#         an audit record, then hot-reloads the in-memory store via
+#         GateConfigStore.update().
 #         Returns the old value, new value, and current epoch.
+#
+#         428 Precondition Required:
+#           Returned when confirm_market_hours=false (the safe UI default)
+#           and the market is currently open.  The UI should present a
+#           confirmation dialog and re-send with confirm_market_hours=true.
 #
 #   GET   /api/admin/gate-config/history
 #         Paginated read of gate_config_audit (newest first), filterable
@@ -451,7 +457,17 @@ class GateConfigUpdate(BaseModel):
     tier:                  int
     value:                 float
     reason:                str | None = None
-    confirm_market_hours:  bool       = True
+    confirm_market_hours:  bool       = False
+    """
+    Market-hours precondition flag.
+
+    False (default) — safe default for UI clients.  If the market is currently
+      open the server returns 428 Precondition Required so the UI can render a
+      confirmation dialog before the admin commits a live gate change.
+
+    True — caller explicitly acknowledges they want to change a gate while
+      trading is active.  The 428 guard is skipped and the update proceeds.
+    """
 
     @field_validator("gate_name")
     @classmethod
@@ -495,7 +511,6 @@ def _build_config_matrix(gate_store: Any) -> list[dict]:
     rows = []
     for gate in _ALL_GATES:
         lo, hi = _GATE_BOUNDS.get(gate, (0.0, float("inf")))
-        # Also pull live bounds from the store's _bounds_cache if available
         live_bounds = getattr(gate_store, "_bounds_cache", {})
         if gate in live_bounds:
             lo, hi = live_bounds[gate]
@@ -597,12 +612,43 @@ async def patch_gate_config(
           "tier": 1,
           "value": 30000.0,
           "reason": "Tightening T1 floor for earnings week",   // optional
-          "confirm_market_hours": true                          // default true
+          "confirm_market_hours": false                         // default false
         }
 
-    ``confirm_market_hours=false`` raises 422 if the market is currently open.
+    ``confirm_market_hours`` controls the 428 precondition guard:
+
+      false (default) — if the market is currently open, returns
+        428 Precondition Required with a structured detail payload.
+        The UI should render a confirmation dialog, then re-send the
+        request with confirm_market_hours=true.
+
+      true — caller explicitly acknowledges the live-market risk.
+        The guard is bypassed and the update proceeds immediately.
+
+    All other validation errors (unknown gate, bad tier, out-of-bounds
+    value) return 422 Unprocessable Entity regardless of market hours.
     """
-    from services.gate_config_store import store as gate_store
+    from services.gate_config_store import store as gate_store, _is_market_open
+
+    # --- 428 Precondition Required: market-hours guard ---------------------
+    # Checked before any DB I/O so the round-trip is free.
+    # confirm_market_hours=False means "block if market is open" (safe UI
+    # default); True means the admin has explicitly acknowledged the risk.
+    if not body.confirm_market_hours and _is_market_open():
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "error":    "market_open_precondition",
+                "message":  (
+                    "The market is currently open. Gate changes during trading hours "
+                    "affect live signal filtering immediately. "
+                    "Re-send with confirm_market_hours=true to proceed."
+                ),
+                "gate_name": body.gate_name,
+                "tier":      body.tier,
+                "value":     body.value,
+            },
+        )
 
     try:
         result = await gate_store.update(
@@ -616,7 +662,6 @@ async def patch_gate_config(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
-        # DB PATCH failed — surface as 502 (upstream dependency failure)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     log.info(
