@@ -52,14 +52,12 @@ Gate catalogue (gate_name → value_type)
     dedup_window_ms      milliseconds  (ms) default all=5000
     require_oi           boolean       (0/1)default all=0
     signal_debounce_ms   milliseconds  (ms) default T1=30000 T2=60000 T3=120000
-    exclude_indices      boolean       (0/1)default all=1  (filter ON)   [ING-011]
-                         Tier-independent gate — only tier=1 row is read at runtime.
-                         When 1.0: SPY/QQQ/IWM/DIA/SPX/NDX/VIX/XSP/RUT/SPXW
-                         options flow is dropped before parse.
-                         When 0.0: index flow passes through unrestricted.
-                         NOTE: VIX is intentionally included in the index set
-                         even though VIX options carry institutional flow value.
-                         Operators who want VIX flow should set exclude_indices=0.
+    exclude_indices      boolean       (0/1)default all=1.0 (filter ON)
+                         Tier-independent gate. Only the tier=1 row is read
+                         by tradier_stream._process_trade(). Tiers 2+3 are
+                         seeded for schema completeness but ignored at runtime.
+                         1.0 = exclude index options (SPY/QQQ/IWM/etc.) from flow.
+                         0.0 = allow index options through (pass-through mode).
 
     Alias: "debounce_ms" is accepted as a shorthand for "signal_debounce_ms"
     so that test fixtures that use the shorter name resolve correctly.
@@ -85,11 +83,9 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     "dedup_window_ms":      {1: 5_000.0,  2: 5_000.0,  3: 5_000.0},
     "require_oi":           {1: 0.0,      2: 0.0,      3: 0.0},
     "signal_debounce_ms":   {1: 30_000.0, 2: 60_000.0, 3: 120_000.0},
-    # ING-011: Gate 6 — index flow filter.
-    # Default 1.0 (filter ON) across all tiers so index noise is suppressed
-    # even at cold start before the DB row is loaded.
-    # Only tier=1 row is read at runtime; tiers 2/3 are seeded for DB
-    # completeness and symmetry with other gates.
+    # ING-011: Gate 6 — index options filter.
+    # Default 1.0 (filter ON) for all tiers — index noise suppressed at cold
+    # start. Only tier=1 is read at runtime; tiers 2+3 seeded for completeness.
     "exclude_indices":      {1: 1.0,      2: 1.0,      3: 1.0},
 }
 
@@ -100,7 +96,6 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "dedup_window_ms":      (500.0,    60_000.0),
     "require_oi":           (0.0,      1.0),
     "signal_debounce_ms":   (1_000.0,  600_000.0),
-    # ING-011: boolean gate — 0.0 (pass all indices) or 1.0 (filter indices)
     "exclude_indices":      (0.0,      1.0),
 }
 
