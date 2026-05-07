@@ -45,26 +45,24 @@ Public singleton
         universe_store.get_epoch(),
     )
 
-Gate catalogue (gate_name -> value_type)
+Gate catalogue (gate_name → value_type)
 ----------------------------------------
     min_premium          currency      ($)  default T1=25000 T2=15000 T3=10000
-    dte_floor_multiplier multiplier    (x)  default T1=1.5   T2=1.0   T3=0.75
+    dte_floor_multiplier multiplier    (×)  default T1=1.5   T2=1.0   T3=0.75
     dedup_window_ms      milliseconds  (ms) default all=5000
     require_oi           boolean       (0/1)default all=0
     signal_debounce_ms   milliseconds  (ms) default T1=30000 T2=60000 T3=120000
-    exclude_indices      boolean       (0/1)default all=1.0 (filter ON)
+    exclude_indices      boolean       (0/1)default all=1  (filter ON)   [ING-011]
+                         Tier-independent gate — only tier=1 row is read at runtime.
+                         When 1.0: SPY/QQQ/IWM/DIA/SPX/NDX/VIX/XSP/RUT/SPXW
+                         options flow is dropped before parse.
+                         When 0.0: index flow passes through unrestricted.
+                         NOTE: VIX is intentionally included in the index set
+                         even though VIX options carry institutional flow value.
+                         Operators who want VIX flow should set exclude_indices=0.
 
     Alias: "debounce_ms" is accepted as a shorthand for "signal_debounce_ms"
     so that test fixtures that use the shorter name resolve correctly.
-
-    Note on exclude_indices
-    -----------------------
-    This is a tier-independent gate stored at all three tiers for completeness,
-    but only tier=1 is read at runtime via get("exclude_indices", 1).
-    value=1.0 means index tickers (SPY, QQQ, IWM, DIA, SPX, NDX, VIX, XSP,
-    RUT, SPXW) are excluded from the flow.  value=0.0 lets them through.
-    Default is 1.0 (filter ON) so index noise is suppressed at cold start
-    without any operator action.
 """
 from __future__ import annotations
 
@@ -87,26 +85,29 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     "dedup_window_ms":      {1: 5_000.0,  2: 5_000.0,  3: 5_000.0},
     "require_oi":           {1: 0.0,      2: 0.0,      3: 0.0},
     "signal_debounce_ms":   {1: 30_000.0, 2: 60_000.0, 3: 120_000.0},
-    # Gate 6: tier-independent boolean — 1.0 = exclude index tickers from flow.
-    # Default ON (1.0) so SPY/QQQ noise is filtered at cold start.
-    # Only tier=1 is read at runtime; tiers 2/3 are seeded for matrix display.
+    # ING-011: Gate 6 — index flow filter.
+    # Default 1.0 (filter ON) across all tiers so index noise is suppressed
+    # even at cold start before the DB row is loaded.
+    # Only tier=1 row is read at runtime; tiers 2/3 are seeded for DB
+    # completeness and symmetry with other gates.
     "exclude_indices":      {1: 1.0,      2: 1.0,      3: 1.0},
 }
 
-# Bounds enforced by update() - mirrors the min_value/max_value columns in DB.
+# Bounds enforced by update() — mirrors the min_value/max_value columns in DB.
 _BOUNDS: dict[str, tuple[float, float]] = {
     "min_premium":          (1_000.0,  500_000.0),
     "dte_floor_multiplier": (0.1,      5.0),
     "dedup_window_ms":      (500.0,    60_000.0),
     "require_oi":           (0.0,      1.0),
     "signal_debounce_ms":   (1_000.0,  600_000.0),
+    # ING-011: boolean gate — 0.0 (pass all indices) or 1.0 (filter indices)
     "exclude_indices":      (0.0,      1.0),
 }
 
 _VALID_GATES = frozenset(_DEFAULTS.keys())
 _VALID_TIERS = frozenset({1, 2, 3})
 
-# Market-hours window: Mon-Fri 09:30-16:00 ET == 13:30-20:00 UTC
+# Market-hours window: Mon–Fri 09:30–16:00 ET == 13:30–20:00 UTC
 _MARKET_OPEN_UTC  = datetime.time(13, 30)
 _MARKET_CLOSE_UTC = datetime.time(20,  0)
 
@@ -142,7 +143,7 @@ class GateConfigStore:
         self._cache: dict[str, dict[int, float]] = {
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
-        # _bounds_cache: {gate_name: (min, max)} - updated by load()
+        # _bounds_cache: {gate_name: (min, max)} — updated by load()
         self._bounds_cache: dict[str, tuple[float, float]] = dict(_BOUNDS)
         self.epoch: int = 0
         # Overridable in tests without subclassing
@@ -158,7 +159,7 @@ class GateConfigStore:
         Return the current threshold for *gate_name* at *tier*.
 
         Falls back to T3 for any tier not in {1, 2, 3}.  Never raises.
-        Resolves "debounce_ms" -> "signal_debounce_ms" transparently.
+        Resolves "debounce_ms" → "signal_debounce_ms" transparently.
         """
         gate_name = self._resolve_alias(gate_name)
         safe_tier = tier if tier in _VALID_TIERS else 3
@@ -187,7 +188,7 @@ class GateConfigStore:
         This is the theoretical race: a gate config update could complete
         between a chain load and the first use of those values.
 
-        The check is directional - it only fires if a *dependent* store is
+        The check is directional — it only fires if a *dependent* store is
         *ahead* of the gate store, not behind. Being behind (gate updated
         without a chain reload) is normal during hot-reload cycles.
 
@@ -199,9 +200,9 @@ class GateConfigStore:
 
         Parameters
         ----------
-        gate_epoch      : int   - store.epoch from the GateConfigStore singleton
-        chain_epoch     : int   - chain_store.get_epoch()
-        universe_epoch  : int   - universe_store.get_epoch()
+        gate_epoch      : int   — store.epoch from the GateConfigStore singleton
+        chain_epoch     : int   — chain_store.get_epoch()
+        universe_epoch  : int   — universe_store.get_epoch()
 
         Raises
         ------
@@ -212,13 +213,13 @@ class GateConfigStore:
         if chain_epoch > 0 and chain_epoch > gate_epoch:
             raise AssertionError(
                 f"chain_store epoch {chain_epoch} is ahead of "
-                f"gate_config epoch {gate_epoch} - gate config may not reflect "
+                f"gate_config epoch {gate_epoch} — gate config may not reflect "
                 f"the generation of chain data currently in memory."
             )
         if universe_epoch > 0 and universe_epoch > gate_epoch:
             raise AssertionError(
                 f"universe_store epoch {universe_epoch} is ahead of "
-                f"gate_config epoch {gate_epoch} - gate config may not reflect "
+                f"gate_config epoch {gate_epoch} — gate config may not reflect "
                 f"the generation of universe data currently in memory."
             )
 
@@ -228,7 +229,7 @@ class GateConfigStore:
         the in-memory cache.  Advances ``epoch`` on success.
         """
         if not self._supabase_url or not self._supabase_key:
-            log.debug("[gate_config_store] load() skipped - no-db mode")
+            log.debug("[gate_config_store] load() skipped — no-db mode")
             return
 
         url = f"{self._supabase_url}/rest/v1/gate_configs?select=gate_name,tier,value,min_value,max_value"
@@ -255,7 +256,7 @@ class GateConfigStore:
             self.epoch += 1
 
         log.info(
-            "[gate_config_store] load() complete - %d rows, epoch=%d",
+            "[gate_config_store] load() complete — %d rows, epoch=%d",
             len(rows),
             self.epoch,
         )
@@ -291,8 +292,8 @@ class GateConfigStore:
 
         Raises
         ------
-        ValueError   - unknown gate, invalid tier, out-of-bounds, market open guard
-        RuntimeError - DB PATCH non-2xx
+        ValueError   — unknown gate, invalid tier, out-of-bounds, market open guard
+        RuntimeError — DB PATCH non-2xx
         """
         gate_name = self._resolve_alias(gate_name)
 
@@ -300,7 +301,7 @@ class GateConfigStore:
             raise ValueError(f"Unknown gate: {gate_name!r}")
 
         if tier not in _VALID_TIERS:
-            raise ValueError(f"Invalid tier: {tier!r} - must be 1, 2, or 3")
+            raise ValueError(f"Invalid tier: {tier!r} — must be 1, 2, or 3")
 
         if not confirm_market_hours and _is_market_open():
             raise ValueError(
@@ -322,7 +323,7 @@ class GateConfigStore:
                 self._cache[gate_name][tier] = float(value)
                 self.epoch += 1
             log.info(
-                "[gate_config_store] no-db update %s[T%d] %s -> %s (epoch=%d)",
+                "[gate_config_store] no-db update %s[T%d] %s → %s (epoch=%d)",
                 gate_name, tier, old_value, value, self.epoch,
             )
             return {
@@ -330,7 +331,7 @@ class GateConfigStore:
                 "tier":       tier,
                 "old_value":  old_value,
                 "new_value":  float(value),
-                "_note":      "no-db mode - in-memory only",
+                "_note":      "no-db mode — in-memory only",
             }
 
         patch_url = (
@@ -363,7 +364,7 @@ class GateConfigStore:
                 self.epoch += 1
 
             log.info(
-                "[gate_config_store] update %s[T%d] %s -> %s (epoch=%d) by %s",
+                "[gate_config_store] update %s[T%d] %s → %s (epoch=%d) by %s",
                 gate_name, tier, old_value, value, self.epoch, updated_by,
             )
 
@@ -385,12 +386,12 @@ class GateConfigStore:
                 )
                 if audit_resp.status_code not in (200, 201, 204):
                     log.warning(
-                        "[gate_config_store] audit insert returned %d for %s[T%d] - non-fatal",
+                        "[gate_config_store] audit insert returned %d for %s[T%d] — non-fatal",
                         audit_resp.status_code, gate_name, tier,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning(
-                    "[gate_config_store] audit insert failed for %s[T%d]: %s - non-fatal",
+                    "[gate_config_store] audit insert failed for %s[T%d]: %s — non-fatal",
                     gate_name, tier, exc,
                 )
 
