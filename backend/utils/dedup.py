@@ -31,6 +31,14 @@ ING-010 (dedup tier-awareness — 2026-05-07):
   _cleanup() uses _effective_cleanup_ttl() = max(self._ttl, max dedup_window_ms
   across all tiers from gate_config_store / 1000). This ensures keys are not
   evicted before the widest tier window expires.
+
+Fix (ING-010-IMPORT 2026-05-07): import store as gate_config_store.
+  Both _resolve_tier_ttl() and _effective_cleanup_ttl() previously imported
+  `gate_config_store` by name from the module — that symbol does not exist.
+  The module exports `store`. Both methods caught the ImportError silently via
+  bare `except Exception: pass` and fell back to self._ttl (5.0s flat), meaning
+  the tier-aware path has never executed. Fixed to:
+      from services.gate_config_store import store as gate_config_store
 """
 import time
 from collections import defaultdict
@@ -145,7 +153,7 @@ class DedupCache:
         if tier_int is None:
             return fallback
         try:
-            from services.gate_config_store import gate_config_store
+            from services.gate_config_store import store as gate_config_store
             raw_ms = gate_config_store.get("dedup_window_ms", tier_int)
             if raw_ms is not None and raw_ms > 0:
                 return float(raw_ms) / 1000.0
@@ -163,7 +171,7 @@ class DedupCache:
         Falls back to self._ttl when store is not loaded (cold start).
         """
         try:
-            from services.gate_config_store import gate_config_store
+            from services.gate_config_store import store as gate_config_store
             max_ms = max(
                 (gate_config_store.get("dedup_window_ms", t) or 0)
                 for t in (1, 2, 3)
