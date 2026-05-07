@@ -2,11 +2,13 @@
 Cipher Backend — FastAPI entry point
 
 Startup sequence (post all fixes):
-  1. _resolve_startup_universe()     — load symbols from DB (<2s)
-  2. init_registry()                 — in-memory init (instant)
-  3. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
-  4. yield                           — SERVER IS LIVE, health probe passes
-  5. Parallel background tasks launched:
+  0. gate_config_store.load()        — load tier gate config from DB into memory  [ING-010]
+  1. validate_ingestion_config()     — warn on missing ingestion config rows  [RC-3]
+  2. _resolve_startup_universe()     — load symbols from DB (<2s)
+  3. init_registry()                 — in-memory init (instant)
+  4. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
+  5. yield                           — SERVER IS LIVE, health probe passes
+  6. Parallel background tasks launched:
      a. _background_build_and_upsert — incremental/full OCC build (P4)
      b. registry.refresh_loop()      — scheduled 30-min rebuilds
      c. _registry_prewarm_loop()     — 9:15 AM ET daily pre-warm
@@ -35,6 +37,9 @@ Key architectural fixes:
                         FIRST so Tradier HTTP connections close cleanly before
                         the process exits, freeing session quota for the next
                         container start immediately.
+  ING-010 (main)      — gate_config_store.load() is step 0 in startup so all
+                        tier gate values are hot in memory before any service
+                        (stream, accumulator, parser) runs its first tick.
 """
 import asyncio
 import json
@@ -64,6 +69,7 @@ from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow
+from services.gate_config_store import gate_config_store
 
 
 class _JsonFormatter(logging.Formatter):
@@ -436,6 +442,18 @@ async def _registry_prewarm_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend\u2026")
+
+    # Step 0 [ING-010]: Load tier gate config into memory before any service
+    # reads gate values (stream, accumulator, parser all call store.get() on
+    # the first tick).  load() is safe to call even if Supabase is unreachable
+    # — it falls back to hardcoded defaults and logs a warning.
+    log.info("[gate_config] Loading tier gate configuration from DB\u2026")
+    await gate_config_store.load()
+    log.info(
+        "[gate_config] Gate config ready (epoch=%d, loaded=%s)",
+        gate_config_store.epoch,
+        gate_config_store._loaded,
+    )
 
     await validate_ingestion_config()
 
