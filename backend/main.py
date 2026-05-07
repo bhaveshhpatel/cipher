@@ -40,14 +40,11 @@ Key architectural fixes:
   ING-010 (main)      — gate_config_store.load() is step 0 in startup so all
                         tier gate values are hot in memory before any service
                         (stream, accumulator, parser) runs its first tick.
-  ACC-TIER (main)     — _post_build_upsert now calls
-                        tradier_stream.accumulator.set_tier_map(tier_map)
-                        after registry.set_tier_map(). The hot-path accumulator
-                        in tradier_stream.py is a module-level singleton — the
-                        registry's own .accumulator attribute is a different
-                        object. Without this call the stream accumulator kept
-                        _tier_map={} and defaulted all tickers to tier 1 (strict
-                        floor) regardless of actual tier assignment.
+  ING-010-ACC (main)  — after registry.set_tier_map(), tradier_stream.accumulator
+                        .set_tier_map() is also called so the module-level hot-path
+                        accumulator receives the same tier map. Without this, Gate 2
+                        in _get_episode_min_premium() resolves every ticker to tier 1
+                        (strict cold-start default) for the entire session.
 """
 import asyncio
 import json
@@ -238,6 +235,39 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
         q.open_interest = oi_map.get(q.symbol, 0)
 
 
+def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
+    """
+    ING-010-ACC: propagate the freshly-assigned tier_map to the module-level
+    accumulator in tradier_stream.py.
+
+    The registry.set_tier_map() call in _post_build_upsert() updates the
+    SymbolRegistry instance used for OCC lookups, but the hot-path accumulator
+    (services.tradier_stream.accumulator) is a separate RepetitionAccumulator
+    instance instantiated at module import time.  Without this call its
+    _tier_map stays empty, causing _get_episode_min_premium() to resolve every
+    ticker to tier 1 (strict cold-start default) for the entire trading session.
+
+    Import is deferred to avoid a circular import at module load time.
+    Logs a warning and returns cleanly if the import or attribute access fails
+    — the stream continues, just without tier-aware Gate 2 floors.
+    """
+    try:
+        import services.tradier_stream as _ts
+        _ts.accumulator.set_tier_map(tier_map)
+        log.info(
+            "[ING-010-ACC] tradier_stream.accumulator tier_map synced "
+            "(T1=%d T2=%d T3=%d)",
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+    except Exception as exc:
+        log.warning(
+            "[ING-010-ACC] Could not sync tier_map to tradier_stream.accumulator: %s",
+            exc,
+        )
+
+
 async def _post_build_upsert(
     registry,
     stream_symbols: list[str],
@@ -306,15 +336,10 @@ async def _post_build_upsert(
     try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
-        # ACC-TIER: also push the tier_map to the module-level accumulator in
-        # tradier_stream.py.  That singleton is the actual hot-path object —
-        # distinct from any accumulator attribute on the registry.  Without
-        # this call it keeps _tier_map={} and defaults every ticker to tier 1.
-        import services.tradier_stream as _ts
-        _ts.accumulator.set_tier_map(tier_map)
+        # ING-010-ACC: also update the module-level accumulator on the hot path.
+        _sync_accumulator_tier_map(tier_map)
         log.info(
-            "[post_build] Tier map updated — T1=%d T2=%d T3=%d "
-            "(registry + stream accumulator)",
+            "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
             sum(1 for t in tier_map.values() if t == 1),
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
@@ -386,13 +411,11 @@ async def _universe_refresh_loop():
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
-                    # ACC-TIER: keep the stream accumulator in sync on every
-                    # 24h universe refresh, same as _post_build_upsert does.
-                    import services.tradier_stream as _ts
-                    _ts.accumulator.set_tier_map(tier_map)
+                    # ING-010-ACC: keep the hot-path accumulator in sync.
+                    _sync_accumulator_tier_map(tier_map)
                     log.info(
-                        "[universe] Background refresh: registry + stream accumulator "
-                        "tier_map updated (T1=%d T2=%d T3=%d)",
+                        "[universe] Background refresh: registry tier_map updated "
+                        "(T1=%d T2=%d T3=%d)",
                         sum(1 for t in tier_map.values() if t == 1),
                         sum(1 for t in tier_map.values() if t == 2),
                         sum(1 for t in tier_map.values() if t == 3),
@@ -516,8 +539,6 @@ async def lifespan(app: FastAPI):
     # module-level `accumulator` in services/tradier_stream.py — not this registry
     # attribute. The worker's accumulator reference is used only to resolve the
     # DTE-tier min_premium floor for lookback DB queries; it does NOT gate flow.
-    # ACC-TIER: set_tier_map() on that module-level accumulator is handled in
-    # _post_build_upsert() and _universe_refresh_loop() — see those functions.
     lookback_task         = asyncio.create_task(
         start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
     )
