@@ -75,7 +75,6 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     "min_premium":          {1: 25_000.0, 2: 15_000.0, 3: 10_000.0},
     "dte_floor_multiplier": {1: 1.5,      2: 1.0,      3: 0.75},
     "dedup_window_ms":      {1: 5_000.0,  2: 5_000.0,  3: 5_000.0},
-    "debounce_ms":          {1: 30_000.0, 2: 60_000.0, 3: 120_000.0},
     "require_oi":           {1: 0.0,      2: 0.0,      3: 0.0},
     "signal_debounce_ms":   {1: 30_000.0, 2: 60_000.0, 3: 120_000.0},
 }
@@ -85,7 +84,6 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "min_premium":          (1_000.0,  500_000.0),
     "dte_floor_multiplier": (0.1,      5.0),
     "dedup_window_ms":      (500.0,    60_000.0),
-    "debounce_ms":          (1_000.0,  600_000.0),
     "require_oi":           (0.0,      1.0),
     "signal_debounce_ms":   (1_000.0,  600_000.0),
 }
@@ -396,7 +394,7 @@ class GateConfigStore:
     def _resolve_alias(gate_name: str) -> str:
         """Normalise short-form aliases to their canonical gate names."""
         if gate_name == "debounce_ms":
-            return gate_name
+            return "signal_debounce_ms"
         return gate_name
 
     def _rest_headers(self) -> dict[str, str]:
