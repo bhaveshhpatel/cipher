@@ -1,3 +1,2 @@
--- SUPERSEDED by 20260507_ing010_gate_configs_and_audit.sql
--- This file is intentionally left as a tombstone to avoid git conflicts.
--- Do not apply this migration — seed data is included in ing010.
+-- DELETED: was already a tombstone stub (seed folded into 019_gate_configs.sql).
+-- Canonical migration: backend/migrations/019_gate_configs.sql
