@@ -483,18 +483,18 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend\u2026")
+    log.info("Starting Cipher backend...")
 
     # Step 0 [ING-010]: Load tier gate config into memory before any service
     # reads gate values (stream, accumulator, parser all call store.get() on
     # the first tick).  load() is safe to call even if Supabase is unreachable
     # — it falls back to hardcoded defaults and logs a warning.
-    log.info("[gate_config] Loading tier gate configuration from DB\u2026")
+    log.info("[gate_config] Loading tier gate configuration from DB...")
     await gate_config_store.load()
     log.info(
         "[gate_config] Gate config ready (epoch=%d, loaded=%s)",
         gate_config_store.epoch,
-        gate_config_store._loaded,
+        gate_config_store.epoch > 0,  # epoch>0 is the canonical load signal; _loaded attr does not exist
     )
 
     await validate_ingestion_config()
@@ -545,7 +545,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    log.info("[shutdown] Closing Tradier stream connections first\u2026")
+    log.info("[shutdown] Closing Tradier stream connections first...")
     stream_task.cancel()
     lookback_task.cancel()
     try:
