@@ -1,2 +1,0 @@
--- DELETED: was already a tombstone stub (seed folded into 019_gate_configs.sql).
--- Canonical migration: backend/migrations/019_gate_configs.sql

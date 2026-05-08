@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS gate_configs (
 );
 
 COMMENT ON TABLE  gate_configs                IS 'Live per-gate per-tier threshold values (ING-010)';
-COMMENT ON COLUMN gate_configs.gate_name      IS 'One of: min_premium, dte_floor_multiplier, dedup_window_ms, require_oi, signal_debounce_ms';
+COMMENT ON COLUMN gate_configs.gate_name      IS 'One of: min_premium, dte_floor_multiplier, dedup_window_ms, require_oi, signal_debounce_ms, signal_min_premium, exclude_indices';
 COMMENT ON COLUMN gate_configs.tier           IS '1=Tier-1 (large-cap), 2=Tier-2 (mid-cap), 3=Tier-3 (small-cap)';
 COMMENT ON COLUMN gate_configs.value          IS 'Current live value for this gate × tier combo';
 COMMENT ON COLUMN gate_configs.min_value      IS 'Inclusive lower bound used by admin UI slider and PATCH validator';
@@ -100,7 +100,7 @@ CREATE TRIGGER trg_gate_configs_updated_at
     FOR EACH ROW EXECUTE FUNCTION _set_gate_configs_updated_at();
 
 -- ---------------------------------------------------------------------------
--- 5. Seed data — default values for all 5 gates × 3 tiers (15 rows)
+-- 5. Seed data — default values for all 7 gates × 3 tiers (21 rows)
 --
 --    Values MUST match _DEFAULTS in services/gate_config_store.py exactly.
 --    Any deviation is a bug.
@@ -112,6 +112,8 @@ CREATE TRIGGER trg_gate_configs_updated_at
 --  dedup_window_ms        | 5 000        | 5 000        | 5 000
 --  require_oi             | 0.0 (off)    | 0.0 (off)    | 0.0 (off)
 --  signal_debounce_ms     | 30 000       | 60 000       | 120 000
+--  signal_min_premium ($) | 50 000       | 35 000       | 20 000   [SA-3]
+--  exclude_indices        | 1.0 (on)     | 1.0 (on)     | 1.0 (on) [SA-3]
 --
 --  Note: 'debounce_ms' is a code-layer alias for 'signal_debounce_ms'
 --  resolved by GateConfigStore._resolve_alias(). It is NOT a DB gate
@@ -147,6 +149,22 @@ VALUES
     -- T1 tightest (30s), T3 widest (120s) to reduce noise on illiquid names.
     ('signal_debounce_ms',      1,  30000.0,   1000.0,   600000.0, 'migration'),
     ('signal_debounce_ms',      2,  60000.0,   1000.0,   600000.0, 'migration'),
-    ('signal_debounce_ms',      3, 120000.0,   1000.0,   600000.0, 'migration')
+    ('signal_debounce_ms',      3, 120000.0,   1000.0,   600000.0, 'migration'),
+
+    -- signal_min_premium  (minimum cumulative episode premium before signal fires)
+    -- T1 strictest (50k) — only large institutional flow signals on mega-caps.
+    -- T3 most relaxed (20k) — captures meaningful but smaller flow on small-caps.
+    -- SA-3: rows were missing from original migration; added here.
+    ('signal_min_premium',      1,  50000.0,   1000.0,   500000.0, 'migration'),
+    ('signal_min_premium',      2,  35000.0,   1000.0,   500000.0, 'migration'),
+    ('signal_min_premium',      3,  20000.0,   1000.0,   500000.0, 'migration'),
+
+    -- exclude_indices  (1.0 = filter ON — exclude SPY/QQQ/IWM/etc. from flow)
+    -- Default ON for all tiers: index options are high-volume noise, not signals.
+    -- Configurable via admin API to allow pass-through mode (0.0) per tier.
+    -- SA-3: rows were missing from original migration; added here.
+    ('exclude_indices',         1,     1.0,       0.0,        1.0, 'migration'),
+    ('exclude_indices',         2,     1.0,       0.0,        1.0, 'migration'),
+    ('exclude_indices',         3,     1.0,       0.0,        1.0, 'migration')
 
 ON CONFLICT (gate_name, tier) DO NOTHING;

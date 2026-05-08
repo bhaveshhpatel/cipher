@@ -497,6 +497,7 @@ async def lifespan(app: FastAPI):
         gate_config_store.epoch > 0,  # epoch>0 is the canonical load signal; _loaded attr does not exist
     )
 
+    # Step 1 [RC-3]: Warn on any missing ingestion config rows in DB.
     await validate_ingestion_config()
 
     stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()

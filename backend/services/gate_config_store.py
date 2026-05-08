@@ -315,11 +315,12 @@ class GateConfigStore:
             f"?gate_name=eq.{gate_name}&tier=eq.{tier}"
         )
         now_iso = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+        # SA-5: previous_value is not a column in gate_configs — removed from
+        # PATCH payload.  old_value is captured correctly in gate_config_audit.
         patch_payload = {
-            "value":          value,
-            "previous_value": old_value,
-            "updated_by":     updated_by,
-            "updated_at":     now_iso,
+            "value":      value,
+            "updated_by": updated_by,
+            "updated_at": now_iso,
         }
         headers = self._rest_headers()
 
