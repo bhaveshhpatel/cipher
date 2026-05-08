@@ -83,6 +83,10 @@ _BOUNDS: dict[str, tuple[float, float, type]] = {
 # _FALLBACK — flat dict {(gate, tier): value}  (backward-compat alias)
 #   Access:    _FALLBACK[("min_premium", 1)]  → 25000.0
 #   Iteration:  for (gate, tier), value in _FALLBACK.items(): ...
+#
+# IMPORTANT: These values MUST match the DB seed in migration 021.
+# Any divergence between this dict and the migration is a bug — the
+# cold-start (no-DB) path and the DB-backed path must behave identically.
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict[str, dict[int, float]] = {
     "min_premium": {
@@ -110,6 +114,8 @@ _DEFAULTS: dict[str, dict[int, float]] = {
         2: 60_000.0,
         3: 120_000.0,
     },
+    # signal_min_premium: values match migration 021 seed.
+    # T1=75k (whale/institutional only), T2=50k, T3=25k (retail catch-all).
     "signal_min_premium": {
         1: 75_000.0,
         2: 50_000.0,
@@ -170,7 +176,7 @@ class GateConfigStore:
     """
 
     def __init__(self) -> None:
-        # Seed cache from _DEFAULTS (deep copy so mutations don’t corrupt the defaults)
+        # Seed cache from _DEFAULTS (deep copy so mutations don't corrupt the defaults)
         self._cache: dict[str, dict[int, float]] = {
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
@@ -266,7 +272,7 @@ class GateConfigStore:
         async with httpx.AsyncClient(base_url=url, headers=headers) as client:
             resp = await client.get(
                 "/rest/v1/gate_configs",
-                params={"select": "*"},
+                params={"select": "gate_name,tier,value,min_value,max_value"},
             )
             resp.raise_for_status()   # propagates HTTPStatusError on non-2xx
             rows: list[dict] = resp.json()

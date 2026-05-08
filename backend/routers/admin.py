@@ -57,13 +57,16 @@ _TIER_THRESHOLD_COLUMNS = _ALLOWED_TIER_COLUMNS  # alias
 # Duplicated here so the router validates before hitting the store,
 # producing a clean 422 rather than a 500 ValueError from the service layer.
 # ING-011: 'exclude_indices' added for Gate 6 (boolean toggle, 0.0/1.0).
+# ING-010: 'signal_min_premium' added — gate was in the store but missing
+#          from this router set, causing PATCH to return 422 for a valid gate.
 _VALID_GATE_NAMES = frozenset({
     "min_premium",
     "dte_floor_multiplier",
     "dedup_window_ms",
-    "debounce_ms",
+    "debounce_ms",          # alias → signal_debounce_ms
     "require_oi",
     "signal_debounce_ms",
+    "signal_min_premium",   # ING-010: was missing — now included
     "exclude_indices",      # ING-011: Gate 6 — index ETF option filter toggle
 })
 
@@ -439,46 +442,7 @@ async def get_activity_log(
 
 # ---------------------------------------------------------------------------
 # ING-010: Gate config — GET / PATCH / history
-#
-#   GET   /api/admin/gate-config
-#         Returns the full gate config matrix from the live GateConfigStore
-#         singleton (in-memory, not a DB read), plus current epoch and the
-#         bounds for every gate so the UI can render sliders.
-#         ING-011: matrix now includes exclude_indices rows (tiers 1/2/3).
-#         Each exclude_indices row carries 'tier_independent': True so the
-#         UI can grey-out tier=2/3 sliders with a tooltip explaining that
-#         only tier=1 is honoured at runtime.
-#
-#   PATCH /api/admin/gate-config
-#         Updates one gate+tier in-place: validates bounds + 428 market-hours
-#         guard (raised here before any DB I/O), PATCHes the DB row, writes
-#         an audit record, then hot-reloads the in-memory store via
-#         GateConfigStore.update().
-#         Returns the old value, new value, current epoch, AND bounds
-#         (min_value, max_value) so the UI can update its slider range
-#         without a second GET round-trip.
-#
-#         ING-011 usage — toggle index filter:
-#           PATCH /api/admin/gate-config
-#           { "gate_name": "exclude_indices", "tier": 1, "value": 0.0,
-#             "reason": "allow SPY flow for macro event",
-#             "confirm_market_hours": true }
-#
-#         exclude_indices is tier-independent — only tier=1 is valid.
-#         Sending tier=2 or tier=3 returns 422 immediately (Pydantic
-#         model_validator fires before any DB I/O).
-#
-#         428 Precondition Required:
-#           Returned when confirm_market_hours=false (the safe UI default)
-#           and the market is currently open.  The UI should present a
-#           confirmation dialog and re-send with confirm_market_hours=true.
-#
-#   GET   /api/admin/gate-config/history
-#         Paginated read of gate_config_audit (newest first), filterable
-#         by gate_name and tier.
 # ---------------------------------------------------------------------------
-
-# --- Pydantic models -------------------------------------------------------
 
 class GateConfigUpdate(BaseModel):
     gate_name:             str
@@ -486,16 +450,6 @@ class GateConfigUpdate(BaseModel):
     value:                 float
     reason:                str | None = None
     confirm_market_hours:  bool       = False
-    """
-    Market-hours precondition flag.
-
-    False (default) — safe default for UI clients.  If the market is currently
-      open the server returns 428 Precondition Required so the UI can render a
-      confirmation dialog before the admin commits a live gate change.
-
-    True — caller explicitly acknowledges they want to change a gate while
-      trading is active.  The 428 guard is skipped and the update proceeds.
-    """
 
     @field_validator("gate_name")
     @classmethod
@@ -518,12 +472,6 @@ class GateConfigUpdate(BaseModel):
     def _validate_tier_independent_gates(self) -> "GateConfigUpdate":
         """
         Reject tier!=1 for gates that are tier-independent at runtime.
-
-        exclude_indices is read only from the tier=1 row by
-        tradier_stream._process_trade(). Writing to tier=2 or tier=3
-        rows succeeds in the DB but has zero effect on ingestion behaviour,
-        making the PATCH silently misleading. We hard-reject it here so
-        the API surface accurately reflects what the system actually honours.
         """
         if self.gate_name in _TIER_INDEPENDENT_GATES and self.tier != 1:
             raise ValueError(
@@ -534,16 +482,15 @@ class GateConfigUpdate(BaseModel):
         return self
 
 
-# --- Helpers ---------------------------------------------------------------
-
-# ING-011: 'exclude_indices' added — boolean gate, included in the config matrix
-# so GET /gate-config surfaces it alongside all numeric gates.
+# ING-011: 'exclude_indices' added — boolean gate, included in the config matrix.
+# ING-010: 'signal_min_premium' added — was in store but missing from router matrix.
 _ALL_GATES = [
     "min_premium",
     "dte_floor_multiplier",
     "dedup_window_ms",
     "require_oi",
     "signal_debounce_ms",
+    "signal_min_premium",   # ING-010: now included in GET /gate-config matrix
     "exclude_indices",      # ING-011: Gate 6 — index ETF filter toggle
 ]
 
@@ -553,24 +500,13 @@ _GATE_BOUNDS: dict[str, tuple[float, float]] = {
     "dedup_window_ms":      (500.0,     60_000.0),
     "require_oi":           (0.0,       1.0),
     "signal_debounce_ms":   (1_000.0,   600_000.0),
-    # alias — resolves to signal_debounce_ms bounds
     "debounce_ms":          (1_000.0,   600_000.0),
-    # ING-011: boolean gate — 0.0 (filter OFF) / 1.0 (filter ON)
+    "signal_min_premium":   (1_000.0,   500_000.0),  # ING-010
     "exclude_indices":      (0.0,       1.0),
 }
 
 
 def _gate_bounds(gate_store: Any, gate_name: str) -> tuple[float, float]:
-    """
-    Resolve the (min, max) bounds for a gate name.
-
-    Priority:
-      1. Live _bounds_cache on the store (populated by store.load() from DB)
-      2. Router-local _GATE_BOUNDS fallback (covers no-DB mode + pre-load)
-
-    Handles the 'debounce_ms' alias transparently — both the alias and the
-    canonical 'signal_debounce_ms' resolve to the same bounds.
-    """
     live = getattr(gate_store, "_bounds_cache", {})
     if gate_name in live:
         return live[gate_name]
@@ -578,16 +514,6 @@ def _gate_bounds(gate_store: Any, gate_name: str) -> tuple[float, float]:
 
 
 def _build_config_matrix(gate_store: Any) -> list[dict]:
-    """
-    Snapshot the live store into a list of row dicts.
-
-    Each row:
-      gate_name, tier, value, min_value, max_value, tier_independent
-
-    tier_independent=True signals that only tier=1 is honoured at runtime
-    for this gate. The UI uses this flag to grey-out tier=2/3 sliders and
-    show a tooltip explaining that changes to those rows have no effect.
-    """
     rows = []
     for gate in _ALL_GATES:
         lo, hi = _gate_bounds(gate_store, gate)
@@ -610,14 +536,9 @@ def _fetch_audit_rows(
     gate_name: str | None,
     tier: int | None,
 ) -> tuple[list[dict], int]:
-    """
-    Synchronous DB read of gate_config_audit — run via run_in_executor.
-    Returns (rows, total_count).
-    """
     from supabase import create_client
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
-    # Count query
     count_q = sb.table("gate_config_audit").select("id", count="exact")
     if gate_name:
         count_q = count_q.eq("gate_name", gate_name)
@@ -626,7 +547,6 @@ def _fetch_audit_rows(
     count_result = count_q.execute()
     total = count_result.count or 0
 
-    # Data query
     data_q = (
         sb.table("gate_config_audit")
         .select("id, gate_name, tier, old_value, new_value, changed_by, reason, changed_at")
@@ -642,42 +562,9 @@ def _fetch_audit_rows(
     return data_result.data or [], total
 
 
-# --- GET /api/admin/gate-config --------------------------------------------
-
 @router.get("/gate-config")
 async def get_gate_config(admin: TokenData = Depends(_require_admin)):
-    """
-    Return the full gate config matrix from the live in-memory GateConfigStore.
-
-    Response shape::
-
-        {
-          "epoch": 4,
-          "gates": [
-            {"gate_name": "min_premium", "tier": 1, "value": 25000.0,
-             "min_value": 1000.0, "max_value": 500000.0,
-             "tier_independent": false},
-            ...
-            {"gate_name": "exclude_indices", "tier": 1, "value": 1.0,
-             "min_value": 0.0, "max_value": 1.0,
-             "tier_independent": true},
-            {"gate_name": "exclude_indices", "tier": 2, "value": 1.0,
-             "min_value": 0.0, "max_value": 1.0,
-             "tier_independent": true},
-            ...
-          ]
-        }
-
-    ``epoch`` is the store's monotonic change counter — the admin UI can
-    poll this to detect when another session has mutated the config.
-    Each gate row includes ``min_value`` and ``max_value`` so the UI can
-    render sliders without a separate bounds lookup.
-    ``tier_independent`` is True for gates whose tier=2/3 rows are seeded
-    for schema completeness but not honoured by the ingestion pipeline.
-    ING-011: matrix includes all 3 exclude_indices tier rows.
-    """
     from services.gate_config_store import store as gate_store
-
     matrix = _build_config_matrix(gate_store)
     log.info("[admin] gate-config read by %s (epoch=%d)", admin.email, gate_store.epoch)
     return {
@@ -686,58 +573,14 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
     }
 
 
-# --- PATCH /api/admin/gate-config ------------------------------------------
-
 @router.patch("/gate-config")
 async def patch_gate_config(
     body:    GateConfigUpdate,
     request: Request,
     admin:   TokenData = Depends(_require_admin),
 ):
-    """
-    Update one gate+tier threshold.  Hot-reloads immediately — no restart.
-
-    Request body::
-
-        {
-          "gate_name": "min_premium",
-          "tier": 1,
-          "value": 30000.0,
-          "reason": "Tightening T1 floor for earnings week",   // optional
-          "confirm_market_hours": false                         // default false
-        }
-
-    ING-011 example — disable index filter during a macro event::
-
-        {
-          "gate_name": "exclude_indices",
-          "tier": 1,
-          "value": 0.0,
-          "reason": "allow SPY/QQQ flow for FOMC",
-          "confirm_market_hours": true
-        }
-
-    ``confirm_market_hours`` controls the 428 precondition guard:
-
-      false (default) — if the market is currently open, returns
-        428 Precondition Required with a structured detail payload.
-        The UI should render a confirmation dialog, then re-send the
-        request with confirm_market_hours=true.
-
-      true — caller explicitly acknowledges the live-market risk.
-        The guard is bypassed and the update proceeds immediately.
-
-    All other validation errors (unknown gate, bad tier, out-of-bounds
-    value, tier!=1 for exclude_indices) return 422 Unprocessable Entity
-    regardless of market hours.
-
-    Response shape includes ``min_value`` and ``max_value`` so the UI
-    can update its slider range in a single round-trip without a
-    subsequent GET /gate-config.
-    """
     from services.gate_config_store import store as gate_store, _is_market_open
 
-    # --- 428 Precondition Required: market-hours guard ---------------------
     if not body.confirm_market_hours and _is_market_open():
         raise HTTPException(
             status_code=428,
@@ -772,12 +615,8 @@ async def patch_gate_config(
 
     log.info(
         "[admin] gate-config updated by %s: %s[T%d] %s -> %s (epoch=%d)",
-        admin.email,
-        body.gate_name,
-        body.tier,
-        result["old_value"],
-        result["new_value"],
-        gate_store.epoch,
+        admin.email, body.gate_name, body.tier,
+        result["old_value"], result["new_value"], gate_store.epoch,
     )
 
     await log_action(
@@ -806,8 +645,6 @@ async def patch_gate_config(
     }
 
 
-# --- GET /api/admin/gate-config/history ------------------------------------
-
 @router.get("/gate-config/history")
 async def get_gate_config_history(
     limit:     int        = Query(50,  ge=1, le=200,
@@ -820,43 +657,12 @@ async def get_gate_config_history(
                                   description="Filter by tier (1, 2, or 3)"),
     admin:     TokenData  = Depends(_require_admin),
 ):
-    """
-    Return a paginated, newest-first audit log of gate config changes.
-
-    Filters (all optional, combinable):
-      gate_name — exact match on gate_name column
-      tier      — exact match on tier column (1, 2, or 3)
-
-    Response shape::
-
-        {
-          "limit": 50, "offset": 0, "total": 12, "count": 12,
-          "items": [
-            {
-              "id": "uuid",
-              "gate_name": "min_premium",
-              "tier": 1,
-              "old_value": 25000.0,
-              "new_value": 30000.0,
-              "changed_by": "admin@cipher.io",
-              "reason": "earnings week",
-              "changed_at": "2026-05-07T17:00:00+00:00"
-            },
-            ...
-          ]
-        }
-    """
     if not settings.SUPABASE_SERVICE_KEY:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured.")
 
     loop = asyncio.get_event_loop()
     rows, total = await loop.run_in_executor(
-        None,
-        _fetch_audit_rows,
-        limit,
-        offset,
-        gate_name,
-        tier,
+        None, _fetch_audit_rows, limit, offset, gate_name, tier,
     )
 
     log.info(
