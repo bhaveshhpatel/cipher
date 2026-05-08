@@ -18,11 +18,11 @@
 -- =============================================================================
 
 INSERT INTO gate_configs
-    (gate_name, tier, value, min_value, max_value, updated_by, updated_at, previous_value)
+    (gate_name, tier, value, min_value, max_value, updated_by, updated_at)
 VALUES
-    ('exclude_indices', 1, 1.0, 0.0, 1.0, 'migration', NOW(), NULL),
-    ('exclude_indices', 2, 1.0, 0.0, 1.0, 'migration', NOW(), NULL),
-    ('exclude_indices', 3, 1.0, 0.0, 1.0, 'migration', NOW(), NULL)
+    ('exclude_indices', 1, 1.0, 0.0, 1.0, 'migration', NOW()),
+    ('exclude_indices', 2, 1.0, 0.0, 1.0, 'migration', NOW()),
+    ('exclude_indices', 3, 1.0, 0.0, 1.0, 'migration', NOW())
 ON CONFLICT (gate_name, tier) DO UPDATE
     SET value      = EXCLUDED.value,
         min_value  = EXCLUDED.min_value,
