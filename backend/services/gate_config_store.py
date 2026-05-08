@@ -52,24 +52,25 @@ _VALID_TIERS: frozenset[int] = frozenset({1, 2, 3})
 _SAFE_DEFAULT_TIER: int = 3
 
 # ---------------------------------------------------------------------------
-# Static bounds — gate_name → (min, max, cast)
-# cast is the Python type used to coerce values (float, int, bool).
+# Static bounds — gate_name → (min, max)
+# Tests unpack as a 2-tuple: lo, hi = _BOUNDS["gate_name"]
 # ---------------------------------------------------------------------------
-_BOUNDS: dict[str, tuple[float, float, type]] = {
-    "min_premium":          (1_000.0,  500_000.0, float),
-    "dte_floor_multiplier": (0.1,      5.0,       float),
-    "dedup_window_ms":      (500.0,    60_000.0,  float),
-    "require_oi":           (0.0,      1.0,       float),
-    "signal_debounce_ms":   (1_000.0,  600_000.0, float),
-    "signal_min_premium":   (1_000.0,  500_000.0, float),
-    "exclude_indices":      (0.0,      1.0,       float),
+_BOUNDS: dict[str, tuple[float, float]] = {
+    "min_premium":          (1_000.0,  500_000.0),
+    "dte_floor_multiplier": (0.1,      5.0),
+    "dedup_window_ms":      (500.0,    60_000.0),
+    "require_oi":           (0.0,      1.0),
+    "signal_debounce_ms":   (1_000.0,  600_000.0),
+    "signal_min_premium":   (1_000.0,  500_000.0),
+    "exclude_indices":      (0.0,      1.0),
 }
 
 # ---------------------------------------------------------------------------
-# Hard-coded defaults — gate_name -> tier -> value
+# Hard-coded defaults (nested, internal use only)
+# gate_name -> tier -> value
 # Used when the DB is unreachable or a row is missing.
 # ---------------------------------------------------------------------------
-_DEFAULTS: dict[str, dict[int, float]] = {
+_DEFAULTS_NESTED: dict[str, dict[int, float]] = {
     "min_premium": {
         1: 25_000.0,
         2: 15_000.0,
@@ -107,12 +108,17 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     },
 }
 
-# Public alias — tests import _FALLBACK to assert default values directly.
-_FALLBACK: dict[tuple[str, int], float] = {
+# Public flat dict — shape: {(gate_name, tier): value}
+# Tests import _DEFAULTS and iterate as:
+#   for (gate, tier), expected in _DEFAULTS.items(): ...
+_DEFAULTS: dict[tuple[str, int], float] = {
     (gate, tier): value
-    for gate, tiers in _DEFAULTS.items()
+    for gate, tiers in _DEFAULTS_NESTED.items()
     for tier, value in tiers.items()
 }
+
+# _FALLBACK kept as a backward-compat alias.
+_FALLBACK: dict[tuple[str, int], float] = _DEFAULTS
 
 
 def _is_market_open() -> bool:
@@ -155,7 +161,7 @@ class GateConfigStore:
 
     def __init__(self) -> None:
         self._cache: dict[str, dict[int, float]] = {
-            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
+            gate: dict(tiers) for gate, tiers in _DEFAULTS_NESTED.items()
         }
         self._bounds_cache: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
@@ -200,15 +206,19 @@ class GateConfigStore:
 
         Always returns float — 0.0 for unknown gates or missing tiers.
         Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
-        Unknown tiers fall back to the T3 (_SAFE_DEFAULT_TIER) value.
+        Unknown tiers (not in _VALID_TIERS) always fall back to T3
+        (_SAFE_DEFAULT_TIER) — even if an out-of-range tier was stored
+        in the cache by load().
         """
         gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
             return 0.0
+        # Clamp unknown tiers to the safe default BEFORE the cache lookup
+        # so that DB rows with tier=99 are never returned directly.
+        if tier not in _VALID_TIERS:
+            tier = _SAFE_DEFAULT_TIER
         tier_map = self._cache.get(gate_name, {})
         val = tier_map.get(tier)
-        if val is None:
-            val = tier_map.get(_SAFE_DEFAULT_TIER)
         if val is None:
             return 0.0
         return float(val)
@@ -223,7 +233,7 @@ class GateConfigStore:
 
         Uses httpx directly (so tests can mock services.gate_config_store.httpx).
         Falls back silently (returns early) when no credentials are available,
-        leaving the cache seeded with hard-coded ``_DEFAULTS``.
+        leaving the cache seeded with hard-coded ``_DEFAULTS_NESTED``.
 
         Epoch is incremented on any successful HTTP 2xx response, even with
         0 rows.  Non-2xx responses raise ``httpx.HTTPStatusError`` and the
@@ -251,7 +261,7 @@ class GateConfigStore:
             rows: list[dict] = resp.json()
 
         new_cache: dict[str, dict[int, float]] = {
-            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
+            gate: dict(tiers) for gate, tiers in _DEFAULTS_NESTED.items()
         }
         new_bounds: dict[str, tuple[float, float]] = {}
         for row in rows:
