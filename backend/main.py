@@ -16,6 +16,7 @@ Startup sequence:
      e. start_flow_writer()          — DB flush loop
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
+     h. start_chain_refresh_worker() — ING-008: 5-min chain cache refresh loop
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -45,6 +46,11 @@ Key architectural fixes:
                         accumulator receives the same tier map. Without this, Gate 2
                         in _get_episode_min_premium() resolves every ticker to tier 1
                         (strict cold-start default) for the entire session.
+  ING-008 (main)      — start_chain_refresh_worker() launched as a background task
+                        after yield. Refreshes options chain vol/OI for all
+                        stream_eligible symbols every 5 minutes via Tradier chain API.
+                        Zero live API calls on the flow hot path — persist_flow_event
+                        and persist_flow_episode read from the in-process cache only.
 """
 import asyncio
 import json
@@ -67,6 +73,7 @@ from routers import admin
 from routers import health
 from core.auth import get_current_user
 from services.flow_store import start_flow_writer, start_lookback_worker
+from services.chain_store import start_chain_refresh_worker  # ING-008
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
 from services.signal_store import start_signal_writer
@@ -549,6 +556,13 @@ async def lifespan(app: FastAPI):
     lookback_task         = asyncio.create_task(
         start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
     )
+    # ING-008: background 5-min chain cache refresh loop.
+    # Populates the in-process vol/OI cache read by persist_flow_event and
+    # persist_flow_episode. Runs only for stream_eligible symbols. Zero live
+    # API calls on the flow hot path.
+    chain_refresh_task    = asyncio.create_task(
+        start_chain_refresh_worker(stream_symbols)
+    )
 
     yield
 
@@ -567,6 +581,7 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
+    chain_refresh_task.cancel()  # ING-008
     for task in (
         build_task,
         db_write_task,
@@ -575,6 +590,7 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         lookback_task,
+        chain_refresh_task,  # ING-008
     ):
         try:
             await task
