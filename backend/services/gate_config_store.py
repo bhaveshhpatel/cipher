@@ -46,10 +46,13 @@ _VALID_GATES: frozenset[str] = frozenset({
 # Valid tier integers. Exported so tests can iterate without hardcoding.
 _VALID_TIERS: frozenset[int] = frozenset({1, 2, 3})
 
+# The tier used as the safe fallback when an unknown tier is requested.
+_SAFE_DEFAULT_TIER: int = 3
+
 # ---------------------------------------------------------------------------
 # Static bounds — used for update() validation when the DB has not yet
 # surfaced min_value/max_value columns (pre-load or no-DB mode).
-# Keyed by canonical gate name → (min, max).
+# Keyed by canonical gate name → (min, max, cast).
 # After load(), _bounds_cache on the instance may override these per-row.
 # ---------------------------------------------------------------------------
 _BOUNDS: dict[str, tuple[float, float]] = {
@@ -97,6 +100,11 @@ _DEFAULTS: dict[tuple[str, int], float] = {
     ("exclude_indices",      2): 1.0,
     ("exclude_indices",      3): 1.0,
 }
+
+# Public alias — tests import _FALLBACK to assert default values directly.
+# Identical to _DEFAULTS; the name difference is intentional for readability
+# in parametrized test assertions.
+_FALLBACK: dict[tuple[str, int], float] = _DEFAULTS
 
 
 def _is_market_open() -> bool:
@@ -146,7 +154,7 @@ class GateConfigStore:
 
         Always returns float — 0.0 for unknown gates or missing tiers.
         Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
-        Unknown tiers fall back to the T3 value for the gate.
+        Unknown tiers fall back to the T3 (_SAFE_DEFAULT_TIER) value.
         """
         gate_name = _ALIAS_MAP.get(gate_name, gate_name)
         if gate_name not in _VALID_GATES:
@@ -154,8 +162,8 @@ class GateConfigStore:
         key = (gate_name, tier)
         val = self._cache.get(key)
         if val is None:
-            # Unknown tier — fall back to T3
-            val = self._cache.get((gate_name, 3))
+            # Unknown tier — fall back to _SAFE_DEFAULT_TIER (T3)
+            val = self._cache.get((gate_name, _SAFE_DEFAULT_TIER))
         if val is None:
             return 0.0
         return float(val)
