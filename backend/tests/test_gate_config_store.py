@@ -16,6 +16,12 @@ Interface under test
 
 NOT tested here (no such methods on GateConfigStore):
   get_all(), _cast(), _loaded flag
+
+Data structure contracts
+------------------------
+  _DEFAULTS  — nested {gate: {tier: value}}  (string keys; .items() → sub-dicts)
+  _FALLBACK  — flat {(gate, tier): value}    (tuple keys; used for iteration here)
+  _BOUNDS    — {gate: (lo, hi, cast)}        (3-tuple)
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from services.gate_config_store import (
     GateConfigStore,
     _BOUNDS,
     _DEFAULTS,
+    _FALLBACK,
     _VALID_GATES,
     _VALID_TIERS,
     store,
@@ -105,9 +112,9 @@ def mock_http_patch_audit(patch_status: int = 204, audit_status: int = 201):
 
 class TestColdStartFallback:
     def test_new_store_seeds_all_defaults(self):
-        """Every gate+tier in _DEFAULTS must be reachable via get()."""
+        """Every gate+tier in _FALLBACK must be reachable via get()."""
         s = GateConfigStore()
-        for (gate, tier), expected in _DEFAULTS.items():
+        for (gate, tier), expected in _FALLBACK.items():
             assert s.get(gate, tier) == expected, (
                 f"get({gate!r}, {tier}) expected {expected}, got {s.get(gate, tier)}"
             )
@@ -122,14 +129,13 @@ class TestColdStartFallback:
         s = make_no_db_store()
         epoch_before = s.epoch
         await s.load()
-        # epoch unchanged — no-db load() returns early without incrementing
         assert s.epoch == epoch_before
 
     @pytest.mark.asyncio
     async def test_load_no_db_preserves_defaults(self):
         s = make_no_db_store()
         await s.load()
-        for (gate, tier), expected in _DEFAULTS.items():
+        for (gate, tier), expected in _FALLBACK.items():
             assert s.get(gate, tier) == expected
 
 
@@ -157,9 +163,6 @@ class TestLoad:
 
     @pytest.mark.asyncio
     async def test_load_non200_preserves_defaults(self):
-        """
-        load() propagates HTTPStatusError on non-200. Cache untouched.
-        """
         s = make_store()
         with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get([], status=500)):
             with pytest.raises(httpx.HTTPStatusError):
@@ -168,7 +171,6 @@ class TestLoad:
 
     @pytest.mark.asyncio
     async def test_load_network_exception_propagates(self):
-        """Any network error propagates out of load()."""
         s = make_store()
         client = AsyncMock()
         client.__aenter__ = AsyncMock(return_value=client)
@@ -181,9 +183,6 @@ class TestLoad:
 
     @pytest.mark.asyncio
     async def test_load_tier99_row_stored_but_get_falls_back_to_t3(self):
-        """
-        load() stores tier-99 as-is; get(gate, 99) falls back to T3 value.
-        """
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 99, "value": 999.0}]
         with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
@@ -246,7 +245,6 @@ class TestGet:
         assert s.get("nonexistent_gate", 1) == 0.0
 
     def test_require_oi_all_tiers_default_zero(self):
-        """require_oi defaults to 0.0 (float), not True/False."""
         s = GateConfigStore()
         for tier in _VALID_TIERS:
             assert s.get("require_oi", tier) == 0.0
@@ -262,10 +260,6 @@ class TestGet:
         assert s.get("signal_debounce_ms", 2) < s.get("signal_debounce_ms", 3)
 
     def test_debounce_ms_alias_matches_signal_debounce_ms(self):
-        """
-        'debounce_ms' is an alias for 'signal_debounce_ms' via _ALIAS_MAP.
-        Both must resolve to the same values for all tiers.
-        """
         s = GateConfigStore()
         for tier in _VALID_TIERS:
             assert s.get("debounce_ms", tier) == s.get("signal_debounce_ms", tier)
@@ -286,7 +280,6 @@ class TestExcludeIndicesGate:
         assert "exclude_indices" in _VALID_GATES
 
     def test_exclude_indices_defaults_to_1_for_all_tiers(self):
-        """Default is 1.0 (enabled) for every tier."""
         s = GateConfigStore()
         for tier in _VALID_TIERS:
             assert s.get("exclude_indices", tier) == 1.0, (
@@ -300,13 +293,12 @@ class TestExcludeIndicesGate:
     def test_exclude_indices_bounds_in_bounds_constant(self):
         """_BOUNDS must include exclude_indices with a valid (lo, hi) tuple."""
         assert "exclude_indices" in _BOUNDS
-        lo, hi = _BOUNDS["exclude_indices"]
+        lo, hi, _ = _BOUNDS["exclude_indices"]  # 3-tuple: (lo, hi, cast)
         assert lo == 0.0
         assert hi == 1.0
 
     @pytest.mark.asyncio
     async def test_exclude_indices_update_in_memory(self):
-        """update() can set exclude_indices to 0.0 (disabled) off-hours."""
         s = make_no_db_store()
         with patch(_MARKET_OPEN_TARGET, return_value=False):
             result = await s.update("exclude_indices", 1, 0.0)
@@ -315,7 +307,6 @@ class TestExcludeIndicesGate:
 
     @pytest.mark.asyncio
     async def test_exclude_indices_above_1_raises(self):
-        """exclude_indices > 1.0 is outside bounds and must raise."""
         s = make_store()
         with patch(_MARKET_OPEN_TARGET, return_value=False):
             with pytest.raises(ValueError, match="outside allowed bounds"):
@@ -323,8 +314,7 @@ class TestExcludeIndicesGate:
 
 
 # ---------------------------------------------------------------------------
-# TGC-3: Bounds validation — invalid values rejected with ValueError.
-# Market guard is patched to False so tests are time-of-day independent.
+# TGC-3: Bounds validation
 # ---------------------------------------------------------------------------
 
 class TestBoundsValidation:
@@ -392,14 +382,11 @@ class TestBoundsValidation:
 
 # ---------------------------------------------------------------------------
 # TGC-4: Market-hours guard
-# Patch _is_market_open directly — avoids mutating the shared datetime module
-# object and is immune to import style and pytest collection order.
 # ---------------------------------------------------------------------------
 
 class TestMarketHoursGuard:
     @pytest.mark.asyncio
     async def test_market_hours_no_confirm_raises(self):
-        """Market open + confirm_market_hours=False → ValueError."""
         s = make_store()
         with patch(_MARKET_OPEN_TARGET, return_value=True):
             with pytest.raises(ValueError, match="Market is currently open"):
@@ -407,7 +394,6 @@ class TestMarketHoursGuard:
 
     @pytest.mark.asyncio
     async def test_market_hours_with_confirm_proceeds(self):
-        """Market open + confirm_market_hours=True → update proceeds."""
         s = make_store()
         client_mock = mock_http_patch_audit()
         with patch(_MARKET_OPEN_TARGET, return_value=True):
@@ -417,7 +403,6 @@ class TestMarketHoursGuard:
 
     @pytest.mark.asyncio
     async def test_outside_market_hours_no_confirm_proceeds(self):
-        """Off-hours + confirm_market_hours=False → update proceeds without error."""
         s = make_store()
         client_mock = mock_http_patch_audit()
         with patch(_MARKET_OPEN_TARGET, return_value=False):
@@ -473,7 +458,6 @@ class TestUpdate:
 
     @pytest.mark.asyncio
     async def test_update_db_patch_failure_does_not_mutate_cache(self):
-        """If DB PATCH fails, the in-memory cache must NOT be updated."""
         s = make_store()
         original_value = s.get("min_premium", 1)
         client_mock = mock_http_patch_audit(patch_status=500)
@@ -502,7 +486,6 @@ class TestUpdate:
 
     @pytest.mark.asyncio
     async def test_update_audit_failure_is_non_fatal(self):
-        """Audit POST failure must not raise — update() result still returned."""
         s = make_store()
         client_mock = mock_http_patch_audit(patch_status=204, audit_status=500)
         with patch(_MARKET_OPEN_TARGET, return_value=False):
@@ -556,7 +539,7 @@ class TestModuleSingleton:
         assert isinstance(store, GateConfigStore)
 
     def test_singleton_seeds_all_defaults(self):
-        for (gate, tier), expected in _DEFAULTS.items():
+        for (gate, tier), expected in _FALLBACK.items():
             assert store.get(gate, tier) == expected
 
     def test_singleton_has_valid_gates(self):

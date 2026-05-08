@@ -16,14 +16,12 @@ Return contract:
 """
 from __future__ import annotations
 
-# Import the stdlib datetime MODULE and expose it under the name `datetime`
-# so that tests can patch it as:  patch("services.gate_config_store.datetime")
-import datetime  # noqa: PLC0414  (we need the module, not the class)
+import datetime
 import logging
 import threading
 from typing import Any
 
-import httpx  # top-level so tests can mock services.gate_config_store.httpx
+import httpx
 
 log = logging.getLogger("gate_config_store")
 
@@ -54,18 +52,9 @@ _SAFE_DEFAULT_TIER: int = 3
 # ---------------------------------------------------------------------------
 # Static bounds — gate_name → (min, max, cast)
 #
-# Three test files impose different unpack contracts on _BOUNDS:
-#   test_gate_config_store.py  →  lo, hi = _BOUNDS[gate]           (2-tuple)
-#   test_gates_tiered.py       →  lo, hi, cast = _BOUNDS[gate]     (3-tuple)
-#
-# We satisfy both by storing the 3-tuple and keeping update() using
-# raw[0] / raw[1] indexing so the extra element is never accessed there.
-# test_gate_config_store.py uses the 2-tuple form only in the
-# test_exclude_indices_bounds_in_bounds_constant test which unpacks as
-#   lo, hi = _BOUNDS["exclude_indices"]
-# — that test file must be updated to unpack 3 values, or we accept
-# that the 3-tuple is the canonical form and the 2-tuple test was wrong.
-# All other usages across both files are satisfied by the 3-tuple.
+# 3-tuple: test_gates_tiered.py unpacks as  lo, hi, cast = _BOUNDS[gate]
+# update() uses raw[0]/raw[1] indexing so the cast element is harmless there.
+# test_gate_config_store.py unpacks as      lo, hi, _ = _BOUNDS[gate]
 # ---------------------------------------------------------------------------
 _BOUNDS: dict[str, tuple[float, float, type]] = {
     "min_premium":          (1_000.0,  500_000.0, float),
@@ -78,11 +67,20 @@ _BOUNDS: dict[str, tuple[float, float, type]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Hard-coded defaults (nested, internal use only)
-# gate_name -> tier -> value
-# Used when the DB is unreachable or a row is missing.
+# Hard-coded defaults
+#
+# _DEFAULTS  — nested {gate: {tier: value}}
+#              Consumed by:
+#                test_gate_hotreload.py B1:  for gate, tiers in _DEFAULTS.items()
+#                test_ing011_*.py:           gate in _DEFAULTS; _DEFAULTS[gate][tier]
+#              Also used internally to seed GateConfigStore._cache.
+#
+# _FALLBACK  — flat {(gate, tier): value}
+#              Consumed by:
+#                test_gates_tiered.py:      (gate, tier) in _FALLBACK
+#                test_gate_config_store.py: for (gate, tier), val in _FALLBACK.items()
 # ---------------------------------------------------------------------------
-_DEFAULTS_NESTED: dict[str, dict[int, float]] = {
+_DEFAULTS: dict[str, dict[int, float]] = {
     "min_premium": {
         1: 25_000.0,
         2: 15_000.0,
@@ -120,60 +118,12 @@ _DEFAULTS_NESTED: dict[str, dict[int, float]] = {
     },
 }
 
-
-class _GateDefaults(dict):
-    """
-    Dual-key dict that satisfies two incompatible test contracts simultaneously.
-
-    Internally stores flat  {(gate, tier): value}  entries so that:
-
-      test_gate_config_store.py:
-        for (gate, tier), val in _DEFAULTS.items(): ...
-
-      test_gates_tiered.py (via _FALLBACK alias):
-        (gate, tier) in _FALLBACK
-        _FALLBACK[(gate, tier)]
-
-    Additionally overrides __getitem__ / __contains__ so that:
-
-      test_ing011_exclude_indices_gate.py:
-        gate in _DEFAULTS                  ->  True  for bare string keys
-        _DEFAULTS[gate][tier]              ->  float value
-        for gate, tiers in _DEFAULTS.items():
-            for tier, value in tiers.items(): ...
-
-    When the key is a plain string the returned object is a read-only
-    view dict  {tier: value}  which supports  [tier]  indexing and
-    .items()  iteration.
-    """
-
-    def __contains__(self, key: object) -> bool:  # type: ignore[override]
-        if isinstance(key, str):
-            return any(g == key for (g, _) in self.keys())
-        return super().__contains__(key)
-
-    def __getitem__(self, key: object) -> Any:
-        if isinstance(key, str):
-            sub = {tier: val for (g, tier), val in self.items() if g == key}
-            if not sub:
-                raise KeyError(key)
-            return sub
-        return super().__getitem__(key)
-
-
-def _build_defaults() -> _GateDefaults:
-    d: _GateDefaults = _GateDefaults()
-    for gate, tiers in _DEFAULTS_NESTED.items():
-        for tier, value in tiers.items():
-            d[(gate, tier)] = value
-    return d
-
-
-# Public: satisfies both flat-tuple iteration AND nested string-key access.
-_DEFAULTS: _GateDefaults = _build_defaults()
-
-# _FALLBACK kept as alias — test_gates_tiered.py imports this name.
-_FALLBACK: _GateDefaults = _DEFAULTS
+# Flat alias — exported for test_gates_tiered.py and test_gate_config_store.py.
+_FALLBACK: dict[tuple[str, int], float] = {
+    (gate, tier): value
+    for gate, tiers in _DEFAULTS.items()
+    for tier, value in tiers.items()
+}
 
 
 def _is_market_open() -> bool:
@@ -181,7 +131,7 @@ def _is_market_open() -> bool:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
     now = datetime.datetime.now(ET)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     open_t  = datetime.time(9, 30)
     close_t = datetime.time(16, 0)
@@ -199,45 +149,20 @@ class GateConfigStore:
        lock-free (reading a dict is GIL-safe for CPython).
     3. Writes go through ``await store.update(...)`` which commits to
        the DB first, then patches the in-memory cache under a lock.
-
-    Thread safety
-    -------------
-    * The internal ``_cache`` dict is replaced atomically on ``load()``.
-    * Individual key writes on ``update()`` are protected by ``_lock``.
-    * Plain reads of ``_cache[key]`` are GIL-safe and need no lock.
-
-    Credential resolution (load and update)
-    ----------------------------------------
-    Both ``load()`` and ``update()`` resolve Supabase credentials by
-    checking instance attributes ``_supabase_url`` / ``_supabase_key``
-    first, then falling back to ``config.settings``.  This allows tests
-    to inject fake credentials without environment variables.
     """
 
     def __init__(self) -> None:
+        # Seed cache from _DEFAULTS (nested form).
         self._cache: dict[str, dict[int, float]] = {
-            gate: dict(tiers) for gate, tiers in _DEFAULTS_NESTED.items()
+            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
         self._bounds_cache: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
         self._supabase_url: str = ""
         self._supabase_key: str = ""
-        self.epoch: int = 0          # monotonic counter — incremented on every update
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        self.epoch: int = 0
 
     def _resolve_credentials(self) -> tuple[str, str]:
-        """
-        Return (url, key) for Supabase access.
-
-        Priority:
-        1. Instance attributes ``_supabase_url`` / ``_supabase_key``
-           (set directly in tests via make_store() / make_no_db_store()).
-        2. ``config.settings.SUPABASE_URL`` / ``SUPABASE_SERVICE_KEY``
-           (production path).
-        """
         url = self._supabase_url or ""
         key = self._supabase_key or ""
         if not url or not key:
@@ -246,57 +171,28 @@ class GateConfigStore:
             key = getattr(settings, "SUPABASE_SERVICE_KEY", "") or ""
         return url, key
 
-    # ------------------------------------------------------------------
-    # Public read API
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _resolve_alias(gate_name: str) -> str:
-        """Resolve a gate name alias to its canonical form."""
         return _ALIAS_MAP.get(gate_name, gate_name)
 
     def get(self, gate_name: str, tier: int) -> float:
         """
         Return the current value for ``gate_name`` × ``tier``.
-
         Always returns float — 0.0 for unknown gates or missing tiers.
-        Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
-        Unknown tiers (not in _VALID_TIERS) always fall back to T3
-        (_SAFE_DEFAULT_TIER) — even if an out-of-range tier was stored
-        in the cache by load().
         """
         gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
             return 0.0
-        # Clamp unknown tiers to the safe default BEFORE the cache lookup
-        # so that DB rows with tier=99 are never returned directly.
         if tier not in _VALID_TIERS:
             tier = _SAFE_DEFAULT_TIER
-        tier_map = self._cache.get(gate_name, {})
-        val = tier_map.get(tier)
-        if val is None:
-            return 0.0
-        return float(val)
-
-    # ------------------------------------------------------------------
-    # Startup load
-    # ------------------------------------------------------------------
+        val = self._cache.get(gate_name, {}).get(tier)
+        return float(val) if val is not None else 0.0
 
     async def load(self) -> None:
         """
         Bulk-load all rows from gate_configs into the in-memory cache.
-
-        Uses httpx directly (so tests can mock services.gate_config_store.httpx).
-        Falls back silently (returns early) when no credentials are available,
-        leaving the cache seeded with hard-coded ``_DEFAULTS_NESTED``.
-
-        Epoch is incremented on any successful HTTP 2xx response, even with
-        0 rows.  Non-2xx responses raise ``httpx.HTTPStatusError`` and the
-        cache is not mutated.
-
-        Credentials are resolved via ``_resolve_credentials()`` — instance
-        attributes take priority over ``config.settings`` so tests can inject
-        fake URLs without environment variables.
+        Falls back silently when no credentials are available.
+        Epoch is incremented on any successful HTTP 2xx response.
         """
         url, key = self._resolve_credentials()
         if not url or not key:
@@ -308,15 +204,12 @@ class GateConfigStore:
             "Authorization": f"Bearer {key}",
         }
         async with httpx.AsyncClient(base_url=url, headers=headers) as client:
-            resp = await client.get(
-                "/rest/v1/gate_configs",
-                params={"select": "*"},
-            )
-            resp.raise_for_status()   # propagates HTTPStatusError on non-2xx
+            resp = await client.get("/rest/v1/gate_configs", params={"select": "*"})
+            resp.raise_for_status()
             rows: list[dict] = resp.json()
 
         new_cache: dict[str, dict[int, float]] = {
-            gate: dict(tiers) for gate, tiers in _DEFAULTS_NESTED.items()
+            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
         new_bounds: dict[str, tuple[float, float]] = {}
         for row in rows:
@@ -329,19 +222,12 @@ class GateConfigStore:
                 new_cache.setdefault(name, {})[int(t)] = float(val)
                 new_bounds[name] = (float(lo), float(hi))
 
-        # Always increment epoch on HTTP 2xx — even with zero rows.
         with self._lock:
             self._cache = new_cache
             self._bounds_cache = new_bounds
             self.epoch += 1
 
-        log.info(
-            "[gate_config] Loaded %d rows from DB (epoch=%d)", len(rows), self.epoch
-        )
-
-    # ------------------------------------------------------------------
-    # Write API (admin PATCH)
-    # ------------------------------------------------------------------
+        log.info("[gate_config] Loaded %d rows from DB (epoch=%d)", len(rows), self.epoch)
 
     async def update(
         self,
@@ -354,15 +240,6 @@ class GateConfigStore:
     ) -> dict[str, Any]:
         """
         Commit a gate value change to the DB and hot-patch the cache.
-
-        Returns
-        -------
-        dict with keys: gate_name, tier, old_value, new_value
-
-        Raises
-        ------
-        ValueError  — unknown gate_name, bad tier, or value out of bounds
-        RuntimeError — DB write failed
         """
         gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
@@ -373,12 +250,10 @@ class GateConfigStore:
         bounds = self._bounds_cache.get(gate_name)
         if bounds is None:
             raw = _BOUNDS.get(gate_name)
-            if raw is not None:
-                lo, hi = raw[0], raw[1]   # raw[2] is cast — not used here
-            else:
-                lo, hi = float("-inf"), float("inf")
+            lo, hi = (raw[0], raw[1]) if raw is not None else (float("-inf"), float("inf"))
         else:
             lo, hi = bounds[0], bounds[1]
+
         if not (lo <= float(value) <= hi):
             raise ValueError(
                 f"{gate_name!r} value {value} is outside allowed bounds [{lo}, {hi}]"
@@ -393,7 +268,6 @@ class GateConfigStore:
 
         url, key = self._resolve_credentials()
         if not url or not key:
-            # No-DB mode — update in-memory only.
             with self._lock:
                 self._cache.setdefault(gate_name, {})[tier] = float(value)
                 self.epoch += 1
@@ -409,7 +283,6 @@ class GateConfigStore:
                 "_note": "no-db mode — in-memory only",
             }
 
-        # DB-backed mode.
         headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
@@ -423,11 +296,8 @@ class GateConfigStore:
                 json={"value": float(value), "updated_by": updated_by},
             )
             if patch_resp.status_code not in (200, 204):
-                raise RuntimeError(
-                    f"DB PATCH failed: HTTP {patch_resp.status_code}"
-                )
+                raise RuntimeError(f"DB PATCH failed: HTTP {patch_resp.status_code}")
 
-            # Audit row — best-effort; failure is non-fatal.
             try:
                 await client.post(
                     "/rest/v1/gate_config_audit",
@@ -461,25 +331,12 @@ class GateConfigStore:
             "new_value": float(value),
         }
 
-    # ------------------------------------------------------------------
-    # Epoch parity guard
-    # ------------------------------------------------------------------
-
     @staticmethod
     def assert_store_epoch_parity(
         gate_epoch: int,
         chain_epoch: int,
         universe_epoch: int,
     ) -> None:
-        """
-        Assert that dependent stores (chain, universe) have not advanced
-        ahead of the gate store epoch.
-
-        Raises
-        ------
-        AssertionError — if chain_epoch > gate_epoch or universe_epoch > gate_epoch
-                         (and the offending epoch is non-zero).
-        """
         if chain_epoch != 0 and chain_epoch > gate_epoch:
             raise AssertionError(
                 f"chain_store epoch {chain_epoch} is ahead of gate_store epoch "
