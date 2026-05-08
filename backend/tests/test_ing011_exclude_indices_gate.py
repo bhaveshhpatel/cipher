@@ -18,6 +18,12 @@ Four targeted tests for ING-011 (Gate 6 — exclude_indices).
 4. Stream reads get("exclude_indices", 1) regardless of symbol tier
    _process_trade() must always pass tier=1 for exclude_indices even when
    the traded symbol is in tier 2 or tier 3.
+
+Note on patch target for Test 4:
+   tradier_stream.py does:
+       from services.gate_config_store import store as gate_config_store
+   Therefore the module-level attribute name is `gate_config_store`, NOT `store`.
+   All patch.object() calls use patch.object(ts, "gate_config_store", spy).
 """
 from __future__ import annotations
 
@@ -149,7 +155,7 @@ class TestLifespanGateConfigLoad:
                 pass
 
         # Simpler, reliable approach: test the store directly.
-        # lifespan() calls `await gate_config_store.load()` which is
+        # lifespan() calls `await gate_config_store.load()` which resolves to
         # `await store.load()` on the module-level singleton.
         # We verify the coroutine is awaitable and produces no error in no-db mode.
         from services.gate_config_store import GateConfigStore
@@ -321,13 +327,16 @@ class TestPatchExcludeIndicesTier2Returns422:
 
 class TestStreamExcludeIndicesAlwaysTier1:
     """
-    _process_trade() must call store.get("exclude_indices", 1) with the
-    hard-coded tier=1, not the symbol's own tier (2 or 3).  This guarantees
-    the gate is truly tier-independent at the hot path level.
+    _process_trade() must call gate_config_store.get("exclude_indices", 1)
+    with the hard-coded tier=1, not the symbol's own tier (2 or 3).
+
+    IMPORTANT — patch target:
+      tradier_stream.py: `from services.gate_config_store import store as gate_config_store`
+      The module-level attribute is `gate_config_store` (the alias), NOT `store`.
+      All patch.object() calls must use patch.object(ts, "gate_config_store", spy).
 
     Because _process_trade() is large and calls many other services we
-    inject a mock store and then inspect the recorded call list rather than
-    running the full ingestion stack.
+    inject a mock and inspect recorded calls rather than running the full stack.
     """
 
     def _make_store_spy(self, exclude_value: float = 1.0) -> MagicMock:
@@ -349,47 +358,52 @@ class TestStreamExcludeIndicesAlwaysTier1:
         """
         When a tier-2 symbol arrives, the exclude_indices lookup must still
         use tier=1 as the canonical value.
+
+        Implementation note: _process_trade() delegates to _resolve_exclude_indices()
+        which calls gate_config_store.get("exclude_indices", 1). The source-scan
+        below verifies the literal tier=1 is present in that helper's source.
         """
         import inspect
         import services.tradier_stream as ts
 
-        # Confirm _process_trade exists and inspect its source for tier=1 hardwire.
         assert hasattr(ts, "_process_trade"), "_process_trade not found in tradier_stream"
-        src = inspect.getsource(ts._process_trade)
-        # The literal string 'exclude_indices', 1 must appear — this is the
-        # tier-independent lookup that the spec mandates.
+        # _resolve_exclude_indices() is called by _process_trade(); check its source.
+        assert hasattr(ts, "_resolve_exclude_indices"), (
+            "_resolve_exclude_indices() not found — ING-011 gate helper missing"
+        )
+        src = inspect.getsource(ts._resolve_exclude_indices)
         assert re.search(r'["\']exclude_indices["\']\s*,\s*1', src), (
-            "_process_trade() must call store.get('exclude_indices', 1) — "
-            "tier=1 must be hardcoded, not derived from the symbol's tier.\n"
-            f"Source excerpt:\n{src[:800]}"
+            "_resolve_exclude_indices() must call gate_config_store.get('exclude_indices', 1) — "
+            "tier=1 must be hardcoded (tier-independent gate).\n"
+            f"Source:\n{src}"
         )
 
     @pytest.mark.asyncio
     async def test_tier3_symbol_reads_exclude_indices_tier1(self):
         """
         Same assertion for a tier-3 context — the gate read must be tier=1.
-        This is the same source check; written as a separate test so CI
-        reports each tier failure independently.
+        Written as a separate test so CI reports each tier failure independently.
         """
         import inspect
         import services.tradier_stream as ts
 
-        src = inspect.getsource(ts._process_trade)
+        src = inspect.getsource(ts._resolve_exclude_indices)
         match = re.search(r'["\']exclude_indices["\']\s*,\s*1', src)
         assert match, (
-            "_process_trade() must use tier=1 for exclude_indices regardless of "
-            "the symbol's actual tier (tier-independent gate). "
-            f"Pattern not found in source.\nSource:\n{src[:800]}"
+            "_resolve_exclude_indices() must use tier=1 for exclude_indices "
+            "regardless of the symbol's actual tier (tier-independent gate). "
+            f"Pattern not found in source.\nSource:\n{src}"
         )
 
     @pytest.mark.asyncio
     async def test_store_get_called_with_tier1_via_mock(self):
         """
-        Runtime assertion: call _process_trade() with a tier-2 ticker
-        (symbol registered as tier 2 in the mock registry) and confirm
-        that the exclude_indices gate is evaluated with tier=1.
+        Runtime assertion: call _process_trade() with a tier-2 ticker and
+        confirm that any exclude_indices gate evaluation uses tier=1.
 
-        We stub the full dependency surface so no I/O occurs.
+        Patch target: `gate_config_store` (the alias name on the ts module),
+        NOT `store` — tradier_stream imports:
+            `from services.gate_config_store import store as gate_config_store`
         """
         import services.tradier_stream as ts
 
@@ -403,20 +417,14 @@ class TestStreamExcludeIndicesAlwaysTier1:
             "date": "1715000000000",
         }
 
-        # Patch the module-level store used by _process_trade
-        with patch.object(ts, "store", spy):
-            # Also patch every other dependency that _process_trade touches
-            # so we don't need a running registry / parser / writer.
-            with (
-                patch.object(ts, "_registry", None, create=True),
-                patch("services.tradier_stream._registry", None),
-            ):
-                try:
-                    await ts._process_trade(fake_tick)
-                except Exception:
-                    # Any exception is acceptable — we only care about the
-                    # store.get() call pattern, not the full processing result.
-                    pass
+        # Correct patch target: `gate_config_store` (the alias), not `store`.
+        with patch.object(ts, "gate_config_store", spy):
+            try:
+                await ts._process_trade(fake_tick)
+            except Exception:
+                # Any exception is acceptable — we only care about the
+                # gate_config_store.get() call pattern recorded by the spy.
+                pass
 
         ei_calls = self._exclude_indices_calls(spy)
         if ei_calls:
@@ -424,9 +432,9 @@ class TestStreamExcludeIndicesAlwaysTier1:
             for c in ei_calls:
                 tier_arg = c.args[1] if len(c.args) > 1 else c.kwargs.get("tier")
                 assert tier_arg == 1, (
-                    f"store.get('exclude_indices', tier) called with tier={tier_arg!r} — "
-                    "must always be tier=1 (tier-independent gate)."
+                    f"gate_config_store.get('exclude_indices', tier) called with "
+                    f"tier={tier_arg!r} — must always be tier=1 (tier-independent gate)."
                 )
-        # If no exclude_indices call was recorded it means the gate check was
-        # short-circuited before reaching that point (e.g. registry=None dropped
-        # the tick earlier). The source-scan tests above cover that contract.
+        # If no exclude_indices call recorded: tick was short-circuited before
+        # reaching the gate (e.g. event_type not in _PROCESSABLE_TYPES).
+        # The source-scan tests above cover that contract independently.
