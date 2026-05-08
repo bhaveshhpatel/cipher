@@ -774,6 +774,12 @@ async def test_bus_signal_listener_ignores_non_dict_message():
 #      suppresses the bus publish (decoupling confirmed).
 #   2. alert_level, strike, and expiry are populated from sig_ep directly
 #      (fixes both the ALERT-LEVEL bug and the historic strike/expiry=None bug).
+#
+# FIX (AsyncMock patch): asyncio.create_task() requires a coroutine object.
+# Without new_callable=AsyncMock, patch() produces a regular MagicMock whose
+# return value is not awaitable — create_task() raises TypeError silently and
+# fake_persist_episode never runs, leaving persisted_episodes empty.
+# All three persist_flow_episode patches below use new_callable=AsyncMock.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -837,7 +843,8 @@ async def test_process_trade_persists_episode_before_debounce():
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_alert_level", return_value="CONVICTION"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
-         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream.persist_flow_episode",
+               new_callable=AsyncMock, side_effect=fake_persist_episode), \
          patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
         await ts._process_trade(raw)
         await asyncio.sleep(0.05)  # allow create_task coroutine to execute
@@ -898,7 +905,8 @@ async def test_process_trade_episode_direction_call_is_repeat_buy():
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_alert_level", return_value="STRONG_SIGNAL"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
-         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream.persist_flow_episode",
+               new_callable=AsyncMock, side_effect=fake_persist_episode), \
          patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
         await ts._process_trade(raw)
         await asyncio.sleep(0.05)
@@ -945,7 +953,8 @@ async def test_process_trade_episode_direction_put_is_repeat_sell():
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_alert_level", return_value="ALERT"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
-         patch("services.tradier_stream.persist_flow_episode", side_effect=fake_persist_episode), \
+         patch("services.tradier_stream.persist_flow_episode",
+               new_callable=AsyncMock, side_effect=fake_persist_episode), \
          patch("services.tradier_stream._should_emit_signal", return_value=(False, "debounced")):
         await ts._process_trade(raw)
         await asyncio.sleep(0.05)
