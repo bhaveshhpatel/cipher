@@ -9,6 +9,11 @@
  *   - default       → plain number input
  *
  * SaveStatus badge: idle (no badge) | saving (spinner) | saved (✓ green) | error (✗ red)
+ *
+ * saveError: when provided, renders a human-readable error message from the
+ * last failed PATCH so the admin knows *why* the save failed, not just that
+ * it did. The draft is reset to the last confirmed server value on error
+ * so there is no ambiguity about what value is actually in the DB.
  */
 "use client";
 import React, { useState, useEffect } from "react";
@@ -24,9 +29,11 @@ import {
 import type { GateRow, SaveStatus } from "@/types/gates";
 
 export interface GateCellInputProps {
-  row:      GateRow;
-  status:   SaveStatus;
-  onSave:   (newValue: number, reason: string | null) => void;
+  row:        GateRow;
+  status:     SaveStatus;
+  /** Human-readable error message from the last failed PATCH, if any. */
+  saveError?: string;
+  onSave:     (newValue: number, reason: string | null) => void;
 }
 
 /** Convert stored value → display string */
@@ -42,20 +49,29 @@ function fromDisplay(gateName: string, display: string): number {
   return MS_GATES.has(gateName) ? n * 1000 : n;
 }
 
-export function GateCellInput({ row, status, onSave }: GateCellInputProps) {
+export function GateCellInput({ row, status, saveError, onSave }: GateCellInputProps) {
   const isToggle = TOGGLE_GATES.has(row.gate_name);
   const isDollar = DOLLAR_GATES.has(row.gate_name);
   const isMs     = MS_GATES.has(row.gate_name);
 
-  const [draft, setDraft]         = useState<string>(toDisplay(row.gate_name, row.value));
-  const [validErr, setValidErr]   = useState<string>("");
-  const [reason, setReason]       = useState<string>("");
+  const [draft, setDraft]       = useState<string>(toDisplay(row.gate_name, row.value));
+  const [validErr, setValidErr] = useState<string>("");
+  const [reason, setReason]     = useState<string>("");
 
-  // Sync draft when server value updates (e.g. after 30s poll)
+  // Sync draft when server value updates (e.g. after 30s poll or successful save)
   useEffect(() => {
     setDraft(toDisplay(row.gate_name, row.value));
     setValidErr("");
   }, [row.value, row.gate_name]);
+
+  // On error: reset draft to last confirmed server value so the admin
+  // can see clearly what is actually in the DB vs what they tried to save.
+  useEffect(() => {
+    if (status === "error") {
+      setDraft(toDisplay(row.gate_name, row.value));
+      setValidErr("");
+    }
+  }, [status, row.value, row.gate_name]);
 
   const storedDraft = fromDisplay(row.gate_name, draft);
   const dirty = !isNaN(storedDraft) && storedDraft !== row.value;
@@ -91,37 +107,49 @@ export function GateCellInput({ row, status, onSave }: GateCellInputProps) {
     return (
       <div
         data-testid={`cell-${row.gate_name}-${row.tier}`}
-        className="flex items-center gap-2"
+        className="flex flex-col gap-1"
       >
-        <button
-          role="switch"
-          aria-checked={isOn}
-          aria-label={`Toggle ${row.gate_name} tier ${row.tier}`}
-          onClick={() => handleToggle(!isOn)}
-          disabled={status === "saving"}
-          className="w-10 h-5 rounded-full relative transition-colors"
-          style={{
-            background: isOn ? A.green : A.faint,
-            border: `1px solid ${isOn ? A.greenBorder : A.border}`,
-            cursor: status === "saving" ? "not-allowed" : "pointer",
-          }}
-        >
-          <span
-            className="absolute top-0.5 w-4 h-4 rounded-full transition-all"
+        <div className="flex items-center gap-2">
+          <button
+            role="switch"
+            aria-checked={isOn}
+            aria-label={`Toggle ${row.gate_name} tier ${row.tier}`}
+            onClick={() => handleToggle(!isOn)}
+            disabled={status === "saving"}
+            className="w-10 h-5 rounded-full relative transition-colors"
             style={{
-              background: A.text,
-              left: isOn ? "20px" : "2px",
+              background: isOn ? A.green : A.faint,
+              border: `1px solid ${isOn ? A.greenBorder : A.border}`,
+              cursor: status === "saving" ? "not-allowed" : "pointer",
             }}
-          />
-        </button>
-        <SaveStatusBadge status={status} />
+          >
+            <span
+              className="absolute top-0.5 w-4 h-4 rounded-full transition-all"
+              style={{
+                background: A.text,
+                left: isOn ? "20px" : "2px",
+              }}
+            />
+          </button>
+          <SaveStatusBadge status={status} />
+        </div>
+        {/* Save error message for toggle gates */}
+        {status === "error" && saveError && (
+          <p
+            data-testid={`save-err-${row.gate_name}-${row.tier}`}
+            className="text-xs font-mono"
+            style={{ color: A.red }}
+          >
+            {saveError}
+          </p>
+        )}
       </div>
     );
   }
 
   // ── Number / Dollar / Ms gate ────────────────────────────────
   const placeholder = isDollar ? "$0" : isMs ? "0s" : "0";
-  const prefix      = isDollar ? "$" : isMs ? "" : "";
+  const prefix      = isDollar ? "$" : "";
   const suffix      = isMs ? "s" : "";
 
   return (
@@ -165,6 +193,8 @@ export function GateCellInput({ row, status, onSave }: GateCellInputProps) {
         />
         <SaveStatusBadge status={status} />
       </div>
+
+      {/* Client-side validation error */}
       {validErr && (
         <p
           data-testid={`err-${row.gate_name}-${row.tier}`}
@@ -174,6 +204,19 @@ export function GateCellInput({ row, status, onSave }: GateCellInputProps) {
           {validErr}
         </p>
       )}
+
+      {/* Server-side save error — shown when status=error and message available */}
+      {status === "error" && saveError && (
+        <p
+          data-testid={`save-err-${row.gate_name}-${row.tier}`}
+          className="text-xs font-mono"
+          style={{ color: A.red }}
+        >
+          {saveError}
+        </p>
+      )}
+
+      {/* Reason input — only when dirty and no validation error */}
       {dirty && !validErr && (
         <input
           aria-label={`Reason for changing ${row.gate_name} tier ${row.tier}`}

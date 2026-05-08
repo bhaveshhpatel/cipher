@@ -9,9 +9,14 @@
  *
  * Auth guard: requires token + isAdmin; renders an access-denied banner
  * if either is missing so the component is safely embeddable in any layout.
+ *
+ * Error surfacing: when a PATCH fails, the error message from the server
+ * (or the network layer) is passed to the affected GateCellInput as
+ * `saveError` so the admin sees a specific human-readable explanation,
+ * not just a ✗ badge with no context.
  */
 "use client";
-import React from "react";
+import React, { useState } from "react";
 import {
   A,
   AdminCard,
@@ -50,6 +55,9 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
   const { data, loading, error, refresh } = useGateConfig(token);
   const { statusMap, patch }              = useGatePatch();
 
+  // Per-cell save error messages: keyed by `${gate_name}:${tier}`
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
+
   // ── Auth guard ───────────────────────────────────────────────
   if (!token || !isAdmin) {
     return (
@@ -82,7 +90,7 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
     );
   }
 
-  // ── Fetch error ──────────────────────────────────────────────
+  // ── Fetch error (no data yet) ─────────────────────────────────
   if (error && !data) {
     return (
       <AdminCard>
@@ -97,8 +105,17 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
 
   const grouped = groupByGate(data?.gates ?? []);
 
-  // Ordered list of gate names actually present in the response
+  // Ordered list of gate names actually present in the response.
+  // Warn for any gates returned by the API that are not in GATE_ORDER
+  // so new backend gates are never silently dropped from the UI.
   const gateNames = GATE_ORDER.filter(name => grouped.has(name));
+  grouped.forEach((_, name) => {
+    if (!GATE_ORDER.includes(name)) {
+      console.warn(
+        `[GateControlPanel] API returned unknown gate "${name}" — add it to GATE_ORDER in @/types/gates.ts`,
+      );
+    }
+  });
 
   async function handleSave(
     gateName: string,
@@ -106,17 +123,36 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
     newValue: number,
     reason: string | null,
   ) {
+    // Explicit null-guard — token is guaranteed non-null by the auth guard
+    // above, but we narrow the type explicitly rather than using `!`.
+    if (!token) return;
+
+    const key = `${gateName}:${tier}`;
+
+    // Clear any previous save error for this cell
+    setSaveErrors(prev => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
     try {
-      await patch(token!, {
-        gate_name:            gateName,
+      await patch(token, {
+        gate_name: gateName,
         tier,
-        value:                newValue,
+        value:     newValue,
         reason,
-        confirm_market_hours: false,
+        // confirm_market_hours omitted — backend defaults to false.
+        // The flag is intentionally not surfaced in the UI; a future story
+        // can add a market-hours confirmation dialog if needed.
       });
       refresh();
-    } catch {
-      // status already set to 'error' inside useGatePatch
+    } catch (e: unknown) {
+      // Capture the error message and surface it in the affected cell so the
+      // admin sees a specific reason (e.g. "Value out of range", "HTTP 422")
+      // rather than just the ✗ badge with no context.
+      const msg = e instanceof Error ? e.message : "Save failed";
+      setSaveErrors(prev => ({ ...prev, [key]: msg }));
     }
   }
 
@@ -129,15 +165,17 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
           <button
             data-testid="refresh-btn"
             onClick={refresh}
+            disabled={loading}
             className="text-xs font-mono px-3 py-1.5 rounded transition-colors"
             style={{
               background: A.surface2,
               border:     `1px solid ${A.border}`,
-              color:      A.muted,
-              cursor:     "pointer",
+              color:      loading ? A.faint : A.muted,
+              cursor:     loading ? "not-allowed" : "pointer",
+              opacity:    loading ? 0.5 : 1,
             }}
           >
-            ↻ Refresh
+            {loading ? "…" : "↻ Refresh"}
           </button>
         }
       />
@@ -205,15 +243,17 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
                 )}
               </span>
               {TIERS.map(tier => {
-                const row     = tierMap[tier];
-                const cellKey = `${gateName}:${tier}`;
-                const status  = statusMap[cellKey] ?? "idle";
+                const row      = tierMap[tier];
+                const cellKey  = `${gateName}:${tier}`;
+                const status   = statusMap[cellKey] ?? "idle";
+                const saveErr  = saveErrors[cellKey];
                 if (!row) return <div key={tier} />;
                 return (
                   <GateCellInput
                     key={tier}
                     row={row}
                     status={status}
+                    saveError={saveErr}
                     onSave={(newValue, reason) =>
                       handleSave(gateName, tier, newValue, reason)
                     }

@@ -1,9 +1,15 @@
 /**
  * useGateConfig.test.ts — 100% coverage for useGateConfig hook
  * ADMIN-UI-001 | Chunk 2
+ *
+ * Updated for deliberation fixes:
+ *  - AbortController: verifies no state update fires after unmount
+ *  - Ghost-state: verifies loading=true is synchronous on token arrival
+ *  - Visibility-change: verifies poll skips when document is hidden
+ *  - GATE_CONFIG_URL constant used for fetch URL assertions
  */
 import { renderHook, act, waitFor } from "@testing-library/react";
-import { useGateConfig } from "@/hooks/useGateConfig";
+import { useGateConfig, GATE_CONFIG_URL } from "@/hooks/useGateConfig";
 import type { GateConfigResponse } from "@/types/gates";
 
 const MOCK_RESPONSE: GateConfigResponse = {
@@ -118,7 +124,10 @@ describe("useGateConfig", () => {
       { initialProps: { tok: null } },
     );
     expect(global.fetch).not.toHaveBeenCalled();
+    // loading must be true synchronously as soon as the token arrives —
+    // no ghost-frame where loading=false, data=null, error=null
     rerender({ tok: "tok_new" });
+    expect(result.current.loading).toBe(true);
     await waitFor(() => expect(result.current.data).not.toBeNull());
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
@@ -140,7 +149,7 @@ describe("useGateConfig", () => {
     await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(3));
   });
 
-  it("clears poll interval on unmount", async () => {
+  it("clears poll interval on unmount and no further fetches fire", async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       status: 200,
@@ -150,8 +159,23 @@ describe("useGateConfig", () => {
     await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
     unmount();
     await act(async () => { jest.advanceTimersByTime(60_000); });
-    // Should still only be 1 call (no polling after unmount)
+    // Interval cleared — still only 1 call
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts in-flight fetch on unmount (AbortController)", async () => {
+    let abortCalled = false;
+    const mockAbort = jest.fn(() => { abortCalled = true; });
+    const mockAbortController = { abort: mockAbort, signal: { aborted: false } };
+    jest.spyOn(global, "AbortController").mockImplementation(
+      () => mockAbortController as unknown as AbortController,
+    );
+    (global.fetch as jest.Mock).mockImplementation(
+      () => new Promise(() => { /* never resolves */ }),
+    );
+    const { unmount } = renderHook(() => useGateConfig("tok_abc"));
+    unmount();
+    expect(abortCalled).toBe(true);
   });
 
   it("refresh() triggers a new fetch", async () => {
@@ -166,7 +190,7 @@ describe("useGateConfig", () => {
     await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(2));
   });
 
-  it("sends Authorization header with token", async () => {
+  it("sends Authorization header with token and uses GATE_CONFIG_URL", async () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -175,10 +199,35 @@ describe("useGateConfig", () => {
     renderHook(() => useGateConfig("tok_secret"));
     await waitFor(() => expect(global.fetch).toHaveBeenCalled());
     expect(global.fetch).toHaveBeenCalledWith(
-      "/api/admin/gate-config",
+      GATE_CONFIG_URL,
       expect.objectContaining({
         headers: { Authorization: "Bearer tok_secret" },
       }),
     );
+  });
+
+  it("skips poll tick when document is hidden", async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => MOCK_RESPONSE,
+    });
+    // Simulate hidden tab
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      writable: true,
+      configurable: true,
+    });
+    renderHook(() => useGateConfig("tok_abc"));
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1)); // initial fetch fires
+    // Advance 30s — poll tick should NOT fire because document is hidden
+    await act(async () => { jest.advanceTimersByTime(30_000); });
+    expect(global.fetch).toHaveBeenCalledTimes(1); // still only initial fetch
+    // Restore
+    Object.defineProperty(document, "visibilityState", {
+      value: "visible",
+      writable: true,
+      configurable: true,
+    });
   });
 });

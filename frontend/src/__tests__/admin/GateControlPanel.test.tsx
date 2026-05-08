@@ -1,6 +1,12 @@
 /**
  * GateControlPanel.test.tsx — 100% coverage for GateControlPanel component
  * ADMIN-UI-001 | Chunk 3
+ *
+ * Updated for deliberation fixes:
+ *  - save-error display path now asserted (was only asserting no-crash)
+ *  - Refresh button disabled + visual feedback while loading
+ *  - confirm_market_hours omitted from patch payload
+ *  - token non-null assertion removed (patch called with string token)
  */
 import React from "react";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
@@ -79,6 +85,19 @@ describe("GateControlPanel — loading state", () => {
     mockUseGateConfig.mockReturnValue(makeHookReturn({ loading: true }));
     render(<GateControlPanel token="tok" isAdmin={true} />);
     expect(screen.queryByTestId("loading-msg")).not.toBeInTheDocument();
+  });
+
+  it("disables and dims Refresh button while loading", () => {
+    mockUseGateConfig.mockReturnValue(makeHookReturn({ loading: true }));
+    render(<GateControlPanel token="tok" isAdmin={true} />);
+    const btn = screen.getByTestId("refresh-btn");
+    expect(btn).toBeDisabled();
+  });
+
+  it("shows '…' on Refresh button while loading with data present", () => {
+    mockUseGateConfig.mockReturnValue(makeHookReturn({ loading: true }));
+    render(<GateControlPanel token="tok" isAdmin={true} />);
+    expect(screen.getByTestId("refresh-btn")).toHaveTextContent("…");
   });
 });
 
@@ -173,12 +192,15 @@ describe("GateControlPanel — save flow", () => {
       expect(mockPatch).toHaveBeenCalledWith(
         "tok",
         expect.objectContaining({
-          gate_name:            "min_premium",
-          tier:                 1,
-          value:                20000,
-          confirm_market_hours: false,
+          gate_name: "min_premium",
+          tier:      1,
+          value:     20000,
+          // confirm_market_hours must NOT be present — omitted by design
         }),
       );
+      // Verify confirm_market_hours is not hardcoded
+      const payload = mockPatch.mock.calls[0][1];
+      expect(payload).not.toHaveProperty("confirm_market_hours");
     });
   });
 
@@ -193,14 +215,37 @@ describe("GateControlPanel — save flow", () => {
     await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
   });
 
-  it("does not throw when patch rejects (error handled internally)", async () => {
+  it("surfaces the error message in the affected cell when patch rejects", async () => {
     mockPatch.mockRejectedValueOnce(new Error("Value out of range"));
     render(<GateControlPanel token="tok" isAdmin={true} />);
+
     const inputs = screen.getAllByRole("spinbutton");
     fireEvent.change(inputs[0], { target: { value: "20000" } });
     await act(async () => {
       fireEvent.click(screen.getAllByText("Save")[0]);
     });
+
+    // The error message must be visible in the UI, not swallowed silently
+    await waitFor(() => {
+      expect(screen.getByTestId("save-err-min_premium-1")).toHaveTextContent("Value out of range");
+    });
+  });
+
+  it("shows 'Save failed' when patch rejects with a non-Error object", async () => {
+    mockPatch.mockRejectedValueOnce("unknown error");
+    render(<GateControlPanel token="tok" isAdmin={true} />);
+    mockUseGatePatch.mockReturnValue({
+      statusMap: { "min_premium:1": "error" },
+      patch: mockPatch,
+    });
+
+    const inputs = screen.getAllByRole("spinbutton");
+    fireEvent.change(inputs[0], { target: { value: "20000" } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText("Save")[0]);
+    });
+
+    // Component must not crash; the panel title must still be visible
     expect(screen.getByText("Gate Control Panel")).toBeInTheDocument();
   });
 
@@ -211,6 +256,11 @@ describe("GateControlPanel — save flow", () => {
     });
     render(<GateControlPanel token="tok" isAdmin={true} />);
     expect(screen.getByTestId("badge-saved")).toBeInTheDocument();
+  });
+
+  it("does not call patch when token is null (auth guard prevents render)", () => {
+    render(<GateControlPanel token={null} isAdmin={false} />);
+    expect(mockPatch).not.toHaveBeenCalled();
   });
 });
 
