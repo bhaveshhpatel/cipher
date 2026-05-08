@@ -55,6 +55,7 @@ _SAFE_DEFAULT_TIER: int = 3
 # Static bounds — used for update() validation when the DB has not yet
 # surfaced min_value/max_value columns (pre-load or no-DB mode).
 # Keyed by canonical gate name → (min, max, cast).
+# cast is the Python type used to coerce values (float, int, bool).
 # After load(), _bounds_cache on the instance may override these per-row.
 # ---------------------------------------------------------------------------
 _BOUNDS: dict[str, tuple[float, float, type]] = {
@@ -99,9 +100,9 @@ _DEFAULTS: dict[str, dict[int, float]] = {
         3: 120_000.0,
     },
     "signal_min_premium": {
-        1: 50_000.0,
-        2: 35_000.0,
-        3: 20_000.0,
+        1: 75_000.0,
+        2: 50_000.0,
+        3: 25_000.0,
     },
     "exclude_indices": {
         1: 1.0,
@@ -198,20 +199,39 @@ class GateConfigStore:
         """
         Bulk-load all rows from gate_configs into the in-memory cache.
 
+        Uses httpx directly (so tests can mock services.gate_config_store.httpx).
         Falls back silently to hard-coded ``_DEFAULTS`` if the DB is
         unreachable or the table does not yet exist (pre-migration).
         """
         from config import settings
+        url = getattr(settings, "SUPABASE_URL", None)
+        key = getattr(settings, "SUPABASE_SERVICE_KEY", None)
+        if not url or not key:
+            log.warning("[gate_config] No Supabase URL/key — using hardcoded defaults")
+            return
+
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+        }
         try:
-            rows = await asyncio.get_event_loop().run_in_executor(
-                None, self._fetch_all_rows, settings.SUPABASE_URL,
-                settings.SUPABASE_SERVICE_KEY,
-            )
+            async with httpx.AsyncClient(base_url=url, headers=headers) as client:
+                resp = await client.get(
+                    "/rest/v1/gate_configs",
+                    params={"select": "*"},
+                )
+                if resp.status_code != 200:
+                    log.warning(
+                        "[gate_config] DB load returned HTTP %d — using defaults",
+                        resp.status_code,
+                    )
+                    return
+                rows: list[dict] = resp.json()
         except Exception as exc:
             log.warning(
                 "[gate_config] DB load failed — using hardcoded defaults: %s", exc
             )
-            return
+            raise
 
         new_cache: dict[str, dict[int, float]] = {
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
@@ -235,13 +255,6 @@ class GateConfigStore:
         log.info(
             "[gate_config] Loaded %d rows from DB (epoch=%d)", len(rows), self.epoch
         )
-
-    @staticmethod
-    def _fetch_all_rows(url: str, key: str) -> list[dict]:
-        from supabase import create_client
-        sb = create_client(url, key)
-        result = sb.table("gate_configs").select("*").execute()
-        return result.data or []
 
     # ------------------------------------------------------------------
     # Write API (admin PATCH)
