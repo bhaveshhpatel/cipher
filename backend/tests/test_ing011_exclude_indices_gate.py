@@ -113,47 +113,6 @@ class TestLifespanGateConfigLoad:
 
     @pytest.mark.asyncio
     async def test_load_called_once_on_startup(self):
-        load_mock = AsyncMock()
-
-        # Minimal registry stub that satisfies all attribute accesses in lifespan
-        fake_registry = MagicMock()
-        fake_registry.is_ready.return_value = False
-        fake_registry.size.return_value = 0
-        fake_registry.load_from_db = AsyncMock(return_value=0)
-        fake_registry.refresh_loop = AsyncMock(return_value=None)
-        fake_registry.accumulator = None
-
-        async def _noop_stream(*args, **kwargs):
-            await asyncio.sleep(0)   # yield, then return cleanly
-
-        patches = [
-            patch("main.gate_config_store.load", load_mock),
-            patch("main.validate_ingestion_config", AsyncMock()),
-            patch(
-                "main._resolve_startup_universe",
-                AsyncMock(return_value=([], {}, [], "")),
-            ),
-            patch("main.init_registry", return_value=fake_registry),
-            patch("main.stream_options_flow", side_effect=_noop_stream),
-            patch("main.start_flow_writer", AsyncMock(return_value=None)),
-            patch("main.start_signal_writer", AsyncMock(return_value=None)),
-            patch("main._universe_refresh_loop", AsyncMock(return_value=None)),
-            patch("main._background_build_and_upsert", AsyncMock(return_value=None)),
-            patch("main._registry_prewarm_loop", AsyncMock(return_value=None)),
-            patch("main.start_lookback_worker", AsyncMock(return_value=None)),
-        ]
-
-        with pytest.raises(Exception):
-            for p in patches:
-                p.start()
-
-        # Re-apply cleanly via context managers
-        for p in patches:
-            try:
-                p.stop()
-            except RuntimeError:
-                pass
-
         # Simpler, reliable approach: test the store directly.
         # lifespan() calls `await gate_config_store.load()` which resolves to
         # `await store.load()` on the module-level singleton.
@@ -281,7 +240,9 @@ class TestPatchExcludeIndicesTier2Returns422:
         """
         Sanity: tier=1 must pass the model_validator.
         We patch gate_store.update to avoid real network I/O.
-        _is_market_open() is patched to False so 428 is not raised.
+
+        _is_market_open() lives in services.gate_config_store (not routers.admin).
+        Patch it there so update() skips the 428 market-hours guard.
         """
         fake_result = {
             "gate_name": "exclude_indices",
@@ -289,22 +250,27 @@ class TestPatchExcludeIndicesTier2Returns422:
             "old_value": 1.0,
             "new_value": 0.0,
         }
+
         with (
-            patch("routers.admin._is_market_open", return_value=False),
+            # Correct module: _is_market_open is defined in gate_config_store,
+            # not in routers.admin — patch at the definition site.
             patch(
-                "routers.admin.gate_store",
+                "services.gate_config_store._is_market_open",
+                return_value=False,
+            ),
+            patch(
+                "services.gate_config_store.store.update",
                 new_callable=lambda: type(
-                    "FakeStore",
-                    (),
-                    {
-                        "update": AsyncMock(return_value=fake_result),
-                        "epoch": 1,
-                        "_bounds_cache": {"exclude_indices": (0.0, 1.0)},
-                    },
+                    "AM", (), {"__call__": lambda self, *a, **kw: None}
                 ),
             ),
             patch("routers.admin.log_action", AsyncMock()),
         ):
+            # Re-import inside the patch context so the mock is active
+            # when the TestClient wires up the app.
+            import services.gate_config_store as gcs
+            gcs.store.update = AsyncMock(return_value=fake_result)
+
             client = self._make_app()
             resp = client.patch(
                 "/api/admin/gate-config",
@@ -372,7 +338,7 @@ class TestStreamExcludeIndicesAlwaysTier1:
             "_resolve_exclude_indices() not found — ING-011 gate helper missing"
         )
         src = inspect.getsource(ts._resolve_exclude_indices)
-        assert re.search(r'["\']exclude_indices["\']\s*,\s*1', src), (
+        assert re.search(r'["\']exclude_indices["\']\\s*,\\s*1', src), (
             "_resolve_exclude_indices() must call gate_config_store.get('exclude_indices', 1) — "
             "tier=1 must be hardcoded (tier-independent gate).\n"
             f"Source:\n{src}"
@@ -388,7 +354,7 @@ class TestStreamExcludeIndicesAlwaysTier1:
         import services.tradier_stream as ts
 
         src = inspect.getsource(ts._resolve_exclude_indices)
-        match = re.search(r'["\']exclude_indices["\']\s*,\s*1', src)
+        match = re.search(r'["\']exclude_indices["\']\\s*,\\s*1', src)
         assert match, (
             "_resolve_exclude_indices() must use tier=1 for exclude_indices "
             "regardless of the symbol's actual tier (tier-independent gate). "
