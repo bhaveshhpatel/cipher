@@ -16,7 +16,9 @@ Return contract:
 """
 from __future__ import annotations
 
-import datetime as dt_module  # import the MODULE so tests can patch it correctly
+# Import the stdlib datetime MODULE and expose it under the name `datetime`
+# so that tests can patch it as:  patch("services.gate_config_store.datetime")
+import datetime  # noqa: PLC0414  (we need the module, not the class)
 import logging
 import threading
 from typing import Any
@@ -117,11 +119,11 @@ def _is_market_open() -> bool:
     """Return True if the US equity market is currently open (9:30–16:00 ET, Mon–Fri)."""
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
-    now = dt_module.datetime.now(ET)
+    now = datetime.datetime.now(ET)
     if now.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
-    open_t  = dt_module.time(9, 30)
-    close_t = dt_module.time(16, 0)
+    open_t  = datetime.time(9, 30)
+    close_t = datetime.time(16, 0)
     return open_t <= now.time() < close_t
 
 
@@ -348,8 +350,8 @@ class GateConfigStore:
                         "new_value":  float(value),
                         "changed_by": updated_by,
                         "reason":     reason,
-                        "changed_at": dt_module.datetime.now(
-                            dt_module.timezone.utc
+                        "changed_at": datetime.datetime.now(
+                            datetime.timezone.utc
                         ).isoformat(),
                     },
                 )
