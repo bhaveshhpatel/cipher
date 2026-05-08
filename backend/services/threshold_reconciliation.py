@@ -30,15 +30,15 @@ reserved for a future S3 snapshot reconciler that reads OI deltas from
 a dedicated OI store.
 
 ING-010 (2026-05-07):
-  _TIER_THRESHOLDS is now the COLD-START FALLBACK only.
-  _get_tier_thresholds(tier) reads from gate_config_store first:
-    oi_spike_pct   = gate_config_store.get("oi_spike_pct",   tier_int)
-    oi_collapse_pct= gate_config_store.get("oi_collapse_pct",tier_int)
-    premium_usd    = gate_config_store.get("premium_usd",    tier_int)
-    volume_ratio   = gate_config_store.get("volume_ratio",   tier_int)
-  Falls back to _TIER_THRESHOLDS[tier] when the store returns None (cold
-  start or key not yet loaded).  Hot-reload propagates automatically on
-  next reconcile pass — no restart required.
+  _TIER_THRESHOLDS is the COLD-START FALLBACK for keys that are NOT
+  in gate_config_store's catalogue (oi_spike_pct, oi_collapse_pct,
+  premium_usd, volume_ratio).  If those keys are ever added to the
+  gate_config_store catalogue, _get_tier_thresholds() will pick them
+  up automatically on the next reconcile pass — no restart required.
+
+  gate_config_store.get() returns 0.0 for any key not in its catalogue.
+  _get_tier_thresholds() guards against this by checking _VALID_GATES
+  before treating a returned value as authoritative.
 """
 
 from __future__ import annotations
@@ -56,8 +56,10 @@ logger = logging.getLogger(__name__)
 # ING-010: tier-aware gate config store for live-configurable thresholds.
 try:
     from services.gate_config_store import gate_config_store as _gate_cfg
+    from services.gate_config_store import _VALID_GATES as _GATE_VALID_GATES
 except Exception:  # pragma: no cover — circular-import guard during unit tests
     _gate_cfg = None  # type: ignore[assignment]
+    _GATE_VALID_GATES = frozenset()  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +106,12 @@ class ReconcileResult:
 
 # ---------------------------------------------------------------------------
 # Per-tier threshold config — COLD-START FALLBACK.
-# Live values are read from gate_config_store via _get_tier_thresholds().
-# Update these only when you want to change the fallback that applies before
-# the DB config has loaded (e.g. on a cold Railway restart with no DB).
+# Live values are read from gate_config_store via _get_tier_thresholds()
+# ONLY when the key exists in the gate catalogue (_GATE_VALID_GATES).
+# These four keys (oi_spike_pct, oi_collapse_pct, premium_usd,
+# volume_ratio) are NOT gate keys — they live here only.  Update these
+# when you want to change the fallback that applies on a cold Railway
+# restart with no DB.
 # ---------------------------------------------------------------------------
 
 _TIER_THRESHOLDS: Dict[str, Dict[str, float]] = {
@@ -141,13 +146,17 @@ def _get_tier_thresholds(tier: str) -> Dict[str, float]:
     """
     Return threshold config for the given tier string ("T1"/"T2"/"T3").
 
-    ING-010: reads live values from gate_config_store first.
-    Falls back to the hardcoded _TIER_THRESHOLDS entry when:
-      - gate_config_store is unavailable (import error / cold test)
-      - gate_config_store.get() returns None (key not yet loaded from DB)
+    ING-010: reads live values from gate_config_store for any threshold key
+    that IS present in the gate catalogue (_GATE_VALID_GATES).  Falls back
+    to the hardcoded _TIER_THRESHOLDS entry for any key that is NOT in the
+    catalogue — gate_config_store.get() returns 0.0 for unknown keys, which
+    is indistinguishable from a real zero threshold, so we must not use it.
 
-    Keys consumed:
-      oi_spike_pct, oi_collapse_pct, premium_usd, volume_ratio
+    Currently oi_spike_pct / oi_collapse_pct / premium_usd / volume_ratio
+    are NOT gate keys, so this function always returns _TIER_THRESHOLDS[tier]
+    (or T3 for unknown tiers).  If any of those keys is ever added to the
+    gate_config_store catalogue the hot-reload path below picks them up
+    automatically on the next reconcile pass — no restart required.
 
     Never raises. Safe on the reconcile hot path.
     """
@@ -158,19 +167,19 @@ def _get_tier_thresholds(tier: str) -> Dict[str, float]:
 
     try:
         tier_int = _TIER_STR_TO_INT.get(tier, 3)
+        merged = dict(fallback)
 
-        oi_spike     = _gate_cfg.get("oi_spike_pct",    tier_int)
-        oi_collapse  = _gate_cfg.get("oi_collapse_pct", tier_int)
-        premium      = _gate_cfg.get("premium_usd",     tier_int)
-        vol_ratio    = _gate_cfg.get("volume_ratio",    tier_int)
+        for key in ("oi_spike_pct", "oi_collapse_pct", "premium_usd", "volume_ratio"):
+            # Only override with a live value if the key is actually in the
+            # gate catalogue.  gate_config_store.get() returns 0.0 for
+            # unknown keys — using that would zero every threshold and trigger
+            # spurious breaches on every reconcile pass.
+            if key in _GATE_VALID_GATES:
+                live = _gate_cfg.get(key, tier_int)
+                if live is not None:
+                    merged[key] = live
 
-        # Build merged dict: use live value where available, fallback otherwise.
-        return {
-            "oi_spike_pct":     oi_spike    if oi_spike    is not None else fallback["oi_spike_pct"],
-            "oi_collapse_pct":  oi_collapse if oi_collapse is not None else fallback["oi_collapse_pct"],
-            "premium_usd":      premium     if premium     is not None else fallback["premium_usd"],
-            "volume_ratio":     vol_ratio   if vol_ratio   is not None else fallback["volume_ratio"],
-        }
+        return merged
     except Exception as exc:  # pragma: no cover
         logger.debug("[threshold_reconciliation] _get_tier_thresholds fallback (%s): %s", tier, exc)
         return fallback
@@ -243,7 +252,8 @@ class ThresholdReconciler:
         """Return the live threshold config for a given tier (read-only copy).
 
         ING-010: delegates to _get_tier_thresholds() so callers always see
-        the current gate_config_store values, not the cold-start fallback.
+        the current gate_config_store values, not the cold-start fallback,
+        for any threshold key that exists in the gate catalogue.
         """
         return dict(_get_tier_thresholds(tier))
 
@@ -266,8 +276,8 @@ class ThresholdReconciler:
                 continue
 
             tier  = tier_map.get(symbol, _DEFAULT_TIER)
-            # ING-010: read live thresholds from gate_config_store;
-            # falls back to _TIER_THRESHOLDS on cold start or store error.
+            # ING-010: read live thresholds from gate_config_store for any
+            # key in the catalogue; falls back to _TIER_THRESHOLDS otherwise.
             thres = _get_tier_thresholds(tier)
             result.checked += 1
 
