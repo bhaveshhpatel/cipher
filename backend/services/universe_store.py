@@ -15,6 +15,7 @@ Public API:
   load_tier_map()               → dict[str, int]        [4A]
   save_snapshot(...)            → bool
   upsert_symbol_quotes(...)     → None
+  get_epoch()                   → int   — mutation epoch, incremented per successful save_snapshot()
 
 ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 does NOT expose .select() after .insert().
@@ -113,6 +114,11 @@ FIX STREAM-ELIGIBLE (2026-04-30):
   upsert_symbol_quotes() updates price/volume/OI/tier only — it must never
   touch stream_eligible. The ON CONFLICT DO UPDATE clause leaves the existing
   stream_eligible value untouched on every warm-restart upsert cycle.
+
+FIX EPOCH (2026-05-07):
+  Added module-level _epoch counter incremented on every successful
+  save_snapshot() call (both new-snapshot and reuse paths). Exposed via
+  get_epoch() for parity assertions with gate_config_store.assert_epoch_parity().
 """
 import asyncio
 import logging
@@ -135,6 +141,17 @@ _PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
 # DEDUP-2 fix: bumped from 0.10 → 0.30 to absorb natural CBOE universe variation
 _SNAPSHOT_REUSE_DRIFT_PCT = 0.30  # 30%
 _SNAPSHOT_REUSE_MAX_AGE_H = 24    # hours — only reuse snapshots younger than this
+
+# ---------------------------------------------------------------------------
+# Epoch counter — incremented on every successful save_snapshot() call.
+# Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
+# ---------------------------------------------------------------------------
+_epoch: int = 0
+
+
+def get_epoch() -> int:
+    """Return the current universe_store mutation epoch (incremented per save_snapshot success)."""
+    return _epoch
 
 
 def _client() -> Client:
@@ -479,7 +496,11 @@ def _sync_save_snapshot(
     3. Upsert ONLY eligible symbols in batches of 500
     4. Deactivate all other snapshots (only when creating new)
     5. Prune beyond _KEEP_SNAPSHOTS
+
+    Increments the module-level _epoch counter on success (both paths).
     """
+    global _epoch
+
     if not symbols:
         log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
         return False
@@ -549,9 +570,10 @@ def _sync_save_snapshot(
                 batch_num, total_batches, len(rows[i : i + _UPSERT_BATCH]),
             )
 
+        _epoch += 1
         log.info(
-            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s new=%s",
-            snapshot_id, len(eligible_symbols), source, is_new_snapshot,
+            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s new=%s (epoch=%d)",
+            snapshot_id, len(eligible_symbols), source, is_new_snapshot, _epoch,
         )
 
         _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
@@ -642,8 +664,6 @@ def _prune_old_snapshots(sb: Client, keep: int) -> None:
         if len(rows) <= keep:
             return
         ids_to_delete = [r["id"] for r in rows[keep:]]
-        # Delete child symbol rows first — safety net for DBs without cascading FK.
-        # Prevents orphaned options_universe_symbols rows from accumulating.
         sb.table("options_universe_symbols").delete().in_("snapshot_id", ids_to_delete).execute()
         sb.table("options_universe_snapshots").delete().in_("id", ids_to_delete).execute()
         log.info("universe_store: pruned %d old snapshots (+ their symbol rows)", len(ids_to_delete))

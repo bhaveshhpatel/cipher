@@ -113,12 +113,16 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
     """
     Verify that _process_trade passes a wall-clock timestamp (> 1e9)
     to flow_dedup.is_duplicate(), not a monotonic value (small float).
+
+    The spy accepts **kwargs so it remains forward-proof against new keyword
+    args added to the is_duplicate() call site (e.g. tier_int= from ING-010).
+    Only the `ts` kwarg is inspected — that is the sole contract being tested.
     """
     import services.tradier_stream as ts_module
 
     captured_ts = []
 
-    def _spy_is_duplicate(occ_symbol, size, fill, exchange=None, ts=None):
+    def _spy_is_duplicate(occ_symbol, size, fill, exchange=None, ts=None, **kwargs):
         if ts is not None:
             captured_ts.append(ts)
         return False

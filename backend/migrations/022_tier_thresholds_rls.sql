@@ -1,4 +1,6 @@
--- migration 012: RLS policies for tier_thresholds
+-- migration 022: RLS policies for tier_thresholds
+-- Renumbered from 020_tier_thresholds_rls.sql to resolve duplicate 020_ slot
+-- conflict with 020_exclude_indices_gate.sql (fix: ING-S10 migration audit).
 -- Allows service-role key full access (Supabase default); authenticated users can SELECT.
 -- Part of feature B-019: admin UI for tier threshold editing.
 

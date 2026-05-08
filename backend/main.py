@@ -1,12 +1,14 @@
 """
 Cipher Backend — FastAPI entry point
 
-Startup sequence (post all fixes):
-  1. _resolve_startup_universe()     — load symbols from DB (<2s)
-  2. init_registry()                 — in-memory init (instant)
-  3. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
-  4. yield                           — SERVER IS LIVE, health probe passes
-  5. Parallel background tasks launched:
+Startup sequence:
+  0. gate_config_store.load()        — load tier gate config from DB into memory  [ING-010]
+  1. validate_ingestion_config()     — warn on missing ingestion config rows  [RC-3]
+  2. _resolve_startup_universe()     — load symbols from DB (<2s)
+  3. init_registry()                 — in-memory init (instant)
+  4. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
+  5. yield                           — SERVER IS LIVE, health probe passes
+  6. Parallel background tasks launched:
      a. _background_build_and_upsert — incremental/full OCC build (P4)
      b. registry.refresh_loop()      — scheduled 30-min rebuilds
      c. _registry_prewarm_loop()     — 9:15 AM ET daily pre-warm
@@ -35,6 +37,14 @@ Key architectural fixes:
                         FIRST so Tradier HTTP connections close cleanly before
                         the process exits, freeing session quota for the next
                         container start immediately.
+  ING-010 (main)      — gate_config_store.load() is step 0 in startup so all
+                        tier gate values are hot in memory before any service
+                        (stream, accumulator, parser) runs its first tick.
+  ING-010-ACC (main)  — after registry.set_tier_map(), tradier_stream.accumulator
+                        .set_tier_map() is also called so the module-level hot-path
+                        accumulator receives the same tier map. Without this, Gate 2
+                        in _get_episode_min_premium() resolves every ticker to tier 1
+                        (strict cold-start default) for the entire session.
 """
 import asyncio
 import json
@@ -64,6 +74,7 @@ from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow
+from services.gate_config_store import gate_config_store
 
 
 class _JsonFormatter(logging.Formatter):
@@ -110,17 +121,17 @@ async def get_config() -> dict:
 
 
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
-    log.info("[universe] Step 1: checking for fresh DB snapshot (max_age=24h)")
+    log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
 
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
         log.info(
-            "[universe] Step 1 HIT: loaded fresh universe from DB (%d symbols) — stream starting",
+            "[universe] Step 2a HIT: loaded fresh universe from DB (%d symbols) — stream starting",
             len(fresh),
         )
         tier_map = await universe_store.load_tier_map()
         log.info(
-            "[universe] Step 1: tier_map loaded (%d symbols mapped, T1=%d T2=%d T3=%d)",
+            "[universe] Step 2a: tier_map loaded (%d symbols mapped, T1=%d T2=%d T3=%d)",
             len(tier_map),
             sum(1 for t in tier_map.values() if t == 1),
             sum(1 for t in tier_map.values() if t == 2),
@@ -140,23 +151,23 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         snapshot_id = active_snap[0]["id"] if active_snap else ""
         return fresh, tier_map, [], snapshot_id
 
-    log.info("[universe] Step 1 MISS: no fresh DB snapshot found")
+    log.info("[universe] Step 2a MISS: no fresh DB snapshot found")
     log.info(
-        "[universe] Step 2: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
+        "[universe] Step 2b: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
         bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL),
     )
 
-    log.info("[universe] Step 2a: loading any stale DB snapshot as safety net")
+    log.info("[universe] Step 2c: loading any stale DB snapshot as safety net")
     stale = await universe_store.load_any_snapshot()
     log.info(
-        "[universe] Step 2a: stale snapshot available=%s (%d symbols)",
+        "[universe] Step 2c: stale snapshot available=%s (%d symbols)",
         stale is not None, len(stale) if stale else 0,
     )
 
-    log.info("[universe] Step 2b: calling load_universe (CBOE + Tradier validate + screen)")
+    log.info("[universe] Step 2d: calling load_universe (CBOE + Tradier validate + screen)")
     symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
     log.info(
-        "[universe] Step 2b: load_universe returned source=%s symbols=%d eligible=%s",
+        "[universe] Step 2d: load_universe returned source=%s symbols=%d eligible=%s",
         source, len(symbols),
         len(stream_eligible_set) if stream_eligible_set is not None else "n/a",
     )
@@ -167,23 +178,23 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
 
     if source == "tradier_validated":
         log.info(
-            "[universe] Step 3: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
+            "[universe] Step 2e: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
             len(symbols),
             len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
         )
         saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
         if saved:
-            log.info("[universe] Step 3 SUCCESS: snapshot persisted to DB")
+            log.info("[universe] Step 2e SUCCESS: snapshot persisted to DB")
         else:
-            log.error("[universe] Step 3 FAILED: save_snapshot returned False")
+            log.error("[universe] Step 2e FAILED: save_snapshot returned False")
 
-        log.info("[universe] Step 3b: fetching batch quotes for %d symbols", len(symbols))
+        log.info("[universe] Step 2f: fetching batch quotes for %d symbols", len(symbols))
         quotes = await _fetch_batch_quotes(symbols)
         if quotes:
-            log.info("[universe] Step 3b: preliminary tier assignment for %d symbols", len(quotes))
+            log.info("[universe] Step 2f: preliminary tier assignment for %d symbols", len(quotes))
             tier_map = await assign_tiers(quotes)
             log.info(
-                "[universe] Step 3b: preliminary tiers — T1=%d T2=%d T3=%d",
+                "[universe] Step 2f: preliminary tiers — T1=%d T2=%d T3=%d",
                 sum(1 for t in tier_map.values() if t == 1),
                 sum(1 for t in tier_map.values() if t == 2),
                 sum(1 for t in tier_map.values() if t == 3),
@@ -203,7 +214,7 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         snapshot_id = active_snap[0]["id"] if active_snap else ""
     else:
         log.warning(
-            "[universe] Step 3 SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
+            "[universe] Step 2e SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
             source,
         )
 
@@ -222,6 +233,39 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
     for q in quotes:
         q.open_interest = oi_map.get(q.symbol, 0)
+
+
+def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
+    """
+    ING-010-ACC: propagate the freshly-assigned tier_map to the module-level
+    accumulator in tradier_stream.py.
+
+    The registry.set_tier_map() call in _post_build_upsert() updates the
+    SymbolRegistry instance used for OCC lookups, but the hot-path accumulator
+    (services.tradier_stream.accumulator) is a separate RepetitionAccumulator
+    instance instantiated at module import time.  Without this call its
+    _tier_map stays empty, causing _get_episode_min_premium() to resolve every
+    ticker to tier 1 (strict cold-start default) for the entire trading session.
+
+    Import is deferred to avoid a circular import at module load time.
+    Logs a warning and returns cleanly if the import or attribute access fails
+    — the stream continues, just without tier-aware Gate 2 floors.
+    """
+    try:
+        import services.tradier_stream as _ts
+        _ts.accumulator.set_tier_map(tier_map)
+        log.info(
+            "[ING-010-ACC] tradier_stream.accumulator tier_map synced "
+            "(T1=%d T2=%d T3=%d)",
+            sum(1 for t in tier_map.values() if t == 1),
+            sum(1 for t in tier_map.values() if t == 2),
+            sum(1 for t in tier_map.values() if t == 3),
+        )
+    except Exception as exc:
+        log.warning(
+            "[ING-010-ACC] Could not sync tier_map to tradier_stream.accumulator: %s",
+            exc,
+        )
 
 
 async def _post_build_upsert(
@@ -292,6 +336,8 @@ async def _post_build_upsert(
     try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
+        # ING-010-ACC: also update the module-level accumulator on the hot path.
+        _sync_accumulator_tier_map(tier_map)
         log.info(
             "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
             sum(1 for t in tier_map.values() if t == 1),
@@ -365,6 +411,8 @@ async def _universe_refresh_loop():
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
+                    # ING-010-ACC: keep the hot-path accumulator in sync.
+                    _sync_accumulator_tier_map(tier_map)
                     log.info(
                         "[universe] Background refresh: registry tier_map updated "
                         "(T1=%d T2=%d T3=%d)",
@@ -435,18 +483,34 @@ async def _registry_prewarm_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend\u2026")
+    log.info("Starting Cipher backend...")
 
+    # Step 0 [ING-010]: Load tier gate config into memory before any service
+    # reads gate values (stream, accumulator, parser all call store.get() on
+    # the first tick).  load() is safe to call even if Supabase is unreachable
+    # — it falls back to hardcoded defaults and logs a warning.
+    log.info("[gate_config] Loading tier gate configuration from DB...")
+    await gate_config_store.load()
+    log.info(
+        "[gate_config] Gate config ready (epoch=%d, loaded=%s)",
+        gate_config_store.epoch,
+        gate_config_store.epoch > 0,
+    )
+
+    # Step 1 [RC-3]: Warn on any missing ingestion config rows in DB.
     await validate_ingestion_config()
 
+    # Step 2: Resolve startup universe (DB snapshot or fresh Tradier fetch).
     stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()
 
+    # Step 3: Init in-memory symbol registry.
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
     log.info(
         "[registry] Initialised with %d stream symbols, %d tiers mapped",
         len(stream_symbols), len(tier_map),
     )
 
+    # Step 4: Seed OCC chains from DB (P1 fallback — no Tradier call).
     if snapshot_id:
         seeded = await registry.load_from_db(snapshot_id)
         log.info(
@@ -461,6 +525,9 @@ async def lifespan(app: FastAPI):
         registry.is_ready(), registry.size(),
     )
 
+    # Step 5: yield — server is live, health probe passes.
+    # Background tasks launch AFTER yield so the process accepts traffic
+    # before the 30-60s OCC build begins.
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
     stream_task           = asyncio.create_task(
@@ -485,7 +552,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    log.info("[shutdown] Closing Tradier stream connections first\u2026")
+    log.info("[shutdown] Closing Tradier stream connections first...")
     stream_task.cancel()
     lookback_task.cancel()
     try:

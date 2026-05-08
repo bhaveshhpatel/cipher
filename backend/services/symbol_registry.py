@@ -62,6 +62,29 @@ FIX B-ZERO-PRICE (2026-04-29): When _fetch_stock_prices() returns 0 prices,
   - _build_ticker guard updated: stock_price <= 0 + zero_price_fallback=True
     bypasses the ATM filter (atm_low=0, atm_high=inf) rather than returning.
     DTE gating via tier params still applies normally.
+
+FIX ING-010 (2026-05-07): Add influence_tier_int() and influence_tier_string().
+  _resolve_min_premium() in tradier_stream.py calls influence_tier_string(ticker)
+  to resolve the per-ticker flow-influence bucket (WHALE/INSTITUTIONAL/LARGE/
+  RETAIL) before looking up the gate floor in gate_config_store.
+  influence_tier_int() exposes the raw _tier_map int for callers that need
+  the numeric key directly (e.g. gate_config_store.get("min_premium", tier_int)).
+  Both methods fall back to the most conservative value (3 / "RETAIL") when
+  the ticker is absent from _tier_map, matching the T3 defaults in
+  gate_config_store and the _DEFAULT_TIER_INT constant in tradier_stream.
+
+ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
+  self.epoch: int is initialised to 0 in __init__ and incremented inside the
+  build() lock immediately after self._build_complete = True.
+  Contract (mirrors GateConfigStore.epoch):
+    - epoch == 0  → registry has never completed a full build().
+    - epoch > 0   → at least one build() has completed; value is the build
+                    generation count (1, 2, 3, …).
+  Consumers (stream_worker, tradier_stream) can watch registry.epoch to
+  detect tier-map refreshes without polling individual symbol keys.
+  load_from_db() does NOT increment epoch — only build() does, so callers
+  can rely on epoch > 0 as a "fully built from Tradier" signal (same
+  semantics as _build_complete).
 """
 import asyncio
 import logging
@@ -80,6 +103,24 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 log = logging.getLogger("symbol_registry")
 
 _DEFAULT_BUILD_CONCURRENCY = 50
+
+# ---------------------------------------------------------------------------
+# ING-010: int tier -> influence string mapping.
+# Kept at module level so tests can import and assert against it directly
+# without needing a live SymbolRegistry instance.
+#
+# T1 maps to "INSTITUTIONAL" (not "WHALE") because SymbolRegistry tier
+# assignment via assign_tiers() produces ints 1/2/3 and has no separate
+# "WHALE" bucket at the registry level. tradier_stream._INFLUENCE_TIER_TO_INT
+# maps both "WHALE" and "INSTITUTIONAL" to T1, so either label resolves
+# to the same gate floor. "INSTITUTIONAL" is chosen as the canonical T1
+# label to avoid confusion about what the registry actually knows.
+# ---------------------------------------------------------------------------
+_INT_TIER_TO_STRING: dict[int, str] = {
+    1: "INSTITUTIONAL",
+    2: "LARGE",
+    3: "RETAIL",
+}
 
 
 @dataclass
@@ -121,6 +162,28 @@ def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParam
 
 
 class SymbolRegistry:
+    """
+    Layer-1 OCC contract registry.
+
+    Attributes
+    ----------
+    epoch : int
+        Monotonically-incrementing build generation counter.
+        Starts at 0; incremented inside the build() lock immediately after
+        ``_build_complete`` is set to True.
+
+        Contract (mirrors GateConfigStore.epoch):
+          - epoch == 0  → no completed build() yet (may be DB-seeded via
+                          load_from_db, but Tradier chain data not yet fresh).
+          - epoch >= 1  → build() has completed at least once; value equals
+                          the number of completed builds (1 on first build,
+                          2 after first refresh_loop() rebuild, etc.).
+
+        Consumers (stream_worker._process_tick, tradier_stream) watch this
+        value to detect tier-map refreshes without polling symbol keys.
+        load_from_db() does NOT increment epoch — only build() does.
+    """
+
     def __init__(
         self,
         watchlist: Optional[list[str]] = None,
@@ -137,12 +200,11 @@ class SymbolRegistry:
         self._volume_by_ticker: dict[str, int] = {}
         self._avg_volume_by_ticker: dict[str, int] = {}
         # M-1/M-2: dedicated build-complete flag.
-        # load_from_db() does NOT set this - it only populates the registry
-        # with stale DB data. build() sets it at the very end, inside the
-        # lock, after self._registry is swapped to the freshly-built data.
-        # stream_options_flow() polls is_ready() which checks this flag.
         self._build_complete: bool = False
-        # H3: _seeded_from_db removed - self._registry itself is the guard
+        # ING-010-EPOCH: monotonically-incrementing build generation counter.
+        # Starts at 0 (no completed build). Incremented by build() only —
+        # never by load_from_db(). Mirrors GateConfigStore.epoch contract.
+        self.epoch: int = 0
 
     def lookup(self, occ_symbol: str) -> Optional[ContractMeta]:
         return self._registry.get(occ_symbol.strip())
@@ -157,12 +219,6 @@ class SymbolRegistry:
         return self._stock_prices.get(ticker, 0.0)
 
     def is_ready(self) -> bool:
-        # M-2: return _build_complete, NOT len(self._registry) > 0.
-        # The registry may be non-empty from load_from_db() (stale DB seed)
-        # long before build() has finished fetching fresh Tradier data.
-        # Returning True too early causes stream workers to spawn against
-        # a partially-seeded registry, leading to the M-1 worker-count
-        # mismatch (all_symbols() called before build() completes).
         return self._build_complete
 
     def set_tier_map(self, tier_map: dict[str, int]) -> None:
@@ -170,6 +226,46 @@ class SymbolRegistry:
 
     def get_oi_map(self) -> dict[str, int]:
         return dict(self._oi_by_ticker)
+
+    # -----------------------------------------------------------------------
+    # ING-010: Tier accessors used by _resolve_min_premium() in
+    # tradier_stream.py to resolve the per-ticker gate floor.
+    # -----------------------------------------------------------------------
+
+    def influence_tier_int(self, ticker: str) -> int:
+        """
+        Return the integer tier (1/2/3) for ticker from _tier_map.
+
+        Fallback: 3 (RETAIL / most conservative floor) for any ticker not
+        present in the map. This matches _DEFAULT_TIER_INT in tradier_stream
+        and the T3 defaults seeded into gate_config_store.
+
+        Thread-safe for reads: _tier_map is replaced atomically at the end of
+        build() inside the build lock; dict.get() is safe under the GIL.
+        """
+        return self._tier_map.get(ticker, 3)
+
+    def influence_tier_string(self, ticker: str) -> str:
+        """
+        Return the human-readable influence tier label for ticker.
+
+        Resolution: _tier_map int -> _INT_TIER_TO_STRING.
+
+        Return values: "INSTITUTIONAL" | "LARGE" | "RETAIL"
+        Fallback:      "RETAIL" for unknown tickers or unexpected int values.
+
+        Used by _resolve_min_premium() in tradier_stream.py:
+          tier_str = reg.influence_tier_string(ticker)  # e.g. "INSTITUTIONAL"
+          tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, 3)  # -> 1
+          floor    = gate_config_store.get("min_premium", tier_int)  # -> 5_000
+
+        Note: tradier_stream._INFLUENCE_TIER_TO_INT also maps "WHALE" -> 1.
+        The registry has no separate WHALE bucket (assign_tiers produces
+        1/2/3 only), so "INSTITUTIONAL" is the canonical T1 string here.
+        Both map to the same gate floor via tradier_stream's dict.
+        """
+        tier_int = self._tier_map.get(ticker, 3)
+        return _INT_TIER_TO_STRING.get(tier_int, "RETAIL")
 
     async def load_from_db(self, snapshot_id: str) -> int:
         chain = await load_chain(snapshot_id)
@@ -189,10 +285,6 @@ class SymbolRegistry:
             return 0
         self._registry = chain
         self._persisted_snapshot_id = snapshot_id
-        # M-1/M-2: do NOT set _build_complete here.
-        # The chain is stale DB data - stream workers must not unblock yet.
-        # H3: no _seeded_from_db flag - populated registry is the signal
-        # Rebuild OI map from the loaded chain
         oi_acc: dict[str, list[int]] = {}
         for meta in chain.values():
             oi_acc.setdefault(meta.ticker, []).append(meta.open_interest)
@@ -239,6 +331,12 @@ class SymbolRegistry:
           atm_high=inf). Chain fetches still run and contracts still load.
           Tickers with missing individual prices use the same bypass inside
           _build_ticker (WARNING per ticker) rather than being skipped.
+
+        ING-010-EPOCH - epoch increment:
+          self.epoch is incremented inside the lock immediately after
+          self._build_complete = True. Epoch is never incremented by
+          load_from_db() — only by build(). epoch == 0 means "not yet
+          built from Tradier"; epoch >= 1 means "build generation N".
         """
         from services.symbols_loader import SymbolQuote
 
@@ -250,7 +348,6 @@ class SymbolRegistry:
         sem = asyncio.Semaphore(build_concurrency)
 
         async with self._build_lock:
-            # H3 fix: use populated registry as the incremental guard
             if self._registry:
                 min_dte_by_ticker: dict[str, int] = {}
                 for meta in self._registry.values():
@@ -302,10 +399,6 @@ class SymbolRegistry:
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
-            # B-ZERO-PRICE: if ALL prices are missing, log ERROR and activate
-            # fallback so _build_ticker bypasses ATM filtering entirely.
-            # Completing with 0 contracts leaves StreamManager empty with no
-            # workers spawned - that is always worse than loading all contracts.
             zero_price_fallback = False
             if tickers_to_refresh and not prices:
                 log.error(
@@ -329,9 +422,6 @@ class SymbolRegistry:
                             zero_price_fallback=zero_price_fallback,
                         )
 
-                # B-ZERO-PRICE: no `if ticker in prices` guard - all tickers
-                # go through unconditionally; _build_ticker handles missing
-                # prices via zero_price_fallback.
                 tasks = [
                     _build_with_sem(ticker)
                     for ticker in tickers_to_refresh
@@ -360,8 +450,6 @@ class SymbolRegistry:
                     open_interest  = new_oi_by_ticker.get(ticker, 0),
                 ))
 
-            # C-3: require_oi=True - OI gate enforced now that build() has
-            # populated new_oi_by_ticker from chain fetches.
             live_tier_map = await assign_tiers(
                 synthetic_quotes,
                 thresholds=thresh,
@@ -384,8 +472,14 @@ class SymbolRegistry:
             self._oi_by_ticker = new_oi_by_ticker
             self._last_build   = datetime.utcnow()
 
-            # M-1/M-2: set _build_complete AFTER self._registry is swapped.
+            # M-1/M-2: mark registry as fully built.
             self._build_complete = True
+            # ING-010-EPOCH: advance epoch so consumers can detect this
+            # tier-map refresh without polling individual symbol keys.
+            # Incremented here (inside the lock, after _build_complete=True)
+            # so any reader that sees epoch N is guaranteed to also see the
+            # fully-built _tier_map and _registry for generation N.
+            self.epoch += 1
 
             t_counts = {1: 0, 2: 0, 3: 0}
             for m in new_registry.values():
@@ -403,15 +497,16 @@ class SymbolRegistry:
                 log.info(
                     "[symbol_registry] Build complete: %d OCC symbols "
                     "(T1=%d T2=%d T3=%d) (was %d, delta=%+d) | OI map: %d tickers "
-                    "| _build_complete=True - stream workers may now spawn",
+                    "| _build_complete=True epoch=%d - stream workers may now spawn",
                     len(new_registry),
                     t_counts[1], t_counts[2], t_counts[3],
                     old_count, len(new_registry) - old_count,
                     len(new_oi_by_ticker),
+                    self.epoch,
                 )
 
             await self._persist_to_db(new_registry)
-            return len(new_registry), raw_quotes  # H1: return raw_quotes
+            return len(new_registry), raw_quotes
 
     async def _persist_to_db(self, registry_dict: dict[str, ContractMeta]) -> None:
         from services.chain_store import save_chain
@@ -532,9 +627,6 @@ class SymbolRegistry:
 
         today = date.today()
 
-        # B-ZERO-PRICE: bypass ATM filter when no price is available.
-        # Using atm_low=0 / atm_high=inf means every positive strike passes.
-        # DTE filtering via params.max_dte still applies normally.
         if stock_price > 0:
             atm_low  = stock_price * (1 - params.atm_pct)
             atm_high = stock_price * (1 + params.atm_pct)

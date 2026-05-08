@@ -109,6 +109,67 @@ Fix (PBE-BLOCKING-1 2026-05-06): revert persist_flow_episode to fire-and-forget.
   emission — the bus fires regardless. A missed/late episode row is an
   acceptable enrichment loss; a stalled hot path is not.
   _PERSIST_EPISODE_TIMEOUT constant removed (no longer referenced).
+
+Fix (ING-010 2026-05-07): Tier-aware configurable ingestion gate system.
+  gate_config_store singleton loaded at startup (main.py lifespan step 0).
+  _resolve_min_premium(ticker) resolves per-tick premium floor from:
+    registry.influence_tier_int(ticker) -> gate_config_store.get("min_premium", tier)
+  Floor is passed to parse_tradier_trade(min_premium=...) kwarg.
+  Epoch-change detection: when gate_config_store.epoch changes between ticks,
+  an INFO log fires so ops can confirm hot-reload propagated to the stream.
+  _stats["gate_epoch"] exposed in get_stats().
+
+Fix (ING-010-GATES 2026-05-07): wire signal_debounce_ms + signal_min_premium.
+  _should_emit_signal() reads signal_debounce_ms live from gate_config_store
+  (T1 tier, ms -> s) instead of hardcoded _SIGNAL_DEBOUNCE_S=30s.
+  _SIGNAL_DEBOUNCE_S retained as cold-start fallback when store returns None.
+  Signal gate in _process_trade reads signal_min_premium live from
+  gate_config_store (T1 tier) instead of hardcoded _SIGNAL_MIN_PREMIUM=50_000.
+  _SIGNAL_MIN_PREMIUM retained as cold-start fallback.
+  Both lookups are O(1) in-memory reads — zero async I/O on hot path.
+
+Fix (ING-010-DUP 2026-05-07): remove duplicate gate_config_store.load() call.
+  stream_options_flow() was scheduling asyncio.create_task(gate_config_store.load())
+  on every invocation (including reconnects). ING-010 already calls load() at
+  lifespan step 0 in main.py before any service starts. The duplicate is dead
+  code and has been removed.
+
+Fix (ING-010-DEDUP 2026-05-07): thread tier_int into flow_dedup.is_duplicate().
+  DedupCache.is_duplicate() now accepts an optional tier_int kwarg (dedup.py
+  ING-010 fix). _process_trade() resolves ev.influence_tier -> tier_int via
+  _INFLUENCE_TIER_TO_INT after parse (ev is available) and passes it to
+  is_duplicate(). This enables DedupCache to read dedup_window_ms per tier
+  from gate_config_store instead of using the flat 5.0s construction default.
+  Zero additional registry lookups — O(1) dict access on the already-available
+  ev.influence_tier string.
+
+Fix (ING-010-IMPORT 2026-05-07): import store as gate_config_store.
+  The previous import `from services.gate_config_store import gate_config_store`
+  referenced a symbol that does not exist — the module exports `store`, not
+  `gate_config_store`. This caused an ImportError at startup so every
+  _resolve_signal_debounce_s() call fell back to the hardcoded constant.
+  Fix: `from services.gate_config_store import store as gate_config_store`.
+
+Fix (ING-011 2026-05-07): exclude_indices Gate 6 — index options filter.
+  _INDEX_SYMBOLS frozenset defines the 10 high-volume index ETF tickers whose
+  options generate noise-level flow that obscures single-stock signals.
+  _resolve_exclude_indices() reads gate_config_store.get("exclude_indices", 1)
+  (tier-1 canonical row); safe fallback = True (filter ON) on any error.
+  Gate check fires in _process_trade() immediately after _raw_ticker extract,
+  before parse_tradier_trade() — no parse cost incurred for filtered ticks.
+  _stats["index_filtered"] counter tracks suppressed index ticks; wired into
+  flow-funnel log line (every 100 ticks).
+
+Fix (EPISODE-GATE-HOIST 2026-05-08): hoist persist_flow_episode before signal gate.
+  persist_flow_episode was fired AFTER the signal_min_premium gate, so any
+  episode whose total_premium < signal_min_premium (T1 default 75_000) was
+  never persisted even though Gate-2 of the accumulator had already cleared.
+  This caused test_process_trade_episode_direction_put_is_repeat_sell to fail
+  (SPY PUT total_premium=60_000 < 75_000 signal_min_premium default).
+  Fix: build alert_level/direction immediately after signal-gate pre-checks,
+  then fire persist_flow_episode as asyncio.create_task() unconditionally,
+  then continue with signal_min_premium gate and SIG-DEBOUNCE.
+  Decoupling is now explicit: episode persistence != signal emission.
 """
 import asyncio
 import logging
@@ -136,15 +197,15 @@ from signals.repetition_accumulator import RepetitionAccumulator, _DEFAULT_DTE_P
 from signals.composite_signal_engine import build_composite, episode_influence_tier, COMPOSITE_SCORE_CEILING
 from utils.dedup import flow_dedup
 # ING-007-PATCH-B: hoisted to module level so tests can patch these names via
-# patch("services.tradier_stream._lbc") etc. Inline imports inside
-# _process_trade() bind to local variables that patch() cannot reach.
-# NOTE: _cache and _is_fresh are imported under aliases _lbc / _lbc_fresh here.
-# Do not rename those symbols in contract_day_cache.py without updating these imports.
+# patch("services.tradier_stream._lbc") etc.
 from utils.contract_day_cache import (
     _cache as _lbc,
     _is_fresh as _lbc_fresh,
     ContractKey as _ContractKey,
 )
+# ING-010: tier-aware gate config store singleton.
+# The module exports `store`; aliased here so all internal references remain unchanged.
+from services.gate_config_store import store as gate_config_store
 
 log = logging.getLogger("tradier_stream")
 
@@ -159,8 +220,6 @@ _IDLE_TIMEOUT        = 30.0
 _CONNECT_TIMEOUT     = 15.0
 _MARKET_CLOSED_SLEEP = 60.0
 _PERSIST_TIMEOUT     = 2.0
-# PBE-BLOCKING-1: _PERSIST_EPISODE_TIMEOUT removed. persist_flow_episode is
-# fire-and-forget (asyncio.create_task) — see fix note in module docstring.
 
 _REGISTRY_READY_TIMEOUT_S = 1800.0
 _REGISTRY_READY_POLL_S    = 0.5
@@ -178,29 +237,57 @@ _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
 
-# ---------------------------------------------------------------------------
-# Signal gate thresholds
-# ---------------------------------------------------------------------------
-_SIGNAL_MIN_TRADES  = 3
-_SIGNAL_MIN_PREMIUM = 50_000
+# ING-011: High-volume index ETF tickers whose options generate noise-level
+# flow that obscures single-stock signals.  Filtered when exclude_indices
+# gate is active (gate_config_store.get("exclude_indices", 1) == 1.0).
+_INDEX_SYMBOLS: frozenset[str] = frozenset({
+    "SPY", "QQQ", "IWM", "DIA",
+    "VXX", "GLD", "TLT", "HYG",
+    "EEM", "SLV",
+})
 
 # ---------------------------------------------------------------------------
-# Per-episode signal debounce
+# Signal gate thresholds — cold-start fallbacks.
+# ING-010-GATES: live values are read from gate_config_store at point-of-use.
+# These constants are only used when the store has not yet loaded (epoch == 0).
 # ---------------------------------------------------------------------------
-_SIGNAL_DEBOUNCE_S  = 30.0
+_SIGNAL_MIN_TRADES  = 3
+_SIGNAL_MIN_PREMIUM = 50_000   # fallback; live value from gate_config_store
+
+# ---------------------------------------------------------------------------
+# Per-episode signal debounce — cold-start fallbacks.
+# ING-010-GATES: _SIGNAL_DEBOUNCE_S is the fallback when
+# gate_config_store.get("signal_debounce_ms", 1) returns None.
+# Live value is read per-call in _should_emit_signal().
+# ---------------------------------------------------------------------------
+_SIGNAL_DEBOUNCE_S  = 30.0     # fallback; live value from gate_config_store
 _SIGNAL_DELTA_PREM  = 25_000.0
 _SIGNAL_DELTA_PCT   = 0.20
 _SIGNAL_EMIT_TTL_S  = 7_200.0
 
-# PBE-2: TTL for _lookback_result_cache entries. Matches _SIGNAL_EMIT_TTL_S
-# so both caches age out on the same 2-hour cycle. Self-contained — eviction
-# has no dependency on _signal_last_emit.
 _LBC_TTL_S = 7_200.0
+
+# ---------------------------------------------------------------------------
+# ING-010: Tier string -> int mapping for gate_config_store lookups.
+# influence_tier on OptionsFlowEvent is a string ("WHALE"/"INSTITUTIONAL"/
+# "LARGE"/"RETAIL"). gate_config_store uses int tiers 1/2/3.
+# T1 = WHALE/INSTITUTIONAL (largest flows, tightest floors)
+# T2 = LARGE (mid-tier)
+# T3 = RETAIL / unknown (smallest flows, most conservative floor = 10_000)
+# ---------------------------------------------------------------------------
+_INFLUENCE_TIER_TO_INT: dict[str, int] = {
+    "WHALE":         1,
+    "INSTITUTIONAL": 1,
+    "LARGE":         2,
+    "RETAIL":        3,
+}
+_DEFAULT_TIER_INT = 3  # safe fallback for any unknown influence_tier string
 
 # ---------------------------------------------------------------------------
 # Global stats
 # ---------------------------------------------------------------------------
 _stream_start_at: float = _time.time()
+_last_gate_epoch: int = -1  # tracks last known gate_config_store epoch
 
 _stats = {
     "active_symbols":    0,
@@ -219,12 +306,15 @@ _stats = {
     "mode":              "starting",
     "last_tick_at":      None,
     "last_reconnect_at": None,
+    # ING-010: gate config epoch — increments on every hot-reload update
+    "gate_epoch":        0,
+    # ING-011: ticks dropped by exclude_indices gate
+    "index_filtered":    0,
 }
 
 _non_timesale_etypes_seen: set = set()
 _order_side_startup_logged: bool = False
 
-# PREMERGE-3 (ING-006): min_premium= constructor kwarg removed in ING-006.
 accumulator = RepetitionAccumulator(
     window_minutes=30,
     min_trades=1,
@@ -233,20 +323,100 @@ accumulator = RepetitionAccumulator(
 
 _sweep_upgrade_dispatched: dict[str, float] = {}
 _signal_last_emit: dict[str, dict] = {}
-
-# ING-007 / PBE-2: in-process cache of last-known lookback result per emit_key.
-# dict[emit_key, tuple[is_multi_day_repeat: bool, stamped_at: float]]
-# Eviction is self-contained via _evict_lookback_result_cache() using _LBC_TTL_S.
 _lookback_result_cache: dict[str, tuple[bool, float]] = {}
 
 
 def get_stats() -> dict:
     stats = dict(_stats)
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
+    stats["gate_epoch"] = gate_config_store.epoch  # always current, not cached
     stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
     stats.update(get_lookback_stats())
     return stats
+
+
+# ---------------------------------------------------------------------------
+# ING-010: Tier-aware min_premium resolver
+# ---------------------------------------------------------------------------
+def _resolve_min_premium(ticker: str) -> int:
+    """
+    Resolve the tier-aware min_premium floor for a given ticker.
+
+    Resolution path:
+      1. Ask the registry for the ticker's influence_tier string.
+      2. Map that string to an int tier (1/2/3) via _INFLUENCE_TIER_TO_INT.
+      3. Read gate_config_store.get("min_premium", tier_int) — O(1) in-memory.
+
+    Falls back to T3 default (10_000) on any error or missing registry.
+    Never raises. Safe on the hot path.
+    """
+    try:
+        reg = None
+        try:
+            from services.symbol_registry import get_registry as _get_reg
+            reg = _get_reg()
+        except Exception:
+            pass
+
+        tier_str = "RETAIL"  # safe default
+        if reg is not None and reg.is_ready():
+            try:
+                tier_str = reg.influence_tier_string(ticker) or "RETAIL"
+            except AttributeError:
+                tier_str = "RETAIL"
+            except Exception:
+                tier_str = "RETAIL"
+
+        tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, _DEFAULT_TIER_INT)
+        return gate_config_store.get("min_premium", tier_int)
+    except Exception:
+        return 10_000
+
+
+# ---------------------------------------------------------------------------
+# ING-010-GATES: live signal_debounce_ms resolver
+# ---------------------------------------------------------------------------
+def _resolve_signal_debounce_s() -> float:
+    try:
+        raw_ms = gate_config_store.get("signal_debounce_ms", 1)
+        if raw_ms is not None and raw_ms > 0:
+            return float(raw_ms) / 1000.0
+    except Exception:
+        pass
+    return _SIGNAL_DEBOUNCE_S
+
+
+# ---------------------------------------------------------------------------
+# ING-010-GATES: live signal_min_premium resolver
+# ---------------------------------------------------------------------------
+def _resolve_signal_min_premium() -> float:
+    try:
+        val = gate_config_store.get("signal_min_premium", 1)
+        if val is not None and val > 0:
+            return float(val)
+    except Exception:
+        pass
+    return float(_SIGNAL_MIN_PREMIUM)
+
+
+# ---------------------------------------------------------------------------
+# ING-011: live exclude_indices resolver
+# ---------------------------------------------------------------------------
+def _resolve_exclude_indices() -> bool:
+    """
+    Return True if the exclude_indices gate is active (1.0), False if disabled (0.0).
+
+    Reads gate_config_store.get("exclude_indices", 1) — tier=1 is the
+    canonical row for this tier-independent gate.  Safe fallback is True
+    (filter ON) so index noise is suppressed even before the store loads.
+    Never raises.
+    """
+    try:
+        val = gate_config_store.get("exclude_indices", 1)
+        return bool(val >= 0.5)
+    except Exception:
+        return True  # safe fallback: filter ON
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +492,11 @@ async def stream_options_flow(
 
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
+
+    # ING-010-DUP: gate_config_store.load() is called at lifespan step 0 in
+    # main.py before any service starts. The duplicate asyncio.create_task()
+    # that previously appeared here has been removed — it fired on every
+    # stream invocation including reconnects, making it dead/redundant code.
 
     if not settings.TRADIER_API_KEY:
         log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
@@ -428,18 +603,6 @@ def _evict_signal_emit_cache(now: float) -> None:
 
 
 def _evict_lookback_result_cache(now: float) -> None:
-    """
-    PBE-2 fix: self-contained TTL eviction keyed on stamped_at.
-
-    Previous implementation evicted entries where emit_key was absent from
-    _signal_last_emit — piggybacking on the wrong namespace. Contracts that
-    never crossed the signal gate (and therefore never wrote to
-    _signal_last_emit) would accumulate entries indefinitely.
-
-    Now: _lookback_result_cache values are (bool, float) tuples where
-    float is time.time() at write time. Evict entries older than _LBC_TTL_S.
-    Fully independent of _signal_last_emit.
-    """
     stale = [
         k for k, (_, stamped_at) in _lookback_result_cache.items()
         if now - stamped_at > _LBC_TTL_S
@@ -462,8 +625,10 @@ def _should_emit_signal(
     if last["alert_level"] != alert_level:
         return True, f"alert_escalation:{last['alert_level']}->{alert_level}"
 
+    debounce_s = _resolve_signal_debounce_s()
+
     elapsed = now - last["ts"]
-    if elapsed >= _SIGNAL_DEBOUNCE_S:
+    if elapsed >= debounce_s:
         delta      = total_premium - last["premium"]
         pct_floor  = last["premium"] * _SIGNAL_DELTA_PCT
         threshold  = max(_SIGNAL_DELTA_PREM, pct_floor)
@@ -471,7 +636,7 @@ def _should_emit_signal(
             return True, f"premium_growth:+${delta:,.0f} (>= ${threshold:,.0f})"
 
     return False, (
-        f"debounced: elapsed={elapsed:.1f}s "
+        f"debounced: elapsed={elapsed:.1f}s/{debounce_s:.0f}s "
         f"delta=${total_premium - last['premium']:,.0f} "
         f"alert={alert_level}"
     )
@@ -484,23 +649,52 @@ async def _process_trade(raw: dict):
     """
     Process a raw Tradier stream event (filter=timesale).
 
+    ING-010 addition: tier-aware min_premium resolution.
+      Before calling parse_tradier_trade(), quick-extract the raw ticker
+      from the OCC symbol or underlying field and resolve the tier-aware
+      premium floor via _resolve_min_premium(). This is a O(1) dict
+      lookup after the registry tier string is known — zero async I/O.
+      The resolved floor is passed as min_premium= to parse_tradier_trade().
+
+    ING-010-GATES addition: signal_min_premium resolved live per-tick from
+      gate_config_store (T1 canonical row). Fallback: _SIGNAL_MIN_PREMIUM.
+
+    ING-010-DEDUP addition: ev.influence_tier -> tier_int threaded into
+      flow_dedup.is_duplicate() so DedupCache reads dedup_window_ms per tier.
+
+    ING-011 addition: exclude_indices gate.
+      After _raw_ticker is extracted (pre-parse), if _resolve_exclude_indices()
+      returns True and _raw_ticker is in _INDEX_SYMBOLS, the tick is dropped
+      immediately. No parse cost is incurred. _stats["index_filtered"] is
+      incremented and a DEBUG log fires. Gate can be toggled live via the
+      PATCH /gates/exclude_indices/1 admin endpoint without stream restart.
+
+    EPISODE-GATE-HOIST (2026-05-08): persist_flow_episode fires before signal gate.
+      Episode persistence is decoupled from signal emission. persist_flow_episode
+      is scheduled as asyncio.create_task() immediately after alert_level and
+      direction are resolved — before the signal_min_premium and SIG-DEBOUNCE
+      checks. This ensures every accumulator Gate-2 crossing is recorded even
+      when the signal_min_premium gate or debounce suppresses bus emission.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
-      persist_ep = await accumulator.ingest_tick(ev)   # persist gate, no cooldown
-      sig_ep     = await accumulator.get_signal(ev)    # bus gate, cooldown-aware
-
-    persist_flow_event fires whenever ingest_tick returns non-None (persist_ep).
-    bus.publish_all fires only when get_signal returns non-None (sig_ep).
-    This satisfies C008-1 (persist fires, bus silent during cooldown) and
-    C008-2 (both fire after cooldown passes).
-
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
-      Episode write does not block the signal emit path. The queue worker
-      (_update_episode_multiday) enriches the DB row asynchronously.
-      A missed episode row is an acceptable enrichment loss under Supabase
-      pressure; a 3s stall on the hot path is not.
     """
+    global _last_gate_epoch
+
     _stats["ticks"] += 1
     tick_n = _stats["ticks"]
+
+    # ING-010: detect gate config hot-reload — log once per epoch change.
+    current_epoch = gate_config_store.epoch
+    if current_epoch != _last_gate_epoch:
+        if _last_gate_epoch >= 0:
+            log.info(
+                "[ING-010] gate_config_store epoch changed %d -> %d — "
+                "tier-aware floors updated on hot path",
+                _last_gate_epoch, current_epoch,
+            )
+        _last_gate_epoch = current_epoch
+        _stats["gate_epoch"] = current_epoch
 
     if tick_n <= _FIRST_TICK_LOG_COUNT:
         log.info(
@@ -512,18 +706,20 @@ async def _process_trade(raw: dict):
         _parser_stats = get_parser_stats()
         log.info(
             "[flow-funnel] ticks=%d parsed=%d parse_failed=%d below_min_premium=%d "
-            "deduped=%d classified=%d accumulator_gated=%d "
-            "persisted=%d signals=%d sig_debounced=%d",
+            "index_filtered=%d deduped=%d classified=%d accumulator_gated=%d "
+            "persisted=%d signals=%d sig_debounced=%d gate_epoch=%d",
             tick_n,
             _stats["parsed"],
             _stats["parse_failed"],
             _parser_stats["below_min_premium"],
+            _stats["index_filtered"],
             _stats["deduped"],
             _stats["classified"],
             _stats["accumulator_gated"],
             _stats["persisted"],
             _stats["signals"],
             _stats["sig_debounced"],
+            current_epoch,
         )
 
     event_type = raw.get("type", "")
@@ -543,7 +739,25 @@ async def _process_trade(raw: dict):
     else:
         trade_payload = raw
 
-    result = parse_tradier_trade(trade_payload)
+    # ING-010: resolve tier-aware premium floor before parse.
+    _raw_ticker = (
+        trade_payload.get("underlying")
+        or trade_payload.get("symbol", "").split()[0]
+        or ""
+    )
+
+    # ING-011: exclude_indices gate — drop index ETF flow before parse.
+    if _raw_ticker and _raw_ticker.upper() in _INDEX_SYMBOLS and _resolve_exclude_indices():
+        _stats["index_filtered"] += 1
+        log.debug(
+            "[ING-011] index_filtered ticker=%s tick=%d (total_filtered=%d)",
+            _raw_ticker, tick_n, _stats["index_filtered"],
+        )
+        return
+
+    _tier_min_premium = _resolve_min_premium(_raw_ticker) if _raw_ticker else None
+
+    result = parse_tradier_trade(trade_payload, min_premium=_tier_min_premium)
     if result == "below_premium":
         return
     if result is None:
@@ -566,17 +780,25 @@ async def _process_trade(raw: dict):
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
 
+    # ING-010-DEDUP: derive tier_int from ev.influence_tier (set by parser from
+    # OCC metadata — more accurate than the pre-parse _raw_ticker quick-extract).
+    # Passed to is_duplicate() so DedupCache uses the per-tier dedup_window_ms.
+    _ev_tier_int: int = _INFLUENCE_TIER_TO_INT.get(
+        getattr(ev, "influence_tier", ""), _DEFAULT_TIER_INT
+    )
+
     if flow_dedup.is_duplicate(
         occ_symbol,
         size=ev.size,
         fill=ev.fill_price,
         exchange=exchange,
         ts=arrival_ts,
+        tier_int=_ev_tier_int,
     ):
         _stats["deduped"] += 1
         log.info(
-            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s",
-            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange,
+            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s tier=%d",
+            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange, _ev_tier_int,
         )
 
         exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
@@ -629,8 +851,6 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
-    # C008 fix: ingest_tick() is the persist gate (no cooldown).
-    # get_signal() is the bus gate (cooldown-aware).
     persist_ep = await accumulator.ingest_tick(ev)
     sig_ep     = await accumulator.get_signal(ev)
 
@@ -643,16 +863,11 @@ async def _process_trade(raw: dict):
         )
         return
 
-    # ING-007: order_side is UNKNOWN by platform design.
     _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
 
-    # ING-007: enqueue ContractKey for async lookback enrichment (non-blocking).
     _contract_key = _ContractKey(ev.ticker, ev.contract_type, ev.strike, ev.expiry)
     enqueue_lookback(_contract_key)
 
-    # ING-007 / PBE-1 fix: resolve is_multi_day_repeat synchronously from the
-    # in-process cache using accumulator._multi_day_min_days as the canonical
-    # threshold.
     emit_key = f"{ev.ticker}|{ev.contract_type}|{ev.strike}|{ev.expiry}"
     _multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
     try:
@@ -665,8 +880,6 @@ async def _process_trade(raw: dict):
     except Exception:
         _is_repeat_now = False
 
-    # PBE-2 fix: stamp wall-clock time so _evict_lookback_result_cache() can
-    # age entries out independently of _signal_last_emit.
     _now = _time.time()
     if _is_repeat_now:
         _lookback_result_cache[emit_key] = (True, _now)
@@ -674,12 +887,10 @@ async def _process_trade(raw: dict):
         _lookback_result_cache[emit_key] = (False, _now)
     _is_multi_day_repeat: bool = _lookback_result_cache[emit_key][0]
 
-    # ING-007: strong_sentiment computed from is_directionally_aggressive().
     _strong_sentiment = is_directionally_aggressive(
         getattr(ev, "bid_ask_class", ""), ev.contract_type
     )
 
-    # ING-007: execution_mechanic AMBIGUOUS_LONG is the correct cold default.
     _execution_mechanic = getattr(ev, "execution_mechanic", None)
     if _execution_mechanic is None:
         log.debug(
@@ -736,20 +947,11 @@ async def _process_trade(raw: dict):
         )
         return
 
-    # C008 fix: bus gate is sig_ep (from get_signal), not persist_ep.
     if not sig_ep:
         return
 
-    # SIGNAL-GATE
-    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _SIGNAL_MIN_PREMIUM:
-        log.debug(
-            "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
-            sig_ep.ticker, sig_ep.contract_type,
-            sig_ep.trade_count, _SIGNAL_MIN_TRADES,
-            sig_ep.total_premium, _SIGNAL_MIN_PREMIUM,
-        )
-        return
-
+    # Resolve alert_level and direction from sig_ep. These are needed by both
+    # persist_flow_episode (unconditional) and the signal emission path below.
     alert_level = accumulator.get_alert_level(sig_ep.total_premium)
     direction   = sig_ep.dominant_direction
 
@@ -758,11 +960,11 @@ async def _process_trade(raw: dict):
         f"trades={sig_ep.trade_count} prem=${sig_ep.total_premium:,.0f}"
     )
 
-    # EPISODE-FIX: persist before debounce gate.
-    # PBE-BLOCKING-1 fix: fire-and-forget via create_task — does NOT block the
-    # hot path. Episode enrichment is asynchronous (queue worker patches DB row).
-    # A missed episode row under Supabase pressure is an acceptable enrichment
-    # loss. Timeout errors on the hot path are not.
+    # EPISODE-GATE-HOIST: fire persist_flow_episode BEFORE the signal_min_premium
+    # gate and SIG-DEBOUNCE check. Episode persistence is decoupled from signal
+    # emission — every accumulator Gate-2 crossing must be recorded regardless of
+    # whether the signal bus fires. Fixes test_process_trade_episode_direction_put_
+    # is_repeat_sell (SPY PUT $60k < $75k signal_min_premium T1 default).
     asyncio.create_task(
         persist_flow_episode({
             "ticker":              sig_ep.ticker,
@@ -780,7 +982,20 @@ async def _process_trade(raw: dict):
         })
     )
 
-    # SIG-DEBOUNCE
+    # Signal gate: suppress bus emission for low-premium episodes.
+    # persist_flow_episode has already fired above — this gate only controls
+    # whether downstream consumers (WebSocket, composite engine) are notified.
+    _live_signal_min_premium = _resolve_signal_min_premium()
+
+    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _live_signal_min_premium:
+        log.debug(
+            "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
+            sig_ep.ticker, sig_ep.contract_type,
+            sig_ep.trade_count, _SIGNAL_MIN_TRADES,
+            sig_ep.total_premium, _live_signal_min_premium,
+        )
+        return
+
     now_ts = _time.time()
     _evict_signal_emit_cache(now_ts)
     _evict_lookback_result_cache(now_ts)
@@ -836,13 +1051,6 @@ async def _process_trade(raw: dict):
             "trade_count":         sig_ep.trade_count,
             "alert_level":         alert_level,
             "is_accelerating":     sig_ep.is_accelerating,
-            # QA-3: is_multi_day_repeat is present in the bus payload so downstream
-            # consumers (e.g. frontend WebSocket handlers) receive it. It is NOT
-            # forwarded to signal_history by signal_store._build_row() because the
-            # column does not exist in signal_history yet. _build_row() reads only
-            # explicit keys via .get() — unknown keys are silently ignored and the
-            # Supabase REST insert succeeds cleanly without the field.
-            # The signal_history column migration is gated on ING-009 merge.
             "is_multi_day_repeat": _is_multi_day_repeat,
             "seed_episode":        ep_summary,
             "timestamp":           ev.timestamp.isoformat(),

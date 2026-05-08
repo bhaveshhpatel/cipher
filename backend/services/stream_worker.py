@@ -71,6 +71,21 @@ S2-POST-2 (2026-05-01):
 S2-POST-4 (2026-05-01):
   CancelledError in run() was swallowed (return instead of raise). Fixed:
   raise after log so the parent task/gather observes cancellation correctly.
+
+ING-010 (2026-05-07):
+  require_oi gate wired into tick_to_metrics().
+    gate_config_store.get("require_oi", tier_int) returns a float.
+    When value > 0.5 (i.e. effectively True / 1.0), oi_delta is populated
+    from the tick's open_interest field instead of always 0.0.
+    Falls back to 0.0 when field absent, store cold, or tier unknown.
+    This activates OI_SPIKE / OI_COLLAPSE breach types in the reconciler.
+
+  dedup_window_ms gate: owned entirely by DedupCache._is_dup_by_raw_key().
+    DedupCache reads gate_config_store directly on every dedup check —
+    no hot-reload mechanism needed in stream_worker. The previous
+    _last_dedup_window_ms + set_window_ms() pattern created two competing
+    mechanisms for the same gate and caused 64x redundant set_window_ms()
+    calls per epoch change. Removed in ING-010 cleanup.
 """
 import asyncio
 import json
@@ -86,6 +101,12 @@ import httpx
 from config import settings
 from services.threshold_reconciliation import SymbolMetrics, reconcile
 from utils.tradier_client import get_session_token
+
+# ING-010: tier-aware gate config store singleton.
+try:
+    from services.gate_config_store import store as _gate_store
+except Exception:  # pragma: no cover
+    _gate_store = None  # type: ignore[assignment]
 
 log = logging.getLogger("stream_worker")
 
@@ -125,9 +146,11 @@ _tier_map_refresh_task: Optional[asyncio.Task] = None
 
 # S2-POST-3 (#24): boolean flag prevents double-spawn across 64 workers
 # observing a stale cache on the same tick cycle.
-# Set True at _refresh_tier_map entry; cleared in its finally block.
-# GIL makes bool reads atomic so no asyncio.Lock is needed.
 _tier_map_refresh_in_progress: bool = False
+
+# ING-010: last known gate_config_store epoch — module-level so all workers
+# share the same epoch-change detection log (avoids 64x duplicate log lines).
+_last_gate_epoch_worker: int = -1
 
 
 def _int_tier_to_str(t: int) -> str:
@@ -135,10 +158,40 @@ def _int_tier_to_str(t: int) -> str:
     return f"T{t}" if t in (1, 2, 3) else "T3"
 
 
+# ---------------------------------------------------------------------------
+# ING-010: symbol → tier int resolver (used for gate_config_store lookups).
+# ---------------------------------------------------------------------------
+def _get_tier_int_for_symbol(symbol: str) -> int:
+    """
+    Resolve a symbol to a tier int (1, 2, or 3) using symbol_registry.
+    Falls back to 3 (most conservative gate) on any error or cold start.
+    Never raises. O(1) dict lookup when registry is warm.
+    """
+    try:
+        from services.symbol_registry import get_registry
+        reg = get_registry()
+        if reg is None or not reg.is_ready():
+            return 3
+        # influence_tier_string() returns e.g. "WHALE" / "INSTITUTIONAL" / etc.
+        tier_str = "RETAIL"
+        try:
+            tier_str = reg.influence_tier_string(symbol) or "RETAIL"
+        except AttributeError:
+            # Registry predating influence_tier_string() — fall through
+            pass
+        _tier_str_to_int = {
+            "WHALE": 1, "INSTITUTIONAL": 1,
+            "LARGE": 2,
+            "RETAIL": 3,
+        }
+        return _tier_str_to_int.get(tier_str, 3)
+    except Exception:
+        return 3
+
+
 async def _refresh_tier_map() -> None:
     """Background task: rebuild tier_map from tier_engine + symbol_registry."""
     global _tier_map_cache, _tier_map_ts, _tier_map_refresh_in_progress
-    # S2-POST-3 (#24): set flag at entry; cleared unconditionally in finally.
     _tier_map_refresh_in_progress = True
     try:
         from services.symbol_registry import get_registry
@@ -186,11 +239,7 @@ def _get_tier_map() -> dict[str, str]:
     return the current (possibly empty) cache immediately — never blocks.
     Cold start: returns {} → reconciler falls back to T3 for all symbols.
 
-    S2-POST-3 (#24): also checks _tier_map_refresh_in_progress to prevent
-    a second task from spawning while a refresh is already running. Since
-    _refresh_tier_map is a coroutine (not a thread), the GIL guarantees that
-    the bool read and the task.done() check are effectively atomic within a
-    single event-loop tick.
+    S2-POST-3 (#24): also checks _tier_map_refresh_in_progress.
     """
     global _tier_map_refresh_task
     now = _time.monotonic()
@@ -206,7 +255,6 @@ def _get_tier_map() -> dict[str, str]:
                     name="tier_map_refresh",
                 )
             except RuntimeError:
-                # No running event loop (unit tests calling synchronously)
                 pass
     return dict(_tier_map_cache)
 
@@ -215,7 +263,11 @@ def _get_tier_map() -> dict[str, str]:
 # APEX-S2: tick → SymbolMetrics
 # ---------------------------------------------------------------------------
 
-def tick_to_metrics(tick: dict, avg_volume: float = 1.0) -> Optional[SymbolMetrics]:
+def tick_to_metrics(
+    tick: dict,
+    avg_volume: float = 1.0,
+    tier_int: int = 3,
+) -> Optional[SymbolMetrics]:
     """
     Convert a raw Tradier timesale tick to a SymbolMetrics instance.
 
@@ -224,12 +276,19 @@ def tick_to_metrics(tick: dict, avg_volume: float = 1.0) -> Optional[SymbolMetri
       - symbol key is missing or empty
       - last price is missing, non-numeric, or <= 0
 
-    oi_delta is always 0.0 — Tradier timesale events do not carry OI.
-    OI is a chain-level field. OI_SPIKE / OI_COLLAPSE breach types are
-    suppressed in S2. S3 enrichment wires oi_delta from chain_store.
+    ING-010 — require_oi gate:
+      When gate_config_store.get("require_oi", tier_int) > 0.5 (i.e. 1.0 /
+      True), oi_delta is populated from the tick's open_interest field.
+      This activates OI_SPIKE / OI_COLLAPSE breach types in the reconciler
+      for T1/T2 symbols once the gate is enabled via the admin panel.
+      Falls back to 0.0 when:
+        - gate is 0 / disabled (default — S2 behaviour preserved)
+        - open_interest field is absent or non-numeric
+        - gate_config_store is cold (import guard above)
 
     avg_volume: pass symbol's average_volume from symbol_registry.
     Falls back to 1.0 if not provided or zero. volume_ratio = volume / avg_volume.
+    tier_int: int tier (1/2/3) used for gate_config_store lookups.
     """
     if tick.get(_TICK_TYPE) != _TICK_TYPE_TIMESALE:
         return None
@@ -255,8 +314,19 @@ def tick_to_metrics(tick: dict, avg_volume: float = 1.0) -> Optional[SymbolMetri
     except (TypeError, ValueError):
         volume = 0.0
 
-    # S2: oi_delta always 0.0 — timesale carries no OI (see docstring)
+    # ING-010: require_oi gate.
+    # Default: oi_delta = 0.0 (S2 behaviour, OI breach types suppressed).
+    # When gate active (> 0.5): read open_interest from tick payload.
     oi_delta: float = 0.0
+    try:
+        if _gate_store is not None:
+            require_oi_val = _gate_store.get("require_oi", tier_int)
+            if require_oi_val is not None and float(require_oi_val) > 0.5:
+                raw_oi = tick.get(_TICK_OI)
+                if raw_oi is not None:
+                    oi_delta = float(raw_oi)
+    except Exception:
+        oi_delta = 0.0  # safe fallback — never blocks the hot path
 
     premium_usd  = last * size
     base         = avg_volume if avg_volume and avg_volume > 0 else 1.0
@@ -331,6 +401,9 @@ class StreamWorker:
         self._last_stall_log_at:   float = 0.0
         # APEX-S2: per-worker reconcile accumulator (last-write-wins per symbol)
         self._pending: dict[str, SymbolMetrics] = {}
+        # NOTE: _last_dedup_window_ms removed in ING-010 cleanup.
+        # DedupCache._is_dup_by_raw_key() reads gate_config_store directly —
+        # no per-worker tracking needed.
 
     def update_symbols(self, new_symbols: list[str]):
         self.symbols = new_symbols
@@ -416,8 +489,43 @@ class StreamWorker:
     # ------------------------------------------------------------------
 
     def _process_tick(self, raw: dict) -> None:
-        """Convert raw tick to SymbolMetrics and accumulate into _pending."""
+        """
+        Convert raw tick to SymbolMetrics and accumulate into _pending.
+
+        ING-010 additions:
+          1. Resolve tier_int for the symbol before calling tick_to_metrics()
+             so the require_oi gate reads the correct per-tier value.
+          2. Log once per epoch change (module-level _last_gate_epoch_worker)
+             to confirm hot-reload propagated without spamming 64 workers.
+
+        Note: dedup_window_ms hot-reload is owned by DedupCache internally.
+        No set_window_ms() call here — DedupCache reads gate_config_store
+        directly on every dedup check.
+        """
+        global _last_gate_epoch_worker
+
         symbol = raw.get(_TICK_SYMBOL, "")
+
+        # ING-010: tier resolution + epoch-change detection.
+        tier_int = 3  # safe default
+        try:
+            if _gate_store is not None:
+                tier_int = _get_tier_int_for_symbol(symbol)
+
+                current_epoch = _gate_store.epoch
+                if current_epoch != _last_gate_epoch_worker:
+                    if _last_gate_epoch_worker >= 0:
+                        log.info(
+                            "[ING-010][worker-%d] gate_config_store epoch %d → %d — "
+                            "tier-aware gates updated on stream worker hot path",
+                            self.worker_id,
+                            _last_gate_epoch_worker,
+                            current_epoch,
+                        )
+                    _last_gate_epoch_worker = current_epoch
+        except Exception:
+            pass
+
         avg_volume = 1.0
         if symbol:
             try:
@@ -430,7 +538,7 @@ class StreamWorker:
             except Exception:
                 pass
 
-        metrics = tick_to_metrics(raw, avg_volume=avg_volume)
+        metrics = tick_to_metrics(raw, avg_volume=avg_volume, tier_int=tier_int)
         if metrics is not None:
             self._pending[metrics.symbol] = metrics
 
@@ -455,9 +563,6 @@ class StreamWorker:
     def _on_flush_done(self, task: asyncio.Task) -> None:
         """
         S2-POST-2 (#23): Done callback attached to every reconcile-flush task.
-        Logs at ERROR if the task raised an unhandled exception that escaped
-        _flush_pending's try/except — guards against future refactors that
-        weaken that guard.
         """
         if not task.cancelled():
             exc = task.exception()
@@ -471,8 +576,6 @@ class StreamWorker:
         """Periodic flush task running alongside the stream reader."""
         while self._running:
             await asyncio.sleep(_RECONCILE_INTERVAL_S)
-            # S2-POST-2 (#23): store task + attach done callback to surface
-            # silent failures from any future refactor that weakens _flush_pending.
             task = asyncio.create_task(
                 self._flush_pending(),
                 name=f"reconcile-flush-{self.worker_id}",
@@ -653,7 +756,7 @@ class StreamWorker:
                                             self.event_queue.qsize(),
                                         )
 
-                                    # APEX-S2
+                                    # APEX-S2 + ING-010
                                     self._process_tick(raw)
 
                                 log.info(
@@ -670,9 +773,6 @@ class StreamWorker:
                     )
 
                 except asyncio.CancelledError:
-                    # S2-POST-4 (#25): re-raise per asyncio contract.
-                    # flush_task.cancel() in the outer finally block runs
-                    # before this propagates, so shutdown is clean.
                     log.info("[worker-%d] Cancelled — stopping", self.worker_id)
                     raise
 

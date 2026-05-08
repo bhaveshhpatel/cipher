@@ -7,14 +7,16 @@ Architecture change (Layer 1):
 
 ING-002: Hard per-event $10k premium floor.
   parse_tradier_trade() returns the sentinel "below_premium" for events
-  whose premium (fill * size * 100) is below _MIN_EVENT_PREMIUM.
-  This is a clean data-quality drop — not a parse error.
+  whose premium (fill * size * 100) is below the effective floor.
+  The floor is resolved tier-aware by the caller (_process_trade in
+  tradier_stream.py) and passed as min_premium kwarg. When min_premium
+  is None (e.g. unit tests, cold-start), the module-level _MIN_EVENT_PREMIUM
+  fallback applies (10_000). This maintains backwards compatibility with
+  all existing callers and tests.
   Counter: _stats["below_min_premium"] owned by this module (gate owns counter).
   Exposed via get_stats() — visible in /health/stream through tradier_stream.
   Sampling log: every _BELOW_PREMIUM_SAMPLE_RATE-th drop emits a DEBUG line
   with ticker + premium so the composition of this gate is observable.
-  Future: wire through ingestion_config key "min_event_premium" with
-  10_000 as hardcoded cold-start fallback (ING-002-CONFIG story).
 
 ING-004: Fallback underlying_price from registry stock_price.
   When Tradier omits underlying_price (returns 0.0), the registry
@@ -41,6 +43,13 @@ ING-006: Directional aggression classification.
   of contract_type (no valid spread data to claim aggression on).
   is_aggressive is NOT yet persisted as a separate column in flow_events;
   that column is added in the ING-007 migration (SA-Q2 deliberation, 2026-05-03).
+
+ING-010: Tier-aware min_premium floor.
+  parse_tradier_trade() accepts an optional min_premium kwarg.
+  When the caller supplies it (e.g. _process_trade resolves the ticker
+  tier from the registry, then reads gate_config_store.get("min_premium", tier)),
+  that value overrides _MIN_EVENT_PREMIUM for this tick only.
+  Backwards compatible: None falls back to _MIN_EVENT_PREMIUM (10_000).
 """
 import logging
 import re
@@ -60,10 +69,12 @@ except Exception:  # pragma: no cover
         return None
 
 # ---------------------------------------------------------------------------
-# ING-002: Hard per-event premium floor.
-# Hardcoded safe default — active at import time, no DB dependency, no cold-start gap.
-# Future: wire through ingestion_config key "min_event_premium" with this as
-# fallback when admin config page is built (ING-002-CONFIG).
+# ING-002 / ING-010: Per-event premium floor.
+# This is the module-level cold-start fallback. In production, _process_trade
+# in tradier_stream.py resolves the tier-aware floor from gate_config_store and
+# passes it as min_premium= to parse_tradier_trade(). This fallback is only
+# used when min_premium= is not supplied (tests, standalone callers, cold-start
+# before gate_config_store.load() has completed).
 # ---------------------------------------------------------------------------
 _MIN_EVENT_PREMIUM = 10_000
 
@@ -87,7 +98,7 @@ _BELOW_PREMIUM_SAMPLE_RATE = 500
 # counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
 # ---------------------------------------------------------------------------
 _stats: dict = {
-    "below_min_premium":                  0,  # ING-002: clean filter drops at parser premium floor ($10k)
+    "below_min_premium":                  0,  # ING-002: clean filter drops at parser premium floor
     "underlying_price_fallback_applied":  0,  # ING-004: ticks where registry stock_price used as fallback
 }
 
@@ -181,16 +192,30 @@ def _parse_timestamp(ts) -> datetime:
         return datetime.utcnow()
 
 
-def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_premium"], None]:
+def parse_tradier_trade(
+    raw: dict,
+    min_premium: Optional[int] = None,
+) -> Union[OptionsFlowEvent, Literal["below_premium"], None]:
     """Parse a single Tradier stream trade dict into OptionsFlowEvent.
+
+    Args:
+        raw:         Raw Tradier timesale tick dict.
+        min_premium: ING-010 — tier-aware premium floor resolved by the caller.
+                     When None, falls back to module-level _MIN_EVENT_PREMIUM (10_000).
+                     Caller (_process_trade) resolves: registry.influence_tier(ticker)
+                     -> gate_config_store.get("min_premium", tier_int) and passes result.
 
     Returns:
       OptionsFlowEvent  — valid event, passes all gates
-      "below_premium"   — clean filter drop: premium < _MIN_EVENT_PREMIUM (ING-002)
+      "below_premium"   — clean filter drop: premium < effective floor (ING-002/ING-010)
                           Caller must NOT increment parse_failed for this sentinel.
                           _stats["below_min_premium"] is incremented here, by the gate.
       None              — genuine parse error or size==0 guard triggered
     """
+    # ING-010: resolve effective floor for this tick.
+    # Caller supplies tier-resolved value; fallback to module constant when absent.
+    effective_floor: int = min_premium if min_premium is not None else _MIN_EVENT_PREMIUM
+
     try:
         symbol = raw.get("symbol", "")
 
@@ -210,29 +235,29 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
 
         premium = fill * size * 100
 
-        # ING-002: Hard per-event premium floor.
+        # ING-002 / ING-010: Tier-aware per-event premium floor.
         # Gate fires after size==0 guard, after premium is known,
         # before OCC parsing and OptionsFlowEvent construction.
         # Counter incremented here — gate owns its counter.
         # Sampling log: every _BELOW_PREMIUM_SAMPLE_RATE-th drop emits a DEBUG
         # line so the ticker composition of this gate is observable in logs.
-        if premium < _MIN_EVENT_PREMIUM:
+        if premium < effective_floor:
             _stats["below_min_premium"] += 1
             if (
                 _BELOW_PREMIUM_SAMPLE_RATE > 0
                 and _stats["below_min_premium"] % _BELOW_PREMIUM_SAMPLE_RATE == 0
             ):
-                # Best-effort ticker extraction — OCC parse not yet run, use raw fields.
                 sample_ticker = (
                     raw.get("underlying")
                     or (symbol.split()[0] if symbol else symbol)
                     or "UNKNOWN"
                 )
                 logger.debug(
-                    "[below_premium] %s prem=$%s (floor=$%s) sample=%d/total=%d",
+                    "[below_premium] %s prem=$%s (floor=$%s tier_resolved=%s) sample=%d/total=%d",
                     sample_ticker,
                     f"{premium:,.0f}",
-                    f"{_MIN_EVENT_PREMIUM:,}",
+                    f"{effective_floor:,}",
+                    min_premium is not None,
                     _BELOW_PREMIUM_SAMPLE_RATE,
                     _stats["below_min_premium"],
                 )
@@ -373,11 +398,6 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
                     ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
 
                 # ING-004: Fallback underlying_price from registry stock_price.
-                # Fires whether or not meta was found — stock_price is ticker-level,
-                # not contract-level. Only applied when tick value is 0.0 (Tradier
-                # frequently omits this field in timesale events).
-                # Placement after meta block so ev.ticker is already canonical.
-                # Deliberation: 2026-05-03 — SA/PBE/QA all signed off.
                 if ev.underlying_price == 0.0:
                     sp = reg.stock_price(ev.ticker)
                     if sp > 0.0:
@@ -387,20 +407,7 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
             pass
 
         # ------------------------------------------------------------------
-        # ING-006 (F1 fix): re-compute is_aggressive AFTER registry enrichment,
-        # in its own isolated try/except.
-        #
-        # WHY separate from registry try/except:
-        # The registry enrichment block above uses a catch-all `except Exception: pass`.
-        # If that block raised mid-way (before reaching this code), is_aggressive
-        # would retain its pre-enrichment value — stale if registry flipped
-        # ev.contract_type (PUT->CALL or CALL->PUT) on an AT_BID/BELOW_BID fill.
-        # By placing re-computation outside that try/except, registry errors
-        # cannot silently skip the aggression update.
-        #
-        # Synthetic quotes are exempt: is_aggressive is pinned False regardless
-        # of contract_type — no valid spread data to claim aggression on.
-        # Deliberation: SA finding F1, 2026-05-03.
+        # ING-006 (F1 fix): re-compute is_aggressive AFTER registry enrichment.
         # ------------------------------------------------------------------
         if not ev.is_synthetic_quote:
             try:
@@ -408,7 +415,7 @@ def parse_tradier_trade(raw: dict) -> Union[OptionsFlowEvent, Literal["below_pre
                     ev.bid_ask_class, ev.contract_type
                 )
             except Exception:
-                pass  # is_aggressive retains pre-enrichment value on unexpected error
+                pass
 
         return ev
     except Exception:
