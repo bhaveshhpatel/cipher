@@ -9,14 +9,12 @@ Design contract (from ING-010 / issue #84)
                    populates the in-memory cache.  Advances ``epoch``.
 * get(gate,tier) — thread-safe read.  Falls back to T3 for unknown tiers;
                    returns 0.0 for gate names not in this store.
+                   Boolean gates (require_oi, exclude_indices) return bool.
 * update(gate, tier, value, ...)
                  — validates bounds and (optionally) market-hours guard,
                    PATCHes the DB row atomically, inserts an audit record
                    (non-fatal on failure), then updates the in-memory cache
                    and increments ``epoch``.
-                   Raises ValueError for tier!=1 on tier-independent gates
-                   (e.g. exclude_indices) — those rows are seeded for schema
-                   completeness but only tier=1 is read at runtime.
 * assert_store_epoch_parity(gate_epoch, chain_epoch, universe_epoch)
                  — staticmethod.  Asserts that dependent stores (chain,
                    universe) are not *ahead* of the gate store.  A dependent
@@ -49,18 +47,18 @@ Gate catalogue (gate_name → value_type)
                          signal is emitted.  Resolved live per-tick via
                          _resolve_signal_min_premium() in tradier_stream.py.
                          Fallback (cold-start): _SIGNAL_MIN_PREMIUM=50_000.
-    exclude_indices      boolean       (0/1)default all=1.0 (filter ON)
-                         Tier-independent gate. Only the tier=1 row is read
-                         by tradier_stream._process_trade(). Tiers 2+3 are
-                         seeded for schema completeness but ignored at runtime.
-                         update() raises ValueError for tier!=1 on this gate.
-                         1.0 = exclude index options (SPY/QQQ/IWM/etc.) from flow.
-                         0.0 = allow index options through (pass-through mode).
+    exclude_indices      boolean       (0/1)default all=1 (filter ON)
+                         1 = exclude index options (SPY/QQQ/IWM/etc.) from flow.
+                         0 = allow index options through (pass-through mode).
+                         All three tiers are independently configurable.
+                         At runtime, tradier_stream reads tier=1; tiers 2+3
+                         serve as pre-seeded defaults for future per-tier logic.
 
     Alias: "debounce_ms" is accepted as a shorthand for "signal_debounce_ms"
     so that test fixtures that use the shorter name resolve correctly.
 
     get() returns 0.0 for any gate_name not in this catalogue.
+    get() returns bool for boolean gates (require_oi, exclude_indices).
 """
 from __future__ import annotations
 
@@ -88,9 +86,8 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     # tradier_stream.py.  Cold-start fallback: _SIGNAL_MIN_PREMIUM=50_000.
     "signal_min_premium":   {1: 50_000.0, 2: 35_000.0, 3: 20_000.0},
     # ING-011: Gate 6 — index options filter.
-    # Default 1.0 (filter ON) for all tiers — index noise suppressed at cold
-    # start. Only tier=1 is read at runtime; tiers 2+3 seeded for completeness.
-    # update() raises ValueError for tier!=1 — those writes would be silent no-ops.
+    # Default True (filter ON) for all tiers — index noise suppressed at cold
+    # start.  All tiers are independently configurable.
     "exclude_indices":      {1: 1.0,      2: 1.0,      3: 1.0},
 }
 
@@ -98,6 +95,7 @@ _DEFAULTS: dict[str, dict[int, float]] = {
 # Bounds enforced by update() — (lo, hi, cast)
 # cast is the Python type constructor used to coerce/validate the value.
 # bool gates use cast=bool; currency/multiplier/ms gates use int or float.
+# get() uses cast to determine the return type for each gate.
 # Mirrors the min_value/max_value columns in the DB.
 # ---------------------------------------------------------------------------
 _BOUNDS: dict[str, tuple[float, float, Callable]] = {
@@ -113,9 +111,11 @@ _BOUNDS: dict[str, tuple[float, float, Callable]] = {
 _VALID_GATES = frozenset(_DEFAULTS.keys())
 _VALID_TIERS = frozenset({1, 2, 3})
 
-# Gates where only tier=1 is read at runtime. update() rejects tier!=1 with
-# ValueError to prevent silent no-op writes to tier=2/3 rows.
-_TIER_INDEPENDENT_GATES = frozenset({"exclude_indices"})
+# Gates where only tier=1 is consumed at runtime by the ingestion pipeline.
+# This set is intentionally empty — all tiers are fully writable so that
+# per-tier gate logic can be introduced without schema changes.  The advisory
+# note about tradier_stream reading only tier=1 lives in the docstring above.
+_TIER_INDEPENDENT_GATES: frozenset[str] = frozenset()
 
 # Market-hours window: Mon–Fri 09:30–16:00 ET == 13:30–20:00 UTC
 _MARKET_OPEN_UTC  = datetime.time(13, 30)
@@ -166,14 +166,16 @@ class GateConfigStore:
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, gate_name: str, tier: int) -> float:
+    def get(self, gate_name: str, tier: int) -> float | bool:
         """
         Return the current threshold for *gate_name* at *tier*.
 
         Returns
         -------
+        bool
+            For boolean gates (require_oi, exclude_indices).
         float
-            The stored value when gate_name is a known ingestion gate.
+            For all other known gates.
         0.0
             When gate_name is not in this store's catalogue.
 
@@ -187,12 +189,15 @@ class GateConfigStore:
         if gate_name not in _VALID_GATES:
             return 0.0
         safe_tier = tier if tier in _VALID_TIERS else 3
+        cast = _BOUNDS[gate_name][2]
         with self._lock:
             gate_data = self._cache.get(gate_name)
             if gate_data is None:
                 return 0.0
             value = gate_data.get(safe_tier, gate_data.get(3))
-            return float(value) if value is not None else 0.0
+            if value is None:
+                return 0.0
+            return cast(value)
 
     async def load(self) -> None:
         """
@@ -263,8 +268,7 @@ class GateConfigStore:
 
         Raises
         ------
-        ValueError   — unknown gate, invalid tier, tier!=1 for tier-independent
-                       gates, out-of-bounds value, market open guard
+        ValueError   — unknown gate, invalid tier, out-of-bounds value, market open guard
         RuntimeError — DB PATCH non-2xx
         """
         gate_name = self._resolve_alias(gate_name)
@@ -274,14 +278,6 @@ class GateConfigStore:
 
         if tier not in _VALID_TIERS:
             raise ValueError(f"Invalid tier: {tier!r} — must be 1, 2, or 3")
-
-        if gate_name in _TIER_INDEPENDENT_GATES and tier != 1:
-            raise ValueError(
-                f"'{gate_name}' is a tier-independent gate — only tier=1 is "
-                f"read at runtime by the ingestion pipeline. Tiers 2 and 3 are "
-                f"seeded for schema completeness but updating them has no effect. "
-                f"Use tier=1 to change this gate."
-            )
 
         if not confirm_market_hours and _is_market_open():
             raise ValueError(
