@@ -10,3 +10,9 @@ export type { UseMarketStatusReturn } from "./useMarketStatus";
 
 export { useAlerts }       from "./useAlerts";
 export type { UseAlertsReturn } from "./useAlerts";
+
+export { useGateConfig }   from "./useGateConfig";
+export type { UseGateConfigReturn } from "./useGateConfig";
+
+export { useGatePatch }    from "./useGatePatch";
+export type { UseGatePatchReturn, StatusMap } from "./useGatePatch";
