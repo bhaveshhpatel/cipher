@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from backend.services.gate_config_store import (
+from services.gate_config_store import (
     GateConfigStore,
     _BOUNDS,
     _FALLBACK,
@@ -224,7 +224,7 @@ class TestBoundsEnforcementPerTier:
             mid_val = cast((lo + hi) / 2.0)
         store = _fresh_store()  # no DB, so update() is in-memory only
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -265,7 +265,7 @@ class TestUpdateRoundtripPerTier:
             new_val = cast((lo + hi) / 2.0)
         store = _fresh_store()
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -286,7 +286,7 @@ class TestUpdateRoundtripPerTier:
         store = _fresh_store()
         old_val = store.get(gate, tier)
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -311,7 +311,7 @@ class TestUpdateRoundtripPerTier:
         store = _fresh_store()
         snapshot_before = {t: store.get(gate, t) for t in _ALL_TIERS if t != tier}
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -336,7 +336,7 @@ class TestUpdateRoundtripPerTier:
             for t in _ALL_TIERS
         }
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -364,7 +364,7 @@ class TestEpochMonotonicPerTier:
         store = _fresh_store()
         epoch_before = store.epoch
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -383,7 +383,7 @@ class TestEpochMonotonicPerTier:
         store = _fresh_store()
         epoch_start = store.epoch
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _OFF_HOURS_DT
             mock_dt.time = datetime.time
@@ -470,7 +470,7 @@ class TestMarketHoursGuardPerTier:
         new_val: Any = True if cast is bool else cast((lo + hi) / 2.0)
         store = _wired_store()
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _MARKET_DT
             mock_dt.time = datetime.time
@@ -486,7 +486,7 @@ class TestMarketHoursGuardPerTier:
         new_val: Any = True if cast is bool else cast((lo + hi) / 2.0)
         store = _fresh_store()  # no DB, so avoids HTTP
         with patch(
-            "backend.services.gate_config_store.datetime.datetime"
+            "services.gate_config_store.datetime.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = _MARKET_DT
             mock_dt.time = datetime.time

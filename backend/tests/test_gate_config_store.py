@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from backend.services.gate_config_store import (
+from services.gate_config_store import (
     GateConfigStore,
     _BOUNDS,
     _DEFAULTS,
@@ -151,7 +151,7 @@ class TestLoad:
     async def test_load_overwrites_defaults_from_db(self):
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 3, "value": 7_500.0}]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         assert s.get("min_premium", 3) == 7_500.0
 
@@ -159,7 +159,7 @@ class TestLoad:
     async def test_load_increments_epoch(self):
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 1, "value": 25_000.0}]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             assert s.epoch == 0
             await s.load()
             assert s.epoch == 1
@@ -171,7 +171,7 @@ class TestLoad:
         The in-memory cache is never mutated so defaults are preserved.
         """
         s = make_store()
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get([], status=500)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get([], status=500)):
             # load() allows the exception to propagate — caller handles it
             with pytest.raises(httpx.HTTPStatusError):
                 await s.load()
@@ -186,7 +186,7 @@ class TestLoad:
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
         client.get = AsyncMock(side_effect=Exception("timeout"))
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=client):
             with pytest.raises(Exception, match="timeout"):
                 await s.load()
         # Defaults preserved because cache was never touched
@@ -200,7 +200,7 @@ class TestLoad:
         """
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 99, "value": 999.0}]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         # tier 99 stored but get(99) maps to T3 — still 10_000 default (row only set 99)
         assert s.get("min_premium", 3) == 10_000.0
@@ -215,7 +215,7 @@ class TestLoad:
             {"gate_name": "min_premium", "tier": 2, "value": 20_000.0},
             {"gate_name": "dedup_window_ms", "tier": 1, "value": 3_000.0},
         ]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         assert s.get("min_premium", 1) == 30_000.0
         assert s.get("min_premium", 2) == 20_000.0
@@ -232,7 +232,7 @@ class TestLoad:
             "min_value": 2_000.0,
             "max_value": 400_000.0,
         }]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         assert s._bounds_cache["min_premium"] == (2_000.0, 400_000.0)
 
@@ -362,7 +362,7 @@ class TestMarketHoursGuard:
     @pytest.mark.asyncio
     async def test_market_hours_no_confirm_raises(self):
         s = make_store()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _market_hours_dt()
             mock_dt.time = datetime.time
             with pytest.raises(ValueError, match="Market is currently open"):
@@ -372,10 +372,10 @@ class TestMarketHoursGuard:
     async def test_market_hours_with_confirm_proceeds(self):
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _market_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 3, 12_000, confirm_market_hours=True)
         assert result["new_value"] == 12_000
 
@@ -384,10 +384,10 @@ class TestMarketHoursGuard:
         """Off-hours update with confirm_market_hours=False must NOT raise."""
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 2, 18_000, confirm_market_hours=False)
         assert result["new_value"] == 18_000
 
@@ -401,10 +401,10 @@ class TestUpdate:
     async def test_update_changes_in_memory_value(self):
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 await s.update("min_premium", 3, 12_000)
         assert s.get("min_premium", 3) == 12_000
 
@@ -412,10 +412,10 @@ class TestUpdate:
     async def test_update_returns_old_and_new_values(self):
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 3, 12_000)
         assert result["old_value"] == 10_000.0
         assert result["new_value"] == 12_000
@@ -427,10 +427,10 @@ class TestUpdate:
         s = make_store()
         epoch_before = s.epoch
         client_mock = mock_http_patch_audit()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 await s.update("signal_debounce_ms", 1, 45_000)
         assert s.epoch == epoch_before + 1
 
@@ -438,10 +438,10 @@ class TestUpdate:
     async def test_update_db_patch_failure_raises_runtime_error(self):
         s = make_store()
         client_mock = mock_http_patch_audit(patch_status=500)
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 with pytest.raises(RuntimeError, match="DB PATCH failed"):
                     await s.update("min_premium", 1, 30_000)
 
@@ -451,10 +451,10 @@ class TestUpdate:
         s = make_store()
         original_value = s.get("min_premium", 1)
         client_mock = mock_http_patch_audit(patch_status=500)
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 with pytest.raises(RuntimeError):
                     await s.update("min_premium", 1, 30_000)
         assert s.get("min_premium", 1) == original_value
@@ -462,7 +462,7 @@ class TestUpdate:
     @pytest.mark.asyncio
     async def test_update_no_db_mode_updates_in_memory_only(self):
         s = make_no_db_store()
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
             result = await s.update("min_premium", 2, 20_000)
@@ -474,7 +474,7 @@ class TestUpdate:
     async def test_update_no_db_mode_increments_epoch(self):
         s = make_no_db_store()
         epoch_before = s.epoch
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
             await s.update("min_premium", 2, 20_000)
@@ -485,10 +485,10 @@ class TestUpdate:
         """Audit POST failure must not raise — update() result still returned."""
         s = make_store()
         client_mock = mock_http_patch_audit(patch_status=204, audit_status=500)
-        with patch("backend.services.gate_config_store.datetime.datetime") as mock_dt:
+        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
             mock_dt.now.return_value = _off_hours_dt()
             mock_dt.time = datetime.time
-            with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
+            with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("dedup_window_ms", 2, 8_000)
         assert result["new_value"] == 8_000
         assert s.get("dedup_window_ms", 2) == 8_000
@@ -507,7 +507,7 @@ class TestEpoch:
     async def test_load_advances_epoch(self):
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 1, "value": 25_000.0}]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         assert s.epoch == 1
 
@@ -515,9 +515,9 @@ class TestEpoch:
     async def test_load_called_twice_epoch_is_two(self):
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 1, "value": 25_000.0}]
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
-        with patch("backend.services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
+        with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
         assert s.epoch == 2
 
