@@ -13,7 +13,7 @@ No story moves to `In Progress` without sign-off from all three roles.
 ## Resolved Pre-Sprint Research
 
 ### ING-001 — Tradier `order_side` Field — ✅ CLOSED (Resolved Before Sprint Start)
-**Finding:** Tradier's timesale WebSocket stream does **not** include `order_side`, `side`, or `aggressor_side` in the tick payload. This is a platform-level limitation — Tradier's documented timesale fields are: `type`, `symbol`, `exchange`, `bid`, `ask`, `last`, `size`, `date`, `open`, `high`, `low`, `close`, `prevclose`. No aggressor-side field exists.
+**Finding:** Tradier’s timesale WebSocket stream does **not** include `order_side`, `side`, or `aggressor_side` in the tick payload. This is a platform-level limitation — Tradier’s documented timesale fields are: `type`, `symbol`, `exchange`, `bid`, `ask`, `last`, `size`, `date`, `open`, `high`, `low`, `close`, `prevclose`. No aggressor-side field exists.
 
 **Resolution:** Fill-placement relative to the bid/ask spread is the industry-standard proxy for aggression when true `order_side` is unavailable. CBOE LiveVol, Unusual Whales, and all major retail options flow tools use this same heuristic. WallStreetJesus himself almost certainly uses fill-at-ask as his aggression proxy since true `order_side` requires OPRA full-feed access (institutional-tier cost).
 
@@ -186,6 +186,26 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 ---
 
+## Post-ING-010 Findings — Admin UI Surface (2026-05-08)
+
+Filed during ING-010 branch work. Frontend surface for the gate control plane is a separate parallel-track story.
+
+| Issue | Title | Blocking? | Sprint Slot | Status |
+|-------|-------|-----------|-------------|--------|
+| [#87](https://github.com/bhaveshhpatel/cipher/issues/87) | ADMIN-UI-001: Gate Control Panel — frontend surface for ING-010 gate control plane | Not blocking ING-010 merge. Parallel frontend track. | `admin/ing-gate-control-panel` branch | 🟡 In Progress — Chunks 1–4 complete |
+
+### ING-010 Post-Merge Admin UI Checklist
+
+> To be completed once ING-010 merges to `main`.
+
+- ☐ Merge `admin/ing-gate-control-panel` → `main` after ING-010 is on `main`
+- ☐ Verify `GET /api/admin/gate-config` and `PATCH /api/admin/gate-config` endpoints reachable from Vercel prod
+- ☐ Smoke-test: load Gate Control Panel in prod admin UI, confirm all 5 gates × 3 tiers render with live DB values
+- ☐ `docs/ARCHITECTURE.md` — document `GateConfigStore` singleton, `gate_configs` DB table, 5-gate × 3-tier threshold matrix
+- ☐ Close Issue [#87](https://github.com/bhaveshhpatel/cipher/issues/87) after merge
+
+---
+
 ## Story Detail
 
 ---
@@ -340,4 +360,4 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 ---
 
-*Last updated: 2026-05-08 — ING-010 branch created and active; all pre-merge deliberation findings resolved on `ing/s10-tiered-gate-control-plane`; 20 commits landed 2026-05-08 covering gate contract alignment, migration fixes, EPISODE-FIX regression, and EI-1–EI-10 stream-side exclude_indices gate tests.*
+*Last updated: 2026-05-08 — ING-010 branch active; all pre-merge deliberation findings resolved; ADMIN-UI-001 (Issue [#87](https://github.com/bhaveshhpatel/cipher/issues/87)) filed as parallel frontend track for ING-010 gate control plane UI — Chunks 1–4 complete on `admin/ing-gate-control-panel`.*
