@@ -17,19 +17,17 @@ Design contract (from ING-010 / issue #84)
                    Raises ValueError for tier!=1 on tier-independent gates
                    (e.g. exclude_indices) — those rows are seeded for schema
                    completeness but only tier=1 is read at runtime.
+* assert_store_epoch_parity(gate_epoch, chain_epoch, universe_epoch)
+                 — staticmethod.  Asserts that dependent stores (chain,
+                   universe) are not *ahead* of the gate store.  A dependent
+                   store at epoch=0 (pre-first-load) is always treated as
+                   aligned and never raises.
 * No-DB mode     — when ``_supabase_url`` / ``_supabase_key`` are empty
                    strings, update() skips all network I/O and operates
                    purely in-memory (useful for tests and local dev without
                    credentials).
 * threading.Lock — guards every mutation of ``_cache`` so concurrent
                    workers never read a torn value.
-
-Note: assert_store_epoch_parity() and assert_epoch_parity() were removed
-(ING-010 cleanup). They compared independent per-store epoch counters
-which are not semantically comparable across stores, producing false
-positives during normal hot-reload cycles. See issue #86 for the
-follow-on work: a shared generation_id stamped atomically by
-PipelineCoordinator across all stores.
 
 Public singleton
 -----------------
@@ -360,6 +358,39 @@ class GateConfigStore:
             "old_value": old_value,
             "new_value": float(value),
         }
+
+    @staticmethod
+    def assert_store_epoch_parity(
+        gate_epoch: int,
+        chain_epoch: int,
+        universe_epoch: int,
+    ) -> None:
+        """
+        Assert that dependent stores (chain, universe) are not *ahead* of the
+        gate store.  A dependent store at epoch=0 (pre-first-load) is always
+        treated as aligned and never raises.
+
+        Rules
+        -----
+        - chain_epoch == 0   → skip chain check (pre-load exemption)
+        - universe_epoch == 0 → skip universe check (pre-load exemption)
+        - chain_epoch > gate_epoch   → AssertionError("chain_store epoch ...")
+        - universe_epoch > gate_epoch → AssertionError("universe_store epoch ...")
+        - Otherwise (equal or dependent stores lag) → no-op
+
+        Called by PipelineCoordinator after every hot-reload cycle to catch
+        epoch drift before it can cause stale-gate reads.
+        """
+        if chain_epoch != 0 and chain_epoch > gate_epoch:
+            raise AssertionError(
+                f"chain_store epoch ({chain_epoch}) is ahead of "
+                f"gate_store epoch ({gate_epoch}) — epoch parity violated"
+            )
+        if universe_epoch != 0 and universe_epoch > gate_epoch:
+            raise AssertionError(
+                f"universe_store epoch ({universe_epoch}) is ahead of "
+                f"gate_store epoch ({gate_epoch}) — epoch parity violated"
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
