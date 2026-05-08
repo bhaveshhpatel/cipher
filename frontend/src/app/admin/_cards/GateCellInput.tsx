@@ -14,6 +14,11 @@
  * last failed PATCH so the admin knows *why* the save failed, not just that
  * it did. The draft is reset to the last confirmed server value on error
  * so there is no ambiguity about what value is actually in the DB.
+ *
+ * 428 market-hours flow:
+ *   When status === "market_confirm" an amber inline banner replaces the
+ *   normal save controls, showing the pending new value and two buttons:
+ *   Confirm (re-sends with confirm_market_hours: true) and Cancel (discards).
  */
 "use client";
 import React, { useState, useEffect } from "react";
@@ -29,11 +34,15 @@ import {
 import type { GateRow, SaveStatus } from "@/types/gates";
 
 export interface GateCellInputProps {
-  row:        GateRow;
-  status:     SaveStatus;
+  row:            GateRow;
+  status:         SaveStatus;
   /** Human-readable error message from the last failed PATCH, if any. */
-  saveError?: string;
-  onSave:     (newValue: number, reason: string | null) => void;
+  saveError?:     string;
+  onSave:         (newValue: number, reason: string | null) => void;
+  /** Called when admin confirms a 428-gated save during market hours. */
+  onConfirm?:     () => void;
+  /** Called when admin cancels a 428-gated save. */
+  onCancelConfirm?: () => void;
 }
 
 /** Convert stored value → display string */
@@ -49,7 +58,14 @@ function fromDisplay(gateName: string, display: string): number {
   return MS_GATES.has(gateName) ? n * 1000 : n;
 }
 
-export function GateCellInput({ row, status, saveError, onSave }: GateCellInputProps) {
+export function GateCellInput({
+  row,
+  status,
+  saveError,
+  onSave,
+  onConfirm,
+  onCancelConfirm,
+}: GateCellInputProps) {
   const isToggle = TOGGLE_GATES.has(row.gate_name);
   const isDollar = DOLLAR_GATES.has(row.gate_name);
   const isMs     = MS_GATES.has(row.gate_name);
@@ -101,6 +117,69 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
     setReason("");
   }
 
+  // ── Market-hours confirmation banner (428 flow) ──────────────
+  // Rendered instead of normal controls while waiting for admin
+  // to confirm or cancel a live-market gate edit.
+  if (status === "market_confirm") {
+    const pendingDisplay = isDollar
+      ? `$${storedDraft.toLocaleString()}`
+      : isMs
+      ? `${storedDraft / 1000}s`
+      : String(storedDraft);
+
+    return (
+      <div
+        data-testid={`cell-${row.gate_name}-${row.tier}`}
+        className="flex flex-col gap-1.5"
+        style={{
+          background: "rgba(217,119,6,0.08)",
+          border:     `1px solid rgba(217,119,6,0.35)`,
+          borderRadius: "6px",
+          padding: "6px 8px",
+        }}
+      >
+        <p
+          className="text-xs font-mono font-semibold"
+          style={{ color: "#d97706" }}
+        >
+          ⚠ Market is open
+        </p>
+        <p className="text-xs font-mono" style={{ color: A.muted }}>
+          Save <span style={{ color: A.text, fontWeight: 600 }}>{pendingDisplay}</span> during live
+          trading?
+        </p>
+        <div className="flex gap-1.5">
+          <button
+            data-testid={`confirm-btn-${row.gate_name}-${row.tier}`}
+            onClick={onConfirm}
+            className="px-2 py-0.5 rounded text-xs font-mono font-semibold"
+            style={{
+              background: "rgba(217,119,6,0.18)",
+              border:     `1px solid rgba(217,119,6,0.5)`,
+              color:      "#d97706",
+              cursor:     "pointer",
+            }}
+          >
+            Confirm
+          </button>
+          <button
+            data-testid={`cancel-btn-${row.gate_name}-${row.tier}`}
+            onClick={onCancelConfirm}
+            className="px-2 py-0.5 rounded text-xs font-mono"
+            style={{
+              background: A.bg,
+              border:     `1px solid ${A.border}`,
+              color:      A.muted,
+              cursor:     "pointer",
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // ── Toggle gate ──────────────────────────────────────────────
   if (isToggle) {
     const isOn = row.value === 1;
@@ -133,7 +212,6 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
           </button>
           <SaveStatusBadge status={status} />
         </div>
-        {/* Save error message for toggle gates */}
         {status === "error" && saveError && (
           <p
             data-testid={`save-err-${row.gate_name}-${row.tier}`}
@@ -194,7 +272,6 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
         <SaveStatusBadge status={status} />
       </div>
 
-      {/* Client-side validation error */}
       {validErr && (
         <p
           data-testid={`err-${row.gate_name}-${row.tier}`}
@@ -205,7 +282,6 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
         </p>
       )}
 
-      {/* Server-side save error — shown when status=error and message available */}
       {status === "error" && saveError && (
         <p
           data-testid={`save-err-${row.gate_name}-${row.tier}`}
@@ -216,7 +292,6 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
         </p>
       )}
 
-      {/* Reason input — only when dirty and no validation error */}
       {dirty && !validErr && (
         <input
           aria-label={`Reason for changing ${row.gate_name} tier ${row.tier}`}
@@ -242,33 +317,21 @@ export function GateCellInput({ row, status, saveError, onSave }: GateCellInputP
 function SaveStatusBadge({ status }: { status: SaveStatus }) {
   if (status === "saved") {
     return (
-      <span
-        data-testid="badge-saved"
-        className="text-xs font-mono"
-        style={{ color: A.green }}
-      >
+      <span data-testid="badge-saved" className="text-xs font-mono" style={{ color: A.green }}>
         ✓
       </span>
     );
   }
   if (status === "error") {
     return (
-      <span
-        data-testid="badge-error"
-        className="text-xs font-mono"
-        style={{ color: A.red }}
-      >
+      <span data-testid="badge-error" className="text-xs font-mono" style={{ color: A.red }}>
         ✗
       </span>
     );
   }
   if (status === "saving") {
     return (
-      <span
-        data-testid="badge-saving"
-        className="text-xs font-mono animate-pulse"
-        style={{ color: A.muted }}
-      >
+      <span data-testid="badge-saving" className="text-xs font-mono animate-pulse" style={{ color: A.muted }}>
         …
       </span>
     );

@@ -32,7 +32,16 @@ export interface PatchGateResponse {
   epoch: number;
 }
 
-export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+/**
+ * SaveStatus — per-cell save lifecycle:
+ *   idle           → no pending action
+ *   saving         → PATCH in-flight
+ *   saved          → PATCH succeeded (auto-resets to idle after 2.5 s)
+ *   error          → PATCH failed with a non-428 error
+ *   market_confirm → PATCH returned 428; waiting for admin confirmation
+ *                    to re-send with confirm_market_hours: true
+ */
+export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error' | 'market_confirm';
 
 /** Maps canonical gate_name → human-readable label */
 export const GATE_LABELS: Record<string, string> = {
