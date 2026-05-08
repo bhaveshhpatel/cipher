@@ -80,15 +80,12 @@ ING-010 (2026-05-07):
     Falls back to 0.0 when field absent, store cold, or tier unknown.
     This activates OI_SPIKE / OI_COLLAPSE breach types in the reconciler.
 
-  dedup_window_ms gate wired into StreamWorker._process_tick().
-    After every tick, resolve the symbol's tier and read
-    gate_config_store.get("dedup_window_ms", tier_int).
-    When the returned value differs from _last_dedup_window_ms, call
-    flow_dedup.set_window_ms(new_ms) to hot-reload the dedup window.
-    Per-worker _last_dedup_window_ms tracks last applied value to avoid
-    a redundant set_window_ms() call on every single tick.
-    Epoch-change log fires once per epoch increment (same pattern as
-    tradier_stream.py).
+  dedup_window_ms gate: owned entirely by DedupCache._is_dup_by_raw_key().
+    DedupCache reads gate_config_store directly on every dedup check —
+    no hot-reload mechanism needed in stream_worker. The previous
+    _last_dedup_window_ms + set_window_ms() pattern created two competing
+    mechanisms for the same gate and caused 64x redundant set_window_ms()
+    calls per epoch change. Removed in ING-010 cleanup.
 """
 import asyncio
 import json
@@ -107,7 +104,7 @@ from utils.tradier_client import get_session_token
 
 # ING-010: tier-aware gate config store singleton.
 try:
-    from services.gate_config_store import gate_config_store as _gate_store
+    from services.gate_config_store import store as _gate_store
 except Exception:  # pragma: no cover
     _gate_store = None  # type: ignore[assignment]
 
@@ -404,9 +401,9 @@ class StreamWorker:
         self._last_stall_log_at:   float = 0.0
         # APEX-S2: per-worker reconcile accumulator (last-write-wins per symbol)
         self._pending: dict[str, SymbolMetrics] = {}
-        # ING-010: track last applied dedup window per worker to avoid
-        # calling flow_dedup.set_window_ms() redundantly on every tick.
-        self._last_dedup_window_ms: Optional[float] = None
+        # NOTE: _last_dedup_window_ms removed in ING-010 cleanup.
+        # DedupCache._is_dup_by_raw_key() reads gate_config_store directly —
+        # no per-worker tracking needed.
 
     def update_symbols(self, new_symbols: list[str]):
         self.symbols = new_symbols
@@ -498,11 +495,12 @@ class StreamWorker:
         ING-010 additions:
           1. Resolve tier_int for the symbol before calling tick_to_metrics()
              so the require_oi gate reads the correct per-tier value.
-          2. Hot-reload dedup window from gate_config_store.get(
-             'dedup_window_ms', tier_int) when the value has changed since
-             the last tick this worker processed for this symbol.
-          3. Log once per epoch change (module-level _last_gate_epoch_worker)
+          2. Log once per epoch change (module-level _last_gate_epoch_worker)
              to confirm hot-reload propagated without spamming 64 workers.
+
+        Note: dedup_window_ms hot-reload is owned by DedupCache internally.
+        No set_window_ms() call here — DedupCache reads gate_config_store
+        directly on every dedup check.
         """
         global _last_gate_epoch_worker
 
@@ -543,33 +541,6 @@ class StreamWorker:
         metrics = tick_to_metrics(raw, avg_volume=avg_volume, tier_int=tier_int)
         if metrics is not None:
             self._pending[metrics.symbol] = metrics
-
-        # ING-010: dedup_window_ms gate hot-reload.
-        # Read the current per-tier dedup window from the store and apply
-        # it to flow_dedup if it differs from the last value we set.
-        # This is synchronous and O(1) — safe on the hot path.
-        try:
-            if _gate_store is not None and symbol:
-                new_window_ms = _gate_store.get("dedup_window_ms", tier_int)
-                if (
-                    new_window_ms is not None
-                    and new_window_ms != self._last_dedup_window_ms
-                ):
-                    from utils.dedup import flow_dedup
-                    if hasattr(flow_dedup, "set_window_ms"):
-                        flow_dedup.set_window_ms(float(new_window_ms))
-                        log.info(
-                            "[ING-010][worker-%d] dedup_window_ms updated: "
-                            "%.0f → %.0f ms (tier=%d symbol=%s)",
-                            self.worker_id,
-                            self._last_dedup_window_ms or 0,
-                            new_window_ms,
-                            tier_int,
-                            symbol,
-                        )
-                    self._last_dedup_window_ms = new_window_ms
-        except Exception:
-            pass  # never raises on hot path
 
     async def _flush_pending(self) -> None:
         """
