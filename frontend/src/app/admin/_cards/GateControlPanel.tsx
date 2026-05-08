@@ -10,13 +10,17 @@
  * Auth guard: requires token + isAdmin; renders an access-denied banner
  * if either is missing so the component is safely embeddable in any layout.
  *
- * Error surfacing: when a PATCH fails, the error message from the server
- * (or the network layer) is passed to the affected GateCellInput as
- * `saveError` so the admin sees a specific human-readable explanation,
- * not just a ✗ badge with no context.
+ * 428 market-hours flow:
+ *   patch()        → backend returns 428 → status → "market_confirm"
+ *   GateCellInput  → amber inline banner with Confirm / Cancel
+ *   onConfirm      → confirmPatch() re-sends with confirm_market_hours: true
+ *   onCancelConfirm→ cancelConfirm() resets status to idle
+ *
+ * Error surfacing: per-cell error messages live in useGatePatch.errorMap
+ * and are passed to GateCellInput as `saveError`.
  */
 "use client";
-import React, { useState } from "react";
+import React from "react";
 import {
   A,
   AdminCard,
@@ -52,13 +56,10 @@ function groupByGate(gates: GateRow[]): Map<string, Record<1 | 2 | 3, GateRow>> 
 }
 
 export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
-  const { data, loading, error, refresh } = useGateConfig(token);
-  const { statusMap, patch }              = useGatePatch();
+  const { data, loading, error, refresh }                     = useGateConfig(token);
+  const { statusMap, errorMap, patch, confirmPatch, cancelConfirm } = useGatePatch();
 
-  // Per-cell save error messages: keyed by `${gate_name}:${tier}`
-  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
-
-  // ── Auth guard ───────────────────────────────────────────────
+  // ── Auth guard ────────────────────────────────────────────
   if (!token || !isAdmin) {
     return (
       <AdminCard>
@@ -71,7 +72,7 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
     );
   }
 
-  // ── Loading ──────────────────────────────────────────────────
+  // ── Loading ─────────────────────────────────────────────
   if (loading && !data) {
     return (
       <AdminCard>
@@ -79,18 +80,14 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
           title="Gate Control Panel"
           subtitle="Ingestion gate thresholds — 5 gates × 3 tiers"
         />
-        <p
-          data-testid="loading-msg"
-          className="text-xs font-mono"
-          style={{ color: A.muted }}
-        >
+        <p data-testid="loading-msg" className="text-xs font-mono" style={{ color: A.muted }}>
           Loading…
         </p>
       </AdminCard>
     );
   }
 
-  // ── Fetch error (no data yet) ─────────────────────────────────
+  // ── Fetch error (no data yet) ───────────────────────────────
   if (error && !data) {
     return (
       <AdminCard>
@@ -105,9 +102,6 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
 
   const grouped = groupByGate(data?.gates ?? []);
 
-  // Ordered list of gate names actually present in the response.
-  // Warn for any gates returned by the API that are not in GATE_ORDER
-  // so new backend gates are never silently dropped from the UI.
   const gateNames = GATE_ORDER.filter(name => grouped.has(name));
   grouped.forEach((_, name) => {
     if (!GATE_ORDER.includes(name)) {
@@ -123,36 +117,28 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
     newValue: number,
     reason: string | null,
   ) {
-    // Explicit null-guard — token is guaranteed non-null by the auth guard
-    // above, but we narrow the type explicitly rather than using `!`.
     if (!token) return;
-
-    const key = `${gateName}:${tier}`;
-
-    // Clear any previous save error for this cell
-    setSaveErrors(prev => {
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
-
     try {
-      await patch(token, {
+      const result = await patch(token, {
         gate_name: gateName,
         tier,
         value:     newValue,
         reason,
-        // confirm_market_hours omitted — backend defaults to false.
-        // The flag is intentionally not surfaced in the UI; a future story
-        // can add a market-hours confirmation dialog if needed.
+        confirm_market_hours: false,
       });
-      refresh();
-    } catch (e: unknown) {
-      // Capture the error message and surface it in the affected cell so the
-      // admin sees a specific reason (e.g. "Value out of range", "HTTP 422")
-      // rather than just the ✗ badge with no context.
-      const msg = e instanceof Error ? e.message : "Save failed";
-      setSaveErrors(prev => ({ ...prev, [key]: msg }));
+      // null result means 428 — status is already "market_confirm", no refresh yet.
+      if (result) refresh();
+    } catch {
+      // Error message is in errorMap[key] — no local state needed.
+    }
+  }
+
+  async function handleConfirm(gateName: string, tier: 1 | 2 | 3) {
+    try {
+      const result = await confirmPatch(gateName, tier);
+      if (result) refresh();
+    } catch {
+      // Error surfaced via errorMap.
     }
   }
 
@@ -180,22 +166,14 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
         }
       />
 
-      {/* Stale-data error banner (data still shown below) */}
       {error && data && <ErrorBanner msg={`⚠ ${error}`} />}
 
-      <div
-        className="overflow-x-auto"
-        role="table"
-        aria-label="Gate Control Panel"
-      >
+      <div className="overflow-x-auto" role="table" aria-label="Gate Control Panel">
         {/* Header row */}
         <div
           role="row"
           className="grid gap-3 mb-2 text-xs font-mono"
-          style={{
-            gridTemplateColumns: "200px 1fr 1fr 1fr",
-            color: A.muted,
-          }}
+          style={{ gridTemplateColumns: "200px 1fr 1fr 1fr", color: A.muted }}
         >
           <span role="columnheader">Gate</span>
           <span role="columnheader">Tier 1</span>
@@ -204,11 +182,7 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
         </div>
 
         {gateNames.length === 0 && (
-          <p
-            data-testid="empty-msg"
-            className="text-xs font-mono py-4"
-            style={{ color: A.muted }}
-          >
+          <p data-testid="empty-msg" className="text-xs font-mono py-4" style={{ color: A.muted }}>
             No gate configuration found.
           </p>
         )}
@@ -234,19 +208,16 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
               >
                 {label}
                 {tierMap[1]?.tier_independent && (
-                  <span
-                    className="block text-xs mt-0.5"
-                    style={{ color: A.faint }}
-                  >
+                  <span className="block text-xs mt-0.5" style={{ color: A.faint }}>
                     (tier-independent)
                   </span>
                 )}
               </span>
               {TIERS.map(tier => {
-                const row      = tierMap[tier];
-                const cellKey  = `${gateName}:${tier}`;
-                const status   = statusMap[cellKey] ?? "idle";
-                const saveErr  = saveErrors[cellKey];
+                const row     = tierMap[tier];
+                const cellKey = `${gateName}:${tier}`;
+                const status  = statusMap[cellKey] ?? "idle";
+                const saveErr = errorMap[cellKey];
                 if (!row) return <div key={tier} />;
                 return (
                   <GateCellInput
@@ -257,6 +228,8 @@ export function GateControlPanel({ token, isAdmin }: GateControlPanelProps) {
                     onSave={(newValue, reason) =>
                       handleSave(gateName, tier, newValue, reason)
                     }
+                    onConfirm={() => handleConfirm(gateName, tier)}
+                    onCancelConfirm={() => cancelConfirm(gateName, tier)}
                   />
                 );
               })}
