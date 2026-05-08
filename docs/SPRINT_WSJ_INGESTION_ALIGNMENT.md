@@ -44,7 +44,7 @@ This is actually **more correct** for WSJ purposes than `order_side` alone — p
 | 8 | ~~**ING-011**~~ | ~~ITM put/call misclassification fix~~ | ING-006 ✅, ING-007 ✅ | ✅ MERGED — 2026-05-07 (PR #81, commit `8d68ed1`) — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed |
 | 8b | ~~**ING-011b**~~ | ~~`is_aggressive` moneyness-blindness inflates `weighted_premium` for ITM PUT AT_BID episodes~~ | ING-011 ✅ (moneyness band must exist on events) | ✅ MERGED — 2026-05-07 (PR #82, squash) — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed |
 | 9 | **ING-008** | Volume vs. OI gate via registry injection | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Deliberation required — ING-011 blocker cleared 2026-05-07 |
-| 10 | **ING-010** | Tier-aware configurable ingestion gate system + hot-reload admin control | ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-006 ✅ | 🔴 Deliberation documented, implementation not started — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) |
+| 10 | **ING-010** | Tier-aware configurable ingestion gate system + hot-reload admin control | ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-006 ✅ | 🔶 **IN PROGRESS** — branch [`ing/s10-tiered-gate-control-plane`](https://github.com/bhaveshhpatel/cipher/tree/ing/s10-tiered-gate-control-plane) — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) |
 
 ---
 
@@ -152,17 +152,51 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 
 ---
 
+## ING-010 Implementation Log — 2026-05-08
+
+**Branch:** [`ing/s10-tiered-gate-control-plane`](https://github.com/bhaveshhpatel/cipher/tree/ing/s10-tiered-gate-control-plane)
+**Status:** 🔶 In Progress — pre-merge checklist items being resolved
+**Canonical Issue:** [#84](https://github.com/bhaveshhpatel/cipher/issues/84)
+
+### Deliberation Findings Resolved on Branch (2026-05-08)
+
+| Tag | Finding | Commit |
+|-----|---------|--------|
+| SA-3 | `signal_min_premium` + `exclude_indices` rows missing from `019_gate_configs.sql` seed — admin PATCH against them would silently no-op | [`0255bec`](https://github.com/bhaveshhpatel/cipher/commit/0255bec1d998a74398e9ddf00d6f3e4829454494) |
+| SA-4 | Tombstone migration stubs (`20260507_create_gate_configs.sql`, `20260507_ing010_gate_configs_and_audit.sql`, `20260507_seed_gate_configs.sql`) deleted — unnumbered files skipped by `run_migrations.py` and created false schema impression | [`3f0046c`](https://github.com/bhaveshhpatel/cipher/commit/3f0046ce1abb5a50f5baff02b9d6e2fe8eede29a) / [`3f3fa2b`](https://github.com/bhaveshhpatel/cipher/commit/3f3fa2be3f1d6034fafc642590fa22da9c6550bd) |
+| SA-5 | `gate_config_store.update()` was inserting `previous_value` key — column does not exist in DDL (uses `old_value`/`new_value`). Removed; audit insert now uses `old_value` consistently | [`b88d882`](https://github.com/bhaveshhpatel/cipher/commit/b88d8826daf62c0c40e3764560f1e9bf761be414) |
+| SA-6 | `main.py` startup sequence comment mis-numbered after ING-010 inserted Step 0 (`gate_config_store.load()`). Steps renumbered to match true execution order | [`b88d882`](https://github.com/bhaveshhpatel/cipher/commit/b88d8826daf62c0c40e3764560f1e9bf761be414) |
+| PBE-1 / TGC-5 | `GateConfigStore.get()` returned `None` for unknown gate names — test contract requires `0.0`. Fixed; return type annotation tightened from `Optional[float]` → `float` | [`d9abdb1`](https://github.com/bhaveshhpatel/cipher/commit/d9abdb1c7ef0d4f0c4a55c9b5df37dd8cc0e349e) |
+| QA-2 / QA-4 | `_VALID_TIERS` and `_BOUNDS` missing as module-level exports (caused `ImportError` on every test run). Added. `exclude_indices` gate coverage added (`TestExcludeIndicesGate`) | [`5b02dd6`](https://github.com/bhaveshhpatel/cipher/commit/5b02dd6558cdff37b56e354f7012e52a294f14db) |
+| Contract collision (5-way) | `_DEFAULTS` / `_FALLBACK` / `_BOUNDS` shapes were inconsistent across 4 test files. Resolved: `_DEFAULTS` = nested `{gate: {tier: value}}`, `_FALLBACK` = flat `{(gate, tier): value}`, `_BOUNDS` = `{gate: (lo, hi, cast)}` 3-tuple | [`04f817b`](https://github.com/bhaveshhpatel/cipher/commit/04f817b94f920983c5644d9c27b014d3b5ddfa33) |
+| datetime import collision | `from datetime import datetime` shadowed the module name; tests patching `services.gate_config_store.datetime` hit `AttributeError`. Refactored to `import datetime as dt_module` | [`89a997a`](https://github.com/bhaveshhpatel/cipher/commit/89a997a503b62ecccf1516456e2250d98461ee7b) |
+| load() credential resolution | `load()` read credentials exclusively from `config.settings`; `update()` already did instance-attr-first. Tests inject `_supabase_url`/`_supabase_key` directly — `load()` was falling through to no-DB branch silently. Aligned both methods | [`c25ea6a`](https://github.com/bhaveshhpatel/cipher/commit/c25ea6af613f5e272b9bd445e398ff120f6b73ba) |
+| Blocker 1 (migration 021) | `021` INSERT referenced wrong columns (missing `value_type`, `description`; duplicate rows already in `020`). Rewritten to be idempotent with correct schema | [`c0b4788`](https://github.com/bhaveshhpatel/cipher/commit/c0b478811cd6863eb623338f2a44992f89d54065) |
+| Medium 3 | `signal_min_premium` `_DEFAULTS` drifted from DB seed (T1/T2/T3 values mismatched). Aligned to T1=75k, T2=50k, T3=25k | [`c0b4788`](https://github.com/bhaveshhpatel/cipher/commit/c0b478811cd6863eb623338f2a44992f89d54065) |
+| Medium 4 | `signal_min_premium` missing from `_VALID_GATE_NAMES` and `_ALL_GATES` in `admin.py` — PATCH and GET matrix excluded it silently. Added | [`c0b4788`](https://github.com/bhaveshhpatel/cipher/commit/c0b478811cd6863eb623338f2a44992f89d54065) |
+| EPISODE-FIX regression | `persist_flow_episode` was called **after** the `signal_min_premium` gate check — episodes with `total_premium` below T1 floor (e.g. SPY PUT $60k) were never persisted even when accumulator crossed Gate-2. Hoisted `asyncio.create_task(persist_flow_episode(...))` to before the signal gate | [`71643f7`](https://github.com/bhaveshhpatel/cipher/commit/71643f746920a31c05805b3788183f2271d69d6b) |
+| AsyncMock patch regression | `persist_flow_episode` patches missing `new_callable=AsyncMock` — `asyncio.create_task()` received a non-coroutine MagicMock, raised `TypeError` silently, leaving `persisted_episodes` empty in 3 episode-direction tests | [`022a6e2`](https://github.com/bhaveshhpatel/cipher/commit/022a6e26971961d1e60b8c141b61596a81b1c91a) |
+| EI-1 through EI-10 | Stream-side `exclude_indices` gate tests added: `_resolve_exclude_indices` + `_process_trade` filter (10 cases covering ON/OFF state, non-index passthrough, safe fallback on exception, `_stats[index_filtered]` counter) | [`e84f4cd`](https://github.com/bhaveshhpatel/cipher/commit/e84f4cd2d14afccebe876f97759435a876772d74) |
+
+### ING-010 Open Items as of 2026-05-08
+
+- Pre-merge checklist items above are all resolved on branch
+- Branch is **not yet merged** — pending final CI green + PR review
+- ING-008 deliberation still required (unblocked since 2026-05-07)
+
+---
+
 ## Story Detail
 
 ---
 
 ### ING-002 — Hard Per-Event $10k Premium Floor at Parser
-**Type:** Feature / Gate Addition  
-**Priority:** P0  
-**Estimated Effort:** 0.5 day  
-**Depends On:** Nothing — ship immediately  
-**Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`  
-**GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)  
+**Type:** Feature / Gate Addition
+**Priority:** P0
+**Estimated Effort:** 0.5 day
+**Depends On:** Nothing — ship immediately
+**Files:** `backend/parsers/options_flow_parser.py`, `backend/services/tradier_stream.py`
+**GitHub Issue:** [#57](https://github.com/bhaveshhpatel/cipher/issues/57)
 **PR:** [#58](https://github.com/bhaveshhpatel/cipher/pull/58) — ✅ **MERGED 2026-05-03** (commit `a38f837`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -239,10 +273,10 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-002-CONFIG — DTE Premium Tier Presets: Admin-Configurable via Named Presets
-**Type:** Feature / Admin Configuration  
-**Priority:** P2 — quality of life; not blocking signal quality  
-**Estimated Effort:** 2.5 days  
-**Depends On:** ING-002 (merged ✅), ING-003 (DTE tiers wired ✅ before this story is needed)  
+**Type:** Feature / Admin Configuration
+**Priority:** P2 — quality of life; not blocking signal quality
+**Estimated Effort:** 2.5 days
+**Depends On:** ING-002 (merged ✅), ING-003 (DTE tiers wired ✅ before this story is needed)
 **Files:**
 - `backend/signals/repetition_accumulator.py` — add preset dicts + `_DEFAULT_PRESET` alias
 - `backend/services/ingestion_config.py` — add `DTE_TIER_PRESET` + 8 custom floor keys to `_DEFAULTS` + `_EXPECTED_DB_KEYS`; add `get_dte_premium_tiers()` loader
@@ -256,9 +290,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-003 — Wire `_DEFAULT_DTE_PREMIUM_TIERS` at Accumulator Init
-**Type:** Bug Fix / Wiring  
-**Priority:** P0  
-**GitHub Issue:** [#59](https://github.com/bhaveshhpatel/cipher/issues/59)  
+**Type:** Bug Fix / Wiring
+**Priority:** P0
+**GitHub Issue:** [#59](https://github.com/bhaveshhpatel/cipher/issues/59)
 **PR:** [#59](https://github.com/bhaveshhpatel/cipher/pull/59) — ✅ **MERGED 2026-05-03** (commit `62b159f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -266,9 +300,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-004 — Fallback `underlying_price` from Registry
-**Type:** Bug Fix  
-**Priority:** P0  
-**GitHub Issue:** [#60](https://github.com/bhaveshhpatel/cipher/issues/60)  
+**Type:** Bug Fix
+**Priority:** P0
+**GitHub Issue:** [#60](https://github.com/bhaveshhpatel/cipher/issues/60)
 **PR:** [#60](https://github.com/bhaveshhpatel/cipher/pull/60) — ✅ **MERGED 2026-05-03** (commit `d3c3f31`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -276,9 +310,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-005 — Align OTM Band Thresholds Registry ↔ Accumulator
-**Type:** Threshold Alignment  
-**Priority:** P0  
-**GitHub Issue:** [#61](https://github.com/bhaveshhpatel/cipher/issues/61)  
+**Type:** Threshold Alignment
+**Priority:** P0
+**GitHub Issue:** [#61](https://github.com/bhaveshhpatel/cipher/issues/61)
 **PR:** [#61](https://github.com/bhaveshhpatel/cipher/pull/61) — ✅ **MERGED 2026-05-03** (commit `252d75f`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -291,9 +325,9 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 ---
 
 ### ING-006 — Directional Aggression Weighting on Premium Floor
-**Type:** Feature / Signal Enhancement  
-**Priority:** P0  
-**GitHub Issue:** [#62](https://github.com/bhaveshhpatel/cipher/issues/62)  
+**Type:** Feature / Signal Enhancement
+**Priority:** P0
+**GitHub Issue:** [#62](https://github.com/bhaveshhpatel/cipher/issues/62)
 **PR:** [#62](https://github.com/bhaveshhpatel/cipher/pull/62) — ✅ **MERGED 2026-05-04** (commit `501b170`)
 
 #### ✅ 3-Way Deliberation — COMPLETE (2026-05-03)
@@ -302,633 +336,8 @@ Identified during live market monitoring on 2026-05-06 after ING-009 merged.
 - `is_directionally_aggressive(bid_ask_class, contract_type)` replaces `is_aggressive(trade_type)` shim — `AT_BID`/`BELOW_BID` now correctly flags PUT **and** CALL as directional
 - `RepetitionEpisode.weighted_premium` property added — Gate 2 and Gate 3 evaluate weighted premium, not total premium
 - `_AGGRESSION_DISCOUNT = 0.5` hardcoded; wire through `ingestion_config` deferred to ING-002-CONFIG
-- New test file `test_ing006_directional_aggression.py` — F-matrix cases F-1 through F-8 + weighted premium boundary cases
+- New test file: `test_directional_aggression.py` — covers all 8 `(bid_ask_class × contract_type)` combinations
 
 ---
 
-### ING-009 — Same-Session Flow Episode Upsert/Merge
-
-**Type:** Bug Fix / Data Model Correctness  
-**Priority:** P0  
-**Estimated Effort:** 1 day  
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-005 ✅, ING-006 ✅  
-**Blocks:** ING-007 — `get_contract_prior_days()` depends on `flow_episodes` being correctly aggregated  
-**Files:**
-- `backend/services/flow_store.py` — `persist_flow_episode()` upsert logic + new `_stats` counters
-- `backend/tests/test_ing009_episode_upsert.py` — NEW: full test matrix
-**GitHub Issue:** [#75](https://github.com/bhaveshhpatel/cipher/issues/75) — ✅ CLOSED 2026-05-06  
-**Branch:** `ing/s9-episode-upsert`  
-**PR:** [#76](https://github.com/bhaveshhpatel/cipher/pull/76) — ✅ **MERGED 2026-05-06** (squash commit `9ceee35`)
-
-#### ✅ 3-Way Deliberation — COMPLETE (2026-05-05)
-#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS. **PBE verdict:** PASS. **QA verdict:** PASS — E-1 through E-11 full matrix present and passing.
-
-#### Problem
-
-`flow_episodes` was insert-only from the Signal Gate path, creating one new row per qualifying print instead of one row per logical same-session episode. This made `flow_episodes` a near-duplicate of `flow_events` (26,906 vs 28,373 rows on 2026-05-05) rather than an aggregated episode table.
-
-#### Deliberation Outcomes
-
-**SA — DECIDED: Fix data model semantics, not the gate threshold**
-- `flow_events` = every qualifying classified tick
-- `flow_episodes` = one aggregated episode per contract per same-session window
-- Keep gate order: Signal Gate → `persist_flow_episode()` → SIG-DEBOUNCE.
-- Fix belongs in episode upsert/merge semantics inside `persist_flow_episode()` in `flow_store.py`
-
-**PBE — DECIDED: Insert-or-update keyed on contract identity + session window**
-- Episode merge key: `(ticker, direction, contract_type, strike, expiry)`
-- On match → PATCH: `trade_count += 1`, `total_premium += new_premium`, `signal_ts = new_ts`
-- On no match → INSERT (existing path unchanged)
-
-**QA — DECIDED: Full boundary test matrix required**
-- Must prove: two qualifying prints for same contract within window → one row, `trade_count = 2`
-- Window edge boundary tests required: at `_EPISODE_MERGE_WINDOW_S`, at `_EPISODE_MERGE_WINDOW_S + 1s`
-
-#### Acceptance Criteria
-
-- [x] `flow_episodes` has exactly 1 row per same-session contract episode within the merge window
-- [x] A subsequent qualifying print for an open episode updates the existing row — no new row inserted
-- [x] `trade_count` increments by 1 on each merge
-- [x] `total_premium` accumulates on merge
-- [x] `signal_ts` updates to the latest qualifying print timestamp on merge
-- [x] `strike` and `expiry` remain correctly populated from the raw signal path (EPISODE-FIX preserved)
-- [x] No debounce regression — `persist_flow_episode()` still called before SIG-DEBOUNCE
-- [x] ING-007 `get_contract_prior_days()` query is unaffected (separate concern)
-- [x] Tests: first print (insert), second print within window (merge), print after window expiry (new episode), next-day (new episode)
-- [x] Boundary tests: merge window edge cases
-- [x] `_stats["created_episodes"]` and `_stats["merged_episodes"]` initialised at module level
-- [x] Both counters visible in `/health/stream` from cold start
-- [x] No TODO comments in implementation code
-- [x] No DB reads on the hot path — lookup is async, does not block the stream tick
-
-#### QA Test Matrix
-
-| Case | Description | Expected |
-|---|---|---|
-| E-1 | First qualifying print for contract | INSERT — new episode row, `trade_count=1` |
-| E-2 | Second qualifying print, same contract, within window | PATCH — same row, `trade_count=2`, `total_premium` accumulated |
-| E-3 | Third qualifying print, same contract, within window | PATCH — same row, `trade_count=3` |
-| E-4 | Print for same contract after window expiry | INSERT — new episode row, `trade_count=1` |
-| E-5 | Print for different strike, same ticker | INSERT — new episode row (different key) |
-| E-6 | Print for different expiry, same strike+ticker | INSERT — new episode row (different key) |
-| E-7 | Next-day print for same contract | INSERT — new episode row (ING-007 repeat flag independent) |
-| E-8 | `_lookup_open_episode` Supabase error → fallback to INSERT | INSERT — episode not lost on lookup failure |
-| E-9 | `strike`/`expiry` correctly populated on both INSERT and PATCH paths | Both fields non-null |
-| E-10 | Window boundary — print at exactly `_EPISODE_MERGE_WINDOW_S` | PATCH (inclusive boundary) |
-| E-11 | Window boundary — print at `_EPISODE_MERGE_WINDOW_S + 1s` | INSERT (new episode) |
-
----
-
-### ING-007 — Multi-Day Repeat Window Lookback (DB + Cache)
-**Type:** Feature / Signal Enhancement  
-**Priority:** P0  
-**Estimated Effort:** 2 days  
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-006 ✅, ING-009 ✅  
-**Files:**
-- `backend/utils/contract_day_cache.py` — NEW
-- `backend/signals/repetition_accumulator.py`
-- `backend/services/flow_store.py`
-- `backend/services/tradier_stream.py`
-- `supabase/migrations/` — S2.5 migration
-- `backend/tests/test_ing007_multiday_lookback.py` — NEW
-**GitHub Issue:** [#70](https://github.com/bhaveshhpatel/cipher/issues/70) — ✅ CLOSED 2026-05-06  
-**Branch:** `ing/s7-multiday-repeat`  
-**PR:** [#74](https://github.com/bhaveshhpatel/cipher/pull/74) — ✅ **MERGED 2026-05-06** (commit `b70d9b0`)
-
-#### ✅ 3-Way Deliberation — COMPLETE (2026-05-04)
-#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-F1/SA-F2 comments added. Queue max corrected 500→5000.  
-**PBE verdict:** PASS — sync threshold reconciled to `accumulator._multi_day_min_days` (PBE-1), `_lookback_result_cache` eviction wired (PBE-3).  
-**QA verdict:** PASS — G-1 through G-8 passing, TTL expiry test added, p99 < 5ms confirmed, otm_band wiring verified.
-
-#### ING-007 Acceptance Criteria
-
-- [x] S2.5 migration runs cleanly — index, `order_side` column, `is_aggressive` column all present in `flow_events`
-- [x] `EXPLAIN ANALYZE` confirms index hit on lookback query
-- [x] `contract_day_cache.py` created in `backend/utils/`
-- [x] Cache key is 4-tuple `(ticker, contract_type, strike, expiry)`
-- [x] `get_lookback()` returns cached result within TTL (300s); re-fetches after expiry
-- [x] DB query uses `DATE_TRUNC('day', NOW())` ceiling — today excluded
-- [x] DB query passes DTE-tier premium floor as parameter — no hardcoded floor
-- [x] `RepetitionEpisode` gains: `prior_days_active`, `prior_days_aggressive`, `is_multi_day_repeat`, `otm_band`
-- [x] `RepetitionAccumulator` gains: `require_multi_day: bool = False`, `multi_day_min_days: int = 2`
-- [x] `is_multi_day_repeat = prior_days_active >= multi_day_min_days`
-- [x] Background `asyncio.Queue` worker — `maxsize=5000`
-- [x] `_stats["lookback_queue_overflow"]` initialised at module level; never propagates as unhandled exception
-- [x] All 8 fixture cases G-1 through G-8 pass
-- [x] TTL expiry test passes
-- [x] Latency benchmark: p99 < 5ms
-- [x] `otm_band` wiring verified
-- [x] No new dependencies added unless `cachetools` already present
-
----
-
-### ING-011 — ITM Put/Call Misclassification Fix
-
-**Type:** Bug Fix / Signal Correctness  
-**Priority:** P0  
-**Estimated Effort:** 1 day  
-**Depends On:** ING-006 ✅, ING-007 ✅ (`otm_band` field established on `RepetitionEpisode`)  
-**Blocks:** ING-008 — OI gate logic depends on correct directional classification  
-**Does NOT block:** ING-010 (parallel track)  
-**Files:**
-- `backend/signals/repetition_accumulator.py` — `_classify_moneyness_band()` + `dominant_direction` ITM override
-- `backend/tests/test_ing011_itm_classification.py` — NEW: 34 tests across 3 classes
-**GitHub Issue:** [#77](https://github.com/bhaveshhpatel/cipher/issues/77) — ✅ CLOSED 2026-05-07  
-**Branch:** `ing/s11-itm-classification`  
-**PR:** [#81](https://github.com/bhaveshhpatel/cipher/pull/81) — ✅ **MERGED 2026-05-07** (commit `8d68ed1`)
-
-#### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
-#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-F1 (`_majority_itm_band()` UNKNOWN-tick suppression) resolved with test I-12 added inline.  
-**PBE verdict:** PASS.  
-**QA verdict:** PASS — QA-F1 (test I-12 added), QA-F3 (I-8 docstring clarified). All 34 tests passing.
-
-#### Deliberation Outcomes
-
-**D1 — ITM threshold — DECIDED: Reuse ING-005 ATM band exactly**
-- `_ITM_THRESHOLD = 0.02` — symmetric with ING-005 ATM ±2% band
-- `_DEEP_ITM_THRESHOLD = 0.10`
-- Thresholds apply symmetrically to puts and calls (PUT: strike > underlying × (1 + threshold); CALL: strike < underlying × (1 − threshold))
-
-**D2 — Override scope — DECIDED: PUT-only override; applies to ALL ITM (not just DEEP_ITM)**
-- Override applies to `otm_band in ('ITM', 'DEEP_ITM')` for PUT contracts
-- ITM CALL AT_BID is unchanged — call seller at bid = bearish, already correct
-- Rationale: mildly ITM put AT_BID buyers are economically meaningful enough to override; DEEP_ITM-only cutoff misses legitimate institutional hedges in the 2–10% ITM band
-
-**D3 — `otm_band` extension — DECIDED: Extend in-place; no DB migration required**
-- `otm_band` TEXT column extended to cover `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN`
-- No DB migration required — column is TEXT, no enum constraint
-- `_classify_otm()` replaced by `_classify_moneyness_band()` — full spectrum classification
-
-#### Problem (recorded for posterity)
-
-Deeply ITM puts filling `AT_BID` were classified as `REPEAT_SELL` (put selling = bullish) when the correct economic read is bearish put buying. The bid/ask classification logic was correct for OTM puts but broke for ITM contracts where the fill price reflects intrinsic value, not directional seller intent.
-
-**Live example — TMDX 2026-05-06 13:43:50 UTC:**
-- PUT $105 · May 15 · underlying price $75.69 · size 1,263 · fill $27.68 · bid $26.70 · ask $29.50
-- `bid_ask_class = AT_BID` → system classified as `REPEAT_SELL` → `direction = REPEAT_SELL` (bullish)
-- Actual: strike ($105) is ~39% above underlying ($75.69) — deeply ITM put buyer, economically bearish
-- Episode emitted as `CONVICTION` bullish signal — **incorrect; fixed by this PR**
-
-#### Acceptance Criteria
-
-- [x] D1, D2, D3 deliberations resolved and documented inline (SA + PBE + QA sign-off)
-- [x] `_classify_moneyness_band()` replaces `_classify_otm()` — full spectrum: `DEEP_ITM | ITM | ATM | OTM | DEEP_OTM | UNKNOWN`
-- [x] `_ITM_THRESHOLD = 0.02` and `_DEEP_ITM_THRESHOLD = 0.10` defined at module level
-- [x] `dominant_direction` for ITM/DEEP_ITM puts with `bid_side_prem > ask_side_prem` resolves to `REPEAT_BUY` (bearish)
-- [x] ITM CALL AT_BID behaviour unchanged
-- [x] TMDX $105P scenario produces correct `BEARISH` direction
-- [x] Existing OTM put `AT_BID` → `REPEAT_SELL` (bullish) behaviour unchanged
-- [x] `underlying_price == 0` fallback: `UNKNOWN` band, no classification attempted
-- [x] 34 tests across `TestClassifyMoneynessBand`, `TestITMDirectionOverride`, `TestThresholdConstants` — all passing
-- [x] No DB migration required — `otm_band` TEXT column extended in-place
-
-#### QA Test Matrix
-
-| Case | Contract | `bid_ask_class` | `otm/itm_band` | Expected direction | Expected sentiment |
-|---|---|---|---|---|---|
-| I-1 | OTM PUT | AT_BID | OTM | REPEAT_SELL | BULLISH (put seller — unchanged) |
-| I-2 | ITM PUT | AT_BID | ITM | REPEAT_BUY | BEARISH (buyer paying intrinsic) |
-| I-3 | DEEP_ITM PUT | AT_BID | DEEP_ITM | REPEAT_BUY | BEARISH (institutional hedge) |
-| I-4 | ITM PUT | AT_ASK | ITM | REPEAT_BUY | BEARISH (aggressive buyer — already correct) |
-| I-5 | ITM CALL | AT_ASK | ITM | REPEAT_BUY | BULLISH (already correct) |
-| I-6 | ITM CALL | AT_BID | ITM | REPEAT_SELL | BEARISH (call seller — unchanged) |
-| I-7 | ATM PUT | AT_BID | ATM | REPEAT_SELL | BULLISH (ATM selling — unchanged) |
-| I-8 | `underlying_price == 0` | any | UNKNOWN | no classification attempted | existing fallback preserved |
-
----
-
-### ING-011b — `is_aggressive` Moneyness-Blindness Inflates `weighted_premium` for ITM PUT AT_BID Episodes
-
-**Type:** Bug Fix / Signal Correctness  
-**Priority:** P1  
-**Estimated Effort:** 0.5–1 day  
-**Depends On:** ING-011 ✅ (moneyness band classification must exist on events before aggression fix is meaningful)  
-**Does NOT block:** ING-008, ING-010 (parallel tracks)  
-**Filed:** 2026-05-06 — annotation commit [`a82f3967`](https://github.com/bhaveshhpatel/cipher/commit/a82f3967fb37a07af180caadefbbcb50e041aae2)  
-**Files:**
-- `backend/signals/repetition_accumulator.py` — `get_weighted_premium()` + promoted `_classify_moneyness_band()` to module-level function
-- `backend/tests/test_ing011b_itm_aggression_weight.py` — NEW: full test matrix (W-1 through W-12)
-**GitHub Issue:** [#80](https://github.com/bhaveshhpatel/cipher/issues/80) — ✅ CLOSED 2026-05-07  
-**Branch:** `ing/s11b-itm-aggression-weight`  
-**PR:** [#82](https://github.com/bhaveshhpatel/cipher/pull/82) — ✅ **MERGED 2026-05-07** (squash)
-
-#### ✅ 3-Way Deliberation — COMPLETE (2026-05-06)
-#### ✅ Pre-Merge Panel Deliberation — COMPLETE (2026-05-06)
-**SA verdict:** PASS — SA-1 (non-blocking comment, no code change required).  
-**PBE verdict:** PASS — PBE-1 (non-blocking), PBE-2 (non-blocking).  
-**QA verdict:** PASS — QA-1 resolved inline (W-4b boundary test added), QA-2 typo fixed (commit `2bb1487`). All 30 assertions across 12 test classes (W-1 through W-12) passing.
-
-#### Deliberation Outcomes
-
-**D1 — Option A, B, or C — DECIDED: Option B**
-- **Option B selected:** Apply ITM-buyer discount per-event inside `get_weighted_premium()`, using a promoted module-level `_classify_moneyness_band()` function.
-- Option A rejected: `is_directionally_aggressive()` is called at parse time in `tradier_stream.py`. `_classify_moneyness_band()` lives in the signal layer (`RepetitionAccumulator`). Pulling signal-layer output back into a parser-layer function inverts the dependency graph — worse than Option B's episode coupling.
-- Option C rejected: permanently skews `prior_days_aggressive` multi-day metrics (ING-007). An ITM PUT AT_BID buyer is not a conviction writer; including them in aggressive counts degrades S8 backtest stratification quality over time.
-
-**D2 — `self.otm_band` vs. per-event classification — DECIDED: Per-event**
-- Use `_classify_moneyness_band(e)` called per-event inside the `get_weighted_premium()` loop.
-- `self.otm_band` is last-tick only (SA-6 Phase 1 accepted limitation). Using it for per-event discount decisions would apply the wrong band to all events except the last.
-- Per-event call is identical to the approach used by `_majority_itm_band()` (inline re-implementation of the same threshold math). Promoting `_classify_moneyness_band()` to module level eliminates that duplication.
-
-**D3 — `_classify_moneyness_band()` location — DECIDED: Promote to module-level function**
-- The function has zero `self` state dependencies — it is pure arithmetic over an event's fields.
-- `RepetitionEpisode._majority_itm_band()` already re-implements the same threshold math inline (SA-F1 fix, ING-011). Promoting `_classify_moneyness_band()` eliminates the duplication and makes it callable from both `RepetitionAccumulator.ingest_tick()` and `RepetitionEpisode.get_weighted_premium()` without circular dependencies.
-- Promotion is in-scope for this PR — not a separate story.
-
-**D4 — `prior_days_aggressive` impact — DECIDED: Accepted known gap**
-- `prior_days_aggressive` is populated by `get_contract_prior_days()` querying `flow_events.is_aggressive` from the DB — a column stamped at parse time by `is_directionally_aggressive()`, which Option B does not touch.
-- DB `is_aggressive` remains parse-time aggression (moneyness-blind). This is the known limitation of Option B vs. Option A.
-- Accepted: file a follow-up story if multi-day aggression metrics prove materially skewed after 5+ trading days of live data under ING-007.
-
-**D5 — Cold-start / `underlying_price == 0` fallback — DECIDED: No discount applied**
-- `_classify_moneyness_band()` returns `'UNKNOWN'` when `underlying_price == 0`.
-- `'UNKNOWN'` is not in `_ITM_BANDS` (`{'ITM', 'DEEP_ITM'}`), so no discount fires — event receives full weight (×1.0).
-- This is the correct safe default: when moneyness cannot be determined, do not discount.
-- Identical safe-default logic to `_majority_itm_band()` (UNKNOWN events contribute 0 weight to both sides).
-
-#### Implementation Spec (PBE — Option B)
-
-Promote `_classify_moneyness_band()` to module-level, then update `get_weighted_premium()`:
-
-```python
-def get_weighted_premium(self, discount: float) -> float:
-    total = 0.0
-    for e in self.events:
-        prem = getattr(e, "premium", 0.0)
-        if getattr(e, "is_aggressive", False):
-            # ING-011b: re-check moneyness per-event.
-            # is_aggressive is moneyness-blind (ING-006). ITM PUT AT_BID
-            # fills are buyers, not aggressive writers — apply discount.
-            bac   = getattr(e, "bid_ask_class", "UNKNOWN")
-            ctype = str(getattr(e, "contract_type", "") or "").upper()
-            if (
-                ctype == "PUT"
-                and bac in ("AT_BID", "BELOW_BID")
-                and _classify_moneyness_band(e) in _ITM_BANDS
-            ):
-                total += prem * discount  # ITM put buyer — discount applies
-            else:
-                total += prem             # Genuine aggressive writer — full weight
-        else:
-            total += prem * discount      # Passive fill — unchanged
-    return total
-```
-
-#### Blast Radius
-
-| Component | Impact |
-|---|---|
-| `Gate 2` in `ingest_tick()` | `ep_weighted` correctly reduced for ITM PUT AT_BID buyer episodes — false Gate-2 clears suppressed |
-| `deep_otm_multiplier` gate | Same — `ep_weighted` no longer overstated for DEEP_OTM puts with AT_BID fills |
-| `prior_days_aggressive` (ING-007) | Not affected — DB column stamped at parse time (D4 accepted gap) |
-| `order_side_classifier.py` | Not affected — directional logic unchanged |
-| `dominant_direction` | Not affected — ING-011 handles direction correctly |
-
-#### Acceptance Criteria
-
-- [x] D1–D5 deliberations recorded inline in this document and in Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80)
-- [x] `_classify_moneyness_band()` promoted to module-level function in `repetition_accumulator.py`
-- [x] `_majority_itm_band()` updated to call module-level `_classify_moneyness_band()` — eliminates inline duplication
-- [x] `get_weighted_premium()` updated per Option B implementation spec above
-- [x] `weighted_premium` property correctly delegates to updated `get_weighted_premium()`
-- [x] A 3-event ITM PUT AT_BID episode at $200k total premium is discounted to $100k `weighted_premium` (all 3 events at 0.5×)
-- [x] A 3-event OTM PUT AT_BID episode at $200k total premium retains $200k `weighted_premium` (full weight unchanged — W-1 regression)
-- [x] No regression on `test_ing006_directional_aggression.py`
-- [x] No regression on `test_ing007_multiday_lookback.py`
-- [x] No regression on `test_ing011_itm_classification.py`
-- [x] All QA matrix cases W-1 through W-12 pass
-
-#### QA Test Matrix
-
-| Case | Contract | `bid_ask_class` | `otm_band` | `is_aggressive` (input) | Expected `weighted_premium` weight |
-|---|---|---|---|---|---|
-| W-1 | OTM PUT | AT_BID | OTM | True | ×1.0 — OTM put writer, correct aggression (ING-006 regression) |
-| W-2 | ITM PUT | AT_BID | ITM | True | ×0.5 — ITM buyer, discount applies |
-| W-3 | DEEP_ITM PUT | AT_BID | DEEP_ITM | True | ×0.5 — DEEP_ITM buyer, discount applies |
-| W-4 | ITM PUT | AT_ASK | ITM | True | ×1.0 — aggressive AT_ASK buyer, full weight always |
-| W-4b | ITM PUT | AT_BID | ITM | True, premium boundary ($10k floor) | ×0.5 — boundary test: floor-value event still discounted |
-| W-5 | ITM CALL | AT_BID | ITM | True | ×1.0 — call writer, correct aggression, no change |
-| W-6 | OTM PUT | MID | OTM | False | ×0.5 — passive mid-fill, unchanged |
-| W-7 | ITM PUT | AT_BID | UNKNOWN | True | ×1.0 — band unknown, no discount applied (safe fallback) |
-| W-8 | 3-event episode: 2× ITM PUT AT_BID + 1× OTM PUT AT_BID | mixed | ITM/OTM | True | Only the 2 ITM events discounted; OTM event full weight |
-| W-9 | ITM PUT AT_BID, `underlying_price=0` | AT_BID | UNKNOWN | True | ×1.0 — UNKNOWN band → no discount (D5 fallback) |
-| W-10 | `weighted_premium` property delegates to updated `get_weighted_premium()` | — | — | — | Same result as direct call |
-| W-11 | ING-006 regression: OTM PUT AT_BID writer | AT_BID | OTM | True | ×1.0 — explicit regression label (same as W-1) |
-| W-12 | `prior_days_aggressive` not affected — DB `is_aggressive` column unchanged | — | — | — | Integration note: confirm in ING-007 lookback test suite |
-
----
-
-### ING-010 — Tier-Aware Configurable Ingestion Gate System + Hot-Reload Admin Control
-
-**Type:** Feature / Ingestion Architecture Revamp  
-**Priority:** P0  
-**Estimated Effort:** 20 story points  
-**Depends On:** ING-002 ✅, ING-003 ✅, ING-004 ✅, ING-006 ✅  
-**Does NOT block:** ING-008 deliberation, but should land before any claim that ingestion flow quality is operationally tunable  
-**Related:** Original floor-only framing in [#78](https://github.com/bhaveshhpatel/cipher/issues/78) is superseded by canonical issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84)  
-**Files:**
-- `services/gate_config_store.py` — NEW
-- `db/migrations/add_gate_configs.sql` — NEW
-- `services/accumulator.py` — MODIFY
-- `services/tradierstream.py` — MODIFY
-- `services/streamworker.py` — MODIFY
-- `routers/admin.py` — CREATE/MODIFY
-- `services/symbol_registry.py` — MODIFY
-- `tests/test_gate_config_store.py` — NEW
-- `tests/test_gates_tiered.py` — NEW
-- `tests/integration/test_gate_hotreload.py` — NEW
-**GitHub Issue:** [#84](https://github.com/bhaveshhpatel/cipher/issues/84)  
-**Branch:** `ing/s10-tiered-gate-control-plane` *(not yet created)*
-
-#### ⚠️ 3-Way Deliberation — COMPLETE, IMPLEMENTATION NOT STARTED
-
-#### Problem
-
-The current ingestion layer still applies most hard gates as flat, tier-blind rules even though the symbol universe itself is already tiered. A T3 small-cap print and a T1 mega-cap print encounter the same parser premium gate, the same DTE-adjusted accumulator floor shape, and the same debounce behavior, which is the wrong control model for a flow engine that explicitly tier-classifies symbols upstream.
-
-The bigger flaw is operational: these gates are effectively hardcoded. You cannot tune them intraday, cannot tighten or relax one tier without touching code, and cannot expose them cleanly to an admin page later without refactoring the ingestion layer into a real control plane.
-
-#### Current Observed Gates
-
-The live ingestion funnel and logs show the following gate/control points:
-
-1. **Symbol registry no-stock-price drop**
-   - Tickers with no resolvable stock price are skipped before streaming.
-
-2. **`belowminpremium`**
-   - A flat per-event minimum premium drop at parse time.
-   - This is currently the largest-volume rejection stage.
-
-3. **Accumulator DTE-adjusted premium floor**
-   - Dynamic by DTE, but not by tier.
-
-4. **Deduplication**
-   - Exact-match duplicate suppression.
-
-5. **`require_oi`**
-   - Currently global/session-scoped behavior, not per-tier.
-
-6. **Signal debounce**
-   - Post-persist signal suppression window, currently uniform.
-
-#### Design Goal
-
-Convert the ingestion layer from flat hardcoded gates into a **tier-aware, runtime-configurable gate system** with:
-- per-tier thresholds for all major gates,
-- a thread-safe in-memory config store,
-- an admin API that updates values without restart,
-- full audit logging of config changes,
-- zero DB reads on the tick hot path.
-
-#### 3-Way Deliberation Outcomes
-
-### Topic 1 — Hot Reload Strategy
-
-**Senior Architect**
-- In-process singleton works for one replica but becomes wrong the moment multiple app replicas exist.
-- Preferred design is distributed fan-out from day one via Supabase Realtime subscription on `gate_configs`.
-
-**Principal Backend Engineer**
-- Realtime adds a new failure mode during market hours and is not needed for the current single-process deployment.
-- Ship the singleton first; keep the distributed fan-out path as a follow-on when multi-replica is actually real.
-
-**Lead QA**
-- Singleton is much easier to test deterministically.
-- Realtime-first would force brittle websocket-heavy integration coverage before the business logic is even stable.
-
-**Decision**
-- Ship **singleton + explicit reload/update path now**.
-- Document Supabase Realtime fan-out as the next-step design for multi-replica deployments.
-
-### Topic 2 — Tier Lookup at Gate Time
-
-**Senior Architect**
-- Tier lookup must be in-memory only, never DB-backed per tick.
-- Dict lookup overhead is negligible; DB round-trips would be unacceptable.
-
-**Principal Backend Engineer**
-- Raw lookup cost is not the risk; stale tier state is.
-- Need epoch/version tagging so a tier refresh and config refresh never produce partial mixed reads.
-
-**Lead QA**
-- Requires a test where a symbol changes tiers mid-session and the next tick uses the new thresholds.
-- Unknown-tier symbols must fall back safely, not explode worker state.
-
-**Decision**
-- Tier lookup is O(1) from in-memory `symbol_registry`.
-- `get_tier()` returns **T3 as safe default** for unknown symbols.
-- Add **epoch/versioning** to tier registry and config store coordination.
-
-### Topic 3 — Admin Guardrails and Auditability
-
-**Senior Architect**
-- Every change must persist who/what/when/old/new.
-- Unsafe values like `min_premium = 0` cannot be allowed.
-
-**Principal Backend Engineer**
-- Bounds should live in validation code first, not in a new limits table.
-- Market-hours changes need a deliberate confirmation flag.
-
-**Lead QA**
-- Admin GET responses should include bounds so the future UI can render valid controls without another API.
-- Invalid changes need explicit 422 behavior; market-hours missing confirmation should fail separately.
-
-**Decision**
-- Hardcode bounds in validation for this story.
-- Require `confirm_market_hours=true` for mid-session changes.
-- Include bounds in `GET /api/admin/gate-config`.
-- Persist a full audit trail with `reason`.
-
-#### Proposed Architecture
-
-### 1. `gate_configs` table
-
-```sql
-CREATE TABLE gate_configs (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    gate_name       TEXT NOT NULL,
-    tier            INTEGER NOT NULL,
-    value           NUMERIC NOT NULL,
-    value_type      TEXT NOT NULL,
-    description     TEXT,
-    updated_by      TEXT NOT NULL,
-    updated_at      TIMESTAMPTZ DEFAULT now(),
-    previous_value  NUMERIC,
-    UNIQUE (gate_name, tier)
-);
-```
-
-### 2. `GateConfigStore`
-
-```python
-class GateConfigStore:
-    """
-    Thread-safe in-memory config store.
-    Loaded at startup from DB. Updated via admin API without restart.
-    Workers hold a reference to the singleton and always read live values.
-    """
-```
-
-Responsibilities:
-- load gate rows from DB at startup,
-- hold all gate values in memory keyed by `(gate_name, tier)`,
-- update atomically on admin write,
-- expose safe fallback values,
-- never perform DB reads on per-tick execution.
-
-### 3. Gates to Convert
-
-#### Gate A — Parser `belowminpremium`
-Current state:
-- Flat absolute premium floor.
-
-Target state:
-- Tier-aware floor by ticker tier.
-
-Suggested seed defaults:
-- T1: 25,000
-- T2: 15,000
-- T3: 10,000
-
-#### Gate B — Accumulator DTE-adjusted floor
-Current state:
-- DTE-scaled but tier-blind.
-
-Target state:
-- Existing DTE curve multiplied by a per-tier multiplier.
-
-Suggested seed defaults:
-- T1: 1.5x
-- T2: 1.0x
-- T3: 0.75x
-
-#### Gate C — `require_oi`
-Current state:
-- Global/session behavior.
-
-Target state:
-- Per-tier boolean behavior.
-
-Suggested seed defaults:
-- T1: off
-- T2: off
-- T3: off
-
-#### Gate D — Signal debounce
-Current state:
-- Uniform debounce window.
-
-Target state:
-- Per-tier debounce windows.
-
-Suggested seed defaults:
-- T1: 30,000 ms
-- T2: 60,000 ms
-- T3: 120,000 ms
-
-#### Gate E — Dedup window
-Current state:
-- Implicit/static.
-
-Target state:
-- Config-backed dedup timing window even if initial values remain the same.
-
-Suggested seed defaults:
-- T1/T2/T3: 5,000 ms
-
-#### Admin API Contract
-
-### `PATCH /api/admin/gate-config`
-
-Request:
-```json
-{
-  "gate_name": "min_premium",
-  "tier": 3,
-  "value": 12000,
-  "reason": "Reducing T3 floor for catalyst week",
-  "confirm_market_hours": true
-}
-```
-
-Response:
-```json
-{
-  "gate_name": "min_premium",
-  "tier": 3,
-  "old_value": 10000,
-  "new_value": 12000,
-  "propagated_at": "2026-05-07T08:00:00Z",
-  "workers_notified": 100
-}
-```
-
-Additional endpoints:
-- `GET /api/admin/gate-config`
-- `GET /api/admin/gate-config/history`
-
-#### Acceptance Criteria
-
-- [ ] All major ingestion gates are represented as per-tier config rows in `gate_configs`
-- [ ] `GateConfigStore` loads all gate configs at startup with safe hardcoded fallbacks
-- [ ] Gate lookups read from in-memory config, not hardcoded constants
-- [ ] Parser `belowminpremium` is tier-aware
-- [ ] Accumulator DTE floor is tier-aware via multiplier
-- [ ] `require_oi` is tier-aware
-- [ ] Signal debounce is tier-aware
-- [ ] Dedup window is config-backed
-- [ ] `PATCH /api/admin/gate-config` updates values with no process restart
-- [ ] Updates propagate to live workers within 5 seconds
-- [ ] Every config change persists audit fields: who, what, when, old value, new value, reason
-- [ ] `GET /api/admin/gate-config` returns current values plus validation bounds
-- [ ] Market-hours config changes require explicit confirmation
-- [ ] Invalid config values return 422 with bounds context
-- [ ] Unknown symbol tier defaults safely to T3
-- [ ] Unit coverage on gate logic and config store is at least 95%
-- [ ] Integration tests prove live hot-reload behavior without restart
-- [ ] Future admin page is unblocked by this API contract
-
-#### QA Test Matrix
-
-| Case | Description | Expected |
-|---|---|---|
-| TGC-1 | Update T3 `min_premium` via admin API | New T3 value used on next eligible tick without restart |
-| TGC-2 | Update T1 DTE multiplier mid-session | Accumulator applies new multiplier within 5 seconds |
-| TGC-3 | Invalid `min_premium=0` | 422 with validation bounds |
-| TGC-4 | Market-hours change without `confirm_market_hours` | Request rejected |
-| TGC-5 | Unknown symbol tier | Safe T3 fallback, no exception |
-| TGC-6 | Tier refresh from T3 → T2 mid-session | Subsequent tick uses T2 thresholds |
-| TGC-7 | Config update persisted | Audit row contains old/new/user/reason |
-| TGC-8 | Cold start with missing DB rows | Hardcoded fallback values load cleanly |
-| TGC-9 | `/health/stream` after config introduction | No missing `_stats` keys, cold-start safe |
-| TGC-10 | Existing Tier 1 names after rollout | No unexpected noise increase on NVDA/SPY/AAPL/AMD |
-
-#### Out of Scope
-
-- Admin frontend UI implementation
-- Supabase Realtime multi-replica fan-out
-- Per-symbol overrides
-- Rollback/versioning UI for config changes
-
----
-
-### ING-008 — Volume vs. OI Gate via Registry Injection
-
-**Type:** Feature / Gate Addition  
-**Priority:** P0  
-**Estimated Effort:** TBD — pending deliberation  
-**Depends On:** ING-004 ✅, ING-005 ✅, **ING-011 ✅**  
-**Files:** TBD — pending deliberation  
-**GitHub Issue:** TBD  
-**Branch:** `ing/s8-vol-oi-gate` *(not yet created)*
-
-#### ⚠️ 3-Way Deliberation — REQUIRED BEFORE IMPLEMENTATION
-
-> **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`). ING-011b merged 2026-05-07 (PR #82). ING-008 deliberation is now unblocked.** Read the full ING-011 and ING-011b deliberation outcomes above (D1–D5 decisions, panel verdicts) before beginning ING-008 deliberation — OI gate thresholds must be calibrated against correctly-classified and correctly-weighted directional data. Do not begin implementation until deliberation is complete and all three roles have signed off.
-
----
-
-*Last updated: 2026-05-07 (ING-010 reframed to canonical ingestion gate revamp issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84); Sprint Order updated; Post-ING-009 live findings updated to mark [#78](https://github.com/bhaveshhpatel/cipher/issues/78) as superseded; new full ING-010 story section added with 3-way deliberation outcomes, acceptance criteria, QA matrix, admin hot-reload architecture, and gate-config schema) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Last updated: 2026-05-08 — ING-010 branch created and active; all pre-merge deliberation findings resolved on `ing/s10-tiered-gate-control-plane`; 20 commits landed 2026-05-08 covering gate contract alignment, migration fixes, EPISODE-FIX regression, and EI-1–EI-10 stream-side exclude_indices gate tests.*
