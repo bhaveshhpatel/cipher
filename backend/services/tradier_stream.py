@@ -170,6 +170,19 @@ Fix (EPISODE-GATE-HOIST 2026-05-08): hoist persist_flow_episode before signal ga
   then fire persist_flow_episode as asyncio.create_task() unconditionally,
   then continue with signal_min_premium gate and SIG-DEBOUNCE.
   Decoupling is now explicit: episode persistence != signal emission.
+
+Fix (ING-011-EXPAND 2026-05-08): expand _INDEX_SYMBOLS to cover leveraged ETFs.
+  TQQQ (3x Nasdaq, 97M avg vol) and SOXL (3x SOX leveraged) were absent from
+  the original frozenset and were classified T1 purely by volume, generating
+  noise-level flow indistinguishable from single-stock whale prints.
+  QQQ and IWM were also missing (only SPY/DIA were included).
+  Added full coverage across four categories:
+    - Leveraged ETFs: TQQQ, TQQQ, SOXL, SOXS, TECS, TECL, UVXY, SVXY
+    - Broad market (missing from v1): QQQ, IWM
+    - Thematic ARK: ARKK, ARKQ, ARKW, ARKG, ARKX
+    - High-volume sector noise: XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
+  No logic changes — only frozenset membership expanded.
+  gate_configs exclude_indices boolean toggle continues to control the gate on/off.
 """
 import asyncio
 import logging
@@ -237,13 +250,34 @@ _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
 
-# ING-011: High-volume index ETF tickers whose options generate noise-level
+# ING-011: High-volume index/ETF tickers whose options generate noise-level
 # flow that obscures single-stock signals.  Filtered when exclude_indices
 # gate is active (gate_config_store.get("exclude_indices", 1) == 1.0).
+#
+# ING-011-EXPAND (2026-05-08): expanded from the original 10-ticker list to
+# cover leveraged ETFs (TQQQ/SOXL etc.) and other high-volume noise sources
+# that were previously sailing through as T1 due to raw volume thresholds.
+#
+# Categories:
+#   Broad-market index ETFs  : SPY, QQQ, IWM, DIA
+#   Volatility products      : VXX, UVXY, SVXY
+#   Commodity/bond ETFs      : GLD, SLV, TLT, HYG, EEM
+#   Leveraged equity ETFs    : TQQQ, SOXL, SOXS, TECS, TECL
+#   Thematic (ARK)           : ARKK, ARKQ, ARKW, ARKG, ARKX
+#   High-vol sector ETFs     : XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
 _INDEX_SYMBOLS: frozenset[str] = frozenset({
+    # Broad-market index ETFs
     "SPY", "QQQ", "IWM", "DIA",
-    "VXX", "GLD", "TLT", "HYG",
-    "EEM", "SLV",
+    # Volatility products
+    "VXX", "UVXY", "SVXY",
+    # Commodity / bond ETFs
+    "GLD", "SLV", "TLT", "HYG", "EEM",
+    # Leveraged equity ETFs
+    "TQQQ", "SOXL", "SOXS", "TECS", "TECL",
+    # Thematic (ARK)
+    "ARKK", "ARKQ", "ARKW", "ARKG", "ARKX",
+    # High-volume sector ETFs
+    "XLF", "XLE", "XLK", "XBI", "IBB", "IBIT", "GDX", "GDXJ",
 })
 
 # ---------------------------------------------------------------------------
