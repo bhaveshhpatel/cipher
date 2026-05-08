@@ -43,10 +43,29 @@ _VALID_GATES: frozenset[str] = frozenset({
     "exclude_indices",
 })
 
+# Valid tier integers. Exported so tests can iterate without hardcoding.
+_VALID_TIERS: frozenset[int] = frozenset({1, 2, 3})
+
+# ---------------------------------------------------------------------------
+# Static bounds — used for update() validation when the DB has not yet
+# surfaced min_value/max_value columns (pre-load or no-DB mode).
+# Keyed by canonical gate name → (min, max).
+# After load(), _bounds_cache on the instance may override these per-row.
+# ---------------------------------------------------------------------------
+_BOUNDS: dict[str, tuple[float, float]] = {
+    "min_premium":          (1_000.0,  500_000.0),
+    "dte_floor_multiplier": (0.1,      5.0),
+    "dedup_window_ms":      (500.0,    60_000.0),
+    "require_oi":           (0.0,      1.0),
+    "signal_debounce_ms":   (1_000.0,  600_000.0),
+    "signal_min_premium":   (1_000.0,  500_000.0),
+    "exclude_indices":      (0.0,      1.0),
+}
+
 # ---------------------------------------------------------------------------
 # Hard-coded defaults — used when the DB is unreachable or a row is missing.
 # Keys are (gate_name, tier) tuples.
-# These MUST match the seed rows in 019_gate_configs.sql.
+# These MUST match the seed rows in 013_gate_configs.sql.
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict[tuple[str, int], float] = {
     # min_premium
@@ -73,7 +92,7 @@ _DEFAULTS: dict[tuple[str, int], float] = {
     ("signal_min_premium",   1): 50_000.0,
     ("signal_min_premium",   2): 35_000.0,
     ("signal_min_premium",   3): 20_000.0,
-    # exclude_indices
+    # exclude_indices — 1.0 means "exclude index options" (boolean-as-float)
     ("exclude_indices",      1): 1.0,
     ("exclude_indices",      2): 1.0,
     ("exclude_indices",      3): 1.0,
@@ -127,12 +146,16 @@ class GateConfigStore:
 
         Always returns float — 0.0 for unknown gates or missing tiers.
         Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
+        Unknown tiers fall back to the T3 value for the gate.
         """
         gate_name = _ALIAS_MAP.get(gate_name, gate_name)
         if gate_name not in _VALID_GATES:
             return 0.0
         key = (gate_name, tier)
         val = self._cache.get(key)
+        if val is None:
+            # Unknown tier — fall back to T3
+            val = self._cache.get((gate_name, 3))
         if val is None:
             return 0.0
         return float(val)
@@ -197,7 +220,7 @@ class GateConfigStore:
         gate_name: str,
         tier: int,
         value: float,
-        updated_by: str,
+        updated_by: str = "system",
         reason: str | None = None,
         confirm_market_hours: bool = False,
     ) -> dict[str, Any]:
@@ -206,74 +229,103 @@ class GateConfigStore:
 
         Returns
         -------
-        dict with keys: old_value, new_value
+        dict with keys: gate_name, tier, old_value, new_value
 
         Raises
         ------
         ValueError  — unknown gate_name, bad tier, or value out of bounds
         RuntimeError — DB write failed
         """
-        from config import settings
-
         gate_name = _ALIAS_MAP.get(gate_name, gate_name)
         if gate_name not in _VALID_GATES:
             raise ValueError(f"Unknown gate: {gate_name!r}")
-        if tier not in (1, 2, 3):
-            raise ValueError(f"tier must be 1, 2, or 3 — got {tier!r}")
+        if tier not in _VALID_TIERS:
+            raise ValueError(f"Invalid tier {tier!r} — must be one of {sorted(_VALID_TIERS)}")
+
+        # Bounds check — use instance bounds_cache (from DB) if available,
+        # otherwise fall back to the static _BOUNDS module constant.
+        lo, hi = self._bounds_cache.get(gate_name, _BOUNDS.get(gate_name, (float("-inf"), float("inf"))))
+        if not (lo <= float(value) <= hi):
+            raise ValueError(
+                f"{gate_name!r} value {value} is outside allowed bounds [{lo}, {hi}]"
+            )
+
+        if _is_market_open() and not confirm_market_hours:
+            raise ValueError(
+                "Market is currently open — pass confirm_market_hours=True to force update"
+            )
 
         old_value = self.get(gate_name, tier)
 
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._write_to_db,
-                settings.SUPABASE_URL,
-                settings.SUPABASE_SERVICE_KEY,
-                gate_name, tier, value, old_value, updated_by, reason,
+        # No-DB mode — update in-memory only.
+        url = getattr(self, "_supabase_url", None)
+        key = getattr(self, "_supabase_key", None)
+        if not url or not key:
+            with self._lock:
+                self._cache[(gate_name, tier)] = float(value)
+                self.epoch += 1
+            log.info(
+                "[gate_config] no-DB mode: %s[T%d] = %s (epoch=%d)",
+                gate_name, tier, value, self.epoch,
             )
-        except Exception as exc:
-            raise RuntimeError(f"DB write failed: {exc}") from exc
+            return {
+                "gate_name": gate_name,
+                "tier": tier,
+                "old_value": old_value,
+                "new_value": float(value),
+                "_note": "no-db mode — in-memory only",
+            }
+
+        # DB-backed mode.
+        import httpx
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        async with httpx.AsyncClient(base_url=url, headers=headers) as client:
+            patch_resp = await client.patch(
+                "/rest/v1/gate_configs",
+                params={"gate_name": f"eq.{gate_name}", "tier": f"eq.{tier}"},
+                json={"value": float(value), "updated_by": updated_by},
+            )
+            if patch_resp.status_code not in (200, 204):
+                raise RuntimeError(
+                    f"DB PATCH failed: HTTP {patch_resp.status_code}"
+                )
+
+            # Audit row — best-effort; failure is non-fatal.
+            try:
+                await client.post(
+                    "/rest/v1/gate_config_audit",
+                    json={
+                        "gate_name":  gate_name,
+                        "tier":       tier,
+                        "old_value":  old_value,
+                        "new_value":  float(value),
+                        "changed_by": updated_by,
+                        "reason":     reason,
+                        "changed_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except Exception as audit_exc:  # noqa: BLE001
+                log.warning("[gate_config] audit write failed (non-fatal): %s", audit_exc)
 
         with self._lock:
-            self._cache[(gate_name, tier)] = value
+            self._cache[(gate_name, tier)] = float(value)
             self.epoch += 1
 
         log.info(
             "[gate_config] %s[T%d] updated: %s -> %s by %s (epoch=%d)",
             gate_name, tier, old_value, value, updated_by, self.epoch,
         )
-        return {"old_value": old_value, "new_value": value}
-
-    @staticmethod
-    def _write_to_db(
-        url: str,
-        key: str,
-        gate_name: str,
-        tier: int,
-        value: float,
-        old_value: float,
-        updated_by: str,
-        reason: str | None,
-    ) -> None:
-        from supabase import create_client
-        sb = create_client(url, key)
-
-        # 1. Update the live value
-        sb.table("gate_configs").update({
-            "value":      value,
-            "updated_by": updated_by,
-        }).eq("gate_name", gate_name).eq("tier", tier).execute()
-
-        # 2. Append audit row — uses old_value/new_value per DDL in 019_gate_configs.sql
-        sb.table("gate_config_audit").insert({
-            "gate_name":  gate_name,
-            "tier":       tier,
-            "old_value":  old_value,
-            "new_value":  value,
-            "changed_by": updated_by,
-            "reason":     reason,
-            "changed_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        return {
+            "gate_name": gate_name,
+            "tier": tier,
+            "old_value": old_value,
+            "new_value": float(value),
+        }
 
 
 # Module-level singleton — imported by all consumers.

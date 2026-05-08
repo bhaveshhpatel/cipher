@@ -107,11 +107,10 @@ class TestColdStartFallback:
     def test_new_store_seeds_all_defaults(self):
         """Every gate+tier in _DEFAULTS must be reachable via get()."""
         s = GateConfigStore()
-        for gate, tiers in _DEFAULTS.items():
-            for tier, expected in tiers.items():
-                assert s.get(gate, tier) == expected, (
-                    f"get({gate!r}, {tier}) expected {expected}, got {s.get(gate, tier)}"
-                )
+        for (gate, tier), expected in _DEFAULTS.items():
+            assert s.get(gate, tier) == expected, (
+                f"get({gate!r}, {tier}) expected {expected}, got {s.get(gate, tier)}"
+            )
 
     def test_new_store_epoch_is_zero(self):
         s = GateConfigStore()
@@ -130,9 +129,8 @@ class TestColdStartFallback:
     async def test_load_no_db_preserves_defaults(self):
         s = make_no_db_store()
         await s.load()
-        for gate, tiers in _DEFAULTS.items():
-            for tier, expected in tiers.items():
-                assert s.get(gate, tier) == expected
+        for (gate, tier), expected in _DEFAULTS.items():
+            assert s.get(gate, tier) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -160,15 +158,12 @@ class TestLoad:
     @pytest.mark.asyncio
     async def test_load_non200_preserves_defaults(self):
         """
-        load() calls raise_for_status() which raises HTTPStatusError on 500.
-        The in-memory cache is never mutated so defaults are preserved.
+        load() propagates HTTPStatusError on non-200. Cache untouched.
         """
         s = make_store()
         with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get([], status=500)):
-            # load() allows the exception to propagate — caller handles it
             with pytest.raises(httpx.HTTPStatusError):
                 await s.load()
-        # Cache untouched — defaults still intact
         assert s.get("min_premium", 1) == 25_000.0
 
     @pytest.mark.asyncio
@@ -182,22 +177,18 @@ class TestLoad:
         with patch("services.gate_config_store.httpx.AsyncClient", return_value=client):
             with pytest.raises(Exception, match="timeout"):
                 await s.load()
-        # Defaults preserved because cache was never touched
         assert s.get("min_premium", 2) == 15_000.0
 
     @pytest.mark.asyncio
     async def test_load_tier99_row_stored_but_get_falls_back_to_t3(self):
         """
         load() stores tier-99 as-is; get(gate, 99) falls back to T3 value.
-        This tests the get() fallback, not tier rejection in load().
         """
         s = make_store()
         rows = [{"gate_name": "min_premium", "tier": 99, "value": 999.0}]
         with patch("services.gate_config_store.httpx.AsyncClient", return_value=mock_http_get(rows)):
             await s.load()
-        # tier 99 stored but get(99) maps to T3 — still 10_000 default (row only set 99)
         assert s.get("min_premium", 3) == 10_000.0
-        # Unknown tier get() returns the T3 value
         assert s.get("min_premium", 99) == s.get("min_premium", 3)
 
     @pytest.mark.asyncio
@@ -262,20 +253,18 @@ class TestGet:
 
     def test_dte_multiplier_tier_ordering(self):
         s = GateConfigStore()
-        # T1 > T2 > T3
         assert s.get("dte_floor_multiplier", 1) > s.get("dte_floor_multiplier", 2)
         assert s.get("dte_floor_multiplier", 2) > s.get("dte_floor_multiplier", 3)
 
     def test_signal_debounce_ms_tier_ordering(self):
         s = GateConfigStore()
-        # T1 debounce < T2 < T3 (T1 is most active, shortest cooldown)
         assert s.get("signal_debounce_ms", 1) < s.get("signal_debounce_ms", 2)
         assert s.get("signal_debounce_ms", 2) < s.get("signal_debounce_ms", 3)
 
     def test_debounce_ms_alias_matches_signal_debounce_ms(self):
         """
-        'debounce_ms' is a separate gate entry in _DEFAULTS seeded with the
-        same T1/T2/T3 values as signal_debounce_ms. Both must be reachable.
+        'debounce_ms' is an alias for 'signal_debounce_ms' via _ALIAS_MAP.
+        Both must resolve to the same values for all tiers.
         """
         s = GateConfigStore()
         for tier in _VALID_TIERS:
@@ -283,16 +272,59 @@ class TestGet:
 
     def test_dedup_window_ms_all_tiers_equal(self):
         s = GateConfigStore()
-        # dedup_window_ms defaults to 5000 for all tiers
         assert s.get("dedup_window_ms", 1) == s.get("dedup_window_ms", 2) == s.get("dedup_window_ms", 3)
 
 
 # ---------------------------------------------------------------------------
+# QA-4: exclude_indices gate coverage
+# ---------------------------------------------------------------------------
+
+class TestExcludeIndicesGate:
+    """Dedicated coverage for the exclude_indices gate (QA-4)."""
+
+    def test_exclude_indices_in_valid_gates(self):
+        assert "exclude_indices" in _VALID_GATES
+
+    def test_exclude_indices_defaults_to_1_for_all_tiers(self):
+        """Default is 1.0 (enabled) for every tier."""
+        s = GateConfigStore()
+        for tier in _VALID_TIERS:
+            assert s.get("exclude_indices", tier) == 1.0, (
+                f"exclude_indices[T{tier}] expected 1.0, got {s.get('exclude_indices', tier)}"
+            )
+
+    def test_exclude_indices_unknown_tier_falls_back_to_t3(self):
+        s = GateConfigStore()
+        assert s.get("exclude_indices", 99) == s.get("exclude_indices", 3)
+
+    def test_exclude_indices_bounds_in_bounds_constant(self):
+        """_BOUNDS must include exclude_indices with a valid (lo, hi) tuple."""
+        assert "exclude_indices" in _BOUNDS
+        lo, hi = _BOUNDS["exclude_indices"]
+        assert lo == 0.0
+        assert hi == 1.0
+
+    @pytest.mark.asyncio
+    async def test_exclude_indices_update_in_memory(self):
+        """update() can set exclude_indices to 0.0 (disabled) off-hours."""
+        s = make_no_db_store()
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            result = await s.update("exclude_indices", 1, 0.0)
+        assert result["new_value"] == 0.0
+        assert s.get("exclude_indices", 1) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_exclude_indices_above_1_raises(self):
+        """exclude_indices > 1.0 is outside bounds and must raise."""
+        s = make_store()
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("exclude_indices", 1, 2.0)
+
+
+# ---------------------------------------------------------------------------
 # TGC-3: Bounds validation — invalid values rejected with ValueError.
-# Market guard is patched to False so tests are time-of-day independent:
-# update() checks the market guard BEFORE bounds, so without this patch a
-# run during trading hours would raise "Market is currently open" instead of
-# "outside allowed bounds", masking the actual assertion.
+# Market guard is patched to False so tests are time-of-day independent.
 # ---------------------------------------------------------------------------
 
 class TestBoundsValidation:
@@ -340,14 +372,12 @@ class TestBoundsValidation:
 
     @pytest.mark.asyncio
     async def test_unknown_gate_raises(self):
-        # Unknown gate is rejected before the market guard fires.
         s = make_store()
         with pytest.raises(ValueError, match="Unknown gate"):
             await s.update("fake_gate", 1, 100)
 
     @pytest.mark.asyncio
     async def test_invalid_tier_raises(self):
-        # Invalid tier is rejected before the market guard fires.
         s = make_store()
         with pytest.raises(ValueError, match="Invalid tier"):
             await s.update("min_premium", 99, 10_000)
@@ -363,8 +393,7 @@ class TestBoundsValidation:
 # ---------------------------------------------------------------------------
 # TGC-4: Market-hours guard
 # Patch _is_market_open directly — avoids mutating the shared datetime module
-# object (which patch("...datetime.datetime") does) and is immune to import
-# style, call-signature matching, and pytest collection order.
+# object and is immune to import style and pytest collection order.
 # ---------------------------------------------------------------------------
 
 class TestMarketHoursGuard:
@@ -527,12 +556,10 @@ class TestModuleSingleton:
         assert isinstance(store, GateConfigStore)
 
     def test_singleton_seeds_all_defaults(self):
-        for gate, tiers in _DEFAULTS.items():
-            for tier, expected in tiers.items():
-                assert store.get(gate, tier) == expected
+        for (gate, tier), expected in _DEFAULTS.items():
+            assert store.get(gate, tier) == expected
 
     def test_singleton_has_valid_gates(self):
         for gate in _VALID_GATES:
-            # Every valid gate must return a numeric value for T3
             val = store.get(gate, 3)
             assert isinstance(val, (int, float))
