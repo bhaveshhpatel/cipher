@@ -195,6 +195,7 @@ class GateConfigStore:
         unreachable or the table does not yet exist (pre-migration).
 
         Epoch is incremented on any HTTP 200 response, even with 0 rows.
+        Non-200 responses raise httpx.HTTPStatusError (cache is not mutated).
         """
         from config import settings
         url = getattr(settings, "SUPABASE_URL", None)
@@ -207,24 +208,13 @@ class GateConfigStore:
             "apikey": key,
             "Authorization": f"Bearer {key}",
         }
-        try:
-            async with httpx.AsyncClient(base_url=url, headers=headers) as client:
-                resp = await client.get(
-                    "/rest/v1/gate_configs",
-                    params={"select": "*"},
-                )
-                if resp.status_code != 200:
-                    log.warning(
-                        "[gate_config] DB load returned HTTP %d — using defaults",
-                        resp.status_code,
-                    )
-                    return
-                rows: list[dict] = resp.json()
-        except Exception as exc:
-            log.warning(
-                "[gate_config] DB load failed — using hardcoded defaults: %s", exc
+        async with httpx.AsyncClient(base_url=url, headers=headers) as client:
+            resp = await client.get(
+                "/rest/v1/gate_configs",
+                params={"select": "*"},
             )
-            raise
+            resp.raise_for_status()   # propagates HTTPStatusError on non-2xx
+            rows: list[dict] = resp.json()
 
         new_cache: dict[str, dict[int, float]] = {
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
