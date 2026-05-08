@@ -28,6 +28,24 @@ function cellKey(gateName: string, tier: 1 | 2 | 3): string {
   return `${gateName}:${tier}`;
 }
 
+/**
+ * Safely extract a human-readable message from an API error body.
+ * FastAPI 422 responses return `detail` as an array of validation objects;
+ * all other errors return `detail` as a plain string.
+ */
+function extractDetail(body: unknown, fallback: string): string {
+  if (!body || typeof body !== "object") return fallback;
+  const detail = (body as Record<string, unknown>).detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    // FastAPI validation error: [{loc, msg, type}, ...]
+    const first = detail[0] as Record<string, unknown>;
+    const msg   = typeof first.msg === "string" ? first.msg : JSON.stringify(first);
+    return detail.length > 1 ? `${msg} (+${detail.length - 1} more)` : msg;
+  }
+  return fallback;
+}
+
 export function useGatePatch(): UseGatePatchReturn {
   const [statusMap, setStatusMap] = useState<StatusMap>({});
 
@@ -50,7 +68,7 @@ export function useGatePatch(): UseGatePatchReturn {
         });
         if (!res.ok) {
           const body = await res.json().catch(() => ({}));
-          const msg  = (body as { detail?: string }).detail ?? `HTTP ${res.status}`;
+          const msg  = extractDetail(body, `HTTP ${res.status}`);
           setStatus(key, "error");
           throw new Error(msg);
         }
