@@ -63,7 +63,7 @@ import asyncio
 import datetime
 import logging
 import threading
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -85,14 +85,19 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     "exclude_indices":      {1: 1.0,      2: 1.0,      3: 1.0},
 }
 
-# Bounds enforced by update() — mirrors the min_value/max_value columns in DB.
-_BOUNDS: dict[str, tuple[float, float]] = {
-    "min_premium":          (1_000.0,  500_000.0),
-    "dte_floor_multiplier": (0.1,      5.0),
-    "dedup_window_ms":      (500.0,    60_000.0),
-    "require_oi":           (0.0,      1.0),
-    "signal_debounce_ms":   (1_000.0,  600_000.0),
-    "exclude_indices":      (0.0,      1.0),
+# ---------------------------------------------------------------------------
+# Bounds enforced by update() — (lo, hi, cast)
+# cast is the Python type constructor used to coerce/validate the value.
+# bool gates use cast=bool; currency/multiplier/ms gates use int or float.
+# Mirrors the min_value/max_value columns in the DB.
+# ---------------------------------------------------------------------------
+_BOUNDS: dict[str, tuple[float, float, Callable]] = {
+    "min_premium":          (1_000.0,   500_000.0, float),
+    "dte_floor_multiplier": (0.1,       5.0,       float),
+    "dedup_window_ms":      (500.0,     60_000.0,  float),
+    "require_oi":           (0.0,       1.0,       bool),
+    "signal_debounce_ms":   (1_000.0,   600_000.0, float),
+    "exclude_indices":      (0.0,       1.0,       bool),
 }
 
 _VALID_GATES = frozenset(_DEFAULTS.keys())
@@ -139,7 +144,9 @@ class GateConfigStore:
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
         # _bounds_cache: {gate_name: (min, max)} — updated by load()
-        self._bounds_cache: dict[str, tuple[float, float]] = dict(_BOUNDS)
+        self._bounds_cache: dict[str, tuple[float, float]] = {
+            gate: (lo, hi) for gate, (lo, hi, _cast) in _BOUNDS.items()
+        }
         self.epoch: int = 0
         # Overridable in tests without subclassing
         self._supabase_url: str = ""
@@ -261,7 +268,7 @@ class GateConfigStore:
                 "override gate updates during trading hours."
             )
 
-        lo, hi = self._bounds_cache.get(gate_name, _BOUNDS.get(gate_name, (0.0, float("inf"))))
+        lo, hi = self._bounds_cache.get(gate_name, _BOUNDS.get(gate_name, (0.0, float("inf")))[:2])
         if not (lo <= value <= hi):
             raise ValueError(
                 f"{value} outside allowed bounds [{lo}, {hi}] for gate {gate_name!r}"
@@ -401,9 +408,16 @@ async def load_gate_configs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test-facing aliases
+# Test-facing exports
 # ---------------------------------------------------------------------------
-# _FALLBACK: the seed defaults used when the DB has no row for a gate+tier.
-_FALLBACK = _DEFAULTS
+# _FALLBACK: flat dict keyed by (gate_name, tier) → seed value.
+# This is the shape the test suite iterates:
+#   [(g, t) for (g, t) in _FALLBACK]   →  unpacks each key as (gate, tier)
+_FALLBACK: dict[tuple[str, int], float] = {
+    (gate, tier): value
+    for gate, tiers in _DEFAULTS.items()
+    for tier, value in tiers.items()
+}
+
 # _SAFE_DEFAULT_TIER: the tier get() falls back to for any unknown tier value.
 _SAFE_DEFAULT_TIER: int = 3
