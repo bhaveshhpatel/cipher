@@ -21,13 +21,16 @@ Endpoints:
                                            Accepts gate_name='exclude_indices' (ING-011 Gate 6)
                                            to toggle index ETF option filtering live.
                                            value=1.0 → filter ON, value=0.0 → filter OFF.
+                                           Only tier=1 is accepted for exclude_indices —
+                                           tiers 2+3 are seeded for schema completeness but
+                                           never read at runtime. PATCH with tier!=1 returns 422.
   GET   /api/admin/gate-config/history   — paginated gate_config_audit log  [ING-010]
 """
 import asyncio
 import logging
 import time
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Any
 from core.auth import get_current_user, TokenData
 from config import settings
@@ -63,6 +66,10 @@ _VALID_GATE_NAMES = frozenset({
     "signal_debounce_ms",
     "exclude_indices",      # ING-011: Gate 6 — index ETF option filter toggle
 })
+
+# Gates that are tier-independent: only the tier=1 row is read at runtime.
+# Attempting to PATCH any other tier for these gates returns 422.
+_TIER_INDEPENDENT_GATES = frozenset({"exclude_indices"})
 
 
 def _get_ip(request: Request) -> str | None:
@@ -438,6 +445,9 @@ async def get_activity_log(
 #         singleton (in-memory, not a DB read), plus current epoch and the
 #         bounds for every gate so the UI can render sliders.
 #         ING-011: matrix now includes exclude_indices rows (tiers 1/2/3).
+#         Each exclude_indices row carries 'tier_independent': True so the
+#         UI can grey-out tier=2/3 sliders with a tooltip explaining that
+#         only tier=1 is honoured at runtime.
 #
 #   PATCH /api/admin/gate-config
 #         Updates one gate+tier in-place: validates bounds + 428 market-hours
@@ -453,6 +463,10 @@ async def get_activity_log(
 #           { "gate_name": "exclude_indices", "tier": 1, "value": 0.0,
 #             "reason": "allow SPY flow for macro event",
 #             "confirm_market_hours": true }
+#
+#         exclude_indices is tier-independent — only tier=1 is valid.
+#         Sending tier=2 or tier=3 returns 422 immediately (Pydantic
+#         model_validator fires before any DB I/O).
 #
 #         428 Precondition Required:
 #           Returned when confirm_market_hours=false (the safe UI default)
@@ -500,6 +514,25 @@ class GateConfigUpdate(BaseModel):
             raise ValueError(f"tier must be 1, 2, or 3 — got {v!r}")
         return v
 
+    @model_validator(mode="after")
+    def _validate_tier_independent_gates(self) -> "GateConfigUpdate":
+        """
+        Reject tier!=1 for gates that are tier-independent at runtime.
+
+        exclude_indices is read only from the tier=1 row by
+        tradier_stream._process_trade(). Writing to tier=2 or tier=3
+        rows succeeds in the DB but has zero effect on ingestion behaviour,
+        making the PATCH silently misleading. We hard-reject it here so
+        the API surface accurately reflects what the system actually honours.
+        """
+        if self.gate_name in _TIER_INDEPENDENT_GATES and self.tier != 1:
+            raise ValueError(
+                f"'{self.gate_name}' is a tier-independent gate — only tier=1 is "
+                f"read at runtime. Tiers 2 and 3 are seeded for schema completeness "
+                f"but ignored by the ingestion pipeline. Send tier=1 to change this gate."
+            )
+        return self
+
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -545,17 +578,28 @@ def _gate_bounds(gate_store: Any, gate_name: str) -> tuple[float, float]:
 
 
 def _build_config_matrix(gate_store: Any) -> list[dict]:
-    """Snapshot the live store into a list of {gate_name, tier, value, min_value, max_value} dicts."""
+    """
+    Snapshot the live store into a list of row dicts.
+
+    Each row:
+      gate_name, tier, value, min_value, max_value, tier_independent
+
+    tier_independent=True signals that only tier=1 is honoured at runtime
+    for this gate. The UI uses this flag to grey-out tier=2/3 sliders and
+    show a tooltip explaining that changes to those rows have no effect.
+    """
     rows = []
     for gate in _ALL_GATES:
         lo, hi = _gate_bounds(gate_store, gate)
+        is_tier_independent = gate in _TIER_INDEPENDENT_GATES
         for tier in (1, 2, 3):
             rows.append({
-                "gate_name": gate,
-                "tier":      tier,
-                "value":     gate_store.get(gate, tier),
-                "min_value": lo,
-                "max_value": hi,
+                "gate_name":       gate,
+                "tier":            tier,
+                "value":           gate_store.get(gate, tier),
+                "min_value":       lo,
+                "max_value":       hi,
+                "tier_independent": is_tier_independent,
             })
     return rows
 
@@ -611,10 +655,15 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
           "epoch": 4,
           "gates": [
             {"gate_name": "min_premium", "tier": 1, "value": 25000.0,
-             "min_value": 1000.0, "max_value": 500000.0},
+             "min_value": 1000.0, "max_value": 500000.0,
+             "tier_independent": false},
             ...
             {"gate_name": "exclude_indices", "tier": 1, "value": 1.0,
-             "min_value": 0.0, "max_value": 1.0},
+             "min_value": 0.0, "max_value": 1.0,
+             "tier_independent": true},
+            {"gate_name": "exclude_indices", "tier": 2, "value": 1.0,
+             "min_value": 0.0, "max_value": 1.0,
+             "tier_independent": true},
             ...
           ]
         }
@@ -623,6 +672,8 @@ async def get_gate_config(admin: TokenData = Depends(_require_admin)):
     poll this to detect when another session has mutated the config.
     Each gate row includes ``min_value`` and ``max_value`` so the UI can
     render sliders without a separate bounds lookup.
+    ``tier_independent`` is True for gates whose tier=2/3 rows are seeded
+    for schema completeness but not honoured by the ingestion pipeline.
     ING-011: matrix includes all 3 exclude_indices tier rows.
     """
     from services.gate_config_store import store as gate_store
@@ -677,7 +728,8 @@ async def patch_gate_config(
         The guard is bypassed and the update proceeds immediately.
 
     All other validation errors (unknown gate, bad tier, out-of-bounds
-    value) return 422 Unprocessable Entity regardless of market hours.
+    value, tier!=1 for exclude_indices) return 422 Unprocessable Entity
+    regardless of market hours.
 
     Response shape includes ``min_value`` and ``max_value`` so the UI
     can update its slider range in a single round-trip without a

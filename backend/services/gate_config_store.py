@@ -14,6 +14,9 @@ Design contract (from ING-010 / issue #84)
                    PATCHes the DB row atomically, inserts an audit record
                    (non-fatal on failure), then updates the in-memory cache
                    and increments ``epoch``.
+                   Raises ValueError for tier!=1 on tier-independent gates
+                   (e.g. exclude_indices) — those rows are seeded for schema
+                   completeness but only tier=1 is read at runtime.
 * assert_store_epoch_parity(chain_epoch, universe_epoch)
                  — class method.  Raises AssertionError if either
                    dependent-store epoch is ahead of this store's epoch,
@@ -56,6 +59,7 @@ Gate catalogue (gate_name → value_type)
                          Tier-independent gate. Only the tier=1 row is read
                          by tradier_stream._process_trade(). Tiers 2+3 are
                          seeded for schema completeness but ignored at runtime.
+                         update() raises ValueError for tier!=1 on this gate.
                          1.0 = exclude index options (SPY/QQQ/IWM/etc.) from flow.
                          0.0 = allow index options through (pass-through mode).
 
@@ -86,6 +90,7 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     # ING-011: Gate 6 — index options filter.
     # Default 1.0 (filter ON) for all tiers — index noise suppressed at cold
     # start. Only tier=1 is read at runtime; tiers 2+3 seeded for completeness.
+    # update() raises ValueError for tier!=1 — those writes would be silent no-ops.
     "exclude_indices":      {1: 1.0,      2: 1.0,      3: 1.0},
 }
 
@@ -101,6 +106,10 @@ _BOUNDS: dict[str, tuple[float, float]] = {
 
 _VALID_GATES = frozenset(_DEFAULTS.keys())
 _VALID_TIERS = frozenset({1, 2, 3})
+
+# Gates where only tier=1 is read at runtime. update() rejects tier!=1 with
+# ValueError to prevent silent no-op writes to tier=2/3 rows.
+_TIER_INDEPENDENT_GATES = frozenset({"exclude_indices"})
 
 # Market-hours window: Mon–Fri 09:30–16:00 ET == 13:30–20:00 UTC
 _MARKET_OPEN_UTC  = datetime.time(13, 30)
@@ -287,7 +296,8 @@ class GateConfigStore:
 
         Raises
         ------
-        ValueError   — unknown gate, invalid tier, out-of-bounds, market open guard
+        ValueError   — unknown gate, invalid tier, tier!=1 for tier-independent
+                       gates, out-of-bounds value, market open guard
         RuntimeError — DB PATCH non-2xx
         """
         gate_name = self._resolve_alias(gate_name)
@@ -297,6 +307,16 @@ class GateConfigStore:
 
         if tier not in _VALID_TIERS:
             raise ValueError(f"Invalid tier: {tier!r} — must be 1, 2, or 3")
+
+        # Belt-and-suspenders: router's model_validator fires first, but
+        # update() may also be called directly from admin scripts or tests.
+        if gate_name in _TIER_INDEPENDENT_GATES and tier != 1:
+            raise ValueError(
+                f"'{gate_name}' is a tier-independent gate — only tier=1 is "
+                f"read at runtime by the ingestion pipeline. Tiers 2 and 3 are "
+                f"seeded for schema completeness but updating them has no effect. "
+                f"Use tier=1 to change this gate."
+            )
 
         if not confirm_market_hours and _is_market_open():
             raise ValueError(
@@ -432,6 +452,8 @@ def _build_singleton() -> GateConfigStore:
 
 
 store: GateConfigStore = _build_singleton()
+# Public alias used by main.py lifespan (gate_config_store.gate_config_store)
+gate_config_store = store
 
 
 def assert_epoch_parity() -> None:
