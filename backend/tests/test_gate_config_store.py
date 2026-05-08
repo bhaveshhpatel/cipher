@@ -35,6 +35,9 @@ from services.gate_config_store import (
     store,
 )
 
+# Canonical patch target for the market-hours guard.
+_MARKET_OPEN_TARGET = "services.gate_config_store._is_market_open"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,16 +97,6 @@ def mock_http_patch_audit(patch_status: int = 204, audit_status: int = 201):
     client.patch = AsyncMock(return_value=patch_resp)
     client.post = AsyncMock(return_value=audit_resp)
     return client
-
-
-def _off_hours_dt() -> datetime.datetime:
-    """Saturday 10:00 UTC — outside market hours."""
-    return datetime.datetime(2026, 5, 9, 10, 0, 0, tzinfo=datetime.timezone.utc)
-
-
-def _market_hours_dt() -> datetime.datetime:
-    """Wednesday 14:00 UTC — inside market hours."""
-    return datetime.datetime(2026, 5, 6, 14, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -295,54 +288,66 @@ class TestGet:
 
 
 # ---------------------------------------------------------------------------
-# TGC-3: Bounds validation — invalid values rejected with ValueError
+# TGC-3: Bounds validation — invalid values rejected with ValueError.
+# Market guard is patched to False so tests are time-of-day independent:
+# update() checks the market guard BEFORE bounds, so without this patch a
+# run during trading hours would raise "Market is currently open" instead of
+# "outside allowed bounds", masking the actual assertion.
 # ---------------------------------------------------------------------------
 
 class TestBoundsValidation:
     @pytest.mark.asyncio
     async def test_min_premium_below_1000_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("min_premium", 1, 500)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("min_premium", 1, 500)
 
     @pytest.mark.asyncio
     async def test_min_premium_above_500k_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("min_premium", 1, 600_000)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("min_premium", 1, 600_000)
 
     @pytest.mark.asyncio
     async def test_dte_multiplier_below_01_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("dte_floor_multiplier", 2, 0.05)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("dte_floor_multiplier", 2, 0.05)
 
     @pytest.mark.asyncio
     async def test_dte_multiplier_above_5_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("dte_floor_multiplier", 1, 6.0)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("dte_floor_multiplier", 1, 6.0)
 
     @pytest.mark.asyncio
     async def test_dedup_window_ms_below_500_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("dedup_window_ms", 1, 100)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("dedup_window_ms", 1, 100)
 
     @pytest.mark.asyncio
     async def test_signal_debounce_ms_above_600000_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("signal_debounce_ms", 3, 700_000)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("signal_debounce_ms", 3, 700_000)
 
     @pytest.mark.asyncio
     async def test_unknown_gate_raises(self):
+        # Unknown gate is rejected before the market guard fires.
         s = make_store()
         with pytest.raises(ValueError, match="Unknown gate"):
             await s.update("fake_gate", 1, 100)
 
     @pytest.mark.asyncio
     async def test_invalid_tier_raises(self):
+        # Invalid tier is rejected before the market guard fires.
         s = make_store()
         with pytest.raises(ValueError, match="Invalid tier"):
             await s.update("min_premium", 99, 10_000)
@@ -350,43 +355,43 @@ class TestBoundsValidation:
     @pytest.mark.asyncio
     async def test_require_oi_above_1_raises(self):
         s = make_store()
-        with pytest.raises(ValueError, match="outside allowed bounds"):
-            await s.update("require_oi", 1, 2.0)
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
+            with pytest.raises(ValueError, match="outside allowed bounds"):
+                await s.update("require_oi", 1, 2.0)
 
 
 # ---------------------------------------------------------------------------
 # TGC-4: Market-hours guard
+# Patch _is_market_open directly — avoids mutating the shared datetime module
+# object (which patch("...datetime.datetime") does) and is immune to import
+# style, call-signature matching, and pytest collection order.
 # ---------------------------------------------------------------------------
 
 class TestMarketHoursGuard:
     @pytest.mark.asyncio
     async def test_market_hours_no_confirm_raises(self):
+        """Market open + confirm_market_hours=False → ValueError."""
         s = make_store()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _market_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=True):
             with pytest.raises(ValueError, match="Market is currently open"):
                 await s.update("min_premium", 3, 12_000, confirm_market_hours=False)
 
     @pytest.mark.asyncio
     async def test_market_hours_with_confirm_proceeds(self):
+        """Market open + confirm_market_hours=True → update proceeds."""
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _market_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=True):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 3, 12_000, confirm_market_hours=True)
         assert result["new_value"] == 12_000
 
     @pytest.mark.asyncio
     async def test_outside_market_hours_no_confirm_proceeds(self):
-        """Off-hours update with confirm_market_hours=False must NOT raise."""
+        """Off-hours + confirm_market_hours=False → update proceeds without error."""
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 2, 18_000, confirm_market_hours=False)
         assert result["new_value"] == 18_000
@@ -401,9 +406,7 @@ class TestUpdate:
     async def test_update_changes_in_memory_value(self):
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 await s.update("min_premium", 3, 12_000)
         assert s.get("min_premium", 3) == 12_000
@@ -412,9 +415,7 @@ class TestUpdate:
     async def test_update_returns_old_and_new_values(self):
         s = make_store()
         client_mock = mock_http_patch_audit()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("min_premium", 3, 12_000)
         assert result["old_value"] == 10_000.0
@@ -427,9 +428,7 @@ class TestUpdate:
         s = make_store()
         epoch_before = s.epoch
         client_mock = mock_http_patch_audit()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 await s.update("signal_debounce_ms", 1, 45_000)
         assert s.epoch == epoch_before + 1
@@ -438,9 +437,7 @@ class TestUpdate:
     async def test_update_db_patch_failure_raises_runtime_error(self):
         s = make_store()
         client_mock = mock_http_patch_audit(patch_status=500)
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 with pytest.raises(RuntimeError, match="DB PATCH failed"):
                     await s.update("min_premium", 1, 30_000)
@@ -451,9 +448,7 @@ class TestUpdate:
         s = make_store()
         original_value = s.get("min_premium", 1)
         client_mock = mock_http_patch_audit(patch_status=500)
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 with pytest.raises(RuntimeError):
                     await s.update("min_premium", 1, 30_000)
@@ -462,9 +457,7 @@ class TestUpdate:
     @pytest.mark.asyncio
     async def test_update_no_db_mode_updates_in_memory_only(self):
         s = make_no_db_store()
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             result = await s.update("min_premium", 2, 20_000)
         assert result["new_value"] == 20_000
         assert s.get("min_premium", 2) == 20_000
@@ -474,9 +467,7 @@ class TestUpdate:
     async def test_update_no_db_mode_increments_epoch(self):
         s = make_no_db_store()
         epoch_before = s.epoch
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             await s.update("min_premium", 2, 20_000)
         assert s.epoch == epoch_before + 1
 
@@ -485,9 +476,7 @@ class TestUpdate:
         """Audit POST failure must not raise — update() result still returned."""
         s = make_store()
         client_mock = mock_http_patch_audit(patch_status=204, audit_status=500)
-        with patch("services.gate_config_store.datetime.datetime") as mock_dt:
-            mock_dt.now.return_value = _off_hours_dt()
-            mock_dt.time = datetime.time
+        with patch(_MARKET_OPEN_TARGET, return_value=False):
             with patch("services.gate_config_store.httpx.AsyncClient", return_value=client_mock):
                 result = await s.update("dedup_window_ms", 2, 8_000)
         assert result["new_value"] == 8_000
