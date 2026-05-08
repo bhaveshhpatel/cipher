@@ -144,6 +144,13 @@ class GateConfigStore:
     * The internal ``_cache`` dict is replaced atomically on ``load()``.
     * Individual key writes on ``update()`` are protected by ``_lock``.
     * Plain reads of ``_cache[key]`` are GIL-safe and need no lock.
+
+    Credential resolution (load and update)
+    ----------------------------------------
+    Both ``load()`` and ``update()`` resolve Supabase credentials by
+    checking instance attributes ``_supabase_url`` / ``_supabase_key``
+    first, then falling back to ``config.settings``.  This allows tests
+    to inject fake credentials without environment variables.
     """
 
     def __init__(self) -> None:
@@ -152,7 +159,31 @@ class GateConfigStore:
         }
         self._bounds_cache: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
+        self._supabase_url: str = ""
+        self._supabase_key: str = ""
         self.epoch: int = 0          # monotonic counter — incremented on every update
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_credentials(self) -> tuple[str, str]:
+        """
+        Return (url, key) for Supabase access.
+
+        Priority:
+        1. Instance attributes ``_supabase_url`` / ``_supabase_key``
+           (set directly in tests via make_store() / make_no_db_store()).
+        2. ``config.settings.SUPABASE_URL`` / ``SUPABASE_SERVICE_KEY``
+           (production path).
+        """
+        url = self._supabase_url
+        key = self._supabase_key
+        if not url or not key:
+            from config import settings
+            url = getattr(settings, "SUPABASE_URL", "") or ""
+            key = getattr(settings, "SUPABASE_SERVICE_KEY", "") or ""
+        return url, key
 
     # ------------------------------------------------------------------
     # Public read API
@@ -191,15 +222,18 @@ class GateConfigStore:
         Bulk-load all rows from gate_configs into the in-memory cache.
 
         Uses httpx directly (so tests can mock services.gate_config_store.httpx).
-        Falls back silently to hard-coded ``_DEFAULTS`` if the DB is
-        unreachable or the table does not yet exist (pre-migration).
+        Falls back silently (returns early) when no credentials are available,
+        leaving the cache seeded with hard-coded ``_DEFAULTS``.
 
-        Epoch is incremented on any HTTP 200 response, even with 0 rows.
-        Non-200 responses raise httpx.HTTPStatusError (cache is not mutated).
+        Epoch is incremented on any successful HTTP 2xx response, even with
+        0 rows.  Non-2xx responses raise ``httpx.HTTPStatusError`` and the
+        cache is not mutated.
+
+        Credentials are resolved via ``_resolve_credentials()`` — instance
+        attributes take priority over ``config.settings`` so tests can inject
+        fake URLs without environment variables.
         """
-        from config import settings
-        url = getattr(settings, "SUPABASE_URL", None)
-        key = getattr(settings, "SUPABASE_SERVICE_KEY", None)
+        url, key = self._resolve_credentials()
         if not url or not key:
             log.warning("[gate_config] No Supabase URL/key — using hardcoded defaults")
             return
@@ -230,7 +264,7 @@ class GateConfigStore:
                 new_cache.setdefault(name, {})[int(t)] = float(val)
                 new_bounds[name] = (float(lo), float(hi))
 
-        # Always increment epoch on HTTP 200 — even with zero rows.
+        # Always increment epoch on HTTP 2xx — even with zero rows.
         with self._lock:
             self._cache = new_cache
             self._bounds_cache = new_bounds
@@ -292,10 +326,9 @@ class GateConfigStore:
 
         old_value = self.get(gate_name, tier)
 
-        # No-DB mode — update in-memory only.
-        url = getattr(self, "_supabase_url", None)
-        key = getattr(self, "_supabase_key", None)
+        url, key = self._resolve_credentials()
         if not url or not key:
+            # No-DB mode — update in-memory only.
             with self._lock:
                 self._cache.setdefault(gate_name, {})[tier] = float(value)
                 self.epoch += 1
