@@ -22,6 +22,8 @@ import threading
 from datetime import datetime, time, timezone
 from typing import Any
 
+import httpx  # top-level so tests can mock services.gate_config_store.httpx
+
 log = logging.getLogger("gate_config_store")
 
 # ---------------------------------------------------------------------------
@@ -55,56 +57,67 @@ _SAFE_DEFAULT_TIER: int = 3
 # Keyed by canonical gate name → (min, max, cast).
 # After load(), _bounds_cache on the instance may override these per-row.
 # ---------------------------------------------------------------------------
-_BOUNDS: dict[str, tuple[float, float]] = {
-    "min_premium":          (1_000.0,  500_000.0),
-    "dte_floor_multiplier": (0.1,      5.0),
-    "dedup_window_ms":      (500.0,    60_000.0),
-    "require_oi":           (0.0,      1.0),
-    "signal_debounce_ms":   (1_000.0,  600_000.0),
-    "signal_min_premium":   (1_000.0,  500_000.0),
-    "exclude_indices":      (0.0,      1.0),
+_BOUNDS: dict[str, tuple[float, float, type]] = {
+    "min_premium":          (1_000.0,  500_000.0, float),
+    "dte_floor_multiplier": (0.1,      5.0,       float),
+    "dedup_window_ms":      (500.0,    60_000.0,  float),
+    "require_oi":           (0.0,      1.0,       float),
+    "signal_debounce_ms":   (1_000.0,  600_000.0, float),
+    "signal_min_premium":   (1_000.0,  500_000.0, float),
+    "exclude_indices":      (0.0,      1.0,       float),
 }
 
 # ---------------------------------------------------------------------------
-# Hard-coded defaults — used when the DB is unreachable or a row is missing.
-# Keys are (gate_name, tier) tuples.
+# Hard-coded defaults — nested dict: gate_name -> tier -> value
+# Used when the DB is unreachable or a row is missing.
 # These MUST match the seed rows in 013_gate_configs.sql.
 # ---------------------------------------------------------------------------
-_DEFAULTS: dict[tuple[str, int], float] = {
-    # min_premium
-    ("min_premium",          1): 25_000.0,
-    ("min_premium",          2): 15_000.0,
-    ("min_premium",          3): 10_000.0,
-    # dte_floor_multiplier
-    ("dte_floor_multiplier", 1): 1.5,
-    ("dte_floor_multiplier", 2): 1.0,
-    ("dte_floor_multiplier", 3): 0.75,
-    # dedup_window_ms
-    ("dedup_window_ms",      1): 5_000.0,
-    ("dedup_window_ms",      2): 5_000.0,
-    ("dedup_window_ms",      3): 5_000.0,
-    # require_oi
-    ("require_oi",           1): 0.0,
-    ("require_oi",           2): 0.0,
-    ("require_oi",           3): 0.0,
-    # signal_debounce_ms
-    ("signal_debounce_ms",   1):  30_000.0,
-    ("signal_debounce_ms",   2):  60_000.0,
-    ("signal_debounce_ms",   3): 120_000.0,
-    # signal_min_premium
-    ("signal_min_premium",   1): 50_000.0,
-    ("signal_min_premium",   2): 35_000.0,
-    ("signal_min_premium",   3): 20_000.0,
-    # exclude_indices — 1.0 means "exclude index options" (boolean-as-float)
-    ("exclude_indices",      1): 1.0,
-    ("exclude_indices",      2): 1.0,
-    ("exclude_indices",      3): 1.0,
+_DEFAULTS: dict[str, dict[int, float]] = {
+    "min_premium": {
+        1: 25_000.0,
+        2: 15_000.0,
+        3: 10_000.0,
+    },
+    "dte_floor_multiplier": {
+        1: 1.5,
+        2: 1.0,
+        3: 0.75,
+    },
+    "dedup_window_ms": {
+        1: 5_000.0,
+        2: 5_000.0,
+        3: 5_000.0,
+    },
+    "require_oi": {
+        1: 0.0,
+        2: 0.0,
+        3: 0.0,
+    },
+    "signal_debounce_ms": {
+        1: 30_000.0,
+        2: 60_000.0,
+        3: 120_000.0,
+    },
+    "signal_min_premium": {
+        1: 50_000.0,
+        2: 35_000.0,
+        3: 20_000.0,
+    },
+    "exclude_indices": {
+        1: 1.0,
+        2: 1.0,
+        3: 1.0,
+    },
 }
 
 # Public alias — tests import _FALLBACK to assert default values directly.
-# Identical to _DEFAULTS; the name difference is intentional for readability
-# in parametrized test assertions.
-_FALLBACK: dict[tuple[str, int], float] = _DEFAULTS
+# Keys are (gate_name, tier) tuples for backwards compatibility with
+# parametrized tests that iterate _FALLBACK.keys().
+_FALLBACK: dict[tuple[str, int], float] = {
+    (gate, tier): value
+    for gate, tiers in _DEFAULTS.items()
+    for tier, value in tiers.items()
+}
 
 
 def _is_market_open() -> bool:
@@ -139,7 +152,11 @@ class GateConfigStore:
     """
 
     def __init__(self) -> None:
-        self._cache: dict[tuple[str, int], float] = dict(_DEFAULTS)
+        # Nested dict: gate_name -> {tier -> value}
+        # Initialised from _DEFAULTS; deep-copied so mutations are isolated.
+        self._cache: dict[str, dict[int, float]] = {
+            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
+        }
         self._bounds_cache: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
         self.epoch: int = 0          # monotonic counter — incremented on every update
@@ -147,6 +164,11 @@ class GateConfigStore:
     # ------------------------------------------------------------------
     # Public read API
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_alias(gate_name: str) -> str:
+        """Resolve a gate name alias to its canonical form. Identity for canonical names."""
+        return _ALIAS_MAP.get(gate_name, gate_name)
 
     def get(self, gate_name: str, tier: int) -> float:
         """
@@ -156,14 +178,14 @@ class GateConfigStore:
         Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
         Unknown tiers fall back to the T3 (_SAFE_DEFAULT_TIER) value.
         """
-        gate_name = _ALIAS_MAP.get(gate_name, gate_name)
+        gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
             return 0.0
-        key = (gate_name, tier)
-        val = self._cache.get(key)
+        tier_map = self._cache.get(gate_name, {})
+        val = tier_map.get(tier)
         if val is None:
             # Unknown tier — fall back to _SAFE_DEFAULT_TIER (T3)
-            val = self._cache.get((gate_name, _SAFE_DEFAULT_TIER))
+            val = tier_map.get(_SAFE_DEFAULT_TIER)
         if val is None:
             return 0.0
         return float(val)
@@ -191,7 +213,9 @@ class GateConfigStore:
             )
             return
 
-        new_cache: dict[tuple[str, int], float] = dict(_DEFAULTS)
+        new_cache: dict[str, dict[int, float]] = {
+            gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
+        }
         new_bounds: dict[str, tuple[float, float]] = {}
         for row in rows:
             name = row.get("gate_name", "")
@@ -200,7 +224,7 @@ class GateConfigStore:
             lo   = row.get("min_value", 0.0)
             hi   = row.get("max_value", float("inf"))
             if name and t is not None and val is not None:
-                new_cache[(name, int(t))] = float(val)
+                new_cache.setdefault(name, {})[int(t)] = float(val)
                 new_bounds[name] = (float(lo), float(hi))
 
         with self._lock:
@@ -244,7 +268,7 @@ class GateConfigStore:
         ValueError  — unknown gate_name, bad tier, or value out of bounds
         RuntimeError — DB write failed
         """
-        gate_name = _ALIAS_MAP.get(gate_name, gate_name)
+        gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
             raise ValueError(f"Unknown gate: {gate_name!r}")
         if tier not in _VALID_TIERS:
@@ -252,7 +276,15 @@ class GateConfigStore:
 
         # Bounds check — use instance bounds_cache (from DB) if available,
         # otherwise fall back to the static _BOUNDS module constant.
-        lo, hi = self._bounds_cache.get(gate_name, _BOUNDS.get(gate_name, (float("-inf"), float("inf"))))
+        bounds = self._bounds_cache.get(gate_name)
+        if bounds is None:
+            raw = _BOUNDS.get(gate_name)
+            if raw is not None:
+                lo, hi = raw[0], raw[1]
+            else:
+                lo, hi = float("-inf"), float("inf")
+        else:
+            lo, hi = bounds
         if not (lo <= float(value) <= hi):
             raise ValueError(
                 f"{gate_name!r} value {value} is outside allowed bounds [{lo}, {hi}]"
@@ -270,7 +302,7 @@ class GateConfigStore:
         key = getattr(self, "_supabase_key", None)
         if not url or not key:
             with self._lock:
-                self._cache[(gate_name, tier)] = float(value)
+                self._cache.setdefault(gate_name, {})[tier] = float(value)
                 self.epoch += 1
             log.info(
                 "[gate_config] no-DB mode: %s[T%d] = %s (epoch=%d)",
@@ -285,7 +317,6 @@ class GateConfigStore:
             }
 
         # DB-backed mode.
-        import httpx
         headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
@@ -321,7 +352,7 @@ class GateConfigStore:
                 log.warning("[gate_config] audit write failed (non-fatal): %s", audit_exc)
 
         with self._lock:
-            self._cache[(gate_name, tier)] = float(value)
+            self._cache.setdefault(gate_name, {})[tier] = float(value)
             self.epoch += 1
 
         log.info(
@@ -334,6 +365,39 @@ class GateConfigStore:
             "old_value": old_value,
             "new_value": float(value),
         }
+
+    # ------------------------------------------------------------------
+    # Epoch parity guard
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def assert_store_epoch_parity(
+        gate_epoch: int,
+        chain_epoch: int,
+        universe_epoch: int,
+    ) -> None:
+        """
+        Assert that dependent stores (chain, universe) have not advanced
+        ahead of the gate store epoch.
+
+        Pre-load zero values for chain_epoch or universe_epoch are always
+        tolerated (no false positives at startup).
+
+        Raises
+        ------
+        AssertionError — if chain_epoch > gate_epoch or universe_epoch > gate_epoch
+                         (and the offending epoch is non-zero).
+        """
+        if chain_epoch != 0 and chain_epoch > gate_epoch:
+            raise AssertionError(
+                f"chain_store epoch {chain_epoch} is ahead of gate_store epoch "
+                f"{gate_epoch} — gate store must be loaded first"
+            )
+        if universe_epoch != 0 and universe_epoch > gate_epoch:
+            raise AssertionError(
+                f"universe_store epoch {universe_epoch} is ahead of gate_store epoch "
+                f"{gate_epoch} — gate store must be loaded first"
+            )
 
 
 # Module-level singleton — imported by all consumers.
