@@ -338,7 +338,9 @@ class TestStreamExcludeIndicesAlwaysTier1:
             "_resolve_exclude_indices() not found — ING-011 gate helper missing"
         )
         src = inspect.getsource(ts._resolve_exclude_indices)
-        assert re.search(r'["\']exclude_indices["\']\\s*,\\s*1', src), (
+        # Match: get("exclude_indices", 1) or get('exclude_indices', 1)
+        # with optional whitespace around the comma.
+        assert re.search(r'["\']exclude_indices["\']\s*,\s*1', src), (
             "_resolve_exclude_indices() must call gate_config_store.get('exclude_indices', 1) — "
             "tier=1 must be hardcoded (tier-independent gate).\n"
             f"Source:\n{src}"
@@ -354,7 +356,9 @@ class TestStreamExcludeIndicesAlwaysTier1:
         import services.tradier_stream as ts
 
         src = inspect.getsource(ts._resolve_exclude_indices)
-        match = re.search(r'["\']exclude_indices["\']\\s*,\\s*1', src)
+        # Match: get("exclude_indices", 1) or get('exclude_indices', 1)
+        # with optional whitespace around the comma.
+        match = re.search(r'["\']exclude_indices["\']\s*,\s*1', src)
         assert match, (
             "_resolve_exclude_indices() must use tier=1 for exclude_indices "
             "regardless of the symbol's actual tier (tier-independent gate). "
