@@ -72,6 +72,14 @@ Bug fixes applied:
      total_premium +=, signal_ts = new). On no match: INSERT (existing path).
      _stats gains "created_episodes" and "merged_episodes" counters.
      Both counters initialised at module level and visible in /health/stream.
+  8. ING-009-RACE (2026-05-08): concurrent coroutines for the same contract
+     arriving within the same batch flush window both called
+     _lookup_open_episode(), both received None (neither INSERT had committed
+     yet), and both issued INSERT — producing 2-3 orphan episode rows instead
+     of 1. Fix: per-contract asyncio.Lock (_episode_locks dict keyed by merge
+     key string) serialises the lookup→insert/patch path. An in-process
+     _episode_in_flight cache allows the second waiter to PATCH the just-
+     inserted row without a DB round-trip.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -127,6 +135,24 @@ ING-009 episode merge semantics:
   _EPISODE_MERGE_WINDOW_S updates the existing row rather than inserting a
   new one. This ensures ING-007's get_contract_prior_days() query operates
   on correctly aggregated episode rows, not per-print duplicates.
+
+ING-009-RACE episode lock semantics:
+  _episode_locks: Dict[str, asyncio.Lock]
+    One lock per merge key ("ticker|dir|ctype|strike|expiry").
+    Created on first use via _get_episode_lock(key). Never deleted within
+    a session — the dict is bounded by the tracked-symbol universe
+    (O(contracts seen per session), not O(events)).
+
+  _episode_in_flight: Dict[str, dict]
+    Stores {"id": int, "trade_count": int, "total_premium": float} for
+    the most recently inserted/patched episode for each key.
+    The first coroutine to acquire the lock finds nothing in-flight and
+    checks the DB. If it INSERTs, it populates _episode_in_flight[key] via
+    _set_episode_in_flight(). Subsequent waiters that acquire the lock see
+    the in-flight entry and go directly to PATCH — no DB GET needed.
+    After each PATCH, total_premium in the in-flight entry is updated so
+    the next waiter accumulates correctly.
+    Cleared on session reset via reset_episode_state().
 """
 import asyncio
 import logging
@@ -163,6 +189,49 @@ _RETRY_DELAY_S = 1.0
 #   30 minutes (1800s) is the WSJ same-session accumulation window.
 # ---------------------------------------------------------------------------
 _EPISODE_MERGE_WINDOW_S: int = 1800
+
+# ---------------------------------------------------------------------------
+# ING-009-RACE: per-contract locks and in-flight cache
+#   Prevents duplicate INSERT when two coroutines for the same contract key
+#   arrive concurrently within the same batch flush window.
+#   Both dicts are keyed by the merge key string:
+#     "{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
+# ---------------------------------------------------------------------------
+_episode_locks: Dict[str, asyncio.Lock] = {}
+_episode_in_flight: Dict[str, dict] = {}  # key -> {"id", "trade_count", "total_premium"}
+
+
+def _episode_key(ticker: str, direction: str, contract_type: str, strike: float, expiry: str) -> str:
+    """Stable merge-key string for _episode_locks and _episode_in_flight."""
+    return f"{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
+
+
+def _get_episode_lock(key: str) -> asyncio.Lock:
+    """Return the existing lock for key, or create one atomically."""
+    if key not in _episode_locks:
+        _episode_locks[key] = asyncio.Lock()
+    return _episode_locks[key]
+
+
+def _set_episode_in_flight(key: str, row_id: int, trade_count: int, total_premium: float) -> None:
+    """Cache the just-inserted/patched episode so concurrent waiters skip the DB GET."""
+    _episode_in_flight[key] = {
+        "id":            row_id,
+        "trade_count":   trade_count,
+        "total_premium": total_premium,
+    }
+
+
+def reset_episode_state() -> None:
+    """
+    Clear the in-flight cache and lock dict for session reset (market-open boundary).
+    Called from the market-open handler and from tests.
+    Note: locks that are currently held will be released when their coroutine
+    exits normally — this is safe to call between sessions only.
+    """
+    _episode_in_flight.clear()
+    _episode_locks.clear()
+
 
 # ---------------------------------------------------------------------------
 # ING-007: async lookback enrichment queue
@@ -400,6 +469,10 @@ async def _lookup_open_episode(
     On any Supabase error: logs a warning and returns None so the caller
     falls back to INSERT — no episode is ever lost due to a lookup failure.
     This satisfies E-8 in the QA test matrix.
+
+    NOTE: Must only be called while holding _get_episode_lock(key).
+    The in-flight cache check (_episode_in_flight) should be done BEFORE
+    calling this function to avoid an unnecessary DB round-trip.
     """
     if not _is_configured():
         return None
@@ -449,6 +522,59 @@ async def _lookup_open_episode(
         return None
 
 
+async def _patch_episode(
+    row_id: int,
+    trade_count: int,
+    total_premium: float,
+    new_ts: str,
+    ticker: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+) -> bool:
+    """
+    Issue the PATCH to flow_episodes for an existing episode row.
+    Returns True on success (200/204), False otherwise.
+    Extracted so both the in-flight and DB-lookup paths share one implementation.
+    """
+    patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
+    patch_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+    payload = {
+        "trade_count":   trade_count,
+        "total_premium": total_premium,
+        "signal_ts":     new_ts,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(patch_url, headers=patch_headers, json=payload)
+        if resp.status_code in (200, 204):
+            prem_str = f"${total_premium:,.0f}"
+            log.info(
+                "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
+                "trade_count=%d prem=%s (id=%s)",
+                ticker, contract_type, strike, expiry,
+                trade_count, prem_str, row_id,
+            )
+            return True
+        log.warning(
+            "[flow_store] flow_episode PATCH failed: %d -- %s "
+            "(id=%s ticker=%s %s) — episode count may be inaccurate",
+            resp.status_code, resp.text[:200], row_id, ticker, contract_type,
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "[flow_store] flow_episode PATCH exception: %s (id=%s ticker=%s)",
+            exc, row_id, ticker,
+        )
+        return False
+
+
 async def persist_flow_episode(signal_data: dict):
     """
     ING-009: Upsert one episode into flow_episodes.
@@ -463,6 +589,14 @@ async def persist_flow_episode(signal_data: dict):
         total_premium += new_premium
         signal_ts     = new timestamp
       Increments _episode_stats["merged_episodes"].
+
+    ING-009-RACE fix (2026-05-08):
+      Acquires a per-contract asyncio.Lock before the lookup to prevent two
+      concurrent coroutines for the same contract from both seeing None from
+      _lookup_open_episode() and both issuing INSERT.
+      After INSERT, stores the new row's id in _episode_in_flight[key] so
+      subsequent waiters that acquire the lock go directly to PATCH without
+      a DB GET.  After each PATCH, updates the cached total_premium.
 
     Gate order is preserved: called from _process_trade() after Signal Gate,
     before SIG-DEBOUNCE. Do not tie back to debounce.
@@ -479,77 +613,131 @@ async def persist_flow_episode(signal_data: dict):
     new_premium   = signal_data.get("total_premium") or 0.0
     new_ts        = signal_data.get("timestamp")
 
-    existing = await _lookup_open_episode(
-        ticker, direction, contract_type, strike, expiry
-    )
+    key = _episode_key(ticker, direction, contract_type, strike, expiry)
+    lock = _get_episode_lock(key)
 
-    if existing:
-        row_id        = existing["id"]
-        trade_count   = (existing.get("trade_count") or 1) + 1
-        total_premium = (existing.get("total_premium") or 0.0) + new_premium
+    async with lock:
+        # -------------------------------------------------------------------
+        # Step 1: check in-flight cache first (avoids DB round-trip for
+        # concurrent waiters that queued up while the first INSERT was in
+        # progress).
+        # -------------------------------------------------------------------
+        in_flight = _episode_in_flight.get(key)
 
-        patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
-        patch_headers = {
-            "apikey":        _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
-            "Content-Type":  "application/json",
-            "Prefer":        "return=minimal",
-        }
-        payload = {
-            "trade_count":   trade_count,
-            "total_premium": total_premium,
-            "signal_ts":     new_ts,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.patch(patch_url, headers=patch_headers, json=payload)
-            if resp.status_code in (200, 204):
-                _episode_stats["merged_episodes"] += 1
-                prem_str = f"${total_premium:,.0f}"
-                log.info(
-                    "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
-                    "trade_count=%d prem=%s (id=%s)",
-                    ticker, contract_type, strike, expiry,
-                    trade_count, prem_str, row_id,
-                )
-            else:
-                log.warning(
-                    "[flow_store] flow_episode PATCH failed: %d -- %s "
-                    "(id=%s ticker=%s %s) — episode count may be inaccurate",
-                    resp.status_code, resp.text[:200], row_id, ticker, contract_type,
-                )
-        except Exception as exc:
-            log.warning(
-                "[flow_store] flow_episode PATCH exception: %s (id=%s ticker=%s)",
-                exc, row_id, ticker,
+        if in_flight is not None:
+            # A prior coroutine already inserted this episode in the same
+            # batch window.  Merge directly without a DB GET.
+            row_id        = in_flight["id"]
+            trade_count   = in_flight["trade_count"] + 1
+            total_premium = in_flight["total_premium"] + new_premium
+
+            ok = await _patch_episode(
+                row_id, trade_count, total_premium, new_ts,
+                ticker, contract_type, strike, expiry,
             )
-        return
+            if ok:
+                _episode_stats["merged_episodes"] += 1
+                # Update cached premium so the next waiter accumulates correctly.
+                in_flight["trade_count"]   = trade_count
+                in_flight["total_premium"] = total_premium
+            return
 
-    row = {
-        "ticker":              ticker,
-        "direction":           direction,
-        "contract_type":       contract_type,
-        "strike":              strike,
-        "expiry":              expiry,
-        "total_premium":       new_premium,
-        "trade_count":         signal_data.get("trade_count"),
-        "alert_level":         signal_data.get("alert_level"),
-        "is_accelerating":     signal_data.get("is_accelerating", False),
-        "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
-        "seed_episode":        signal_data.get("seed_episode"),
-        "signal_ts":           new_ts,
-    }
-    ok = await _insert_rows("flow_episodes", [row])
-    if ok:
-        _episode_stats["created_episodes"] += 1
-        prem_str = f"${new_premium:,.0f}"
-        log.info(
-            "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
-            "alert=%s prem=%s multi_day=%s",
-            ticker, contract_type, strike, expiry,
-            row["alert_level"], prem_str,
-            row["is_multi_day_repeat"],
+        # -------------------------------------------------------------------
+        # Step 2: no in-flight entry — check the DB.
+        # -------------------------------------------------------------------
+        existing = await _lookup_open_episode(
+            ticker, direction, contract_type, strike, expiry
         )
+
+        if existing:
+            row_id        = existing["id"]
+            trade_count   = (existing.get("trade_count") or 1) + 1
+            total_premium = (existing.get("total_premium") or 0.0) + new_premium
+
+            ok = await _patch_episode(
+                row_id, trade_count, total_premium, new_ts,
+                ticker, contract_type, strike, expiry,
+            )
+            if ok:
+                _episode_stats["merged_episodes"] += 1
+                # Populate in-flight so subsequent waiters skip the DB GET.
+                _set_episode_in_flight(key, row_id, trade_count, total_premium)
+            return
+
+        # -------------------------------------------------------------------
+        # Step 3: no existing episode — INSERT.
+        # -------------------------------------------------------------------
+        row = {
+            "ticker":              ticker,
+            "direction":           direction,
+            "contract_type":       contract_type,
+            "strike":              strike,
+            "expiry":              expiry,
+            "total_premium":       new_premium,
+            "trade_count":         signal_data.get("trade_count"),
+            "alert_level":         signal_data.get("alert_level"),
+            "is_accelerating":     signal_data.get("is_accelerating", False),
+            "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
+            "seed_episode":        signal_data.get("seed_episode"),
+            "signal_ts":           new_ts,
+        }
+        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium)
+        if ok:
+            _episode_stats["created_episodes"] += 1
+            prem_str = f"${new_premium:,.0f}"
+            log.info(
+                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
+                "alert=%s prem=%s multi_day=%s",
+                ticker, contract_type, strike, expiry,
+                row["alert_level"], prem_str,
+                row["is_multi_day_repeat"],
+            )
+
+
+async def _insert_rows_with_episode_id(table: str, row: dict, key: str, premium: float) -> bool:
+    """
+    INSERT a single flow_episodes row and populate _episode_in_flight[key]
+    with the returned bigserial id so concurrent waiters can PATCH without
+    a DB GET.
+
+    Uses Prefer: return=representation + select=id to get the generated id
+    back from PostgREST in the 201 response body.
+
+    Falls back gracefully: if the id cannot be retrieved (e.g. PostgREST
+    returns minimal or the body is malformed), _episode_in_flight is NOT
+    populated — the next waiter will fall back to _lookup_open_episode(),
+    which is the pre-existing safe path.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return False
+
+    url = f"{_SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",  # ask PostgREST to return the inserted row
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, json=[row])
+        if resp.status_code in (200, 201):
+            try:
+                returned = resp.json()
+                if returned and isinstance(returned, list) and "id" in returned[0]:
+                    row_id = returned[0]["id"]
+                    trade_count = row.get("trade_count") or 1
+                    _set_episode_in_flight(key, row_id, trade_count, premium)
+            except Exception:
+                pass  # in-flight not populated — next waiter falls back to DB GET (safe)
+            return True
+        log.error(
+            f"[flow_store] insert into {table} failed: {resp.status_code} -- {resp.text[:300]}"
+        )
+        return False
+    except Exception as e:
+        log.error(f"[flow_store] insert into {table} exception: {e}")
+        return False
 
 
 async def _update_episode_multiday(
