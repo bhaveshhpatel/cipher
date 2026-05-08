@@ -21,6 +21,14 @@ Design constraints
   duplicate breach events (dedup via last-seen cache keyed on
   (symbol, breach_type, epoch-minute)).
 
+OI suppression (S2 contract)
+-----------------------------
+Stream-worker (S2) always produces oi_delta=0.0 because timesale ticks
+carry no OI field.  _evaluate() therefore skips both OI_SPIKE and
+OI_COLLAPSE checks when oi_delta == 0.0.  OI breach detection is
+reserved for a future S3 snapshot reconciler that reads OI deltas from
+a dedicated OI store.
+
 ING-010 (2026-05-07):
   _TIER_THRESHOLDS is now the COLD-START FALLBACK only.
   _get_tier_thresholds(tier) reads from gate_config_store first:
@@ -301,8 +309,12 @@ class ThresholdReconciler:
     ) -> List[ThresholdBreach]:
         breaches: List[ThresholdBreach] = []
 
-        # OI spike
-        if m.oi_delta >= thres["oi_spike_pct"]:
+        # OI spike — skip entirely when oi_delta is zero.
+        # S2 (stream_worker) always produces oi_delta=0.0 because timesale
+        # ticks carry no OI field.  A zero delta means OI did not move, so
+        # neither a spike nor a collapse could have occurred.  This guard also
+        # prevents spurious breaches when the threshold is hot-reloaded to 0.0.
+        if m.oi_delta != 0.0 and m.oi_delta >= thres["oi_spike_pct"]:
             breaches.append(ThresholdBreach(
                 symbol=m.symbol,
                 breach_type=BreachType.OI_SPIKE,
@@ -312,8 +324,8 @@ class ThresholdReconciler:
                 timestamp=m.timestamp,
             ))
 
-        # OI collapse
-        if m.oi_delta <= thres["oi_collapse_pct"]:
+        # OI collapse — same zero-delta guard as OI spike above.
+        if m.oi_delta != 0.0 and m.oi_delta <= thres["oi_collapse_pct"]:
             breaches.append(ThresholdBreach(
                 symbol=m.symbol,
                 breach_type=BreachType.OI_COLLAPSE,
