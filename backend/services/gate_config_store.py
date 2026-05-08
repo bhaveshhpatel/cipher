@@ -45,6 +45,11 @@ Gate catalogue (gate_name → value_type)
     dedup_window_ms      milliseconds  (ms) default all=5000
     require_oi           boolean       (0/1)default all=0
     signal_debounce_ms   milliseconds  (ms) default T1=30000 T2=60000 T3=120000
+    signal_min_premium   currency      ($)  default T1=50000 T2=35000 T3=20000
+                         Minimum cumulative episode premium required before a
+                         signal is emitted.  Resolved live per-tick via
+                         _resolve_signal_min_premium() in tradier_stream.py.
+                         Fallback (cold-start): _SIGNAL_MIN_PREMIUM=50_000.
     exclude_indices      boolean       (0/1)default all=1.0 (filter ON)
                          Tier-independent gate. Only the tier=1 row is read
                          by tradier_stream._process_trade(). Tiers 2+3 are
@@ -82,6 +87,10 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     "dedup_window_ms":      {1: 5_000.0,  2: 5_000.0,  3: 5_000.0},
     "require_oi":           {1: 0.0,      2: 0.0,      3: 0.0},
     "signal_debounce_ms":   {1: 30_000.0, 2: 60_000.0, 3: 120_000.0},
+    # ING-010-GATES: Gate 7 — per-episode signal minimum premium floor.
+    # Resolved live per-tick via _resolve_signal_min_premium() in
+    # tradier_stream.py.  Cold-start fallback: _SIGNAL_MIN_PREMIUM=50_000.
+    "signal_min_premium":   {1: 50_000.0, 2: 35_000.0, 3: 20_000.0},
     # ING-011: Gate 6 — index options filter.
     # Default 1.0 (filter ON) for all tiers — index noise suppressed at cold
     # start. Only tier=1 is read at runtime; tiers 2+3 seeded for completeness.
@@ -101,6 +110,7 @@ _BOUNDS: dict[str, tuple[float, float, Callable]] = {
     "dedup_window_ms":      (500.0,     60_000.0,  float),
     "require_oi":           (0.0,       1.0,       bool),
     "signal_debounce_ms":   (1_000.0,   600_000.0, float),
+    "signal_min_premium":   (1_000.0,   500_000.0, float),
     "exclude_indices":      (0.0,       1.0,       bool),
 }
 
