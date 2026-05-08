@@ -398,3 +398,12 @@ async def load_gate_configs() -> None:
     Convenience coroutine called from app startup (``main.py`` lifespan).
     """
     await store.load()
+
+
+# ---------------------------------------------------------------------------
+# Test-facing aliases
+# ---------------------------------------------------------------------------
+# _FALLBACK: the seed defaults used when the DB has no row for a gate+tier.
+_FALLBACK = _DEFAULTS
+# _SAFE_DEFAULT_TIER: the tier get() falls back to for any unknown tier value.
+_SAFE_DEFAULT_TIER: int = 3
