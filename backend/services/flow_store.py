@@ -80,6 +80,13 @@ Bug fixes applied:
      key string) serialises the lookup→insert/patch path. An in-process
      _episode_in_flight cache allows the second waiter to PATCH the just-
      inserted row without a DB round-trip.
+  9. ING-008 (2026-05-08): persist_flow_event() now captures vol/OI snapshot
+     from chain_store.get_contract_vol_oi(occ_symbol) and writes
+     contract_volume_snapshot and contract_oi to the flow_events row.
+     persist_flow_episode() captures vol/OI at INSERT time (contract_oi_at_open)
+     and at PATCH time (contract_volume_at_close), then pre-computes
+     volume_oi_ratio = volume / oi (NULL-safe, zero-OI-safe).
+     Vol/OI is enrichment only — a cache miss (None) never drops flow.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -153,6 +160,26 @@ ING-009-RACE episode lock semantics:
     After each PATCH, total_premium in the in-flight entry is updated so
     the next waiter accumulates correctly.
     Cleared on session reset via reset_episode_state().
+
+ING-008 Vol/OI capture semantics:
+  flow_events.contract_volume_snapshot
+  flow_events.contract_oi
+    Captured inline in persist_flow_event() via get_contract_vol_oi(occ_symbol).
+    Written into the buffered row dict before it enters _flow_event_buffer.
+    NULL on cache miss — never a drop condition.
+
+  flow_episodes.contract_oi_at_open
+    Captured at INSERT time (episode creation) only.
+    Represents OI for the contract at the time the episode opened.
+
+  flow_episodes.contract_volume_at_close
+    Captured at every PATCH (episode merge) — always the latest value
+    at the time of the most recent qualifying print.
+
+  flow_episodes.volume_oi_ratio
+    Pre-computed at persist time as contract_volume_at_close / contract_oi_at_open.
+    NULL when either component is None or contract_oi_at_open == 0.
+    No live computation required in signal engines — read directly.
 """
 import asyncio
 import logging
@@ -362,37 +389,55 @@ async def persist_flow_event(ev_dict: dict):
     if strike is None:
         strike = None
 
-    ticker = ev_dict.get("ticker", "UNKNOWN")
+    ticker     = ev_dict.get("ticker", "UNKNOWN")
+    occ_symbol = ev_dict.get("occ_symbol")
+
     if not expiry:
         log.warning(f"[flow_store] {ticker}: expiry is empty -- OCC parse may have failed")
     if strike == 0.0:
         log.warning(f"[flow_store] {ticker}: strike=0.0 -- verify OCC parse for this symbol")
 
+    # -----------------------------------------------------------------------
+    # ING-008: capture intraday vol/OI snapshot from chain_store cache.
+    # O(1) dict lookup — zero API calls. NULL on cache miss; never a gate.
+    # -----------------------------------------------------------------------
+    contract_volume_snapshot: Optional[int] = None
+    contract_oi: Optional[int] = None
+    if occ_symbol:
+        try:
+            from services.chain_store import get_contract_vol_oi
+            contract_volume_snapshot, contract_oi = get_contract_vol_oi(occ_symbol)
+        except Exception:
+            pass  # enrichment failure is non-fatal
+
     row = {
-        "ticker":               ticker,
-        "contract_type":        ev_dict.get("contract_type"),
-        "strike":               strike,
-        "expiry":               expiry,
-        "dte":                  ev_dict.get("dte", 0),
-        "fill_price":           ev_dict.get("fill_price", 0.0),
-        "bid":                  ev_dict.get("bid", 0.0),
-        "ask":                  ev_dict.get("ask", 0.0),
-        "size":                 ev_dict.get("size", 0),
-        "premium":              ev_dict.get("premium", 0.0),
-        "trade_type":           ev_dict.get("trade_type", "UNKNOWN"),
-        "bid_ask_class":        ev_dict.get("bid_ask_class", "MID"),
-        "is_aggressive":        ev_dict.get("is_aggressive", False),
-        "is_golden_sweep":      ev_dict.get("is_golden_sweep", False),
-        "sentiment":            ev_dict.get("sentiment", "NEUTRAL"),
-        "influence_tier":       ev_dict.get("influence_tier", "RETAIL"),
-        "conviction_score":     ev_dict.get("conviction_score", 0.0),
-        "exchange_count":       ev_dict.get("exchange_count", 1),
-        "fill_count":           ev_dict.get("fill_count", 1),
-        "open_interest":        ev_dict.get("open_interest", 0),
-        "iv":                   ev_dict.get("iv", 0.0),
-        "underlying_price":     ev_dict.get("underlying_price", 0.0),
-        "occ_symbol":           ev_dict.get("occ_symbol"),
-        "is_synthetic_quote":   ev_dict.get("is_synthetic_quote", False),
+        "ticker":                   ticker,
+        "contract_type":            ev_dict.get("contract_type"),
+        "strike":                   strike,
+        "expiry":                   expiry,
+        "dte":                      ev_dict.get("dte", 0),
+        "fill_price":               ev_dict.get("fill_price", 0.0),
+        "bid":                      ev_dict.get("bid", 0.0),
+        "ask":                      ev_dict.get("ask", 0.0),
+        "size":                     ev_dict.get("size", 0),
+        "premium":                  ev_dict.get("premium", 0.0),
+        "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
+        "bid_ask_class":            ev_dict.get("bid_ask_class", "MID"),
+        "is_aggressive":            ev_dict.get("is_aggressive", False),
+        "is_golden_sweep":          ev_dict.get("is_golden_sweep", False),
+        "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
+        "influence_tier":           ev_dict.get("influence_tier", "RETAIL"),
+        "conviction_score":         ev_dict.get("conviction_score", 0.0),
+        "exchange_count":           ev_dict.get("exchange_count", 1),
+        "fill_count":               ev_dict.get("fill_count", 1),
+        "open_interest":            ev_dict.get("open_interest", 0),
+        "iv":                       ev_dict.get("iv", 0.0),
+        "underlying_price":         ev_dict.get("underlying_price", 0.0),
+        "occ_symbol":               occ_symbol,
+        "is_synthetic_quote":       ev_dict.get("is_synthetic_quote", False),
+        # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
+        "contract_volume_snapshot": contract_volume_snapshot,
+        "contract_oi":              contract_oi,
     }
     _flow_event_buffer.append(row)
 
@@ -497,7 +542,7 @@ async def _lookup_open_episode(
         f"&signal_ts=gte.{quote(cutoff)}"
         f"&order=signal_ts.desc"
         f"&limit=1"
-        f"&select=id,trade_count,total_premium"
+        f"&select=id,trade_count,total_premium,contract_oi_at_open"
     )
 
     try:
@@ -531,11 +576,15 @@ async def _patch_episode(
     contract_type: str,
     strike: float,
     expiry: str,
+    contract_volume_at_close: Optional[int] = None,
+    volume_oi_ratio: Optional[float] = None,
 ) -> bool:
     """
     Issue the PATCH to flow_episodes for an existing episode row.
     Returns True on success (200/204), False otherwise.
-    Extracted so both the in-flight and DB-lookup paths share one implementation.
+
+    ING-008: now accepts contract_volume_at_close and volume_oi_ratio;
+    both are written when not None (NULL-safe — omitted from payload if None).
     """
     patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
     patch_headers = {
@@ -544,11 +593,17 @@ async def _patch_episode(
         "Content-Type":  "application/json",
         "Prefer":        "return=minimal",
     }
-    payload = {
+    payload: dict = {
         "trade_count":   trade_count,
         "total_premium": total_premium,
         "signal_ts":     new_ts,
     }
+    # ING-008: only include vol/OI fields if we have values (cache hit)
+    if contract_volume_at_close is not None:
+        payload["contract_volume_at_close"] = contract_volume_at_close
+    if volume_oi_ratio is not None:
+        payload["volume_oi_ratio"] = volume_oi_ratio
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.patch(patch_url, headers=patch_headers, json=payload)
@@ -556,9 +611,10 @@ async def _patch_episode(
             prem_str = f"${total_premium:,.0f}"
             log.info(
                 "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
-                "trade_count=%d prem=%s (id=%s)",
+                "trade_count=%d prem=%s vol=%s oi_ratio=%s (id=%s)",
                 ticker, contract_type, strike, expiry,
-                trade_count, prem_str, row_id,
+                trade_count, prem_str,
+                contract_volume_at_close, volume_oi_ratio, row_id,
             )
             return True
         log.warning(
@@ -573,6 +629,19 @@ async def _patch_episode(
             exc, row_id, ticker,
         )
         return False
+
+
+def _compute_vol_oi_ratio(
+    volume: Optional[int],
+    oi: Optional[int],
+) -> Optional[float]:
+    """
+    ING-008: Pre-compute volume_oi_ratio = volume / oi.
+    Returns None when either input is None or oi == 0 (div-by-zero safe).
+    """
+    if volume is None or oi is None or oi == 0:
+        return None
+    return round(volume / oi, 4)
 
 
 async def persist_flow_episode(signal_data: dict):
@@ -598,6 +667,14 @@ async def persist_flow_episode(signal_data: dict):
       subsequent waiters that acquire the lock go directly to PATCH without
       a DB GET.  After each PATCH, updates the cached total_premium.
 
+    ING-008 (2026-05-08):
+      Vol/OI is captured at two points:
+        INSERT → contract_oi_at_open  (OI at the time the episode opens)
+        PATCH  → contract_volume_at_close (latest vol; always the most recent
+                  qualifying print), volume_oi_ratio (pre-computed, NULL-safe).
+      Cache miss (get_contract_vol_oi returns None) results in NULL stored;
+      NULL is never a gate condition.
+
     Gate order is preserved: called from _process_trade() after Signal Gate,
     before SIG-DEBOUNCE. Do not tie back to debounce.
 
@@ -612,8 +689,21 @@ async def persist_flow_episode(signal_data: dict):
     expiry        = signal_data.get("expiry") or None
     new_premium   = signal_data.get("total_premium") or 0.0
     new_ts        = signal_data.get("timestamp")
+    occ_symbol    = signal_data.get("occ_symbol")
 
-    key = _episode_key(ticker, direction, contract_type, strike, expiry)
+    # -----------------------------------------------------------------------
+    # ING-008: resolve current vol/OI from chain_store cache (O(1) lookup).
+    # -----------------------------------------------------------------------
+    current_volume: Optional[int] = None
+    current_oi: Optional[int] = None
+    if occ_symbol:
+        try:
+            from services.chain_store import get_contract_vol_oi
+            current_volume, current_oi = get_contract_vol_oi(occ_symbol)
+        except Exception:
+            pass  # enrichment failure is non-fatal
+
+    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
     lock = _get_episode_lock(key)
 
     async with lock:
@@ -625,19 +715,24 @@ async def persist_flow_episode(signal_data: dict):
         in_flight = _episode_in_flight.get(key)
 
         if in_flight is not None:
-            # A prior coroutine already inserted this episode in the same
-            # batch window.  Merge directly without a DB GET.
             row_id        = in_flight["id"]
             trade_count   = in_flight["trade_count"] + 1
             total_premium = in_flight["total_premium"] + new_premium
 
+            # ING-008: vol at close is the latest cache value; oi_at_open
+            # is preserved from when the episode was created (in-flight cache
+            # stores it so we can compute the ratio consistently).
+            oi_at_open = in_flight.get("contract_oi_at_open")
+            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
+
             ok = await _patch_episode(
                 row_id, trade_count, total_premium, new_ts,
                 ticker, contract_type, strike, expiry,
+                contract_volume_at_close=current_volume,
+                volume_oi_ratio=vol_ratio,
             )
             if ok:
                 _episode_stats["merged_episodes"] += 1
-                # Update cached premium so the next waiter accumulates correctly.
                 in_flight["trade_count"]   = trade_count
                 in_flight["total_premium"] = total_premium
             return
@@ -654,18 +749,26 @@ async def persist_flow_episode(signal_data: dict):
             trade_count   = (existing.get("trade_count") or 1) + 1
             total_premium = (existing.get("total_premium") or 0.0) + new_premium
 
+            # ING-008: oi_at_open from the existing DB row (captured at INSERT).
+            oi_at_open = existing.get("contract_oi_at_open")
+            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
+
             ok = await _patch_episode(
                 row_id, trade_count, total_premium, new_ts,
                 ticker, contract_type, strike, expiry,
+                contract_volume_at_close=current_volume,
+                volume_oi_ratio=vol_ratio,
             )
             if ok:
                 _episode_stats["merged_episodes"] += 1
-                # Populate in-flight so subsequent waiters skip the DB GET.
                 _set_episode_in_flight(key, row_id, trade_count, total_premium)
+                # Cache oi_at_open so in-flight path can compute ratio without DB
+                _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
             return
 
         # -------------------------------------------------------------------
         # Step 3: no existing episode — INSERT.
+        # ING-008: capture contract_oi_at_open at creation time.
         # -------------------------------------------------------------------
         row = {
             "ticker":              ticker,
@@ -680,33 +783,39 @@ async def persist_flow_episode(signal_data: dict):
             "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
             "seed_episode":        signal_data.get("seed_episode"),
             "signal_ts":           new_ts,
+            # ING-008: OI at episode open; NULL on cache miss
+            "contract_oi_at_open": current_oi,
         }
-        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium)
+        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium, current_oi)
         if ok:
             _episode_stats["created_episodes"] += 1
             prem_str = f"${new_premium:,.0f}"
             log.info(
                 "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
-                "alert=%s prem=%s multi_day=%s",
+                "alert=%s prem=%s multi_day=%s oi_at_open=%s",
                 ticker, contract_type, strike, expiry,
                 row["alert_level"], prem_str,
-                row["is_multi_day_repeat"],
+                row["is_multi_day_repeat"], current_oi,
             )
 
 
-async def _insert_rows_with_episode_id(table: str, row: dict, key: str, premium: float) -> bool:
+async def _insert_rows_with_episode_id(
+    table: str,
+    row: dict,
+    key: str,
+    premium: float,
+    oi_at_open: Optional[int] = None,
+) -> bool:
     """
     INSERT a single flow_episodes row and populate _episode_in_flight[key]
     with the returned bigserial id so concurrent waiters can PATCH without
     a DB GET.
 
+    ING-008: also stores oi_at_open in the in-flight entry so the PATCH
+    path can compute volume_oi_ratio without a DB round-trip.
+
     Uses Prefer: return=representation + select=id to get the generated id
     back from PostgREST in the 201 response body.
-
-    Falls back gracefully: if the id cannot be retrieved (e.g. PostgREST
-    returns minimal or the body is malformed), _episode_in_flight is NOT
-    populated — the next waiter will fall back to _lookup_open_episode(),
-    which is the pre-existing safe path.
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
@@ -716,7 +825,7 @@ async def _insert_rows_with_episode_id(table: str, row: dict, key: str, premium:
         "apikey":        _SUPABASE_KEY,
         "Authorization": f"Bearer {_SUPABASE_KEY}",
         "Content-Type":  "application/json",
-        "Prefer":        "return=representation",  # ask PostgREST to return the inserted row
+        "Prefer":        "return=representation",
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -728,6 +837,8 @@ async def _insert_rows_with_episode_id(table: str, row: dict, key: str, premium:
                     row_id = returned[0]["id"]
                     trade_count = row.get("trade_count") or 1
                     _set_episode_in_flight(key, row_id, trade_count, premium)
+                    # ING-008: cache oi_at_open for ratio computation in PATCH path
+                    _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
             except Exception:
                 pass  # in-flight not populated — next waiter falls back to DB GET (safe)
             return True
@@ -751,20 +862,10 @@ async def _update_episode_multiday(
     ING-007: PATCH the most-recent flow_episodes row for this contract
     to set is_multi_day_repeat after the async lookback fetch completes.
 
-    PBE-F2 fix (2026-05-04): PostgREST silently ignores &order= and &limit=
-    on PATCH requests — all rows matching the filter predicate are updated,
-    not just the most recent one. Fixed with a two-step GET+PATCH by id:
+    PBE-F2 fix (2026-05-04): two-step GET+PATCH by id to avoid PostgREST
+    silently ignoring order/limit on PATCH and updating all rows.
 
-      Step 1: GET ?...&order=signal_ts.desc&limit=1&select=id
-              Retrieve the bigserial id of the target (most recent) row.
-      Step 2: PATCH ?id=eq.{id}
-              Update exactly that single row. No spurious multi-row overwrites.
-
-    SA-F3 fix (2026-05-04): empty GET response (race between INSERT commit
-    and queue worker) was logged at DEBUG — invisible in Railway. Elevated
-    to INFO so cold-miss rate is observable without changing global log level.
-
-    Silently swallows errors — enrichment failure must never block the stream.
+    SA-F3 fix (2026-05-04): empty GET response elevated to INFO.
     """
     if not _is_configured():
         return
@@ -856,35 +957,8 @@ async def start_lookback_worker(accumulator) -> None:
     ING-007: Async queue worker — drains _lookback_queue populated by
     enqueue_lookback() in _process_trade().
 
-    For each ContractKey dequeued:
-      1. Resolve the DTE-tier min_premium from the accumulator so the
-         lookback query uses the same floor as the persist gate.
-      2. Call contract_day_cache.get_lookback(key, min_premium).
-      3. PATCH the most-recent flow_episodes row via _update_episode_multiday()
-         with is_multi_day_repeat = (
-             prior_days_active >= accumulator._multi_day_min_days
-         ).
-         Uses the accumulator's configured threshold — never hardcoded.
-
-    SA-F1 fix (2026-05-04):
-      Previously called getattr(accumulator, "_dte_premium_tiers", None) which
-      always returned None because the attribute is stored as "_dte_tiers" on
-      RepetitionAccumulator. Also, _dte_tiers is a List[Tuple[int, Dict[int,
-      float]]], not a flat dict, so min(dte_tiers.values()) would have raised
-      TypeError. Fixed to use the correct attribute name and traverse the
-      list-of-tuples structure to extract the minimum floor value.
-
-    PBE-F5 fix (2026-05-04):
-      min_premium resolved per-key but never logged. Added debug line so
-      Railway logs surface which DTE-tier floor is applied to each fetch.
-
-    Cold-cache note: the first episode for any contract returns
-    prior_days_active=0 (cache miss → DB fetch). Subsequent ticks within
-    the 5-min TTL window use the cached result. This is acceptable —
-    is_multi_day_repeat is enrichment-only, not a hard gate.
-
-    Runs as a persistent background task spawned from main.py lifespan.
-    Cancelled cleanly on shutdown via lookback_task.cancel().
+    SA-F1 fix (2026-05-04): correct attr name (_dte_tiers) + list-of-tuples traversal.
+    PBE-F5 fix (2026-05-04): log min_premium per-key at DEBUG.
     """
     from utils.contract_day_cache import get_lookback
 
