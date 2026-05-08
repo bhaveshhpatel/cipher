@@ -11,6 +11,7 @@ import { IngestionConfigCard } from "./_cards/IngestionConfigCard";
 import { HowItWorksCard } from "./_cards/HowItWorksCard";
 import { TierDistributionCard } from "./_cards/TierDistributionCard";
 import { ActivityLogCard } from "./_cards/ActivityLogCard";
+import { GateControlPanel } from "./_cards/GateControlPanel";
 
 export default function AdminPage() {
   const router = useRouter();
@@ -28,7 +29,7 @@ export default function AdminPage() {
   return (
     <div className="min-h-screen" style={{ background: A.bg, color: A.text }}>
 
-      {/* ── Top bar ─────────────────────────────────────── */}
+      {/* ── Top bar ──────────────────────────────────── */}
       <div
         className="sticky top-0 z-10 flex items-center justify-between px-8 py-4"
         style={{
@@ -60,7 +61,7 @@ export default function AdminPage() {
         </div>
       </div>
 
-      {/* ── Body ────────────────────────────────────────── */}
+      {/* ── Body ──────────────────────────────────────── */}
       <div className="p-8 space-y-6">
 
         {/* Row 1: Demo Engine + Stream Health */}
@@ -81,13 +82,16 @@ export default function AdminPage() {
           <IngestionConfigCard token={token} />
         </div>
 
-        {/* Row 3: Pipeline Overview */}
+        {/* Row 3: Gate Control Panel — ADMIN-UI-001 (ING-010 frontend surface) */}
+        <GateControlPanel token={token} isAdmin={isAdmin} />
+
+        {/* Row 4: Pipeline Overview */}
         <HowItWorksCard />
 
-        {/* Row 4: Tier Distribution */}
+        {/* Row 5: Tier Distribution */}
         <TierDistributionCard token={token} />
 
-        {/* Row 5: Activity Log — STORY-BE-001 */}
+        {/* Row 6: Activity Log — STORY-BE-001 */}
         <ActivityLogCard token={token} />
 
       </div>
