@@ -159,6 +159,17 @@ Fix (ING-011 2026-05-07): exclude_indices Gate 6 — index options filter.
   before parse_tradier_trade() — no parse cost incurred for filtered ticks.
   _stats["index_filtered"] counter tracks suppressed index ticks; wired into
   flow-funnel log line (every 100 ticks).
+
+Fix (EPISODE-GATE-HOIST 2026-05-08): hoist persist_flow_episode before signal gate.
+  persist_flow_episode was fired AFTER the signal_min_premium gate, so any
+  episode whose total_premium < signal_min_premium (T1 default 75_000) was
+  never persisted even though Gate-2 of the accumulator had already cleared.
+  This caused test_process_trade_episode_direction_put_is_repeat_sell to fail
+  (SPY PUT total_premium=60_000 < 75_000 signal_min_premium default).
+  Fix: build alert_level/direction immediately after signal-gate pre-checks,
+  then fire persist_flow_episode as asyncio.create_task() unconditionally,
+  then continue with signal_min_premium gate and SIG-DEBOUNCE.
+  Decoupling is now explicit: episode persistence != signal emission.
 """
 import asyncio
 import logging
@@ -658,6 +669,13 @@ async def _process_trade(raw: dict):
       incremented and a DEBUG log fires. Gate can be toggled live via the
       PATCH /gates/exclude_indices/1 admin endpoint without stream restart.
 
+    EPISODE-GATE-HOIST (2026-05-08): persist_flow_episode fires before signal gate.
+      Episode persistence is decoupled from signal emission. persist_flow_episode
+      is scheduled as asyncio.create_task() immediately after alert_level and
+      direction are resolved — before the signal_min_premium and SIG-DEBOUNCE
+      checks. This ensures every accumulator Gate-2 crossing is recorded even
+      when the signal_min_premium gate or debounce suppresses bus emission.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -932,17 +950,8 @@ async def _process_trade(raw: dict):
     if not sig_ep:
         return
 
-    _live_signal_min_premium = _resolve_signal_min_premium()
-
-    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _live_signal_min_premium:
-        log.debug(
-            "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
-            sig_ep.ticker, sig_ep.contract_type,
-            sig_ep.trade_count, _SIGNAL_MIN_TRADES,
-            sig_ep.total_premium, _live_signal_min_premium,
-        )
-        return
-
+    # Resolve alert_level and direction from sig_ep. These are needed by both
+    # persist_flow_episode (unconditional) and the signal emission path below.
     alert_level = accumulator.get_alert_level(sig_ep.total_premium)
     direction   = sig_ep.dominant_direction
 
@@ -951,6 +960,11 @@ async def _process_trade(raw: dict):
         f"trades={sig_ep.trade_count} prem=${sig_ep.total_premium:,.0f}"
     )
 
+    # EPISODE-GATE-HOIST: fire persist_flow_episode BEFORE the signal_min_premium
+    # gate and SIG-DEBOUNCE check. Episode persistence is decoupled from signal
+    # emission — every accumulator Gate-2 crossing must be recorded regardless of
+    # whether the signal bus fires. Fixes test_process_trade_episode_direction_put_
+    # is_repeat_sell (SPY PUT $60k < $75k signal_min_premium T1 default).
     asyncio.create_task(
         persist_flow_episode({
             "ticker":              sig_ep.ticker,
@@ -967,6 +981,20 @@ async def _process_trade(raw: dict):
             "timestamp":           ev.timestamp.isoformat(),
         })
     )
+
+    # Signal gate: suppress bus emission for low-premium episodes.
+    # persist_flow_episode has already fired above — this gate only controls
+    # whether downstream consumers (WebSocket, composite engine) are notified.
+    _live_signal_min_premium = _resolve_signal_min_premium()
+
+    if sig_ep.trade_count < _SIGNAL_MIN_TRADES or sig_ep.total_premium <= _live_signal_min_premium:
+        log.debug(
+            "[signal-gate] suppressed %s %s — trades=%d (min=%d) prem=$%.0f (min=$%.0f)",
+            sig_ep.ticker, sig_ep.contract_type,
+            sig_ep.trade_count, _SIGNAL_MIN_TRADES,
+            sig_ep.total_premium, _live_signal_min_premium,
+        )
+        return
 
     now_ts = _time.time()
     _evict_signal_emit_cache(now_ts)
