@@ -1,3 +1,0 @@
--- DELETED: superseded by backend/migrations/019_gate_configs.sql
--- This file is intentionally left as a tombstone.
--- Do not apply — 019_gate_configs.sql is the canonical ING-010 migration.
