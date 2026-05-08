@@ -30,11 +30,11 @@ start_chain_refresh_worker(registry_fn, tradier_client, symbols_fn)
 
     API budget: one Tradier GET /markets/options/chains call per tracked
     symbol per refresh cycle.  At 300-second cadence and a 50-symbol
-    universe that is ~10 calls/minute — well within Tradier’s 120 req/min
+    universe that is ~10 calls/minute — well within Tradier's 120 req/min
     limit.  Scale note: revisit cadence when universe exceeds ~200 symbols.
 
     Volume reset: the cache is fully invalidated at market open
-    (call invalidate_vol_oi_cache()) so yesterday’s volume never bleeds
+    (call invalidate_vol_oi_cache()) so yesterday's volume never bleeds
     into early-morning events.
 
 get_epoch() -> int
@@ -83,11 +83,15 @@ ING-008 (2026-05-08):
   Added start_chain_refresh_worker() — 5-min background refresh of
   intraday volume+OI for all tracked symbols via Tradier chain API.
   Added invalidate_vol_oi_cache() for market-open reset.
+
+FIX ING-008 (2026-05-08):
+  Added Awaitable to typing imports — was missing, causing NameError at
+  module load time on Python 3.12.
 """
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 from supabase import create_client, Client
 from config import settings
@@ -150,7 +154,7 @@ def get_contract_vol_oi(occ_symbol: str) -> Tuple[Optional[int], Optional[int]]:
 
 def invalidate_vol_oi_cache() -> None:
     """
-    ING-008: Clear the vol/OI cache at market open so yesterday’s intraday
+    ING-008: Clear the vol/OI cache at market open so yesterday's intraday
     volume never bleeds into early-morning flow events.
     Call this from the market-open boundary handler in main.py or the stream.
     """
@@ -203,7 +207,7 @@ async def start_chain_refresh_worker(
     ------------
     _vol_oi_cache is NOT cleared here between cycles — it is invalidated
     at market open by calling invalidate_vol_oi_cache() from the stream
-    market-open handler.  This prevents yesterday’s volume from bleeding
+    market-open handler.  This prevents yesterday's volume from bleeding
     into pre-market / early-morning events.
     """
     log.info(
