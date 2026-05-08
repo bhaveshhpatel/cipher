@@ -17,20 +17,19 @@ Design contract (from ING-010 / issue #84)
                    Raises ValueError for tier!=1 on tier-independent gates
                    (e.g. exclude_indices) — those rows are seeded for schema
                    completeness but only tier=1 is read at runtime.
-* assert_store_epoch_parity(chain_epoch, universe_epoch)
-                 — class method.  Raises AssertionError if either
-                   dependent-store epoch is ahead of this store's epoch,
-                   indicating the gate config was not reloaded in the same
-                   generation as the chain/universe data it governs.
-                   Tolerates store_epoch == 0 (pre-first-load).
-                   See also module-level assert_epoch_parity() for the
-                   convenience wrapper that reads from the live singleton.
 * No-DB mode     — when ``_supabase_url`` / ``_supabase_key`` are empty
                    strings, update() skips all network I/O and operates
                    purely in-memory (useful for tests and local dev without
                    credentials).
 * threading.Lock — guards every mutation of ``_cache`` so concurrent
                    workers never read a torn value.
+
+Note: assert_store_epoch_parity() and assert_epoch_parity() were removed
+(ING-010 cleanup). They compared independent per-store epoch counters
+which are not semantically comparable across stores, producing false
+positives during normal hot-reload cycles. See issue #86 for the
+follow-on work: a shared generation_id stamped atomically by
+PipelineCoordinator across all stores.
 
 Public singleton
 -----------------
@@ -39,14 +38,6 @@ Public singleton
     value = store.get("min_premium", tier)          # O(1), lock-free read
     await store.update("min_premium", 1, 30_000)    # async, DB + in-memory
     await store.load()                              # called once at startup
-
-    # Epoch parity check (call after any gate update in tests / health checks)
-    from services.gate_config_store import assert_epoch_parity
-    from services import chain_store, universe_store
-    assert_epoch_parity(
-        chain_store.get_epoch(),
-        universe_store.get_epoch(),
-    )
 
 Gate catalogue (gate_name → value_type)
 ----------------------------------------
@@ -172,60 +163,6 @@ class GateConfigStore:
             if gate_data is None:
                 return 0.0
             return float(gate_data.get(safe_tier, gate_data.get(3, 0.0)))
-
-    @classmethod
-    def assert_store_epoch_parity(
-        cls,
-        gate_epoch: int,
-        chain_epoch: int,
-        universe_epoch: int,
-    ) -> None:
-        """
-        Assert that chain_store and universe_store epochs have not advanced
-        ahead of the gate_config_store epoch.
-
-        Rationale
-        ---------
-        If chain_epoch > gate_epoch or universe_epoch > gate_epoch it means
-        the dependent stores have been mutated (new chain loaded, new snapshot
-        saved) in a generation that the gate config has not yet caught up with.
-        This is the theoretical race: a gate config update could complete
-        between a chain load and the first use of those values.
-
-        The check is directional — it only fires if a *dependent* store is
-        *ahead* of the gate store, not behind. Being behind (gate updated
-        without a chain reload) is normal during hot-reload cycles.
-
-        Pre-first-load tolerance
-        ------------------------
-        A store epoch of 0 means "never mutated" and is always acceptable
-        regardless of the gate epoch. This prevents false positives at startup
-        before any save_chain() or save_snapshot() has been called.
-
-        Parameters
-        ----------
-        gate_epoch      : int   — store.epoch from the GateConfigStore singleton
-        chain_epoch     : int   — chain_store.get_epoch()
-        universe_epoch  : int   — universe_store.get_epoch()
-
-        Raises
-        ------
-        AssertionError
-            ``chain_store epoch N is ahead of gate_config epoch M``
-            ``universe_store epoch N is ahead of gate_config epoch M``
-        """
-        if chain_epoch > 0 and chain_epoch > gate_epoch:
-            raise AssertionError(
-                f"chain_store epoch {chain_epoch} is ahead of "
-                f"gate_config epoch {gate_epoch} — gate config may not reflect "
-                f"the generation of chain data currently in memory."
-            )
-        if universe_epoch > 0 and universe_epoch > gate_epoch:
-            raise AssertionError(
-                f"universe_store epoch {universe_epoch} is ahead of "
-                f"gate_config epoch {gate_epoch} — gate config may not reflect "
-                f"the generation of universe data currently in memory."
-            )
 
     async def load(self) -> None:
         """
@@ -452,34 +389,8 @@ def _build_singleton() -> GateConfigStore:
 
 
 store: GateConfigStore = _build_singleton()
-# Public alias used by main.py lifespan (gate_config_store.gate_config_store)
+# Public alias used by main.py lifespan
 gate_config_store = store
-
-
-def assert_epoch_parity() -> None:
-    """
-    Module-level convenience wrapper around GateConfigStore.assert_store_epoch_parity().
-
-    Reads live epochs from the chain_store and universe_store singletons
-    and asserts parity against the gate_config_store singleton epoch.
-
-    Usage::
-
-        from services.gate_config_store import assert_epoch_parity
-        assert_epoch_parity()   # raises AssertionError on generation skew
-
-    Raises
-    ------
-    AssertionError
-        See GateConfigStore.assert_store_epoch_parity() for conditions.
-    """
-    from services.chain_store import get_epoch as chain_epoch
-    from services.universe_store import get_epoch as universe_epoch
-    GateConfigStore.assert_store_epoch_parity(
-        gate_epoch=store.epoch,
-        chain_epoch=chain_epoch(),
-        universe_epoch=universe_epoch(),
-    )
 
 
 async def load_gate_configs() -> None:
