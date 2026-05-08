@@ -8,7 +8,8 @@ Design contract (from ING-010 / issue #84)
 * load()         — reads all rows from ``gate_configs`` in Supabase and
                    populates the in-memory cache.  Advances ``epoch``.
 * get(gate,tier) — thread-safe read.  Falls back to T3 for unknown tiers;
-                   never raises.
+                   returns None for gate names not in this store (lets
+                   callers distinguish "key not loaded" from "value is zero").
 * update(gate, tier, value, ...)
                  — validates bounds and (optionally) market-hours guard,
                    PATCHes the DB row atomically, inserts an audit record
@@ -54,6 +55,11 @@ Gate catalogue (gate_name → value_type)
 
     Alias: "debounce_ms" is accepted as a shorthand for "signal_debounce_ms"
     so that test fixtures that use the shorter name resolve correctly.
+
+    get() returns None for any gate_name not in this catalogue.  This lets
+    callers (e.g. threshold_reconciliation._get_tier_thresholds) distinguish
+    a genuine zero value from "key not present in this store" and fall back
+    to their own defaults correctly.
 """
 from __future__ import annotations
 
@@ -61,7 +67,7 @@ import asyncio
 import datetime
 import logging
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -154,20 +160,37 @@ class GateConfigStore:
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, gate_name: str, tier: int) -> float:
+    def get(self, gate_name: str, tier: int) -> Optional[float]:
         """
         Return the current threshold for *gate_name* at *tier*.
 
-        Falls back to T3 for any tier not in {1, 2, 3}.  Never raises.
-        Resolves "debounce_ms" → "signal_debounce_ms" transparently.
+        Returns
+        -------
+        float
+            The stored value when gate_name is a known ingestion gate.
+        None
+            When gate_name is not in this store's catalogue.  Callers
+            must treat None as "not available" and fall back to their own
+            defaults.  This lets callers distinguish a genuine 0.0 gate
+            value from a missing key.
+
+        Notes
+        -----
+        Falls back to T3 for any tier not in {1, 2, 3} when the gate IS
+        known.  Resolves "debounce_ms" → "signal_debounce_ms" transparently.
         """
         gate_name = self._resolve_alias(gate_name)
+        # Return None for any key not owned by this store so callers can
+        # distinguish "genuine zero" from "key not present here".
+        if gate_name not in _VALID_GATES:
+            return None
         safe_tier = tier if tier in _VALID_TIERS else 3
         with self._lock:
             gate_data = self._cache.get(gate_name)
             if gate_data is None:
-                return 0.0
-            return float(gate_data.get(safe_tier, gate_data.get(3, 0.0)))
+                return None
+            value = gate_data.get(safe_tier, gate_data.get(3))
+            return float(value) if value is not None else None
 
     async def load(self) -> None:
         """
@@ -250,8 +273,6 @@ class GateConfigStore:
         if tier not in _VALID_TIERS:
             raise ValueError(f"Invalid tier: {tier!r} — must be 1, 2, or 3")
 
-        # Belt-and-suspenders: router's model_validator fires first, but
-        # update() may also be called directly from admin scripts or tests.
         if gate_name in _TIER_INDEPENDENT_GATES and tier != 1:
             raise ValueError(
                 f"'{gate_name}' is a tier-independent gate — only tier=1 is "
@@ -372,14 +393,11 @@ class GateConfigStore:
 
         Rules
         -----
-        - chain_epoch == 0   → skip chain check (pre-load exemption)
+        - chain_epoch == 0    → skip chain check (pre-load exemption)
         - universe_epoch == 0 → skip universe check (pre-load exemption)
-        - chain_epoch > gate_epoch   → AssertionError("chain_store epoch ...")
+        - chain_epoch > gate_epoch    → AssertionError("chain_store epoch ...")
         - universe_epoch > gate_epoch → AssertionError("universe_store epoch ...")
         - Otherwise (equal or dependent stores lag) → no-op
-
-        Called by PipelineCoordinator after every hot-reload cycle to catch
-        epoch drift before it can cause stale-gate reads.
         """
         if chain_epoch != 0 and chain_epoch > gate_epoch:
             raise AssertionError(
