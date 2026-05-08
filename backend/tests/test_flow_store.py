@@ -422,10 +422,35 @@ async def test_upgrade_to_sweep_url_contains_occ_symbol():
 
 # ---------------------------------------------------------------------------
 # persist_flow_episode
+#
+# ING-009 refactored persist_flow_episode to call _insert_rows_with_episode_id
+# (not _insert_rows directly) so it can capture the returned bigserial id for
+# the in-flight race-prevention cache.  Tests must patch the correct function.
+#
+# _insert_rows_with_episode_id signature:
+#   (table: str, row: dict, key: str, premium: float, oi_at_open: Optional[int])
+#
+# call_args positional layout:
+#   [0][0] = table   (str)         "flow_episodes"
+#   [0][1] = row     (dict)        the full episode row dict
+#   [0][2] = key     (str)         merge key
+#   [0][3] = premium (float)
+#   [0][4] = oi_at_open (Optional[int])
+#
+# _lookup_open_episode must also be patched to return None so the INSERT
+# branch is always taken (avoids an attempted DB GET in CI).
+#
+# chain_store.get_contract_vol_oi is patched to avoid ImportError in
+# environments where chain_store is not available.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_persist_flow_episode_calls_insert_rows():
+    """
+    ING-009: persist_flow_episode calls _insert_rows_with_episode_id on the
+    INSERT path (no existing open episode).  Previously patched _insert_rows
+    which is never reached on the episode INSERT path post-ING-009.
+    """
     import services.flow_store as fs
     signal_data = {
         "ticker": "AAPL",
@@ -440,13 +465,26 @@ async def test_persist_flow_episode_calls_insert_rows():
         "seed_episode": "3 large calls, escalating",
         "timestamp": "2026-04-28T10:00:00Z",
     }
-    with patch("services.flow_store._insert_rows", new_callable=AsyncMock, return_value=True) as mock_insert:
+
+    # Ensure no stale in-flight entry interferes with this test
+    fs.reset_episode_state()
+
+    with patch("services.flow_store._lookup_open_episode",
+               new_callable=AsyncMock, return_value=None), \
+         patch("services.flow_store._insert_rows_with_episode_id",
+               new_callable=AsyncMock, return_value=True) as mock_insert, \
+         patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
+         patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
+               create=True):
         await fs.persist_flow_episode(signal_data)
+
     mock_insert.assert_called_once()
-    table, rows = mock_insert.call_args[0]
+    # positional args: (table, row, key, premium, oi_at_open)
+    args = mock_insert.call_args[0]
+    table = args[0]
+    row   = args[1]
     assert table == "flow_episodes"
-    assert len(rows) == 1
-    row = rows[0]
     assert row["ticker"] == "AAPL"
     assert row["alert_level"] == "STRONG_SIGNAL"
     assert row["total_premium"] == 500_000.0
@@ -455,14 +493,32 @@ async def test_persist_flow_episode_calls_insert_rows():
 
 @pytest.mark.asyncio
 async def test_persist_flow_episode_empty_expiry_becomes_none():
+    """
+    ING-009: empty-string expiry must be coerced to None before the row is
+    built.  Patch target is _insert_rows_with_episode_id (INSERT path).
+    """
     import services.flow_store as fs
-    signal_data = {"ticker": "SPY", "expiry": "", "total_premium": 100_000.0,
-                   "trade_count": 5, "alert_level": "WATCH",
-                   "is_accelerating": False, "seed_episode": None, "timestamp": None,
-                   "direction": "BEARISH", "contract_type": "PUT", "strike": 440.0}
-    with patch("services.flow_store._insert_rows", new_callable=AsyncMock, return_value=True) as mock_insert:
+    signal_data = {
+        "ticker": "SPY", "expiry": "", "total_premium": 100_000.0,
+        "trade_count": 5, "alert_level": "WATCH",
+        "is_accelerating": False, "seed_episode": None, "timestamp": None,
+        "direction": "BEARISH", "contract_type": "PUT", "strike": 440.0,
+    }
+
+    fs.reset_episode_state()
+
+    with patch("services.flow_store._lookup_open_episode",
+               new_callable=AsyncMock, return_value=None), \
+         patch("services.flow_store._insert_rows_with_episode_id",
+               new_callable=AsyncMock, return_value=True) as mock_insert, \
+         patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
+         patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
+               create=True):
         await fs.persist_flow_episode(signal_data)
-    row = mock_insert.call_args[0][1][0]
+
+    args = mock_insert.call_args[0]
+    row = args[1]  # second positional arg is the row dict
     assert row["expiry"] is None
 
 
@@ -597,7 +653,9 @@ async def test_persist_flow_event_adds_to_buffer():
     }
     orig_buffer = fs._flow_event_buffer[:]
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
-         patch("services.flow_store._SUPABASE_KEY", "svc"):
+         patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
+               create=True):
         await fs.persist_flow_event(ev)
     assert len(fs._flow_event_buffer) > len(orig_buffer)
     fs._flow_event_buffer.clear()
@@ -620,7 +678,9 @@ async def test_persist_flow_event_early_flush_on_max_rows():
     fs._flow_event_buffer = [{"ticker": "DUMMY"}] * (fs._FLUSH_MAX_ROWS - 1)
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
-         patch("services.flow_store._insert_rows_with_retry", new_callable=AsyncMock, return_value=True):
+         patch("services.flow_store._insert_rows_with_retry", new_callable=AsyncMock, return_value=True), \
+         patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
+               create=True):
         await fs.persist_flow_event(ev)
     assert len(fs._flow_event_buffer) < fs._FLUSH_MAX_ROWS
     fs._flow_event_buffer.clear()
@@ -641,7 +701,9 @@ async def test_persist_flow_event_warns_on_zero_strike():
         "is_synthetic_quote": False,
     }
     with patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
-         patch("services.flow_store._SUPABASE_KEY", "svc"):
+         patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
+               create=True):
         await fs.persist_flow_event(ev)
     fs._flow_event_buffer.clear()
 
