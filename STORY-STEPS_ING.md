@@ -47,9 +47,9 @@ ING stories have hard sequential dependencies. Before touching any story:
 | ING-007 | ING-002, ING-003, ING-006, ING-009 | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0`. Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
 | ING-011 | ING-006 ✅, ING-007 ✅ | ✅ MERGED 2026-05-07 — PR #81 commit `8d68ed1`. Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed. |
 | ING-011b | ING-011 ✅ | ✅ MERGED 2026-05-07 — PR #82 squash-merged. Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed. |
+| ING-010 | ING-002 ✅, ING-003 ✅ | ✅ MERGED 2026-05-08 — PR #85 commit `a673697`. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) closed. |
 | ING-008 | ING-004 ✅, ING-005 ✅, **ING-011 ✅** | ⏳ Ready for deliberation — ING-011 blocker cleared. Deliberation required before implementation. |
-| ING-010 | ING-002 ✅, ING-003 ✅ | ⏳ Ready for deliberation — parallel track to ING-008. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) |
-| **ING-012** | **ING-010 ✅ (tier system must exist), ING-008 ✅ (gate wiring must be stable)** | **🔴 Not started — deliberation required. Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84)** |
+| **ING-012** | **ING-010 ✅ (tier system must exist), ING-008 ✅ (gate wiring must be stable)** | **⏳ ING-010 blocker cleared 2026-05-08. Still blocked on ING-008 ⏳. Deliberation complete — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84). Do not begin implementation until ING-008 merges.** |
 
 ---
 
@@ -73,12 +73,12 @@ Every ING story requires a 3-way deliberation **before implementation begins**:
 | ING-007 | ✅ COMPLETE (2026-05-04) — pre-merge panel deliberation COMPLETE (2026-05-06). **MERGED PR #74 commit `b70d9b0` (2026-05-06).** Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed. |
 | ING-011 | ✅ COMPLETE (2026-05-06) — D1/D2/D3 resolved. Pre-merge panel deliberation COMPLETE (2026-05-06). All panel findings (SA-F1, QA-F1/QA-F3) resolved inline. **MERGED PR #81 commit `8d68ed1` (2026-05-07).** Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed. |
 | ING-011b | ✅ COMPLETE (2026-05-07) — D1–D5 resolved. Pre-merge panel deliberation COMPLETE (2026-05-07). All panel findings (SA-1, PBE-1, PBE-2 non-blocking; QA-1 resolved inline; QA-2 typo fixed commit `2bb1487`) resolved. **MERGED PR #82 squash-merged (2026-05-07).** Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed. |
+| ING-010 | ✅ COMPLETE (2026-05-08) — pre-merge panel deliberation COMPLETE (2026-05-08). Findings SA-1/PBE-2/PBE-3/PBE-4 resolved inline on branch before merge. **MERGED PR #85 commit `a673697` (2026-05-08).** Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) closed. |
 | ING-008 | ⏳ Ready for deliberation — ING-011 blocker cleared (MERGED 2026-05-07). Deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Do not begin implementation until deliberation is complete. |
-| ING-010 | ⏳ Ready for deliberation — parallel track to ING-008. Deliberation required (SA · PBE · QA). D1/D2/D3 open questions in sprint doc. Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78). |
-| **ING-012** | **🔴 NOT STARTED — deliberation required (SA · PBE · QA). Full 3-way deliberation recorded in sprint doc (D1–D3 resolved: singleton hot-reload, O(1) tier lookup with epoch versioning, hardcoded bounds + market-hours guard). Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84). Blocked until ING-010 and ING-008 merge.** |
+| **ING-012** | **⏳ ING-010 blocker cleared 2026-05-08. Still blocked on ING-008 ⏳. Deliberation COMPLETE — D1 (singleton hot-reload), D2 (O(1) epoch versioning), D3 (hardcoded bounds + market-hours guard) all resolved in sprint doc. Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84). Do not begin implementation until ING-008 merges.** |
 
-> For ING-002 through ING-007, ING-009, ING-011, and ING-011b: deliberation is complete. Do not re-litigate any decisions.
-> For ING-008, ING-010, and ING-012: read the open deliberation questions in the sprint doc before writing a single line of code.
+> For ING-002 through ING-007, ING-009, ING-010, ING-011, and ING-011b: deliberation is complete. Do not re-litigate any decisions.
+> For ING-008 and ING-012: read the open deliberation questions in the sprint doc before writing a single line of code.
 
 ---
 
@@ -131,7 +131,7 @@ Always: branch → commits → PR → deliberation → merge.
 - `ing/s7-multiday-repeat` → ING-007 ✅ MERGED PR #74
 - `ing/s11-itm-classification` → ING-011 ✅ MERGED PR #81
 - `ing/s11b-itm-aggression-weight` → ING-011b ✅ MERGED PR #82
-- `ing/s10-tier-floor` → ING-010
+- `ing/s10-tiered-gate-control-plane` → ING-010 ✅ MERGED PR #85
 - `ing/s8-vol-oi-gate` → ING-008
 - **`ing/s12-tier-gate-config` → ING-012**
 
@@ -201,9 +201,9 @@ These apply to every ING story. Violating any of these is a blocker at deliberat
 8. **ING-008 chain API verification is a hard prerequisite.** Document OI quality findings in `docs/FIXES.md` under ING-008 before writing any gate logic.
 9. **ING-009 merged 2026-05-06 (PR #76 commit `9ceee35`).** `flow_episodes` is correctly aggregated.
 10. **ING-011 merged 2026-05-07 (PR #81 commit `8d68ed1`).** ✅ `_classify_moneyness_band()` is live on main. `otm_band` TEXT column extended to cover `ITM | DEEP_ITM`. ING-008 deliberation is now unblocked.
-11. **ING-010 deliberation is a hard prerequisite.** D1 (option selection), D2 (Tier 3 floor value), and D3 (`average_volume = 0` handling) must all be resolved and recorded in `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` before any code is written. Option D (per-ticker debug logging at `belowminpremium`) ships first regardless of D1/D2/D3 outcome.
+11. **ING-010 merged 2026-05-08 (PR #85 commit `a673697`).** ✅ `GateConfigStore` singleton is live on main. 5 gates × 3 tiers hot-reloadable from `gate_configs` DB table. `gate_config_store.load()` runs at lifespan step 0. ING-012 ING-010 blocker now cleared — still waiting on ING-008.
 12. **ING-011b merged 2026-05-07 (PR #82 squash-merged).** ✅ D1 Option B live on main — `get_weighted_premium()` now applies `_AGGRESSION_DISCOUNT` to ITM/DEEP_ITM PUT AT_BID/BELOW_BID fills regardless of `is_aggressive` flag. `_classify_moneyness_band()` promoted to module-level function (D3). `_ITM_BANDS = frozenset({"ITM","DEEP_ITM"})` exported (D4). UNKNOWN band → full weight safe-by-default (D5). Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed.
-13. **ING-012 depends on ING-010 and ING-008 both merged.** The tier system (ING-010) and stable gate wiring (ING-008) must exist before the configurable gate layer is added. Do not begin ING-012 implementation until both are merged. Three-way deliberation is complete and recorded in the sprint doc and Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) — do not re-litigate D1 (singleton hot-reload), D2 (O(1) tier lookup + epoch versioning), or D3 (hardcoded bounds + market-hours guard).
+13. **ING-012 depends on ING-010 ✅ and ING-008 ⏳ both merged.** ING-010 cleared 2026-05-08. Do not begin ING-012 implementation until ING-008 merges. Three-way deliberation is complete and recorded in the sprint doc and Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) — do not re-litigate D1 (singleton hot-reload), D2 (O(1) tier lookup + epoch versioning), or D3 (hardcoded bounds + market-hours guard).
 14. **ING-012: No DB reads on the gate hot-path.** `GateConfigStore.get_threshold()` is a dict lookup only. The singleton is updated async via admin endpoint; workers read from it synchronously per tick. This is a hard constraint — no awaiting config store inside gate evaluation.
 15. **ING-012: `confirm_market_hours: true` is required for any gate config change between 09:30–16:00 ET.** Admin endpoint returns HTTP 428 without it. This is a safety gate, not optional.
 
@@ -247,10 +247,14 @@ Immediately after an ING PR merges:
 - ☐ Confirm no regression on ING-006 test suite (`test_ing006_*.py`) — run CI
 - ☐ Confirm no regression on ING-007 multi-day lookback tests — run CI
 
-**ING-010 specific post-merge steps (in addition to the above):**
-- Confirm GDYN and PENG flow events are now appearing in `flow_events` on the next live session (manual spot-check)
-- Confirm Tier 1/2 signal counts are unchanged (no noise regression on NVDA/SPY/AMD/AAPL)
-- Update `docs/FIXES.md` with the D1/D2/D3 option decisions
+**ING-010 specific post-merge steps — ✅ MERGED 2026-05-08 (PR #85 commit `a673697`):**
+- ✅ Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) closed (state: completed)
+- ✅ `STORY-STEPS_ING.md` updated — dependency chain, deliberation table, Rule 6 constraint 11, Quick Reference all marked ✅. ING-012 ING-010 blocker cleared.
+- ☐ `docs/SPRINT_WSJ_INGESTION_ALIGNMENT.md` — mark ING-010 ✅ MERGED, update Quick Reference, record panel verdicts (SA-1/PBE-2/PBE-3/PBE-4 resolved inline)
+- ☐ `docs/FIXES.md` — record ING-010 option decisions (D1/D2/D3) and ING-010-ACC accumulator tier_map sync fix
+- ☐ `docs/ARCHITECTURE.md` — document `GateConfigStore` singleton, `gate_configs` DB table, 5-gate × 3-tier threshold matrix, `gate_config_store.load()` at lifespan step 0, admin GET/PATCH API contract
+- ☐ Confirm GDYN and PENG flow events are now appearing in `flow_events` on the next live session (manual spot-check)
+- ☐ Confirm Tier 1/2 signal counts are unchanged (no noise regression on NVDA/SPY/AMD/AAPL)
 
 **ING-012 specific post-merge steps (once merged):**
 - ☐ Close Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) (state: completed)
@@ -342,11 +346,11 @@ POST-MERGE
 | ING-007 | Multi-day repeat window lookback + is_aggressive DB column | ✅ MERGED 2026-05-06 — PR #74 commit `b70d9b0` — Issue [#70](https://github.com/bhaveshhpatel/cipher/issues/70) closed | `ing/s7-multiday-repeat` |
 | ING-011 | ITM put/call moneyness classification + direction override | ✅ MERGED 2026-05-07 — PR #81 commit `8d68ed1` — Issue [#77](https://github.com/bhaveshhpatel/cipher/issues/77) closed | `ing/s11-itm-classification` |
 | ING-011b | `is_aggressive` moneyness-blindness fix — ITM PUT AT_BID `weighted_premium` discount | ✅ MERGED 2026-05-07 — PR #82 squash-merged — Issue [#80](https://github.com/bhaveshhpatel/cipher/issues/80) closed | `ing/s11b-itm-aggression-weight` |
+| ING-010 | Tiered gate control plane — per-tier configurable ingestion gates | ✅ MERGED 2026-05-08 — PR #85 commit `a673697` — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) closed | `ing/s10-tiered-gate-control-plane` |
 | ING-008 | Volume vs. OI gate | ⏳ Ready for deliberation — ING-011 blocker cleared 2026-05-07 | `ing/s8-vol-oi-gate` |
-| ING-010 | Tier-aware min-premium floor + OI-relative bypass gate | ⏳ Ready for deliberation — Issue [#78](https://github.com/bhaveshhpatel/cipher/issues/78) — parallel to ING-008 | `ing/s10-tier-floor` |
-| **ING-012** | **Tier-aware configurable gate system with hot-reload admin control** | **🔴 Not started — blocked on ING-010 + ING-008 — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) — deliberation complete** | **`ing/s12-tier-gate-config`** |
+| **ING-012** | **Tier-aware configurable gate system with hot-reload admin control** | **⏳ ING-010 blocker cleared 2026-05-08 — still blocked on ING-008 ⏳ — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) — deliberation complete** | **`ing/s12-tier-gate-config`** |
 
 ---
 
-*Created: 2026-05-03 | Last updated: 2026-05-07 (ING-012 filed — Issue [#84](https://github.com/bhaveshhpatel/cipher/issues/84) — tier-aware configurable gate system with hot-reload admin control; dependency chain updated with ING-012 row; deliberation table updated with ING-012 🔴 status; Rule 6 constraints 13–15 added for ING-012; Rule 7 ING-012 post-merge steps added; Quick Reference updated with ING-012 row; ING-010 status updated from 🔴 to ⏳) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
+*Created: 2026-05-03 | Last updated: 2026-05-08 (ING-010 ✅ MERGED — PR #85 commit `a673697` — tiered gate control plane; Issue #78 closed; ING-012 ING-010 blocker cleared — still waiting on ING-008; Rule 6 constraint 11 updated; dependency chain, deliberation table, Quick Reference all updated) | Sprint: WSJ Ingestion Alignment (P0) | Owner: Dhruv Patel*
 *Template: derived from root `STORY-STEPS.md` — ING-specific constraints, branch naming, deliberation state, and reference table added*
