@@ -16,10 +16,9 @@ Return contract:
 """
 from __future__ import annotations
 
-import asyncio
+import datetime as dt_module  # import the MODULE so tests can patch it correctly
 import logging
 import threading
-from datetime import datetime, time, timezone
 from typing import Any
 
 import httpx  # top-level so tests can mock services.gate_config_store.httpx
@@ -28,7 +27,6 @@ log = logging.getLogger("gate_config_store")
 
 # ---------------------------------------------------------------------------
 # Gate name → alias resolution
-# The DB stores the canonical name; code may use either spelling.
 # ---------------------------------------------------------------------------
 _ALIAS_MAP: dict[str, str] = {
     "debounce_ms": "signal_debounce_ms",
@@ -52,11 +50,8 @@ _VALID_TIERS: frozenset[int] = frozenset({1, 2, 3})
 _SAFE_DEFAULT_TIER: int = 3
 
 # ---------------------------------------------------------------------------
-# Static bounds — used for update() validation when the DB has not yet
-# surfaced min_value/max_value columns (pre-load or no-DB mode).
-# Keyed by canonical gate name → (min, max, cast).
+# Static bounds — gate_name → (min, max, cast)
 # cast is the Python type used to coerce values (float, int, bool).
-# After load(), _bounds_cache on the instance may override these per-row.
 # ---------------------------------------------------------------------------
 _BOUNDS: dict[str, tuple[float, float, type]] = {
     "min_premium":          (1_000.0,  500_000.0, float),
@@ -69,9 +64,8 @@ _BOUNDS: dict[str, tuple[float, float, type]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Hard-coded defaults — nested dict: gate_name -> tier -> value
+# Hard-coded defaults — gate_name -> tier -> value
 # Used when the DB is unreachable or a row is missing.
-# These MUST match the seed rows in 013_gate_configs.sql.
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict[str, dict[int, float]] = {
     "min_premium": {
@@ -112,8 +106,6 @@ _DEFAULTS: dict[str, dict[int, float]] = {
 }
 
 # Public alias — tests import _FALLBACK to assert default values directly.
-# Keys are (gate_name, tier) tuples for backwards compatibility with
-# parametrized tests that iterate _FALLBACK.keys().
 _FALLBACK: dict[tuple[str, int], float] = {
     (gate, tier): value
     for gate, tiers in _DEFAULTS.items()
@@ -125,11 +117,11 @@ def _is_market_open() -> bool:
     """Return True if the US equity market is currently open (9:30–16:00 ET, Mon–Fri)."""
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
-    now = datetime.now(ET)
+    now = dt_module.datetime.now(ET)
     if now.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
-    open_t  = time(9, 30)
-    close_t = time(16, 0)
+    open_t  = dt_module.time(9, 30)
+    close_t = dt_module.time(16, 0)
     return open_t <= now.time() < close_t
 
 
@@ -153,8 +145,6 @@ class GateConfigStore:
     """
 
     def __init__(self) -> None:
-        # Nested dict: gate_name -> {tier -> value}
-        # Initialised from _DEFAULTS; deep-copied so mutations are isolated.
         self._cache: dict[str, dict[int, float]] = {
             gate: dict(tiers) for gate, tiers in _DEFAULTS.items()
         }
@@ -168,7 +158,7 @@ class GateConfigStore:
 
     @staticmethod
     def _resolve_alias(gate_name: str) -> str:
-        """Resolve a gate name alias to its canonical form. Identity for canonical names."""
+        """Resolve a gate name alias to its canonical form."""
         return _ALIAS_MAP.get(gate_name, gate_name)
 
     def get(self, gate_name: str, tier: int) -> float:
@@ -185,7 +175,6 @@ class GateConfigStore:
         tier_map = self._cache.get(gate_name, {})
         val = tier_map.get(tier)
         if val is None:
-            # Unknown tier — fall back to _SAFE_DEFAULT_TIER (T3)
             val = tier_map.get(_SAFE_DEFAULT_TIER)
         if val is None:
             return 0.0
@@ -202,6 +191,8 @@ class GateConfigStore:
         Uses httpx directly (so tests can mock services.gate_config_store.httpx).
         Falls back silently to hard-coded ``_DEFAULTS`` if the DB is
         unreachable or the table does not yet exist (pre-migration).
+
+        Epoch is incremented on any HTTP 200 response, even with 0 rows.
         """
         from config import settings
         url = getattr(settings, "SUPABASE_URL", None)
@@ -247,6 +238,7 @@ class GateConfigStore:
                 new_cache.setdefault(name, {})[int(t)] = float(val)
                 new_bounds[name] = (float(lo), float(hi))
 
+        # Always increment epoch on HTTP 200 — even with zero rows.
         with self._lock:
             self._cache = new_cache
             self._bounds_cache = new_bounds
@@ -287,8 +279,6 @@ class GateConfigStore:
         if tier not in _VALID_TIERS:
             raise ValueError(f"Invalid tier {tier!r} — must be one of {sorted(_VALID_TIERS)}")
 
-        # Bounds check — use instance bounds_cache (from DB) if available,
-        # otherwise fall back to the static _BOUNDS module constant.
         bounds = self._bounds_cache.get(gate_name)
         if bounds is None:
             raw = _BOUNDS.get(gate_name)
@@ -358,7 +348,9 @@ class GateConfigStore:
                         "new_value":  float(value),
                         "changed_by": updated_by,
                         "reason":     reason,
-                        "changed_at": datetime.now(timezone.utc).isoformat(),
+                        "changed_at": dt_module.datetime.now(
+                            dt_module.timezone.utc
+                        ).isoformat(),
                     },
                 )
             except Exception as audit_exc:  # noqa: BLE001
@@ -392,9 +384,6 @@ class GateConfigStore:
         """
         Assert that dependent stores (chain, universe) have not advanced
         ahead of the gate store epoch.
-
-        Pre-load zero values for chain_epoch or universe_epoch are always
-        tolerated (no false positives at startup).
 
         Raises
         ------
