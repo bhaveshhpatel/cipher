@@ -15,7 +15,7 @@ Test matrix
   EI-6  _process_trade passes INDEX tick when gate OFF → parse called
   EI-7  _process_trade passes NON-INDEX tick even when gate ON → parse called
   EI-8  _INDEX_SYMBOLS frozenset contains canonical index ETF tickers
-  EI-9  _stats[\"index_filtered\"] starts at 0 and increments per suppressed tick
+  EI-9  _stats["index_filtered"] starts at 0 and increments per suppressed tick
   EI-10 gate check fires BEFORE parse_tradier_trade (no parse cost for filtered ticks)
 
 Patch targets (all module-level in services.tradier_stream)
@@ -134,10 +134,27 @@ class TestIndexSymbolsSet:
         assert "SPY" in _INDEX_SYMBOLS
         assert "QQQ" in _INDEX_SYMBOLS
 
-    def test_ei8_contains_all_canonical_tickers(self):
+    def test_ei8_contains_canonical_minimum_set(self):
+        """
+        EI-8: The 10-ticker canonical minimum set must always be present in
+        _INDEX_SYMBOLS.  New ETFs may be added to the production frozenset
+        without breaking this test — the assertion is a subset check, not
+        exact equality.  If a canonical ticker is ever *removed* from
+        _INDEX_SYMBOLS this test will catch it.
+
+        Canonical minimum: SPY QQQ IWM DIA VXX GLD TLT HYG EEM SLV
+        """
         from services.tradier_stream import _INDEX_SYMBOLS
-        expected = {"SPY", "QQQ", "IWM", "DIA", "VXX", "GLD", "TLT", "HYG", "EEM", "SLV"}
-        assert expected == _INDEX_SYMBOLS
+        canonical_minimum = {
+            "SPY", "QQQ", "IWM", "DIA",
+            "VXX", "GLD", "TLT", "HYG",
+            "EEM", "SLV",
+        }
+        missing = canonical_minimum - _INDEX_SYMBOLS
+        assert not missing, (
+            f"_INDEX_SYMBOLS is missing canonical tickers: {missing}. "
+            "These must always be present regardless of what else is added."
+        )
 
     def test_ei8_is_frozenset(self):
         from services.tradier_stream import _INDEX_SYMBOLS

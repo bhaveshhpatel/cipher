@@ -17,6 +17,26 @@ load_chain(snapshot_id, max_age_hours)  -> dict[str, ContractMeta] | None
     has rows AND is within max_age_hours (default 24) (C-2 fix).
     Returns None on DB error, empty dict if no fresh chains exist.
 
+get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
+    ING-008: Fast in-process lookup from the module-level _vol_oi_cache
+    dict keyed by OCC symbol.  Returns (volume, open_interest) or
+    (None, None) on cache miss.  Zero API calls on the hot path.
+    The cache is populated / refreshed by start_chain_refresh_worker().
+
+start_chain_refresh_worker(registry_fn, tradier_client, symbols_fn)
+    ING-008: Background asyncio task that refreshes the intraday chain
+    data (volume + OI) every _CHAIN_REFRESH_INTERVAL_S seconds for all
+    stream-eligible symbols.
+
+    API budget: one Tradier GET /markets/options/chains call per tracked
+    symbol per refresh cycle.  At 300-second cadence and a 50-symbol
+    universe that is ~10 calls/minute — well within Tradier's 120 req/min
+    limit.  Scale note: revisit cadence when universe exceeds ~200 symbols.
+
+    Volume reset: the cache is fully invalidated at market open
+    (call invalidate_vol_oi_cache()) so yesterday's volume never bleeds
+    into early-morning events.
+
 get_epoch() -> int
     Return the current mutation epoch counter.  Incremented on every
     successful save_chain() call.  Used by assert_epoch_parity() in
@@ -56,11 +76,22 @@ FIX EPOCH (2026-05-07):
   Added module-level _epoch counter incremented on every successful
   save_chain(). Exposed via get_epoch() for parity assertions with
   gate_config_store.assert_epoch_parity().
+
+ING-008 (2026-05-08):
+  Added `volume` column to save_chain / load_chain / _paginate_chain.
+  Added get_contract_vol_oi() — O(1) dict lookup from _vol_oi_cache.
+  Added start_chain_refresh_worker() — 5-min background refresh of
+  intraday volume+OI for all tracked symbols via Tradier chain API.
+  Added invalidate_vol_oi_cache() for market-open reset.
+
+FIX ING-008 (2026-05-08):
+  Added Awaitable to typing imports — was missing, causing NameError at
+  module load time on Python 3.12.
 """
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 from supabase import create_client, Client
 from config import settings
@@ -76,6 +107,23 @@ _PAGE_SIZE  = 1000
 _DEFAULT_MAX_AGE_HOURS = 24
 
 # ---------------------------------------------------------------------------
+# ING-008: background refresh cadence for intraday vol/OI
+# One Tradier chain call per symbol per cycle.
+# At 300s cadence and 50 symbols → ~10 req/min (limit: 120 req/min).
+# Revisit when universe exceeds ~200 symbols.
+# ---------------------------------------------------------------------------
+_CHAIN_REFRESH_INTERVAL_S: int = 300  # 5 minutes
+
+# ---------------------------------------------------------------------------
+# ING-008: in-process vol/OI cache
+#   Keyed by OCC symbol string.
+#   Value: {"volume": int, "open_interest": int, "refreshed_at": float}
+#   Populated / refreshed by start_chain_refresh_worker().
+#   Invalidated at market open via invalidate_vol_oi_cache().
+# ---------------------------------------------------------------------------
+_vol_oi_cache: Dict[str, Dict] = {}
+
+# ---------------------------------------------------------------------------
 # Epoch counter — incremented on every successful save_chain().
 # Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
 # ---------------------------------------------------------------------------
@@ -85,6 +133,127 @@ _epoch: int = 0
 def get_epoch() -> int:
     """Return the current chain_store mutation epoch (incremented per save_chain success)."""
     return _epoch
+
+
+def get_contract_vol_oi(occ_symbol: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    ING-008: O(1) in-process lookup of (volume, open_interest) for an OCC symbol.
+
+    Returns (volume, open_interest) from the _vol_oi_cache populated by
+    start_chain_refresh_worker().  Returns (None, None) on cache miss.
+
+    Never makes a live API call — zero latency on the hot path.
+    Cache misses are expected on cold start and for symbols not yet
+    refreshed in the current cycle; callers must treat None as acceptable.
+    """
+    entry = _vol_oi_cache.get(occ_symbol)
+    if entry is None:
+        return (None, None)
+    return (entry.get("volume"), entry.get("open_interest"))
+
+
+def invalidate_vol_oi_cache() -> None:
+    """
+    ING-008: Clear the vol/OI cache at market open so yesterday's intraday
+    volume never bleeds into early-morning flow events.
+    Call this from the market-open boundary handler in main.py or the stream.
+    """
+    _vol_oi_cache.clear()
+    log.info("[chain_store] vol/OI cache invalidated (market-open reset)")
+
+
+async def start_chain_refresh_worker(
+    get_tracked_symbols: Callable[[], list],
+    fetch_chain_fn: Callable[[str], Awaitable[list]],
+) -> None:
+    """
+    ING-008: Background asyncio task that refreshes intraday chain data
+    (volume + OI per OCC symbol) for all stream-eligible tracked symbols.
+
+    Runs every _CHAIN_REFRESH_INTERVAL_S seconds (default: 300s / 5 min).
+
+    Parameters
+    ----------
+    get_tracked_symbols : Callable[[], list]
+        Zero-argument callable that returns the current list of tracked
+        ticker symbols (e.g. lambda: list(registry.tickers())).  Called
+        fresh on each cycle so newly added symbols are picked up.
+
+    fetch_chain_fn : Callable[[str], Awaitable[list]]
+        Async callable that accepts a ticker symbol string and returns a
+        list of contract dicts from Tradier GET /markets/options/chains.
+        Each dict must contain at minimum:
+          - "symbol"        : str  (OCC symbol)
+          - "volume"        : int
+          - "open_interest" : int
+        On error it should return [] (never raise) so one bad symbol does
+        not abort the entire refresh cycle.
+
+    API budget
+    ----------
+    One call per symbol per cycle.  At 300s cadence, 50 symbols → 10 req/min.
+    Tradier rate limit: 120 req/min.  Headroom: ~110 req/min for stream.
+    Scale note: if symbol universe exceeds ~200, increase interval to 600s.
+
+    Cache population
+    ----------------
+    Writes directly into _vol_oi_cache[occ_symbol] = {
+        "volume": int, "open_interest": int, "refreshed_at": epoch_float
+    }.
+    flow_store.persist_flow_event and persist_flow_episode call
+    get_contract_vol_oi(occ_symbol) for a zero-API-call lookup.
+
+    Volume reset
+    ------------
+    _vol_oi_cache is NOT cleared here between cycles — it is invalidated
+    at market open by calling invalidate_vol_oi_cache() from the stream
+    market-open handler.  This prevents yesterday's volume from bleeding
+    into pre-market / early-morning events.
+    """
+    log.info(
+        "[chain_store] chain refresh worker started — interval=%ds",
+        _CHAIN_REFRESH_INTERVAL_S,
+    )
+    try:
+        while True:
+            await asyncio.sleep(_CHAIN_REFRESH_INTERVAL_S)
+            symbols = get_tracked_symbols()
+            if not symbols:
+                log.debug("[chain_store] chain refresh: no tracked symbols yet, skipping cycle")
+                continue
+
+            refreshed = 0
+            errors = 0
+            for symbol in symbols:
+                try:
+                    contracts = await fetch_chain_fn(symbol)
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    for c in contracts:
+                        occ = c.get("symbol", "").strip()
+                        if not occ:
+                            continue
+                        _vol_oi_cache[occ] = {
+                            "volume":        int(c.get("volume") or 0),
+                            "open_interest": int(c.get("open_interest") or 0),
+                            "refreshed_at":  now_ts,
+                        }
+                    refreshed += 1
+                except Exception as exc:
+                    errors += 1
+                    log.warning(
+                        "[chain_store] chain refresh: error fetching %s: %s",
+                        symbol, exc,
+                    )
+
+            log.info(
+                "[chain_store] chain refresh cycle complete — "
+                "symbols=%d refreshed=%d errors=%d cache_size=%d",
+                len(symbols), refreshed, errors, len(_vol_oi_cache),
+            )
+
+    except asyncio.CancelledError:
+        log.info("[chain_store] chain refresh worker cancelled — shutting down cleanly")
+        raise
 
 
 def _client() -> Client:
@@ -111,6 +280,9 @@ async def save_chain(
 
     Wall time improvement: ~5.8s (sequential) → ~300ms (concurrent).
 
+    ING-008: now includes `volume` in each upserted row (sourced from
+    ContractMeta.volume if present, else 0).
+
     Increments the module-level _epoch counter on success.
     """
     global _epoch
@@ -129,6 +301,7 @@ async def save_chain(
             "expiry":        m.expiry,
             "dte":           int(m.dte),
             "open_interest": int(m.open_interest),
+            "volume":        int(getattr(m, "volume", 0) or 0),
             "tier":          int(m.tier),
         }
         for occ, m in registry_dict.items()
@@ -226,7 +399,7 @@ def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']"
         resp = (
             sb.table(_TABLE)
             .select(
-                "occ_symbol,ticker,contract_type,strike,expiry,dte,open_interest,tier"
+                "occ_symbol,ticker,contract_type,strike,expiry,dte,open_interest,volume,tier"
             )
             .eq("snapshot_id", snapshot_id)
             .range(offset, offset + _PAGE_SIZE - 1)
@@ -243,7 +416,7 @@ def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']"
         occ = row.get("occ_symbol", "").strip()
         if not occ:
             continue
-        chain[occ] = ContractMeta(
+        cm = ContractMeta(
             ticker        = row["ticker"],
             strike        = float(row["strike"]),
             expiry        = row["expiry"],
@@ -252,6 +425,15 @@ def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']"
             open_interest = int(row["open_interest"]),
             tier          = int(row.get("tier") or 3),
         )
+        # ING-008: attach volume if the ContractMeta dataclass supports it;
+        # use setattr so this is non-breaking if the field hasn't been added yet.
+        vol = row.get("volume")
+        if vol is not None:
+            try:
+                object.__setattr__(cm, "volume", int(vol))
+            except (TypeError, AttributeError):
+                pass
+        chain[occ] = cm
     return chain
 
 

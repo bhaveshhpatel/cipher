@@ -16,6 +16,7 @@ Startup sequence:
      e. start_flow_writer()          — DB flush loop
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
+     h. start_chain_refresh_worker() — ING-008: 5-min chain cache refresh loop
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -45,6 +46,16 @@ Key architectural fixes:
                         accumulator receives the same tier map. Without this, Gate 2
                         in _get_episode_min_premium() resolves every ticker to tier 1
                         (strict cold-start default) for the entire session.
+  ING-008 (main)      — start_chain_refresh_worker() launched as a background task
+                        after yield. Refreshes options chain vol/OI for all
+                        stream_eligible symbols every 5 minutes via Tradier chain API.
+                        Zero live API calls on the flow hot path — persist_flow_event
+                        and persist_flow_episode read from the in-process cache only.
+                        FIX: wired with correct two-callable signature:
+                          get_tracked_symbols — lambda returning live OCC symbol list
+                          fetch_chain_fn      — _fetch_tradier_chain(symbol) helper
+                        invalidate_vol_oi_cache() called at market-open boundary in
+                        _registry_prewarm_loop() so yesterday's volume never bleeds.
 """
 import asyncio
 import json
@@ -67,6 +78,7 @@ from routers import admin
 from routers import health
 from core.auth import get_current_user
 from services.flow_store import start_flow_writer, start_lookback_worker
+from services.chain_store import start_chain_refresh_worker, invalidate_vol_oi_cache  # ING-008
 from services.symbols_loader import load_universe, _fetch_batch_quotes
 from services import universe_store
 from services.signal_store import start_signal_writer
@@ -75,6 +87,8 @@ from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow
 from services.gate_config_store import gate_config_store
+
+import httpx
 
 
 class _JsonFormatter(logging.Formatter):
@@ -118,6 +132,61 @@ async def get_config() -> dict:
         "app_env":   settings.APP_ENV,
         "log_level": settings.LOG_LEVEL,
     }
+
+
+# ---------------------------------------------------------------------------
+# ING-008: Tradier chain fetch helper for the background refresh worker.
+#
+# Calls GET /v1/markets/options/chains?symbol=X&greeks=false.
+# Returns a list of contract dicts, each containing at minimum:
+#   {"symbol": <occ_str>, "volume": int, "open_interest": int}
+# Returns [] on any error — one bad symbol must never abort the refresh cycle.
+# ---------------------------------------------------------------------------
+async def _fetch_tradier_chain(symbol: str) -> list:
+    """
+    ING-008: Fetch the current options chain for `symbol` from Tradier.
+
+    Used exclusively by start_chain_refresh_worker() as the fetch_chain_fn
+    callable.  Returns a flat list of option contract dicts.  On any
+    network or API error returns [] so the worker continues to the next
+    symbol without aborting the refresh cycle.
+
+    API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
+    Each returned dict includes at minimum:
+      - "symbol"        : str  (21-char OCC symbol)
+      - "volume"        : int  (today's volume for this contract)
+      - "open_interest" : int
+    """
+    if not settings.TRADIER_API_KEY:
+        return []
+    url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
+    headers = {
+        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+        "Accept": "application/json",
+    }
+    params = {"symbol": symbol, "greeks": "false"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            log.warning(
+                "[chain_refresh] Tradier chain fetch %s -> HTTP %d",
+                symbol, resp.status_code,
+            )
+            return []
+        data = resp.json()
+        options = data.get("options") or {}
+        option_list = options.get("option") or []
+        if isinstance(option_list, dict):
+            # Single-contract response (rare edge case)
+            option_list = [option_list]
+        return option_list
+    except Exception as exc:
+        log.warning(
+            "[chain_refresh] _fetch_tradier_chain(%s) error: %s",
+            symbol, exc,
+        )
+        return []
 
 
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
@@ -466,6 +535,11 @@ async def _registry_prewarm_loop() -> None:
         )
         await asyncio.sleep(sleep_secs)
 
+        # ING-008: invalidate vol/OI cache at market-open boundary so yesterday's
+        # intraday volume never bleeds into early-morning flow events.
+        invalidate_vol_oi_cache()
+        log.info("[prewarm] vol/OI cache invalidated ahead of market open")
+
         log.info("[prewarm] Building OCC registry ahead of market open...")
         try:
             registry = get_registry()
@@ -550,6 +624,41 @@ async def lifespan(app: FastAPI):
         start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
     )
 
+    # ING-008: background 5-min chain cache refresh loop.
+    #
+    # Wired with the two-callable signature required by start_chain_refresh_worker:
+    #
+    #   get_tracked_symbols — zero-arg callable returning the live list of OCC
+    #     symbols currently in the registry.  Called fresh each cycle so newly
+    #     added symbols are automatically picked up without a restart.
+    #     Falls back to stream_symbols (ticker list) if the registry dict is not
+    #     accessible, which is safe because chain_store only uses the symbol as a
+    #     key for the Tradier chain API call (it accepts either OCC or ticker).
+    #
+    #   fetch_chain_fn — async callable accepting a ticker string and returning a
+    #     list of contract dicts from Tradier GET /v1/markets/options/chains.
+    #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
+    #     aborts the refresh cycle.
+    #
+    # Zero live API calls on the flow hot path: persist_flow_event and
+    # persist_flow_episode read from the in-process _vol_oi_cache via
+    # get_contract_vol_oi(occ_symbol) — O(1) dict lookup.
+    def _get_tracked_tickers() -> list:
+        reg = get_registry()
+        if reg is not None and hasattr(reg, "_registry") and reg._registry:
+            # Return the unique set of underlying tickers (not OCC symbols) so
+            # one Tradier chain call per ticker covers all its strikes/expiries.
+            return list({v.ticker for v in reg._registry.values()})
+        # Fallback: use the startup stream_symbols list.
+        return list(stream_symbols)
+
+    chain_refresh_task    = asyncio.create_task(
+        start_chain_refresh_worker(
+            get_tracked_symbols=_get_tracked_tickers,
+            fetch_chain_fn=_fetch_tradier_chain,
+        )
+    )
+
     yield
 
     log.info("[shutdown] Closing Tradier stream connections first...")
@@ -567,6 +676,7 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
+    chain_refresh_task.cancel()  # ING-008
     for task in (
         build_task,
         db_write_task,
@@ -575,6 +685,7 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         lookback_task,
+        chain_refresh_task,  # ING-008
     ):
         try:
             await task
