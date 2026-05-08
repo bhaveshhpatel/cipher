@@ -268,7 +268,7 @@ async def test_e9_strike_expiry_populated_on_insert():
 
     captured_rows = []
 
-    async def capture_insert(table, row, key, premium):
+    async def capture_insert(table, row, key, premium, current_oi=None):
         captured_rows.append(row)
         return True
 
@@ -380,7 +380,7 @@ async def test_e12_concurrent_same_key_produces_one_insert():
 
     patch_call_payloads = []
 
-    async def fake_insert(table, row, key, premium):
+    async def fake_insert(table, row, key, premium, current_oi=None):
         # Simulate PostgREST returning the id — populate in-flight.
         fs._set_episode_in_flight(key, INSERTED_ID, row.get("trade_count") or 1, premium)
         return True
@@ -426,7 +426,7 @@ async def test_e13_different_keys_concurrent_no_blocking():
 
     insert_calls = []
 
-    async def fake_insert(table, row, key, premium):
+    async def fake_insert(table, row, key, premium, current_oi=None):
         insert_calls.append(key)
         return True
 
