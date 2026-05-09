@@ -39,6 +39,21 @@ The re-architecture is built on one core principle: **ingestion captures and tag
 
 ---
 
+## Alert Level Vocabulary (REARCH)
+
+All pre-REARCH alert level values (`CONVICTION`, `WHALE`, `INSTITUTIONAL`, `LARGE`, `RETAIL`) are retired. The canonical vocabulary across all tables, APIs, and UI is:
+
+| Level | Notional Threshold | Description |
+|---|---|---|
+| `WATCH` | < $50K | Minimum qualifying premium |
+| `NOTEWORTHY` | $50K – $500K | Institutional-scale flow |
+| `BLOCK` | $500K – $1M | Block-trade-level flow |
+| `GOLDEN` | ≥ $1M | Golden sweep — all 5 Steamroom dimensions pass at max tier |
+
+All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / HOLD`).
+
+---
+
 ## Story Sequence and Status
 
 | # | Story | GitHub Issue | Branch | Status | Deliberation | Dependencies |
@@ -49,9 +64,12 @@ The re-architecture is built on one core principle: **ingestion captures and tag
 | 4 | **REARCH-004** — Episode Quality Enrichment | [#105](https://github.com/bhaveshhpatel/cipher/issues/105) | `feat/rearch-004-episode-quality-enrichment` | 🔲 Not Started | SA · PBE · QA | REARCH-003 |
 | 5 | **REARCH-005** — Signal Config Store | [#106](https://github.com/bhaveshhpatel/cipher/issues/106) | `feat/rearch-005-signal-config-store` | 🔲 Not Started | SA · PBE · QA | REARCH-002, REARCH-004 |
 | 6 | **REARCH-006** — Signal Engine Rewrite | [#107](https://github.com/bhaveshhpatel/cipher/issues/107) | `feat/rearch-006-signal-engine-rewrite` | 🔲 Not Started | SA · PBE · QA | REARCH-003, REARCH-004, REARCH-005 |
-| 7 | **REARCH-007** — Admin UI: Ingestion Panel | [#108](https://github.com/bhaveshhpatel/cipher/issues/108) | `feat/rearch-007-admin-ingestion-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-002 |
+| 7 | **REARCH-007** — Admin UI: Ingestion Config Panel | [#108](https://github.com/bhaveshhpatel/cipher/issues/108) | `feat/rearch-007-admin-ingestion-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-002 |
 | 8 | **REARCH-008** — Admin UI: Signal Strategy Panel | [#109](https://github.com/bhaveshhpatel/cipher/issues/109) | `feat/rearch-008-admin-signal-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-005, REARCH-006 |
 | 9 | **REARCH-009** — Integration Test Suite | [#110](https://github.com/bhaveshhpatel/cipher/issues/110) | `feat/rearch-009-integration-tests` | 🔲 Not Started | SA · PBE · QA | REARCH-001 through REARCH-008 |
+| 10 | **REARCH-010** — DB Schema Purge | [#111](https://github.com/bhaveshhpatel/cipher/issues/111) | `feat/rearch-010-db-schema-purge` | 🔲 Not Started | SA · PBE · QA | None (prerequisite for REARCH-003, REARCH-004, REARCH-006) |
+| 11 | **REARCH-011** — Dashboard Frontend Overhaul | [#112](https://github.com/bhaveshhpatel/cipher/issues/112) | `feat/rearch-011-dashboard-overhaul` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-010, REARCH-006, REARCH-004 |
+| 12 | **REARCH-012** — Admin Page Overhaul | [#113](https://github.com/bhaveshhpatel/cipher/issues/113) | `feat/rearch-012-admin-page-overhaul` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-010, REARCH-007, REARCH-008 |
 
 ### Status Legend
 | Icon | Meaning |
@@ -74,10 +92,31 @@ REARCH-001 (Index Purge)
             │       └── REARCH-004 (Episode Enrichment)
             │               └── REARCH-005 (Signal Config Store)
             │                       └── REARCH-006 (Signal Engine Rewrite)
-            │                               └── REARCH-008 (Admin: Signal Panel)
-            │                                       └── REARCH-009 (Integration Tests)
-            └── REARCH-007 (Admin: Ingestion Panel)
+            │                               ├── REARCH-008 (Admin: Signal Panel)
+            │                               │       └── REARCH-009 (Integration Tests)
+            │                               └── REARCH-011 (Dashboard Overhaul) ──┐
+            └── REARCH-007 (Admin: Ingestion Panel)                               │
+                        └── REARCH-012 (Admin Page Overhaul) ────────────────────┘
+
+REARCH-010 (DB Schema Purge)  ← prerequisite; unblocks REARCH-003, REARCH-004,
+    ├── REARCH-011 (Dashboard Overhaul)      REARCH-006 column reads and all UI work
+    └── REARCH-012 (Admin Page Overhaul)
 ```
+
+> **REARCH-010 note:** Although REARCH-010 has no application-code dependencies, it is a hard prerequisite for all frontend work (REARCH-011, REARCH-012) and for any code that reads `signal_history.alert_level` or `flow_episodes` new columns. It should be scheduled immediately after REARCH-002 seeding is confirmed and before any feature branch touches the affected tables.
+
+---
+
+## Story Summaries
+
+### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
+Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill strategy required for 28,504 existing `signal_history` rows before constraint swap.
+
+### REARCH-011 — Dashboard Frontend Overhaul ([#112](https://github.com/bhaveshhpatel/cipher/issues/112))
+Full audit and rebuild of the dashboard page against the REARCH data model. Audit-first: every current component is classified KEEP / REWORK / REMOVE. Key removals: swarm voting UI, `influence_tier` displays, raw event `conviction_score` gauge, `is_golden_sweep` badge. New components: Steamroom Score pip indicator (0–5), Ask-Side fill bar, Alert Level badge (4-tier), Vol>OI tag, DTE bucket label. New information hierarchy: Market Status → Golden/Block Banner → Live Signal Feed → Episode Activity Panel → Aggregate Stats Bar → Signal History Table.
+
+### REARCH-012 — Admin Page Overhaul ([#113](https://github.com/bhaveshhpatel/cipher/issues/113))
+Full audit and consolidation of the admin page. Removes Gate Config panel (backed by dropped `gate_configs` table), backtest results viewer, and any swarm monitoring UI. Integrates REARCH-007 and REARCH-008 panels into a clean 5-tab layout: Stream & Health / Ingestion Config / Signal Strategy / Universe Management / Demo Engine. Demo engine is explicitly preserved but must pass a 6-point audit checklist for retired field references. Persistent Activity Log footer drawer replaces any scattered log views.
 
 ---
 
@@ -94,7 +133,10 @@ main
         ├── feat/rearch-006-signal-engine-rewrite
         ├── feat/rearch-007-admin-ingestion-panel
         ├── feat/rearch-008-admin-signal-panel
-        └── feat/rearch-009-integration-tests
+        ├── feat/rearch-009-integration-tests
+        ├── feat/rearch-010-db-schema-purge
+        ├── feat/rearch-011-dashboard-overhaul
+        └── feat/rearch-012-admin-page-overhaul
 ```
 
 **Rules:**
@@ -137,15 +179,47 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-004 | `add_episode_quality_aggregate_columns.sql` | ☐ |
 | REARCH-005 | `create_signal_config_table.sql` | ☐ |
 | REARCH-005 | `seed_signal_config_steamroom_defaults.sql` | ☐ |
+| REARCH-010 | `backfill_signal_history_alert_level.sql` | ☐ |
+| REARCH-010 | `backfill_signal_history_direction.sql` | ☐ |
+| REARCH-010 | `drop_tables_backtest_gate_configs.sql` | ☐ |
+| REARCH-010 | `drop_columns_flow_events_pre_rearch.sql` | ☐ |
+| REARCH-010 | `drop_columns_flow_episodes_pre_rearch.sql` | ☐ |
+| REARCH-010 | `drop_columns_signal_history_swarm.sql` | ☐ |
+| REARCH-010 | `alter_signal_history_constraints_rearch.sql` | ☐ |
+| REARCH-010 | `add_steamroom_columns_flow_episodes.sql` | ☐ |
+| REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☐ |
+
+---
+
+## Retired Vocabulary Reference
+
+The following pre-REARCH terms must not appear in any new code, component, API response, or documentation:
+
+| Retired Term | REARCH Replacement | Where It Appeared |
+|---|---|---|
+| `CONVICTION`, `WHALE`, `INSTITUTIONAL`, `LARGE`, `RETAIL` | `WATCH`, `NOTEWORTHY`, `BLOCK`, `GOLDEN` | `signal_history.alert_level`, UI badges |
+| `BUY`, `SELL`, `HOLD` | `BULLISH`, `BEARISH`, `NEUTRAL` | `signal_history.direction`, UI labels |
+| `conviction_score` (raw event) | Normalized 0-100 from REARCH-006 formula | `flow_events`, signal cards |
+| `influence_tier` | `options_universe_symbols.tier` (T1/T2/T3) | `flow_events`, `signal_history`, UI |
+| `is_golden_sweep` (boolean) | `alert_level = 'GOLDEN'` | `flow_events`, UI badges |
+| `swarm_direction`, `swarm_confidence`, `swarm_agents`, `swarm_bull_votes`, `swarm_bear_votes`, `swarm_hold_votes` | Retired with no replacement | `signal_history`, swarm monitoring UI |
+| `volume_premium_factor` | `episode_steamroom_score` + conviction pipeline | `signal_history` |
+| `backtest_results` (table) | `GET /admin/signal-config/backtest` (in-memory replay) | DB table, admin UI |
+| `gate_configs` (table) | `ingestion_config` | DB table, admin Gate Config panel |
+| `gate_config_audit` (table) | `admin_activity_log` | DB table |
+| `seed_episode` (column) | Removed; no replacement | `flow_episodes` |
 
 ---
 
 ## Merge-to-Main Readiness Checklist
 
-- [ ] REARCH-001 through REARCH-008 all status ✅ (merged to aggregation branch)
+- [ ] REARCH-001 through REARCH-012 all status ✅ (merged to aggregation branch)
 - [ ] REARCH-009 integration test suite: all 19 scenarios green in CI
+- [ ] REARCH-010 DB schema purge applied and verified with `get_advisors` scan
 - [ ] No index ticker in `flow_events` (verified by query)
+- [ ] No retired vocabulary in any API response, DB column, or UI component
 - [ ] Admin UI: ingestion panel and signal panel both render and save correctly
+- [ ] Dashboard: signal feed shows REARCH alert levels; no swarm UI present
 - [ ] Signal engine: at least 5 trading session dry-runs with side-by-side comparison to old pipeline
 - [ ] `main` branch PR reviewed by SA + PBE + QA before merge
 - [ ] Railway deployment: zero-downtime deploy confirmed (no restart-required config changes)
