@@ -50,13 +50,27 @@ ING-010: Tier-aware min_premium floor.
   tier from the registry, then reads gate_config_store.get("min_premium", tier)),
   that value overrides _MIN_EVENT_PREMIUM for this tick only.
   Backwards compatible: None falls back to _MIN_EVENT_PREMIUM (10_000).
+
+SENTIMENT FIX (2026-05-09):
+  ev.sentiment is now derived from classify_sentiment(bid_ask_class, contract_type)
+  instead of contract_type alone. The old logic (CALL->BULLISH, PUT->BEARISH)
+  was correct for ASK-side fills (buyers initiating) but wrong for BID-side
+  fills (sellers writing):
+    - AT_BID/BELOW_BID CALL fill = call seller (bearish), was incorrectly BULLISH
+    - AT_BID/BELOW_BID PUT  fill = put seller  (bullish), was incorrectly BEARISH
+  Both the initial assignment and the registry enrichment block now use
+  classify_sentiment() so that registry contract_type overrides don't
+  silently revert to the old naive logic.
+  All historical flow_events rows had order_side=UNKNOWN (Tradier stream
+  never populated it), so bid_ask_class is the only available fill-placement
+  signal and is the correct input to classify_sentiment().
 """
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional, Union, Literal
-from parsers.bid_ask_classifier import classify_bid_ask, is_directionally_aggressive
+from parsers.bid_ask_classifier import classify_bid_ask, classify_sentiment, is_directionally_aggressive
 from parsers.trade_type_detector import detect_trade_type, is_golden_sweep
 
 logger = logging.getLogger(__name__)
@@ -303,6 +317,9 @@ def parse_tradier_trade(
         #   4. Apply a 40% conviction haircut (×0.6) downstream
         # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
         # post-registry — synthetic spreads have no valid aggression signal.
+        # NOTE (SENTIMENT FIX): synthetic quotes force ba_class="MID" which
+        # means classify_sentiment() falls back to contract type — correct
+        # behaviour since we have no fill placement signal.
         # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
@@ -347,10 +364,11 @@ def parse_tradier_trade(
             is_synthetic_quote = is_synthetic_quote,
         )
 
-        if ctype == "CALL":
-            ev.sentiment = "BULLISH"
-        elif ctype == "PUT":
-            ev.sentiment = "BEARISH"
+        # SENTIMENT FIX (2026-05-09): derive from bid_ask_class + contract_type.
+        # ASK-side fills -> buyer initiating -> sentiment follows contract type.
+        # BID-side fills -> seller writing  -> sentiment is INVERSE of contract type.
+        # MID fills      -> ambiguous        -> fallback to contract type.
+        ev.sentiment = classify_sentiment(ev.bid_ask_class, ev.contract_type)
 
         if premium >= 2_000_000:
             ev.influence_tier = "WHALE"
@@ -395,7 +413,9 @@ def parse_tradier_trade(
                     ev.contract_type = meta.contract_type
                     ev.dte           = meta.dte
                     ev.open_interest = meta.open_interest
-                    ev.sentiment     = "BULLISH" if meta.contract_type == "CALL" else "BEARISH"
+                    # SENTIMENT FIX: re-derive after registry may flip contract_type.
+                    # bid_ask_class does not change here — only contract_type can flip.
+                    ev.sentiment = classify_sentiment(ev.bid_ask_class, ev.contract_type)
 
                 # ING-004: Fallback underlying_price from registry stock_price.
                 if ev.underlying_price == 0.0:

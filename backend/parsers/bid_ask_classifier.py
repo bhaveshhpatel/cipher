@@ -40,6 +40,29 @@ SA-F2 / ING-007 NOTE:
   stratification will be degraded (same argument as execution_mechanic — Session
   21 deliberation). ING-007 story must be created and S2.5 migration extended
   before production deploy.
+
+SENTIMENT CLASSIFICATION (classify_sentiment):
+  Derives BULLISH/BEARISH from bid_ask_class + contract_type per the
+  10-row decision table agreed in the REARCH session (2026-05-09).
+  The key insight is that fill placement (bid_ask_class) reveals whether
+  a trade is a BUY or a SELL, and the directional interpretation flips
+  for put sellers vs call sellers:
+
+    ABOVE_ASK + CALL -> BULLISH   urgent buyer paying up for calls
+    AT_ASK    + CALL -> BULLISH   initiating long call
+    ABOVE_ASK + PUT  -> BEARISH   urgent buyer paying up for puts
+    AT_ASK    + PUT  -> BEARISH   initiating downside protection
+    AT_BID    + CALL -> BEARISH   writing/closing calls, short gamma
+    BELOW_BID + CALL -> BEARISH   desperate call seller, strong short signal
+    AT_BID    + PUT  -> BULLISH   selling puts at bid, floor view expressed
+    BELOW_BID + PUT  -> BULLISH   aggressive put seller, conviction floor holds
+    MID       + CALL -> BULLISH   ambiguous, fallback to contract type
+    MID       + PUT  -> BEARISH   ambiguous, fallback to contract type
+
+  order_side is NOT used here because the Tradier stream never populates
+  it — bid_ask_class is the only available fill-placement signal at parse
+  time. When order_side population is implemented in a future sprint,
+  classify_sentiment() should be extended to use it as a tiebreaker.
 """
 from typing import Literal
 
@@ -108,6 +131,56 @@ def classify_bid_ask(fill: float, bid: float, ask: float) -> TradeType:
     if fill < mid:
         return "AT_BID"
     return "MID"
+
+
+def classify_sentiment(bid_ask_class: str, contract_type: str) -> str:
+    """Derive BULLISH or BEARISH sentiment from fill placement and contract type.
+
+    Decision table (10-row, agreed 2026-05-09):
+
+      bid_ask_class  | contract_type | sentiment | rationale
+      ---------------+---------------+-----------+----------------------------------
+      ABOVE_ASK      | CALL          | BULLISH   | Urgent buyer paying up for calls
+      AT_ASK         | CALL          | BULLISH   | Initiating long call position
+      ABOVE_ASK      | PUT           | BEARISH   | Urgent buyer paying up for puts
+      AT_ASK         | PUT           | BEARISH   | Initiating downside protection
+      AT_BID         | CALL          | BEARISH   | Writing/closing calls, short gamma
+      BELOW_BID      | CALL          | BEARISH   | Desperate call seller, strong short
+      AT_BID         | PUT           | BULLISH   | Selling puts at bid, floor view
+      BELOW_BID      | PUT           | BULLISH   | Aggressive put seller, floor conviction
+      MID            | CALL          | BULLISH   | Ambiguous, fallback to contract type
+      MID            | PUT           | BEARISH   | Ambiguous, fallback to contract type
+
+    Logic:
+      - ASK-side fills (ABOVE_ASK, AT_ASK): buyer is initiating — sentiment
+        follows contract type directly (calls=bullish, puts=bearish).
+      - BID-side fills (AT_BID, BELOW_BID): seller is writing — sentiment is
+        the INVERSE of contract type (call seller=bearish, put seller=bullish).
+      - MID fills: ambiguous execution, cannot determine buyer vs seller —
+        fall back to contract type as a neutral default.
+      - Unknown bid_ask_class or contract_type: fall back to contract type.
+
+    Args:
+        bid_ask_class: One of ABOVE_ASK, AT_ASK, MID, AT_BID, BELOW_BID.
+        contract_type: CALL or PUT.
+
+    Returns:
+        "BULLISH" or "BEARISH". Never returns NEUTRAL — a neutral signal
+        would not pass the signal engine threshold anyway.
+    """
+    ba    = (bid_ask_class or "").strip().upper()
+    ctype = (contract_type or "").strip().upper()
+
+    # ASK-side: buyer initiating — sentiment follows contract type.
+    if ba in ("ABOVE_ASK", "AT_ASK"):
+        return "BULLISH" if ctype == "CALL" else "BEARISH"
+
+    # BID-side: seller writing — sentiment is INVERSE of contract type.
+    if ba in ("AT_BID", "BELOW_BID"):
+        return "BEARISH" if ctype == "CALL" else "BULLISH"
+
+    # MID or unknown bid_ask_class: ambiguous, fall back to contract type.
+    return "BULLISH" if ctype == "CALL" else "BEARISH"
 
 
 def is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool:
