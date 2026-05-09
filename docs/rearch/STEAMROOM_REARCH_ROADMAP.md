@@ -6,6 +6,56 @@
 
 ---
 
+## ⛔ Streaming Boundary — Frozen, Out of Scope for All Re-Architecture Work
+
+**The re-architecture scope begins exactly here:**
+
+```
+[Tradier WebSocket] ──► [Streaming Worker] ──► _process_trade(raw_event)
+                                                        │
+                                              ══════════╪══════════════
+                                              REARCH     │  STARTS HERE
+                                              ══════════╪══════════════
+                                                        │
+                                              flow_events write
+                                              episode accumulation
+                                              signal engine
+                                              swarm annotation
+                                              signal_history write
+```
+
+Everything **above** the `_process_trade()` entry point is **permanently frozen and excluded from all re-architecture work.** These systems are working correctly and must not be touched:
+
+| Frozen Component | What It Does | Why It's Frozen |
+|---|---|---|
+| **Tradier WebSocket connection** | Establishes and maintains the real-time options flow stream | Working correctly. Any disruption breaks live data ingest entirely. |
+| **Streaming worker / event loop** | Receives raw Tradier trade messages, dispatches to `_process_trade()` | Working correctly. Reconnect logic, heartbeat, and backpressure handling are stable. |
+| **OCC symbol lookup** | Parses OCC option symbols into structured fields (underlying, strike, expiry, type) | Working correctly. No changes to symbol parsing or OCC format handling. |
+| **Option chain cache** | Caches chain-level data (open interest, bid/ask) used for Vol>OI and bid/ask classification | Working correctly. Cache generation, TTL, and invalidation are stable. |
+| **Registry sync / universe workers** | Syncs `options_universe_symbols` (T1/T2/T3 tiers) from external sources | Working correctly. Worker process, scheduling, and sync contract are stable. |
+| **`_process_trade()` signature** | Entry point called by the streaming worker with a raw Tradier event | Signature and call contract are frozen. Internal logic downstream of this call is in scope. |
+
+### What "In Scope" Means
+
+The re-architecture touches **only** the logic that runs after `_process_trade()` has received a raw event:
+
+1. **Quality filtering** — which events clear the ingestion floor and get written to `flow_events`
+2. **Event tagging** — Steamroom dimension tags (`is_ask_side`, `vol_oi_signal`, `bid_ask_class`, etc.) computed and stored on `flow_events`
+3. **Episode accumulation** — how events are merged into `flow_episodes` (merge window, repetition detection)
+4. **Signal engine** — what gates an episode must pass before a `signal_history` row is emitted
+5. **Swarm annotation** — explicit-invocation-only enrichment on already-emitted signals
+6. **DB schema** — columns, tables, and constraints in `flow_events`, `flow_episodes`, `signal_history`
+7. **Admin UI** — ingestion config, signal strategy, episode management panels
+8. **Dashboard UI** — signal feed, episode panel, Steamroom scoring display
+
+### Enforcement Rules
+
+- **No PR touching streaming files will be approved** as part of this re-architecture. If a streaming file change is needed for an independent reason, it must go through a separate PR on `main` with its own review cycle, completely decoupled from this branch.
+- **REARCH-009 integration tests must never mock or stub the streaming worker.** Tests drive the pipeline from `_process_trade()` downward, using synthetic raw event payloads that match the exact Tradier format — not from a mock WebSocket.
+- **If any story's implementation requires a change upstream of `_process_trade()`**, that is a design error. The story must be redesigned so that all changes land downstream.
+
+---
+
 ## Architecture Decision: Permissive Ingestion + Signal-Layer Conviction
 
 The re-architecture is built on one core principle: **ingestion captures and tags; signals filter and score.**
@@ -21,11 +71,15 @@ The re-architecture is built on one core principle: **ingestion captures and tag
 
 **Why this shape:** Keeping ingestion permissive (above sanity floors) means the `flow_events` + `flow_episodes` tables can be used for backtesting alternative strategies by varying signal-layer parameters without re-ingesting. The signal engine becomes a parameterized query over enriched episode data. The swarm engine is a separate, explicit-invocation-only enrichment path that never touches the hot path.
 
+> **Note on "ingestion" language:** Throughout this document, "ingestion" refers exclusively to the logic inside `_process_trade()` and the downstream pipeline — quality filtering, DB writes, episode accumulation. It does **not** refer to the Tradier streaming layer, which is frozen per the boundary above.
+
 ---
 
 ## Index Symbol Policy
 
 **All index tickers are permanently excluded.** No index symbol (SPX, NDX, VIX, RUT, DJX, any `$`-prefixed ticker) will ever appear in `flow_events`, `flow_episodes`, or `signal_history`. Index options have fundamentally different settlement mechanics (cash-settled, AM/PM ambiguity, no share-equivalent underlying) that corrupt every flow quality metric. REARCH-001 is the mandatory first story.
+
+> **Boundary note:** Index exclusion is enforced inside `_process_trade()` as an early-return check — not at the streaming layer. The streaming worker continues to receive and dispatch all Tradier events; the filter lives in the application layer where it belongs.
 
 ---
 
@@ -111,6 +165,9 @@ REARCH-010 (DB Schema Purge)  ← prerequisite; unblocks REARCH-003, REARCH-004,
 
 REARCH-013 (Tiered Swarm) ← blocks REARCH-014
     └── defines swarm annotation contract that backtest engine must know to exclude from replay
+
+[Tradier WebSocket → Streaming Worker → _process_trade()]
+    ✗ NOT IN THIS GRAPH — frozen, out of scope, no stories touch these components
 ```
 
 > **REARCH-010 note:** Although REARCH-010 has no application-code dependencies, it is a hard prerequisite for all frontend work (REARCH-011, REARCH-012) and for REARCH-013 (swarm writes to `signal_history.detail` JSONB which is formalized in REARCH-010). Schedule immediately after REARCH-002 seeding is confirmed and before any feature branch touches the affected tables.
@@ -124,11 +181,17 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 ### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
 Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill strategy required for 28,504 existing `signal_history` rows before constraint swap.
 
+> **Streaming boundary:** REARCH-010 only touches Supabase schema. No streaming files, no worker process, no Tradier client code.
+
 ### REARCH-011 — Dashboard Frontend Overhaul ([#112](https://github.com/bhaveshhpatel/cipher/issues/112))
 Full audit and rebuild of the dashboard page against the REARCH data model. Audit-first: every current component is classified KEEP / REWORK / REMOVE. Key removals: swarm voting UI, `influence_tier` displays, raw event `conviction_score` gauge, `is_golden_sweep` badge. New components: Steamroom Score pip indicator (0–5), Ask-Side fill bar, Alert Level badge (4-tier), Vol>OI tag, DTE bucket label. New information hierarchy: Market Status → Golden/Block Banner → Live Signal Feed → Episode Activity Panel → Aggregate Stats Bar → Signal History Table.
 
+> **Streaming boundary:** Dashboard reads from Supabase and existing WebSocket push endpoints only. No changes to the streaming worker, Tradier connection, or any upstream data pipeline.
+
 ### REARCH-012 — Admin Page Overhaul ([#113](https://github.com/bhaveshhpatel/cipher/issues/113))
 Full audit and consolidation of the admin page. Removes Gate Config panel (backed by dropped `gate_configs` table), backtest results viewer, and any swarm monitoring UI. Integrates REARCH-007 and REARCH-008 panels into a clean 5-tab layout: Stream & Health / Ingestion Config / Signal Strategy / Universe Management / Demo Engine. Demo engine is explicitly preserved but must pass a 6-point audit checklist for retired field references. Persistent Activity Log footer drawer replaces any scattered log views. Swarm invocation surface (invoke button + tier selector + result display) is a contextual panel within the Episode detail view — not a standalone tab — added in this story.
+
+> **Streaming boundary:** The Stream & Health tab displays read-only metrics from the existing streaming worker (uptime, event rate, reconnect count). It does not modify, restart, or reconfigure the streaming worker itself.
 
 ### REARCH-013 — S7: Tiered Swarm Engine + Circuit Breaker ([#115](https://github.com/bhaveshhpatel/cipher/issues/115))
 Full rewrite of `backend/services/swarm_engine.py` and deprecation of `backend/simulation/ensemble_runner.py`. Replaces the always-on 12-agent flat swarm with an explicit-invocation-only `SwarmCoordinator` using a tiered model: FAST (3 agents, 2s timeout), STANDARD (6 agents, 5s timeout), DEEP (12 agents, 10s timeout). A sliding-window p95 `CircuitBreaker` guards the FAST tier — opens for 60s if p95 latency over last 20 calls exceeds 2000ms, returning `circuit_broken=True` immediately with no Groq calls. The swarm result is stored as a PATCH to `signal_history.detail['swarm']` JSONB after signal emission — it never gates or delays signal output. `build_composite()` (sync hot path) is completely unmodified. REARCH vocabulary throughout: `BULLISH/BEARISH/NEUTRAL` only. New `POST /admin/swarm/invoke` endpoint. 15-test matrix. `docs/SIGNAL_ENGINE.md` update required.
@@ -139,6 +202,8 @@ Full rewrite of `backend/services/swarm_engine.py` and deprecation of `backend/s
 - Swarm result: supplemental annotation only, stored in `detail` JSONB, never a gate
 - Circuit breaker: FAST tier only; STANDARD and DEEP have no breaker (human-invoked, latency-tolerant)
 - Direction vocabulary: `BULLISH/BEARISH/NEUTRAL` — `BUY/SELL/HOLD` banned from all new code
+
+> **Streaming boundary:** Swarm engine is called from `build_composite_async()` or `POST /admin/swarm/invoke` only. It has zero interaction with the streaming worker, Tradier connection, or OCC symbol lookup. The `_process_trade()` sync hot path is never modified.
 
 **Key deliberations (3-way SA · PBE · QA):**
 - **SA-1:** Circuit breaker state — in-process singleton vs. dependency-injected instance (DI is the correct answer; resolves both SA-1 and QA-5 simultaneously)
@@ -174,6 +239,8 @@ Implements a fully in-memory, read-only, `dry_run=True`-hardcoded backtest engin
 - `config_override` uses deep merge (not full replacement) so a single threshold tweak doesn't wipe all other config fields
 - Force-flush all open `RepetitionAccumulator` instances after event loop ends (captures late-day episodes that hadn't closed their merge window)
 - 500,000 event hard guard: raise `BacktestTooLargeError` with a message pointing to date range narrowing
+
+> **Streaming boundary:** Backtest engine reads exclusively from `flow_events` table in Supabase (already-captured historical data). It has no interaction with the streaming worker, Tradier connection, option chain cache, or any live data component. It is a pure read-from-DB → replay-in-memory → return-result pipeline.
 
 **Key deliberations (3-way SA · PBF · QA):**
 - **SA-1:** Bulk SELECT all events into memory vs. per-symbol sequential fetch — per-symbol is the correct long-term shape (2MB peak vs. 75MB), mitigated by `idx_flow_events_date_symbol` index; decide which ships in this story
@@ -215,6 +282,7 @@ main
 - No direct commits to `rearch/steamroom-signal-engine` except this roadmap doc and DB migration files that span multiple stories
 - `rearch/steamroom-signal-engine` → `main` merge requires REARCH-009 integration tests passing green in CI
 - `admin` branch is **never touched** by this re-architecture work
+- **No PR modifying any streaming file** (`tradier_client.py`, `stream_worker.py`, `occ_parser.py`, `chain_cache.py`, `registry_sync.py`, or any file in the streaming worker process) will be accepted as part of this re-architecture
 
 ---
 
@@ -268,6 +336,8 @@ Deliberation results must be documented as comments on the GitHub issue before t
 
 > **REARCH-014 DB note:** No DDL changes. The dropped `backtest_results` table (REARCH-010) is not recreated. Backtest results are fully in-memory and returned in the API response only.
 
+> **Streaming boundary:** No migration file in this list touches the streaming worker, Tradier client configuration, OCC symbol lookup tables, option chain cache, or registry sync tables. All migrations are purely within `flow_events`, `flow_episodes`, `signal_history`, and new config tables.
+
 ---
 
 ## Retired Vocabulary Reference
@@ -304,5 +374,6 @@ The following pre-REARCH terms must not appear in any new code, component, API r
 - [ ] **Swarm:** `POST /admin/swarm/invoke` endpoint functional; `build_composite()` sync path verified unmodified; circuit breaker trips and resets correctly; `ensemble_runner.py` deprecated with `DeprecationWarning`
 - [ ] **Backtest:** `GET /admin/signal-config/backtest` returns valid `BacktestResult`; `dry_run=True` hardcoded; no writes to any table; swarm excluded flag confirmed in all responses
 - [ ] `docs/SIGNAL_ENGINE.md` updated: tiered swarm architecture, circuit breaker behavior table, backtest engine contract, explicit-invocation-only contract documented
+- [ ] **Streaming boundary audit:** Confirm zero diff in any of the following files between `rearch/steamroom-signal-engine` and `main`: Tradier client, streaming worker, OCC parser, chain cache, registry sync workers. If any diff exists, it must be explained and approved as an intentional exception.
 - [ ] `main` branch PR reviewed by SA + PBE + QA before merge
 - [ ] Railway deployment: zero-downtime deploy confirmed (no restart-required config changes)
