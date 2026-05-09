@@ -20,6 +20,10 @@ BUG FIX (2026-04-30): FlowEventOut.expiry/strike made Optional — flow_episodes
 Rearch-010 (2026-05-09): Removed conviction_score, influence_tier, is_golden_sweep from
                       FlowEventOut and FlowEventRaw (columns dropped in migration 024).
                       Removed _ALERT_TO_TIER mapping (no longer used).
+BUG FIX (2026-05-09): Removed stale influence_tier + is_golden_sweep PostgREST filter
+                      injection from _query_flow_events() — both columns dropped in
+                      migration 024. Removed tier + golden_sweep Query params from
+                      GET /events route and active_filters dict. Fixes #118.
 """
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -214,13 +218,15 @@ async def _query_flow_events(
     ticker:         Optional[str],
     sentiment:      Optional[str],
     contract_type:  Optional[str],
-    tier:           Optional[str],
     aggressive:     Optional[bool],
-    golden_sweep:   Optional[bool],
     limit:          int,
     offset:         int,
 ) -> tuple[list[dict], int]:
-    """Query flow_events table with optional filters."""
+    """Query flow_events table with optional filters.
+
+    NOTE: influence_tier and is_golden_sweep were removed — both columns
+    were dropped in migration 024 (rearch-010). Do not re-add them.
+    """
     url_base = os.environ.get("SUPABASE_URL")
     if not url_base or not (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")):
         log.warning("[flow/events] SUPABASE_URL or key not set — returning empty")
@@ -243,12 +249,8 @@ async def _query_flow_events(
         params["sentiment"] = f"eq.{sentiment.upper()}"
     if contract_type:
         params["contract_type"] = f"eq.{contract_type.upper()}"
-    if tier:
-        params["influence_tier"] = f"eq.{tier.upper()}"
     if aggressive is not None:
         params["is_aggressive"] = f"eq.{str(aggressive).lower()}"
-    if golden_sweep is not None:
-        params["is_golden_sweep"] = f"eq.{str(golden_sweep).lower()}"
 
     headers = {**_headers(), "Prefer": "count=exact"}
 
@@ -399,9 +401,7 @@ async def get_flow_events(
     ticker:        Optional[str]  = Query(default=None, min_length=1, max_length=10),
     sentiment:     Optional[str]  = Query(default=None, description="BULLISH | BEARISH | NEUTRAL"),
     contract_type: Optional[str]  = Query(default=None, description="CALL | PUT"),
-    tier:          Optional[str]  = Query(default=None, description="T1 | T2 | T3"),
     aggressive:    Optional[bool] = Query(default=None),
-    golden_sweep:  Optional[bool] = Query(default=None),
     limit:         int            = Query(default=50, ge=1, le=500),
     offset:        int            = Query(default=0,  ge=0),
     _: TokenData = Depends(get_current_user),
@@ -412,9 +412,7 @@ async def get_flow_events(
         ticker=ticker_clean,
         sentiment=sentiment,
         contract_type=contract_type,
-        tier=tier,
         aggressive=aggressive,
-        golden_sweep=golden_sweep,
         limit=limit,
         offset=offset,
     )
@@ -448,12 +446,10 @@ async def get_flow_events(
 
     active_filters = {
         k: v for k, v in {
-            "ticker": ticker_clean,
-            "sentiment": sentiment,
+            "ticker":        ticker_clean,
+            "sentiment":     sentiment,
             "contract_type": contract_type,
-            "tier": tier,
-            "aggressive": aggressive,
-            "golden_sweep": golden_sweep,
+            "aggressive":    aggressive,
         }.items() if v is not None
     }
 
