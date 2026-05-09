@@ -17,10 +17,11 @@ Endpoints:
   POST  /api/admin/registry/prewarm      — trigger registry.build() on demand (background task)
   GET   /api/admin/activity-log          — paginated admin audit log  [STORY-BE-001]
 
-Removed in rearch-010 (migration 024 drops gate_configs + gate_config_audit tables):
-  GET   /api/admin/gate-config
-  PATCH /api/admin/gate-config
-  GET   /api/admin/gate-config/history
+Removed in rearch-010 (migration 024 drops gate_configs + gate_config_audit tables).
+Stubbed as 410 Gone so stale clients get an actionable error:
+  GET   /api/admin/gate-config           — 410 Gone
+  PATCH /api/admin/gate-config           — 410 Gone
+  GET   /api/admin/gate-config/history   — 410 Gone
 """
 import asyncio
 import logging
@@ -62,6 +63,41 @@ def _require_admin(current_user: TokenData = Depends(get_current_user)) -> Token
             detail="Admin access required",
         )
     return current_user
+
+
+# ---------------------------------------------------------------------------
+# Gate-config — REMOVED in rearch-010 (migration 024 drops gate_configs +
+# gate_config_audit tables). Stubbed as 410 Gone so stale clients and any
+# cached API calls get an actionable error rather than a silent 404.
+# DO NOT remove these stubs until all callers have been updated.
+# ---------------------------------------------------------------------------
+
+_GATE_CONFIG_GONE = {
+    "error":  "gone",
+    "detail": (
+        "The gate-config endpoints have been removed. "
+        "The gate_configs and gate_config_audit tables were dropped in migration 024 (rearch-010). "
+        "Signal gating is now controlled via tier_thresholds."
+    ),
+}
+
+
+@router.get("/gate-config", status_code=410, include_in_schema=False)
+async def gate_config_get_gone(_: TokenData = Depends(_require_admin)):
+    """410 Gone — gate_configs table dropped in migration 024."""
+    raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE["detail"])
+
+
+@router.patch("/gate-config", status_code=410, include_in_schema=False)
+async def gate_config_patch_gone(_: TokenData = Depends(_require_admin)):
+    """410 Gone — gate_configs table dropped in migration 024."""
+    raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE["detail"])
+
+
+@router.get("/gate-config/history", status_code=410, include_in_schema=False)
+async def gate_config_history_gone(_: TokenData = Depends(_require_admin)):
+    """410 Gone — gate_config_audit table dropped in migration 024."""
+    raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE["detail"])
 
 
 # ---------------------------------------------------------------------------
