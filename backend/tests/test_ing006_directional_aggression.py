@@ -62,11 +62,21 @@ QA-Q2 notes:
   - Passive-only episode at $60k raw against T1 DTE<=7 floor ($50k) ->
     weighted=$30k < $50k -> DROPS (weighted is below floor, not at it)
   - Boundary: aggressive-only at exactly floor -> passes
+
+QA-SENTIMENT (2026-05-09): classify_sentiment() 10-row decision table tests.
+  Added TestClassifySentiment covering all rows of the decision table agreed
+  in the REARCH session. Closes the outstanding test checkbox in PR #117.
+  Key cases verified:
+    - ASK-side fills: sentiment follows contract type (buyer initiating)
+    - BID-side fills: sentiment is INVERSE of contract type (seller writing)
+    - MID fills: ambiguous, fallback to contract type
+    - Edge cases: unknown ba_class, empty/None ctype, synthetic quote path,
+      case-insensitive normalisation.
 """
 import asyncio
 from datetime import datetime, timezone
 
-from parsers.bid_ask_classifier import classify_bid_ask, is_directionally_aggressive
+from parsers.bid_ask_classifier import classify_bid_ask, classify_sentiment, is_directionally_aggressive
 from signals.repetition_accumulator import (
     RepetitionAccumulator,
     RepetitionEpisode,
@@ -178,6 +188,193 @@ class TestClassifyBidAsk:
         assert classify_bid_ask(mid, bid, ask) == "MID"
         assert classify_bid_ask(1.026, bid, ask) == "AT_ASK"
         assert classify_bid_ask(1.024, bid, ask) == "AT_BID"
+
+
+# ---------------------------------------------------------------------------
+# QA-SENTIMENT (2026-05-09): classify_sentiment() 10-row decision table
+# ---------------------------------------------------------------------------
+
+class TestClassifySentiment:
+    """
+    QA-SENTIMENT (2026-05-09) — classify_sentiment() 10-row decision table.
+
+    Decision table (agreed in REARCH session 2026-05-09):
+
+      Row  | bid_ask_class | contract_type | sentiment | Rationale
+      -----+---------------+---------------+-----------+----------------------------------
+      S-1  | ABOVE_ASK     | CALL          | BULLISH   | Urgent buyer paying up for calls
+      S-2  | AT_ASK        | CALL          | BULLISH   | Initiating long call position
+      S-3  | ABOVE_ASK     | PUT           | BEARISH   | Urgent buyer paying up for puts
+      S-4  | AT_ASK        | PUT           | BEARISH   | Initiating downside protection
+      S-5  | AT_BID        | CALL          | BEARISH   | Writing/closing calls, short gamma
+      S-6  | BELOW_BID     | CALL          | BEARISH   | Desperate call seller, strong short
+      S-7  | AT_BID        | PUT           | BULLISH   | Selling puts at bid, floor view
+      S-8  | BELOW_BID     | PUT           | BULLISH   | Aggressive put seller, floor conviction
+      S-9  | MID           | CALL          | BULLISH   | Ambiguous, fallback to contract type
+      S-10 | MID           | PUT           | BEARISH   | Ambiguous, fallback to contract type
+
+    The key inversion: BID-side fills (AT_BID, BELOW_BID) flip the sentiment
+    relative to contract type because the fill is seller-initiated, not
+    buyer-initiated. A CALL seller is bearish; a PUT seller is bullish.
+    """
+
+    # ------------------------------------------------------------------
+    # ASK-side: buyer initiating — sentiment follows contract type
+    # ------------------------------------------------------------------
+
+    def test_s1_above_ask_call_bullish(self):
+        """S-1: ABOVE_ASK + CALL -> BULLISH (urgent buyer paying up for calls)."""
+        assert classify_sentiment("ABOVE_ASK", "CALL") == "BULLISH"
+
+    def test_s2_at_ask_call_bullish(self):
+        """S-2: AT_ASK + CALL -> BULLISH (initiating long call)."""
+        assert classify_sentiment("AT_ASK", "CALL") == "BULLISH"
+
+    def test_s3_above_ask_put_bearish(self):
+        """S-3: ABOVE_ASK + PUT -> BEARISH (urgent buyer paying up for puts)."""
+        assert classify_sentiment("ABOVE_ASK", "PUT") == "BEARISH"
+
+    def test_s4_at_ask_put_bearish(self):
+        """S-4: AT_ASK + PUT -> BEARISH (initiating downside protection)."""
+        assert classify_sentiment("AT_ASK", "PUT") == "BEARISH"
+
+    # ------------------------------------------------------------------
+    # BID-side: seller writing — sentiment is INVERSE of contract type
+    # ------------------------------------------------------------------
+
+    def test_s5_at_bid_call_bearish(self):
+        """
+        S-5: AT_BID + CALL -> BEARISH (call seller writing at bid = short gamma).
+
+        This is the primary inversion case that the old naive logic got wrong:
+        old logic returned BULLISH (because CALL -> BULLISH), but a call seller
+        at the bid is expressing a bearish/neutral view — willing to cap upside
+        by writing calls. classify_sentiment() correctly returns BEARISH.
+        """
+        assert classify_sentiment("AT_BID", "CALL") == "BEARISH"
+
+    def test_s6_below_bid_call_bearish(self):
+        """
+        S-6: BELOW_BID + CALL -> BEARISH (desperate call seller, strong short signal).
+
+        Symmetric to S-5 but more aggressive: selling calls below the bid
+        means the writer is motivated to exit or establish a short position
+        urgently. Strongly bearish signal.
+        """
+        assert classify_sentiment("BELOW_BID", "CALL") == "BEARISH"
+
+    def test_s7_at_bid_put_bullish(self):
+        """
+        S-7: AT_BID + PUT -> BULLISH (selling puts at bid = floor conviction).
+
+        The old naive logic returned BEARISH (because PUT -> BEARISH), but a
+        put seller at the bid is expressing a bullish/floor view — agreeing to
+        buy the underlying at the strike price. classify_sentiment() correctly
+        returns BULLISH, reversing the old misclassification.
+        """
+        assert classify_sentiment("AT_BID", "PUT") == "BULLISH"
+
+    def test_s8_below_bid_put_bullish(self):
+        """
+        S-8: BELOW_BID + PUT -> BULLISH (aggressive put seller, floor conviction).
+
+        Symmetric to S-7 but more aggressive: selling puts below the bid
+        signals strong conviction that the underlying will hold above the strike.
+        Confirmed bullish sentiment.
+        """
+        assert classify_sentiment("BELOW_BID", "PUT") == "BULLISH"
+
+    # ------------------------------------------------------------------
+    # MID: ambiguous execution — fallback to contract type
+    # ------------------------------------------------------------------
+
+    def test_s9_mid_call_bullish(self):
+        """
+        S-9: MID + CALL -> BULLISH (ambiguous, fallback to contract type).
+
+        A mid-spread fill cannot determine buyer vs seller, so sentiment
+        defaults to what the contract type alone implies: CALL = BULLISH.
+        """
+        assert classify_sentiment("MID", "CALL") == "BULLISH"
+
+    def test_s10_mid_put_bearish(self):
+        """
+        S-10: MID + PUT -> BEARISH (ambiguous, fallback to contract type).
+
+        Symmetric to S-9. MID fill on a PUT defaults to BEARISH via
+        the contract-type fallback path.
+        """
+        assert classify_sentiment("MID", "PUT") == "BEARISH"
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    def test_unknown_ba_class_falls_back_to_contract_type(self):
+        """
+        Unknown / unrecognised bid_ask_class -> falls back to contract type.
+
+        An unrecognised value (e.g. 'UNKNOWN', '') is treated the same as
+        MID: no fill-placement signal available, so sentiment follows ctype.
+        """
+        assert classify_sentiment("UNKNOWN", "CALL") == "BULLISH"
+        assert classify_sentiment("UNKNOWN", "PUT") == "BEARISH"
+        assert classify_sentiment("", "CALL") == "BULLISH"
+        assert classify_sentiment("", "PUT") == "BEARISH"
+
+    def test_empty_contract_type_defaults_to_bearish(self):
+        """
+        Empty/None contract_type: ctype resolves to '' which is not 'CALL',
+        so the BULLISH branch is never taken -> returns BEARISH.
+
+        This is consistent with the conservative default: when we cannot
+        confirm a CALL, we do not label the flow BULLISH.
+        ASK-side: ba in (ABOVE_ASK, AT_ASK) -> return BULLISH if ctype=='CALL' else BEARISH
+          With ctype='': returns BEARISH.
+        BID-side: ba in (AT_BID, BELOW_BID) -> return BEARISH if ctype=='CALL' else BULLISH
+          With ctype='': returns BULLISH.
+        MID/unknown: return BULLISH if ctype=='CALL' else BEARISH
+          With ctype='': returns BEARISH.
+        """
+        # ASK-side with empty ctype -> BEARISH (not CALL, so not BULLISH)
+        assert classify_sentiment("AT_ASK", "") == "BEARISH"
+        assert classify_sentiment("ABOVE_ASK", None) == "BEARISH"  # type: ignore[arg-type]
+        # BID-side with empty ctype -> BULLISH (not CALL, so not BEARISH)
+        assert classify_sentiment("AT_BID", "") == "BULLISH"
+        assert classify_sentiment("BELOW_BID", None) == "BULLISH"  # type: ignore[arg-type]
+
+    def test_synthetic_quote_mid_fallback(self):
+        """
+        Synthetic quote path: bid=ask=0 forces classify_bid_ask() to return MID.
+        classify_sentiment('MID', ctype) then falls back to contract type.
+
+        This test verifies the synthetic quote path end-to-end:
+          bid=0, ask=0, fill=0 -> classify_bid_ask -> MID
+          classify_sentiment(MID, CALL) -> BULLISH
+          classify_sentiment(MID, PUT)  -> BEARISH
+        """
+        ba_class = classify_bid_ask(0.0, 0.0, 0.0)
+        assert ba_class == "MID", (
+            f"Synthetic quote (bid=ask=0) must produce MID, got {ba_class}"
+        )
+        assert classify_sentiment(ba_class, "CALL") == "BULLISH"
+        assert classify_sentiment(ba_class, "PUT") == "BEARISH"
+
+    def test_case_insensitive_normalisation(self):
+        """
+        Inputs are normalised to upper — lowercase or mixed-case should work.
+        """
+        assert classify_sentiment("at_ask", "call") == "BULLISH"
+        assert classify_sentiment("AT_BID", "put") == "BULLISH"
+        assert classify_sentiment("below_bid", "CALL") == "BEARISH"
+        assert classify_sentiment("Mid", "Put") == "BEARISH"
+
+    def test_none_inputs_safe(self):
+        """None inputs should not raise — treated as empty strings."""
+        # None ba_class -> '' -> not ASK or BID side -> MID fallback -> ctype
+        # None ctype -> '' -> not CALL -> BEARISH
+        result = classify_sentiment(None, None)  # type: ignore[arg-type]
+        assert result == "BEARISH"
 
 
 # ---------------------------------------------------------------------------
