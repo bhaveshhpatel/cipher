@@ -4,11 +4,16 @@ history.py — Signal history endpoint.
 Phase 4: Queries signal_history table from Supabase with full
 pagination and filter support.
 
+Rearch-010 (2026-05-09): Removed flow_score, backtest_score,
+volume_premium_factor, and influence_tier — all four columns were dropped
+from signal_history in migration 024. Removed _VALID_TIERS, _TIER_TO_DB,
+and the ?tier= query param (PostgREST would 400 filtering on a dropped
+column). composite_score is the sole score surface.
+
 Endpoints:
   GET /api/signals/history
     ?ticker=AAPL
     &direction=bullish          # bullish | bearish | neutral
-    &tier=whale                 # whale | institutional | large | retail
     &min_conviction=0.65
     &limit=50
     &offset=0
@@ -29,36 +34,24 @@ _SUPABASE_URL = os.environ.get("SUPABASE_URL")
 _SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # anon key — SELECT only
 
 _VALID_DIRECTIONS = {"bullish", "bearish", "neutral"}
-_VALID_TIERS      = {"whale", "institutional", "large", "retail"}
 
 # Map frontend direction names to DB recommendation values
 _DIR_TO_REC = {"bullish": "BUY", "bearish": "SELL", "neutral": "HOLD"}
-# Map tier names to DB influence_tier values
-_TIER_TO_DB = {
-    "whale":         "WHALE",
-    "institutional": "INSTITUTIONAL",
-    "large":         "LARGE",
-    "retail":        "RETAIL",
-}
 
 
 class SignalHistoryItem(BaseModel):
-    id:                     int
-    ticker:                 str
-    recommendation:         str
-    composite_score:        float
-    flow_score:             float
-    backtest_score:         float
-    volume_premium_factor:  float
-    reasoning:              Optional[str]  = None
-    contract_type:          Optional[str]  = None
-    direction:              Optional[str]  = None
-    influence_tier:         Optional[str]  = None
-    total_premium:          Optional[float] = None
-    trade_count:            Optional[int]  = None
-    is_accelerating:        bool           = False
-    signal_ts:              Optional[str]  = None
-    created_at:             str
+    id:               int
+    ticker:           str
+    recommendation:   str
+    composite_score:  float
+    reasoning:        Optional[str]  = None
+    contract_type:    Optional[str]  = None
+    direction:        Optional[str]  = None
+    total_premium:    Optional[float] = None
+    trade_count:      Optional[int]  = None
+    is_accelerating:  bool           = False
+    signal_ts:        Optional[str]  = None
+    created_at:       str
 
 
 class HistoryResponse(BaseModel):
@@ -80,7 +73,6 @@ def _headers() -> dict:
 async def _query_signal_history(
     ticker:         Optional[str],
     recommendation: Optional[str],
-    influence_tier: Optional[str],
     min_conviction: float,
     limit:          int,
     offset:         int,
@@ -91,9 +83,8 @@ async def _query_signal_history(
 
     url = f"{_SUPABASE_URL}/rest/v1/signal_history"
     params: dict = {
-        "select": "id,ticker,recommendation,composite_score,flow_score,backtest_score,"
-                  "volume_premium_factor,reasoning,contract_type,direction,influence_tier,"
-                  "total_premium,trade_count,is_accelerating,signal_ts,created_at",
+        "select": "id,ticker,recommendation,composite_score,reasoning,contract_type,"
+                  "direction,total_premium,trade_count,is_accelerating,signal_ts,created_at",
         "order":  "created_at.desc",
         "limit":  str(limit),
         "offset": str(offset),
@@ -103,8 +94,6 @@ async def _query_signal_history(
         params["ticker"] = f"eq.{ticker}"
     if recommendation:
         params["recommendation"] = f"eq.{recommendation}"
-    if influence_tier:
-        params["influence_tier"] = f"eq.{influence_tier}"
     if min_conviction > 0.0:
         params["composite_score"] = f"gte.{min_conviction}"
 
@@ -138,7 +127,6 @@ async def _query_signal_history(
 async def get_signal_history(
     ticker:         Optional[str]   = Query(default=None, min_length=1, max_length=10, description="Filter by ticker"),
     direction:      Optional[str]   = Query(default=None, description="bullish | bearish | neutral"),
-    tier:           Optional[str]   = Query(default=None, description="whale | institutional | large | retail"),
     min_conviction: float           = Query(default=0.0,  ge=0.0, le=1.0, description="Minimum composite_score"),
     limit:          int             = Query(default=50,   ge=1,   le=200,  description="Max rows to return"),
     offset:         int             = Query(default=0,    ge=0,            description="Pagination offset"),
@@ -150,17 +138,13 @@ async def get_signal_history(
     """
     if direction and direction.lower() not in _VALID_DIRECTIONS:
         raise HTTPException(status_code=422, detail=f"direction must be one of: {sorted(_VALID_DIRECTIONS)}")
-    if tier and tier.lower() not in _VALID_TIERS:
-        raise HTTPException(status_code=422, detail=f"tier must be one of: {sorted(_VALID_TIERS)}")
 
-    ticker_clean  = ticker.upper().strip() if ticker else None
-    rec_filter    = _DIR_TO_REC.get(direction.lower()) if direction else None
-    tier_filter   = _TIER_TO_DB.get(tier.lower()) if tier else None
+    ticker_clean = ticker.upper().strip() if ticker else None
+    rec_filter   = _DIR_TO_REC.get(direction.lower()) if direction else None
 
     rows, total = await _query_signal_history(
         ticker         = ticker_clean,
         recommendation = rec_filter,
-        influence_tier = tier_filter,
         min_conviction = min_conviction,
         limit          = limit,
         offset         = offset,
@@ -170,22 +154,18 @@ async def get_signal_history(
     for r in rows:
         try:
             signals.append(SignalHistoryItem(
-                id                    = r["id"],
-                ticker                = r["ticker"],
-                recommendation        = r["recommendation"],
-                composite_score       = float(r["composite_score"]),
-                flow_score            = float(r["flow_score"]),
-                backtest_score        = float(r["backtest_score"]),
-                volume_premium_factor = float(r.get("volume_premium_factor") or 0.5),
-                reasoning             = r.get("reasoning"),
-                contract_type         = r.get("contract_type"),
-                direction             = r.get("direction"),
-                influence_tier        = r.get("influence_tier"),
-                total_premium         = float(r["total_premium"]) if r.get("total_premium") is not None else None,
-                trade_count           = r.get("trade_count"),
-                is_accelerating       = bool(r.get("is_accelerating", False)),
-                signal_ts             = r.get("signal_ts"),
-                created_at            = r["created_at"],
+                id              = r["id"],
+                ticker          = r["ticker"],
+                recommendation  = r["recommendation"],
+                composite_score = float(r["composite_score"]),
+                reasoning       = r.get("reasoning"),
+                contract_type   = r.get("contract_type"),
+                direction       = r.get("direction"),
+                total_premium   = float(r["total_premium"]) if r.get("total_premium") is not None else None,
+                trade_count     = r.get("trade_count"),
+                is_accelerating = bool(r.get("is_accelerating", False)),
+                signal_ts       = r.get("signal_ts"),
+                created_at      = r["created_at"],
             ))
         except Exception as e:
             log.warning(f"[history] row parse error: {e} — row={r}")

@@ -15,15 +15,16 @@ B3-001: StatsOut(**get_stats()) replaced with explicit .get() extraction
 B3-002: SUPABASE_KEY replaced with SUPABASE_SERVICE_ROLE_KEY preference
   so DB queries bypass RLS and actually return rows.
 
-Rearch-010 (2026-05-09): Removed influence_tier from /list endpoint and
-  _fetch_from_db() — column dropped in migration 024. Removed _VALID_TIERS
-  and _TIER_TO_DB mappings.
+Rearch-010 (2026-05-09): Removed influence_tier, flow_score, backtest_score,
+  and volume_premium_factor from all DB select params, CompositeOut model,
+  _row_to_composite(), and _mock_composite(). All four columns were dropped
+  from signal_history in migration 024. composite_score + reasoning are the
+  retained signal surfaces.
 """
 from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from core.auth import get_current_user, TokenData
-from signals.backtest_validator import get_backtest_score
 from services.tradier_stream import get_stats
 import os
 import logging
@@ -46,13 +47,10 @@ _DIR_TO_REC       = {"bullish": "BUY", "bearish": "SELL", "neutral": "HOLD"}
 
 
 class CompositeOut(BaseModel):
-    ticker:                 str
-    recommendation:         str
-    composite_score:        float
-    flow_score:             float
-    backtest_score:         float
-    volume_premium_factor:  float = 0.5
-    reasoning:              str
+    ticker:          str
+    recommendation:  str
+    composite_score: float
+    reasoning:       str
 
 
 class SignalsListResponse(BaseModel):
@@ -98,7 +96,7 @@ async def _fetch_from_db(
         return [], 0
     url = f"{_SUPABASE_URL}/rest/v1/signal_history"
     params: dict = {
-        "select": "ticker,recommendation,composite_score,flow_score,backtest_score,volume_premium_factor,reasoning",
+        "select": "ticker,recommendation,composite_score,reasoning",
         "order":  "created_at.desc",
         "limit":  str(limit),
         "offset": str(offset),
@@ -108,7 +106,7 @@ async def _fetch_from_db(
     if min_conviction > 0.0:
         params["composite_score"] = f"gte.{min_conviction}"
     try:
-    	async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(url, headers=_db_headers(), params=params)
         if resp.status_code not in (200, 206):
             log.warning(f"[smart_signals] DB list query failed: {resp.status_code}")
@@ -133,7 +131,7 @@ async def _fetch_ticker_from_db(ticker: str) -> Optional[dict]:
         return None
     url = f"{_SUPABASE_URL}/rest/v1/signal_history"
     params = {
-        "select": "ticker,recommendation,composite_score,flow_score,backtest_score,volume_premium_factor,reasoning",
+        "select": "ticker,recommendation,composite_score,reasoning",
         "ticker": f"eq.{ticker}",
         "order":  "created_at.desc",
         "limit":  "1",
@@ -153,42 +151,26 @@ async def _fetch_ticker_from_db(ticker: str) -> Optional[dict]:
 # Mock fallback (used when DB has no data yet)
 # ---------------------------------------------------------------------------
 def _mock_composite(ticker: str) -> CompositeOut:
-    rng    = random.Random(hash(ticker) % 88888)
-    flow_s = round(rng.uniform(0.35, 0.92), 3)
-    bt_s   = get_backtest_score(
-        ticker,
-        rng.choice(["CALL", "PUT"]),
-        rng.choice([14, 30, 60]),
-        "INSTITUTIONAL",
-    )
-    vwp_f = round(rng.uniform(0.3, 0.85), 3)
-    comp  = round(flow_s * 0.55 + bt_s * 0.35 + vwp_f * 0.10, 3)
-    rec   = "BUY" if comp >= 0.65 else ("SELL" if comp <= 0.35 else "HOLD")
+    rng   = random.Random(hash(ticker) % 88888)
+    score = round(rng.uniform(0.35, 0.92), 3)
+    rec   = "BUY" if score >= 0.65 else ("SELL" if score <= 0.35 else "HOLD")
     return CompositeOut(
-        ticker                = ticker,
-        recommendation        = rec,
-        composite_score       = comp,
-        flow_score            = flow_s,
-        backtest_score        = bt_s,
-        volume_premium_factor = vwp_f,
+        ticker          = ticker,
+        recommendation  = rec,
+        composite_score = score,
         reasoning=(
             f"Composite analysis for {ticker}: "
-            f"flow score {flow_s:.0%}, backtest win-rate {bt_s:.0%}, "
-            f"volume-premium factor {vwp_f:.0%}. "
-            f"Combined score {comp:.0%} suggests {rec}."
+            f"combined score {score:.0%} suggests {rec}."
         ),
     )
 
 
 def _row_to_composite(r: dict) -> CompositeOut:
     return CompositeOut(
-        ticker                = r["ticker"],
-        recommendation        = r["recommendation"],
-        composite_score       = float(r["composite_score"]),
-        flow_score            = float(r["flow_score"]),
-        backtest_score        = float(r["backtest_score"]),
-        volume_premium_factor = float(r.get("volume_premium_factor") or 0.5),
-        reasoning             = r.get("reasoning") or "",
+        ticker          = r["ticker"],
+        recommendation  = r["recommendation"],
+        composite_score = float(r["composite_score"]),
+        reasoning       = r.get("reasoning") or "",
     )
 
 
@@ -282,8 +264,6 @@ async def list_signals(
 @router.get("/stream/stats", response_model=StatsResponse)
 async def stream_stats(_: TokenData = Depends(get_current_user)):
     # B3-001: explicit .get() extraction — never passes unknown keys to StatsOut
-    # get_stats() returns many extra fields (deduped, reconnects, mode, timestamps,
-    # uptime_seconds, dedup counters); StatsOut only exposes the 5-field public contract.
     s = get_stats()
     return StatsResponse(stats=StatsOut(
         active_symbols = s.get("active_symbols", 0),
