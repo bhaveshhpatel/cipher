@@ -1,10 +1,14 @@
 """
 signal_store.py — Supabase DB writer for composite signals.
 
-Phase 5A changes:
-  - _build_row() now persists swarm fields:
-    swarm_direction, swarm_confidence, swarm_agents (JSONB),
-    swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
+Rearch-010 (2026-05-09):
+  - Removed swarm fields from _build_row(): swarm_direction, swarm_confidence,
+    swarm_agents, swarm_bull_votes, swarm_bear_votes, swarm_hold_votes
+    (columns dropped in migration 024).
+  - Removed influence_tier from _build_row() (column dropped in migration 024).
+  - Removed is_golden_sweep from _build_row() (column dropped in migration 024).
+  - Removed _normalise_influence_tier() helper (no longer called).
+  - Stripped swarm interpolation from persist_composite_signal log line.
 
 Fix 3 (2026-04-26):
   - _signal_memory is now a collections.deque(maxlen=1000) to prevent
@@ -95,7 +99,6 @@ _TABLE = "signal_history"
 # Update here if and only if the corresponding migration alters the constraint.
 _VALID_DIRECTIONS   = {"BUY", "SELL", "HOLD"}
 _VALID_TRADE_TYPES  = {"SWEEP", "BLOCK", "SPLIT", "SINGLE"}
-_VALID_TIERS        = {"WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}
 _VALID_SENTIMENTS   = {"BULLISH", "BEARISH", "NEUTRAL"}                              # signal_feed_log_sentiment_check
 _VALID_ALERT_LEVELS = {"CONVICTION", "WHALE", "INSTITUTIONAL", "LARGE", "RETAIL"}   # signal_feed_log_alert_level_check (Fix 7)
 
@@ -210,13 +213,6 @@ def _normalise_trade_type(raw: str) -> str:
     return lower if lower in ("sweep", "block", "split", "single") else "single"
 
 
-def _normalise_influence_tier(raw: str) -> str:
-    if not raw:
-        return "RETAIL"
-    upper = raw.upper()
-    return upper if upper in _VALID_TIERS else "RETAIL"
-
-
 def _normalise_sentiment(raw: str) -> str:
     """
     Normalise raw sentiment to a value accepted by signal_feed_log_sentiment_check.
@@ -324,12 +320,9 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     else:
         sentiment = "NEUTRAL"
 
-    direction      = _db_direction(raw_dir)
-    trade_type     = _db_trade_type(
+    direction  = _db_direction(raw_dir)
+    trade_type = _db_trade_type(
         episode.get("trade_type") or sig.get("trade_type", "")
-    )
-    influence_tier = _normalise_influence_tier(
-        episode.get("influence_tier") or sig.get("influence_tier", "")
     )
 
     # QA-3 note: is_multi_day_repeat (ING-007) is intentionally NOT included here.
@@ -351,21 +344,11 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
         "sentiment":             sentiment,
         "premium":               episode.get("total_premium") or sig.get("total_premium") or 0,
         "trade_type":            trade_type,
-        "influence_tier":        influence_tier,
-        "is_golden_sweep":       bool(
-            episode.get("is_golden_sweep") or sig.get("is_golden_sweep", False)
-        ),
         "contract_type":         ctype or None,
         "total_premium":         episode.get("total_premium"),
         "trade_count":           episode.get("trade_count"),
         "is_accelerating":       episode.get("is_accelerating", False),
         "signal_ts":             episode.get("timestamp"),
-        "swarm_direction":       sig.get("swarm_direction"),
-        "swarm_confidence":      sig.get("swarm_confidence"),
-        "swarm_bull_votes":      sig.get("swarm_bull_votes"),
-        "swarm_bear_votes":      sig.get("swarm_bear_votes"),
-        "swarm_hold_votes":      sig.get("swarm_hold_votes"),
-        "swarm_agents":          sig.get("swarm_agents"),
     }
 
 
@@ -436,23 +419,15 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
     row = _build_row(sig, ep)
     ok  = await _insert_signal_with_retry(row)
     if ok:
-        premium_val  = row["premium"]
-        premium_fmt  = "${:,.0f}".format(premium_val) if premium_val else "$0"
-        golden_sweep = row["is_golden_sweep"]
-        golden_tag   = " \u26a1 GOLDEN SWEEP" if golden_sweep else ""
-        swarm_dir    = row["swarm_direction"] or "--"
-        bull         = row["swarm_bull_votes"]
-        bear         = row["swarm_bear_votes"]
-        hold         = row["swarm_hold_votes"]
+        premium_val = row["premium"]
+        premium_fmt = "${:,.0f}".format(premium_val) if premium_val else "$0"
         log.info(
             "[signal_store] DB INSERT OK | "
             "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
-            "sentiment=%s | tier=%s | type=%s | premium=%s | "
-            "swarm=%s (%sB/%sBe/%sH)%s",
+            "sentiment=%s | type=%s | premium=%s",
             row["ticker"], row["recommendation"], row["direction"],
             row["composite_score"], row["flow_score"], row["alert_level"],
-            row["sentiment"], row["influence_tier"], row["trade_type"],
-            premium_fmt, swarm_dir, bull, bear, hold, golden_tag,
+            row["sentiment"], row["trade_type"], premium_fmt,
         )
     else:
         log.warning(

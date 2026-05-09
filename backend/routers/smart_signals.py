@@ -14,6 +14,10 @@ B3-001: StatsOut(**get_stats()) replaced with explicit .get() extraction
 
 B3-002: SUPABASE_KEY replaced with SUPABASE_SERVICE_ROLE_KEY preference
   so DB queries bypass RLS and actually return rows.
+
+Rearch-010 (2026-05-09): Removed influence_tier from /list endpoint and
+  _fetch_from_db() — column dropped in migration 024. Removed _VALID_TIERS
+  and _TIER_TO_DB mappings.
 """
 from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from pydantic import BaseModel
@@ -38,14 +42,7 @@ _SUPABASE_KEY = (
 )
 
 _VALID_DIRECTIONS = {"bullish", "bearish", "neutral"}
-_VALID_TIERS      = {"whale", "institutional", "large", "retail"}
 _DIR_TO_REC       = {"bullish": "BUY", "bearish": "SELL", "neutral": "HOLD"}
-_TIER_TO_DB       = {
-    "whale":         "WHALE",
-    "institutional": "INSTITUTIONAL",
-    "large":         "LARGE",
-    "retail":        "RETAIL",
-}
 
 
 class CompositeOut(BaseModel):
@@ -92,7 +89,6 @@ def _db_headers() -> dict:
 
 async def _fetch_from_db(
     recommendation: Optional[str] = None,
-    influence_tier: Optional[str] = None,
     min_conviction: float = 0.0,
     limit: int = 100,
     offset: int = 0,
@@ -109,12 +105,10 @@ async def _fetch_from_db(
     }
     if recommendation:
         params["recommendation"] = f"eq.{recommendation}"
-    if influence_tier:
-        params["influence_tier"] = f"eq.{influence_tier}"
     if min_conviction > 0.0:
         params["composite_score"] = f"gte.{min_conviction}"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+    	async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(url, headers=_db_headers(), params=params)
         if resp.status_code not in (200, 206):
             log.warning(f"[smart_signals] DB list query failed: {resp.status_code}")
@@ -225,7 +219,6 @@ async def list_signals(
     page:           int            = Query(default=1,   ge=1,          description="Page number (1-indexed)"),
     page_size:      int            = Query(default=20,  ge=1,  le=100, description="Results per page"),
     direction:      Optional[str]  = Query(default=None, description="bullish | bearish | neutral"),
-    tier:           Optional[str]  = Query(default=None, description="whale | institutional | large | retail"),
     min_conviction: float          = Query(default=0.0, ge=0.0, le=1.0, description="Minimum composite_score"),
     _: TokenData = Depends(get_current_user),
 ):
@@ -236,16 +229,12 @@ async def list_signals(
     """
     if direction and direction.lower() not in _VALID_DIRECTIONS:
         raise HTTPException(status_code=422, detail=f"direction must be one of: {sorted(_VALID_DIRECTIONS)}")
-    if tier and tier.lower() not in _VALID_TIERS:
-        raise HTTPException(status_code=422, detail=f"tier must be one of: {sorted(_VALID_TIERS)}")
 
-    rec_filter  = _DIR_TO_REC.get(direction.lower()) if direction else None
-    tier_filter = _TIER_TO_DB.get(tier.lower()) if tier else None
-    offset      = (page - 1) * page_size
+    rec_filter = _DIR_TO_REC.get(direction.lower()) if direction else None
+    offset     = (page - 1) * page_size
 
     rows, total = await _fetch_from_db(
         recommendation = rec_filter,
-        influence_tier = tier_filter,
         min_conviction = min_conviction,
         limit          = page_size,
         offset         = offset,
