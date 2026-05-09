@@ -2,6 +2,11 @@
 signal_store.py — Supabase DB writer for composite signals.
 
 Rearch-010 (2026-05-09) — schema purge pass 2:
+  - Removed flow_score from _build_row() (column dropped in migration 024;
+    was a write-only orphan — never read by any SELECT in any router or service).
+    composite_score is now the sole score surface per REARCH-010.
+  - Removed flow=%.3f log interpolation from persist_composite_signal() log
+    line to match (would have raised KeyError post-migration).
   - Removed backtest_score from _build_row() (column retired, not in signal_history).
   - Removed volume_premium_factor from _build_row() (column dropped in migration 024).
   - Updated _VALID_ALERT_LEVELS to REARCH vocab: WATCH | NOTEWORTHY | BLOCK | GOLDEN
@@ -345,13 +350,15 @@ def _build_row(sig, ep: Optional[dict] = None) -> dict:
     # to this return dict after the column migration lands.
     #
     # Rearch-010 removed columns (DO NOT re-add without a corresponding migration):
-    #   backtest_score       — column retired, never existed in signal_history schema
+    #   backtest_score        — column retired, never existed in signal_history schema
     #   volume_premium_factor — dropped in migration 024
+    #   flow_score            — dropped in migration 024 Section 6; write-only orphan
+    #                           (written here, read by nothing). composite_score is
+    #                           the sole score surface per REARCH-010.
     return {
         "ticker":          sig.get("ticker"),
         "recommendation":  sig.get("recommendation"),
         "composite_score": sig.get("composite_score"),
-        "flow_score":      sig.get("flow_score"),
         "reasoning":       sig.get("reasoning"),
         "alert_level":     alert_level,
         "direction":       direction,
@@ -437,10 +444,10 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
         premium_fmt = "${:,.0f}".format(premium_val) if premium_val else "$0"
         log.info(
             "[signal_store] DB INSERT OK | "
-            "%s | %s | dir=%s | score=%.3f | flow=%.3f | alert=%s | "
+            "%s | %s | dir=%s | score=%.3f | alert=%s | "
             "sentiment=%s | type=%s | premium=%s",
             row["ticker"], row["recommendation"], row["direction"],
-            row["composite_score"], row["flow_score"], row["alert_level"],
+            row["composite_score"], row["alert_level"],
             row["sentiment"], row["trade_type"], premium_fmt,
         )
     else:
