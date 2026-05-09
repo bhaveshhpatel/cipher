@@ -11,7 +11,7 @@
 -- ⚠️  READ BEFORE APPLYING TO PROD:
 --   1. Confirm signal_history backfill mappings with PBE (see issue #111 deliberations)
 --   2. Confirm API endpoints no longer SELECT retired columns (REARCH-010 AC #3)
---   3. Confirm backend Python sweep is clean (no swarm_*, conviction_score, etc.)
+--   3. Confirm backend Python sweep is clean (no swarm_*, conviction_score, flow_score, etc.)
 --   4. Run EXPLAIN on the backfill UPDATE — 28,504 rows, fast but worth checking.
 --   5. Apply during low-traffic window; flow_events DROP COLUMN locks table briefly.
 -- =============================================================================
@@ -30,6 +30,13 @@ BEGIN;
 --   LARGE      → NOTEWORTHY
 --   RETAIL     → WATCH
 -- Any rows with NULL or unrecognised values are set to WATCH (safe default).
+--
+-- ⚠️  GOLDEN cannot be retroactively assigned: doing so would require
+--     re-computing all 5 Steamroom dimensions (ask_side_pct, vol>OI,
+--     premium tier, DTE bucket, trade_count gate) against historical
+--     flow_events. BLOCK is the safe-maximum for pre-REARCH rows.
+--     If historical GOLDEN attribution is ever needed, file a dedicated
+--     REARCH-006 backfill task — it does not belong in this migration.
 -- =============================================================================
 
 UPDATE signal_history
@@ -99,7 +106,14 @@ ALTER TABLE flow_episodes
 
 -- =============================================================================
 -- SECTION 6: DROP deprecated columns — signal_history
--- 6 swarm columns + volume_premium_factor + influence_tier = 8 drops.
+-- 6 swarm columns + volume_premium_factor + influence_tier + flow_score = 9 drops.
+--
+-- flow_score added here (D1 fix): composite_score is the sole score surface
+-- per REARCH-010. flow_score was still being written by signal_store._build_row()
+-- but read by no SELECT in any router or service — making it a write-only orphan.
+-- Retire it here alongside the other pre-REARCH columns.
+-- companion Python change: remove flow_score key from signal_store._build_row()
+-- return dict (tracked in this same PR commit).
 -- =============================================================================
 
 ALTER TABLE signal_history
@@ -110,7 +124,8 @@ ALTER TABLE signal_history
     DROP COLUMN IF EXISTS swarm_bear_votes,
     DROP COLUMN IF EXISTS swarm_hold_votes,
     DROP COLUMN IF EXISTS volume_premium_factor,
-    DROP COLUMN IF EXISTS influence_tier;
+    DROP COLUMN IF EXISTS influence_tier,
+    DROP COLUMN IF EXISTS flow_score;
 
 -- =============================================================================
 -- SECTION 7: UPDATE CHECK constraints on signal_history
@@ -290,15 +305,15 @@ BEGIN
         RAISE EXCEPTION 'VALIDATION FAILED: seed_episode column still present on flow_episodes';
     END IF;
 
-    -- Assert: signal_history swarm columns are gone
+    -- Assert: signal_history swarm + legacy score columns are gone (D1 fix: flow_score added)
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name = 'signal_history'
           AND column_name IN ('swarm_direction','swarm_confidence','swarm_agents',
                               'swarm_bull_votes','swarm_bear_votes','swarm_hold_votes',
-                              'volume_premium_factor')
+                              'volume_premium_factor','flow_score')
     ) THEN
-        RAISE EXCEPTION 'VALIDATION FAILED: retired swarm/volume_premium_factor column(s) still present on signal_history';
+        RAISE EXCEPTION 'VALIDATION FAILED: retired swarm/legacy score column(s) still present on signal_history';
     END IF;
 
     -- Assert: no signal_history rows violate the new alert_level constraint
@@ -320,6 +335,11 @@ BEGIN
     -- Assert: new flow_episodes Steamroom columns exist
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'flow_episodes' AND column_name = 'episode_steamroom_score') THEN
         RAISE EXCEPTION 'VALIDATION FAILED: episode_steamroom_score not added to flow_episodes';
+    END IF;
+
+    -- Assert: flow_score is fully retired from signal_history
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'signal_history' AND column_name = 'flow_score') THEN
+        RAISE EXCEPTION 'VALIDATION FAILED: flow_score column still present on signal_history — should have been dropped in Section 6';
     END IF;
 
     RAISE NOTICE 'VALIDATION PASSED: All post-migration assertions satisfied.';
@@ -346,3 +366,7 @@ COMMIT;
 -- Row count sanity:
 -- SELECT COUNT(*), COUNT(episode_steamroom_score) FROM flow_episodes;
 -- SELECT COUNT(*), COUNT(ask_side_pct) FROM signal_history;
+
+-- Verify flow_score is fully retired:
+-- SELECT COUNT(*) FROM signal_history WHERE flow_score IS NOT NULL;  -- should error (column gone)
+-- SELECT column_name FROM information_schema.columns WHERE table_name = 'signal_history' AND column_name = 'flow_score';  -- 0 rows expected
