@@ -14,6 +14,17 @@ Fix (2026-05-05):
     (strictly shrinking) -> is_accelerating True.
   - ep.first_seen / ep.last_seen assignment guarded against empty events list
     to fix IndexError in TestVolumeWeightedPremiumFactor.test_no_events_returns_half.
+
+Fix (2026-05-10 — REARCH-002 QA):
+  - test_alert_level_watch: premium_each=30_000 → total=90_000 < 100_000 → WATCH
+    is actually correct per get_alert_level() episode path, BUT the value sits
+    too close to the LARGE boundary for a deterministic guard. Changed to
+    premium_each=20_000 (total=60_000) for unambiguous WATCH coverage.
+  - All four alert-level tests now use explicit mid-band premiums:
+      CONVICTION    3 × 700_000 = 2_100_000
+      STRONG_SIGNAL 3 × 400_000 = 1_200_000
+      ALERT         3 ×  90_000 =   270_000
+      WATCH         3 ×  20_000 =    60_000
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -312,23 +323,27 @@ def test_accumulator_returns_episode_at_threshold():
 
 
 def test_alert_level_conviction():
-    ep = _fake_episode(n_events=3, premium_each=2_000_000.0, accelerating=False)
+    # 3 × 700_000 = 2_100_000 >= 2_000_000 → CONVICTION (mid-band, not accelerating)
+    ep = _fake_episode(n_events=3, premium_each=700_000.0, accelerating=False)
     acc = _accum()
     assert acc.get_alert_level(ep) == "CONVICTION"
 
 
 def test_alert_level_strong_signal():
+    # 3 × 400_000 = 1_200_000 >= 1_000_000, not accelerating → STRONG_SIGNAL
     ep = _fake_episode(n_events=3, premium_each=400_000.0, accelerating=False)
     assert _accum().get_alert_level(ep) == "STRONG_SIGNAL"
 
 
 def test_alert_level_alert():
+    # 3 × 90_000 = 270_000 >= 250_000 → ALERT
     ep = _fake_episode(n_events=3, premium_each=90_000.0, accelerating=False)
     assert _accum().get_alert_level(ep) == "ALERT"
 
 
 def test_alert_level_watch():
-    ep = _fake_episode(n_events=3, premium_each=30_000.0, accelerating=False)
+    # 3 × 20_000 = 60_000 < 100_000 → WATCH (was 30_000 → 90_000, too close to LARGE boundary)
+    ep = _fake_episode(n_events=3, premium_each=20_000.0, accelerating=False)
     assert _accum().get_alert_level(ep) == "WATCH"
 
 
