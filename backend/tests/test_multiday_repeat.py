@@ -39,6 +39,16 @@ FIX (2026-05-08 ING-008/ING-009):
     call to the fake URL, and captured_rows stayed empty.
     Fix: patch `_insert_rows_with_episode_id` with a fake that accepts the
     5-arg signature and appends the row dict to captured_rows.
+
+FIX (REARCH-002 2026-05-10):
+  Bug F — _ingestion_processor not patched.
+    REARCH-002 wired IngestionProcessor into _process_trade(). Without patching
+    _ingestion_processor, the real processor runs gate checks against a MagicMock
+    ev. Numeric comparisons on MagicMock attributes are non-deterministic and
+    the processor returns None, dropping the tick before build_composite is
+    reached — composite stays None, then composite.score raises AttributeError.
+    Fix: patch "services.tradier_stream._ingestion_processor" with a pass-through
+    mock (process returns ev unchanged) in both process_trade tests.
 """
 import asyncio
 import datetime
@@ -132,6 +142,10 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
+    # REARCH-002: pass-through mock so real gate logic does not run on mock ev.
+    mock_ingestion_processor = MagicMock()
+    mock_ingestion_processor.process = MagicMock(return_value=ev)
+
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
@@ -141,7 +155,8 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
          patch("services.tradier_stream.build_composite", return_value=None), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
          patch("services.tradier_stream._lbc", mock_lbc), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):
+         patch("services.tradier_stream._lbc_fresh", return_value=True), \
+         patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor):
 
         mock_bus.publish_all = AsyncMock()
         mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
@@ -191,6 +206,10 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
+    # REARCH-002: pass-through mock so real gate logic does not run on mock ev.
+    mock_ingestion_processor = MagicMock()
+    mock_ingestion_processor.process = MagicMock(return_value=ev)
+
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
@@ -200,7 +219,8 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
          patch("services.tradier_stream.build_composite", return_value=None), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
          patch("services.tradier_stream._lbc", mock_lbc), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):
+         patch("services.tradier_stream._lbc_fresh", return_value=True), \
+         patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor):
 
         mock_bus.publish_all = AsyncMock(side_effect=lambda m: published.append(m))
         mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
