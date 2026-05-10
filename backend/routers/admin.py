@@ -20,8 +20,10 @@ Endpoints:
 Removed in rearch-010 (migration 024 drops gate_configs + gate_config_audit tables).
 Stubbed as 410 Gone so stale clients get an actionable error:
   GET   /api/admin/gate-config           — 410 Gone
+  POST  /api/admin/gate-config           — 410 Gone
   PATCH /api/admin/gate-config           — 410 Gone
   GET   /api/admin/gate-config/history   — 410 Gone
+  GET   /api/admin/backtest-results      — 410 Gone
 """
 import asyncio
 import logging
@@ -70,7 +72,7 @@ def _require_admin(current_user: TokenData = Depends(get_current_user)) -> Token
 # gate_config_audit tables). Stubbed as 410 Gone so stale clients and any
 # cached API calls get an actionable error rather than a silent 404.
 #
-# TODO(rearch-012): Remove these three 410 stubs once the admin page frontend
+# TODO(rearch-012): Remove these 410 stubs once the admin page frontend
 # no longer calls /gate-config at all. Safe to delete after REARCH-012
 # (admin page overhaul) is merged and smoke-tested.
 # ---------------------------------------------------------------------------
@@ -90,6 +92,12 @@ async def gate_config_get_gone(_: TokenData = Depends(_require_admin)):
     raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE)
 
 
+@router.post("/gate-config", status_code=410, include_in_schema=False)
+async def gate_config_post_gone(_: TokenData = Depends(_require_admin)):
+    """410 Gone — gate_configs table dropped in migration 024."""
+    raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE)
+
+
 @router.patch("/gate-config", status_code=410, include_in_schema=False)
 async def gate_config_patch_gone(_: TokenData = Depends(_require_admin)):
     """410 Gone — gate_configs table dropped in migration 024."""
@@ -100,6 +108,25 @@ async def gate_config_patch_gone(_: TokenData = Depends(_require_admin)):
 async def gate_config_history_gone(_: TokenData = Depends(_require_admin)):
     """410 Gone — gate_config_audit table dropped in migration 024."""
     raise HTTPException(status_code=410, detail=_GATE_CONFIG_GONE)
+
+
+# ---------------------------------------------------------------------------
+# Backtest-results — REMOVED in rearch-010 (migration 024 drops the
+# backtest_results table). Stubbed as 410 Gone.
+#
+# TODO(rearch-012): Remove once frontend no longer calls /backtest-results.
+# ---------------------------------------------------------------------------
+
+_BACKTEST_RESULTS_GONE = (
+    "The backtest-results endpoint has been removed. "
+    "The backtest_results table was dropped in migration 024 (rearch-010)."
+)
+
+
+@router.get("/backtest-results", status_code=410, include_in_schema=False)
+async def backtest_results_gone(_: TokenData = Depends(_require_admin)):
+    """410 Gone — backtest_results table dropped in migration 024."""
+    raise HTTPException(status_code=410, detail=_BACKTEST_RESULTS_GONE)
 
 
 # ---------------------------------------------------------------------------
