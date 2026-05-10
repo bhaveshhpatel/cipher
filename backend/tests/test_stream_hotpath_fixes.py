@@ -1,6 +1,8 @@
 """
 Tests for tradier_stream._process_trade hot-path fixes:
-  - issue #4: persist_flow_event timeout (asyncio.wait_for 2s)
+  - issue #4: persist_flow_event task failure increments _stats['errors']
+              (PBE-BLOCKING-1: persist is fire-and-forget via create_task,
+               not asyncio.wait_for — timeout path no longer exists)
   - issue #5: sweep upgrade double-dispatch guard
   - issue #6: composite_errors counter incremented on build_composite failure,
               separate from generic errors counter
@@ -76,23 +78,34 @@ def _make_sig_ep(ticker="AAPL"):
 
 
 # ---------------------------------------------------------------------------
-# Issue #4: persist_flow_event timeout
+# Issue #4: persist_flow_event task failure increments _stats['errors']
+#
+# PBE-BLOCKING-1 reverted asyncio.wait_for() to create_task() (fire-and-forget).
+# The timeout path no longer exists on the hot path.  The new contract is:
+#   a persist task that RAISES must increment _stats['errors'] via the task's
+#   done callback.  We patch persist_flow_event to raise immediately, then
+#   yield control (asyncio.sleep(0) twice — once to let the task start, once
+#   to let the done-callback fire) before asserting.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_persist_timeout_does_not_block_hotpath():
     """
-    If persist_flow_event hangs beyond _PERSIST_TIMEOUT, _process_trade
-    should catch the TimeoutError, increment _stats['errors'], and return
-    without raising.
+    If the persist_flow_event task raises (simulating a fatal error / timeout
+    inside the coroutine), _process_trade must:
+      - NOT block the caller (returns promptly)
+      - increment _stats['errors'] via the task's done callback
+
+    PBE-BLOCKING-1: persist is fire-and-forget (create_task). The hot path
+    itself never raises; the error is surfaced through the task done callback.
     """
     import services.tradier_stream as ts_mod
 
     ev = _make_ev()
     mock_ep = _make_sig_ep()
 
-    async def slow_persist(_):
-        await asyncio.sleep(10)
+    async def failing_persist(_):
+        raise RuntimeError("simulated persist failure")
 
     errors_before = ts_mod._stats["errors"]
 
@@ -101,10 +114,15 @@ async def test_persist_timeout_does_not_block_hotpath():
          patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
          patch("services.tradier_stream.accumulator.ingest_tick", new_callable=AsyncMock, return_value=mock_ep), \
          patch("services.tradier_stream.accumulator.get_signal", new_callable=AsyncMock, return_value=None), \
-         patch("services.tradier_stream.persist_flow_event", side_effect=slow_persist):
+         patch("services.tradier_stream.persist_flow_event", side_effect=failing_persist):
 
         raw = _make_raw_timesale()
         await ts_mod._process_trade(raw)
+
+        # Yield twice: first iteration starts the task, second lets the
+        # done-callback (which increments _stats["errors"]) execute.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     assert ts_mod._stats["errors"] == errors_before + 1
 
