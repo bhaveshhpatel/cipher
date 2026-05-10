@@ -627,6 +627,11 @@ async def test_insert_rows_with_retry_succeeds_on_second_attempt():
 
 # ---------------------------------------------------------------------------
 # persist_flow_event buffering
+#
+# NOTE (migration 024): is_golden_sweep, influence_tier, conviction_score were
+# dropped from the flow_events table. These keys must NOT appear in ev dicts
+# passed to persist_flow_event() — doing so would cause Supabase to reject the
+# INSERT post-migration. The ev fixtures below are kept clean of those 3 keys.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -640,13 +645,13 @@ async def test_persist_flow_event_not_configured_drops_event():
 @pytest.mark.asyncio
 async def test_persist_flow_event_adds_to_buffer():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "AAPL", "contract_type": "CALL", "strike": 180.0,
         "expiry": "2026-06-20", "dte": 30, "fill_price": 2.35,
         "bid": 2.30, "ask": 2.40, "size": 100, "premium": 23_500.0,
         "trade_type": "BTO", "bid_ask_class": "ASK", "is_aggressive": True,
-        "is_golden_sweep": False, "sentiment": "BULLISH",
-        "influence_tier": "WHALE", "conviction_score": 0.80,
+        "sentiment": "BULLISH",
         "exchange_count": 1, "fill_count": 1, "open_interest": 5000,
         "iv": 0.45, "underlying_price": 175.0, "occ_symbol": "AAPL240620C00180000",
         "is_synthetic_quote": False,
@@ -664,13 +669,13 @@ async def test_persist_flow_event_adds_to_buffer():
 @pytest.mark.asyncio
 async def test_persist_flow_event_early_flush_on_max_rows():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "SPY", "contract_type": "PUT", "strike": 440.0,
         "expiry": "2026-05-17", "dte": 19, "fill_price": 1.10,
         "bid": 1.05, "ask": 1.15, "size": 50, "premium": 5_500.0,
         "trade_type": "BTO", "bid_ask_class": "BID", "is_aggressive": False,
-        "is_golden_sweep": False, "sentiment": "BEARISH",
-        "influence_tier": "INSTITUTIONAL", "conviction_score": 0.55,
+        "sentiment": "BEARISH",
         "exchange_count": 1, "fill_count": 1, "open_interest": 20000,
         "iv": 0.22, "underlying_price": 442.0, "occ_symbol": "SPY240517P00440000",
         "is_synthetic_quote": False,
@@ -689,13 +694,13 @@ async def test_persist_flow_event_early_flush_on_max_rows():
 @pytest.mark.asyncio
 async def test_persist_flow_event_warns_on_zero_strike():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "TSLA", "contract_type": "CALL", "strike": 0.0,
         "expiry": "2026-06-20", "dte": 30, "fill_price": 1.0,
         "bid": 0.95, "ask": 1.05, "size": 10, "premium": 1_000.0,
         "trade_type": "BTO", "bid_ask_class": "MID", "is_aggressive": False,
-        "is_golden_sweep": False, "sentiment": "NEUTRAL",
-        "influence_tier": "RETAIL", "conviction_score": 0.3,
+        "sentiment": "NEUTRAL",
         "exchange_count": 1, "fill_count": 1, "open_interest": 0,
         "iv": 0.0, "underlying_price": 200.0, "occ_symbol": "TSLA240620C00001000",
         "is_synthetic_quote": False,
@@ -837,11 +842,12 @@ async def test_bus_signal_listener_ignores_non_dict_message():
 #   2. alert_level, strike, and expiry are populated from sig_ep directly
 #      (fixes both the ALERT-LEVEL bug and the historic strike/expiry=None bug).
 #
-# FIX (AsyncMock patch): asyncio.create_task() requires a coroutine object.
-# Without new_callable=AsyncMock, patch() produces a regular MagicMock whose
-# return value is not awaitable — create_task() raises TypeError silently and
-# fake_persist_episode never runs, leaving persisted_episodes empty.
-# All three persist_flow_episode patches below use new_callable=AsyncMock.
+# NOTE: ev.is_golden_sweep, ev.influence_tier, ev.conviction_score below are
+# attributes on the stream event MagicMock (TradeEvent), not DB columns. They
+# are used inside _process_trade() to build the TradeEvent payload. The 3
+# columns were dropped from the DB schema (migration 024) but the TradeEvent
+# dataclass still carries them as intermediate fields — persist_flow_event()
+# is responsible for excluding them before the DB INSERT.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
