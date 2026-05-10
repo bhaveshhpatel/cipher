@@ -10,13 +10,15 @@ Covers:
   - limit out of range: limit=0 → 422, limit=201 → 422
   - No Supabase env vars → empty list, not 500
   - direction→sentiment mapping: REPEAT_BUY→BULLISH, REPEAT_SELL→BEARISH, HOLD→NEUTRAL
-  - alert_level→influence_tier mapping: CRITICAL→WHALE, HIGH→INSTITUTIONAL
-  - conviction_score mapping from alert_level (CRITICAL→0.92)
-  - is_accelerating=True → is_golden_sweep=True, trade_type='SWEEP'
-  - is_accelerating=False → is_golden_sweep=False, trade_type='BLOCK'
+  - is_accelerating=True → trade_type='SWEEP'
+  - is_accelerating=False → trade_type='BLOCK'
   - Row with a parse error is skipped; rest of response still returned
   - Null-expiry / null-strike episode row IS included (valid aggregated episode)
-  - Unknown direction/alert values fall back to NEUTRAL / RETAIL
+  - Unknown direction values fall back to NEUTRAL
+
+Removed (rearch-010 / migration 024):
+  - influence_tier, conviction_score, is_golden_sweep — columns dropped from DB;
+    fields removed from FlowEventOut. Tests for these mappings deleted accordingly.
 """
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -92,9 +94,11 @@ def test_flow_scan_returns_valid_response_shape():
     assert len(body["events"]) == 1
     ev = body["events"][0]
     for key in ("ticker", "contract_type", "strike", "expiry", "premium",
-                "trade_type", "sentiment", "influence_tier", "conviction_score",
-                "is_golden_sweep"):
+                "trade_type", "sentiment"):
         assert key in ev
+    # Removed from schema in migration 024 (rearch-010) — must NOT be present:
+    for removed_key in ("influence_tier", "conviction_score", "is_golden_sweep"):
+        assert removed_key not in ev
 
 
 def test_flow_scan_empty_returns_zero_events():
@@ -207,33 +211,15 @@ def test_flow_direction_to_sentiment_mapping(direction, expected_sentiment):
     assert resp.json()["events"][0]["sentiment"] == expected_sentiment
 
 
-# ── alert_level → influence_tier + conviction_score mapping ────────────────────────
+# ── is_accelerating → trade_type mapping ─────────────────────────────────────────
+# Note: is_golden_sweep was removed in migration 024 (rearch-010).
+# trade_type (SWEEP/BLOCK) is still derived from is_accelerating and is tested here.
 
-@pytest.mark.parametrize("alert,expected_tier,expected_conviction", [
-    ("CRITICAL", "WHALE",         0.92),
-    ("HIGH",     "INSTITUTIONAL", 0.75),
-    ("MEDIUM",   "LARGE",         0.55),
-    ("LOW",      "RETAIL",        0.35),
-    ("UNKNOWN",  "RETAIL",        0.5),  # unmapped falls back to RETAIL / 0.5
-])
-def test_flow_alert_level_mapping(alert, expected_tier, expected_conviction):
-    row = _sample_row(alert_level=alert)
-    with _mock_user(), _mock_query([row], total=1):
-        resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
-    assert resp.status_code == 200
-    ev = resp.json()["events"][0]
-    assert ev["influence_tier"] == expected_tier
-    assert pytest.approx(ev["conviction_score"], abs=0.01) == expected_conviction
-
-
-# ── is_accelerating flag ─────────────────────────────────────────────────────────
-
-def test_flow_is_accelerating_true_sets_golden_sweep_and_sweep_type():
+def test_flow_is_accelerating_true_sets_sweep_type():
     row = _sample_row(is_accelerating=True)
     with _mock_user(), _mock_query([row], total=1):
         resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
     ev = resp.json()["events"][0]
-    assert ev["is_golden_sweep"] is True
     assert ev["trade_type"] == "SWEEP"
 
 
@@ -242,7 +228,6 @@ def test_flow_is_accelerating_false_sets_block_type():
     with _mock_user(), _mock_query([row], total=1):
         resp = client.get("/api/flow/scan", headers=_auth(_make_token()))
     ev = resp.json()["events"][0]
-    assert ev["is_golden_sweep"] is False
     assert ev["trade_type"] == "BLOCK"
 
 
@@ -312,4 +297,4 @@ def test_flow_scan_null_expiry_row_is_included():
     assert ev["expiry"] is None
     assert ev["strike"] is None
     assert ev["premium"] == 259_857.0
-    assert ev["is_golden_sweep"] is True
+    assert ev["trade_type"] == "SWEEP"

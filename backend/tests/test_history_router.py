@@ -1,9 +1,15 @@
 """
 Regression tests for routers/history.py
 
+Rearch-010 update (2026-05-09):
+  _TIER_TO_DB, tier= query param, volume_premium_factor, backtest_score,
+  flow_score, and influence_tier were removed from routers/history.py
+  when migration 024 dropped those columns from signal_history.
+  This file is updated to match the current router surface.
+
 Strategy:
   - Use FastAPI TestClient with dependency override for get_current_user.
-  - Supabase HTTP calls (_query_signal_history) are patched via httpx mock.
+  - Supabase HTTP calls (_query_signal_history) are patched via AsyncMock.
   - No live DB required.
 
 Covers:
@@ -12,7 +18,6 @@ Covers:
 
   Input validation:
   - direction not in {bullish, bearish, neutral} → 422
-  - tier not in {whale, institutional, large, retail} → 422
   - min_conviction > 1.0 → 422
   - min_conviction < 0.0 → 422
   - limit > 200 → 422
@@ -21,8 +26,6 @@ Covers:
 
   Mapping constants:
   - _DIR_TO_REC: bullish→BUY, bearish→SELL, neutral→HOLD
-  - _TIER_TO_DB: whale→WHALE, institutional→INSTITUTIONAL,
-                 large→LARGE, retail→RETAIL
 
   No Supabase configured:
   - Returns {signals: [], total: 0, limit: 50, offset: 0}
@@ -30,19 +33,15 @@ Covers:
   Supabase HTTP 200 with rows:
   - Rows parsed into SignalHistoryItem list
   - HistoryResponse shape: signals, total, limit, offset
-  - volume_premium_factor missing defaults to 0.5
   - is_accelerating missing defaults to False
   - total parsed from content-range header
+  - total_premium=None maps to None
 
-  Supabase HTTP 4xx:
-  - Returns empty signals list (no crash)
-
-  Supabase connection exception:
+  Supabase HTTP 4xx / exception:
   - Returns empty signals list (no crash)
 
   Pagination params:
-  - limit and offset forwarded in query params
-  - limit and offset echoed back in response
+  - limit and offset forwarded and echoed in response
 """
 import pytest
 from fastapi import FastAPI
@@ -50,7 +49,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
 
 from core.auth import get_current_user, TokenData
-from routers.history import router, _DIR_TO_REC, _TIER_TO_DB
+from routers.history import router, _DIR_TO_REC
 import routers.history as hist
 
 
@@ -107,22 +106,6 @@ def test_dir_to_rec_neutral():
     assert _DIR_TO_REC["neutral"] == "HOLD"
 
 
-def test_tier_to_db_whale():
-    assert _TIER_TO_DB["whale"] == "WHALE"
-
-
-def test_tier_to_db_institutional():
-    assert _TIER_TO_DB["institutional"] == "INSTITUTIONAL"
-
-
-def test_tier_to_db_large():
-    assert _TIER_TO_DB["large"] == "LARGE"
-
-
-def test_tier_to_db_retail():
-    assert _TIER_TO_DB["retail"] == "RETAIL"
-
-
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
@@ -136,18 +119,6 @@ def test_invalid_direction_returns_422(client):
 def test_valid_direction_accepted(client, direction):
     with patch.object(hist, "_SUPABASE_URL", None):
         resp = client.get("/api/signals/history", params={"direction": direction})
-    assert resp.status_code == 200
-
-
-def test_invalid_tier_returns_422(client):
-    resp = client.get("/api/signals/history", params={"tier": "hedge_fund"})
-    assert resp.status_code == 422
-
-
-@pytest.mark.parametrize("tier", ["whale", "institutional", "large", "retail"])
-def test_valid_tier_accepted(client, tier):
-    with patch.object(hist, "_SUPABASE_URL", None):
-        resp = client.get("/api/signals/history", params={"tier": tier})
     assert resp.status_code == 200
 
 
@@ -197,30 +168,27 @@ def test_no_supabase_returns_empty_response(client):
 # ---------------------------------------------------------------------------
 
 def _make_signal_row(**overrides) -> dict:
+    """Minimal valid signal_history row — REARCH-010 schema."""
     base = {
-        "id":                     1,
-        "ticker":                 "AAPL",
-        "recommendation":         "BUY",
-        "composite_score":        0.85,
-        "flow_score":             0.80,
-        "backtest_score":         0.75,
-        "volume_premium_factor":  1.2,
-        "reasoning":              "Strong flow",
-        "contract_type":          "CALL",
-        "direction":              "bullish",
-        "influence_tier":         "WHALE",
-        "total_premium":          50000.0,
-        "trade_count":            12,
-        "is_accelerating":        True,
-        "signal_ts":              "2026-04-25T18:00:00Z",
-        "created_at":             "2026-04-25T18:00:01Z",
+        "id":               1,
+        "ticker":           "AAPL",
+        "recommendation":   "BUY",
+        "composite_score":  0.85,
+        "reasoning":        "Strong flow",
+        "contract_type":    "CALL",
+        "direction":        "BULLISH",
+        "total_premium":    50000.0,
+        "trade_count":      12,
+        "is_accelerating":  True,
+        "signal_ts":        "2026-04-25T18:00:00Z",
+        "created_at":       "2026-04-25T18:00:01Z",
     }
     base.update(overrides)
     return base
 
 
 def _mock_supabase_response(rows: list, total: int = None, status_code: int = 200):
-    """Return a patched _query_signal_history that yields the given rows."""
+    """Patch _query_signal_history to return the given rows."""
     effective_total = total if total is not None else len(rows)
     return patch(
         "routers.history._query_signal_history",
@@ -262,15 +230,6 @@ def test_limit_and_offset_echoed_in_response(client):
     assert body["offset"] == 50
 
 
-def test_missing_volume_premium_factor_defaults_to_05(client):
-    row = _make_signal_row()
-    del row["volume_premium_factor"]
-    row["volume_premium_factor"] = None
-    with _mock_supabase_response([row]):
-        resp = client.get("/api/signals/history")
-    assert resp.json()["signals"][0]["volume_premium_factor"] == 0.5
-
-
 def test_is_accelerating_defaults_to_false_when_absent(client):
     row = _make_signal_row()
     del row["is_accelerating"]
@@ -291,6 +250,27 @@ def test_multiple_rows_all_parsed(client):
     with _mock_supabase_response(rows, total=5):
         resp = client.get("/api/signals/history")
     assert len(resp.json()["signals"]) == 5
+
+
+def test_composite_score_parsed_as_float(client):
+    row = _make_signal_row(composite_score="0.72")
+    with _mock_supabase_response([row]):
+        resp = client.get("/api/signals/history")
+    assert resp.json()["signals"][0]["composite_score"] == pytest.approx(0.72)
+
+
+# ---------------------------------------------------------------------------
+# REARCH-010 vocab — direction and alert_level pass-through
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("direction", ["BULLISH", "BEARISH", "NEUTRAL"])
+def test_rearch_direction_vocab_passes_through(client, direction):
+    """signal_history rows use BULLISH/BEARISH/NEUTRAL — confirm model accepts them."""
+    row = _make_signal_row(direction=direction)
+    with _mock_supabase_response([row]):
+        resp = client.get("/api/signals/history")
+    assert resp.status_code == 200
+    assert resp.json()["signals"][0]["direction"] == direction
 
 
 # ---------------------------------------------------------------------------

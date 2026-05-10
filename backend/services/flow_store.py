@@ -87,6 +87,10 @@ Bug fixes applied:
      and at PATCH time (contract_volume_at_close), then pre-computes
      volume_oi_ratio = volume / oi (NULL-safe, zero-OI-safe).
      Vol/OI is enrichment only — a cache miss (None) never drops flow.
+  10. REARCH-010 (2026-05-09): removed is_golden_sweep, influence_tier, and
+      conviction_score from persist_flow_event() row dict — all three columns
+      were dropped from flow_events in migration 024. Keeping them caused a
+      PostgREST 400 on every event insert.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -424,10 +428,7 @@ async def persist_flow_event(ev_dict: dict):
         "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
         "bid_ask_class":            ev_dict.get("bid_ask_class", "MID"),
         "is_aggressive":            ev_dict.get("is_aggressive", False),
-        "is_golden_sweep":          ev_dict.get("is_golden_sweep", False),
         "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
-        "influence_tier":           ev_dict.get("influence_tier", "RETAIL"),
-        "conviction_score":         ev_dict.get("conviction_score", 0.0),
         "exchange_count":           ev_dict.get("exchange_count", 1),
         "fill_count":               ev_dict.get("fill_count", 1),
         "open_interest":            ev_dict.get("open_interest", 0),
@@ -707,11 +708,6 @@ async def persist_flow_episode(signal_data: dict):
     lock = _get_episode_lock(key)
 
     async with lock:
-        # -------------------------------------------------------------------
-        # Step 1: check in-flight cache first (avoids DB round-trip for
-        # concurrent waiters that queued up while the first INSERT was in
-        # progress).
-        # -------------------------------------------------------------------
         in_flight = _episode_in_flight.get(key)
 
         if in_flight is not None:
@@ -719,9 +715,6 @@ async def persist_flow_episode(signal_data: dict):
             trade_count   = in_flight["trade_count"] + 1
             total_premium = in_flight["total_premium"] + new_premium
 
-            # ING-008: vol at close is the latest cache value; oi_at_open
-            # is preserved from when the episode was created (in-flight cache
-            # stores it so we can compute the ratio consistently).
             oi_at_open = in_flight.get("contract_oi_at_open")
             vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
 
@@ -737,9 +730,6 @@ async def persist_flow_episode(signal_data: dict):
                 in_flight["total_premium"] = total_premium
             return
 
-        # -------------------------------------------------------------------
-        # Step 2: no in-flight entry — check the DB.
-        # -------------------------------------------------------------------
         existing = await _lookup_open_episode(
             ticker, direction, contract_type, strike, expiry
         )
@@ -749,7 +739,6 @@ async def persist_flow_episode(signal_data: dict):
             trade_count   = (existing.get("trade_count") or 1) + 1
             total_premium = (existing.get("total_premium") or 0.0) + new_premium
 
-            # ING-008: oi_at_open from the existing DB row (captured at INSERT).
             oi_at_open = existing.get("contract_oi_at_open")
             vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
 
@@ -762,14 +751,9 @@ async def persist_flow_episode(signal_data: dict):
             if ok:
                 _episode_stats["merged_episodes"] += 1
                 _set_episode_in_flight(key, row_id, trade_count, total_premium)
-                # Cache oi_at_open so in-flight path can compute ratio without DB
                 _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
             return
 
-        # -------------------------------------------------------------------
-        # Step 3: no existing episode — INSERT.
-        # ING-008: capture contract_oi_at_open at creation time.
-        # -------------------------------------------------------------------
         row = {
             "ticker":              ticker,
             "direction":           direction,

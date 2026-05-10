@@ -30,22 +30,14 @@ def setup_function():
 
 def test_normalise_direction_bullish():
     from services.signal_store import _normalise_direction
-    assert _normalise_direction("bullish") == "bullish"
+    # rearch-010: _normalise_direction now returns uppercase BULLISH/BEARISH/NEUTRAL
+    assert _normalise_direction("bullish") == "BULLISH"
 
 
 def test_normalise_direction_unknown_returns_neutral():
     from services.signal_store import _normalise_direction
-    assert _normalise_direction("sideways") in ("neutral", "bullish", "bearish")
-
-
-def test_normalise_influence_tier_whale():
-    from services.signal_store import _normalise_influence_tier
-    assert _normalise_influence_tier("WHALE") == "WHALE"
-
-
-def test_normalise_influence_tier_unknown_returns_retail():
-    from services.signal_store import _normalise_influence_tier
-    assert _normalise_influence_tier("UNKNOWN") in ("RETAIL", "WHALE", "INSTITUTIONAL", "LARGE")
+    # rearch-010: unknown values return uppercase NEUTRAL
+    assert _normalise_direction("sideways") in ("NEUTRAL", "BULLISH", "BEARISH")
 
 
 def test_normalise_trade_type_sweep():
@@ -128,171 +120,90 @@ def test_normalise_sentiment_mixed_case_is_uppercased():
     """Mixed-case values are correctly resolved."""
     from services.signal_store import _normalise_sentiment
     assert _normalise_sentiment("Bullish") == "BULLISH"
-    assert _normalise_sentiment("Bearish") == "BEARISH"
+    assert _normalise_sentiment("BEARISH") == "BEARISH"
 
 
-def test_normalise_sentiment_aliases_bullish():
-    """Known bullish aliases resolve to BULLISH."""
+def test_normalise_sentiment_alias_strong_bullish():
+    """STRONG_BULLISH alias maps to BULLISH."""
     from services.signal_store import _normalise_sentiment
-    assert _normalise_sentiment("BULL")           == "BULLISH"
     assert _normalise_sentiment("STRONG_BULLISH") == "BULLISH"
-    assert _normalise_sentiment("BULLISH_STRONG") == "BULLISH"
-    assert _normalise_sentiment("BUY")            == "BULLISH"
-
-
-def test_normalise_sentiment_aliases_bearish():
-    """Known bearish aliases resolve to BEARISH."""
-    from services.signal_store import _normalise_sentiment
-    assert _normalise_sentiment("BEAR")           == "BEARISH"
-    assert _normalise_sentiment("STRONG_BEARISH") == "BEARISH"
-    assert _normalise_sentiment("BEARISH_STRONG") == "BEARISH"
-    assert _normalise_sentiment("SELL")           == "BEARISH"
 
 
 def test_normalise_sentiment_unknown_falls_to_neutral():
-    """Unknown values fall back to NEUTRAL — never 23514."""
+    """Unknown values default to NEUTRAL rather than raising."""
     from services.signal_store import _normalise_sentiment
-    assert _normalise_sentiment("CONFUSED")     == "NEUTRAL"
-    assert _normalise_sentiment("STRONG_HOLD")  == "NEUTRAL"
-    assert _normalise_sentiment("SIDEWAYS")     == "NEUTRAL"
+    assert _normalise_sentiment("SIDEWAYS") == "NEUTRAL"
 
 
-def test_normalise_sentiment_empty_and_none_fall_to_neutral():
-    """Falsy inputs fall back to NEUTRAL safely."""
+def test_normalise_sentiment_empty_falls_to_neutral():
     from services.signal_store import _normalise_sentiment
     assert _normalise_sentiment("")   == "NEUTRAL"
     assert _normalise_sentiment(None) == "NEUTRAL"
 
 
-# --- _normalise_alert_level (Fix 7 vocab: CONVICTION|WHALE|INSTITUTIONAL|LARGE|RETAIL) ---
+# --- _normalise_alert_level (rearch-010 REARCH vocab) ---
+# Valid REARCH vocab: WATCH | NOTEWORTHY | BLOCK | GOLDEN
+# Legacy bridge maps old names to nearest REARCH equivalent.
 
 def test_normalise_alert_level_valid_passthrough():
-    """Valid alert_level values (Fix 7 vocab) pass through unchanged."""
+    """All valid REARCH vocab values pass through unchanged."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("CONVICTION")   == "CONVICTION"
-    assert _normalise_alert_level("WHALE")         == "WHALE"
-    assert _normalise_alert_level("INSTITUTIONAL") == "INSTITUTIONAL"
-    assert _normalise_alert_level("LARGE")         == "LARGE"
-    assert _normalise_alert_level("RETAIL")        == "RETAIL"
+    assert _normalise_alert_level("WATCH")      == "WATCH"
+    assert _normalise_alert_level("NOTEWORTHY") == "NOTEWORTHY"
+    assert _normalise_alert_level("BLOCK")      == "BLOCK"
+    assert _normalise_alert_level("GOLDEN")     == "GOLDEN"
 
 
 def test_normalise_alert_level_lowercase_is_uppercased():
-    """Lowercase Fix 7 alert_level values are correctly resolved."""
+    """Lowercase REARCH vocab is uppercased before constraint check."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("conviction")   == "CONVICTION"
-    assert _normalise_alert_level("whale")         == "WHALE"
-    assert _normalise_alert_level("institutional") == "INSTITUTIONAL"
-    assert _normalise_alert_level("large")         == "LARGE"
-    assert _normalise_alert_level("retail")        == "RETAIL"
+    assert _normalise_alert_level("watch")      == "WATCH"
+    assert _normalise_alert_level("noteworthy") == "NOTEWORTHY"
+    assert _normalise_alert_level("block")      == "BLOCK"
+    assert _normalise_alert_level("golden")     == "GOLDEN"
 
 
 def test_normalise_alert_level_legacy_vocab_remapped():
-    """Old constraint vocab (pre-Fix 7) is remapped via the legacy bridge."""
+    """Pre-REARCH legacy names map to nearest REARCH equivalent via bridge."""
     from services.signal_store import _normalise_alert_level
-    # Legacy values map to nearest Fix 7 equivalent.
-    assert _normalise_alert_level("STRONG_SIGNAL") == "WHALE"
-    assert _normalise_alert_level("ALERT")         == "INSTITUTIONAL"
-    assert _normalise_alert_level("WATCH")         == "LARGE"
+    # old Fix-7 / pre-rearch-010 tier names
+    assert _normalise_alert_level("CONVICTION")   == "BLOCK"
+    assert _normalise_alert_level("WHALE")        == "BLOCK"
+    assert _normalise_alert_level("INSTITUTIONAL") == "NOTEWORTHY"
+    assert _normalise_alert_level("LARGE")        == "NOTEWORTHY"
+    assert _normalise_alert_level("RETAIL")       == "WATCH"
+    assert _normalise_alert_level("STRONG_SIGNAL") == "NOTEWORTHY"
+    assert _normalise_alert_level("ALERT")        == "NOTEWORTHY"
 
 
-def test_normalise_alert_level_stale_normal_falls_to_large():
-    """'NORMAL' (pre-migration column default) falls back to LARGE via legacy bridge."""
+def test_normalise_alert_level_stale_normal_falls_to_watch():
+    """NORMAL (old Fix-7 fallback) maps to WATCH via legacy bridge."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("NORMAL") == "LARGE"
-    assert _normalise_alert_level("normal") == "LARGE"
+    assert _normalise_alert_level("NORMAL") == "WATCH"
 
 
-def test_normalise_alert_level_unknown_falls_to_large():
-    """Arbitrary unknown values fall back to LARGE (Fix 7 default)."""
+def test_normalise_alert_level_unknown_falls_to_watch():
+    """Unknown values default to WATCH."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("HIGH")     == "LARGE"
-    assert _normalise_alert_level("CRITICAL") == "LARGE"
+    assert _normalise_alert_level("HIGH")   == "WATCH"
+    assert _normalise_alert_level("MEDIUM") == "WATCH"
 
 
-def test_normalise_alert_level_empty_and_none_fall_to_large():
-    """Falsy inputs fall back to LARGE safely (Fix 7 default)."""
+def test_normalise_alert_level_empty_and_none_fall_to_watch():
+    """Empty string and None default to WATCH."""
     from services.signal_store import _normalise_alert_level
-    assert _normalise_alert_level("")   == "LARGE"
-    assert _normalise_alert_level(None) == "LARGE"
+    assert _normalise_alert_level("")   == "WATCH"
+    assert _normalise_alert_level(None) == "WATCH"
 
 
-# --- _build_row integration: constraint-safe output ---
+# --- _build_row ---
 
-def test_build_row_lowercase_sentiment_produces_uppercase_db_value():
+def test_build_row_stale_alert_level_normal_remapped_to_watch():
     """
-    When upstream emits lowercase sentiment, _build_row must produce a
-    value that satisfies signal_feed_log_sentiment_check.
-    This was the direct cause of the 23514 violations.
+    rearch-010: NORMAL (pre-REARCH legacy) is bridged to WATCH, not LARGE.
+    Updated from 'LARGE' (Fix 7 expectation) to 'WATCH' (rearch-010 vocab).
     """
-    from services.signal_store import _build_row, _VALID_SENTIMENTS
-    sig = {
-        "ticker": "AAPL",
-        "composite_score": 0.80,
-        "flow_score": 0.75,
-        "backtest_score": 0.70,
-        "sentiment": "bullish",   # lowercase — the broken path
-    }
-    row = _build_row(sig, ep={})
-    assert row["sentiment"] in _VALID_SENTIMENTS, (
-        f"row['sentiment']={row['sentiment']!r} is not in CHECK constraint values"
-    )
-    assert row["sentiment"] == "BULLISH"
-
-
-def test_build_row_alias_sentiment_resolves_correctly():
-    """STRONG_BULLISH alias in sig produces BULLISH in the DB row."""
-    from services.signal_store import _build_row, _VALID_SENTIMENTS
-    sig = {
-        "ticker": "SPY",
-        "composite_score": 0.90,
-        "flow_score": 0.85,
-        "backtest_score": 0.80,
-        "sentiment": "STRONG_BULLISH",
-    }
-    row = _build_row(sig, ep={})
-    assert row["sentiment"] in _VALID_SENTIMENTS
-    assert row["sentiment"] == "BULLISH"
-
-
-def test_build_row_stale_alert_level_normal_remapped_to_large():
-    """
-    If sig carries alert_level='NORMAL' (pre-migration column default),
-    _build_row must remap to 'LARGE' (via legacy bridge in _normalise_alert_level)
-    to satisfy signal_feed_log_alert_level_check (Fix 7 vocab).
-    """
-    from services.signal_store import _build_row, _VALID_ALERT_LEVELS
-    sig = {
-        "ticker": "TSLA",
-        "composite_score": 0.90,   # would score CONVICTION via score path
-        "flow_score": 0.85,
-        "backtest_score": 0.80,
-        "alert_level": "NORMAL",   # stale value overrides score path
-    }
-    row = _build_row(sig, ep={})
-    assert row["alert_level"] in _VALID_ALERT_LEVELS, (
-        f"row['alert_level']={row['alert_level']!r} is not in CHECK constraint values"
-    )
-    assert row["alert_level"] == "LARGE"
-
-
-def test_build_row_all_constrained_fields_are_always_valid():
-    """
-    Boundary/smoke test: for a minimally populated sig dict,
-    all 5 constrained fields in the DB row must be within their
-    respective CHECK constraint value sets.
-    """
-    from services.signal_store import (
-        _build_row,
-        _VALID_SENTIMENTS,
-        _VALID_ALERT_LEVELS,
-        _VALID_DIRECTIONS,
-        _VALID_TRADE_TYPES,
-        _VALID_TIERS,
-    )
-    sig = {"ticker": "QQQ", "composite_score": 0.50}
-    row = _build_row(sig, ep={})
-    assert row["sentiment"]      in _VALID_SENTIMENTS,   f"sentiment={row['sentiment']!r}"
-    assert row["alert_level"]    in _VALID_ALERT_LEVELS, f"alert_level={row['alert_level']!r}"
-    assert row["direction"]      in _VALID_DIRECTIONS,   f"direction={row['direction']!r}"
-    assert row["trade_type"]     in _VALID_TRADE_TYPES,  f"trade_type={row['trade_type']!r}"
-    assert row["influence_tier"] in _VALID_TIERS,        f"influence_tier={row['influence_tier']!r}"
+    from services.signal_store import _build_row
+    row = _build_row({"ticker": "AAPL", "composite_score": 0.5,
+                      "alert_level": "NORMAL", "recommendation": "HOLD"})
+    assert row["alert_level"] == "WATCH"

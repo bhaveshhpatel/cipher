@@ -1,11 +1,11 @@
 """
-test_flow_events.py — 100% coverage for GET /api/flow/events
+test_flow_events.py — coverage for GET /api/flow/events
 
 Tests:
   - happy path: returns events list with correct shape
   - ticker filter uppercased and passed through
-  - sentiment / contract_type / tier filters
-  - aggressive=True / golden_sweep=True boolean filters
+  - sentiment / contract_type filters
+  - aggressive=True boolean filter
   - combined filters build correct active_filters dict
   - row parse error is skipped (warning logged, rest returned)
   - Supabase env missing → 200 with empty events
@@ -14,6 +14,10 @@ Tests:
   - content-range total parsing (valid + malformed)
   - auth guard: 401 when no token
   - limit/offset defaults and query params passed
+
+Removed (rearch-010 / migration 024):
+  - influence_tier, conviction_score, is_golden_sweep — columns dropped from
+    flow_events. All assertions and filter tests for these fields deleted.
 """
 import json
 import pytest
@@ -70,10 +74,9 @@ def _patch_httpx(rows, status=200, content_range=""):
     return patch("routers.flow.httpx.AsyncClient", return_value=mock_client)
 
 
-# _SAMPLE_ROW uses actual flow_events DB column names.
-# - 'influence_tier'  (not 'tier'  — that was the old name)
-# - 'created_at'      (not 'timestamp' — that column does not exist in DB)
-f_SAMPLE_ROW = {
+# _SAMPLE_ROW uses actual flow_events DB column names after migration 024.
+# influence_tier, conviction_score, is_golden_sweep were dropped from the table.
+_SAMPLE_ROW = {
     "id": "abc123",
     "ticker": "AAPL",
     "strike": 180.0,
@@ -87,17 +90,12 @@ f_SAMPLE_ROW = {
     "bid": 1.45,
     "ask": 1.50,
     "fill_price": 1.47,
-    "influence_tier": "T1",
-    "conviction_score": 0.88,
     "is_aggressive": True,
-    "is_golden_sweep": False,
     "iv": 0.42,
     "underlying_price": 178.50,
     "occ_symbol": "AAPL260516C00180000",
     "created_at": "2026-04-28T15:00:00Z",
 }
-
-_SAMPLE_ROW = f_SAMPLE_ROW
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +122,14 @@ def test_events_happy_path(auth_client, monkeypatch):
     assert e["bid"] == 1.45
     assert e["ask"] == 1.50
     assert e["fill_price"] == 1.47
-    assert e["influence_tier"] == "T1"   # renamed from 'tier'
-    assert e["conviction_score"] == 0.88
     assert e["is_aggressive"] is True
-    assert e["is_golden_sweep"] is False
     assert e["iv"] == 0.42
     assert e["underlying_price"] == 178.50
     assert e["occ_symbol"] == "AAPL260516C00180000"
     assert e["timestamp"] == "2026-04-28T15:00:00Z"  # mapped from created_at
+    # Removed in migration 024 — must NOT be present:
+    for removed_key in ("influence_tier", "conviction_score", "is_golden_sweep"):
+        assert removed_key not in e
 
 
 def test_events_default_limit_is_50(auth_client, monkeypatch):
@@ -169,10 +167,8 @@ def test_events_ticker_filter_uppercased(auth_client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("param,value,expected_key,expected_val", [
-    ("sentiment",     "bullish",  "sentiment",      "eq.BULLISH"),
-    ("contract_type", "put",      "contract_type",  "eq.PUT"),
-    # URL query param is '?tier=', but the Supabase filter key is 'influence_tier'
-    ("tier",          "t2",       "influence_tier",  "eq.T2"),
+    ("sentiment",     "bullish", "sentiment",     "eq.BULLISH"),
+    ("contract_type", "put",     "contract_type", "eq.PUT"),
 ])
 def test_events_string_filters(auth_client, monkeypatch, param, value, expected_key, expected_val):
     monkeypatch.setenv("SUPABASE_URL", "http://fake")
@@ -201,28 +197,20 @@ def test_events_aggressive_false(auth_client, monkeypatch):
     assert params["is_aggressive"] == "eq.false"
 
 
-def test_events_golden_sweep_true(auth_client, monkeypatch):
-    monkeypatch.setenv("SUPABASE_URL", "http://fake")
-    monkeypatch.setenv("SUPABASE_KEY", "fake-key")
-    with _patch_httpx([]) as mock_cls:
-        auth_client.get("/api/flow/events?golden_sweep=true")
-    params = mock_cls.return_value.__aenter__.return_value.get.call_args[1]["params"]
-    assert params["is_golden_sweep"] == "eq.true"
-
-
 def test_events_combined_filters_in_response(auth_client, monkeypatch):
     monkeypatch.setenv("SUPABASE_URL", "http://fake")
     monkeypatch.setenv("SUPABASE_KEY", "fake-key")
     with _patch_httpx([]):
-        resp = auth_client.get("/api/flow/events?ticker=SPY&sentiment=BEARISH&contract_type=PUT&tier=T1&aggressive=true&golden_sweep=false")
+        resp = auth_client.get("/api/flow/events?ticker=SPY&sentiment=BEARISH&contract_type=PUT&aggressive=true")
     data = resp.json()
     f = data["filters"]
     assert f["ticker"] == "SPY"
     assert f["sentiment"] == "BEARISH"
     assert f["contract_type"] == "PUT"
-    assert f["tier"] == "T1"
     assert f["aggressive"] is True
-    assert f["golden_sweep"] is False
+    # Removed in migration 024 — must NOT appear in filters:
+    assert "tier" not in f
+    assert "golden_sweep" not in f
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +218,7 @@ def test_events_combined_filters_in_response(auth_client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_events_null_optional_fields_handled(auth_client, monkeypatch):
-    """Row with null bid/ask/fill_price/expiry/influence_tier returns without error."""
+    """Row with null bid/ask/fill_price/expiry returns without error."""
     monkeypatch.setenv("SUPABASE_URL", "http://fake")
     monkeypatch.setenv("SUPABASE_KEY", "fake-key")
     sparse_row = {
@@ -238,8 +226,7 @@ def test_events_null_optional_fields_handled(auth_client, monkeypatch):
         "dte": None, "contract_type": "PUT", "trade_type": None,
         "sentiment": "BEARISH", "premium": 5000.0, "size": 50,
         "bid": None, "ask": None, "fill_price": None,
-        "influence_tier": None, "conviction_score": None,
-        "is_aggressive": False, "is_golden_sweep": False,
+        "is_aggressive": False,
         "iv": None, "underlying_price": None, "occ_symbol": None,
         "created_at": None,
     }
@@ -250,7 +237,6 @@ def test_events_null_optional_fields_handled(auth_client, monkeypatch):
     assert e["bid"] is None
     assert e["ask"] is None
     assert e["fill_price"] is None
-    assert e["influence_tier"] is None   # renamed from 'tier'
     assert e["timestamp"] is None
 
 

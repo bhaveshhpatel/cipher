@@ -24,8 +24,7 @@ Covers:
   GET /api/signals/list:
   - Invalid direction -> 422
   - Valid directions accepted
-  - Invalid tier -> 422
-  - Valid tiers accepted
+  - tier param removed in rearch-010 (influence_tier col dropped)
   - min_conviction > 1.0 -> 422
   - min_conviction < 0.0 -> 422
   - page_size > 100 -> 422
@@ -41,7 +40,6 @@ Covers:
 
   Internal helpers:
   - _mock_composite: deterministic (same ticker, same result)
-  - _row_to_composite: null volume_premium_factor -> 0.5
   - _row_to_composite: null reasoning -> empty string
 """
 import pytest
@@ -106,10 +104,11 @@ def test_stream_stats_no_auth_returns_401(raw_client):
 # ---------------------------------------------------------------------------
 
 def test_composite_db_hit_returns_row(client):
+    # rearch-010: only ticker/recommendation/composite_score/reasoning
+    # remain in signal_history select and CompositeOut.
     db_row = {
         "ticker": "AAPL", "recommendation": "BUY",
-        "composite_score": 0.85, "flow_score": 0.80,
-        "backtest_score": 0.75, "volume_premium_factor": 1.2,
+        "composite_score": 0.85,
         "reasoning": "Strong call flow",
     }
     with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock,
@@ -155,12 +154,19 @@ def test_composite_ticker_too_long_returns_422(client):
 
 
 def test_composite_out_shape(client):
+    """
+    rearch-010: CompositeOut was trimmed to 4 fields.
+    flow_score, backtest_score, volume_premium_factor were all dropped
+    from signal_history in migration 024 and removed from the model.
+    """
     with patch.object(ss, "_fetch_ticker_from_db", new_callable=AsyncMock, return_value=None):
         resp = client.get("/api/signals/composite/NVDA")
     body = resp.json()
-    for key in ("ticker", "recommendation", "composite_score",
-                "flow_score", "backtest_score", "volume_premium_factor", "reasoning"):
+    for key in ("ticker", "recommendation", "composite_score", "reasoning"):
         assert key in body
+    # Confirm removed fields are absent
+    for gone in ("flow_score", "backtest_score", "volume_premium_factor"):
+        assert gone not in body
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +185,14 @@ def test_list_valid_direction_accepted(client, direction):
     assert resp.status_code == 200
 
 
-def test_list_invalid_tier_returns_422(client):
-    resp = client.get("/api/signals/list", params={"tier": "hedge_fund"})
-    assert resp.status_code == 422
-
-
-@pytest.mark.parametrize("tier", ["whale", "institutional", "large", "retail"])
-def test_list_valid_tier_accepted(client, tier):
+def test_list_tier_param_removed_returns_200(client):
+    """
+    rearch-010: influence_tier column dropped in migration 024.
+    The `tier` query param was removed from /list. Passing an unknown
+    query param to FastAPI is silently ignored -> 200, not 422.
+    """
     with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=([], 0)):
-        resp = client.get("/api/signals/list", params={"tier": tier})
+        resp = client.get("/api/signals/list", params={"tier": "hedge_fund"})
     assert resp.status_code == 200
 
 
@@ -225,8 +230,7 @@ def test_list_db_empty_returns_mock_source(client):
 def test_list_db_rows_returns_live_source(client):
     rows = [{
         "ticker": "AAPL", "recommendation": "BUY",
-        "composite_score": 0.85, "flow_score": 0.80,
-        "backtest_score": 0.75, "volume_premium_factor": 1.2,
+        "composite_score": 0.85,
         "reasoning": "test",
     }]
     with patch.object(ss, "_fetch_from_db", new_callable=AsyncMock, return_value=(rows, 1)):
@@ -292,27 +296,29 @@ def test_mock_composite_is_deterministic():
 def test_mock_composite_different_tickers_differ():
     r_aapl = _mock_composite("AAPL")
     r_tsla = _mock_composite("TSLA")
-    # At minimum the ticker field must differ
     assert r_aapl.ticker != r_tsla.ticker
 
 
-def test_row_to_composite_null_volume_premium_defaults_to_05():
-    row = {
-        "ticker": "X", "recommendation": "BUY",
-        "composite_score": 0.7, "flow_score": 0.6,
-        "backtest_score": 0.5, "volume_premium_factor": None,
-        "reasoning": "ok",
-    }
-    result = _row_to_composite(row)
-    assert result.volume_premium_factor == 0.5
-
-
 def test_row_to_composite_null_reasoning_becomes_empty_string():
+    """
+    rearch-010: only ticker/recommendation/composite_score/reasoning
+    remain. reasoning=None should coerce to empty string.
+    """
     row = {
         "ticker": "Y", "recommendation": "HOLD",
-        "composite_score": 0.5, "flow_score": 0.4,
-        "backtest_score": 0.3, "volume_premium_factor": 0.8,
+        "composite_score": 0.5,
         "reasoning": None,
     }
     result = _row_to_composite(row)
     assert result.reasoning == ""
+
+
+def test_row_to_composite_reasoning_passthrough():
+    """Non-null reasoning is passed through unchanged."""
+    row = {
+        "ticker": "Z", "recommendation": "BUY",
+        "composite_score": 0.8,
+        "reasoning": "Strong sweep activity.",
+    }
+    result = _row_to_composite(row)
+    assert result.reasoning == "Strong sweep activity."
