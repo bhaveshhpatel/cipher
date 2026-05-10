@@ -26,11 +26,22 @@ Note on symbol_registry constants:
 Public API:
   IngestionConfig                     frozen dataclass — immutable config snapshot
   IngestionProcessor                  main class
-  IngestionProcessor.process(ev)      Optional[OptionsFlowEvent]
+  IngestionProcessor.process(ev, tier=None)      Optional[OptionsFlowEvent]
   get_ingestion_config()              -> IngestionConfig  (cached, TTL=30 s)
   invalidate_ingestion_config_cache() -> None             (admin PATCH side-effect)
 
 REARCH-002 (2026-05-09)
+
+Fix (REARCH-010 2026-05-10): resolve influence_tier removal in _apply_gates.
+  REARCH-010 dropped ev.influence_tier from OptionsFlowEvent (migration 024).
+  _apply_gates previously read it via getattr(ev, "influence_tier", _TIER_T3),
+  silently falling back to T3 floors for every event regardless of actual tier.
+  Fix: process() and process_with_config() accept an optional `tier` int param
+  (1=INSTITUTIONAL, 2=LARGE, 3/None=RETAIL).  _tier_int_to_str() converts the
+  int to the string expected by _premium_floor().  When tier is supplied it
+  takes precedence over any residual ev.influence_tier attribute.
+  tradier_stream.py passes _ev_tier_int (resolved pre-parse from registry) so
+  the correct per-ticker floor is enforced.
 """
 from __future__ import annotations
 
@@ -52,6 +63,20 @@ _CACHE_TTL_SECONDS: float = 30.0
 _TIER_T1 = "INSTITUTIONAL"
 _TIER_T2 = "LARGE"
 _TIER_T3 = "RETAIL"
+
+# ---------------------------------------------------------------------------
+# Tier int -> string conversion (REARCH-010 fix)
+# influence_tier_string() was deleted from SymbolRegistry; convert here so
+# _apply_gates keeps working with the string-based _premium_floor() helper.
+# ---------------------------------------------------------------------------
+
+def _tier_int_to_str(tier_int: Optional[int]) -> str:
+    """Convert an integer tier (1/2/3) to the legacy tier string for _premium_floor()."""
+    if tier_int == 1:
+        return _TIER_T1
+    if tier_int == 2:
+        return _TIER_T2
+    return _TIER_T3
 
 
 # ---------------------------------------------------------------------------
@@ -219,50 +244,81 @@ class IngestionProcessor:
 
     Usage (in tradier_stream.py):
 
-        self.ingestion_processor = IngestionProcessor()
+        processor = IngestionProcessor()
         ...
-        # inside _process_trade():
-        ev = self.ingestion_processor.process(parsed_event)
+        # inside _process_trade(), after parse_tradier_trade():
+        ev = processor.process(ev, tier=_ev_tier_int)
         if ev is None:
             return
 
     The processor is stateless beyond reading the shared config cache, so a
-    single instance per stream is sufficient.  It can also be instantiated
-    directly in tests with an injected IngestionConfig via process_with_config().
+    single module-level instance in tradier_stream.py is sufficient.  It can
+    also be instantiated directly in tests with an injected IngestionConfig
+    via process_with_config().
+
+    REARCH-010: process() and process_with_config() accept an optional `tier`
+    int (1/2/3) to replace the now-removed ev.influence_tier attribute.  When
+    supplied, `tier` takes precedence over any residual ev.influence_tier.
     """
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
-    def process(self, ev: object) -> Optional[object]:
+    def process(self, ev: object, tier: Optional[int] = None) -> Optional[object]:
         """
         Apply all ingestion gates to *ev* using the live cached IngestionConfig.
         Returns the event unchanged if it passes all gates, or None if dropped.
+
+        tier: optional int (1=INSTITUTIONAL, 2=LARGE, 3/None=RETAIL).
+          Pass _ev_tier_int from tradier_stream._process_trade() so the
+          correct per-ticker premium floor is enforced after REARCH-010
+          dropped ev.influence_tier from OptionsFlowEvent.
 
         Type is `object` here to avoid a circular import with the event models;
         callers hold the concrete OptionsFlowEvent type.  All attribute accesses
         are duck-typed against the expected event shape.
         """
         cfg = get_ingestion_config()
-        return self._apply_gates(ev, cfg)
+        return self._apply_gates(ev, cfg, tier=tier)
 
-    def process_with_config(self, ev: object, cfg: IngestionConfig) -> Optional[object]:
+    def process_with_config(
+        self,
+        ev: object,
+        cfg: IngestionConfig,
+        tier: Optional[int] = None,
+    ) -> Optional[object]:
         """
         Apply gates using an explicitly supplied IngestionConfig.  Intended for
         unit tests that need deterministic config without touching the cache.
+
+        tier: optional int — same semantics as process().
         """
-        return self._apply_gates(ev, cfg)
+        return self._apply_gates(ev, cfg, tier=tier)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _apply_gates(self, ev: object, cfg: IngestionConfig) -> Optional[object]:
-        dte            = getattr(ev, "dte",            0)
-        premium        = getattr(ev, "premium",        0)
-        open_interest  = getattr(ev, "open_interest",  0)
-        influence_tier = getattr(ev, "influence_tier", _TIER_T3)
+    def _apply_gates(
+        self,
+        ev: object,
+        cfg: IngestionConfig,
+        tier: Optional[int] = None,
+    ) -> Optional[object]:
+        dte           = getattr(ev, "dte",           0)
+        premium       = getattr(ev, "premium",       0)
+        open_interest = getattr(ev, "open_interest", 0)
+
+        # REARCH-010: ev.influence_tier no longer exists (dropped in migration 024).
+        # Resolve tier string from the int param supplied by tradier_stream
+        # (_ev_tier_int from pre-parse registry lookup).  Fall back to the
+        # legacy attribute for callers that still set it (e.g. older unit tests),
+        # then default to T3 if neither is available.
+        if tier is not None:
+            influence_tier = _tier_int_to_str(tier)
+        else:
+            influence_tier = getattr(ev, "influence_tier", _TIER_T3)
 
         # Gate 1 — DTE hard floor
         if dte < cfg.min_dte:
