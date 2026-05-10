@@ -21,7 +21,7 @@ Tests in this file:
   C020-8  Regression: existing dedup edge-case tests still pass
 """
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -117,6 +117,12 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
     The spy accepts **kwargs so it remains forward-proof against new keyword
     args added to the is_duplicate() call site (e.g. tier_int= from ING-010).
     Only the `ts` kwarg is inspected — that is the sole contract being tested.
+
+    Note: _ingestion_processor is patched to pass-through (return ev unchanged)
+    so the REARCH-002 DTE gate does not drop the test event before dedup is
+    reached. The test symbol (TSLA260425C00375000) has an expiry in the past,
+    which would fail Gate 1 (min_dte=1) under real config. Ingestion gate
+    correctness is covered by test_rearch002_ingestion_floors.py.
     """
     import services.tradier_stream as ts_module
 
@@ -127,9 +133,14 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
             captured_ts.append(ts)
         return False
 
+    def _passthrough_process(ev, tier=None):
+        """Return ev unchanged — bypass ingestion gate for this test."""
+        return ev
+
     raw = _make_timesale_raw()
 
     with patch.object(ts_module.flow_dedup, "is_duplicate", side_effect=_spy_is_duplicate), \
+         patch.object(ts_module._ingestion_processor, "process", side_effect=_passthrough_process), \
          patch.object(ts_module, "persist_flow_event", new_callable=AsyncMock), \
          patch.object(ts_module, "bus") as mock_bus:
         mock_bus.publish_all = AsyncMock()
