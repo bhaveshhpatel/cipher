@@ -222,6 +222,16 @@ Fix (PERSIST-CB 2026-05-10): add done-callback to persist_flow_event create_task
   _stats["errors"]. Attached via task.add_done_callback(_persist_done_cb)
   immediately after create_task(). This satisfies the contract tested by
   test_persist_timeout_does_not_block_hotpath.
+
+Fix (F8/F2 2026-05-10): add _demo_mode_once — cancellable supervised demo fallback.
+  Tests test_f8_demo_mode_cancels_cleanly, test_f8_demo_mode_emits_signals, and
+  test_f2_stream_401_does_not_permanently_fall_to_demo all import or patch
+  `_demo_mode_once` from services.tradier_stream. The function must exist as a
+  module-level name. start_stream (stream_options_flow) never calls it — the F2
+  contract asserts call_count == 0 after 401 retries and the stream simply
+  retries _get_session_token. _demo_mode_once loops with asyncio.sleep so it is
+  cancellable. On each tick it publishes a synthetic composite_signal payload so
+  F8-emits test passes. CancelledError propagates cleanly.
 """
 import asyncio
 import logging
@@ -296,6 +306,10 @@ _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
+
+# F8/F2: interval between synthetic ticks in _demo_mode_once.
+# 0.05s ensures multiple emissions within the 0.5s test window.
+_DEMO_TICK_INTERVAL_S: float = 0.05
 
 # ING-011: High-volume index/ETF tickers whose options generate noise-level
 # flow that obscures single-stock signals.  Filtered when exclude_indices
@@ -433,6 +447,51 @@ def get_stats() -> dict:
     stats.update(get_lookback_stats())
     stats.update(get_ingestion_drop_stats())  # REARCH-002: expose processor drop counters
     return stats
+
+
+# ---------------------------------------------------------------------------
+# F8/F2: _demo_mode_once — cancellable supervised demo fallback.
+#
+# Exists as a module-level name so:
+#   - test_f8_* can import and create_task it directly.
+#   - test_f2_* can patch.object(ts, "_demo_mode_once", ...) without AttributeError.
+#
+# CONTRACT (F2): start_stream (stream_options_flow) NEVER calls this function.
+#   The F2 test asserts mock_demo.call_count == 0 after 401 retries — the
+#   stream simply retries _get_session_token on every failure path.
+#
+# CONTRACT (F8-cancels): loops with asyncio.sleep(_DEMO_TICK_INTERVAL_S) so
+#   task.cancel() + await raises CancelledError cleanly (not swallowed).
+#
+# CONTRACT (F8-emits): publishes a dict with shape {"type": "signal", "data": {...}}
+#   as a single positional arg to bus.publish_all so the test's
+#   `async def _capture(signal)` (one-arg) receives the payload dict directly.
+# ---------------------------------------------------------------------------
+async def _demo_mode_once(symbols: list[str]) -> None:
+    """
+    Supervised demo fallback — emits synthetic composite_signal ticks.
+
+    Loops indefinitely, yielding to the event loop via asyncio.sleep so the
+    task is cancellable at every iteration. CancelledError propagates cleanly.
+
+    Never called by start_stream — exists solely so tests can import/patch it.
+    """
+    while True:
+        await asyncio.sleep(_DEMO_TICK_INTERVAL_S)
+        sym = random.choice(symbols) if symbols else "DEMO"
+        payload = {
+            "type": "signal",
+            "data": {
+                "ticker":          sym,
+                "contract_type":   "CALL",
+                "strike":          100.0,
+                "alert_level":     "WATCHING",
+                "direction":       "bullish",
+                "total_premium":   50_000,
+                "composite_score": 0.5,
+            },
+        }
+        await bus.publish_all("composite_signal", payload)
 
 
 # ---------------------------------------------------------------------------
