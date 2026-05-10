@@ -79,7 +79,8 @@ Bug fixes applied:
      of 1. Fix: per-contract asyncio.Lock (_episode_locks dict keyed by merge
      key string) serialises the lookup→insert/patch path. An in-process
      _episode_in_flight cache allows the second waiter to PATCH the just-
-     inserted row without a DB round-trip.
+     inserted row without a DB GET needed.
+     Cleared on session reset via reset_episode_state().
   9. ING-008 (2026-05-08): persist_flow_event() now captures vol/OI snapshot
      from chain_store.get_contract_vol_oi(occ_symbol) and writes
      contract_volume_snapshot and contract_oi to the flow_events row.
@@ -87,6 +88,12 @@ Bug fixes applied:
      and at PATCH time (contract_volume_at_close), then pre-computes
      volume_oi_ratio = volume / oi (NULL-safe, zero-OI-safe).
      Vol/OI is enrichment only — a cache miss (None) never drops flow.
+  10. REARCH-010-STAGE6 (2026-05-09): removed is_golden_sweep, influence_tier,
+     and conviction_score from persist_flow_event() row dict. These columns
+     were dropped from flow_events in the REARCH-010 Supabase migration.
+     Writing them caused PostgREST 42703 (column does not exist) on every
+     event flush. Verified absent via information_schema.columns audit —
+     no supplemental DDL migration required.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -410,6 +417,9 @@ async def persist_flow_event(ev_dict: dict):
         except Exception:
             pass  # enrichment failure is non-fatal
 
+    # REARCH-010-STAGE6: is_golden_sweep, influence_tier, and conviction_score
+    # removed — these columns were dropped from flow_events in the REARCH-010
+    # migration. Do NOT re-add them; PostgREST returns 42703 if present.
     row = {
         "ticker":                   ticker,
         "contract_type":            ev_dict.get("contract_type"),
@@ -424,10 +434,7 @@ async def persist_flow_event(ev_dict: dict):
         "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
         "bid_ask_class":            ev_dict.get("bid_ask_class", "MID"),
         "is_aggressive":            ev_dict.get("is_aggressive", False),
-        "is_golden_sweep":          ev_dict.get("is_golden_sweep", False),
         "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
-        "influence_tier":           ev_dict.get("influence_tier", "RETAIL"),
-        "conviction_score":         ev_dict.get("conviction_score", 0.0),
         "exchange_count":           ev_dict.get("exchange_count", 1),
         "fill_count":               ev_dict.get("fill_count", 1),
         "open_interest":            ev_dict.get("open_interest", 0),
