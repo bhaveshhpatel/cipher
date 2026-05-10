@@ -188,6 +188,11 @@ Fix (REARCH-002 2026-05-10): wire IngestionProcessor into _process_trade.
   ev = result. Returns None —> tick dropped with INFO log + drop_stats.
   _ev_tier_int (pre-parse registry int) is passed as tier so the processor
   uses the correct T1/T2/T3 premium floor (ev.influence_tier removed REARCH-010).
+
+Fix (SYNTAX-001 2026-05-10): close unclosed paren in persist log.info at line 1020.
+  The log.info() call after _stats["persisted"] += 1 was truncated — missing
+  format args and closing paren caused SyntaxError on import, blocking all 7
+  test files that transitively import tradier_stream.
 """
 import asyncio
 import logging
@@ -1019,4 +1024,130 @@ async def _process_trade(raw: dict):
     _stats["persisted"] += 1
     log.info(
         "[persist] %s %s $%.0f %s fill=%.2f size=%d prem=$%.0f type=%s",
-        ev.ticker, ev.contract_t
+        ev.ticker, ev.contract_type, ev.strike, ev.expiry,
+        ev.fill_price, ev.size, ev.premium, ev.trade_type,
+    )
+
+    asyncio.create_task(
+        persist_flow_event({
+            "occ_symbol":        occ_symbol,
+            "ticker":            ev.ticker,
+            "contract_type":     ev.contract_type,
+            "strike":            ev.strike,
+            "expiry":            str(ev.expiry),
+            "dte":               ev.dte,
+            "fill_price":        ev.fill_price,
+            "bid":               ev.bid,
+            "ask":               ev.ask,
+            "size":              ev.size,
+            "premium":           ev.premium,
+            "trade_type":        ev.trade_type,
+            "sentiment":         ev.sentiment,
+            "bid_ask_class":     ev.bid_ask_class,
+            "is_aggressive":     ev.is_aggressive,
+            "exchange":          exchange,
+            "exchange_count":    ev.exchange_count,
+            "is_synthetic_quote": ev.is_synthetic_quote,
+            "order_side":        _order_side,
+        })
+    )
+
+    if sig_ep is None:
+        return
+
+    alert_level = sig_ep.alert_level
+    direction   = sig_ep.dominant_direction
+
+    asyncio.create_task(
+        persist_flow_episode({
+            "occ_symbol":         occ_symbol,
+            "ticker":             ev.ticker,
+            "contract_type":      ev.contract_type,
+            "strike":             ev.strike,
+            "expiry":             str(ev.expiry),
+            "dte":                ev.dte,
+            "alert_level":        alert_level,
+            "direction":          direction,
+            "total_premium":      sig_ep.total_premium,
+            "trade_count":        sig_ep.trade_count,
+            "is_sweep":           sig_ep.is_sweep,
+            "is_multi_day_repeat": _is_multi_day_repeat,
+            "strong_sentiment":   _strong_sentiment,
+            "execution_mechanic": _execution_mechanic,
+        })
+    )
+
+    _sig_min_premium = _resolve_signal_min_premium()
+    if sig_ep.total_premium < _sig_min_premium:
+        return
+
+    _evict_signal_emit_cache(_now)
+    _evict_lookback_result_cache(_now)
+
+    should_emit, reason = _should_emit_signal(
+        emit_key, alert_level, sig_ep.total_premium, _now
+    )
+    if not should_emit:
+        _stats["sig_debounced"] += 1
+        log.info(
+            "[sig-debounce] suppressed %s %s — %s",
+            ev.ticker, alert_level, reason,
+        )
+        return
+
+    _signal_last_emit[emit_key] = {
+        "ts":          _now,
+        "alert_level": alert_level,
+        "premium":     sig_ep.total_premium,
+    }
+
+    _stats["signals"] += 1
+
+    try:
+        composite = build_composite(sig_ep)
+        _composite_tier = episode_influence_tier(sig_ep)
+    except Exception as exc:
+        _stats["composite_errors"] += 1
+        log.warning("[composite] build_composite failed for %s: %s", occ_symbol, exc)
+        return
+
+    log.info(
+        "[signal] %s %s $%.0f %s | alert=%s dir=%s trades=%d prem=$%.0f "
+        "sweep=%s repeat=%s sentiment=%s composite=%.3f tier=%s reason=%s",
+        ev.ticker, ev.contract_type, ev.strike, ev.expiry,
+        alert_level, direction,
+        sig_ep.trade_count, sig_ep.total_premium,
+        sig_ep.is_sweep, _is_multi_day_repeat,
+        ev.sentiment,
+        composite.score, _composite_tier,
+        reason,
+    )
+
+    await bus.publish_all(
+        "composite_signal",
+        {
+            "occ_symbol":         occ_symbol,
+            "ticker":             ev.ticker,
+            "contract_type":      ev.contract_type,
+            "strike":             float(ev.strike),
+            "expiry":             str(ev.expiry),
+            "dte":                ev.dte,
+            "alert_level":        alert_level,
+            "direction":          direction,
+            "total_premium":      sig_ep.total_premium,
+            "trade_count":        sig_ep.trade_count,
+            "is_sweep":           sig_ep.is_sweep,
+            "is_multi_day_repeat": _is_multi_day_repeat,
+            "strong_sentiment":   _strong_sentiment,
+            "execution_mechanic": _execution_mechanic,
+            "composite_score":    composite.score,
+            "composite_tier":     _composite_tier,
+            "signal_reason":      reason,
+            "s1_score":           composite.s1_score,
+            "s2_score":           composite.s2_score,
+            "s3_score":           composite.s3_score,
+            "s4_score":           composite.s4_score,
+            "s5_score":           composite.s5_score,
+            "s6_score":           composite.s6_score,
+        },
+    )
