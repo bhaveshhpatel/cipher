@@ -203,6 +203,16 @@ Fix (ALERT-LEVEL 2026-05-10): call accumulator.get_alert_level(sig_ep) instead
   resolved tier-aware alert level string is accumulator.get_alert_level(sig_ep)
   — consistent with how the test contracts are written and how the accumulator
   encapsulates alert-level resolution logic.
+
+Fix (LAT-1 2026-05-10): guard composite=None after build_composite().
+  build_composite() can legitimately return None when the episode does not
+  have enough data for a composite score (cold accumulator, insufficient
+  trades, etc.). The try/except block caught exceptions but did not handle
+  the None return — composite.score on the next line raised AttributeError.
+  Fix: after the try/except, check `if composite is None: return`. Correct
+  semantics: no composite score available means no bus publish for this tick.
+  This is also the path exercised by test_lat_benchmark (LAT-1), which
+  patches build_composite to return None to measure pure hot-path overhead.
 """
 import asyncio
 import logging
@@ -793,6 +803,11 @@ async def _process_trade(raw: dict):
       target patched in tests — reading the attribute directly bypassed the
       patch and returned a raw MagicMock on test sig_ep objects.
 
+    LAT-1 (2026-05-10): guard composite=None after build_composite().
+      build_composite() can return None (no composite score available yet).
+      Added None check before accessing composite.score — if None, return
+      without publishing to bus. Correct behavior: no composite = no signal.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -1130,6 +1145,16 @@ async def _process_trade(raw: dict):
     except Exception as exc:
         _stats["composite_errors"] += 1
         log.warning("[composite] build_composite failed for %s: %s", occ_symbol, exc)
+        return
+
+    # LAT-1: build_composite() can legitimately return None when the episode
+    # does not yet have enough data for a composite score (e.g. cold accumulator,
+    # insufficient S-formula inputs). None is not an error — no bus publish.
+    if composite is None:
+        log.debug(
+            "[composite] no composite score for %s — skipping bus publish",
+            occ_symbol,
+        )
         return
 
     log.info(
