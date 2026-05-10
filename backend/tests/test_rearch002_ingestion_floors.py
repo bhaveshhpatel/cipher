@@ -9,6 +9,12 @@ Test matrix:
   QA-2  — TTL cache refresh test (monkeypatch _fetch_from_db + time.monotonic)
   QA-3  — apply_config() index symbol rejection (REARCH-001 follow-on)
   QA-4  — Admin PATCH range validation (422 on out-of-range + unknown keys)
+
+ING-012 note: influence_tier_string() and _INT_TIER_TO_STRING have been
+removed from symbol_registry.py. The processor's tier-aware gate now receives
+an integer tier (1/2/3) directly via influence_tier_int(). All tests below
+pass integer tier values to match the live code path. The former string labels
+('INSTITUTIONAL', 'LARGE', 'RETAIL') are retired and must not be re-introduced.
 """
 from __future__ import annotations
 
@@ -33,10 +39,17 @@ def _ev(
     dte: int = 30,
     premium: int = 25_000,
     open_interest: int = 50,
-    influence_tier: str = "INSTITUTIONAL",
+    influence_tier: int = 1,   # ING-012: int tier (1=T1, 2=T2, 3=T3). No string labels.
     is_aggressive: bool = True,
 ) -> types.SimpleNamespace:
-    """Build a minimal duck-typed event object for testing."""
+    """Build a minimal duck-typed event object for testing.
+
+    influence_tier must be an int (1, 2, or 3).  The former string labels
+    ('INSTITUTIONAL', 'LARGE', 'RETAIL') were removed with ING-012 when
+    influence_tier_string() / _INT_TIER_TO_STRING were deleted from
+    symbol_registry.py.  Passing a string here would test a dead code path
+    and silently fall through to the T3 default — masking misclassification.
+    """
     return types.SimpleNamespace(
         dte=dte,
         premium=premium,
@@ -95,44 +108,54 @@ def test_dte_above_ceiling():
 
 # ---------------------------------------------------------------------------
 # QA-1 — Gate 3: Tier-aware premium floor
+#
+# ING-012: influence_tier is int (1/2/3). T1=INSTITUTIONAL, T2=LARGE, T3=RETAIL
+# in Steamroom vocabulary but the processor receives the integer directly from
+# influence_tier_int() — no string intermediary exists anymore.
 # ---------------------------------------------------------------------------
 
 def test_premium_t1_exactly_at_floor():
-    ev = _ev(premium=25_000, influence_tier="INSTITUTIONAL")
+    ev = _ev(premium=25_000, influence_tier=1)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
 
 
 def test_premium_t1_one_below_floor():
-    ev = _ev(premium=24_999, influence_tier="INSTITUTIONAL")
+    ev = _ev(premium=24_999, influence_tier=1)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is None
     assert get_drop_stats()["dropped_min_premium"] == 1
 
 
 def test_premium_t2_exactly_at_floor():
-    ev = _ev(premium=15_000, influence_tier="LARGE")
+    ev = _ev(premium=15_000, influence_tier=2)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
 
 
 def test_premium_t2_one_below_floor():
-    ev = _ev(premium=14_999, influence_tier="LARGE")
+    ev = _ev(premium=14_999, influence_tier=2)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is None
     assert get_drop_stats()["dropped_min_premium"] == 1
 
 
 def test_premium_t3_exactly_at_floor():
-    ev = _ev(premium=5_000, influence_tier="RETAIL")
+    ev = _ev(premium=5_000, influence_tier=3)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
 
 
 def test_premium_t3_one_below_floor():
-    ev = _ev(premium=4_999, influence_tier="RETAIL")
+    ev = _ev(premium=4_999, influence_tier=3)
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is None
     assert get_drop_stats()["dropped_min_premium"] == 1
 
 
 def test_unknown_tier_uses_t3_floor():
-    """Unknown tier strings must default to T3 (most permissive floor is T3)."""
-    ev = _ev(premium=5_000, influence_tier="UNKNOWN")
+    """Tier value outside 1/2/3 must default to T3 (most permissive floor).
+
+    Uses 0 as the unknown sentinel. The processor calls .get(tier, default_t3)
+    so any value not in {1, 2, 3} falls to T3. This is the only test that
+    intentionally passes an out-of-range tier int — it documents the fallback
+    contract, not a valid runtime value.
+    """
+    ev = _ev(premium=5_000, influence_tier=0)  # 0 is not a valid tier; falls to T3
     assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
 
 
