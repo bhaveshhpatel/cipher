@@ -136,12 +136,13 @@ Fix (ING-010-DUP 2026-05-07): remove duplicate gate_config_store.load() call.
 
 Fix (ING-010-DEDUP 2026-05-07): thread tier_int into flow_dedup.is_duplicate().
   DedupCache.is_duplicate() now accepts an optional tier_int kwarg (dedup.py
-  ING-010 fix). _process_trade() resolves ev.influence_tier -> tier_int via
-  _INFLUENCE_TIER_TO_INT after parse (ev is available) and passes it to
-  is_duplicate(). This enables DedupCache to read dedup_window_ms per tier
-  from gate_config_store instead of using the flat 5.0s construction default.
-  Zero additional registry lookups — O(1) dict access on the already-available
-  ev.influence_tier string.
+  ING-010 fix). _process_trade() resolves tier_int via _resolve_min_premium's
+  registry path (pre-parse _raw_ticker) and passes it to is_duplicate().
+  This enables DedupCache to read dedup_window_ms per tier from gate_config_store.
+  Zero additional registry lookups — O(1) dict access.
+  NOTE (REARCH-010 2026-05-09): ev.influence_tier no longer exists on
+  OptionsFlowEvent (column dropped in migration 024). tier_int is now derived
+  from the pre-parse registry lookup via _resolve_min_premium path.
 
 Fix (ING-010-IMPORT 2026-05-07): import store as gate_config_store.
   The previous import `from services.gate_config_store import gate_config_store`
@@ -183,6 +184,14 @@ Fix (ING-011-EXPAND 2026-05-08): expand _INDEX_SYMBOLS to cover leveraged ETFs.
     - High-volume sector noise: XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
   No logic changes — only frozenset membership expanded.
   gate_configs exclude_indices boolean toggle continues to control the gate on/off.
+
+Fix (REARCH-010 2026-05-09): drop influence_tier, conviction_score, is_golden_sweep
+  from persist_flow_event() call and from the debug log line.
+  Migration 024 dropped these three columns from options_flow_events; writing
+  them caused column-not-found errors at runtime. The debug log line referenced
+  ev.conviction_score and ev.influence_tier which no longer exist on
+  OptionsFlowEvent post-REARCH-010. _ev_tier_int derivation moved to use the
+  pre-parse registry lookup result already available in the _raw_ticker path.
 """
 import asyncio
 import logging
@@ -303,11 +312,9 @@ _LBC_TTL_S = 7_200.0
 
 # ---------------------------------------------------------------------------
 # ING-010: Tier string -> int mapping for gate_config_store lookups.
-# influence_tier on OptionsFlowEvent is a string ("WHALE"/"INSTITUTIONAL"/
-# "LARGE"/"RETAIL"). gate_config_store uses int tiers 1/2/3.
-# T1 = WHALE/INSTITUTIONAL (largest flows, tightest floors)
-# T2 = LARGE (mid-tier)
-# T3 = RETAIL / unknown (smallest flows, most conservative floor = 10_000)
+# REARCH-010 (2026-05-09): ev.influence_tier no longer exists on
+# OptionsFlowEvent (column dropped in migration 024). This map is still used
+# for pre-parse _raw_ticker registry lookups via _resolve_min_premium.
 # ---------------------------------------------------------------------------
 _INFLUENCE_TIER_TO_INT: dict[str, int] = {
     "WHALE":         1,
@@ -406,6 +413,41 @@ def _resolve_min_premium(ticker: str) -> int:
         return gate_config_store.get("min_premium", tier_int)
     except Exception:
         return 10_000
+
+
+# ---------------------------------------------------------------------------
+# ING-010: Tier-aware tier_int resolver (pre-parse, from registry)
+# REARCH-010: ev.influence_tier no longer available post-parse; derive tier_int
+# from registry using the raw ticker extracted before parse_tradier_trade().
+# ---------------------------------------------------------------------------
+def _resolve_tier_int(raw_ticker: str) -> int:
+    """
+    Resolve the dedup tier_int for a ticker using the symbol registry.
+
+    Used by _process_trade() to pass tier_int to flow_dedup.is_duplicate()
+    without relying on ev.influence_tier (removed in REARCH-010/migration 024).
+
+    Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
+    Never raises.
+    """
+    try:
+        reg = None
+        try:
+            from services.symbol_registry import get_registry as _get_reg
+            reg = _get_reg()
+        except Exception:
+            pass
+
+        tier_str = "RETAIL"
+        if reg is not None and reg.is_ready():
+            try:
+                tier_str = reg.influence_tier_string(raw_ticker) or "RETAIL"
+            except Exception:
+                tier_str = "RETAIL"
+
+        return _INFLUENCE_TIER_TO_INT.get(tier_str, _DEFAULT_TIER_INT)
+    except Exception:
+        return _DEFAULT_TIER_INT
 
 
 # ---------------------------------------------------------------------------
@@ -693,8 +735,10 @@ async def _process_trade(raw: dict):
     ING-010-GATES addition: signal_min_premium resolved live per-tick from
       gate_config_store (T1 canonical row). Fallback: _SIGNAL_MIN_PREMIUM.
 
-    ING-010-DEDUP addition: ev.influence_tier -> tier_int threaded into
-      flow_dedup.is_duplicate() so DedupCache reads dedup_window_ms per tier.
+    ING-010-DEDUP addition: tier_int threaded into flow_dedup.is_duplicate()
+      so DedupCache reads dedup_window_ms per tier. Derived via _resolve_tier_int()
+      from the pre-parse _raw_ticker (registry lookup). Not from ev.influence_tier
+      which no longer exists on OptionsFlowEvent post REARCH-010/migration 024.
 
     ING-011 addition: exclude_indices gate.
       After _raw_ticker is extracted (pre-parse), if _resolve_exclude_indices()
@@ -709,6 +753,10 @@ async def _process_trade(raw: dict):
       direction are resolved — before the signal_min_premium and SIG-DEBOUNCE
       checks. This ensures every accumulator Gate-2 crossing is recorded even
       when the signal_min_premium gate or debounce suppresses bus emission.
+
+    REARCH-010 (2026-05-09): influence_tier, conviction_score, is_golden_sweep
+      removed from persist_flow_event() dict and debug log. These columns were
+      dropped from options_flow_events in migration 024.
 
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
@@ -791,6 +839,10 @@ async def _process_trade(raw: dict):
 
     _tier_min_premium = _resolve_min_premium(_raw_ticker) if _raw_ticker else None
 
+    # REARCH-010: derive tier_int from pre-parse registry lookup.
+    # ev.influence_tier is no longer available (dropped in migration 024).
+    _ev_tier_int: int = _resolve_tier_int(_raw_ticker) if _raw_ticker else _DEFAULT_TIER_INT
+
     result = parse_tradier_trade(trade_payload, min_premium=_tier_min_premium)
     if result == "below_premium":
         return
@@ -813,13 +865,6 @@ async def _process_trade(raw: dict):
     occ_symbol = trade_payload.get("symbol", "")
     exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
     arrival_ts = _time.time()
-
-    # ING-010-DEDUP: derive tier_int from ev.influence_tier (set by parser from
-    # OCC metadata — more accurate than the pre-parse _raw_ticker quick-extract).
-    # Passed to is_duplicate() so DedupCache uses the per-tier dedup_window_ms.
-    _ev_tier_int: int = _INFLUENCE_TIER_TO_INT.get(
-        getattr(ev, "influence_tier", ""), _DEFAULT_TIER_INT
-    )
 
     if flow_dedup.is_duplicate(
         occ_symbol,
@@ -873,6 +918,8 @@ async def _process_trade(raw: dict):
     _stats["classified"] += 1
     _stats["last_tick_at"] = _time.time()
 
+    # REARCH-010: conviction_score and influence_tier removed from OptionsFlowEvent
+    # (columns dropped in migration 024). Log only fields that still exist on the model.
     log.debug(
         f"[flow] {ev.ticker} {ev.contract_type} "
         f"${ev.strike:.2f} {ev.expiry} dte={ev.dte} "
@@ -880,8 +927,8 @@ async def _process_trade(raw: dict):
         f"| prem=${ev.premium:,.0f} "
         f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
         f"| type={ev.trade_type} exch={exchange} exch_count={ev.exchange_count} "
-        f"| sentiment={ev.sentiment} tier={ev.influence_tier} "
-        f"| conviction={ev.conviction_score} occ={occ_symbol} "
+        f"| sentiment={ev.sentiment} "
+        f"| occ={occ_symbol} "
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
@@ -956,10 +1003,7 @@ async def _process_trade(raw: dict):
                 "trade_type":           ev.trade_type,
                 "bid_ask_class":        ev.bid_ask_class,
                 "is_aggressive":        ev.is_aggressive,
-                "is_golden_sweep":      ev.is_golden_sweep,
                 "sentiment":            ev.sentiment,
-                "influence_tier":       ev.influence_tier,
-                "conviction_score":     ev.conviction_score,
                 "exchange_count":       ev.exchange_count,
                 "fill_count":           ev.fill_count,
                 "open_interest":        ev.open_interest,
