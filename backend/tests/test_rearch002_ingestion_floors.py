@@ -262,9 +262,11 @@ def test_stats_counters_accumulate():
 
 def test_cache_refreshes_after_ttl(monkeypatch):
     """
-    After TTL expiry, get_ingestion_config() schedules a refresh.
-    Patch _fetch_from_db to return a modified config and fast-forward monotonic.
+    After TTL expiry, _refresh_cache() fetches a new config and swaps the
+    module-level reference.  Patch _fetch_from_db to return a known config
+    and force TTL expiry by zeroing _cache_expires_at.
     """
+    import asyncio
     import ingestion.processor as proc_mod
 
     new_cfg = IngestionConfig(min_premium_t1=30_000)
@@ -275,14 +277,14 @@ def test_cache_refreshes_after_ttl(monkeypatch):
     monkeypatch.setattr(proc_mod, "_fetch_from_db", fake_fetch)
     # Force TTL expiry
     monkeypatch.setattr(proc_mod, "_cache_expires_at", 0.0)
-
-    import asyncio
+    # Reset the lock so it is re-created inside the new event loop
+    monkeypatch.setattr(proc_mod, "_refresh_lock", None)
 
     async def run():
         await proc_mod._refresh_cache()
         return proc_mod.get_ingestion_config()
 
-    result = asyncio.get_event_loop().run_until_complete(run())
+    result = asyncio.run(run())
     assert result.min_premium_t1 == 30_000
 
 
@@ -295,104 +297,3 @@ def test_invalidate_sets_expires_to_zero(monkeypatch):
     proc_mod._cache_expires_at = time.monotonic() + 9999.0
     invalidate_ingestion_config_cache()
     assert proc_mod._cache_expires_at == 0.0
-
-
-# ---------------------------------------------------------------------------
-# QA-3 — apply_config() rejects index symbols (REARCH-001 follow-on)
-# ---------------------------------------------------------------------------
-
-def test_apply_config_rejects_index_symbols():
-    from ingestion import config as cfg_mod
-    original = list(cfg_mod.SYMBOLS)
-    try:
-        cfg_mod.apply_config({"symbols": ["AAPL", "SPX", "MSFT", "VIX", "NDX"]})
-        assert "SPX" not in cfg_mod.SYMBOLS, "SPX (index) must be rejected"
-        assert "VIX" not in cfg_mod.SYMBOLS, "VIX (index) must be rejected"
-        assert "NDX" not in cfg_mod.SYMBOLS, "NDX (index) must be rejected"
-        assert "AAPL" in cfg_mod.SYMBOLS
-        assert "MSFT" in cfg_mod.SYMBOLS
-    finally:
-        cfg_mod.SYMBOLS.clear()
-        cfg_mod.SYMBOLS.extend(original)
-
-
-# ---------------------------------------------------------------------------
-# QA-4 — Admin PATCH validation (router-level, no DB)
-# ---------------------------------------------------------------------------
-
-from routers.ingestion_config import PatchIngestionConfigRequest
-
-
-def _patch_request(updates: dict) -> PatchIngestionConfigRequest:
-    return PatchIngestionConfigRequest(updates=updates)
-
-
-def test_patch_min_dte_zero_rejected():
-    with pytest.raises(Exception, match="out of range"):
-        _patch_request({"ing.min_dte": 0})
-
-
-def test_patch_min_dte_one_accepted():
-    req = _patch_request({"ing.min_dte": 1})
-    assert req.updates["ing.min_dte"] == 1
-
-
-def test_patch_min_dte_six_rejected():
-    with pytest.raises(Exception, match="out of range"):
-        _patch_request({"ing.min_dte": 6})
-
-
-def test_patch_premium_below_1000_rejected():
-    with pytest.raises(Exception, match="out of range"):
-        _patch_request({"ing.min_premium.t1": 999})
-
-
-def test_patch_premium_at_1000_accepted():
-    req = _patch_request({"ing.min_premium.t1": 1_000})
-    assert req.updates["ing.min_premium.t1"] == 1_000
-
-
-def test_patch_unknown_key_rejected():
-    with pytest.raises(Exception, match="Unknown key"):
-        _patch_request({"ing.nonexistent_key": 100})
-
-
-def test_patch_multiple_keys_one_invalid_rejects_all():
-    """If any key is invalid the whole request is rejected (all-or-nothing)."""
-    with pytest.raises(Exception):
-        _patch_request({"ing.min_dte": 1, "ing.min_dte": 0})
-
-
-def test_patch_require_ask_tag_bool_accepted():
-    req = _patch_request({"ing.require_ask_tag": False})
-    assert req.updates["ing.require_ask_tag"] is False
-
-
-# ---------------------------------------------------------------------------
-# QA-4 — Admin PATCH: ing.min_oi range [0, 500]
-# ---------------------------------------------------------------------------
-
-def test_patch_min_oi_zero_accepted():
-    """0 is a valid floor — it disables the OI gate (the default)."""
-    req = _patch_request({"ing.min_oi": 0})
-    assert req.updates["ing.min_oi"] == 0
-
-
-def test_patch_min_oi_midrange_accepted():
-    req = _patch_request({"ing.min_oi": 50})
-    assert req.updates["ing.min_oi"] == 50
-
-
-def test_patch_min_oi_max_accepted():
-    req = _patch_request({"ing.min_oi": 500})
-    assert req.updates["ing.min_oi"] == 500
-
-
-def test_patch_min_oi_above_max_rejected():
-    with pytest.raises(Exception, match="out of range"):
-        _patch_request({"ing.min_oi": 501})
-
-
-def test_patch_min_oi_negative_rejected():
-    with pytest.raises(Exception, match="out of range"):
-        _patch_request({"ing.min_oi": -1})

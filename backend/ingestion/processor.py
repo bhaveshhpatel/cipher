@@ -316,10 +316,16 @@ class IngestionProcessor:
         # (_ev_tier_int from pre-parse registry lookup).  Fall back to the
         # legacy attribute for callers that still set it (e.g. older unit tests),
         # then default to T3 if neither is available.
+        #
+        # IMPORTANT: always pipe through _tier_int_to_str() — ev.influence_tier
+        # is an int (1/2/3) and _premium_floor() compares against string
+        # constants.  Without conversion, int 1 != "INSTITUTIONAL" and the T3
+        # floor silently wins for every T1/T2 event.
         if tier is not None:
             influence_tier = _tier_int_to_str(tier)
         else:
-            influence_tier = getattr(ev, "influence_tier", _TIER_T3)
+            raw = getattr(ev, "influence_tier", None)
+            influence_tier = _tier_int_to_str(raw) if isinstance(raw, int) else (raw or _TIER_T3)
 
         # Gate 1 — DTE hard floor
         if dte < cfg.min_dte:
