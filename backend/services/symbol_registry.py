@@ -63,15 +63,18 @@ FIX B-ZERO-PRICE (2026-04-29): When _fetch_stock_prices() returns 0 prices,
     bypasses the ATM filter (atm_low=0, atm_high=inf) rather than returning.
     DTE gating via tier params still applies normally.
 
-FIX ING-010 (2026-05-07): Add influence_tier_int() and influence_tier_string().
-  _resolve_min_premium() in tradier_stream.py calls influence_tier_string(ticker)
-  to resolve the per-ticker flow-influence bucket (WHALE/INSTITUTIONAL/LARGE/
-  RETAIL) before looking up the gate floor in gate_config_store.
-  influence_tier_int() exposes the raw _tier_map int for callers that need
-  the numeric key directly (e.g. gate_config_store.get("min_premium", tier_int)).
-  Both methods fall back to the most conservative value (3 / "RETAIL") when
-  the ticker is absent from _tier_map, matching the T3 defaults in
-  gate_config_store and the _DEFAULT_TIER_INT constant in tradier_stream.
+FIX ING-010 (2026-05-07): Add influence_tier_int() as the sole tier accessor.
+  _resolve_min_premium() in tradier_stream.py calls influence_tier_int(ticker)
+  directly to get the integer tier (1/2/3) and passes it straight to
+  gate_config_store.get("min_premium", tier_int). No string intermediary.
+  Fallback: 3 (most conservative / T3 defaults) for unknown tickers.
+
+  NOTE: The former influence_tier_string() method and _INT_TIER_TO_STRING dict
+  have been removed (ING-012). The int→string→int round-trip they introduced
+  was pure overhead — influence_tier_int() already returns the int directly.
+  episode_influence_tier() in composite_signal_engine.py is a separate,
+  orthogonal function that classifies episode premium size (WHALE/INSTITUTIONAL/
+  LARGE/RETAIL) and is unrelated to symbol tier; it is untouched.
 
 ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
   self.epoch: int is initialised to 0 in __init__ and incremented inside the
@@ -128,24 +131,6 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 log = logging.getLogger("symbol_registry")
 
 _DEFAULT_BUILD_CONCURRENCY = 50
-
-# ---------------------------------------------------------------------------
-# ING-010: int tier -> influence string mapping.
-# Kept at module level so tests can import and assert against it directly
-# without needing a live SymbolRegistry instance.
-#
-# T1 maps to "INSTITUTIONAL" (not "WHALE") because SymbolRegistry tier
-# assignment via assign_tiers() produces ints 1/2/3 and has no separate
-# "WHALE" bucket at the registry level. tradier_stream._INFLUENCE_TIER_TO_INT
-# maps both "WHALE" and "INSTITUTIONAL" to T1, so either label resolves
-# to the same gate floor. "INSTITUTIONAL" is chosen as the canonical T1
-# label to avoid confusion about what the registry actually knows.
-# ---------------------------------------------------------------------------
-_INT_TIER_TO_STRING: dict[int, str] = {
-    1: "INSTITUTIONAL",
-    2: "LARGE",
-    3: "RETAIL",
-}
 
 
 @dataclass
@@ -253,44 +238,27 @@ class SymbolRegistry:
         return dict(self._oi_by_ticker)
 
     # -----------------------------------------------------------------------
-    # ING-010: Tier accessors used by _resolve_min_premium() in
+    # ING-010: Tier accessor used by _resolve_min_premium() in
     # tradier_stream.py to resolve the per-ticker gate floor.
+    #
+    # influence_tier_int() is the sole accessor — returns the int tier
+    # directly so callers can pass it straight to
+    # gate_config_store.get("min_premium", tier_int) with no string hop.
     # -----------------------------------------------------------------------
 
     def influence_tier_int(self, ticker: str) -> int:
         """
         Return the integer tier (1/2/3) for ticker from _tier_map.
 
-        Fallback: 3 (RETAIL / most conservative floor) for any ticker not
-        present in the map. This matches _DEFAULT_TIER_INT in tradier_stream
-        and the T3 defaults seeded into gate_config_store.
+        Fallback: 3 (most conservative / T3 defaults) for any ticker not
+        present in the map. This matches the fallback constant formerly
+        named _DEFAULT_TIER_INT in tradier_stream and the T3 defaults
+        seeded into gate_config_store.
 
         Thread-safe for reads: _tier_map is replaced atomically at the end of
         build() inside the build lock; dict.get() is safe under the GIL.
         """
         return self._tier_map.get(ticker, 3)
-
-    def influence_tier_string(self, ticker: str) -> str:
-        """
-        Return the human-readable influence tier label for ticker.
-
-        Resolution: _tier_map int -> _INT_TIER_TO_STRING.
-
-        Return values: "INSTITUTIONAL" | "LARGE" | "RETAIL"
-        Fallback:      "RETAIL" for unknown tickers or unexpected int values.
-
-        Used by _resolve_min_premium() in tradier_stream.py:
-          tier_str = reg.influence_tier_string(ticker)  # e.g. "INSTITUTIONAL"
-          tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, 3)  # -> 1
-          floor    = gate_config_store.get("min_premium", tier_int)  # -> 5_000
-
-        Note: tradier_stream._INFLUENCE_TIER_TO_INT also maps "WHALE" -> 1.
-        The registry has no separate WHALE bucket (assign_tiers produces
-        1/2/3 only), so "INSTITUTIONAL" is the canonical T1 string here.
-        Both map to the same gate floor via tradier_stream's dict.
-        """
-        tier_int = self._tier_map.get(ticker, 3)
-        return _INT_TIER_TO_STRING.get(tier_int, "RETAIL")
 
     async def load_from_db(self, snapshot_id: str) -> int:
         chain = await load_chain(snapshot_id)
