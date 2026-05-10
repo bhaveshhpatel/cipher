@@ -27,6 +27,19 @@ Fix (2026-05-01): Reset module-level _signal_last_emit and _stats["ticks"] befor
   does not suppress signals in subsequent tests (C008-2, C008-4 were failing because
   the first-crossing emit-key written by C008-1/C008-3 caused _should_emit_signal to
   return should_emit=False in later tests).
+
+Fix (REARCH-002 2026-05-10): patch _ingestion_processor in all _process_trade tests.
+  With REARCH-002 wired, the real IngestionProcessor runs against the MagicMock ev;
+  its numeric gate checks (ev.dte >= min_dte, ev.open_interest >= min_oi, etc.) get
+  MagicMock values back and the processor returns None, dropping the tick before
+  persist_flow_event is ever reached. Fix: mock _ingestion_processor.process to
+  return ev (pass-through) in every test that calls _process_trade.
+
+Fix (REARCH-002 composite 2026-05-10): C008-2 and C008-4 patched build_composite
+  to return_value=None, which hits the LAT-1 'if composite is None: return' guard
+  and exits before bus.publish_all. Fix: replace None patch with a mock composite
+  object that has .score and .s1_score-.s6_score so the log line and bus.publish_all
+  can execute.
 """
 import asyncio
 import sys
@@ -109,6 +122,19 @@ def _make_ep(trade_count=3, total_premium=300_000.0):
     return ep
 
 
+def _make_composite():
+    """Mock composite object with all fields accessed by _process_trade after build_composite()."""
+    c = MagicMock()
+    c.score = 0.75
+    c.s1_score = 0.8
+    c.s2_score = 0.7
+    c.s3_score = 0.75
+    c.s4_score = 0.6
+    c.s5_score = 0.8
+    c.s6_score = 0.7
+    return c
+
+
 def _reset_stream_state():
     """Reset module-level mutable state in tradier_stream between tests.
 
@@ -137,7 +163,11 @@ class TestC008PersistDuringCooldown:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
@@ -168,11 +198,18 @@ class TestC008BothFireAfterCooldown:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_composite = _make_composite()
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=mock_composite), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -200,7 +237,11 @@ class TestC008SubThresholdNeither:
         ev = _make_ev()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
@@ -231,11 +272,18 @@ class TestC008FirstCrossingBothFire:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_composite = _make_composite()
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=mock_composite), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -360,7 +408,11 @@ class TestC008DedupRegression:
         ev = _make_ev()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
