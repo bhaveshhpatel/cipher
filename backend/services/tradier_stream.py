@@ -183,6 +183,14 @@ Fix (ING-011-EXPAND 2026-05-08): expand _INDEX_SYMBOLS to cover leveraged ETFs.
     - High-volume sector noise: XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
   No logic changes — only frozenset membership expanded.
   gate_configs exclude_indices boolean toggle continues to control the gate on/off.
+
+Fix (REARCH-010-STAGE6 2026-05-09): remove retired fields from write paths.
+  flow_score removed from composite_msg signal dict (live path and demo mode).
+  is_golden_sweep, influence_tier, conviction_score removed from the
+  persist_flow_event() dict — these columns were dropped in Supabase migration
+  rearch_010_stage6_drop_retired_columns. These fields remain valid on the
+  parsed OptionsFlowEvent object and inside composite_signal_engine internals;
+  only their presence in DB write dicts and bus payloads is removed.
 """
 import asyncio
 import logging
@@ -712,6 +720,8 @@ async def _process_trade(raw: dict):
 
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
+    REARCH-010-STAGE6 (2026-05-09): removed is_golden_sweep, influence_tier,
+      conviction_score from persist_flow_event dict — columns dropped in DB.
     """
     global _last_gate_epoch
 
@@ -956,10 +966,7 @@ async def _process_trade(raw: dict):
                 "trade_type":           ev.trade_type,
                 "bid_ask_class":        ev.bid_ask_class,
                 "is_aggressive":        ev.is_aggressive,
-                "is_golden_sweep":      ev.is_golden_sweep,
                 "sentiment":            ev.sentiment,
-                "influence_tier":       ev.influence_tier,
-                "conviction_score":     ev.conviction_score,
                 "exchange_count":       ev.exchange_count,
                 "fill_count":           ev.fill_count,
                 "open_interest":        ev.open_interest,
@@ -1102,7 +1109,6 @@ async def _process_trade(raw: dict):
                     "recommendation":          composite.recommendation,
                     "composite_score":         composite.composite_score,
                     "composite_score_ceiling": COMPOSITE_SCORE_CEILING,
-                    "flow_score":              composite.flow_score,
                     "backtest_score":          composite.backtest_score,
                     "volume_premium_factor":   composite.volume_premium_factor,
                     "premium_tier_score":      composite.premium_tier_score,
@@ -1188,7 +1194,6 @@ async def _demo_mode_once(symbols: list[str]):
                         "recommendation":          rec,
                         "composite_score":         composite_score,
                         "composite_score_ceiling": COMPOSITE_SCORE_CEILING,
-                        "flow_score":              round(rng.uniform(0.4, 0.9), 3),
                         "backtest_score":          0.0,
                         "volume_premium_factor":   round(rng.uniform(0.3, 0.8), 3),
                         "premium_tier_score":      round(rng.uniform(0.0, 1.0), 3),
