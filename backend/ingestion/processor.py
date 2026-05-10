@@ -10,7 +10,8 @@ must pass before it reaches the signal engines.  Gates are evaluated in order:
      T1 (INSTITUTIONAL) : ing.min_premium.t1  (default $25 000)
      T2 (LARGE)         : ing.min_premium.t2  (default $15 000)
      T3 (RETAIL)        : ing.min_premium.t3  (default $5 000)
-  4. Open-interest floor  (min_oi — default 50 contracts)
+  4. Open-interest floor  (min_oi — default 0; new-chain events must reach
+     signal engines — Vol>OI conviction gating is REARCH-006 signal logic)
 
 Note on require_ask_tag (ing.require_ask_tag):
   This flag is stored in ingestion_config and exposed in IngestionConfig but
@@ -98,7 +99,7 @@ class IngestionConfig:
     min_premium_t1:  int  = 25_000
     min_premium_t2:  int  = 15_000
     min_premium_t3:  int  = 5_000
-    min_oi:          int  = 50
+    min_oi:          int  = 0      # 0 = pass new-chain events; Vol>OI gating is REARCH-006
     require_ask_tag: bool = True   # tagging only — does not gate events
 
 
@@ -337,6 +338,8 @@ class IngestionProcessor:
             return None
 
         # Gate 4 — Open-interest floor (OI sourced from options_chain_cache)
+        # Default is 0 — new-chain events with OI=0 pass through.
+        # Vol>OI conviction gating belongs in signal engines (REARCH-006).
         if open_interest < cfg.min_oi:
             _stats["dropped_min_oi"] += 1
             return None
