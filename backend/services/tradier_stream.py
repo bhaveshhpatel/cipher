@@ -161,30 +161,6 @@ Fix (ING-011 2026-05-07): exclude_indices Gate 6 — index options filter.
   _stats["index_filtered"] counter tracks suppressed index ticks; wired into
   flow-funnel log line (every 100 ticks).
 
-Fix (EPISODE-GATE-HOIST 2026-05-08): hoist persist_flow_episode before signal gate.
-  persist_flow_episode was fired AFTER the signal_min_premium gate, so any
-  episode whose total_premium < signal_min_premium (T1 default 75_000) was
-  never persisted even though Gate-2 of the accumulator had already cleared.
-  This caused test_process_trade_episode_direction_put_is_repeat_sell to fail
-  (SPY PUT total_premium=60_000 < 75_000 signal_min_premium default).
-  Fix: build alert_level/direction immediately after signal-gate pre-checks,
-  then fire persist_flow_episode as asyncio.create_task() unconditionally,
-  then continue with signal_min_premium gate and SIG-DEBOUNCE.
-  Decoupling is now explicit: episode persistence != signal emission.
-
-Fix (ING-011-EXPAND 2026-05-08): expand _INDEX_SYMBOLS to cover leveraged ETFs.
-  TQQQ (3x Nasdaq, 97M avg vol) and SOXL (3x SOX leveraged) were absent from
-  the original frozenset and were classified T1 purely by volume, generating
-  noise-level flow indistinguishable from single-stock whale prints.
-  QQQ and IWM were also missing (only SPY/DIA were included).
-  Added full coverage across four categories:
-    - Leveraged ETFs: TQQQ, TQQQ, SOXL, SOXS, TECS, TECL, UVXY, SVXY
-    - Broad market (missing from v1): QQQ, IWM
-    - Thematic ARK: ARKK, ARKQ, ARKW, ARKG, ARKX
-    - High-volume sector noise: XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
-  No logic changes — only frozenset membership expanded.
-  gate_configs exclude_indices boolean toggle continues to control the gate on/off.
-
 Fix (REARCH-010 2026-05-09): drop influence_tier, conviction_score, is_golden_sweep
   from persist_flow_event() call and from the debug log line.
   Migration 024 dropped these three columns from options_flow_events; writing
@@ -192,6 +168,16 @@ Fix (REARCH-010 2026-05-09): drop influence_tier, conviction_score, is_golden_sw
   ev.conviction_score and ev.influence_tier which no longer exist on
   OptionsFlowEvent post-REARCH-010. _ev_tier_int derivation moved to use the
   pre-parse registry lookup result already available in the _raw_ticker path.
+
+Fix (ING-012 2026-05-10): eliminate influence_tier_string() calls in stream resolvers.
+  ING-012 deleted influence_tier_string() and _INT_TIER_TO_STRING from
+  SymbolRegistry. Both _resolve_min_premium() and _resolve_tier_int() still
+  called reg.influence_tier_string() which raised AttributeError on every tick,
+  causing the entire tier-aware gate to silently fall back to T3 defaults.
+  Fix: call reg.influence_tier_int(ticker) directly — it already returns 1/2/3.
+  The intermediate tier_str variable and _INFLUENCE_TIER_TO_INT.get() lookup
+  are removed from both resolvers. _INFLUENCE_TIER_TO_INT dict is retained
+  for back-compat with existing tests that reference it directly.
 """
 import asyncio
 import logging
@@ -271,7 +257,7 @@ _PROCESSABLE_TYPES = {"timesale"}
 #   Broad-market index ETFs  : SPY, QQQ, IWM, DIA
 #   Volatility products      : VXX, UVXY, SVXY
 #   Commodity/bond ETFs      : GLD, SLV, TLT, HYG, EEM
-#   Leveraged equity ETFs    : TQQQ, SOXL, SOXS, TECS, TECL
+#   Leveraged equity ETFs    : TQQQ, TQQQ, SOXL, SOXS, TECS, TECL
 #   Thematic (ARK)           : ARKK, ARKQ, ARKW, ARKG, ARKX
 #   High-vol sector ETFs     : XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
 _INDEX_SYMBOLS: frozenset[str] = frozenset({
@@ -311,10 +297,11 @@ _SIGNAL_EMIT_TTL_S  = 7_200.0
 _LBC_TTL_S = 7_200.0
 
 # ---------------------------------------------------------------------------
-# ING-010: Tier string -> int mapping for gate_config_store lookups.
-# REARCH-010 (2026-05-09): ev.influence_tier no longer exists on
-# OptionsFlowEvent (column dropped in migration 024). This map is still used
-# for pre-parse _raw_ticker registry lookups via _resolve_min_premium.
+# ING-010: Tier string -> int mapping retained for back-compat with existing
+# tests that reference _INFLUENCE_TIER_TO_INT directly.
+# ING-012: influence_tier_string() deleted from SymbolRegistry — stream
+# resolvers now call influence_tier_int() directly and no longer use this map
+# at runtime. _DEFAULT_TIER_INT is still used as the fallback in resolvers.
 # ---------------------------------------------------------------------------
 _INFLUENCE_TIER_TO_INT: dict[str, int] = {
     "WHALE":         1,
@@ -322,7 +309,7 @@ _INFLUENCE_TIER_TO_INT: dict[str, int] = {
     "LARGE":         2,
     "RETAIL":        3,
 }
-_DEFAULT_TIER_INT = 3  # safe fallback for any unknown influence_tier string
+_DEFAULT_TIER_INT = 3  # safe fallback for unknown tickers / cold registry
 
 # ---------------------------------------------------------------------------
 # Global stats
@@ -379,15 +366,16 @@ def get_stats() -> dict:
 
 # ---------------------------------------------------------------------------
 # ING-010: Tier-aware min_premium resolver
+# ING-012: calls influence_tier_int() directly — influence_tier_string() deleted.
 # ---------------------------------------------------------------------------
 def _resolve_min_premium(ticker: str) -> int:
     """
     Resolve the tier-aware min_premium floor for a given ticker.
 
-    Resolution path:
-      1. Ask the registry for the ticker's influence_tier string.
-      2. Map that string to an int tier (1/2/3) via _INFLUENCE_TIER_TO_INT.
-      3. Read gate_config_store.get("min_premium", tier_int) — O(1) in-memory.
+    Resolution path (ING-012):
+      1. Ask the registry for the ticker's tier via influence_tier_int().
+         Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
+      2. Read gate_config_store.get("min_premium", tier_int) — O(1) in-memory.
 
     Falls back to T3 default (10_000) on any error or missing registry.
     Never raises. Safe on the hot path.
@@ -400,16 +388,13 @@ def _resolve_min_premium(ticker: str) -> int:
         except Exception:
             pass
 
-        tier_str = "RETAIL"  # safe default
+        tier_int = _DEFAULT_TIER_INT  # safe default: T3
         if reg is not None and reg.is_ready():
             try:
-                tier_str = reg.influence_tier_string(ticker) or "RETAIL"
-            except AttributeError:
-                tier_str = "RETAIL"
+                tier_int = reg.influence_tier_int(ticker)
             except Exception:
-                tier_str = "RETAIL"
+                tier_int = _DEFAULT_TIER_INT
 
-        tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, _DEFAULT_TIER_INT)
         return gate_config_store.get("min_premium", tier_int)
     except Exception:
         return 10_000
@@ -417,6 +402,7 @@ def _resolve_min_premium(ticker: str) -> int:
 
 # ---------------------------------------------------------------------------
 # ING-010: Tier-aware tier_int resolver (pre-parse, from registry)
+# ING-012: calls influence_tier_int() directly — influence_tier_string() deleted.
 # REARCH-010: ev.influence_tier no longer available post-parse; derive tier_int
 # from registry using the raw ticker extracted before parse_tradier_trade().
 # ---------------------------------------------------------------------------
@@ -438,14 +424,13 @@ def _resolve_tier_int(raw_ticker: str) -> int:
         except Exception:
             pass
 
-        tier_str = "RETAIL"
         if reg is not None and reg.is_ready():
             try:
-                tier_str = reg.influence_tier_string(raw_ticker) or "RETAIL"
+                return reg.influence_tier_int(raw_ticker)
             except Exception:
-                tier_str = "RETAIL"
+                pass
 
-        return _INFLUENCE_TIER_TO_INT.get(tier_str, _DEFAULT_TIER_INT)
+        return _DEFAULT_TIER_INT
     except Exception:
         return _DEFAULT_TIER_INT
 
@@ -729,7 +714,7 @@ async def _process_trade(raw: dict):
       Before calling parse_tradier_trade(), quick-extract the raw ticker
       from the OCC symbol or underlying field and resolve the tier-aware
       premium floor via _resolve_min_premium(). This is a O(1) dict
-      lookup after the registry tier string is known — zero async I/O.
+      lookup after the registry tier int is known — zero async I/O.
       The resolved floor is passed as min_premium= to parse_tradier_trade().
 
     ING-010-GATES addition: signal_min_premium resolved live per-tick from
@@ -746,6 +731,9 @@ async def _process_trade(raw: dict):
       immediately. No parse cost is incurred. _stats["index_filtered"] is
       incremented and a DEBUG log fires. Gate can be toggled live via the
       PATCH /gates/exclude_indices/1 admin endpoint without stream restart.
+
+    ING-012 (2026-05-10): _resolve_min_premium and _resolve_tier_int now call
+      reg.influence_tier_int() directly. influence_tier_string() was deleted.
 
     EPISODE-GATE-HOIST (2026-05-08): persist_flow_episode fires before signal gate.
       Episode persistence is decoupled from signal emission. persist_flow_episode
