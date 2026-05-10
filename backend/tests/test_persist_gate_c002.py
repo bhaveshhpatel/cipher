@@ -37,6 +37,15 @@ Fix (PBE-CORO-NAME 2026-05-10): AsyncMock coroutines have __name__='_execute_moc
   Also fixed C002-8 _capture arity: bus.publish_all(event_type, data) passes
   two args; _capture(msg) accepted only one -> TypeError. Fixed to
   _capture(event_type, msg) and assertion updated accordingly.
+
+Fix (C002-6 2026-05-10): _track_create_task must return a MagicMock task object.
+  _track_create_task had no return value, so asyncio.create_task() returned None
+  inside _process_trade. The PERSIST-CB done-callback line immediately called
+  _persist_task.add_done_callback(_persist_done_cb) which raised:
+    AttributeError: 'NoneType' object has no attribute 'add_done_callback'
+  Fix: return MagicMock() from _track_create_task. The mock task absorbs
+  .add_done_callback() without raising while the call_order tracking is
+  unaffected.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
@@ -237,7 +246,7 @@ class TestC002ThresholdCrossing:
         ev = _make_ev()
         ep = _make_ep()
         raw = _make_raw()
-        mock_create_task = MagicMock()
+        mock_create_task = MagicMock(return_value=MagicMock())
         # PBE-CORO-NAME: _named_coro_mock ensures coro.__name__ == 'persist_flow_event'.
         mock_persist = _named_coro_mock("persist_flow_event")
 
@@ -276,7 +285,7 @@ class TestC002SubsequentQualifyingTicks:
         ev = _make_ev()
         ep = _make_ep()
         raw = _make_raw()
-        mock_create_task = MagicMock()
+        mock_create_task = MagicMock(return_value=MagicMock())
         # PBE-CORO-NAME: _named_coro_mock ensures coro.__name__ == 'persist_flow_event'.
         mock_persist = _named_coro_mock("persist_flow_event")
 
@@ -319,7 +328,7 @@ class TestC002PersistPayload:
         ep = _make_ep(ticker="NVDA")
         raw = _make_raw(occ="NVDA  260516C00900000", exchange="Q")
 
-        mock_create_task = MagicMock()
+        mock_create_task = MagicMock(return_value=MagicMock())
         # PBE-CORO-NAME: _named_coro_mock ensures coro.__name__ == 'persist_flow_event'.
         mock_persist = _named_coro_mock("persist_flow_event")
 
@@ -395,11 +404,16 @@ class TestC002OrderGuarantee:
             return ep
 
         def _track_create_task(coro):
+            # C002-6: record which coro was scheduled, then return a MagicMock
+            # so _process_trade can call .add_done_callback() on the returned
+            # task without raising AttributeError: 'NoneType' has no attribute
+            # 'add_done_callback'.
             name = getattr(coro, "__name__", None) or getattr(coro, "__qualname__", "")
             if "persist_flow_event" in name:
                 call_order.append("persist")
             if hasattr(coro, "close"):
                 coro.close()
+            return MagicMock()  # fake Task — absorbs .add_done_callback()
 
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
              patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor(ev)), \
@@ -463,7 +477,7 @@ class TestC002BusRegression:
         ev = _make_ev()
         ep = _make_ep()
         raw = _make_raw()
-        mock_create_task = MagicMock()
+        mock_create_task = MagicMock(return_value=MagicMock())
         mock_persist = _named_coro_mock("persist_flow_event")
         published = []
 
