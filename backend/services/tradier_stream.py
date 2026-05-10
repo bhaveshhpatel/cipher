@@ -193,6 +193,16 @@ Fix (SYNTAX-001 2026-05-10): close unclosed paren in persist log.info at line 10
   The log.info() call after _stats["persisted"] += 1 was truncated — missing
   format args and closing paren caused SyntaxError on import, blocking all 7
   test files that transitively import tradier_stream.
+
+Fix (ALERT-LEVEL 2026-05-10): call accumulator.get_alert_level(sig_ep) instead
+  of reading sig_ep.alert_level directly.
+  Reading alert_level = sig_ep.alert_level assumed RepetitionEpisode exposes
+  alert_level as a plain attribute. In tests, sig_ep is a MagicMock so
+  sig_ep.alert_level returns a raw MagicMock object instead of the patched
+  string, causing the ALERT-LEVEL regression. The canonical source of the
+  resolved tier-aware alert level string is accumulator.get_alert_level(sig_ep)
+  — consistent with how the test contracts are written and how the accumulator
+  encapsulates alert-level resolution logic.
 """
 import asyncio
 import logging
@@ -776,6 +786,13 @@ async def _process_trade(raw: dict):
       Gates enforced: DTE floor, DTE ceiling, tier-aware premium floor, OI floor.
       _ev_tier_int (pre-parse registry int) ensures correct T1/T2/T3 floor.
 
+    ALERT-LEVEL (2026-05-10): use accumulator.get_alert_level(sig_ep).
+      alert_level is now resolved by calling accumulator.get_alert_level(sig_ep)
+      rather than reading sig_ep.alert_level directly. The accumulator method
+      is the canonical source of the tier-aware alert level string and is the
+      target patched in tests — reading the attribute directly bypassed the
+      patch and returned a raw MagicMock on test sig_ep objects.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -1055,7 +1072,11 @@ async def _process_trade(raw: dict):
     if sig_ep is None:
         return
 
-    alert_level = sig_ep.alert_level
+    # ALERT-LEVEL: resolved via accumulator.get_alert_level(sig_ep) — the
+    # canonical method that encapsulates tier-aware level logic and is the
+    # target patched in tests. Do NOT read sig_ep.alert_level directly:
+    # on a MagicMock sig_ep that returns a raw MagicMock, not the patched string.
+    alert_level = accumulator.get_alert_level(sig_ep)
     direction   = sig_ep.dominant_direction
 
     asyncio.create_task(
@@ -1063,8 +1084,8 @@ async def _process_trade(raw: dict):
             "occ_symbol":         occ_symbol,
             "ticker":             ev.ticker,
             "contract_type":      ev.contract_type,
-            "strike":             ev.strike,
-            "expiry":             str(ev.expiry),
+            "strike":             sig_ep.strike,
+            "expiry":             str(sig_ep.expiry),
             "dte":                ev.dte,
             "alert_level":        alert_level,
             "direction":          direction,
