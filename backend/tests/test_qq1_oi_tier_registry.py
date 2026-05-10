@@ -14,8 +14,9 @@ Key facts verified:
                             by _build_ticker() to select _TierParams (ATM%, max_dte).
       Pass 2 (final)      — require_oi=True, after OI is known from chain, produces the
                             authoritative _tier_map and stamps meta.tier on every contract.
-  - influence_tier_string() / influence_tier_int() expose the final tier to
-    _resolve_min_premium in the stream layer.
+  - influence_tier_int() is the sole tier accessor post-ING-012 (575dd58 removed
+    influence_tier_string() and _INT_TIER_TO_STRING to eliminate the int→string→int
+    round-trip). It exposes the final tier to _resolve_min_premium in the stream layer.
 
 All tests are pure-unit (no network, no Supabase, no Tradier).
 """
@@ -472,8 +473,6 @@ class TestTierParamsSelectionByBootstrapTier:
         A ticker in a T1 bootstrap position must receive T1-wide _TierParams.
         This ensures the chain is fetched with the maximum ATM/DTE window.
         """
-        # The bootstrap tier_map is built pre-OI with require_oi=False.
-        # Simulate what symbol_registry does: look up tier → select params.
         tier_to_atm = {1: 0.20, 2: 0.15, 3: 0.10}
         tier_to_dte = {1: 90,   2: 60,   3: 30}
 
@@ -495,42 +494,15 @@ class TestTierParamsSelectionByBootstrapTier:
 
 
 # ===========================================================================
-# Section 5 — influence_tier_string / influence_tier_int gateway
+# Section 5 — influence_tier_int() gateway
 # ===========================================================================
 
 class TestInfluenceTierGateway:
     """
-    influence_tier_string() and influence_tier_int() expose the final tier
-    to the stream layer (_resolve_min_premium in tradier_stream).
+    influence_tier_int() is the sole tier accessor post-ING-012.
+    influence_tier_string() and _INT_TIER_TO_STRING were removed in 575dd58
+    to eliminate the int→string→int round-trip in the stream layer.
     """
-
-    def test_influence_tier_string_t1_returns_institutional(self):
-        """Tier 1 → 'INSTITUTIONAL'."""
-        from services.symbol_registry import SymbolRegistry
-        reg = SymbolRegistry(watchlist=["AAPL"], tier_map={"AAPL": 1})
-        result = reg.influence_tier_string("AAPL")
-        assert result.upper() == "INSTITUTIONAL"
-
-    def test_influence_tier_string_t2_returns_large(self):
-        """Tier 2 → 'LARGE'."""
-        from services.symbol_registry import SymbolRegistry
-        reg = SymbolRegistry(watchlist=["HOOD"], tier_map={"HOOD": 2})
-        result = reg.influence_tier_string("HOOD")
-        assert result.upper() == "LARGE"
-
-    def test_influence_tier_string_t3_returns_retail(self):
-        """Tier 3 → 'RETAIL'."""
-        from services.symbol_registry import SymbolRegistry
-        reg = SymbolRegistry(watchlist=["SPCE"], tier_map={"SPCE": 3})
-        result = reg.influence_tier_string("SPCE")
-        assert result.upper() == "RETAIL"
-
-    def test_influence_tier_string_unknown_ticker_defaults_to_retail(self):
-        """Unknown tickers must default to 'RETAIL' (tier 3 / lowest gate)."""
-        from services.symbol_registry import SymbolRegistry
-        reg = SymbolRegistry(watchlist=[], tier_map={})
-        result = reg.influence_tier_string("UNKNOWN_XYZ")
-        assert result.upper() == "RETAIL"
 
     def test_influence_tier_int_t1(self):
         """influence_tier_int() must return 1 for T1 ticker."""
@@ -539,11 +511,13 @@ class TestInfluenceTierGateway:
         assert reg.influence_tier_int("SPY") == 1
 
     def test_influence_tier_int_t2(self):
+        """influence_tier_int() must return 2 for T2 ticker."""
         from services.symbol_registry import SymbolRegistry
         reg = SymbolRegistry(watchlist=["RIVN"], tier_map={"RIVN": 2})
         assert reg.influence_tier_int("RIVN") == 2
 
     def test_influence_tier_int_t3(self):
+        """influence_tier_int() must return 3 for T3 ticker."""
         from services.symbol_registry import SymbolRegistry
         reg = SymbolRegistry(watchlist=["SPCE"], tier_map={"SPCE": 3})
         assert reg.influence_tier_int("SPCE") == 3
@@ -554,19 +528,19 @@ class TestInfluenceTierGateway:
         reg = SymbolRegistry(watchlist=[], tier_map={})
         assert reg.influence_tier_int("GHOST") == 3
 
-    def test_influence_tier_reflects_final_tier_map(self):
+    def test_influence_tier_int_reflects_final_tier_map(self):
         """
-        influence_tier_string() must read from _tier_map, which is replaced
+        influence_tier_int() must read from _tier_map, which is replaced
         atomically after the final reclassification pass.  Mutating _tier_map
-        directly must be immediately visible to influence_tier_string().
+        directly must be immediately visible to influence_tier_int().
         """
         from services.symbol_registry import SymbolRegistry
         reg = SymbolRegistry(watchlist=["NVDA"], tier_map={"NVDA": 3})
-        assert reg.influence_tier_string("NVDA").upper() == "RETAIL"
+        assert reg.influence_tier_int("NVDA") == 3
 
         # Simulate final reclassification atomically replacing _tier_map
         reg._tier_map = {"NVDA": 1}
-        assert reg.influence_tier_string("NVDA").upper() == "INSTITUTIONAL"
+        assert reg.influence_tier_int("NVDA") == 1
 
 
 # ===========================================================================
