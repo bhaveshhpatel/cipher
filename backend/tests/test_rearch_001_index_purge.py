@@ -16,7 +16,6 @@ All tests are pure unit tests. No DB, no network, no mocking required.
 """
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 import types
@@ -106,7 +105,7 @@ class TestValidateSymbolIndexRejection:
         """Index tickers pass alpha/length checks but validate_symbol must return False."""
         # Sanity: confirm they would pass structural checks alone
         assert sym.isalpha()
-        assert 1 <= len(sym) <= 5 or sym == "SPXPM"  # SPXPM is 5 chars
+        assert 1 <= len(sym) <= 5  # all blocked tickers are 3-5 chars
         # Now confirm the full gate rejects them
         assert validate_symbol(sym) is False
 
