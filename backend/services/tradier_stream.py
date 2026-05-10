@@ -213,6 +213,15 @@ Fix (LAT-1 2026-05-10): guard composite=None after build_composite().
   semantics: no composite score available means no bus publish for this tick.
   This is also the path exercised by test_lat_benchmark (LAT-1), which
   patches build_composite to return None to measure pure hot-path overhead.
+
+Fix (PERSIST-CB 2026-05-10): add done-callback to persist_flow_event create_task.
+  The fire-and-forget create_task(persist_flow_event(...)) had no done-callback,
+  so task exceptions were silently swallowed — _stats["errors"] was never
+  incremented when persist raised. Module-level _persist_done_cb(task) now
+  catches any non-CancelledError exception from the finished task and increments
+  _stats["errors"]. Attached via task.add_done_callback(_persist_done_cb)
+  immediately after create_task(). This satisfies the contract tested by
+  test_persist_timeout_does_not_block_hotpath.
 """
 import asyncio
 import logging
@@ -395,6 +404,24 @@ accumulator = RepetitionAccumulator(
 _sweep_upgrade_dispatched: dict[str, float] = {}
 _signal_last_emit: dict[str, dict] = {}
 _lookback_result_cache: dict[str, tuple[bool, float]] = {}
+
+
+# ---------------------------------------------------------------------------
+# PERSIST-CB: done-callback for fire-and-forget persist_flow_event tasks.
+# Increments _stats["errors"] when the task raises any non-CancelledError
+# exception. Attached via task.add_done_callback(_persist_done_cb) so the
+# hot path is never blocked — the callback fires after the task completes.
+# ---------------------------------------------------------------------------
+def _persist_done_cb(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _stats["errors"] += 1
+        log.error(
+            "[persist] persist_flow_event task raised — _stats['errors']=%d: %s",
+            _stats["errors"], exc,
+        )
 
 
 def get_stats() -> dict:
@@ -808,6 +835,10 @@ async def _process_trade(raw: dict):
       Added None check before accessing composite.score — if None, return
       without publishing to bus. Correct behavior: no composite = no signal.
 
+    PERSIST-CB (2026-05-10): done-callback on persist_flow_event task.
+      _persist_done_cb is attached to the create_task so task exceptions are
+      caught and routed to _stats["errors"] instead of silently swallowed.
+
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
     """
@@ -1060,7 +1091,8 @@ async def _process_trade(raw: dict):
         ev.fill_price, ev.size, ev.premium, ev.trade_type,
     )
 
-    asyncio.create_task(
+    # PERSIST-CB: attach done-callback so task exceptions increment _stats["errors"].
+    _persist_task = asyncio.create_task(
         persist_flow_event({
             "occ_symbol":        occ_symbol,
             "ticker":            ev.ticker,
@@ -1083,6 +1115,7 @@ async def _process_trade(raw: dict):
             "order_side":        _order_side,
         })
     )
+    _persist_task.add_done_callback(_persist_done_cb)
 
     if sig_ep is None:
         return
