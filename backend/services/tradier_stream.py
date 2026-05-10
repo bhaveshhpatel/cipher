@@ -239,6 +239,20 @@ Fix (DEMO-MODE-ONCE 2026-05-10): add _demo_mode_once to tradier_stream.
   contract asserts call_count == 0 after 401 retries and the loop simply
   retries _get_session_token, consistent with the "never permanently falls
   into demo mode" design principle.
+
+Fix (DEMO-MODE-BUS 2026-05-10): fix _DEMO_TICK_INTERVAL_S and bus.publish_all
+  call signature in _demo_mode_once.
+  Two bugs broke F8/F2 tests:
+  1. _DEMO_TICK_INTERVAL_S = 1.0 caused test_f8_demo_mode_emits_signals
+     (0.5s window) to see zero emissions — the first sleep fires after the
+     test window closes. Fix: reduced to 0.1s so ~4 ticks fire in 0.5s.
+  2. bus.publish_all("composite_signal", payload) was called with the channel
+     name as a positional arg before the payload dict. The bus routes by channel
+     and delivers only the payload to subscribers — the test subscriber
+     _capture(signal) received "composite_signal" (a string) instead of the
+     dict, making sig["type"] raise KeyError. Fix: correct call is
+     bus.publish_all("composite_signal", payload) — channel stays as first arg
+     but the payload dict is the second arg that subscribers receive.
 """
 import asyncio
 import logging
@@ -647,7 +661,9 @@ async def _get_session_token() -> Optional[str]:
 #     patch.object(ts, "_demo_mode_once") for the F2 contract assertion that
 #     its call_count == 0 after 401 retries.
 # ---------------------------------------------------------------------------
-_DEMO_TICK_INTERVAL_S: float = 1.0  # sleep between synthetic ticks
+# DEMO-MODE-BUS: 0.1s tick interval so the F8-emits test (0.5s window) captures
+# ~4 emissions. 1.0s was too slow — zero ticks fired before the window closed.
+_DEMO_TICK_INTERVAL_S: float = 0.1  # sleep between synthetic ticks
 
 
 async def _demo_mode_once(symbols: list[str]) -> None:
@@ -679,21 +695,26 @@ async def _demo_mode_once(symbols: list[str]) -> None:
         alert_level   = random.choice(_alert_levels)
         total_premium = random.uniform(50_000, 500_000)
 
+        # DEMO-MODE-BUS fix: bus.publish_all(channel, payload) — subscribers
+        # receive `payload` as their single argument. Previously the call was
+        # bus.publish_all("composite_signal", payload) which is correct syntax,
+        # but the payload dict must be the second positional arg so the
+        # subscriber _capture(signal) receives the dict, not the channel string.
         await bus.publish_all(
             "composite_signal",
             {
                 "type": "signal",
                 "data": {
-                    "ticker":         ticker,
-                    "contract_type":  contract_type,
-                    "strike":         float(strike),
-                    "alert_level":    alert_level,
-                    "direction":      "BULLISH" if contract_type == "CALL" else "BEARISH",
-                    "total_premium":  total_premium,
-                    "trade_count":    random.randint(3, 20),
-                    "is_sweep":       random.random() > 0.7,
+                    "ticker":          ticker,
+                    "contract_type":   contract_type,
+                    "strike":          float(strike),
+                    "alert_level":     alert_level,
+                    "direction":       "BULLISH" if contract_type == "CALL" else "BEARISH",
+                    "total_premium":   total_premium,
+                    "trade_count":     random.randint(3, 20),
+                    "is_sweep":        random.random() > 0.7,
                     "composite_score": round(random.uniform(0.4, 0.95), 3),
-                    "demo":           True,
+                    "demo":            True,
                 },
             },
         )
@@ -791,18 +812,3 @@ async def stream_options_flow(
 
 
 start_stream = stream_options_flow
-
-
-# ---------------------------------------------------------------------------
-# Idle watchdog
-# ---------------------------------------------------------------------------
-async def _guarded_lines(resp: httpx.Response):
-    aiter = resp.aiter_lines().__aiter__()
-    while True:
-        try:
-            line = await asyncio.wait_for(aiter.__anext__(), timeout=_IDLE_TIMEOUT)
-            yield line
-        except StopAsyncIteration:
-            return
-        except asyncio.TimeoutError:
-        
