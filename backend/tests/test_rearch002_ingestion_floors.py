@@ -15,6 +15,12 @@ removed from symbol_registry.py. The processor's tier-aware gate now receives
 an integer tier (1/2/3) directly via influence_tier_int(). All tests below
 pass integer tier values to match the live code path. The former string labels
 ('INSTITUTIONAL', 'LARGE', 'RETAIL') are retired and must not be re-introduced.
+
+min_oi default is 0 (REARCH-002 fix 2026-05-10):
+  Smart money opens positions on new-chain contracts where OI is still 0.
+  Gate 4 is intentionally a no-op at default config.  It only activates when
+  an operator explicitly PATCHes ing.min_oi above 0 via the admin API.
+  Vol>OI conviction gating belongs in signal engines (REARCH-006).
 """
 from __future__ import annotations
 
@@ -38,11 +44,15 @@ from ingestion.processor import (
 def _ev(
     dte: int = 30,
     premium: int = 25_000,
-    open_interest: int = 50,
+    open_interest: int = 0,    # 0 = new-chain baseline — must pass by default
     influence_tier: int = 1,   # ING-012: int tier (1=T1, 2=T2, 3=T3). No string labels.
     is_aggressive: bool = True,
 ) -> types.SimpleNamespace:
     """Build a minimal duck-typed event object for testing.
+
+    open_interest defaults to 0 to reflect the new-chain use-case that drove
+    the min_oi default change (2026-05-10).  Tests that want a non-zero OI
+    value pass it explicitly.
 
     influence_tier must be an int (1, 2, or 3).  The former string labels
     ('INSTITUTIONAL', 'LARGE', 'RETAIL') were removed with ING-012 when
@@ -59,7 +69,7 @@ def _ev(
     )
 
 
-_DEFAULT_CFG = IngestionConfig()          # default floors
+_DEFAULT_CFG = IngestionConfig()          # default floors (min_oi=0)
 _PROC        = IngestionProcessor()
 
 
@@ -161,23 +171,50 @@ def test_unknown_tier_uses_t3_floor():
 
 # ---------------------------------------------------------------------------
 # QA-1 — Gate 4: Open-interest floor
+#
+# Default min_oi is 0 — Gate 4 is intentionally a no-op at default config.
+# Smart money opens positions on new-chain contracts where OI is still 0;
+# blocking those events at ingestion loses exactly the signal we care about.
+# Vol>OI conviction gating belongs in signal engines (REARCH-006).
+#
+# Gate 4 only activates when an operator PATCHes ing.min_oi above 0 via the
+# admin API (valid range: [0, 500]).
 # ---------------------------------------------------------------------------
 
-def test_oi_exactly_at_floor():
-    ev = _ev(open_interest=50)
-    assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
-
-
-def test_oi_one_below_floor():
-    ev = _ev(open_interest=49)
-    assert _PROC.process_with_config(ev, _DEFAULT_CFG) is None
-    assert get_drop_stats()["dropped_min_oi"] == 1
-
-
-def test_oi_zero():
+def test_oi_zero_passes_by_default():
+    """OI=0 must pass with default config — new-chain opening position."""
     ev = _ev(open_interest=0)
-    assert _PROC.process_with_config(ev, _DEFAULT_CFG) is None
+    assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev
+    assert get_drop_stats()["dropped_min_oi"] == 0
+
+
+def test_oi_gate_inactive_at_default_for_any_value():
+    """Any OI value (including 1) passes when min_oi=0 (the default)."""
+    for oi in (0, 1, 10, 49, 50, 500):
+        reset_drop_stats()
+        ev = _ev(open_interest=oi)
+        assert _PROC.process_with_config(ev, _DEFAULT_CFG) is ev, (
+            f"Expected OI={oi} to pass with default min_oi=0"
+        )
+        assert get_drop_stats()["dropped_min_oi"] == 0
+
+
+def test_oi_gate_fires_when_configured_above_zero():
+    """Gate 4 only activates when min_oi is explicitly set above 0 via admin PATCH."""
+    cfg = IngestionConfig(min_oi=10)
+    ev_below = _ev(open_interest=9)
+    ev_at    = _ev(open_interest=10)
+    ev_above = _ev(open_interest=11)
+
+    assert _PROC.process_with_config(ev_below, cfg) is None
     assert get_drop_stats()["dropped_min_oi"] == 1
+
+    reset_drop_stats()
+    assert _PROC.process_with_config(ev_at, cfg) is ev_at
+    assert get_drop_stats()["dropped_min_oi"] == 0
+
+    assert _PROC.process_with_config(ev_above, cfg) is ev_above
+    assert get_drop_stats()["dropped_min_oi"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +238,16 @@ def test_require_ask_tag_does_not_gate():
 # ---------------------------------------------------------------------------
 
 def test_stats_counters_accumulate():
-    _PROC.process_with_config(_ev(dte=0),              _DEFAULT_CFG)  # min_dte
-    _PROC.process_with_config(_ev(dte=0),              _DEFAULT_CFG)  # min_dte
-    _PROC.process_with_config(_ev(dte=91),             _DEFAULT_CFG)  # max_dte
-    _PROC.process_with_config(_ev(premium=100),        _DEFAULT_CFG)  # min_premium
-    _PROC.process_with_config(_ev(open_interest=0),    _DEFAULT_CFG)  # min_oi
-    _PROC.process_with_config(_ev(),                   _DEFAULT_CFG)  # pass
+    # Use a config with min_oi=10 to exercise the dropped_min_oi counter —
+    # OI=0 no longer drops with the default config (min_oi=0).
+    cfg_with_oi = IngestionConfig(min_oi=10)
+
+    _PROC.process_with_config(_ev(dte=0),                       _DEFAULT_CFG)   # min_dte
+    _PROC.process_with_config(_ev(dte=0),                       _DEFAULT_CFG)   # min_dte
+    _PROC.process_with_config(_ev(dte=91),                      _DEFAULT_CFG)   # max_dte
+    _PROC.process_with_config(_ev(premium=100),                 _DEFAULT_CFG)   # min_premium
+    _PROC.process_with_config(_ev(open_interest=5), cfg_with_oi)                # min_oi (OI=5 < floor=10)
+    _PROC.process_with_config(_ev(),                            _DEFAULT_CFG)   # pass
     s = get_drop_stats()
     assert s["dropped_min_dte"]     == 2
     assert s["dropped_max_dte"]     == 1
@@ -325,3 +366,33 @@ def test_patch_multiple_keys_one_invalid_rejects_all():
 def test_patch_require_ask_tag_bool_accepted():
     req = _patch_request({"ing.require_ask_tag": False})
     assert req.updates["ing.require_ask_tag"] is False
+
+
+# ---------------------------------------------------------------------------
+# QA-4 — Admin PATCH: ing.min_oi range [0, 500]
+# ---------------------------------------------------------------------------
+
+def test_patch_min_oi_zero_accepted():
+    """0 is a valid floor — it disables the OI gate (the default)."""
+    req = _patch_request({"ing.min_oi": 0})
+    assert req.updates["ing.min_oi"] == 0
+
+
+def test_patch_min_oi_midrange_accepted():
+    req = _patch_request({"ing.min_oi": 50})
+    assert req.updates["ing.min_oi"] == 50
+
+
+def test_patch_min_oi_max_accepted():
+    req = _patch_request({"ing.min_oi": 500})
+    assert req.updates["ing.min_oi"] == 500
+
+
+def test_patch_min_oi_above_max_rejected():
+    with pytest.raises(Exception, match="out of range"):
+        _patch_request({"ing.min_oi": 501})
+
+
+def test_patch_min_oi_negative_rejected():
+    with pytest.raises(Exception, match="out of range"):
+        _patch_request({"ing.min_oi": -1})
