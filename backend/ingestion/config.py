@@ -22,6 +22,10 @@ REARCH-001 (2026-05-09): validate_symbol() now rejects index tickers via
   is_index_symbol() as a second gate, after the structural alpha/length checks.
   This ensures index symbols added through the admin API or apply_config() are
   rejected at the application layer even if they slip past the streaming guard.
+
+REARCH-002 (2026-05-09): apply_config() now filters every symbol through
+  validate_symbol() so index tickers (SPX, VIX, NDX, etc.) submitted via the
+  admin config API are silently dropped before being added to SYMBOLS.
 """
 import os
 from typing import Optional
@@ -136,8 +140,17 @@ def apply_config(cfg: dict) -> None:
     Recognised keys:
       symbols  list[str]  — replaces the working SYMBOLS list
     Other keys are silently ignored (forward-compat).
+
+    REARCH-002: every symbol is now filtered through validate_symbol() so
+    index tickers (SPX, VIX, NDX, etc.) are silently dropped even if they
+    arrive via the admin config API.  Only structurally valid, non-index
+    equity tickers are admitted.
     """
     if "symbols" in cfg:
-        new_syms = [s.strip().upper() for s in cfg["symbols"] if isinstance(s, str) and s.strip()]
+        new_syms = [
+            s.strip().upper()
+            for s in cfg["symbols"]
+            if isinstance(s, str) and validate_symbol(s.strip())
+        ]
         SYMBOLS.clear()
         SYMBOLS.extend(new_syms)
