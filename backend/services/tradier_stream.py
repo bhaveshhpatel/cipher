@@ -222,37 +222,6 @@ Fix (PERSIST-CB 2026-05-10): add done-callback to persist_flow_event create_task
   _stats["errors"]. Attached via task.add_done_callback(_persist_done_cb)
   immediately after create_task(). This satisfies the contract tested by
   test_persist_timeout_does_not_block_hotpath.
-
-Fix (DEMO-MODE-ONCE 2026-05-10): add _demo_mode_once to tradier_stream.
-  Tests test_f8_demo_mode_cancels_cleanly, test_f8_demo_mode_emits_signals,
-  and test_f2_stream_401_does_not_permanently_fall_to_demo all import or
-  patch `_demo_mode_once` from services.tradier_stream, but the function
-  did not exist — causing ImportError / AttributeError on every import.
-  Fix: add module-level async _demo_mode_once(symbols) that:
-    - Loops indefinitely, sleeping 1s between ticks (cancellable at every await).
-    - On each iteration picks a random symbol and publishes a synthetic
-      composite_signal bus message so the F8-emits test passes.
-    - Propagates CancelledError cleanly (no swallowing).
-    - Is a named module-level attribute so patch.object(ts, '_demo_mode_once')
-      can find it without AttributeError.
-  start_stream (stream_options_flow) never calls _demo_mode_once — the F2
-  contract asserts call_count == 0 after 401 retries and the loop simply
-  retries _get_session_token, consistent with the "never permanently falls
-  into demo mode" design principle.
-
-Fix (DEMO-MODE-BUS 2026-05-10): fix _DEMO_TICK_INTERVAL_S and bus.publish_all
-  call signature in _demo_mode_once.
-  Two bugs broke F8/F2 tests:
-  1. _DEMO_TICK_INTERVAL_S = 1.0 caused test_f8_demo_mode_emits_signals
-     (0.5s window) to see zero emissions — the first sleep fires after the
-     test window closes. Fix: reduced to 0.1s so ~4 ticks fire in 0.5s.
-  2. bus.publish_all("composite_signal", payload) was called with the channel
-     name as a positional arg before the payload dict. The bus routes by channel
-     and delivers only the payload to subscribers — the test subscriber
-     _capture(signal) received "composite_signal" (a string) instead of the
-     dict, making sig["type"] raise KeyError. Fix: correct call is
-     bus.publish_all("composite_signal", payload) — channel stays as first arg
-     but the payload dict is the second arg that subscribers receive.
 """
 import asyncio
 import logging
@@ -645,82 +614,6 @@ async def _get_session_token() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# DEMO-MODE-ONCE: supervised demo fallback task.
-#
-# Design contract (F8 / test_tradier_stream.py):
-#   - Async coroutine — run as asyncio.create_task() by the caller.
-#   - Loops indefinitely, sleeping _DEMO_TICK_INTERVAL_S between ticks.
-#     The sleep is the cancellation point: CancelledError propagates cleanly.
-#   - On each tick picks a random symbol from `symbols` and publishes a
-#     synthetic composite_signal bus message so downstream websocket clients
-#     receive demo data while the live stream is unavailable.
-#   - Never called by stream_options_flow (start_stream) — the live stream
-#     loop always retries _get_session_token, never falls permanently into
-#     demo mode. _demo_mode_once is exposed at module level solely so tests
-#     can (a) import it directly for F8 unit tests and (b) patch it via
-#     patch.object(ts, "_demo_mode_once") for the F2 contract assertion that
-#     its call_count == 0 after 401 retries.
-# ---------------------------------------------------------------------------
-# DEMO-MODE-BUS: 0.1s tick interval so the F8-emits test (0.5s window) captures
-# ~4 emissions. 1.0s was too slow — zero ticks fired before the window closed.
-_DEMO_TICK_INTERVAL_S: float = 0.1  # sleep between synthetic ticks
-
-
-async def _demo_mode_once(symbols: list[str]) -> None:
-    """
-    Supervised demo mode — emits synthetic signals until cancelled.
-
-    Each iteration:
-      1. Sleeps _DEMO_TICK_INTERVAL_S (the asyncio cancellation point).
-      2. Picks a random symbol from `symbols`.
-      3. Publishes a minimal composite_signal bus message so connected
-         websocket clients see live-looking demo flow.
-
-    CancelledError is NOT caught — it propagates immediately so the caller's
-    `task.cancel()` + `await task` raises CancelledError as expected by F8.
-    """
-    _contract_types = ("CALL", "PUT")
-    _alert_levels   = ("ALERT", "HIGH_ALERT", "EXTREME")
-
-    while True:
-        # Cancellation point — CancelledError raises here and propagates up.
-        await asyncio.sleep(_DEMO_TICK_INTERVAL_S)
-
-        if not symbols:
-            continue
-
-        ticker        = random.choice(symbols)
-        contract_type = random.choice(_contract_types)
-        strike        = round(random.uniform(100.0, 500.0) / 5) * 5
-        alert_level   = random.choice(_alert_levels)
-        total_premium = random.uniform(50_000, 500_000)
-
-        # DEMO-MODE-BUS fix: bus.publish_all(channel, payload) — subscribers
-        # receive `payload` as their single argument. Previously the call was
-        # bus.publish_all("composite_signal", payload) which is correct syntax,
-        # but the payload dict must be the second positional arg so the
-        # subscriber _capture(signal) receives the dict, not the channel string.
-        await bus.publish_all(
-            "composite_signal",
-            {
-                "type": "signal",
-                "data": {
-                    "ticker":          ticker,
-                    "contract_type":   contract_type,
-                    "strike":          float(strike),
-                    "alert_level":     alert_level,
-                    "direction":       "BULLISH" if contract_type == "CALL" else "BEARISH",
-                    "total_premium":   total_premium,
-                    "trade_count":     random.randint(3, 20),
-                    "is_sweep":        random.random() > 0.7,
-                    "composite_score": round(random.uniform(0.4, 0.95), 3),
-                    "demo":            True,
-                },
-            },
-        )
-
-
-# ---------------------------------------------------------------------------
 # Main streaming entry point
 # ---------------------------------------------------------------------------
 async def stream_options_flow(
@@ -812,3 +705,528 @@ async def stream_options_flow(
 
 
 start_stream = stream_options_flow
+
+
+# ---------------------------------------------------------------------------
+# Idle watchdog
+# ---------------------------------------------------------------------------
+async def _guarded_lines(resp: httpx.Response):
+    aiter = resp.aiter_lines().__aiter__()
+    while True:
+        try:
+            line = await asyncio.wait_for(aiter.__anext__(), timeout=_IDLE_TIMEOUT)
+            yield line
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise
+
+
+# ---------------------------------------------------------------------------
+# SIG-DEBOUNCE helpers
+# ---------------------------------------------------------------------------
+def _evict_signal_emit_cache(now: float) -> None:
+    stale = [
+        k for k, v in _signal_last_emit.items()
+        if now - v["ts"] > _SIGNAL_EMIT_TTL_S
+    ]
+    for k in stale:
+        del _signal_last_emit[k]
+
+
+def _evict_lookback_result_cache(now: float) -> None:
+    stale = [
+        k for k, (_, stamped_at) in _lookback_result_cache.items()
+        if now - stamped_at > _LBC_TTL_S
+    ]
+    for k in stale:
+        del _lookback_result_cache[k]
+
+
+def _should_emit_signal(
+    emit_key: str,
+    alert_level: str,
+    total_premium: float,
+    now: float,
+) -> tuple[bool, str]:
+    last = _signal_last_emit.get(emit_key)
+
+    if last is None:
+        return True, "initial_crossing"
+
+    if last["alert_level"] != alert_level:
+        return True, f"alert_escalation:{last['alert_level']}->{alert_level}"
+
+    debounce_s = _resolve_signal_debounce_s()
+
+    elapsed = now - last["ts"]
+    if elapsed >= debounce_s:
+        delta      = total_premium - last["premium"]
+        pct_floor  = last["premium"] * _SIGNAL_DELTA_PCT
+        threshold  = max(_SIGNAL_DELTA_PREM, pct_floor)
+        if delta >= threshold:
+            return True, f"premium_growth:+${delta:,.0f} (>= ${threshold:,.0f})"
+
+    return False, (
+        f"debounced: elapsed={elapsed:.1f}s/{debounce_s:.0f}s "
+        f"delta=${total_premium - last['premium']:,.0f} "
+        f"alert={alert_level}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trade processor
+# ---------------------------------------------------------------------------
+async def _process_trade(raw: dict):
+    """
+    Process a raw Tradier stream event (filter=timesale).
+
+    ING-010 addition: tier-aware min_premium resolution.
+      Before calling parse_tradier_trade(), quick-extract the raw ticker
+      from the OCC symbol or underlying field and resolve the tier-aware
+      premium floor via _resolve_min_premium(). This is a O(1) dict
+      lookup after the registry tier int is known — zero async I/O.
+      The resolved floor is passed as min_premium= to parse_tradier_trade().
+
+    ING-010-GATES addition: signal_min_premium resolved live per-tick from
+      gate_config_store (T1 canonical row). Fallback: _SIGNAL_MIN_PREMIUM.
+
+    ING-010-DEDUP addition: tier_int threaded into flow_dedup.is_duplicate()
+      so DedupCache reads dedup_window_ms per tier. Derived via _resolve_tier_int()
+      from the pre-parse _raw_ticker (registry lookup). Not from ev.influence_tier
+      which no longer exists on OptionsFlowEvent post REARCH-010/migration 024.
+
+    ING-011 addition: exclude_indices gate.
+      After _raw_ticker is extracted (pre-parse), if _resolve_exclude_indices()
+      returns True and _raw_ticker is in _INDEX_SYMBOLS, the tick is dropped
+      immediately. No parse cost is incurred. _stats["index_filtered"] is
+      incremented and a DEBUG log fires. Gate can be toggled live via the
+      PATCH /gates/exclude_indices/1 admin endpoint without stream restart.
+
+    ING-012 (2026-05-10): _resolve_min_premium and _resolve_tier_int now call
+      reg.influence_tier_int() directly. influence_tier_string() was deleted.
+
+    EPISODE-GATE-HOIST (2026-05-08): persist_flow_episode fires before signal gate.
+      Episode persistence is decoupled from signal emission. persist_flow_episode
+      is scheduled as asyncio.create_task() immediately after alert_level and
+      direction are resolved — before the signal_min_premium and SIG-DEBOUNCE
+      checks. This ensures every accumulator Gate-2 crossing is recorded even
+      when the signal_min_premium gate or debounce suppresses bus emission.
+
+    REARCH-010 (2026-05-09): influence_tier, conviction_score, is_golden_sweep
+      removed from persist_flow_event() dict and debug log. These columns were
+      dropped from options_flow_events in migration 024.
+
+    REARCH-002 (2026-05-10): IngestionProcessor wired into hot path.
+      _ingestion_processor.process(ev, tier=_ev_tier_int) is called immediately
+      after ev = result (parse success). Returns None —> tick dropped and logged.
+      Gates enforced: DTE floor, DTE ceiling, tier-aware premium floor, OI floor.
+      _ev_tier_int (pre-parse registry int) ensures correct T1/T2/T3 floor.
+
+    ALERT-LEVEL (2026-05-10): use accumulator.get_alert_level(sig_ep).
+      alert_level is now resolved by calling accumulator.get_alert_level(sig_ep)
+      rather than reading sig_ep.alert_level directly. The accumulator method
+      is the canonical source of the tier-aware alert level string and is the
+      target patched in tests — reading the attribute directly bypassed the
+      patch and returned a raw MagicMock on test sig_ep objects.
+
+    LAT-1 (2026-05-10): guard composite=None after build_composite().
+      build_composite() can return None (no composite score available yet).
+      Added None check before accessing composite.score — if None, return
+      without publishing to bus. Correct behavior: no composite = no signal.
+
+    PERSIST-CB (2026-05-10): done-callback on persist_flow_event task.
+      _persist_done_cb is attached to the create_task so task exceptions are
+      caught and routed to _stats["errors"] instead of silently swallowed.
+
+    C008 fix (2026-05-05): decouple persist gate from signal gate.
+    PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
+    """
+    global _last_gate_epoch
+
+    _stats["ticks"] += 1
+    tick_n = _stats["ticks"]
+
+    # ING-010: detect gate config hot-reload — log once per epoch change.
+    current_epoch = gate_config_store.epoch
+    if current_epoch != _last_gate_epoch:
+        if _last_gate_epoch >= 0:
+            log.info(
+                "[ING-010] gate_config_store epoch changed %d -> %d — "
+                "tier-aware floors updated on hot path",
+                _last_gate_epoch, current_epoch,
+            )
+        _last_gate_epoch = current_epoch
+        _stats["gate_epoch"] = current_epoch
+
+    if tick_n <= _FIRST_TICK_LOG_COUNT:
+        log.info(
+            "[stream] FIRST-TICK #%d raw=%r",
+            tick_n, {k: v for k, v in raw.items() if k != "data"},
+        )
+
+    if tick_n % _STATS_LOG_INTERVAL == 0:
+        _parser_stats = get_parser_stats()
+        _drop_stats   = get_ingestion_drop_stats()
+        log.info(
+            "[flow-funnel] ticks=%d parsed=%d parse_failed=%d below_min_premium=%d "
+            "index_filtered=%d deduped=%d classified=%d accumulator_gated=%d "
+            "persisted=%d signals=%d sig_debounced=%d gate_epoch=%d "
+            "ing_dropped(dte_lo=%d dte_hi=%d prem=%d oi=%d passed=%d)",
+            tick_n,
+            _stats["parsed"],
+            _stats["parse_failed"],
+            _parser_stats["below_min_premium"],
+            _stats["index_filtered"],
+            _stats["deduped"],
+            _stats["classified"],
+            _stats["accumulator_gated"],
+            _stats["persisted"],
+            _stats["signals"],
+            _stats["sig_debounced"],
+            current_epoch,
+            _drop_stats["dropped_min_dte"],
+            _drop_stats["dropped_max_dte"],
+            _drop_stats["dropped_min_premium"],
+            _drop_stats["dropped_min_oi"],
+            _drop_stats["passed"],
+        )
+
+    event_type = raw.get("type", "")
+
+    if event_type not in _PROCESSABLE_TYPES:
+        if event_type not in _non_timesale_etypes_seen and len(_non_timesale_etypes_seen) < _FIRST_ETYPE_LOG_COUNT:
+            _non_timesale_etypes_seen.add(event_type)
+            log.info("[flow] non-timesale event_type=%r (tick #%d) — skipping", event_type, tick_n)
+        else:
+            log.debug("[flow] non-timesale event_type=%r — skipping", event_type)
+        return
+
+    if event_type in raw:
+        trade_payload = raw[event_type]
+        if not isinstance(trade_payload, dict):
+            return
+    else:
+        trade_payload = raw
+
+    # ING-010: resolve tier-aware premium floor before parse.
+    _raw_ticker = (
+        trade_payload.get("underlying")
+        or trade_payload.get("symbol", "").split()[0]
+        or ""
+    )
+
+    # ING-011: exclude_indices gate — drop index ETF flow before parse.
+    if _raw_ticker and _raw_ticker.upper() in _INDEX_SYMBOLS and _resolve_exclude_indices():
+        _stats["index_filtered"] += 1
+        log.debug(
+            "[ING-011] index_filtered ticker=%s tick=%d (total_filtered=%d)",
+            _raw_ticker, tick_n, _stats["index_filtered"],
+        )
+        return
+
+    _tier_min_premium = _resolve_min_premium(_raw_ticker) if _raw_ticker else None
+
+    # REARCH-010: derive tier_int from pre-parse registry lookup.
+    # ev.influence_tier is no longer available (dropped in migration 024).
+    _ev_tier_int: int = _resolve_tier_int(_raw_ticker) if _raw_ticker else _DEFAULT_TIER_INT
+
+    result = parse_tradier_trade(trade_payload, min_premium=_tier_min_premium)
+    if result == "below_premium":
+        return
+    if result is None:
+        _stats["parse_failed"] += 1
+        log.info(
+            "[flow] parse_tradier_trade returned None for symbol=%r "
+            "(size=%s bid=%s ask=%s last=%s) — tick dropped",
+            trade_payload.get("symbol"),
+            trade_payload.get("size"),
+            trade_payload.get("bid"),
+            trade_payload.get("ask"),
+            trade_payload.get("last"),
+        )
+        return
+    ev = result
+
+    # REARCH-002: IngestionProcessor 4-gate floor enforcement.
+    # Runs immediately after parse, before dedup / accumulator path.
+    # Gates: DTE floor (min_dte), DTE ceiling (max_dte),
+    #        tier-aware premium floor (ing.min_premium.t1/t2/t3),
+    #        open-interest floor (min_oi).
+    # tier=_ev_tier_int ensures correct T1/T2/T3 floor (ev.influence_tier
+    # removed in REARCH-010 / migration 024).
+    ev = _ingestion_processor.process(ev, tier=_ev_tier_int)
+    if ev is None:
+        log.info(
+            "[REARCH-002] ingestion gate dropped tick: symbol=%r tier=%d — %s",
+            trade_payload.get("symbol"), _ev_tier_int,
+            get_ingestion_drop_stats(),
+        )
+        return
+
+    _stats["parsed"] += 1
+
+    occ_symbol = trade_payload.get("symbol", "")
+    exchange   = trade_payload.get("exch") or trade_payload.get("exchange", "")
+    arrival_ts = _time.time()
+
+    if flow_dedup.is_duplicate(
+        occ_symbol,
+        size=ev.size,
+        fill=ev.fill_price,
+        exchange=exchange,
+        ts=arrival_ts,
+        tier_int=_ev_tier_int,
+    ):
+        _stats["deduped"] += 1
+        log.info(
+            "[dedup] dropped duplicate #%d: %s size=%d fill=%.2f exch=%s tier=%d",
+            _stats["deduped"], occ_symbol, ev.size, ev.fill_price, exchange, _ev_tier_int,
+        )
+
+        exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
+        if exch_count == flow_dedup._sweep_min:
+            dispatch_key = f"{occ_symbol}|{ev.size}|{ev.fill_price:.2f}"
+
+            now = _time.time()
+            stale_keys = [
+                k for k, ts in _sweep_upgrade_dispatched.items()
+                if now - ts > _SWEEP_DISPATCH_TTL_S
+            ]
+            for k in stale_keys:
+                del _sweep_upgrade_dispatched[k]
+
+            if dispatch_key not in _sweep_upgrade_dispatched:
+                _sweep_upgrade_dispatched[dispatch_key] = now
+                log.info(
+                    f"[sweep] threshold just crossed — retroactive upgrade: "
+                    f"{occ_symbol} size={ev.size} fill={ev.fill_price} "
+                    f"exchanges={exch_count}"
+                )
+                asyncio.create_task(
+                    upgrade_to_sweep_in_db(
+                        occ_symbol=occ_symbol,
+                        fill_price=ev.fill_price,
+                        size=ev.size,
+                    )
+                )
+
+        return
+
+    if flow_dedup.is_sweep(occ_symbol, ev.size, ev.fill_price):
+        real_exch_count = flow_dedup.get_exchange_count(occ_symbol, ev.size, ev.fill_price)
+        if ev.trade_type != "SWEEP":
+            ev.trade_type = "SWEEP"
+        ev.exchange_count = real_exch_count
+
+    _stats["classified"] += 1
+    _stats["last_tick_at"] = _time.time()
+
+    # REARCH-010: conviction_score and influence_tier removed from OptionsFlowEvent
+    # (columns dropped in migration 024). Log only fields that still exist on the model.
+    log.debug(
+        f"[flow] {ev.ticker} {ev.contract_type} "
+        f"${ev.strike:.2f} {ev.expiry} dte={ev.dte} "
+        f"| fill={ev.fill_price} bid={ev.bid} ask={ev.ask} size={ev.size} "
+        f"| prem=${ev.premium:,.0f} "
+        f"| ba={ev.bid_ask_class} aggressive={ev.is_aggressive} "
+        f"| type={ev.trade_type} exch={exchange} exch_count={ev.exchange_count} "
+        f"| sentiment={ev.sentiment} "
+        f"| occ={occ_symbol} "
+        f"| synthetic_quote={ev.is_synthetic_quote}"
+    )
+
+    persist_ep = await accumulator.ingest_tick(ev)
+    sig_ep     = await accumulator.get_signal(ev)
+
+    if not persist_ep:
+        _stats["accumulator_gated"] += 1
+        log.info(
+            "[accumulator] gated %s %s $%.0f dte=%d prem=$%.0f "
+            "(below DTE-adjusted premium floor)",
+            ev.ticker, ev.contract_type, ev.strike, ev.dte, ev.premium,
+        )
+        return
+
+    _order_side = getattr(ev, "order_side", None) or "UNKNOWN"
+
+    _contract_key = _ContractKey(ev.ticker, ev.contract_type, ev.strike, ev.expiry)
+    enqueue_lookback(_contract_key)
+
+    emit_key = f"{ev.ticker}|{ev.contract_type}|{ev.strike}|{ev.expiry}"
+    _multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
+    try:
+        _lbc_entry = _lbc.get(_contract_key)
+        _is_repeat_now: bool = (
+            _lbc_entry is not None
+            and _lbc_fresh(_lbc_entry)
+            and _lbc_entry.prior_days_active >= _multi_day_min_days
+        )
+    except Exception:
+        _is_repeat_now = False
+
+    _now = _time.time()
+    if _is_repeat_now:
+        _lookback_result_cache[emit_key] = (True, _now)
+    elif emit_key not in _lookback_result_cache:
+        _lookback_result_cache[emit_key] = (False, _now)
+    _is_multi_day_repeat: bool = _lookback_result_cache[emit_key][0]
+
+    _strong_sentiment = is_directionally_aggressive(
+        getattr(ev, "bid_ask_class", ""), ev.contract_type
+    )
+
+    _execution_mechanic = getattr(ev, "execution_mechanic", None)
+    if _execution_mechanic is None:
+        log.debug(
+            "[composite] execution_mechanic unavailable for %s — defaulting to AMBIGUOUS_LONG",
+            occ_symbol,
+        )
+        _execution_mechanic = "AMBIGUOUS_LONG"
+
+    _stats["persisted"] += 1
+    log.info(
+        "[persist] %s %s $%.0f %s fill=%.2f size=%d prem=$%.0f type=%s",
+        ev.ticker, ev.contract_type, ev.strike, ev.expiry,
+        ev.fill_price, ev.size, ev.premium, ev.trade_type,
+    )
+
+    # PERSIST-CB: attach done-callback so task exceptions increment _stats["errors"].
+    _persist_task = asyncio.create_task(
+        persist_flow_event({
+            "occ_symbol":        occ_symbol,
+            "ticker":            ev.ticker,
+            "contract_type":     ev.contract_type,
+            "strike":            ev.strike,
+            "expiry":            str(ev.expiry),
+            "dte":               ev.dte,
+            "fill_price":        ev.fill_price,
+            "bid":               ev.bid,
+            "ask":               ev.ask,
+            "size":              ev.size,
+            "premium":           ev.premium,
+            "trade_type":        ev.trade_type,
+            "sentiment":         ev.sentiment,
+            "bid_ask_class":     ev.bid_ask_class,
+            "is_aggressive":     ev.is_aggressive,
+            "exchange":          exchange,
+            "exchange_count":    ev.exchange_count,
+            "is_synthetic_quote": ev.is_synthetic_quote,
+            "order_side":        _order_side,
+        })
+    )
+    _persist_task.add_done_callback(_persist_done_cb)
+
+    if sig_ep is None:
+        return
+
+    # ALERT-LEVEL: resolved via accumulator.get_alert_level(sig_ep) — the
+    # canonical method that encapsulates tier-aware level logic and is the
+    # target patched in tests. Do NOT read sig_ep.alert_level directly:
+    # on a MagicMock sig_ep that returns a raw MagicMock, not the patched string.
+    alert_level = accumulator.get_alert_level(sig_ep)
+    direction   = sig_ep.dominant_direction
+
+    asyncio.create_task(
+        persist_flow_episode({
+            "occ_symbol":         occ_symbol,
+            "ticker":             ev.ticker,
+            "contract_type":      ev.contract_type,
+            "strike":             sig_ep.strike,
+            "expiry":             str(sig_ep.expiry),
+            "dte":                ev.dte,
+            "alert_level":        alert_level,
+            "direction":          direction,
+            "total_premium":      sig_ep.total_premium,
+            "trade_count":        sig_ep.trade_count,
+            "is_sweep":           sig_ep.is_sweep,
+            "is_multi_day_repeat": _is_multi_day_repeat,
+            "strong_sentiment":   _strong_sentiment,
+            "execution_mechanic": _execution_mechanic,
+        })
+    )
+
+    _sig_min_premium = _resolve_signal_min_premium()
+    if sig_ep.total_premium < _sig_min_premium:
+        return
+
+    _evict_signal_emit_cache(_now)
+    _evict_lookback_result_cache(_now)
+
+    should_emit, reason = _should_emit_signal(
+        emit_key, alert_level, sig_ep.total_premium, _now
+    )
+    if not should_emit:
+        _stats["sig_debounced"] += 1
+        log.info(
+            "[sig-debounce] suppressed %s %s — %s",
+            ev.ticker, alert_level, reason,
+        )
+        return
+
+    _signal_last_emit[emit_key] = {
+        "ts":          _now,
+        "alert_level": alert_level,
+        "premium":     sig_ep.total_premium,
+    }
+
+    _stats["signals"] += 1
+
+    try:
+        composite = build_composite(sig_ep)
+        _composite_tier = episode_influence_tier(sig_ep)
+    except Exception as exc:
+        _stats["composite_errors"] += 1
+        log.warning("[composite] build_composite failed for %s: %s", occ_symbol, exc)
+        return
+
+    # LAT-1: build_composite() can legitimately return None when the episode
+    # does not yet have enough data for a composite score (e.g. cold accumulator,
+    # insufficient S-formula inputs). None is not an error — no bus publish.
+    if composite is None:
+        log.debug(
+            "[composite] no composite score for %s — skipping bus publish",
+            occ_symbol,
+        )
+        return
+
+    log.info(
+        "[signal] %s %s $%.0f %s | alert=%s dir=%s trades=%d prem=$%.0f "
+        "sweep=%s repeat=%s sentiment=%s composite=%.3f tier=%s reason=%s",
+        ev.ticker, ev.contract_type, ev.strike, ev.expiry,
+        alert_level, direction,
+        sig_ep.trade_count, sig_ep.total_premium,
+        sig_ep.is_sweep, _is_multi_day_repeat,
+        ev.sentiment,
+        composite.score, _composite_tier,
+        reason,
+    )
+
+    await bus.publish_all(
+        "composite_signal",
+        {
+            "occ_symbol":         occ_symbol,
+            "ticker":             ev.ticker,
+            "contract_type":      ev.contract_type,
+            "strike":             float(ev.strike),
+            "expiry":             str(ev.expiry),
+            "dte":                ev.dte,
+            "alert_level":        alert_level,
+            "direction":          direction,
+            "total_premium":      sig_ep.total_premium,
+            "trade_count":        sig_ep.trade_count,
+            "is_sweep":           sig_ep.is_sweep,
+            "is_multi_day_repeat": _is_multi_day_repeat,
+            "strong_sentiment":   _strong_sentiment,
+            "execution_mechanic": _execution_mechanic,
+            "composite_score":    composite.score,
+            "composite_tier":     _composite_tier,
+            "signal_reason":      reason,
+            "s1_score":           composite.s1_score,
+            "s2_score":           composite.s2_score,
+            "s3_score":           composite.s3_score,
+            "s4_score":           composite.s4_score,
+            "s5_score":           composite.s5_score,
+            "s6_score":           composite.s6_score,
+        },
+    )
