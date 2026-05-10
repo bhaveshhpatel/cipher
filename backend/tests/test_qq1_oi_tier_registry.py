@@ -553,8 +553,15 @@ class TestBuildIdempotency:
         """
         Calling build() twice with identical chain OI must produce the same
         final tier_map both times (idempotent).
+
+        FIX: The fake _build_ticker must write a real ContractMeta with dte=0
+        (not a MagicMock with dte=30). The H3 incremental guard in build()
+        computes min_dte_by_ticker from self._registry and skips _build_ticker
+        for tickers whose min_dte > 0 (i.e., "not expiring today"). Using
+        dte=0 means the ticker is classified as "expiring today" so both
+        build 1 and build 2 call _build_ticker, making call_count["n"] == 2.
         """
-        from services.symbol_registry import SymbolRegistry
+        from services.symbol_registry import SymbolRegistry, ContractMeta
 
         call_count = {"n": 0}
 
@@ -564,11 +571,18 @@ class TestBuildIdempotency:
             zero_price_fallback=False,
         ):
             call_count["n"] += 1
-            meta = MagicMock()
-            meta.ticker        = ticker
-            meta.open_interest = 5_000
-            meta.tier          = 3
-            meta.dte           = 30  # real int so H3 incremental DTE scan works on 2nd build
+            # Use a real ContractMeta with dte=0 so the H3 incremental guard
+            # treats this ticker as "expired today" and re-fetches it on
+            # every subsequent build() call.
+            meta = ContractMeta(
+                ticker        = ticker,
+                strike        = 100.0,
+                expiry        = "2025-01-17",
+                contract_type = "CALL",
+                dte           = 0,
+                open_interest = 5_000,
+                tier          = 3,
+            )
             registry[f"{ticker}250117C00100000"] = meta
             oi_by_ticker[ticker] = 5_000
 
@@ -600,8 +614,14 @@ class TestBuildIdempotency:
         """
         If chain OI grows between refresh cycles, the next build() must
         promote the ticker tier accordingly.
+
+        FIX: The fake _build_ticker must write a real ContractMeta with dte=0
+        (not a MagicMock with dte=30). The H3 incremental guard skips
+        _build_ticker for tickers whose min_dte > 0. Using dte=0 ensures the
+        ticker is always re-fetched, so the OI iterator yields 0 on build 1
+        (→ T3) and 5000 on build 2 (→ T1).
         """
-        from services.symbol_registry import SymbolRegistry
+        from services.symbol_registry import SymbolRegistry, ContractMeta
 
         oi_seq = iter([0, 5_000])  # first build: OI=0, second: OI=5000
 
@@ -611,11 +631,18 @@ class TestBuildIdempotency:
             zero_price_fallback=False,
         ):
             oi = next(oi_seq)
-            meta = MagicMock()
-            meta.ticker        = ticker
-            meta.open_interest = oi
-            meta.tier          = 3
-            meta.dte           = 30  # real int so H3 incremental DTE scan works on 2nd build
+            # Use a real ContractMeta with dte=0 so the H3 incremental guard
+            # treats this ticker as "expired today" and re-fetches it on
+            # every subsequent build() call.
+            meta = ContractMeta(
+                ticker        = ticker,
+                strike        = 100.0,
+                expiry        = "2025-01-17",
+                contract_type = "CALL",
+                dte           = 0,
+                open_interest = oi,
+                tier          = 3,
+            )
             registry[f"{ticker}250117C00100000"] = meta
             oi_by_ticker[ticker] = oi
 
