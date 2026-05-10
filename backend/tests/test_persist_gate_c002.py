@@ -84,6 +84,19 @@ def _make_ep(ticker="TSLA", contract_type="CALL", trade_count=3, total_premium=6
     return ep
 
 
+def _make_composite():
+    """Return a composite mock that satisfies the composite.score access in _process_trade."""
+    c = MagicMock()
+    c.score = 0.75
+    c.s1_score = 0.7
+    c.s2_score = 0.7
+    c.s3_score = 0.7
+    c.s4_score = 0.7
+    c.s5_score = 0.7
+    c.s6_score = 0.7
+    return c
+
+
 def _make_raw(occ="TSLA  260516C00375000", exchange="C"):
     return {
         "type": "timesale",
@@ -97,6 +110,12 @@ def _make_raw(occ="TSLA  260516C00375000", exchange="C"):
             "date": 1745686200000,
         },
     }
+
+
+def _make_ingestion_processor():
+    proc = MagicMock()
+    proc.process.return_value = True
+    return proc
 
 
 class TestC002SubThreshold:
@@ -138,7 +157,9 @@ class TestC002ThresholdCrossing:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=_make_composite()), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor()), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -165,7 +186,9 @@ class TestC002SubsequentQualifyingTicks:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=_make_composite()), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor()), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -199,7 +222,9 @@ class TestC002PersistPayload:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", side_effect=_capture), \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=_make_composite()), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor()), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -259,7 +284,9 @@ class TestC002OrderGuarantee:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", side_effect=_persist), \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=_make_composite()), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor()), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
@@ -320,7 +347,9 @@ class TestC002BusRegression:
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
              patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.build_composite", return_value=_make_composite()), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor()), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
