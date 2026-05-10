@@ -191,6 +191,11 @@ class TestMigrationSqlShape:
     These are smoke tests only — they do not execute SQL against a DB.
     They catch the most common mistake: a migration that omits a constraint
     name or a ticker, discovered only at apply-time.
+
+    NOTE (REARCH-001 patch 2026-05-09): tracked_symbols does not exist in the
+    cipher schema. Both migration files operate on options_universe_symbols only.
+    Assertions referencing chk_tracked_symbols_no_index and
+    NOTIFY tracked_symbols_changed have been removed accordingly.
     """
 
     _MIGRATIONS = pathlib.Path(__file__).resolve().parents[1] / "migrations"
@@ -208,10 +213,6 @@ class TestMigrationSqlShape:
         assert self._DELETE_FILE.exists(), (
             f"Missing migration file: {self._DELETE_FILE.name}"
         )
-
-    def test_constraint_file_has_tracked_symbols_constraint_name(self):
-        sql = self._CONSTRAINT_FILE.read_text()
-        assert "chk_tracked_symbols_no_index" in sql
 
     def test_constraint_file_has_universe_symbols_constraint_name(self):
         sql = self._CONSTRAINT_FILE.read_text()
@@ -235,13 +236,9 @@ class TestMigrationSqlShape:
         sql = self._DELETE_FILE.read_text()
         assert "$%" in sql
 
-    def test_delete_file_has_notify_for_tracked_symbols(self):
-        sql = self._DELETE_FILE.read_text()
-        assert "NOTIFY" in sql
-        assert "tracked_symbols_changed" in sql
-
     def test_delete_file_has_notify_for_universe_symbols(self):
         sql = self._DELETE_FILE.read_text()
+        assert "NOTIFY" in sql
         assert "options_universe_symbols_changed" in sql
 
     def test_both_files_wrapped_in_transaction(self):
