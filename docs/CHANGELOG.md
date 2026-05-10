@@ -9,6 +9,128 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [REARCH-010 — DB Schema Purge] — 2026-05-09
+
+### Summary
+
+Comprehensive schema cleanup against the live `cipher-database` as part of the
+Steamroom Signal Engine re-architecture. Retires all pre-REARCH vocabulary, swarm
+dedicated columns, legacy gate config tables, and backtest results table. Adds 9 new
+Steamroom-dimension columns to `flow_episodes` and `signal_history`. Closes GitHub
+issue [#111](https://github.com/bhaveshhpatel/cipher/issues/111).
+Merged via PR [#119](https://github.com/bhaveshhpatel/cipher/pull/119).
+
+### Removed
+
+#### Tables Dropped
+
+| Table | Reason |
+|---|---|
+| `backtest_results` | Replaced by in-memory `GET /admin/signal-config/backtest` replay (REARCH-014) |
+| `gate_configs` | Replaced by `ingestion_config` table (REARCH-002) |
+| `gate_config_audit` | Replaced by `admin_activity_log` |
+
+#### `flow_events` — Columns Dropped
+
+| Column | Pre-REARCH Role | REARCH Replacement |
+|---|---|---|
+| `conviction_score` | Raw event conviction float | Normalized 0–100 from REARCH-006 formula |
+| `influence_tier` | `WHALE`/`INSTITUTIONAL`/`LARGE`/`RETAIL` string | `options_universe_symbols.tier` (T1/T2/T3) |
+| `is_golden_sweep` | Boolean golden sweep flag | `alert_level = 'GOLDEN'` |
+
+#### `flow_episodes` — Columns Dropped
+
+| Column | Pre-REARCH Role | REARCH Replacement |
+|---|---|---|
+| `volume_premium_factor` | Scalar signal weight | `episode_steamroom_score` + conviction pipeline |
+| `seed_episode` | Seed episode flag | Removed; no replacement |
+
+#### `signal_history` — Columns Dropped (Swarm Dedicated Columns)
+
+| Column |
+|---|
+| `swarm_direction` |
+| `swarm_confidence` |
+| `swarm_agents` |
+| `swarm_bull_votes` |
+| `swarm_bear_votes` |
+| `swarm_hold_votes` |
+
+Swarm results are now stored as a PATCH to the existing `signal_history.detail['swarm']`
+JSONB object (REARCH-013). No dedicated columns.
+
+### Changed
+
+#### `signal_history` — CHECK Constraints Updated
+
+| Constraint | Old Values | New Values |
+|---|---|---|
+| `alert_level` CHECK | `CONVICTION`, `WHALE`, `INSTITUTIONAL`, `LARGE`, `RETAIL` | `WATCH`, `NOTEWORTHY`, `BLOCK`, `GOLDEN` |
+| `direction` CHECK | `BUY`, `SELL`, `HOLD` | `BULLISH`, `BEARISH`, `NEUTRAL` |
+
+28,504 existing `signal_history` rows backfilled before constraint swap:
+- `alert_level` mapped: `CONVICTION`→`GOLDEN`, `WHALE`→`BLOCK`, `INSTITUTIONAL`→`NOTEWORTHY`, `LARGE`→`NOTEWORTHY`, `RETAIL`→`WATCH`, all others→`WATCH`
+- `direction` mapped: `BUY`→`BULLISH`, `SELL`→`BEARISH`, `HOLD`→`NEUTRAL`
+
+### Added
+
+#### `flow_episodes` — 9 Steamroom Dimension Columns
+
+| Column | Type | Description |
+|---|---|---|
+| `episode_steamroom_score` | `INTEGER` | 0–5 Steamroom dimension score |
+| `ask_side_pct` | `NUMERIC` | Fraction of constituent events executed on ask side |
+| `vol_oi_signal` | `BOOLEAN` | True if any constituent event had Vol > OI |
+| `volume_oi_ratio` | `NUMERIC` | Aggregate volume / open interest ratio |
+| `bid_ask_class` | `TEXT` | `ASK_SIDE`, `BID_SIDE`, `MID`, `AMBIGUOUS` |
+| `dte_min` | `INTEGER` | Minimum DTE across constituent events |
+| `dte_max` | `INTEGER` | Maximum DTE across constituent events |
+| `is_ask_side` | `BOOLEAN` | Majority of fills executed at or above ask |
+| `is_repeat` | `BOOLEAN` | Episode flagged as clustering/repetition pattern |
+
+#### `signal_history` — Steamroom Snapshot Columns
+
+| Column | Type | Description |
+|---|---|---|
+| `steamroom_score` | `INTEGER` | Snapshot of `episode_steamroom_score` at signal emit time |
+| `ask_side_pct_snapshot` | `NUMERIC` | Snapshot of `ask_side_pct` at signal emit time |
+
+### Migration Files Applied
+
+| File | Status |
+|---|---|
+| `backfill_signal_history_alert_level.sql` | ☑ Applied |
+| `drop_tables_backtest_gate_configs.sql` | ☑ Applied |
+| `drop_columns_flow_events_pre_rearch.sql` | ☑ Applied |
+| `drop_columns_flow_episodes_pre_rearch.sql` | ☑ Applied |
+| `drop_columns_signal_history_swarm.sql` | ☑ Applied |
+| `alter_signal_history_constraints_rearch.sql` | ☑ Applied |
+| `add_steamroom_columns_flow_episodes.sql` | ☑ Applied |
+| `add_steamroom_snapshot_columns_signal_history.sql` | ☑ Applied |
+
+### Tests Fixed
+
+`backend/tests/test_flow_endpoint.py` updated to remove assertions on retired fields:
+- Removed `influence_tier` from response shape check and `test_flow_alert_level_mapping`
+- Removed `is_golden_sweep` from `test_flow_is_accelerating_*` and `test_flow_scan_null_expiry_row_is_included`
+
+These fields were intentionally dropped from `FlowEventOut` in this story. Tests that
+asserted their presence were stale and have been deleted or updated accordingly.
+
+### Retired Vocabulary
+
+The following terms must not appear in any new code, API response, DB column, or UI after this migration:
+
+| Retired | Replacement |
+|---|---|
+| `CONVICTION`, `WHALE`, `INSTITUTIONAL`, `LARGE`, `RETAIL` | `WATCH`, `NOTEWORTHY`, `BLOCK`, `GOLDEN` |
+| `BUY`, `SELL`, `HOLD` | `BULLISH`, `BEARISH`, `NEUTRAL` |
+| `conviction_score` (flow event field) | REARCH-006 normalized score |
+| `influence_tier` | `options_universe_symbols.tier` (T1/T2/T3) |
+| `is_golden_sweep` (boolean) | `alert_level = 'GOLDEN'` |
+
+---
+
 ## [Migration 012 — Catch-up Schema Delta] — 2026-05-06
 
 ### Summary
