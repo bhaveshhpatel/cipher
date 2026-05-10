@@ -568,6 +568,7 @@ class TestBuildIdempotency:
             meta.ticker        = ticker
             meta.open_interest = 5_000
             meta.tier          = 3
+            meta.dte           = 30  # real int so H3 incremental DTE scan works on 2nd build
             registry[f"{ticker}250117C00100000"] = meta
             oi_by_ticker[ticker] = 5_000
 
@@ -614,6 +615,7 @@ class TestBuildIdempotency:
             meta.ticker        = ticker
             meta.open_interest = oi
             meta.tier          = 3
+            meta.dte           = 30  # real int so H3 incremental DTE scan works on 2nd build
             registry[f"{ticker}250117C00100000"] = meta
             oi_by_ticker[ticker] = oi
 
