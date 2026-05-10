@@ -17,9 +17,16 @@ Public API:
   remove_symbol(s)      → None   (silent no-op if missing)
   validate_symbol(s)    → bool
   apply_config(cfg)     → None   (dict with optional 'symbols' key)
+
+REARCH-001 (2026-05-09): validate_symbol() now rejects index tickers via
+  is_index_symbol() as a second gate, after the structural alpha/length checks.
+  This ensures index symbols added through the admin API or apply_config() are
+  rejected at the application layer even if they slip past the streaming guard.
 """
 import os
 from typing import Optional
+
+from ingestion.filters import is_index_symbol
 
 # ---------------------------------------------------------------------------
 # API key / feature flags
@@ -92,10 +99,21 @@ def remove_symbol(symbol: str) -> None:
 
 def validate_symbol(symbol: str) -> bool:
     """
-    Return True if *symbol* looks like a valid US equity ticker:
-      - Non-empty string
-      - 1-5 characters
-      - All alphabetic (A-Z) — rejects purely numeric strings
+    Return True if *symbol* looks like a valid US equity ticker that is
+    permitted in the ingestion pipeline.
+
+    Rejection criteria (all must pass to return True):
+      1. Non-empty string
+      2. 1-5 characters after strip
+      3. All alphabetic (A-Z) — rejects purely numeric strings
+      4. NOT an index symbol (REARCH-001) — is_index_symbol() returns False
+
+    The index check is the LAST gate so structural rejects (empty, too long,
+    non-alpha) short-circuit before the frozenset lookup.
+
+    REARCH-001 note: This is the API-layer enforcement point. The streaming
+    boundary guard in _process_trade() is a separate, independent defense that
+    this function must never be used to replace.
     """
     if not symbol or not isinstance(symbol, str):
         return False
@@ -105,6 +123,9 @@ def validate_symbol(symbol: str) -> bool:
     if not s.isalpha():
         return False
     if len(s) > 5:
+        return False
+    # REARCH-001: index symbols pass alpha/length checks but must be rejected.
+    if is_index_symbol(s):
         return False
     return True
 
