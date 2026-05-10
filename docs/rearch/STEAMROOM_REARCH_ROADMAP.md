@@ -123,7 +123,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 | 7 | **REARCH-007** — Admin UI: Ingestion Config Panel | [#108](https://github.com/bhaveshhpatel/cipher/issues/108) | `feat/rearch-007-admin-ingestion-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-002 |
 | 8 | **REARCH-008** — Admin UI: Signal Strategy Panel | [#109](https://github.com/bhaveshhpatel/cipher/issues/109) | `feat/rearch-008-admin-signal-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-005, REARCH-006 |
 | 9 | **REARCH-009** — Integration Test Suite | [#110](https://github.com/bhaveshhpatel/cipher/issues/110) | `feat/rearch-009-integration-tests` | 🔲 Not Started | SA · PBE · QA | REARCH-001 through REARCH-008, REARCH-013, REARCH-014 |
-| 10 | **REARCH-010** — DB Schema Purge | [#111](https://github.com/bhaveshhpatel/cipher/issues/111) | `feat/rearch-010-db-schema-purge` | 🔲 Not Started | SA · PBE · QA | None (prerequisite for REARCH-003, REARCH-004, REARCH-006) |
+| 10 | **REARCH-010** — DB Schema Purge | [#111](https://github.com/bhaveshhpatel/cipher/issues/111) | `feat/rearch-010-db-schema-purge` | ✅ Merged to aggregation branch | SA · PBE · QA | None (prerequisite for REARCH-003, REARCH-004, REARCH-006) |
 | 11 | **REARCH-011** — Dashboard Frontend Overhaul | [#112](https://github.com/bhaveshhpatel/cipher/issues/112) | `feat/rearch-011-dashboard-overhaul` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-010, REARCH-006, REARCH-004 |
 | 12 | **REARCH-012** — Admin Page Overhaul | [#113](https://github.com/bhaveshhpatel/cipher/issues/113) | `feat/rearch-012-admin-page-overhaul` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-010, REARCH-007, REARCH-008 |
 | 13 | **REARCH-013** — S7: Tiered Swarm Engine + Circuit Breaker | [#115](https://github.com/bhaveshhpatel/cipher/issues/115) | `feat/rearch-013-tiered-swarm-circuit-breaker` | 🔲 Not Started | SA · PBE · QA | REARCH-010, REARCH-006, REARCH-004 |
@@ -158,7 +158,7 @@ REARCH-001 (Index Purge)
             └── REARCH-007 (Admin: Ingestion Panel)
                         └── REARCH-012 (Admin Page Overhaul)
 
-REARCH-010 (DB Schema Purge)  ← prerequisite; unblocks REARCH-003, REARCH-004,
+REARCH-010 (DB Schema Purge) ✅ Applied — unblocks REARCH-003, REARCH-004,
     ├── REARCH-011 (Dashboard Overhaul)      REARCH-006 column reads and all UI work
     ├── REARCH-012 (Admin Page Overhaul)
     └── REARCH-013 (Tiered Swarm)           ← signal_history.detail JSONB is the swarm write target
@@ -170,7 +170,7 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
     ✗ NOT IN THIS GRAPH — frozen, out of scope, no stories touch these components
 ```
 
-> **REARCH-010 note:** Although REARCH-010 has no application-code dependencies, it is a hard prerequisite for all frontend work (REARCH-011, REARCH-012) and for REARCH-013 (swarm writes to `signal_history.detail` JSONB which is formalized in REARCH-010). Schedule immediately after REARCH-002 seeding is confirmed and before any feature branch touches the affected tables.
+> **REARCH-010 note:** ✅ Merged 2026-05-09. Schema purge applied: 3 tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 pre-REARCH columns retired, CHECK constraints updated to REARCH vocabulary, 9 new Steamroom columns added. All downstream stories (REARCH-003, REARCH-004, REARCH-006, REARCH-011, REARCH-012, REARCH-013) are now unblocked.
 
 > **REARCH-013 → REARCH-014 dependency note:** REARCH-014's backtest engine must know whether swarm is annotated on historical signals. The contract is: swarm is **always excluded from backtest replay scoring**. Deterministic Steamroom scoring only. REARCH-013 must be merged first so the `signal_history.detail['swarm']` shape is stable and REARCH-014 can explicitly exclude it.
 
@@ -179,7 +179,7 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 ## Story Summaries
 
 ### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
-Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill strategy required for 28,504 existing `signal_history` rows before constraint swap.
+✅ **Merged 2026-05-09.** Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill strategy required for 28,504 existing `signal_history` rows before constraint swap.
 
 > **Streaming boundary:** REARCH-010 only touches Supabase schema. No streaming files, no worker process, no Tradier client code.
 
@@ -269,7 +269,7 @@ main
         ├── feat/rearch-007-admin-ingestion-panel
         ├── feat/rearch-008-admin-signal-panel
         ├── feat/rearch-009-integration-tests
-        ├── feat/rearch-010-db-schema-purge
+        ├── feat/rearch-010-db-schema-purge        ✅ merged
         ├── feat/rearch-011-dashboard-overhaul
         ├── feat/rearch-012-admin-page-overhaul
         ├── feat/rearch-013-tiered-swarm-circuit-breaker
@@ -322,14 +322,14 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-004 | `add_episode_quality_aggregate_columns.sql` | ☐ |
 | REARCH-005 | `create_signal_config_table.sql` | ☐ |
 | REARCH-005 | `seed_signal_config_steamroom_defaults.sql` | ☐ |
-| REARCH-010 | `backfill_signal_history_alert_level.sql` | ☐ |
-| REARCH-010 | `drop_tables_backtest_gate_configs.sql` | ☐ |
-| REARCH-010 | `drop_columns_flow_events_pre_rearch.sql` | ☐ |
-| REARCH-010 | `drop_columns_flow_episodes_pre_rearch.sql` | ☐ |
-| REARCH-010 | `drop_columns_signal_history_swarm.sql` | ☐ |
-| REARCH-010 | `alter_signal_history_constraints_rearch.sql` | ☐ |
-| REARCH-010 | `add_steamroom_columns_flow_episodes.sql` | ☐ |
-| REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☐ |
+| REARCH-010 | `backfill_signal_history_alert_level.sql` | ☑ |
+| REARCH-010 | `drop_tables_backtest_gate_configs.sql` | ☑ |
+| REARCH-010 | `drop_columns_flow_events_pre_rearch.sql` | ☑ |
+| REARCH-010 | `drop_columns_flow_episodes_pre_rearch.sql` | ☑ |
+| REARCH-010 | `drop_columns_signal_history_swarm.sql` | ☑ |
+| REARCH-010 | `alter_signal_history_constraints_rearch.sql` | ☑ |
+| REARCH-010 | `add_steamroom_columns_flow_episodes.sql` | ☑ |
+| REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☑ |
 | REARCH-013 | `create_index_signal_history_detail_swarm.sql` (GIN index on `detail->'swarm'`) | ☐ |
 
 > **REARCH-013 DB note:** No DDL changes to table structure — swarm result lives in the existing `signal_history.detail` JSONB column added in REARCH-010. The only migration is the GIN index to support admin queries over swarm-annotated signals.
@@ -365,7 +365,7 @@ The following pre-REARCH terms must not appear in any new code, component, API r
 
 - [ ] REARCH-001 through REARCH-014 all status ✅ (merged to aggregation branch)
 - [ ] REARCH-009 integration test suite: all scenarios green in CI (includes swarm and backtest integration tests)
-- [ ] REARCH-010 DB schema purge applied and verified with `get_advisors` scan
+- [x] REARCH-010 DB schema purge applied and verified with `get_advisors` scan
 - [ ] No index ticker in `flow_events` (verified by query)
 - [ ] No retired vocabulary in any API response, DB column, or UI component
 - [ ] Admin UI: ingestion panel and signal panel both render and save correctly
