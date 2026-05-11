@@ -93,7 +93,8 @@ Bug fixes applied:
       PostgREST 400 on every event insert.
   11. REARCH-003 (2026-05-11): added classify_bid_ask(), compute_vol_oi_signal(),
       and quality tag fields (is_ask_side, bid_ask_class, vol_oi_signal,
-      normalized_premium, normalized_oi) to persist_flow_event() row dict.
+      normalized_premium, normalized_oi, dte_bucket, notional_tier) to
+      persist_flow_event() row dict.
   12. SA-5 (2026-05-11): three code sites independently divided vol/OI with no
       shared helper. Added _compute_vol_oi_ratio(vol, oi) -> Optional[float] as
       the single source of truth (round(vol/oi, 4), None on bad inputs).
@@ -106,6 +107,14 @@ Bug fixes applied:
       (bid_ask_class, is_ask_side) — callers get both values from one call.
       _classify_bid_ask() is now the PRIVATE test-shim returning str only.
       persist_flow_event() updated to unpack the tuple from classify_bid_ask().
+  14. REARCH-003-ENUM (2026-05-11): dte_bucket and notional_tier were missing
+      from persist_flow_event() row dict entirely — new rows were written with
+      NULL for both columns despite the columns existing in the schema.
+      Fixed by importing _compute_dte_bucket/_compute_notional_tier from
+      processor and computing both inline before the row dict is built.
+      Enum values are the canonical Steamroom set:
+        dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
+        notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -219,6 +228,14 @@ REARCH-003 quality tag semantics:
                                                    persist time). Rounded to 4dp via
                                                    _compute_vol_oi_ratio(). NULL when contract_oi
                                                    is unavailable or zero.
+  flow_events.dte_bucket       TEXT — Steamroom DTE bracket:
+                                 '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
+                                 Computed by _compute_dte_bucket() from processor.py.
+                                 Never NULL — defaults to '90+' on missing/negative DTE.
+  flow_events.notional_tier    TEXT — Steamroom premium size bucket:
+                                 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
+                                 Computed by _compute_notional_tier() from processor.py.
+                                 Never NULL — defaults to 'WATCH' on missing/zero premium.
 
   classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]:
     PUBLIC API — returns (bid_ask_class: str, is_ask_side: bool).
@@ -618,6 +635,7 @@ async def persist_flow_event(ev_dict: dict):
     ask              = ev_dict.get("ask", 0.0) or 0.0
     underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
     premium          = ev_dict.get("premium", 0.0) or 0.0
+    dte              = ev_dict.get("dte")
 
     # normalized_oi numerator: Tradier tick-level OI field from the event dict.
     # normalized_oi denominator: contract_oi captured from chain_store at persist time (intraday snapshot).
@@ -645,6 +663,15 @@ async def persist_flow_event(ev_dict: dict):
     # Rounded to 4dp. NULL when contract_oi is unavailable or zero (cache miss).
     # See INTENTIONALLY DIFFERENT SOURCES note above.
     normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
+
+    # REARCH-003-ENUM: dte_bucket and notional_tier — Steamroom canonical enums.
+    # Imported from processor to keep the single source of truth in one place.
+    # dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
+    # notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
+    # Neither is nullable — defaults to '90+' / 'WATCH' on missing inputs.
+    from ingestion.processor import _compute_dte_bucket, _compute_notional_tier
+    dte_bucket    = _compute_dte_bucket(dte)
+    notional_tier = _compute_notional_tier(premium)
 
     row = {
         "ticker":                   ticker,
@@ -676,6 +703,8 @@ async def persist_flow_event(ev_dict: dict):
         "vol_oi_signal":            vol_oi_signal,
         "normalized_premium":       normalized_premium,
         "normalized_oi":            normalized_oi,
+        "dte_bucket":               dte_bucket,
+        "notional_tier":            notional_tier,
     }
     _flow_event_buffer.append(row)
 
