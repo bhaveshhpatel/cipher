@@ -115,7 +115,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 | # | Story | GitHub Issue | Branch | Status | Deliberation | Dependencies |
 |---|---|---|---|---|---|---|
 | 1 | **REARCH-001** — Index Symbol Purge | [#102](https://github.com/bhaveshhpatel/cipher/issues/102) | `feat/rearch-001-index-purge` | ✅ Merged to aggregation branch | SA · PBE · QA | None |
-| 2 | **REARCH-002** — Ingestion Quality Floors | [#103](https://github.com/bhaveshhpatel/cipher/issues/103) | `feat/rearch-002-ingestion-floors` | 🔲 Not Started | SA · PBE · QA | REARCH-001 |
+| 2 | **REARCH-002** — Ingestion Quality Floors | [#103](https://github.com/bhaveshhpatel/cipher/issues/103) | `feat/rearch-002-ingestion-floors` | ✅ Merged to aggregation branch | SA · PBE · QA | REARCH-001 |
 | 3 | **REARCH-003** — Flow Event Quality Tagging | [#104](https://github.com/bhaveshhpatel/cipher/issues/104) | `feat/rearch-003-event-quality-tags` | 🔲 Not Started | SA · PBE · QA | REARCH-002 |
 | 4 | **REARCH-004** — Episode Quality Enrichment | [#105](https://github.com/bhaveshhpatel/cipher/issues/105) | `feat/rearch-004-episode-quality-enrichment` | 🔲 Not Started | SA · PBE · QA | REARCH-003 |
 | 5 | **REARCH-005** — Signal Config Store | [#106](https://github.com/bhaveshhpatel/cipher/issues/106) | `feat/rearch-005-signal-config-store` | 🔲 Not Started | SA · PBE · QA | REARCH-002, REARCH-004 |
@@ -145,7 +145,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 
 ```
 REARCH-001 (Index Purge) ✅
-    └── REARCH-002 (Ingestion Floors)
+    └── REARCH-002 (Ingestion Floors) ✅
             ├── REARCH-003 (Event Tagging)
             │       └── REARCH-004 (Episode Enrichment)
             │               └── REARCH-005 (Signal Config Store)
@@ -170,9 +170,11 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
     ✗ NOT IN THIS GRAPH — frozen, out of scope, no stories touch these components
 ```
 
-> **REARCH-001 note:** ✅ Merged 2026-05-09. Index symbol purge complete: `validate_symbol()` now rejects all 11 index tickers + `$`-prefixed symbols via `is_index_symbol()` frozenset gate. `chk_options_universe_symbols_no_index` CHECK constraint applied to Supabase production. 33 unit tests passing. Follow-on items tracked: `apply_config()` admin-path bypass verification, `flow_events`/`signal_history` index constraint coverage (candidate for REARCH-002 scope).
+> **REARCH-001 note:** ✅ Merged 2026-05-10 via [PR #121](https://github.com/bhaveshhpatel/cipher/pull/121). Index symbol purge complete: `validate_symbol()` now rejects all 11 index tickers + `$`-prefixed symbols via `is_index_symbol()` frozenset gate. `chk_options_universe_symbols_no_index` CHECK constraint applied to Supabase production. 33 unit tests passing. Follow-on items tracked: `apply_config()` admin-path bypass verification (resolved in REARCH-002), `flow_events`/`signal_history` index constraint coverage (candidate for REARCH-003 scope).
 
-> **REARCH-010 note:** ✅ Merged 2026-05-09. Schema purge applied: 3 tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 pre-REARCH columns retired, CHECK constraints updated to REARCH vocabulary, 9 new Steamroom columns added. All downstream stories (REARCH-003, REARCH-004, REARCH-006, REARCH-011, REARCH-012, REARCH-013) are now unblocked.
+> **REARCH-002 note:** ✅ Merged 2026-05-11 via [PR #126](https://github.com/bhaveshhpatel/cipher/pull/126). `IngestionProcessor` 4-gate pipeline shipped: G1 DTE floor (min_dte=1) → G2 DTE ceiling (max_dte=90) → G3 tier-aware premium floor (T1=$25K / T2=$15K / T3=$5K) → G4 OI floor (min_oi=50). DB-backed `ingestion_config` table with 30s TTL cache and GIL-safe atomic reference swap on hot path. `GET /admin/ingestion-config` and `PATCH /admin/ingestion-config` endpoints live. `apply_config()` now routes through `validate_symbol()` (closes REARCH-001 follow-on). 16 boundary-value tests passing. Migrations `create_ingestion_config_table.sql` and `seed_ingestion_config_defaults.sql` applied to Supabase production prior to merge. Unblocks: REARCH-003, REARCH-005, REARCH-007.
+
+> **REARCH-010 note:** ✅ Merged 2026-05-10 via [PR #119](https://github.com/bhaveshhpatel/cipher/pull/119). Schema purge applied: 3 tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 pre-REARCH columns retired, CHECK constraints updated to REARCH vocabulary, 9 new Steamroom columns added. 410 Gone stubs added to `admin.py` for deprecated endpoints; removed once REARCH-012 cleans the admin frontend. All downstream stories (REARCH-003, REARCH-004, REARCH-006, REARCH-011, REARCH-012, REARCH-013) are now unblocked.
 
 > **REARCH-013 → REARCH-014 dependency note:** REARCH-014's backtest engine must know whether swarm is annotated on historical signals. The contract is: swarm is **always excluded from backtest replay scoring**. Deterministic Steamroom scoring only. REARCH-013 must be merged first so the `signal_history.detail['swarm']` shape is stable and REARCH-014 can explicitly exclude it.
 
@@ -181,7 +183,7 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 ## Story Summaries
 
 ### REARCH-001 — Index Symbol Purge ([#102](https://github.com/bhaveshhpatel/cipher/issues/102))
-✅ **Merged 2026-05-09** via [PR #121](https://github.com/bhaveshhpatel/cipher/pull/121). Three-layer defence-in-depth against index symbol ingestion:
+✅ **Merged 2026-05-10** via [PR #121](https://github.com/bhaveshhpatel/cipher/pull/121). Three-layer defence-in-depth against index symbol ingestion:
 
 1. **`validate_symbol()` API gate** — `is_index_symbol()` frozenset check added as the fourth gate in `ingestion/config.py`, after structural checks. Rejects SPX, SPXW, SPXPM, NDX, NDXP, VIX, VIXW, RUT, MRUT, DJX, XSP and any `$`-prefixed symbol.
 2. **DB CHECK constraint** — `chk_options_universe_symbols_no_index` applied to `options_universe_symbols` with idempotent `IF NOT EXISTS` guard. Applied to Supabase production prior to merge.
@@ -189,16 +191,42 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 
 Migrations applied: `rearch_001_delete_index_tickers_from_tracked_symbols.sql` (purges existing rows, issues `NOTIFY options_universe_symbols_changed`) and `rearch_001_add_index_blacklist_constraint.sql`. Note: `tracked_symbols` table does not exist in the cipher schema — both migrations operate on `options_universe_symbols` only. 33 unit tests across `TestIsIndexSymbol`, `TestValidateSymbolIndexRejection`, `TestDefenceInDepthIndependence`, `TestMigrationSqlShape`.
 
-**Follow-on items (not in REARCH-001 scope):**
-- `apply_config()` admin-path bypass — confirm it routes through `validate_symbol()`
-- `flow_events` / `signal_history` have no index CHECK constraint — consider REARCH-002 scope
+**Follow-on items (resolved in REARCH-002):**
+- `apply_config()` admin-path bypass — ✅ resolved: now routes through `validate_symbol()` (PR #126)
+- `flow_events` / `signal_history` have no index CHECK constraint — candidate for REARCH-003 scope
 
 > **Streaming boundary:** REARCH-001 only touches `ingestion/config.py`, `ingestion/filters.py`, migration SQL files, and tests. No streaming files modified.
 
-### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
-✅ **Merged 2026-05-09.** Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill strategy required for 28,504 existing `signal_history` rows before constraint swap.
+### REARCH-002 — Ingestion Quality Floors ([#103](https://github.com/bhaveshhpatel/cipher/issues/103))
+✅ **Merged 2026-05-11** via [PR #126](https://github.com/bhaveshhpatel/cipher/pull/126). Introduces the `IngestionProcessor` 4-gate pipeline with DB-backed runtime configuration, a TTL cache for hot-path performance, and an admin API to read/patch config without a redeploy.
 
-> **Streaming boundary:** REARCH-010 only touches Supabase schema. No streaming files, no worker process, no Tradier client code.
+**Gates (execute in order):**
+
+| # | Gate | Config Field(s) | Default |
+|---|---|---|---|
+| G1 | DTE hard floor | `min_dte` | 1 day |
+| G2 | DTE ceiling | `max_dte` | 90 days |
+| G3 | Tier-aware premium floor | `min_premium_t1` / `min_premium_t2` / `min_premium_t3` | $25K / $15K / $5K |
+| G4 | Open-interest floor | `min_oi` | 50 contracts |
+
+**Key implementation details:**
+- `IngestionConfig` frozen dataclass with 7 tunable floor fields
+- 30s TTL cache with GIL-safe atomic reference swap — no lock on the hot path
+- Drop counters per gate exposed via `get_drop_stats()`
+- `apply_config()` now routes through `validate_symbol()` (closes REARCH-001 follow-on)
+- `GET /admin/ingestion-config` and `PATCH /admin/ingestion-config` endpoints live (422 on unknown key or out-of-range value)
+- `influence_tier` passed as `int` (1/2/3) matching live `influence_tier_int()` code path; retired string labels removed
+- Migrations `create_ingestion_config_table.sql` and `seed_ingestion_config_defaults.sql` applied to Supabase production prior to merge
+- 16 boundary-value tests covering all 4 gates, TTL behaviour, `apply_config` index rejection, and 422 PATCH responses
+
+> **WSJ Steamroom alignment:** G1/G2 enforce Dimension 4 (DTE Quality) at the ingestion sanity layer. G3 enforces Dimension 1 (Premium Threshold) per-tier. G4 is the liquidity floor. `is_aggressive` is tagged (not gated) here; ask-side conviction filtering lives in the Signal Engine (REARCH-006) per the Steamroom permissive-ingestion principle.
+
+> **Streaming boundary:** REARCH-002 only touches `ingestion/processor.py`, `ingestion/config.py`, `routers/ingestion_config.py`, `main.py` (router mount), migration SQL files, and tests. No streaming files modified.
+
+### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
+✅ **Merged 2026-05-10** via [PR #119](https://github.com/bhaveshhpatel/cipher/pull/119). Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill applied to 28,504 existing `signal_history` rows before constraint swap. 410 Gone stubs added to `admin.py` for `GET /gate-config`, `POST /gate-config`, `PATCH /gate-config`, `GET /gate-config/history`, `GET /backtest-results` — will be removed in REARCH-012 once admin frontend stops calling them.
+
+> **Streaming boundary:** REARCH-010 only touches Supabase schema and application-layer models/routers/services. No streaming files, no worker process, no Tradier client code.
 
 ### REARCH-011 — Dashboard Frontend Overhaul ([#112](https://github.com/bhaveshhpatel/cipher/issues/112))
 Full audit and rebuild of the dashboard page against the REARCH data model. Audit-first: every current component is classified KEEP / REWORK / REMOVE. Key removals: swarm voting UI, `influence_tier` displays, raw event `conviction_score` gauge, `is_golden_sweep` badge. New components: Steamroom Score pip indicator (0–5), Ask-Side fill bar, Alert Level badge (4-tier), Vol>OI tag, DTE bucket label. New information hierarchy: Market Status → Golden/Block Banner → Live Signal Feed → Episode Activity Panel → Aggregate Stats Bar → Signal History Table.
@@ -206,7 +234,7 @@ Full audit and rebuild of the dashboard page against the REARCH data model. Audi
 > **Streaming boundary:** Dashboard reads from Supabase and existing WebSocket push endpoints only. No changes to the streaming worker, Tradier connection, or any upstream data pipeline.
 
 ### REARCH-012 — Admin Page Overhaul ([#113](https://github.com/bhaveshhpatel/cipher/issues/113))
-Full audit and consolidation of the admin page. Removes Gate Config panel (backed by dropped `gate_configs` table), backtest results viewer, and any swarm monitoring UI. Integrates REARCH-007 and REARCH-008 panels into a clean 5-tab layout: Stream & Health / Ingestion Config / Signal Strategy / Universe Management / Demo Engine. Demo engine is explicitly preserved but must pass a 6-point audit checklist for retired field references. Persistent Activity Log footer drawer replaces any scattered log views. Swarm invocation surface (invoke button + tier selector + result display) is a contextual panel within the Episode detail view — not a standalone tab — added in this story.
+Full audit and consolidation of the admin page. Removes Gate Config panel (backed by dropped `gate_configs` table), backtest results viewer, and any swarm monitoring UI. Integrates REARCH-007 and REARCH-008 panels into a clean 5-tab layout: Stream & Health / Ingestion Config / Signal Strategy / Universe Management / Demo Engine. Demo engine is explicitly preserved but must pass a 6-point audit checklist for retired field references. Persistent Activity Log footer drawer replaces any scattered log views. Swarm invocation surface (invoke button + tier selector + result display) is a contextual panel within the Episode detail view — not a standalone tab — added in this story. **Note:** Will also remove 410 Gone stubs from `admin.py` after smoke-testing that the frontend has stopped calling deprecated endpoints.
 
 > **Streaming boundary:** The Stream & Health tab displays read-only metrics from the existing streaming worker (uptime, event rate, reconnect count). It does not modify, restart, or reconfigure the streaming worker itself.
 
@@ -243,8 +271,8 @@ Implements a fully in-memory, read-only, `dry_run=True`-hardcoded backtest engin
   "episodes_completed": 1847,
   "signals_emitted": 312,
   "signals_by_alert_level": { "WATCH": 198, "NOTEWORTHY": 89, "BLOCK": 21, "GOLDEN": 4 },
-  "signals_per_hour": { "09": 0, "10": 47, "11": 38, ... },
-  "top_episodes_blocked": [ ... ],
+  "signals_per_hour": { "09": 0, "10": 47, "11": 38, "...": "..." },
+  "top_episodes_blocked": [ "..." ],
   "swarm_excluded": true,
   "replay_duration_ms": 1842
 }
@@ -278,7 +306,7 @@ Implements a fully in-memory, read-only, `dry_run=True`-hardcoded backtest engin
 main
   └── cipher-rearch  ← aggregation branch (all merges land here)
         ├── feat/rearch-001-index-purge        ✅ merged
-        ├── feat/rearch-002-ingestion-floors
+        ├── feat/rearch-002-ingestion-floors   ✅ merged
         ├── feat/rearch-003-event-quality-tags
         ├── feat/rearch-004-episode-quality-enrichment
         ├── feat/rearch-005-signal-config-store
@@ -286,7 +314,7 @@ main
         ├── feat/rearch-007-admin-ingestion-panel
         ├── feat/rearch-008-admin-signal-panel
         ├── feat/rearch-009-integration-tests
-        ├── feat/rearch-010-db-schema-purge        ✅ merged
+        ├── feat/rearch-010-db-schema-purge    ✅ merged
         ├── feat/rearch-011-dashboard-overhaul
         ├── feat/rearch-012-admin-page-overhaul
         ├── feat/rearch-013-tiered-swarm-circuit-breaker
@@ -332,8 +360,8 @@ Deliberation results must be documented as comments on the GitHub issue before t
 |---|---|---|
 | REARCH-001 | `rearch_001_delete_index_tickers_from_tracked_symbols.sql` | ☑ |
 | REARCH-001 | `rearch_001_add_index_blacklist_constraint.sql` | ☑ |
-| REARCH-002 | `create_ingestion_config_table.sql` | ☐ |
-| REARCH-002 | `seed_ingestion_config_defaults.sql` | ☐ |
+| REARCH-002 | `create_ingestion_config_table.sql` | ☑ |
+| REARCH-002 | `seed_ingestion_config_defaults.sql` | ☑ |
 | REARCH-003 | `add_event_quality_tag_columns_to_flow_events.sql` | ☐ |
 | REARCH-003 | `backfill_event_quality_tags.sql` (batched) | ☐ |
 | REARCH-004 | `add_episode_quality_aggregate_columns.sql` | ☐ |
@@ -349,7 +377,9 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☑ |
 | REARCH-013 | `create_index_signal_history_detail_swarm.sql` (GIN index on `detail->'swarm'`) | ☐ |
 
-> **REARCH-001 DB note:** Both migrations applied to Supabase production 2026-05-09. `chk_options_universe_symbols_no_index` is live. Note: `tracked_symbols` table does not exist in the cipher schema — both migrations operate on `options_universe_symbols` only.
+> **REARCH-001 DB note:** Both migrations applied to Supabase production 2026-05-10. `chk_options_universe_symbols_no_index` is live. Note: `tracked_symbols` table does not exist in the cipher schema — both migrations operate on `options_universe_symbols` only.
+
+> **REARCH-002 DB note:** Both migrations applied to Supabase production prior to merge (2026-05-11). `ingestion_config` table is live with 7 seeded default rows.
 
 > **REARCH-013 DB note:** No DDL changes to table structure — swarm result lives in the existing `signal_history.detail` JSONB column added in REARCH-010. The only migration is the GIN index to support admin queries over swarm-annotated signals.
 
@@ -386,6 +416,7 @@ The following pre-REARCH terms must not appear in any new code, component, API r
 - [ ] REARCH-009 integration test suite: all scenarios green in CI (includes swarm and backtest integration tests)
 - [x] REARCH-010 DB schema purge applied and verified with `get_advisors` scan
 - [x] REARCH-001 index symbol purge applied: `chk_options_universe_symbols_no_index` live on Supabase production
+- [x] REARCH-002 ingestion floors applied: `ingestion_config` table live, 7 default rows seeded, router mounted
 - [ ] No index ticker in `flow_events` (verified by query)
 - [ ] No retired vocabulary in any API response, DB column, or UI component
 - [ ] Admin UI: ingestion panel and signal panel both render and save correctly
