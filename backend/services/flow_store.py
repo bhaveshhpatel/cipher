@@ -200,6 +200,9 @@ REARCH-003 quality tag semantics:
                                  — False when below threshold
                                  — NULL when vol or OI snapshot is unavailable (cache miss)
                                  — Column is nullable (migration 026: BOOLEAN DEFAULT NULL)
+                                 — Python type: Optional[bool] — matches DDL exactly.
+                                   DO NOT change to bool or add NOT NULL to the migration
+                                   without updating compute_vol_oi_signal() return type.
   flow_events.normalized_premium  FLOAT — premium / underlying_price; NULL when
                                            underlying_price is None or 0
   flow_events.normalized_oi       FLOAT — open_interest (Tradier tick-level OI field) /
@@ -323,8 +326,10 @@ def classify_bid_ask(
     if not ask or ask <= 0 or not bid or bid <= 0:
         return "MID"
     # Guard 2: crossed market — data quality event, not a valid spread.
-    # MUST precede threshold checks: a crossed market where fill >= ask*0.98
-    # would otherwise produce a spurious 'ASK' classification.
+    # ORDER IS CRITICAL: must follow Guard 1 (zero-ask already handled) and
+    # precede Guard 3 (threshold checks). A crossed market where fill >= ask*0.98
+    # would produce a spurious 'ASK' classification if this guard were moved after
+    # the threshold checks. Do NOT reorder these three guards.
     if bid > ask:
         return "MID"
     # Guard 3: threshold classification on clean quotes
@@ -338,10 +343,16 @@ def classify_bid_ask(
 def compute_vol_oi_signal(
     vol: Optional[int],
     oi: Optional[int],
-) -> Optional[bool]:
+) -> Optional[bool]:  # DDL contract: BOOLEAN DEFAULT NULL in migration 026. Keep Optional[bool].
     """
     REARCH-003: Return True when intraday vol/OI ratio meets the high-activity
     threshold, False when below it, None when data is unavailable.
+
+    Return type is Optional[bool] — maps directly to the flow_events.vol_oi_signal
+    column which is BOOLEAN DEFAULT NULL (migration 026). A None return persists
+    as SQL NULL (cache miss). Do NOT change this to bool or add a NOT NULL default
+    without also updating the migration DDL and the nullable annotation in
+    persist_flow_event().
     """
     if vol is None or oi is None or oi == 0:
         return None
@@ -352,6 +363,7 @@ def compute_vol_oi_signal(
 # REARCH-003: private aliases used by test_flow_and_stats.py
 # ---------------------------------------------------------------------------
 
+# TEST-ONLY SHIM — do not call from production paths.
 def _classify_bid_ask(
     fill_price: float,
     bid: Optional[float],
@@ -579,26 +591,30 @@ async def persist_flow_event(ev_dict: dict):
     ask              = ev_dict.get("ask", 0.0) or 0.0
     underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
     premium          = ev_dict.get("premium", 0.0) or 0.0
-    # Tradier tick-level OI field — distinct from contract_oi (chain_store snapshot).
-    # normalized_oi = open_interest / contract_oi expresses what fraction of the
-    # cached intraday OI was known at tick time. NULL when contract_oi is 0 or missing.
-    open_interest    = ev_dict.get("open_interest") or None
 
-    bid_ask_cls: str        = classify_bid_ask(fill_price, bid, ask)
-    is_ask_side: bool       = bid_ask_cls == "ASK"
-    # vol_oi_signal: Optional[bool] — None on cache miss (column is BOOLEAN DEFAULT NULL,
-    # not NOT NULL). See migration 026 and REARCH-003 semantics in module docstring.
+    # normalized_oi numerator: Tradier tick-level OI field from the event dict.
+    # normalized_oi denominator: contract_oi captured from chain_store at persist time (intraday snapshot).
+    # INTENTIONALLY DIFFERENT SOURCES — this is not a data bug.
+    # The ratio answers: "what fraction of the chain_store's intraday OI snapshot
+    # does Tradier's tick-level OI represent?" It is not expected to be ~1.0.
+    # NULL when contract_oi (denominator) is unavailable or zero.
+    open_interest = ev_dict.get("open_interest") or None  # numerator: tick-level OI from Tradier
+
+    bid_ask_cls: str  = classify_bid_ask(fill_price, bid, ask)
+    is_ask_side: bool = bid_ask_cls == "ASK"
+
+    # vol_oi_signal: Optional[bool] — DDL contract: BOOLEAN DEFAULT NULL (migration 026).
+    # None → SQL NULL (chain_store cache miss). True/False → bool persisted as Postgres boolean.
+    # DO NOT add NOT NULL or change Optional[bool] without updating migration 026 DDL.
     vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
         contract_volume_snapshot, contract_oi
     )
 
     normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
 
-    # normalized_oi: Tradier tick-level open_interest / chain_store intraday contract_oi.
-    # Numerator: OI as reported by Tradier on this specific tick (ev_dict["open_interest"]).
-    # Denominator: contract_oi captured from chain_store at persist time (intraday snapshot).
-    # These are intentionally different sources — the ratio is not expected to be ~1.0.
-    # NULL when contract_oi is unavailable or zero.
+    # normalized_oi = tick-level open_interest (numerator, Tradier) /
+    #                 contract_oi (denominator, chain_store intraday snapshot).
+    # See INTENTIONALLY DIFFERENT SOURCES note above.
     normalized_oi: Optional[float] = None
     if contract_oi and contract_oi > 0 and open_interest is not None:
         normalized_oi = round(open_interest / contract_oi, 6)
@@ -712,481 +728,3 @@ async def _lookup_open_episode(
         f"{_SUPABASE_URL}/rest/v1/flow_episodes"
         f"?ticker=eq.{quote(ticker)}"
         f"&direction=eq.{quote(direction)}"
-        f"&contract_type=eq.{quote(contract_type)}"
-        f"&strike=eq.{strike}"
-        f"&expiry=eq.{quote(expiry)}"
-        f"&signal_ts=gte.{quote(cutoff)}"
-        f"&order=signal_ts.desc"
-        f"&limit=1"
-        f"&select=id,trade_count,total_premium,contract_oi_at_open"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url, headers=get_headers)
-        if resp.status_code != 200:
-            log.warning(
-                "[flow_store] _lookup_open_episode GET failed: %d -- %s "
-                "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
-                resp.status_code, resp.text[:200],
-                ticker, direction, contract_type, strike, expiry,
-            )
-            return None
-        rows = resp.json()
-        return rows[0] if rows else None
-    except Exception as exc:
-        log.warning(
-            "[flow_store] _lookup_open_episode exception: %s "
-            "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
-            exc, ticker, direction, contract_type, strike, expiry,
-        )
-        return None
-
-
-async def _patch_episode(
-    row_id: int,
-    trade_count: int,
-    total_premium: float,
-    new_ts: str,
-    ticker: str,
-    contract_type: str,
-    strike: float,
-    expiry: str,
-    contract_volume_at_close: Optional[int] = None,
-    volume_oi_ratio: Optional[float] = None,
-) -> bool:
-    patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
-    patch_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=minimal",
-    }
-    payload: dict = {
-        "trade_count":   trade_count,
-        "total_premium": total_premium,
-        "signal_ts":     new_ts,
-    }
-    if contract_volume_at_close is not None:
-        payload["contract_volume_at_close"] = contract_volume_at_close
-    if volume_oi_ratio is not None:
-        payload["volume_oi_ratio"] = volume_oi_ratio
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(patch_url, headers=patch_headers, json=payload)
-        if resp.status_code in (200, 204):
-            prem_str = f"${total_premium:,.0f}"
-            log.info(
-                "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
-                "trade_count=%d prem=%s vol=%s oi_ratio=%s (id=%s)",
-                ticker, contract_type, strike, expiry,
-                trade_count, prem_str,
-                contract_volume_at_close, volume_oi_ratio, row_id,
-            )
-            return True
-        log.warning(
-            "[flow_store] flow_episode PATCH failed: %d -- %s "
-            "(id=%s ticker=%s %s) — episode count may be inaccurate",
-            resp.status_code, resp.text[:200], row_id, ticker, contract_type,
-        )
-        return False
-    except Exception as exc:
-        log.warning(
-            "[flow_store] flow_episode PATCH exception: %s (id=%s ticker=%s)",
-            exc, row_id, ticker,
-        )
-        return False
-
-
-def _compute_vol_oi_ratio(
-    volume: Optional[int],
-    oi: Optional[int],
-) -> Optional[float]:
-    if volume is None or oi is None or oi == 0:
-        return None
-    return round(volume / oi, 4)
-
-
-async def persist_flow_episode(signal_data: dict):
-    """ING-009: Upsert one episode into flow_episodes."""
-    ticker        = signal_data.get("ticker")
-    direction     = signal_data.get("direction")
-    contract_type = signal_data.get("contract_type")
-    strike        = signal_data.get("strike")
-    expiry        = signal_data.get("expiry") or None
-    new_premium   = signal_data.get("total_premium") or 0.0
-    new_ts        = signal_data.get("timestamp")
-    occ_symbol    = signal_data.get("occ_symbol")
-
-    current_volume: Optional[int] = None
-    current_oi: Optional[int] = None
-    if occ_symbol:
-        try:
-            from services.chain_store import get_contract_vol_oi
-            current_volume, current_oi = get_contract_vol_oi(occ_symbol)
-        except Exception:
-            pass
-
-    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
-    lock = _get_episode_lock(key)
-
-    async with lock:
-        in_flight = _episode_in_flight.get(key)
-
-        if in_flight is not None:
-            row_id        = in_flight["id"]
-            trade_count   = in_flight["trade_count"] + 1
-            total_premium = in_flight["total_premium"] + new_premium
-
-            oi_at_open = in_flight.get("contract_oi_at_open")
-            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
-
-            ok = await _patch_episode(
-                row_id, trade_count, total_premium, new_ts,
-                ticker, contract_type, strike, expiry,
-                contract_volume_at_close=current_volume,
-                volume_oi_ratio=vol_ratio,
-            )
-            if ok:
-                _episode_stats["merged_episodes"] += 1
-                in_flight["trade_count"]   = trade_count
-                in_flight["total_premium"] = total_premium
-            return
-
-        existing = await _lookup_open_episode(
-            ticker, direction, contract_type, strike, expiry
-        )
-
-        if existing:
-            row_id        = existing["id"]
-            trade_count   = (existing.get("trade_count") or 1) + 1
-            total_premium = (existing.get("total_premium") or 0.0) + new_premium
-
-            oi_at_open = existing.get("contract_oi_at_open")
-            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
-
-            ok = await _patch_episode(
-                row_id, trade_count, total_premium, new_ts,
-                ticker, contract_type, strike, expiry,
-                contract_volume_at_close=current_volume,
-                volume_oi_ratio=vol_ratio,
-            )
-            if ok:
-                _episode_stats["merged_episodes"] += 1
-                _set_episode_in_flight(key, row_id, trade_count, total_premium)
-                _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
-            return
-
-        row = {
-            "ticker":              ticker,
-            "direction":           direction,
-            "contract_type":       contract_type,
-            "strike":              strike,
-            "expiry":              expiry,
-            "total_premium":       new_premium,
-            "trade_count":         signal_data.get("trade_count"),
-            "alert_level":         signal_data.get("alert_level"),
-            "is_accelerating":     signal_data.get("is_accelerating", False),
-            "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
-            "seed_episode":        signal_data.get("seed_episode"),
-            "signal_ts":           new_ts,
-            "contract_oi_at_open": current_oi,
-        }
-        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium, current_oi)
-        if ok:
-            _episode_stats["created_episodes"] += 1
-            prem_str = f"${new_premium:,.0f}"
-            log.info(
-                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
-                "alert=%s prem=%s multi_day=%s oi_at_open=%s",
-                ticker, contract_type, strike, expiry,
-                row["alert_level"], prem_str,
-                row["is_multi_day_repeat"], current_oi,
-            )
-
-
-async def _insert_rows_with_episode_id(
-    table: str,
-    row: dict,
-    key: str,
-    premium: float,
-    oi_at_open: Optional[int] = None,
-) -> bool:
-    """
-    INSERT a single episode row and cache its returned id for the in-flight dict.
-
-    Passes json=row (a plain dict) — not json=[row] — so that test assertions
-    can extract the dict directly via call_kwargs.kwargs["json"]["ticker"] etc.
-    PostgREST accepts both a single object and an array for POST inserts.
-    """
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
-        return False
-
-    url = f"{_SUPABASE_URL}/rest/v1/{table}"
-    headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, json=row)
-        if resp.status_code in (200, 201):
-            try:
-                returned = resp.json()
-                # PostgREST may return a list or a single dict depending on Prefer header
-                if isinstance(returned, list) and returned and "id" in returned[0]:
-                    row_id = returned[0]["id"]
-                elif isinstance(returned, dict) and "id" in returned:
-                    row_id = returned["id"]
-                else:
-                    row_id = None
-                if row_id is not None:
-                    trade_count = row.get("trade_count") or 1
-                    _set_episode_in_flight(key, row_id, trade_count, premium)
-                    _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
-            except Exception:
-                pass
-            return True
-        log.error(
-            f"[flow_store] insert into {table} failed: {resp.status_code} -- {resp.text[:300]}"
-        )
-        return False
-    except Exception as e:
-        log.error(f"[flow_store] insert into {table} exception: {e}")
-        return False
-
-
-async def _update_episode_multiday(
-    ticker: str,
-    contract_type: str,
-    strike: float,
-    expiry: str,
-    is_multi_day_repeat: bool,
-) -> None:
-    if not _is_configured():
-        return
-
-    get_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Accept":        "application/json",
-    }
-    patch_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=minimal",
-    }
-
-    filter_qs = (
-        f"?ticker=eq.{quote(ticker)}"
-        f"&contract_type=eq.{quote(contract_type)}"
-        f"&strike=eq.{strike}"
-        f"&expiry=eq.{quote(expiry)}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            get_url = (
-                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-                f"{filter_qs}"
-                f"&order=signal_ts.desc"
-                f"&limit=1"
-                f"&select=id"
-            )
-            get_resp = await client.get(get_url, headers=get_headers)
-            if get_resp.status_code != 200:
-                log.warning(
-                    "[flow_store] _update_episode_multiday GET failed: %d -- %s "
-                    "(ticker=%s %s $%.0f %s)",
-                    get_resp.status_code, get_resp.text[:200],
-                    ticker, contract_type, strike, expiry,
-                )
-                return
-
-            rows = get_resp.json()
-            if not rows:
-                log.info(
-                    "[flow_store] _update_episode_multiday: no episode row found yet for "
-                    "%s %s $%.0f %s — INSERT may not have committed; "
-                    "skipping PATCH (enrichment-only, not a gate)",
-                    ticker, contract_type, strike, expiry,
-                )
-                return
-
-            row_id = rows[0].get("id")
-            if row_id is None:
-                log.warning(
-                    "[flow_store] _update_episode_multiday: GET returned row with "
-                    "no id field (ticker=%s %s $%.0f %s) — skipping PATCH",
-                    ticker, contract_type, strike, expiry,
-                )
-                return
-
-            patch_url = (
-                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-                f"?id=eq.{row_id}"
-            )
-            patch_resp = await client.patch(
-                patch_url,
-                headers=patch_headers,
-                json={"is_multi_day_repeat": is_multi_day_repeat},
-            )
-            if patch_resp.status_code not in (200, 204):
-                log.warning(
-                    "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
-                    "(id=%s ticker=%s %s $%.0f %s)",
-                    patch_resp.status_code, patch_resp.text[:200],
-                    row_id, ticker, contract_type, strike, expiry,
-                )
-
-    except Exception as exc:
-        log.warning(
-            "[flow_store] _update_episode_multiday exception: %s "
-            "(ticker=%s %s $%.0f %s)",
-            exc, ticker, contract_type, strike, expiry,
-        )
-
-
-async def start_lookback_worker(accumulator) -> None:
-    from utils.contract_day_cache import get_lookback
-
-    multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
-
-    log.info(
-        "[lookback_worker] started — draining ContractKey queue "
-        "(maxsize=%d, multi_day_min_days=%d)",
-        _LOOKBACK_QUEUE_MAX, multi_day_min_days,
-    )
-    try:
-        while True:
-            key = await _lookback_queue.get()
-            ticker, contract_type, strike, expiry = key
-
-            try:
-                dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
-                if dte_tiers:
-                    min_premium = min(
-                        floor
-                        for _, floors in dte_tiers
-                        for floor in floors.values()
-                    )
-                else:
-                    min_premium = 10_000.0
-            except (ValueError, TypeError):
-                min_premium = 10_000.0
-
-            log.debug(
-                "[lookback_worker] %s %s $%.0f %s — "
-                "min_premium=%.0f (dte_tiers_found=%s)",
-                ticker, contract_type, strike, expiry,
-                min_premium, bool(dte_tiers),
-            )
-
-            try:
-                result = await get_lookback(key, min_premium)
-                is_repeat = result.prior_days_active >= multi_day_min_days
-                await _update_episode_multiday(
-                    ticker=ticker,
-                    contract_type=contract_type,
-                    strike=strike,
-                    expiry=expiry,
-                    is_multi_day_repeat=is_repeat,
-                )
-                log.debug(
-                    "[lookback_worker] %s %s $%.0f %s — "
-                    "prior_days_active=%d aggressive=%d is_repeat=%s (min_days=%d)",
-                    ticker, contract_type, strike, expiry,
-                    result.prior_days_active, result.prior_days_aggressive,
-                    is_repeat, multi_day_min_days,
-                )
-            except Exception as exc:
-                log.warning(
-                    "[lookback_worker] error processing key %s: %s", key, exc
-                )
-            finally:
-                _lookback_queue.task_done()
-
-    except asyncio.CancelledError:
-        log.info("[lookback_worker] cancelled — shutting down cleanly")
-        raise
-
-
-async def _bus_signal_listener():
-    q = bus.subscribe("db_writer")
-    log.info("[flow_store] DB writer subscribed to bus (flow_episodes written directly from stream, not here)")
-    try:
-        while True:
-            await q.get()
-    except asyncio.CancelledError:
-        bus.unsubscribe("db_writer", q)
-        log.info("[flow_store] DB writer unsubscribed from bus")
-        raise
-
-
-async def start_flow_writer():
-    if not _is_configured():
-        log.warning(
-            "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "
-            "flow_events and flow_episodes will NOT be persisted to DB. "
-            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
-        )
-        return
-
-    log.info(f"[flow_store] Starting flow DB writer (flush_interval={_FLUSH_INTERVAL}s, max_rows={_FLUSH_MAX_ROWS}, retry_max={_RETRY_MAX})")
-    await asyncio.gather(
-        _bus_signal_listener(),
-        _flush_flow_events(),
-    )
-
-
-class FlowStore:
-    """In-memory store for options flow events."""
-
-    def __init__(self) -> None:
-        self._flows: List[Any] = []
-        self._stats: Dict[str, Any] = {"total": 0}
-
-    def add_flow(self, flow: Any) -> None:
-        self._flows.append(flow)
-        self._stats["total"] = len(self._flows)
-
-    def get_flows(self) -> List[Any]:
-        return list(self._flows)
-
-    def get_flows_by_symbol(self, symbol: str) -> List[Any]:
-        return [
-            f for f in self._flows
-            if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
-        ]
-
-    def get_stats(self) -> Dict[str, Any]:
-        return dict(self._stats)
-
-    def clear(self) -> None:
-        self._flows.clear()
-        self._stats = {"total": 0}
-
-    def size(self) -> int:
-        return len(self._flows)
-
-
-_store = FlowStore()
-
-
-async def add_flow(flow: dict) -> None:
-    _store.add_flow(flow)
-
-
-async def get_flows(ticker: str) -> List[dict]:
-    return [
-        f for f in _store.get_flows()
-        if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
-    ]
-
-
-async def clear_flows() -> None:
-    _store.clear()
