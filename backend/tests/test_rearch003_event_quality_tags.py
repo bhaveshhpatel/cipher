@@ -14,6 +14,10 @@ Covers:
   E10 compute_vol_oi_signal — None inputs → None
   E11 persist_flow_event integration — all quality tag fields present in buffered row
   E12 REARCH-010 regression guard — purged columns absent from row dict
+
+PBE-1 note: classify_bid_ask() now returns Tuple[str, bool]. Tests that assert
+on the string label call the private _classify_bid_ask() shim which returns str.
+Tests that call classify_bid_ask() directly unpack the tuple.
 """
 import asyncio
 import os
@@ -105,49 +109,76 @@ def _run_persist(ev_dict: dict, vol: Optional[int], oi: Optional[int]) -> dict:
 # ---------------------------------------------------------------------------
 
 class TestClassifyBidAsk:
-    """Unit tests for classify_bid_ask() pure function."""
+    """
+    Unit tests for classify_bid_ask() public API.
+
+    PBE-1: classify_bid_ask() returns Tuple[str, bool]. Each test unpacks
+    the tuple and asserts on both components.
+    """
 
     def test_e1_ask_side_98pct_threshold(self):
-        """fill == ask * 0.98 → ASK  (boundary — should be ASK, not MID)."""
+        """fill == ask * 0.98 → ('ASK', True)  (boundary — should be ASK, not MID)."""
         ask = 5.20
         fill = round(ask * 0.98, 6)   # 5.096
-        cls = fs.classify_bid_ask(fill, bid=4.80, ask=ask)
+        cls, is_ask = fs.classify_bid_ask(fill, bid=4.80, ask=ask)
         assert cls == "ASK", f"Expected ASK at 98% of ask, got {cls!r} (fill={fill}, ask={ask})"
+        assert is_ask is True
 
     def test_e2_bid_side_102pct_threshold(self):
-        """fill == bid * 1.02 → BID  (boundary — should be BID, not MID)."""
+        """fill == bid * 1.02 → ('BID', False)  (boundary — should be BID, not MID)."""
         bid = 4.80
         fill = round(bid * 1.02, 6)   # 4.896
-        cls = fs.classify_bid_ask(fill, bid=bid, ask=5.20)
+        cls, is_ask = fs.classify_bid_ask(fill, bid=bid, ask=5.20)
         assert cls == "BID", f"Expected BID at 102% of bid, got {cls!r} (fill={fill}, bid={bid})"
+        assert is_ask is False
 
     def test_e3_exact_ask_is_ask_side(self):
-        """fill exactly at ask → ASK."""
-        assert fs.classify_bid_ask(5.20, bid=4.80, ask=5.20) == "ASK"
+        """fill exactly at ask → ('ASK', True)."""
+        cls, is_ask = fs.classify_bid_ask(5.20, bid=4.80, ask=5.20)
+        assert cls == "ASK"
+        assert is_ask is True
 
     def test_e4_exact_bid_is_bid_side(self):
-        """fill exactly at bid → BID."""
-        assert fs.classify_bid_ask(4.80, bid=4.80, ask=5.20) == "BID"
+        """fill exactly at bid → ('BID', False)."""
+        cls, is_ask = fs.classify_bid_ask(4.80, bid=4.80, ask=5.20)
+        assert cls == "BID"
+        assert is_ask is False
 
     def test_e5_midpoint_is_mid(self):
-        """fill at exact midpoint → MID."""
-        assert fs.classify_bid_ask(5.00, bid=4.80, ask=5.20) == "MID"
+        """fill at exact midpoint → ('MID', False)."""
+        cls, is_ask = fs.classify_bid_ask(5.00, bid=4.80, ask=5.20)
+        assert cls == "MID"
+        assert is_ask is False
 
     def test_e6_zero_ask_guard(self):
-        """ask == 0 → MID (synthetic/bad quote guard)."""
-        assert fs.classify_bid_ask(0.0, bid=0.0, ask=0.0) == "MID"
+        """ask == 0 → ('MID', False) (synthetic/bad quote guard)."""
+        cls, is_ask = fs.classify_bid_ask(0.0, bid=0.0, ask=0.0)
+        assert cls == "MID"
+        assert is_ask is False
 
     def test_e7_crossed_market_guard(self):
-        """bid > ask → MID (crossed market guard)."""
-        assert fs.classify_bid_ask(5.00, bid=5.50, ask=5.00) == "MID"
+        """bid > ask → ('MID', False) (crossed market guard)."""
+        cls, is_ask = fs.classify_bid_ask(5.00, bid=5.50, ask=5.00)
+        assert cls == "MID"
+        assert is_ask is False
 
     def test_above_ask_still_ask(self):
-        """fill above ask → ASK (aggressive buyer)."""
-        assert fs.classify_bid_ask(5.50, bid=4.80, ask=5.20) == "ASK"
+        """fill above ask → ('ASK', True) (aggressive buyer)."""
+        cls, is_ask = fs.classify_bid_ask(5.50, bid=4.80, ask=5.20)
+        assert cls == "ASK"
+        assert is_ask is True
 
     def test_below_bid_still_bid(self):
-        """fill below bid → BID (aggressive seller)."""
-        assert fs.classify_bid_ask(4.50, bid=4.80, ask=5.20) == "BID"
+        """fill below bid → ('BID', False) (aggressive seller)."""
+        cls, is_ask = fs.classify_bid_ask(4.50, bid=4.80, ask=5.20)
+        assert cls == "BID"
+        assert is_ask is False
+
+    def test_private_shim_returns_str_only(self):
+        """PBE-1: _classify_bid_ask() private shim returns str, not tuple."""
+        result = fs._classify_bid_ask(5.20, bid=4.80, ask=5.20)
+        assert isinstance(result, str)
+        assert result == "ASK"
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +233,26 @@ class TestPersistFlowEventTagIntegration:
     """
 
     def test_e11_all_tag_fields_present(self):
-        """Row must contain all four REARCH-003 quality tag keys."""
+        """Row must contain all five REARCH-003 quality tag keys."""
         row = _run_persist(_make_ev_dict(), vol=500, oi=1000)
         for field in ("is_ask_side", "bid_ask_class", "vol_oi_signal",
                       "normalized_premium", "normalized_oi"):
             assert field in row, f"Missing REARCH-003 field: {field!r}"
+
+    def test_e11_group2_normalized_oi_computed(self):
+        """
+        QA-1: E11 must also assert the computed VALUE of normalized_oi, not just
+        its presence. open_interest=200, contract_oi=1000 → ratio = 200/1000 = 0.2.
+        """
+        row = _run_persist(_make_ev_dict(open_interest=200), vol=500, oi=1000)
+        assert row["normalized_oi"] == pytest.approx(0.2, rel=1e-5), (
+            f"normalized_oi expected 0.2, got {row['normalized_oi']}"
+        )
+
+    def test_e11_normalized_oi_none_on_cache_miss(self):
+        """normalized_oi is None when contract_oi is unavailable (cache miss)."""
+        row = _run_persist(_make_ev_dict(open_interest=200), vol=None, oi=None)
+        assert row["normalized_oi"] is None
 
     def test_e11_ask_side_true_in_row(self):
         """fill == ask → is_ask_side=True, bid_ask_class='ASK'."""
@@ -259,6 +305,6 @@ class TestPersistFlowEventTagIntegration:
             assert purged not in row, f"REARCH-010 purged column still present: {purged!r}"
 
     def test_bid_ask_class_consistent_with_is_ask_side(self):
-        """bid_ask_class='ASK' iff is_ask_side=True; 'BID' iff is_ask_side=False."""
+        """bid_ask_class='ASK' iff is_ask_side=True; 'BID'/'MID' iff is_ask_side=False."""
         row = _run_persist(_make_ev_dict(fill_price=5.00, bid=4.80, ask=5.00), vol=500, oi=1000)
         assert (row["bid_ask_class"] == "ASK") == row["is_ask_side"]

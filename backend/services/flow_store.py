@@ -94,9 +94,6 @@ Bug fixes applied:
   11. REARCH-003 (2026-05-11): added classify_bid_ask(), compute_vol_oi_signal(),
       and quality tag fields (is_ask_side, bid_ask_class, vol_oi_signal,
       normalized_premium, normalized_oi) to persist_flow_event() row dict.
-      Private aliases _classify_bid_ask (returns tuple), _compute_vol_oi_signal
-      (returns HIGH/NORMAL/UNKNOWN strings), _compute_normalized_premium added
-      for test compatibility.
   12. SA-5 (2026-05-11): three code sites independently divided vol/OI with no
       shared helper. Added _compute_vol_oi_ratio(vol, oi) -> Optional[float] as
       the single source of truth (round(vol/oi, 4), None on bad inputs).
@@ -104,6 +101,11 @@ Bug fixes applied:
       of re-implementing the division. persist_flow_event() normalized_oi block
       replaced with _compute_vol_oi_ratio(open_interest, contract_oi), fixing
       rounding from 6dp to 4dp to match the test spec.
+  13. PBE-1 (2026-05-11): public/private API type inversion corrected.
+      classify_bid_ask() is now the PUBLIC function returning Tuple[str, bool]
+      (bid_ask_class, is_ask_side) — callers get both values from one call.
+      _classify_bid_ask() is now the PRIVATE test-shim returning str only.
+      persist_flow_event() updated to unpack the tuple from classify_bid_ask().
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -200,7 +202,7 @@ ING-008 Vol/OI capture semantics:
 
 REARCH-003 quality tag semantics:
   flow_events.is_ask_side      BOOLEAN NOT NULL DEFAULT FALSE
-                                 — fill >= ask * ASK_THRESHOLD (boundary inclusive)
+                                 — True when bid_ask_class == 'ASK'
   flow_events.bid_ask_class    TEXT    — 'ASK' | 'BID' | 'MID'
   flow_events.vol_oi_signal    BOOLEAN DEFAULT NULL
                                  — True when vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
@@ -210,28 +212,30 @@ REARCH-003 quality tag semantics:
                                  — Python type: Optional[bool] — matches DDL exactly.
                                    DO NOT change to bool or add NOT NULL to the migration
                                    without updating compute_vol_oi_signal() return type.
-  flow_events.normalized_premium  FLOAT — premium / underlying_price; NULL when
-                                           underlying_price is None or 0
-  flow_events.normalized_oi       FLOAT — open_interest (Tradier tick-level OI field) /
-                                           contract_oi (chain_store intraday snapshot at
-                                           persist time). These are intentionally different
-                                           sources: the ratio expresses what fraction of
-                                           the cached intraday OI was known at tick time.
-                                           NULL when contract_oi is None or 0.
-                                           Rounded to 4dp via _compute_vol_oi_ratio().
+  flow_events.normalized_premium  NUMERIC(18,4) — premium / underlying_price; NULL when
+                                                   underlying_price is None or 0
+  flow_events.normalized_oi       NUMERIC(18,4) — open_interest (Tradier tick-level OI field) /
+                                                   contract_oi (chain_store intraday snapshot at
+                                                   persist time). Rounded to 4dp via
+                                                   _compute_vol_oi_ratio(). NULL when contract_oi
+                                                   is unavailable or zero.
 
-  classify_bid_ask(fill, bid, ask) -> str:
+  classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]:
+    PUBLIC API — returns (bid_ask_class: str, is_ask_side: bool).
+    PBE-1: This is the canonical public function. Callers get both the class
+    label and the boolean flag in one call — no need to re-derive is_ask_side
+    from the string at the call site.
     Thresholds (Steamroom deliberation 2026-05-11):
-      fill >= ask * 0.98  → 'ASK'  (buyer at or above near-ask band, boundary inclusive)
-      fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
-      otherwise           → 'MID'
-    Boundary inclusive on ASK: a fill exactly at ask*0.98 is ask-side pressure,
-    not ambiguous mid. Mid territory is strictly between both thresholds.
-    Edge cases: ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard).
-    Crossed market (bid > ask with positive values) → 'MID' (data quality guard).
-    ORDERING NOTE: the crossed-market guard MUST come after the zero/bad-quote
-    guard and BEFORE the threshold checks. Reordering these will produce wrong
-    ASK/BID classifications on crossed-market ticks where fill >= ask * 0.98.
+      fill >= ask * 0.98  → ('ASK', True)
+      fill <= bid * 1.02  → ('BID', False)
+      otherwise           → ('MID', False)
+    Edge cases: ask <= 0 or bid <= 0 → ('MID', False)
+    Crossed market (bid > ask) → ('MID', False)
+
+  _classify_bid_ask(fill, bid, ask) -> str:
+    PRIVATE TEST-SHIM — returns bid_ask_class string only.
+    TEST-ONLY. Guards None bid/ask → 'MID' via coercion to 0.
+    Must NOT be called from production paths.
 
   compute_vol_oi_signal(vol, oi) -> Optional[bool]:
     Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
@@ -240,11 +244,10 @@ REARCH-003 quality tag semantics:
     Delegates division to _compute_vol_oi_ratio() — do not re-implement inline.
 
   Private test aliases (test_flow_and_stats.py contract):
-    _classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]
-      TEST-ONLY SHIM. Returns (bid_ask_class, is_ask_side).
-      Guards None bid/ask → ('MID', False) via coercion to 0.
-      Must NOT be called from production paths — production call sites
-      in persist_flow_event() already guard None upstream.
+    _classify_bid_ask(fill, bid, ask) -> str
+      TEST-ONLY SHIM. Returns bid_ask_class string.
+      Guards None bid/ask → 'MID' via coercion to 0.
+      Must NOT be called from production paths.
     _compute_vol_oi_signal(vol, oi, threshold=VOL_OI_HIGH_THRESHOLD) -> str
       Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string form for test assertions).
     _compute_normalized_premium(premium, underlying) -> Optional[float]
@@ -302,55 +305,48 @@ VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5      → True / "HIGH"
 
 
 # ---------------------------------------------------------------------------
-# REARCH-003: public helpers
+# REARCH-003: public API
 # ---------------------------------------------------------------------------
 
 def classify_bid_ask(
     fill_price: float,
     bid: float,
     ask: float,
-) -> str:
+) -> Tuple[str, bool]:
     """
-    REARCH-003: Classify a fill as ASK-side, BID-side, or MID.
+    REARCH-003 PUBLIC API — classify a fill and return (bid_ask_class, is_ask_side).
+
+    PBE-1: Returns a tuple so callers get both the class label and the boolean
+    flag in a single call — no need to re-derive is_ask_side from the string
+    at every call site.
 
     Thresholds (Steamroom deliberation 2026-05-11):
-      fill >= ask * 0.98  → 'ASK'  (buyer at or above near-ask band, boundary inclusive)
-      fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
-      otherwise           → 'MID'
+      fill >= ask * 0.98  → ('ASK', True)   (buyer at or above near-ask band)
+      fill <= bid * 1.02  → ('BID', False)  (seller hit at or near bid)
+      otherwise           → ('MID', False)
 
     Boundary inclusive on ASK: a fill exactly at ask*0.98 is ask-side pressure.
     Mid territory is strictly between both thresholds.
 
     Guard ordering (DO NOT reorder — each guard is a prerequisite for the next):
       1. Zero/bad-quote guard  (ask <= 0 or bid <= 0) must come first.
-         A zero ask would make the ASK threshold 0.0, causing every fill to
-         classify as ASK regardless of actual market conditions.
-      2. Crossed-market guard (bid > ask) is a DATA QUALITY guard, not a spread
-         calculation. It must come AFTER the zero guard (a crossed market with a
-         zero bid/ask is already handled above) and BEFORE the threshold checks.
-         If bid > ask and fill >= ask * 0.98, the ASK threshold would incorrectly
-         fire on a bad-data tick. Returning 'MID' here is intentional — crossed
-         markets are not valid trading conditions, not ambiguous mid fills.
+      2. Crossed-market guard  (bid > ask) must follow Guard 1, precede Guard 3.
       3. ASK/BID threshold checks last, on clean valid quotes only.
 
-    Returns one of: 'ASK', 'BID', 'MID'
+    Returns: Tuple[bid_ask_class: str, is_ask_side: bool]
     """
     # Guard 1: synthetic/bad quote (zero or missing bid/ask)
     if not ask or ask <= 0 or not bid or bid <= 0:
-        return "MID"
+        return ("MID", False)
     # Guard 2: crossed market — data quality event, not a valid spread.
-    # ORDER IS CRITICAL: must follow Guard 1 (zero-ask already handled) and
-    # precede Guard 3 (threshold checks). A crossed market where fill >= ask*0.98
-    # would produce a spurious 'ASK' classification if this guard were moved after
-    # the threshold checks. Do NOT reorder these three guards.
     if bid > ask:
-        return "MID"
+        return ("MID", False)
     # Guard 3: threshold classification on clean quotes
     if fill_price >= ask * _BID_ASK_ASK_THRESHOLD:
-        return "ASK"
+        return ("ASK", True)
     if fill_price <= bid * _BID_ASK_BID_THRESHOLD:
-        return "BID"
-    return "MID"
+        return ("BID", False)
+    return ("MID", False)
 
 
 def _compute_vol_oi_ratio(
@@ -397,29 +393,23 @@ def compute_vol_oi_signal(
 
 
 # ---------------------------------------------------------------------------
-# REARCH-003: private aliases used by test_flow_and_stats.py
+# REARCH-003: private aliases used by tests
 # ---------------------------------------------------------------------------
 
-# TEST-ONLY SHIM — do not call from production paths.
 def _classify_bid_ask(
     fill_price: float,
     bid: Optional[float],
     ask: Optional[float],
-) -> Tuple[str, bool]:
+) -> str:
     """
-    TEST-ONLY SHIM — do not call from production paths.
+    PRIVATE TEST-SHIM — returns bid_ask_class string only. Do not call from production.
 
-    Production call sites in persist_flow_event() already guard None bid/ask
-    upstream via `ev_dict.get("bid", 0.0) or 0.0`. Calling this shim from
-    production would silently coerce None quotes to 0, which then hits the
-    zero/bad-quote guard and returns ('MID', False) — masking missing data
-    instead of surfacing it.
-
-    Returns (bid_ask_class: str, is_ask_side: bool).
+    PBE-1: The public classify_bid_ask() returns Tuple[str, bool]. This private
+    shim exists solely for test suites that assert on the string label only.
     Coerces None bid/ask → 0 before delegating to classify_bid_ask().
     """
-    cls = classify_bid_ask(fill_price, bid or 0, ask or 0)
-    return cls, cls == "ASK"
+    cls, _ = classify_bid_ask(fill_price, bid or 0, ask or 0)
+    return cls
 
 
 def _compute_vol_oi_signal(
@@ -637,8 +627,8 @@ async def persist_flow_event(ev_dict: dict):
     # NULL when contract_oi (denominator) is unavailable or zero.
     open_interest = ev_dict.get("open_interest") or None  # numerator: tick-level OI from Tradier
 
-    bid_ask_cls: str  = classify_bid_ask(fill_price, bid, ask)
-    is_ask_side: bool = bid_ask_cls == "ASK"
+    # PBE-1: classify_bid_ask() now returns Tuple[str, bool] — unpack directly.
+    bid_ask_cls, is_ask_side = classify_bid_ask(fill_price, bid, ask)
 
     # vol_oi_signal: Optional[bool] — DDL contract: BOOLEAN DEFAULT NULL (migration 026).
     # None → SQL NULL (chain_store cache miss). True/False → bool persisted as Postgres boolean.
@@ -939,7 +929,7 @@ async def persist_flow_episode(
                     resp = await client.post(
                         f"{_SUPABASE_URL}/rest/v1/flow_episodes",
                         headers=insert_headers,
-                        json=insert_payload,
+                        json=[insert_payload],
                     )
                 if resp.status_code in (200, 201):
                     rows = resp.json()

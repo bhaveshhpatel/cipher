@@ -8,6 +8,10 @@
 --   A TEXT column rejects Python True/False — PostgREST returns 400 on every
 --   event insert. Fixed to BOOLEAN DEFAULT NULL (NULL = cache miss, per deliberation).
 --
+-- SA-2 fix (2026-05-11): normalized_oi was NUMERIC(18,6).
+--   _compute_vol_oi_ratio() rounds to 4dp — extra precision digits are wasted storage.
+--   Fixed to NUMERIC(18,4) to match the rounding contract in flow_store.py.
+--
 -- normalized_oi: added here because flow_store.py writes this key in the row dict.
 --   Missing column would cause a PostgREST 400 on insert.
 
@@ -15,7 +19,7 @@ ALTER TABLE flow_events
   ADD COLUMN IF NOT EXISTS is_ask_side           BOOLEAN  NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS vol_oi_signal          BOOLEAN  DEFAULT NULL,
   ADD COLUMN IF NOT EXISTS normalized_premium     NUMERIC(18, 4),
-  ADD COLUMN IF NOT EXISTS normalized_oi          NUMERIC(18, 6);
+  ADD COLUMN IF NOT EXISTS normalized_oi          NUMERIC(18, 4);
 
 COMMENT ON COLUMN flow_events.is_ask_side IS
   'True when fill_price >= ask * 0.98 (ask-side aggression). Computed at persist time by classify_bid_ask().';
@@ -29,7 +33,7 @@ COMMENT ON COLUMN flow_events.normalized_premium IS
 
 COMMENT ON COLUMN flow_events.normalized_oi IS
   'open_interest (event-level OI from Tradier) / contract_oi (chain_store intraday snapshot). '
-  'NULL when contract_oi is unavailable or zero.';
+  'Rounded to 4dp via _compute_vol_oi_ratio(). NULL when contract_oi is unavailable or zero.';
 
 -- Index: vol_oi_signal TRUE rows are the primary signal-engine read target.
 -- CONCURRENTLY means the migration does not lock the table for reads/writes.
