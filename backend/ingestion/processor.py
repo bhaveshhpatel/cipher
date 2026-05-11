@@ -55,7 +55,7 @@ REARCH-003 (2026-05-10): enrich_tags() static method.
   Dimensions scored (1 point each):
     Dim 1 — is_ask_side  (fill >= ask * 0.98)
     Dim 2 — vol_oi_signal == 'HIGH'  (volume / OI >= 0.5)
-    Dim 3 — notional_tier in ('BLOCK', 'GOLDEN')  (premium >= $50k)
+    Dim 3 — notional_tier in ('BLOCK', 'GOLDEN')  (premium >= $100k)
     Dim 4 — dte_bucket in ('1-4', '5-60')  (near-term expiry)
 
   Dim 5 (multi-day repeat conviction) is REARCH-004 scope.
@@ -63,9 +63,14 @@ REARCH-003 (2026-05-10): enrich_tags() static method.
 
   enrich_tags() is a static method so it can be called without an
   IngestionProcessor instance and is trivially testable without the gate
-  machinery. It is called from flow_store.persist_flow_event() after
-  ING-008 vol/OI resolution — not from process() — so it always has
-  contract_volume_snapshot and contract_oi available in the ev_dict.
+  machinery.
+
+  NOTE (REARCH-003-ENUM): dte_bucket and notional_tier are also exported
+  as module-level helpers _compute_dte_bucket() and _compute_notional_tier()
+  so that flow_store.persist_flow_event() can import them directly and
+  compute both tags inline. enrich_tags() itself is NOT called from
+  persist_flow_event() — production writes use the inline path.
+  REARCH-004 may wire enrich_tags() into a different call site.
 """
 from __future__ import annotations
 
@@ -276,6 +281,7 @@ def _premium_floor(cfg: IngestionConfig, tier: str) -> int:
 
 # ---------------------------------------------------------------------------
 # REARCH-003: enrich_tags helpers (module-level, pure)
+# Exported so flow_store.persist_flow_event() can import them directly.
 # ---------------------------------------------------------------------------
 
 def _compute_dte_bucket(dte: Optional[int]) -> str:
@@ -381,9 +387,9 @@ class IngestionProcessor:
     supplied, `tier` takes precedence over any residual ev.influence_tier.
 
     REARCH-003: enrich_tags() is a static method that computes dte_bucket,
-    notional_tier, and event_cipher_score from an ev_dict that already
-    contains is_ask_side, vol_oi_signal, premium, and dte.  It is called
-    from flow_store.persist_flow_event() after ING-008 vol/OI resolution.
+    notional_tier, and event_cipher_score from an ev_dict. It is a standalone
+    testable helper. Production writes use _compute_dte_bucket() and
+    _compute_notional_tier() directly from flow_store.persist_flow_event().
     """
 
     # ------------------------------------------------------------------
@@ -434,13 +440,18 @@ class IngestionProcessor:
         Reads from ev_dict (all must already be present from prior steps):
           dte              int    — from parsed event
           premium          float  — from parsed event
-          is_ask_side      bool   — set by flow_store._classify_bid_ask()
-          vol_oi_signal    str    — set by flow_store._compute_vol_oi_signal()
+          is_ask_side      bool   — set by flow_store.classify_bid_ask()
+          vol_oi_signal    str    — 'HIGH'|'NORMAL'|'UNKNOWN' string form
 
         Writes into ev_dict:
           dte_bucket           TEXT      — '0DTE'|'1-4'|'5-60'|'61-90'|'90+'
           notional_tier        TEXT      — 'WATCH'|'NOTEWORTHY'|'BLOCK'|'GOLDEN'
           event_cipher_score   SMALLINT  — 0–4 (Dim 5 added in REARCH-004)
+
+        NOTE: This method is NOT called from persist_flow_event() in production.
+        persist_flow_event() imports _compute_dte_bucket/_compute_notional_tier
+        directly and computes both inline. enrich_tags() is a standalone
+        testable helper and future REARCH-004 call site.
 
         None-safety: missing keys default to zero-score values.  Never raises.
         Returns the same dict object (mutated in place) for call-site brevity.
