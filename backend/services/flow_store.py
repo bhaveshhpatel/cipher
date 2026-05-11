@@ -248,6 +248,8 @@ from urllib.parse import quote
 
 import httpx
 
+import utils.contract_day_cache as _contract_day_cache  # ING-007: module ref so patch('utils.contract_day_cache.get_lookback') intercepts at call time
+
 from core.async_bus import bus  # module-level import so patch('services.flow_store.bus') works
 
 log = logging.getLogger("flow_store")
@@ -1047,7 +1049,14 @@ async def _update_episode_multiday(
             )
             return
 
-        row_id = rows[0]["id"]
+        row_id = rows[0].get("id")
+        if row_id is None:
+            log.warning(
+                "[flow_store] _update_episode_multiday: row missing 'id' field "
+                "(ticker=%s %s $%.0f %s) — skipping multiday patch",
+                ticker, contract_type, strike, expiry,
+            )
+            return
 
         patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
         patch_headers = {
@@ -1096,6 +1105,11 @@ async def start_lookback_worker(accumulator=None) -> None:
     correct traversal for List[Tuple[int, Dict[int, float]]].
 
     PBE-F5 fix: log the resolved min_premium per key at DEBUG.
+
+    ING-007-PATCH (2026-05-10): get_lookback is called via module reference
+    (_contract_day_cache.get_lookback) so that unittest.mock.patch(
+    'utils.contract_day_cache.get_lookback') correctly intercepts the call.
+    A `from ... import get_lookback` local binding would shadow the patch.
     """
     log.info("[lookback_worker] starting")
 
@@ -1110,6 +1124,8 @@ async def start_lookback_worker(accumulator=None) -> None:
     except (ValueError, TypeError):
         min_premium = 10_000.0  # hardcoded floor when accumulator has no tiers
 
+    min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
+
     while True:
         try:
             key = await _lookback_queue.get()
@@ -1121,12 +1137,13 @@ async def start_lookback_worker(accumulator=None) -> None:
                 ticker, contract_type, strike, expiry, min_premium,
             )
 
-            # Fetch from contract_day_cache (populated by lookback RPC)
+            # ING-007: fetch via module reference so patch() intercepts at call time.
+            # A local `from utils.contract_day_cache import get_lookback` would
+            # bind a name that bypasses any patch on the module attribute.
             try:
-                from services.contract_day_cache import get_contract_prior_days
-                result = get_contract_prior_days(ticker, contract_type, strike, expiry)
+                result = await _contract_day_cache.get_lookback(key, min_premium)
             except Exception as exc:
-                log.debug("[lookback_worker] cache miss for %s: %s", key, exc)
+                log.debug("[lookback_worker] get_lookback error for %s: %s", key, exc)
                 _lookback_queue.task_done()
                 continue
 
@@ -1134,8 +1151,7 @@ async def start_lookback_worker(accumulator=None) -> None:
                 _lookback_queue.task_done()
                 continue
 
-            prior_days, total_prem = result
-            is_repeat = prior_days > 0 and total_prem >= min_premium
+            is_repeat = result.prior_days_active >= min_days
 
             await _update_episode_multiday(
                 ticker=ticker,
@@ -1146,7 +1162,7 @@ async def start_lookback_worker(accumulator=None) -> None:
             )
 
         except asyncio.CancelledError:
-            log.info("[lookback_worker] cancelled — shutting down")
+            log.info("[lookback_worker] cancelled \u2014 shutting down")
             break
         except Exception as exc:
             log.warning("[lookback_worker] unhandled exception: %s", exc)
