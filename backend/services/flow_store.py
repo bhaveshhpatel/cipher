@@ -192,14 +192,22 @@ ING-008 Vol/OI capture semantics:
     No live computation required in signal engines — read directly.
 
 REARCH-003 quality tag semantics:
-  flow_events.is_ask_side      BOOLEAN — fill >= ask * ASK_THRESHOLD (boundary inclusive)
+  flow_events.is_ask_side      BOOLEAN NOT NULL DEFAULT FALSE
+                                 — fill >= ask * ASK_THRESHOLD (boundary inclusive)
   flow_events.bid_ask_class    TEXT    — 'ASK' | 'BID' | 'MID'
-  flow_events.vol_oi_signal    BOOLEAN — vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
-                                         NULL when vol or OI is None
+  flow_events.vol_oi_signal    BOOLEAN DEFAULT NULL
+                                 — True when vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
+                                 — False when below threshold
+                                 — NULL when vol or OI snapshot is unavailable (cache miss)
+                                 — Column is nullable (migration 026: BOOLEAN DEFAULT NULL)
   flow_events.normalized_premium  FLOAT — premium / underlying_price; NULL when
                                            underlying_price is None or 0
-  flow_events.normalized_oi       FLOAT — open_interest / contract_oi (chain OI);
-                                           NULL when contract_oi is None or 0
+  flow_events.normalized_oi       FLOAT — open_interest (Tradier tick-level OI field) /
+                                           contract_oi (chain_store intraday snapshot at
+                                           persist time). These are intentionally different
+                                           sources: the ratio expresses what fraction of
+                                           the cached intraday OI was known at tick time.
+                                           NULL when contract_oi is None or 0.
 
   classify_bid_ask(fill, bid, ask) -> str:
     Thresholds (Steamroom deliberation 2026-05-11):
@@ -209,6 +217,10 @@ REARCH-003 quality tag semantics:
     Boundary inclusive on ASK: a fill exactly at ask*0.98 is ask-side pressure,
     not ambiguous mid. Mid territory is strictly between both thresholds.
     Edge cases: ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard).
+    Crossed market (bid > ask with positive values) → 'MID' (data quality guard).
+    ORDERING NOTE: the crossed-market guard MUST come after the zero/bad-quote
+    guard and BEFORE the threshold checks. Reordering these will produce wrong
+    ASK/BID classifications on crossed-market ticks where fill >= ask * 0.98.
 
   compute_vol_oi_signal(vol, oi) -> Optional[bool]:
     Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
@@ -217,7 +229,10 @@ REARCH-003 quality tag semantics:
 
   Private test aliases (test_flow_and_stats.py contract):
     _classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]
-      Returns (bid_ask_class, is_ask_side). Guards None bid/ask → ('MID', False).
+      TEST-ONLY SHIM. Returns (bid_ask_class, is_ask_side).
+      Guards None bid/ask → ('MID', False) via coercion to 0.
+      Must NOT be called from production paths — production call sites
+      in persist_flow_event() already guard None upstream.
     _compute_vol_oi_signal(vol, oi, threshold=VOL_OI_HIGH_THRESHOLD) -> str
       Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string form for test assertions).
     _compute_normalized_premium(premium, underlying) -> Optional[float]
@@ -290,16 +305,29 @@ def classify_bid_ask(
     Boundary inclusive on ASK: a fill exactly at ask*0.98 is ask-side pressure.
     Mid territory is strictly between both thresholds.
 
-    Edge cases:
-      ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard)
-      bid > ask            → 'MID' (crossed market guard)
+    Guard ordering (DO NOT reorder — each guard is a prerequisite for the next):
+      1. Zero/bad-quote guard  (ask <= 0 or bid <= 0) must come first.
+         A zero ask would make the ASK threshold 0.0, causing every fill to
+         classify as ASK regardless of actual market conditions.
+      2. Crossed-market guard (bid > ask) is a DATA QUALITY guard, not a spread
+         calculation. It must come AFTER the zero guard (a crossed market with a
+         zero bid/ask is already handled above) and BEFORE the threshold checks.
+         If bid > ask and fill >= ask * 0.98, the ASK threshold would incorrectly
+         fire on a bad-data tick. Returning 'MID' here is intentional — crossed
+         markets are not valid trading conditions, not ambiguous mid fills.
+      3. ASK/BID threshold checks last, on clean valid quotes only.
 
     Returns one of: 'ASK', 'BID', 'MID'
     """
+    # Guard 1: synthetic/bad quote (zero or missing bid/ask)
     if not ask or ask <= 0 or not bid or bid <= 0:
         return "MID"
+    # Guard 2: crossed market — data quality event, not a valid spread.
+    # MUST precede threshold checks: a crossed market where fill >= ask*0.98
+    # would otherwise produce a spurious 'ASK' classification.
     if bid > ask:
         return "MID"
+    # Guard 3: threshold classification on clean quotes
     if fill_price >= ask * _BID_ASK_ASK_THRESHOLD:
         return "ASK"
     if fill_price <= bid * _BID_ASK_BID_THRESHOLD:
@@ -330,9 +358,16 @@ def _classify_bid_ask(
     ask: Optional[float],
 ) -> Tuple[str, bool]:
     """
-    Private alias for test_flow_and_stats.py.
+    TEST-ONLY SHIM — do not call from production paths.
+
+    Production call sites in persist_flow_event() already guard None bid/ask
+    upstream via `ev_dict.get("bid", 0.0) or 0.0`. Calling this shim from
+    production would silently coerce None quotes to 0, which then hits the
+    zero/bad-quote guard and returns ('MID', False) — masking missing data
+    instead of surfacing it.
+
     Returns (bid_ask_class: str, is_ask_side: bool).
-    Guards None bid/ask inputs → ('MID', False).
+    Coerces None bid/ask → 0 before delegating to classify_bid_ask().
     """
     cls = classify_bid_ask(fill_price, bid or 0, ask or 0)
     return cls, cls == "ASK"
@@ -544,16 +579,26 @@ async def persist_flow_event(ev_dict: dict):
     ask              = ev_dict.get("ask", 0.0) or 0.0
     underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
     premium          = ev_dict.get("premium", 0.0) or 0.0
+    # Tradier tick-level OI field — distinct from contract_oi (chain_store snapshot).
+    # normalized_oi = open_interest / contract_oi expresses what fraction of the
+    # cached intraday OI was known at tick time. NULL when contract_oi is 0 or missing.
     open_interest    = ev_dict.get("open_interest") or None
 
     bid_ask_cls: str        = classify_bid_ask(fill_price, bid, ask)
     is_ask_side: bool       = bid_ask_cls == "ASK"
+    # vol_oi_signal: Optional[bool] — None on cache miss (column is BOOLEAN DEFAULT NULL,
+    # not NOT NULL). See migration 026 and REARCH-003 semantics in module docstring.
     vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
         contract_volume_snapshot, contract_oi
     )
 
     normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
 
+    # normalized_oi: Tradier tick-level open_interest / chain_store intraday contract_oi.
+    # Numerator: OI as reported by Tradier on this specific tick (ev_dict["open_interest"]).
+    # Denominator: contract_oi captured from chain_store at persist time (intraday snapshot).
+    # These are intentionally different sources — the ratio is not expected to be ~1.0.
+    # NULL when contract_oi is unavailable or zero.
     normalized_oi: Optional[float] = None
     if contract_oi and contract_oi > 0 and open_interest is not None:
         normalized_oi = round(open_interest / contract_oi, 6)
