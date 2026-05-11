@@ -192,7 +192,7 @@ ING-008 Vol/OI capture semantics:
     No live computation required in signal engines — read directly.
 
 REARCH-003 quality tag semantics:
-  flow_events.is_ask_side      BOOLEAN — fill >= ask (True = buyer lifted ask)
+  flow_events.is_ask_side      BOOLEAN — fill > ask * ASK_THRESHOLD (strict gt)
   flow_events.bid_ask_class    TEXT    — 'ASK' | 'BID' | 'MID'
   flow_events.vol_oi_signal    BOOLEAN — vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
                                          NULL when vol or OI is None
@@ -203,9 +203,11 @@ REARCH-003 quality tag semantics:
 
   classify_bid_ask(fill, bid, ask) -> str:
     Thresholds (Steamroom deliberation 2026-05-11):
-      fill >= ask * 0.98  → 'ASK'  (buyer lifted at or near ask)
+      fill > ask * 0.98   → 'ASK'  (buyer lifted strictly above near-ask band)
       fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
       otherwise           → 'MID'
+    Strict gt on ASK threshold: a fill exactly at ask*0.98 is ambiguous
+    mid territory, not a confirmed lifted ask.
     Edge cases: ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard).
 
   compute_vol_oi_signal(vol, oi) -> Optional[bool]:
@@ -263,9 +265,9 @@ _episode_in_flight: Dict[str, dict] = {}
 # ---------------------------------------------------------------------------
 # REARCH-003: bid/ask classification thresholds
 # ---------------------------------------------------------------------------
-_BID_ASK_ASK_THRESHOLD: float = 0.98   # fill >= ask * 0.98  → ASK
-_BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02  → BID
-VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5       → True / "HIGH"
+_BID_ASK_ASK_THRESHOLD: float = 0.98   # fill > ask * 0.98  → ASK  (strict gt)
+_BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02 → BID
+VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5      → True / "HIGH"
 
 
 # ---------------------------------------------------------------------------
@@ -281,9 +283,12 @@ def classify_bid_ask(
     REARCH-003: Classify a fill as ASK-side, BID-side, or MID.
 
     Thresholds (Steamroom deliberation 2026-05-11):
-      fill >= ask * 0.98  → 'ASK'  (buyer lifted at or near ask)
+      fill > ask * 0.98   → 'ASK'  (buyer lifted strictly above near-ask band)
       fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
       otherwise           → 'MID'
+
+    Strict gt on ASK threshold: a fill exactly at ask*0.98 is ambiguous
+    mid territory, not a confirmed lifted ask.
 
     Edge cases:
       ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard)
@@ -295,7 +300,7 @@ def classify_bid_ask(
         return "MID"
     if bid > ask:
         return "MID"
-    if fill_price >= ask * _BID_ASK_ASK_THRESHOLD:
+    if fill_price > ask * _BID_ASK_ASK_THRESHOLD:
         return "ASK"
     if fill_price <= bid * _BID_ASK_BID_THRESHOLD:
         return "BID"
