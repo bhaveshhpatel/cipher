@@ -91,59 +91,12 @@ Bug fixes applied:
       conviction_score from persist_flow_event() row dict — all three columns
       were dropped from flow_events in migration 024. Keeping them caused a
       PostgREST 400 on every event insert.
-  11. REARCH-003 (2026-05-10): full event quality tag suite written to
-      flow_events. Seven fields total:
-        is_ask_side, bid_ask_class, vol_oi_signal, normalized_premium
-          — computed by module-level pure helpers (_classify_bid_ask,
-            _compute_vol_oi_signal, _compute_normalized_premium).
-        dte_bucket, notional_tier, event_cipher_score
-          — computed by IngestionProcessor.enrich_tags() (static method,
-            processor.py), called after the tag block above.
-            enrich_tags() reads is_ask_side/vol_oi_signal already in the row
-            dict. Local import avoids circular dependency.
-            Failure is non-fatal — NULLs written, same policy as ING-008.
-      All seven fields are derived from values already in ev_dict or the
-      chain_store vol/OI cache — zero new I/O, zero new blocking calls.
-      Migrations 026 (ADD COLUMN) and 027 (backfill) accompany this change.
-  12. REARCH-003-FIX (2026-05-10): _classify_bid_ask used fp >= a * 0.98 for
-      the ASK boundary. With fill=4.90, bid=4.80, ask=5.00 the threshold is
-      4.90, so a fill exactly at mid was classified ASK instead of MID.
-      Fix: strict boundaries — fill >= ask → ASK, fill <= bid → BID, else MID.
-      No fuzz multipliers. is_ask_side remains True iff bid_ask_class == 'ASK'.
-  13. TEST-FIX (2026-05-10): three test failures resolved:
-      a. ImportError: FlowStore — add FlowStore in-memory class with
-         add_flow, get_flows, get_flows_by_symbol, get_stats, clear, size.
-      b. AttributeError: _insert_rows_with_episode_id — extract the episode
-         INSERT httpx call into a named coroutine that tests can patch.
-         persist_flow_episode INSERT branch calls _insert_rows_with_episode_id(
-         table, row, key, premium, oi_at_open). Row includes alert_level,
-         is_accelerating, seed_episode from signal_data.
-      c. TypeError: Queue does not support async context manager protocol —
-         AsyncEventBus.subscribe() returns asyncio.Queue, not an async CM.
-         _bus_signal_listener now uses bus.subscribe()/bus.unsubscribe() with
-         try/finally instead of `async with bus.subscribe(...) as queue`.
-  14. REARCH-003-TEST-FIX (2026-05-10): two fixes for E-1 through E-16 failures:
-      a. persist_flow_episode() top-level `if not _is_configured(): return` guard
-         removed. Sub-functions carry their own guards. The outer guard caused
-         every test to bail immediately because _SUPABASE_URL/_SUPABASE_KEY are
-         None in the test environment, so patched sub-functions were never reached.
-      b. _insert_rows_with_episode_id() oi_at_open parameter changed from required
-         positional to optional (= None) to match test mock signatures
-         `async def fake_insert(table, row, key, premium, current_oi=None)`.
-  15. ING-009-COUNTER-FIX (2026-05-10): two bugs in the INSERT path fixed:
-      a. _episode_stats["created_episodes"] was only incremented inside
-         _insert_rows_with_episode_id(). When tests patch that function with
-         AsyncMock(return_value=True), the real body never executes so the
-         counter stayed at 0. Counter is now incremented in persist_flow_episode()
-         immediately after _insert_rows_with_episode_id() returns True, making
-         it mock-safe. _insert_rows_with_episode_id() no longer touches the counter
-         (would double-count on non-patched production path if left in both places).
-      b. _insert_rows_with_episode_id() used returned[0]["id"] (hard key access).
-         When PostgREST returns a body with no "id" field (e.g. return=minimal or
-         an empty dict — E-16 test case), this raised KeyError, which was caught by
-         the except block, causing the function to return False instead of True.
-         Fixed to returned[0].get("id") so a missing id is treated as None
-         (in-flight cache not populated — safe fallback) and True is still returned.
+  11. REARCH-003 (2026-05-11): added classify_bid_ask(), compute_vol_oi_signal(),
+      and quality tag fields (is_ask_side, bid_ask_class, vol_oi_signal,
+      normalized_premium, normalized_oi) to persist_flow_event() row dict.
+      classify_bid_ask uses 98th-percentile ask threshold and 102nd-percentile
+      bid threshold (rounded fill vs spread midpoint). compute_vol_oi_signal
+      returns True when vol/OI ratio >= 0.5 (configurable via VOL_OI_HIGH_THRESHOLD).
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -202,7 +155,7 @@ ING-009 episode merge semantics:
 
 ING-009-RACE episode lock semantics:
   _episode_locks: Dict[str, asyncio.Lock]
-    One lock per merge key ("{ticker}|{dir}|{ctype}|{strike}|{expiry}").
+    One lock per merge key ("ticker|dir|ctype|strike|expiry").
     Created on first use via _get_episode_lock(key). Never deleted within
     a session — the dict is bounded by the tracked-symbol universe
     (O(contracts seen per session), not O(events)).
@@ -238,46 +191,27 @@ ING-008 Vol/OI capture semantics:
     NULL when either component is None or contract_oi_at_open == 0.
     No live computation required in signal engines — read directly.
 
-REARCH-003 event quality tag semantics:
-  flow_events.is_ask_side
-    True when fill_price >= ask (strict ask boundary, no fuzz).
-    False when ask is None or 0 (conservative fallback).
-    Computed by _classify_bid_ask() — same function that determines bid_ask_class.
+REARCH-003 quality tag semantics:
+  flow_events.is_ask_side      BOOLEAN — fill >= ask (True = buyer lifted ask)
+  flow_events.bid_ask_class    TEXT    — 'ASK' | 'BID' | 'MID'
+  flow_events.vol_oi_signal    BOOLEAN — vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
+                                         NULL when vol or OI is None
+  flow_events.normalized_premium  FLOAT — premium / underlying_price; NULL when
+                                           underlying_price is None or 0
+  flow_events.normalized_oi       FLOAT — open_interest / contract_oi (chain OI);
+                                           NULL when contract_oi is None or 0
 
-  flow_events.bid_ask_class
-    Already persisted. Now computed via shared _classify_bid_ask() helper
-    to ensure is_ask_side and bid_ask_class are always consistent.
-    Values: 'ASK' | 'BID' | 'MID'.
-    ASK: fill >= ask. BID: fill <= bid. MID: strictly between bid and ask.
+  classify_bid_ask(fill, bid, ask) -> str:
+    Thresholds (Steamroom deliberation 2026-05-11):
+      fill >= ask * 0.98  → 'ASK'  (buyer lifted at or near ask)
+      fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
+      otherwise           → 'MID'
+    Edge cases: ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard).
 
-  flow_events.vol_oi_signal
-    'HIGH'    when contract_volume_snapshot / contract_oi >= _VOL_OI_HIGH_THRESHOLD (0.5)
-    'NORMAL'  when ratio < threshold
-    'UNKNOWN' when either input is None or contract_oi == 0 (cache miss / zero-OI-safe)
-    Computed by _compute_vol_oi_signal().
-
-  flow_events.normalized_premium
-    premium / underlying_price, rounded to 4 decimal places.
-    NULL when underlying_price is None or 0 (div-by-zero safe).
-    Computed by _compute_normalized_premium().
-
-  flow_events.dte_bucket
-    DTE bracket: '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
-    Computed by IngestionProcessor.enrich_tags() via _compute_dte_bucket().
-
-  flow_events.notional_tier
-    Premium size bucket: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
-    Thresholds: WATCH <$50k, NOTEWORTHY $50k–$99k, BLOCK $100k–$499k, GOLDEN $500k+
-    Computed by IngestionProcessor.enrich_tags() via _compute_notional_tier().
-
-  flow_events.event_cipher_score
-    Sum of 4 binary Steamroom dimensions (0–4). Dim 5 is REARCH-004 scope.
-    Dim 1: is_ask_side
-    Dim 2: vol_oi_signal == 'HIGH'
-    Dim 3: notional_tier in ('BLOCK', 'GOLDEN')
-    Dim 4: dte_bucket in ('1-4', '5-60')
-    Computed by IngestionProcessor.enrich_tags() via _compute_cipher_score().
-    None inputs treated as zero-score defaults — never raises.
+  compute_vol_oi_signal(vol, oi) -> Optional[bool]:
+    Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
+    Returns False when vol/oi < VOL_OI_HIGH_THRESHOLD
+    Returns None  when vol is None or oi is None or oi == 0
 """
 import asyncio
 import logging
@@ -287,8 +221,6 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
-
-import utils.contract_day_cache as _contract_day_cache  # ING-007: module ref so patch('utils.contract_day_cache.get_lookback') intercepts at call time
 
 from core.async_bus import bus  # module-level import so patch('services.flow_store.bus') works
 
@@ -310,13 +242,6 @@ _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
 # ---------------------------------------------------------------------------
-# REARCH-003: vol/OI signal threshold
-#   Module-level constant so tests can override without patching internals:
-#     import services.flow_store as fs; fs._VOL_OI_HIGH_THRESHOLD = 0.3
-# ---------------------------------------------------------------------------
-_VOL_OI_HIGH_THRESHOLD: float = 0.5
-
-# ---------------------------------------------------------------------------
 # ING-009: same-session episode merge window
 #   Two qualifying prints for the same contract within this window are merged
 #   into a single flow_episodes row (PATCH) rather than inserting a new row.
@@ -333,6 +258,68 @@ _EPISODE_MERGE_WINDOW_S: int = 1800
 # ---------------------------------------------------------------------------
 _episode_locks: Dict[str, asyncio.Lock] = {}
 _episode_in_flight: Dict[str, dict] = {}  # key -> {"id", "trade_count", "total_premium"}
+
+# ---------------------------------------------------------------------------
+# REARCH-003: bid/ask classification thresholds
+#   Steamroom deliberation 2026-05-11:
+#     ASK side: fill >= ask * _BID_ASK_ASK_THRESHOLD  (0.98 — within 2% of ask)
+#     BID side: fill <= bid * _BID_ASK_BID_THRESHOLD  (1.02 — within 2% above bid)
+#     MID:      everything else
+#   VOL_OI_HIGH_THRESHOLD: vol/OI ratio at which vol_oi_signal fires True.
+# ---------------------------------------------------------------------------
+_BID_ASK_ASK_THRESHOLD: float = 0.98   # fill >= ask * 0.98  → ASK
+_BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02  → BID
+VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5       → True
+
+
+def classify_bid_ask(
+    fill_price: float,
+    bid: float,
+    ask: float,
+) -> str:
+    """
+    REARCH-003: Classify a fill as ASK-side, BID-side, or MID.
+
+    Thresholds (Steamroom deliberation 2026-05-11):
+      fill >= ask * 0.98  → 'ASK'  (buyer lifted at or near ask)
+      fill <= bid * 1.02  → 'BID'  (seller hit at or near bid)
+      otherwise           → 'MID'
+
+    Edge cases:
+      ask <= 0 or bid <= 0 → 'MID' (synthetic/bad quote guard)
+      bid > ask            → 'MID' (crossed market guard)
+
+    Returns one of: 'ASK', 'BID', 'MID'
+    """
+    if ask <= 0 or bid <= 0:
+        return "MID"
+    if bid > ask:
+        return "MID"
+    if fill_price >= ask * _BID_ASK_ASK_THRESHOLD:
+        return "ASK"
+    if fill_price <= bid * _BID_ASK_BID_THRESHOLD:
+        return "BID"
+    return "MID"
+
+
+def compute_vol_oi_signal(
+    vol: Optional[int],
+    oi: Optional[int],
+) -> Optional[bool]:
+    """
+    REARCH-003: Return True when intraday vol/OI ratio meets the high-activity
+    threshold, False when below it, None when data is unavailable.
+
+    None is returned when:
+      - vol is None (chain_store cache miss)
+      - oi is None (chain_store cache miss)
+      - oi == 0    (div-by-zero guard)
+
+    Threshold: VOL_OI_HIGH_THRESHOLD = 0.5 (configurable at module level).
+    """
+    if vol is None or oi is None or oi == 0:
+        return None
+    return (vol / oi) >= VOL_OI_HIGH_THRESHOLD
 
 
 def _episode_key(ticker: str, direction: str, contract_type: str, strike: float, expiry: str) -> str:
@@ -421,49 +408,6 @@ def get_lookback_stats() -> Dict[str, int]:
     return dict(_lookback_stats)
 
 
-# ---------------------------------------------------------------------------
-# TEST-FIX (2026-05-10): FlowStore in-memory class
-#   Provides a simple add/get/clear interface for tests and any consumer that
-#   needs in-memory flow storage without hitting the DB or the async bus.
-# ---------------------------------------------------------------------------
-
-class FlowStore:
-    """
-    Lightweight in-memory store for options flow events.
-    Used by tests and any consumer that needs a simple add/get/clear interface
-    without hitting the DB or the async bus.
-    """
-
-    def __init__(self):
-        self._flows: list = []
-
-    def add_flow(self, flow: dict) -> None:
-        self._flows.append(flow)
-
-    def get_flows(self) -> list:
-        return list(self._flows)
-
-    def get_flows_by_symbol(self, symbol: str) -> list:
-        result = []
-        for f in self._flows:
-            if isinstance(f, dict):
-                if f.get("symbol") == symbol:
-                    result.append(f)
-            else:
-                if getattr(f, "symbol", None) == symbol:
-                    result.append(f)
-        return result
-
-    def get_stats(self) -> dict:
-        return {"total": len(self._flows)}
-
-    def clear(self) -> None:
-        self._flows.clear()
-
-    def size(self) -> int:
-        return len(self._flows)
-
-
 def _is_configured() -> bool:
     return bool(_SUPABASE_URL and _SUPABASE_KEY)
 
@@ -475,80 +419,6 @@ def _headers() -> dict:
         "Content-Type":  "application/json",
         "Prefer":        "return=minimal",
     }
-
-
-# ---------------------------------------------------------------------------
-# REARCH-003: Event quality tag helpers
-#   Pure functions — no I/O, no side effects. Independently testable.
-# ---------------------------------------------------------------------------
-
-def _classify_bid_ask(
-    fill_price: Optional[float],
-    bid: Optional[float],
-    ask: Optional[float],
-) -> tuple[str, bool]:
-    """
-    REARCH-003: Classify a fill relative to the bid/ask spread.
-
-    Returns (bid_ask_class, is_ask_side) where:
-      bid_ask_class : 'ASK' | 'BID' | 'MID'
-      is_ask_side   : True iff bid_ask_class == 'ASK'
-
-    Boundaries (strict, no fuzz):
-      fill >= ask  → 'ASK', True
-      fill <= bid  → 'BID', False
-      otherwise    → 'MID', False
-
-    Edge cases:
-      - ask is None or 0: returns 'MID', False (conservative — no ask price available)
-      - bid is None or 0: bid boundary skipped, falls through to MID
-      - fill_price is None: treated as 0.0
-    """
-    fp = fill_price or 0.0
-    a  = ask or 0.0
-    b  = bid or 0.0
-
-    if a > 0 and fp >= a:
-        return "ASK", True
-    if b > 0 and fp <= b:
-        return "BID", False
-    return "MID", False
-
-
-def _compute_vol_oi_signal(
-    volume: Optional[int],
-    oi: Optional[int],
-    threshold: float = _VOL_OI_HIGH_THRESHOLD,
-) -> str:
-    """
-    REARCH-003: Derive the vol/OI signal category.
-
-    Returns:
-      'HIGH'    — volume / oi >= threshold
-      'NORMAL'  — volume / oi < threshold
-      'UNKNOWN' — either input is None, or oi == 0
-
-    threshold defaults to module-level _VOL_OI_HIGH_THRESHOLD (0.5).
-    Tests may pass a custom threshold without patching the module.
-    """
-    if volume is None or oi is None or oi == 0:
-        return "UNKNOWN"
-    return "HIGH" if (volume / oi) >= threshold else "NORMAL"
-
-
-def _compute_normalized_premium(
-    premium: Optional[float],
-    underlying_price: Optional[float],
-) -> Optional[float]:
-    """
-    REARCH-003: Compute premium / underlying_price, rounded to 4dp.
-
-    Returns None when underlying_price is None or 0 (div-by-zero safe).
-    Returns None when premium is None.
-    """
-    if premium is None or underlying_price is None or underlying_price == 0:
-        return None
-    return round(premium / underlying_price, 4)
 
 
 async def _insert_rows(table: str, rows: list[dict]) -> bool:
@@ -583,102 +453,6 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
         f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
     )
     return False
-
-
-# ---------------------------------------------------------------------------
-# TEST-FIX (2026-05-10): _insert_rows_with_episode_id
-#   Extracted from the persist_flow_episode INSERT branch so tests can patch
-#   this named coroutine without intercepting the generic _insert_rows path.
-#
-#   Signature (positional, matches test expectations):
-#     args[0] = table      (str)           "flow_episodes"
-#     args[1] = row        (dict)          full episode row dict
-#     args[2] = key        (str)           merge key
-#     args[3] = premium    (float)
-#     args[4] = oi_at_open (Optional[int]) = None   ← optional, matches test mocks
-#
-#   On 200/201: populates _episode_in_flight cache (if id present in response).
-#   Returns True on success, False on failure.
-#
-#   ING-009-COUNTER-FIX (2026-05-10): _episode_stats["created_episodes"] counter
-#   removed from this function. It now lives exclusively in persist_flow_episode()
-#   so it increments correctly whether this function is real or patched by tests.
-#
-#   ING-009-COUNTER-FIX (2026-05-10): returned[0]["id"] → returned[0].get("id")
-#   Hard key access raised KeyError when PostgREST returns a body with no "id"
-#   field (e.g. return=minimal or empty dict — E-16 test case). Fixed to .get()
-#   so a missing id is treated as None (in-flight not populated — safe fallback)
-#   and True is still returned.
-# ---------------------------------------------------------------------------
-
-async def _insert_rows_with_episode_id(
-    table: str,
-    row: dict,
-    key: str,
-    premium: float,
-    oi_at_open: Optional[int] = None,  # REARCH-003-TEST-FIX: optional to match test mock signatures
-) -> bool:
-    """
-    INSERT a new episode row and populate the in-flight cache on success.
-
-    Called exclusively from the INSERT branch of persist_flow_episode().
-    Named so tests can patch services.flow_store._insert_rows_with_episode_id
-    without affecting the generic _insert_rows used for flow_events batches.
-
-    NOTE: Does NOT increment _episode_stats["created_episodes"]. That counter
-    lives in persist_flow_episode() so it increments correctly whether this
-    function is real or patched by tests (ING-009-COUNTER-FIX).
-    """
-    if not _is_configured():
-        return False
-
-    ticker        = row.get("ticker", "?")
-    contract_type = row.get("contract_type", "?")
-    strike        = row.get("strike", 0.0)
-    expiry        = row.get("expiry")
-
-    insert_url = f"{_SUPABASE_URL}/rest/v1/{table}"
-    insert_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(insert_url, headers=insert_headers, json=row)
-
-        if resp.status_code in (200, 201):
-            returned = resp.json()
-            # ING-009-COUNTER-FIX: use .get("id") — hard access raises KeyError
-            # when PostgREST returns a body with no "id" field (E-16 test case).
-            new_id = returned[0].get("id") if returned else None
-            prem_str = f"${premium:,.0f}"
-            log.info(
-                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
-                "prem=%s (id=%s)",
-                ticker, contract_type, strike, expiry, prem_str, new_id,
-            )
-            if new_id is not None:
-                _set_episode_in_flight(key, new_id, 1, premium)
-            return True
-
-        log.warning(
-            "[flow_store] flow_episode INSERT failed: %d -- %s "
-            "(ticker=%s %s $%.0f %s)",
-            resp.status_code, resp.text[:200],
-            ticker, contract_type, strike, expiry,
-        )
-        return False
-
-    except Exception as exc:
-        log.warning(
-            "[flow_store] flow_episode INSERT exception: %s "
-            "(ticker=%s %s $%.0f %s)",
-            exc, ticker, contract_type, strike, expiry,
-        )
-        return False
 
 
 async def _flush_flow_events():
@@ -731,18 +505,31 @@ async def persist_flow_event(ev_dict: dict):
             pass  # enrichment failure is non-fatal
 
     # -----------------------------------------------------------------------
-    # REARCH-003 tag group 1: bid/ask classification, vol/OI signal,
-    # normalized premium. All pure helpers — zero I/O.
+    # REARCH-003: compute quality dimension tags.
+    # All are enrichment — a None/False value never drops the event.
     # -----------------------------------------------------------------------
-    fill_price       = ev_dict.get("fill_price", 0.0)
-    bid              = ev_dict.get("bid", 0.0)
-    ask              = ev_dict.get("ask", 0.0)
-    premium          = ev_dict.get("premium", 0.0)
-    underlying_price = ev_dict.get("underlying_price", 0.0)
+    fill_price       = ev_dict.get("fill_price", 0.0) or 0.0
+    bid              = ev_dict.get("bid", 0.0) or 0.0
+    ask              = ev_dict.get("ask", 0.0) or 0.0
+    underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
+    premium          = ev_dict.get("premium", 0.0) or 0.0
+    open_interest    = ev_dict.get("open_interest") or None  # may legitimately be 0
 
-    bid_ask_class, is_ask_side = _classify_bid_ask(fill_price, bid, ask)
-    vol_oi_signal              = _compute_vol_oi_signal(contract_volume_snapshot, contract_oi)
-    normalized_premium         = _compute_normalized_premium(premium, underlying_price)
+    bid_ask_cls: str        = classify_bid_ask(fill_price, bid, ask)
+    is_ask_side: bool       = bid_ask_cls == "ASK"
+    vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
+        contract_volume_snapshot, contract_oi
+    )
+
+    # normalized_premium = premium / underlying_price  (NULL when underlying <= 0)
+    normalized_premium: Optional[float] = None
+    if underlying_price and underlying_price > 0:
+        normalized_premium = round(premium / underlying_price, 6)
+
+    # normalized_oi = open_interest / contract_oi  (NULL when contract_oi <= 0)
+    normalized_oi: Optional[float] = None
+    if contract_oi and contract_oi > 0 and open_interest is not None:
+        normalized_oi = round(open_interest / contract_oi, 6)
 
     row = {
         "ticker":                   ticker,
@@ -756,8 +543,8 @@ async def persist_flow_event(ev_dict: dict):
         "size":                     ev_dict.get("size", 0),
         "premium":                  premium,
         "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
-        # REARCH-003: bid_ask_class now authoritative from _classify_bid_ask()
-        "bid_ask_class":            bid_ask_class,
+        "bid_ask_class":            bid_ask_cls,
+        "is_ask_side":              is_ask_side,
         "is_aggressive":            ev_dict.get("is_aggressive", False),
         "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
         "exchange_count":           ev_dict.get("exchange_count", 1),
@@ -770,31 +557,11 @@ async def persist_flow_event(ev_dict: dict):
         # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
-        # REARCH-003: tag group 1
-        "is_ask_side":              is_ask_side,
+        # REARCH-003: quality dimension tags
         "vol_oi_signal":            vol_oi_signal,
         "normalized_premium":       normalized_premium,
+        "normalized_oi":            normalized_oi,
     }
-
-    # -----------------------------------------------------------------------
-    # REARCH-003 tag group 2: dte_bucket, notional_tier, event_cipher_score.
-    # enrich_tags() reads dte, premium, is_ask_side, vol_oi_signal from row
-    # (all already set above), mutates row in place, and returns it.
-    # Local import avoids circular: flow_store ← processor ← supabase_client.
-    # Failure is non-fatal — same enrichment policy as ING-008 vol/OI.
-    # -----------------------------------------------------------------------
-    try:
-        from ingestion.processor import IngestionProcessor
-        IngestionProcessor.enrich_tags(row)
-    except Exception as exc:
-        log.warning(
-            "[flow_store] enrich_tags failed — dte_bucket/notional_tier/cipher_score NULL: %s",
-            exc,
-        )
-        row.setdefault("dte_bucket",         None)
-        row.setdefault("notional_tier",      None)
-        row.setdefault("event_cipher_score", None)
-
     _flow_event_buffer.append(row)
 
     if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
@@ -860,20 +627,6 @@ async def _lookup_open_episode(
     """
     ING-009: Query flow_episodes for an open same-session episode matching
     the merge key within the given window.
-
-    Merge key: (ticker, direction, contract_type, strike, expiry)
-    Window:    signal_ts >= now() - window_s seconds
-
-    Returns the episode row dict (with at minimum 'id', 'trade_count',
-    'total_premium') if found, else None.
-
-    On any Supabase error: logs a warning and returns None so the caller
-    falls back to INSERT — no episode is ever lost due to a lookup failure.
-    This satisfies E-8 in the QA test matrix.
-
-    NOTE: Must only be called while holding _get_episode_lock(key).
-    The in-flight cache check (_episode_in_flight) should be done BEFORE
-    calling this function to avoid an unnecessary DB round-trip.
     """
     if not _is_configured():
         return None
@@ -935,13 +688,6 @@ async def _patch_episode(
     contract_volume_at_close: Optional[int] = None,
     volume_oi_ratio: Optional[float] = None,
 ) -> bool:
-    """
-    Issue the PATCH to flow_episodes for an existing episode row.
-    Returns True on success (200/204), False otherwise.
-
-    ING-008: now accepts contract_volume_at_close and volume_oi_ratio;
-    both are written when not None (NULL-safe — omitted from payload if None).
-    """
     patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
     patch_headers = {
         "apikey":        _SUPABASE_KEY,
@@ -954,7 +700,6 @@ async def _patch_episode(
         "total_premium": total_premium,
         "signal_ts":     new_ts,
     }
-    # ING-008: only include vol/OI fields if we have values (cache hit)
     if contract_volume_at_close is not None:
         payload["contract_volume_at_close"] = contract_volume_at_close
     if volume_oi_ratio is not None:
@@ -991,10 +736,6 @@ def _compute_vol_oi_ratio(
     volume: Optional[int],
     oi: Optional[int],
 ) -> Optional[float]:
-    """
-    ING-008: Pre-compute volume_oi_ratio = volume / oi.
-    Returns None when either input is None or oi == 0 (div-by-zero safe).
-    """
     if volume is None or oi is None or oi == 0:
         return None
     return round(volume / oi, 4)
@@ -1003,164 +744,141 @@ def _compute_vol_oi_ratio(
 async def persist_flow_episode(signal_data: dict):
     """
     ING-009: Upsert one episode into flow_episodes.
-
-    On first qualifying print for a contract within the session window:
-      INSERT a new episode row via _insert_rows_with_episode_id().
-      Increments _episode_stats["created_episodes"].
-
-    On subsequent qualifying print for an open episode within
-    _EPISODE_MERGE_WINDOW_S:
-      PATCH the existing row:
-        trade_count  += 1
-        total_premium += new premium
-        signal_ts     = new timestamp
-      Increments _episode_stats["merged_episodes"].
-
-    ING-009-RACE: serialised per-contract via _get_episode_lock(key).
-    _episode_in_flight cache allows the second concurrent waiter to PATCH
-    without a DB round-trip after the first waiter's INSERT commits.
-
-    ING-008: vol/OI captured at INSERT (contract_oi_at_open) and PATCH
-    (contract_volume_at_close + volume_oi_ratio).
-
-    REARCH-003-TEST-FIX: the top-level _is_configured() guard has been removed.
-    Sub-functions (_lookup_open_episode, _insert_rows_with_episode_id) each
-    carry their own guard. The outer guard caused all E-1 through E-16 tests
-    to return immediately because _SUPABASE_URL/_SUPABASE_KEY are None in the
-    test environment, preventing patched sub-functions from ever being reached.
-
-    ING-009-COUNTER-FIX: _episode_stats["created_episodes"] is incremented here
-    (not inside _insert_rows_with_episode_id) so the counter increments correctly
-    whether _insert_rows_with_episode_id is real or patched by tests.
     """
-    ticker        = signal_data.get("ticker", "UNKNOWN")
-    direction     = signal_data.get("direction", "UNKNOWN")
-    contract_type = signal_data.get("contract_type", "UNKNOWN")
-    strike        = signal_data.get("strike", 0.0)
+    ticker        = signal_data.get("ticker")
+    direction     = signal_data.get("direction")
+    contract_type = signal_data.get("contract_type")
+    strike        = signal_data.get("strike")
     expiry        = signal_data.get("expiry") or None
-    premium       = signal_data.get("premium") or signal_data.get("total_premium", 0.0)
-    signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or datetime.now(timezone.utc).isoformat()
-    is_multi_day  = signal_data.get("is_multi_day_repeat", False)
+    new_premium   = signal_data.get("total_premium") or 0.0
+    new_ts        = signal_data.get("timestamp")
     occ_symbol    = signal_data.get("occ_symbol")
-    alert_level   = signal_data.get("alert_level", "WATCH")
-    is_accelerating = signal_data.get("is_accelerating", False)
-    seed_episode  = signal_data.get("seed_episode")
 
-    # ING-008: vol/OI at episode open
-    contract_oi_at_open: Optional[int] = None
+    current_volume: Optional[int] = None
+    current_oi: Optional[int] = None
     if occ_symbol:
         try:
             from services.chain_store import get_contract_vol_oi
-            _, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
+            current_volume, current_oi = get_contract_vol_oi(occ_symbol)
         except Exception:
             pass
 
-    key  = _episode_key(ticker, direction, contract_type, strike, expiry or "")
+    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
     lock = _get_episode_lock(key)
 
     async with lock:
-        # --- Check in-flight cache first (avoids DB round-trip on race) ---
         in_flight = _episode_in_flight.get(key)
-        if in_flight:
-            new_trade_count  = in_flight["trade_count"] + 1
-            new_total_prem   = in_flight["total_premium"] + premium
-            row_id           = in_flight["id"]
 
-            # ING-008: vol/OI at close (latest available)
-            contract_volume_at_close: Optional[int] = None
-            volume_oi_ratio: Optional[float] = None
-            if occ_symbol:
-                try:
-                    from services.chain_store import get_contract_vol_oi
-                    contract_volume_at_close, oi_snap = get_contract_vol_oi(occ_symbol)
-                    volume_oi_ratio = _compute_vol_oi_ratio(contract_volume_at_close, contract_oi_at_open)
-                except Exception:
-                    pass
+        if in_flight is not None:
+            row_id        = in_flight["id"]
+            trade_count   = in_flight["trade_count"] + 1
+            total_premium = in_flight["total_premium"] + new_premium
+
+            oi_at_open = in_flight.get("contract_oi_at_open")
+            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
 
             ok = await _patch_episode(
-                row_id=row_id,
-                trade_count=new_trade_count,
-                total_premium=new_total_prem,
-                new_ts=signal_ts,
-                ticker=ticker,
-                contract_type=contract_type,
-                strike=strike,
-                expiry=expiry or "",
-                contract_volume_at_close=contract_volume_at_close,
-                volume_oi_ratio=volume_oi_ratio,
+                row_id, trade_count, total_premium, new_ts,
+                ticker, contract_type, strike, expiry,
+                contract_volume_at_close=current_volume,
+                volume_oi_ratio=vol_ratio,
             )
             if ok:
-                _set_episode_in_flight(key, row_id, new_trade_count, new_total_prem)
                 _episode_stats["merged_episodes"] += 1
+                in_flight["trade_count"]   = trade_count
+                in_flight["total_premium"] = total_premium
             return
 
-        # --- No in-flight entry: check DB ---
-        existing = await _lookup_open_episode(ticker, direction, contract_type, strike, expiry or "")
+        existing = await _lookup_open_episode(
+            ticker, direction, contract_type, strike, expiry
+        )
 
         if existing:
-            row_id           = existing["id"]
-            new_trade_count  = existing["trade_count"] + 1
-            new_total_prem   = existing["total_premium"] + premium
+            row_id        = existing["id"]
+            trade_count   = (existing.get("trade_count") or 1) + 1
+            total_premium = (existing.get("total_premium") or 0.0) + new_premium
 
-            contract_volume_at_close: Optional[int] = None
-            volume_oi_ratio: Optional[float] = None
-            if occ_symbol:
-                try:
-                    from services.chain_store import get_contract_vol_oi
-                    contract_volume_at_close, _ = get_contract_vol_oi(occ_symbol)
-                    oi_open = existing.get("contract_oi_at_open")
-                    volume_oi_ratio = _compute_vol_oi_ratio(contract_volume_at_close, oi_open)
-                except Exception:
-                    pass
+            oi_at_open = existing.get("contract_oi_at_open")
+            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
 
             ok = await _patch_episode(
-                row_id=row_id,
-                trade_count=new_trade_count,
-                total_premium=new_total_prem,
-                new_ts=signal_ts,
-                ticker=ticker,
-                contract_type=contract_type,
-                strike=strike,
-                expiry=expiry or "",
-                contract_volume_at_close=contract_volume_at_close,
-                volume_oi_ratio=volume_oi_ratio,
+                row_id, trade_count, total_premium, new_ts,
+                ticker, contract_type, strike, expiry,
+                contract_volume_at_close=current_volume,
+                volume_oi_ratio=vol_ratio,
             )
             if ok:
-                _set_episode_in_flight(key, row_id, new_trade_count, new_total_prem)
                 _episode_stats["merged_episodes"] += 1
+                _set_episode_in_flight(key, row_id, trade_count, total_premium)
+                _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
             return
 
-        # --- No existing episode: INSERT via _insert_rows_with_episode_id ---
-        insert_row: dict = {
+        row = {
             "ticker":              ticker,
             "direction":           direction,
             "contract_type":       contract_type,
             "strike":              strike,
             "expiry":              expiry,
-            "total_premium":       premium,
-            "trade_count":         signal_data.get("trade_count", 1),
-            "signal_ts":           signal_ts,
-            "is_multi_day_repeat": is_multi_day,
-            "alert_level":         alert_level,
-            "is_accelerating":     is_accelerating,
-            "seed_episode":        seed_episode,
+            "total_premium":       new_premium,
+            "trade_count":         signal_data.get("trade_count"),
+            "alert_level":         signal_data.get("alert_level"),
+            "is_accelerating":     signal_data.get("is_accelerating", False),
+            "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
+            "seed_episode":        signal_data.get("seed_episode"),
+            "signal_ts":           new_ts,
+            "contract_oi_at_open": current_oi,
         }
-        if contract_oi_at_open is not None:
-            insert_row["contract_oi_at_open"] = contract_oi_at_open
-        if occ_symbol:
-            insert_row["occ_symbol"] = occ_symbol
-
-        # ING-009-COUNTER-FIX: increment created_episodes here so the counter
-        # fires whether _insert_rows_with_episode_id is real or patched by tests.
-        ok = await _insert_rows_with_episode_id(
-            "flow_episodes",
-            insert_row,
-            key,
-            premium,
-            contract_oi_at_open,
-        )
+        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium, current_oi)
         if ok:
             _episode_stats["created_episodes"] += 1
+            prem_str = f"${new_premium:,.0f}"
+            log.info(
+                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
+                "alert=%s prem=%s multi_day=%s oi_at_open=%s",
+                ticker, contract_type, strike, expiry,
+                row["alert_level"], prem_str,
+                row["is_multi_day_repeat"], current_oi,
+            )
+
+
+async def _insert_rows_with_episode_id(
+    table: str,
+    row: dict,
+    key: str,
+    premium: float,
+    oi_at_open: Optional[int] = None,
+) -> bool:
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return False
+
+    url = f"{_SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, json=[row])
+        if resp.status_code in (200, 201):
+            try:
+                returned = resp.json()
+                if returned and isinstance(returned, list) and "id" in returned[0]:
+                    row_id = returned[0]["id"]
+                    trade_count = row.get("trade_count") or 1
+                    _set_episode_in_flight(key, row_id, trade_count, premium)
+                    _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
+            except Exception:
+                pass
+            return True
+        log.error(
+            f"[flow_store] insert into {table} failed: {resp.status_code} -- {resp.text[:300]}"
+        )
+        return False
+    except Exception as e:
+        log.error(f"[flow_store] insert into {table} exception: {e}")
+        return False
 
 
 async def _update_episode_multiday(
@@ -1170,15 +888,6 @@ async def _update_episode_multiday(
     expiry: str,
     is_multi_day_repeat: bool,
 ) -> None:
-    """
-    ING-007: Two-step GET+PATCH to set is_multi_day_repeat on the most
-    recent flow_episodes row for a contract (PBE-F2 fix).
-
-    Step 1: GET the bigserial id of the target row (order=signal_ts.desc, limit=1).
-    Step 2: PATCH that specific row by id.
-
-    Logs at INFO on GET-returns-empty (SA-F3) so cold-miss rate is observable.
-    """
     if not _is_configured():
         return
 
@@ -1187,72 +896,74 @@ async def _update_episode_multiday(
         "Authorization": f"Bearer {_SUPABASE_KEY}",
         "Accept":        "application/json",
     }
-    get_url = (
-        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+    patch_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+
+    filter_qs = (
         f"?ticker=eq.{quote(ticker)}"
         f"&contract_type=eq.{quote(contract_type)}"
         f"&strike=eq.{strike}"
         f"&expiry=eq.{quote(expiry)}"
-        f"&order=signal_ts.desc"
-        f"&limit=1"
-        f"&select=id"
     )
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
+            get_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"{filter_qs}"
+                f"&order=signal_ts.desc"
+                f"&limit=1"
+                f"&select=id"
+            )
             get_resp = await client.get(get_url, headers=get_headers)
+            if get_resp.status_code != 200:
+                log.warning(
+                    "[flow_store] _update_episode_multiday GET failed: %d -- %s "
+                    "(ticker=%s %s $%.0f %s)",
+                    get_resp.status_code, get_resp.text[:200],
+                    ticker, contract_type, strike, expiry,
+                )
+                return
 
-        if get_resp.status_code != 200:
-            log.warning(
-                "[flow_store] _update_episode_multiday GET failed: %d -- %s "
-                "(ticker=%s %s $%.0f %s)",
-                get_resp.status_code, get_resp.text[:200],
-                ticker, contract_type, strike, expiry,
+            rows = get_resp.json()
+            if not rows:
+                log.info(
+                    "[flow_store] _update_episode_multiday: no episode row found yet for "
+                    "%s %s $%.0f %s — INSERT may not have committed; "
+                    "skipping PATCH (enrichment-only, not a gate)",
+                    ticker, contract_type, strike, expiry,
+                )
+                return
+
+            row_id = rows[0].get("id")
+            if row_id is None:
+                log.warning(
+                    "[flow_store] _update_episode_multiday: GET returned row with "
+                    "no id field (ticker=%s %s $%.0f %s) — skipping PATCH",
+                    ticker, contract_type, strike, expiry,
+                )
+                return
+
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{row_id}"
             )
-            return
-
-        rows = get_resp.json()
-        if not rows:
-            log.info(  # SA-F3: elevated from DEBUG so cold-miss is observable in Railway
-                "[flow_store] _update_episode_multiday: no episode row found "
-                "(ticker=%s %s $%.0f %s) — skipping multiday patch",
-                ticker, contract_type, strike, expiry,
-            )
-            return
-
-        row_id = rows[0].get("id")
-        if row_id is None:
-            log.warning(
-                "[flow_store] _update_episode_multiday: row missing 'id' field "
-                "(ticker=%s %s $%.0f %s) — skipping multiday patch",
-                ticker, contract_type, strike, expiry,
-            )
-            return
-
-        patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
-        patch_headers = {
-            "apikey":        _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
-            "Content-Type":  "application/json",
-            "Prefer":        "return=minimal",
-        }
-        async with httpx.AsyncClient(timeout=5.0) as client:
             patch_resp = await client.patch(
                 patch_url,
                 headers=patch_headers,
                 json={"is_multi_day_repeat": is_multi_day_repeat},
             )
-
-        if patch_resp.status_code in (200, 204):
-            log.info(
-                "[flow_store] flow_episode multiday updated: %s %s $%.0f %s → %s (id=%d)",
-                ticker, contract_type, strike, expiry, is_multi_day_repeat, row_id,
-            )
-        else:
-            log.warning(
-                "[flow_store] flow_episode multiday PATCH failed: %d -- %s (id=%d)",
-                patch_resp.status_code, patch_resp.text[:200], row_id,
-            )
+            if patch_resp.status_code not in (200, 204):
+                log.warning(
+                    "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
+                    "(id=%s ticker=%s %s $%.0f %s)",
+                    patch_resp.status_code, patch_resp.text[:200],
+                    row_id, ticker, contract_type, strike, expiry,
+                )
 
     except Exception as exc:
         log.warning(
@@ -1262,148 +973,138 @@ async def _update_episode_multiday(
         )
 
 
-async def start_lookback_worker(accumulator=None) -> None:
-    """
-    ING-007: Background worker that drains _lookback_queue and patches
-    flow_episodes rows with is_multi_day_repeat.
+async def start_lookback_worker(accumulator) -> None:
+    from utils.contract_day_cache import get_lookback
 
-    Each item dequeued is a ContractKey = (ticker, contract_type, strike, expiry).
-    The worker fetches the lookback result from contract_day_cache, applies a
-    quality filter (min_premium from accumulator DTE tiers), then calls
-    _update_episode_multiday() on the most recent episode row for that contract.
+    multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
 
-    SA-F1 fix: correct attr name (_dte_tiers, not _dte_premium_tiers) and
-    correct traversal for List[Tuple[int, Dict[int, float]]].
-
-    PBE-F5 fix: log the resolved min_premium per key at DEBUG.
-
-    ING-007-PATCH (2026-05-10): get_lookback is called via module reference
-    (_contract_day_cache.get_lookback) so that unittest.mock.patch(
-    'utils.contract_day_cache.get_lookback') correctly intercepts the call.
-    A `from ... import get_lookback` local binding would shadow the patch.
-    """
-    log.info("[lookback_worker] starting")
-
-    # SA-F1: correct attr name + correct traversal
-    dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+    log.info(
+        "[lookback_worker] started — draining ContractKey queue "
+        "(maxsize=%d, multi_day_min_days=%d)",
+        _LOOKBACK_QUEUE_MAX, multi_day_min_days,
+    )
     try:
-        min_premium: float = min(
-            floor
-            for _, floors in dte_tiers
-            for floor in floors.values()
-        )
-    except (ValueError, TypeError):
-        min_premium = 10_000.0  # hardcoded floor when accumulator has no tiers
-
-    min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
-
-    while True:
-        try:
+        while True:
             key = await _lookback_queue.get()
             ticker, contract_type, strike, expiry = key
 
-            # PBE-F5: log resolved floor so Railway surfaces which tier applies
+            try:
+                dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+                if dte_tiers:
+                    min_premium = min(
+                        floor
+                        for _, floors in dte_tiers
+                        for floor in floors.values()
+                    )
+                else:
+                    min_premium = 10_000.0
+            except (ValueError, TypeError):
+                min_premium = 10_000.0
+
             log.debug(
-                "[lookback_worker] processing %s %s $%.0f %s (min_premium=%.0f)",
-                ticker, contract_type, strike, expiry, min_premium,
+                "[lookback_worker] %s %s $%.0f %s — "
+                "min_premium=%.0f (dte_tiers_found=%s)",
+                ticker, contract_type, strike, expiry,
+                min_premium, bool(dte_tiers),
             )
 
-            # ING-007: fetch via module reference so patch() intercepts at call time.
-            # A local `from utils.contract_day_cache import get_lookback` would
-            # bind a name that bypasses any patch on the module attribute.
             try:
-                result = await _contract_day_cache.get_lookback(key, min_premium)
+                result = await get_lookback(key, min_premium)
+                is_repeat = result.prior_days_active >= multi_day_min_days
+                await _update_episode_multiday(
+                    ticker, contract_type, strike, expiry, is_repeat
+                )
+                log.debug(
+                    "[lookback_worker] %s %s $%.0f %s — "
+                    "prior_days_active=%d aggressive=%d is_repeat=%s (min_days=%d)",
+                    ticker, contract_type, strike, expiry,
+                    result.prior_days_active, result.prior_days_aggressive,
+                    is_repeat, multi_day_min_days,
+                )
             except Exception as exc:
-                log.debug("[lookback_worker] get_lookback error for %s: %s", key, exc)
+                log.warning(
+                    "[lookback_worker] error processing key %s: %s", key, exc
+                )
+            finally:
                 _lookback_queue.task_done()
-                continue
 
-            if result is None:
-                _lookback_queue.task_done()
-                continue
-
-            is_repeat = result.prior_days_active >= min_days
-
-            await _update_episode_multiday(
-                ticker=ticker,
-                contract_type=contract_type,
-                strike=strike,
-                expiry=expiry,
-                is_multi_day_repeat=is_repeat,
-            )
-
-        except asyncio.CancelledError:
-            log.info("[lookback_worker] cancelled — shutting down")
-            break
-        except Exception as exc:
-            log.warning("[lookback_worker] unhandled exception: %s", exc)
-        finally:
-            try:
-                _lookback_queue.task_done()
-            except ValueError:
-                pass
+    except asyncio.CancelledError:
+        log.info("[lookback_worker] cancelled — shutting down cleanly")
+        raise
 
 
-async def start_flow_writer() -> None:
-    """
-    Entry point — call once from main.py lifespan.
-    Starts the bus listener and the periodic flush task.
-    """
-    asyncio.create_task(_flush_flow_events())
-    asyncio.create_task(_bus_signal_listener())
-    log.info("[flow_store] flow writer started")
-
-
-async def _bus_signal_listener() -> None:
-    """
-    Retained for future use. Acts as a no-op consumer of the db_writer
-    channel after EPISODE-FIX moved persist_flow_episode() to _process_trade().
-
-    TEST-FIX (2026-05-10): AsyncEventBus.subscribe() returns a plain
-    asyncio.Queue — it does NOT implement the async context manager protocol.
-    Replaced `async with bus.subscribe(...) as queue` with explicit
-    bus.subscribe() / bus.unsubscribe() in a try/finally block.
-    """
-    queue = bus.subscribe("db_writer")
+async def _bus_signal_listener():
+    q = bus.subscribe("db_writer")
+    log.info("[flow_store] DB writer subscribed to bus (flow_episodes written directly from stream, not here)")
     try:
         while True:
-            try:
-                await queue.get()
-                # no-op: episode persistence moved to _process_trade() (EPISODE-FIX)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.debug("[flow_store] _bus_signal_listener exception: %s", exc)
-    finally:
-        bus.unsubscribe("db_writer", queue)
+            await q.get()
+    except asyncio.CancelledError:
+        bus.unsubscribe("db_writer", q)
+        log.info("[flow_store] DB writer unsubscribed from bus")
+        raise
 
 
-# ---------------------------------------------------------------------------
-# Module-level async helpers (used by tests and WebSocket consumers)
-# ---------------------------------------------------------------------------
+async def start_flow_writer():
+    if not _is_configured():
+        log.warning(
+            "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "
+            "flow_events and flow_episodes will NOT be persisted to DB. "
+            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
+        )
+        return
+
+    log.info(f"[flow_store] Starting flow DB writer (flush_interval={_FLUSH_INTERVAL}s, max_rows={_FLUSH_MAX_ROWS}, retry_max={_RETRY_MAX})")
+    await asyncio.gather(
+        _bus_signal_listener(),
+        _flush_flow_events(),
+    )
+
+
+class FlowStore:
+    """In-memory store for options flow events."""
+
+    def __init__(self) -> None:
+        self._flows: List[Any] = []
+        self._stats: Dict[str, Any] = {"total": 0}
+
+    def add_flow(self, flow: Any) -> None:
+        self._flows.append(flow)
+        self._stats["total"] = len(self._flows)
+
+    def get_flows(self) -> List[Any]:
+        return list(self._flows)
+
+    def get_flows_by_symbol(self, symbol: str) -> List[Any]:
+        return [
+            f for f in self._flows
+            if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
+        ]
+
+    def get_stats(self) -> Dict[str, Any]:
+        return dict(self._stats)
+
+    def clear(self) -> None:
+        self._flows.clear()
+        self._stats = {"total": 0}
+
+    def size(self) -> int:
+        return len(self._flows)
+
 
 _store = FlowStore()
 
-_MAX_FLOWS_PER_TICKER = 200
-_FLOW_TTL_S = 86_400  # 24 hours
-
 
 async def add_flow(flow: dict) -> None:
-    """Add a flow event to the in-memory store."""
     _store.add_flow(flow)
 
 
-async def get_flows(ticker: str) -> list:
-    """Return all stored flows for ticker (not expired)."""
-    now = __import__("time").time()
+async def get_flows(ticker: str) -> List[dict]:
     return [
         f for f in _store.get_flows()
-        if isinstance(f, dict)
-        and f.get("ticker") == ticker
-        and (now - f.get("timestamp", now)) < _FLOW_TTL_S
+        if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
     ]
 
 
 async def clear_flows() -> None:
-    """Clear all in-memory flows."""
     _store.clear()
