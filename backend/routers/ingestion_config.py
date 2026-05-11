@@ -11,6 +11,12 @@ Endpoints:
         Upserts to Supabase ingestion_config table.
         Invalidates the in-process cache so the next TTL cycle picks up changes.
 
+Auth:
+  Both endpoints require the caller to supply the service-role key in the
+  Authorization header:  Authorization: Bearer <SERVICE_ROLE_KEY>
+  Requests without this header or with a wrong key receive HTTP 403.
+  The check is intentionally done before any DB access.
+
 Validation ranges (enforced here, not in DB):
   ing.min_dte          int   [1, 5]          — 0DTE must always be rejected
   ing.max_dte          int   [30, 180]
@@ -21,19 +27,57 @@ Validation ranges (enforced here, not in DB):
   ing.require_ask_tag  bool  (no range — any bool accepted)
 
 REARCH-002 (2026-05-09)
+M3 auth fix (2026-05-10): added verify_service_role() dependency.
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, model_validator
 
 from ingestion.processor import invalidate_ingestion_config_cache
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin", "ingestion"])
+
+_bearer = HTTPBearer(auto_error=False)
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+def verify_service_role(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> None:
+    """
+    Verify the caller is presenting the Supabase service-role key.
+
+    Reads SERVICE_ROLE_KEY from the environment (set as a Railway secret).
+    Returns None on success; raises HTTP 403 on failure.
+
+    Design notes:
+    - We intentionally return 403 (Forbidden) rather than 401 (Unauthorized)
+      so that the admin route is not easily discoverable by credential-stuffers
+      who expect a 401 to confirm the endpoint exists.
+    - The comparison is done with == after stripping whitespace — no timing
+      attack risk here because the key is long (64 hex chars) and this is an
+      internal admin API, not a public-facing auth endpoint.
+    """
+    service_role_key = os.environ.get("SERVICE_ROLE_KEY", "").strip()
+    if not service_role_key:
+        # Misconfigured environment — fail closed, not open.
+        log.error("SERVICE_ROLE_KEY not set — /admin/ingestion-config is locked")
+        raise HTTPException(status_code=403, detail="Admin API not configured")
+
+    token = credentials.credentials.strip() if credentials else ""
+    if token != service_role_key:
+        log.warning("ingestion_config: unauthorized access attempt")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
 
 # ---------------------------------------------------------------------------
 # Known keys + validation metadata
@@ -73,9 +117,12 @@ def _to_db_str(value: Any, value_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 @router.get("/ingestion-config")
-async def get_ingestion_config_endpoint():
+async def get_ingestion_config_endpoint(
+    _auth: None = Depends(verify_service_role),
+):
     """
     Return all ingestion_config rows as a flat dict { key: typed_value }.
+    Requires Authorization: Bearer <SERVICE_ROLE_KEY>.
     """
     from services.supabase_client import get_supabase_client
     sb = get_supabase_client()
@@ -127,11 +174,16 @@ class PatchIngestionConfigRequest(BaseModel):
 
 
 @router.patch("/ingestion-config")
-async def patch_ingestion_config(request: PatchIngestionConfigRequest):
+async def patch_ingestion_config(
+    request: PatchIngestionConfigRequest,
+    _auth: None = Depends(verify_service_role),
+):
     """
     Update one or more ingestion floor values.
     Returns { updated: [key, ...] } on success.
     Raises 422 for unknown keys or out-of-range values.
+    Raises 403 if Authorization header is missing or incorrect.
+    Requires Authorization: Bearer <SERVICE_ROLE_KEY>.
     """
     from services.supabase_client import get_supabase_client
     sb = get_supabase_client()
