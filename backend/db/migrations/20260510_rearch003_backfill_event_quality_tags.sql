@@ -4,21 +4,35 @@
 --   • Processes flow_events in batches of 5 000 rows ordered by created_at ASC.
 --   • For each row, recomputes all 6 tag columns using the same pure-SQL
 --     expressions that mirror flow_store.py's Python helpers exactly.
---   • Safe to re-run: WHERE clause targets only rows missing dte_bucket OR
---     notional_tier (the 2 new REARCH-003 TEXT columns). Rows that already
---     have both set are skipped.
---   • bid_ask_class / is_ask_side were written by prior inserts with the old
---     lowercase enum ('ask_side', 'above_ask', etc.). This backfill rewrites
---     them to the canonical enum: 'ASK' | 'BID' | 'MID'.
---   • vol_oi_signal was TEXT in the old column definition. The column type is
---     corrected to BOOLEAN by the companion DDL fix migration that must be run
---     BEFORE this backfill.
+--   • Safe to re-run: WHERE clause targets rows that still hold old placeholder
+--     enum values OR NULL, so re-running after a partial run is harmless.
+--
+--   OLD (wrong) enums written by the first backfill run:
+--     dte_bucket:    '0dte' | 'weekly' | 'monthly' | 'quarterly' | 'leaps'
+--     notional_tier: 'small' | 'medium' | 'large' | 'whale'
+--
+--   CANONICAL Steamroom enums (matching processor.py + flow_store.py):
+--     dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
+--     notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
+--
+--   • bid_ask_class / is_ask_side: rewritten to canonical 'ASK' | 'BID' | 'MID'.
+--   • vol_oi_signal: BOOLEAN (TRUE = high, FALSE = normal, NULL = no data).
 --   • event_cipher_score is NOT touched here — it is owned by REARCH-004.
 --
--- Threshold constants (must match flow_store.py exactly):
---   _BID_ASK_ASK_THRESHOLD = 0.98   fill >= ask * 0.98  → 'ASK'
---   _BID_ASK_BID_THRESHOLD = 1.02   fill <= bid * 1.02  → 'BID'
---   VOL_OI_HIGH_THRESHOLD  = 0.5    vol/OI >= 0.5       → TRUE
+-- Threshold constants (must match processor.py and flow_store.py exactly):
+--   _BID_ASK_ASK_THRESHOLD  = 0.98    fill >= ask * 0.98  → 'ASK'
+--   _BID_ASK_BID_THRESHOLD  = 1.02    fill <= bid * 1.02  → 'BID'
+--   VOL_OI_HIGH_THRESHOLD   = 0.5     vol/OI >= 0.5       → TRUE
+--   _NOTIONAL_GOLDEN        = 500000  premium >= $500k    → 'GOLDEN'
+--   _NOTIONAL_BLOCK         = 100000  premium >= $100k    → 'BLOCK'
+--   _NOTIONAL_NOTEWORTHY    = 50000   premium >= $50k     → 'NOTEWORTHY'
+--                                     premium <  $50k     → 'WATCH'
+--   DTE buckets:
+--     dte = 0           → '0DTE'
+--     1  <= dte <= 4    → '1-4'
+--     5  <= dte <= 60   → '5-60'
+--     61 <= dte <= 90   → '61-90'
+--     dte > 90 or NULL  → '90+'
 --
 -- Schema column names used:
 --   fill_price, bid, ask, contract_volume_snapshot, contract_oi,
@@ -31,7 +45,7 @@ DECLARE
   rows_done    BIGINT       := 0;
   batch_rows   INT;
 BEGIN
-  RAISE NOTICE 'REARCH-003 backfill started at %', clock_timestamp();
+  RAISE NOTICE 'REARCH-003 backfill (canonical enums) started at %', clock_timestamp();
 
   LOOP
     WITH batch AS (
@@ -40,8 +54,6 @@ BEGIN
         created_at,
 
         -- is_ask_side: TRUE when fill is at or above ask * 0.98 threshold.
-        -- Mirrors classify_bid_ask() → (cls == "ASK") in flow_store.py.
-        -- NULL bid/ask or ask<=0 or bid<=0 → FALSE (MID path).
         CASE
           WHEN bid IS NOT NULL AND ask IS NOT NULL
                AND bid > 0 AND ask > 0
@@ -51,7 +63,6 @@ BEGIN
         END AS calc_is_ask_side,
 
         -- bid_ask_class: canonical enum ASK | BID | MID.
-        -- Matches classify_bid_ask() thresholds exactly.
         CASE
           WHEN bid IS NOT NULL AND ask IS NOT NULL
                AND bid > 0 AND ask > 0
@@ -66,7 +77,6 @@ BEGIN
         END AS calc_bid_ask_class,
 
         -- vol_oi_signal: BOOLEAN — TRUE when vol/OI >= 0.5, else FALSE, NULL on missing data.
-        -- Mirrors compute_vol_oi_signal() → Optional[bool] in flow_store.py.
         CASE
           WHEN contract_volume_snapshot IS NULL
             OR contract_oi IS NULL
@@ -76,38 +86,45 @@ BEGIN
         END AS calc_vol_oi_signal,
 
         -- normalized_premium: premium / underlying_price, 4dp.
-        -- Mirrors _compute_normalized_premium() in flow_store.py.
-        -- NO * 100 — it is a pure ratio, not a percentage.
         CASE
           WHEN underlying_price IS NOT NULL AND underlying_price > 0
           THEN ROUND(premium / underlying_price, 4)
           ELSE NULL
         END AS calc_normalized_premium,
 
-        -- dte_bucket: time-to-expiry classification.
+        -- dte_bucket: canonical Steamroom DTE bracket.
+        -- Matches _compute_dte_bucket() in processor.py exactly.
         CASE
-          WHEN dte IS NULL  THEN NULL
-          WHEN dte <= 1     THEN '0dte'
-          WHEN dte <= 7     THEN 'weekly'
-          WHEN dte <= 30    THEN 'monthly'
-          WHEN dte <= 90    THEN 'quarterly'
-          ELSE                   'leaps'
+          WHEN dte IS NULL OR dte < 0 THEN '90+'
+          WHEN dte = 0                THEN '0DTE'
+          WHEN dte <= 4               THEN '1-4'
+          WHEN dte <= 60              THEN '5-60'
+          WHEN dte <= 90              THEN '61-90'
+          ELSE                             '90+'
         END AS calc_dte_bucket,
 
-        -- notional_tier: premium size classification.
+        -- notional_tier: canonical Steamroom premium size bucket.
+        -- Matches _compute_notional_tier() in processor.py exactly.
         CASE
-          WHEN premium IS NULL    THEN NULL
-          WHEN premium >= 1000000 THEN 'whale'
-          WHEN premium >= 250000  THEN 'large'
-          WHEN premium >= 50000   THEN 'medium'
-          ELSE                        'small'
+          WHEN premium IS NULL OR premium = 0 THEN 'WATCH'
+          WHEN premium >= 500000              THEN 'GOLDEN'
+          WHEN premium >= 100000              THEN 'BLOCK'
+          WHEN premium >= 50000               THEN 'NOTEWORTHY'
+          ELSE                                     'WATCH'
         END AS calc_notional_tier
 
       FROM public.flow_events
       WHERE created_at > last_cursor
         AND (
-          dte_bucket       IS NULL
+          -- Target rows that are NULL or still hold old placeholder enum values.
+          -- This makes the backfill idempotent: rows already correct are skipped
+          -- only if we tighten the WHERE further; for now a full re-run is safe
+          -- because overwriting the correct value with the same correct value is
+          -- a no-op in terms of data integrity.
+          dte_bucket IS NULL
+          OR dte_bucket IN ('0dte', 'weekly', 'monthly', 'quarterly', 'leaps')
           OR notional_tier IS NULL
+          OR notional_tier IN ('small', 'medium', 'large', 'whale')
         )
       ORDER BY created_at ASC
       LIMIT BATCH_SIZE
@@ -133,5 +150,5 @@ BEGIN
     EXIT WHEN batch_rows < BATCH_SIZE;
   END LOOP;
 
-  RAISE NOTICE 'REARCH-003 backfill complete: % total rows updated at %', rows_done, clock_timestamp();
+  RAISE NOTICE 'REARCH-003 backfill (canonical enums) complete: % total rows updated at %', rows_done, clock_timestamp();
 END $$;
