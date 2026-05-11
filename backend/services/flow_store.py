@@ -110,6 +110,18 @@ Bug fixes applied:
       4.90, so a fill exactly at mid was classified ASK instead of MID.
       Fix: strict boundaries — fill >= ask → ASK, fill <= bid → BID, else MID.
       No fuzz multipliers. is_ask_side remains True iff bid_ask_class == 'ASK'.
+  13. TEST-FIX (2026-05-10): three test failures resolved:
+      a. ImportError: FlowStore — add FlowStore in-memory class with
+         add_flow, get_flows, get_flows_by_symbol, get_stats, clear, size.
+      b. AttributeError: _insert_rows_with_episode_id — extract the episode
+         INSERT httpx call into a named coroutine that tests can patch.
+         persist_flow_episode INSERT branch calls _insert_rows_with_episode_id(
+         table, row, key, premium, oi_at_open). Row includes alert_level,
+         is_accelerating, seed_episode from signal_data.
+      c. TypeError: Queue does not support async context manager protocol —
+         AsyncEventBus.subscribe() returns asyncio.Queue, not an async CM.
+         _bus_signal_listener now uses bus.subscribe()/bus.unsubscribe() with
+         try/finally instead of `async with bus.subscribe(...) as queue`.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -387,6 +399,49 @@ def get_lookback_stats() -> Dict[str, int]:
     return dict(_lookback_stats)
 
 
+# ---------------------------------------------------------------------------
+# TEST-FIX (2026-05-10): FlowStore in-memory class
+#   Provides a simple add/get/clear interface for tests and any consumer that
+#   needs in-memory flow storage without hitting the DB or the async bus.
+# ---------------------------------------------------------------------------
+
+class FlowStore:
+    """
+    Lightweight in-memory store for options flow events.
+    Used by tests and any consumer that needs a simple add/get/clear interface
+    without hitting the DB or the async bus.
+    """
+
+    def __init__(self):
+        self._flows: list = []
+
+    def add_flow(self, flow: dict) -> None:
+        self._flows.append(flow)
+
+    def get_flows(self) -> list:
+        return list(self._flows)
+
+    def get_flows_by_symbol(self, symbol: str) -> list:
+        result = []
+        for f in self._flows:
+            if isinstance(f, dict):
+                if f.get("symbol") == symbol:
+                    result.append(f)
+            else:
+                if getattr(f, "symbol", None) == symbol:
+                    result.append(f)
+        return result
+
+    def get_stats(self) -> dict:
+        return {"total": len(self._flows)}
+
+    def clear(self) -> None:
+        self._flows.clear()
+
+    def size(self) -> int:
+        return len(self._flows)
+
+
 def _is_configured() -> bool:
     return bool(_SUPABASE_URL and _SUPABASE_KEY)
 
@@ -506,6 +561,88 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
         f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
     )
     return False
+
+
+# ---------------------------------------------------------------------------
+# TEST-FIX (2026-05-10): _insert_rows_with_episode_id
+#   Extracted from the persist_flow_episode INSERT branch so tests can patch
+#   this named coroutine without intercepting the generic _insert_rows path.
+#
+#   Signature (positional, matches test expectations):
+#     args[0] = table      (str)           "flow_episodes"
+#     args[1] = row        (dict)          full episode row dict
+#     args[2] = key        (str)           merge key
+#     args[3] = premium    (float)
+#     args[4] = oi_at_open (Optional[int])
+#
+#   On 200/201: populates _episode_in_flight cache and increments
+#   _episode_stats["created_episodes"]. Returns True.
+#   On failure: logs warning. Returns False.
+# ---------------------------------------------------------------------------
+
+async def _insert_rows_with_episode_id(
+    table: str,
+    row: dict,
+    key: str,
+    premium: float,
+    oi_at_open: Optional[int],
+) -> bool:
+    """
+    INSERT a new episode row and populate the in-flight cache on success.
+
+    Called exclusively from the INSERT branch of persist_flow_episode().
+    Named so tests can patch services.flow_store._insert_rows_with_episode_id
+    without affecting the generic _insert_rows used for flow_events batches.
+    """
+    if not _is_configured():
+        return False
+
+    ticker        = row.get("ticker", "?")
+    contract_type = row.get("contract_type", "?")
+    strike        = row.get("strike", 0.0)
+    expiry        = row.get("expiry")
+
+    insert_url = f"{_SUPABASE_URL}/rest/v1/{table}"
+    insert_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(insert_url, headers=insert_headers, json=row)
+
+        if resp.status_code in (200, 201):
+            returned = resp.json()
+            new_id = returned[0]["id"] if returned else None
+            prem_str = f"${premium:,.0f}"
+            log.info(
+                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
+                "prem=%s (id=%s)",
+                ticker, contract_type, strike, expiry, prem_str, new_id,
+            )
+            if new_id is not None:
+                _set_episode_in_flight(key, new_id, 1, premium)
+            _episode_stats["created_episodes"] += 1
+            return True
+
+        log.warning(
+            "[flow_store] flow_episode INSERT failed: %d -- %s "
+            "(ticker=%s %s $%.0f %s)",
+            resp.status_code, resp.text[:200],
+            ticker, contract_type, strike, expiry,
+        )
+        return False
+
+    except Exception as exc:
+        log.warning(
+            "[flow_store] flow_episode INSERT exception: %s "
+            "(ticker=%s %s $%.0f %s)",
+            exc, ticker, contract_type, strike, expiry,
+        )
+        return False
 
 
 async def _flush_flow_events():
@@ -832,7 +969,8 @@ async def persist_flow_episode(signal_data: dict):
     ING-009: Upsert one episode into flow_episodes.
 
     On first qualifying print for a contract within the session window:
-      INSERT a new episode row. Increments _episode_stats["created_episodes"].
+      INSERT a new episode row via _insert_rows_with_episode_id().
+      Increments _episode_stats["created_episodes"].
 
     On subsequent qualifying print for an open episode within
     _EPISODE_MERGE_WINDOW_S:
@@ -856,11 +994,14 @@ async def persist_flow_episode(signal_data: dict):
     direction     = signal_data.get("direction", "UNKNOWN")
     contract_type = signal_data.get("contract_type", "UNKNOWN")
     strike        = signal_data.get("strike", 0.0)
-    expiry        = signal_data.get("expiry", "")
-    premium       = signal_data.get("premium", 0.0)
-    signal_ts     = signal_data.get("signal_ts") or datetime.now(timezone.utc).isoformat()
+    expiry        = signal_data.get("expiry") or None
+    premium       = signal_data.get("premium") or signal_data.get("total_premium", 0.0)
+    signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or datetime.now(timezone.utc).isoformat()
     is_multi_day  = signal_data.get("is_multi_day_repeat", False)
     occ_symbol    = signal_data.get("occ_symbol")
+    alert_level   = signal_data.get("alert_level", "WATCH")
+    is_accelerating = signal_data.get("is_accelerating", False)
+    seed_episode  = signal_data.get("seed_episode")
 
     # ING-008: vol/OI at episode open
     contract_oi_at_open: Optional[int] = None
@@ -871,7 +1012,7 @@ async def persist_flow_episode(signal_data: dict):
         except Exception:
             pass
 
-    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
+    key  = _episode_key(ticker, direction, contract_type, strike, expiry or "")
     lock = _get_episode_lock(key)
 
     async with lock:
@@ -901,7 +1042,7 @@ async def persist_flow_episode(signal_data: dict):
                 ticker=ticker,
                 contract_type=contract_type,
                 strike=strike,
-                expiry=expiry,
+                expiry=expiry or "",
                 contract_volume_at_close=contract_volume_at_close,
                 volume_oi_ratio=volume_oi_ratio,
             )
@@ -911,7 +1052,7 @@ async def persist_flow_episode(signal_data: dict):
             return
 
         # --- No in-flight entry: check DB ---
-        existing = await _lookup_open_episode(ticker, direction, contract_type, strike, expiry)
+        existing = await _lookup_open_episode(ticker, direction, contract_type, strike, expiry or "")
 
         if existing:
             row_id           = existing["id"]
@@ -937,7 +1078,7 @@ async def persist_flow_episode(signal_data: dict):
                 ticker=ticker,
                 contract_type=contract_type,
                 strike=strike,
-                expiry=expiry,
+                expiry=expiry or "",
                 contract_volume_at_close=contract_volume_at_close,
                 volume_oi_ratio=volume_oi_ratio,
             )
@@ -946,61 +1087,33 @@ async def persist_flow_episode(signal_data: dict):
                 _episode_stats["merged_episodes"] += 1
             return
 
-        # --- No existing episode: INSERT ---
+        # --- No existing episode: INSERT via _insert_rows_with_episode_id ---
         insert_row: dict = {
-            "ticker":           ticker,
-            "direction":        direction,
-            "contract_type":    contract_type,
-            "strike":           strike,
-            "expiry":           expiry,
-            "total_premium":    premium,
-            "trade_count":      1,
-            "signal_ts":        signal_ts,
+            "ticker":              ticker,
+            "direction":           direction,
+            "contract_type":       contract_type,
+            "strike":              strike,
+            "expiry":              expiry,
+            "total_premium":       premium,
+            "trade_count":         signal_data.get("trade_count", 1),
+            "signal_ts":           signal_ts,
             "is_multi_day_repeat": is_multi_day,
+            "alert_level":         alert_level,
+            "is_accelerating":     is_accelerating,
+            "seed_episode":        seed_episode,
         }
         if contract_oi_at_open is not None:
             insert_row["contract_oi_at_open"] = contract_oi_at_open
         if occ_symbol:
             insert_row["occ_symbol"] = occ_symbol
 
-        insert_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-        insert_headers = {
-            "apikey":        _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
-            "Content-Type":  "application/json",
-            "Prefer":        "return=representation",
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(insert_url, headers=insert_headers, json=insert_row)
-
-            if resp.status_code in (200, 201):
-                returned = resp.json()
-                new_id = returned[0]["id"] if returned else None
-                prem_str = f"${premium:,.0f}"
-                log.info(
-                    "[flow_store] flow_episode created: %s %s %s strike=%s expiry=%s "
-                    "prem=%s multi_day=%s (id=%s)",
-                    ticker, direction, contract_type, strike, expiry,
-                    prem_str, is_multi_day, new_id,
-                )
-                if new_id is not None:
-                    _set_episode_in_flight(key, new_id, 1, premium)
-                _episode_stats["created_episodes"] += 1
-            else:
-                log.warning(
-                    "[flow_store] flow_episode INSERT failed: %d -- %s "
-                    "(ticker=%s dir=%s %s $%.0f %s)",
-                    resp.status_code, resp.text[:200],
-                    ticker, direction, contract_type, strike, expiry,
-                )
-        except Exception as exc:
-            log.warning(
-                "[flow_store] flow_episode INSERT exception: %s "
-                "(ticker=%s dir=%s %s $%.0f %s)",
-                exc, ticker, direction, contract_type, strike, expiry,
-            )
+        await _insert_rows_with_episode_id(
+            "flow_episodes",
+            insert_row,
+            key,
+            premium,
+            contract_oi_at_open,
+        )
 
 
 async def _update_episode_multiday(
@@ -1198,11 +1311,52 @@ async def _bus_signal_listener() -> None:
     """
     Retained for future use. Acts as a no-op consumer of the db_writer
     channel after EPISODE-FIX moved persist_flow_episode() to _process_trade().
+
+    TEST-FIX (2026-05-10): AsyncEventBus.subscribe() returns a plain
+    asyncio.Queue — it does NOT implement the async context manager protocol.
+    Replaced `async with bus.subscribe(...) as queue` with explicit
+    bus.subscribe() / bus.unsubscribe() in a try/finally block.
     """
-    async with bus.subscribe("db_writer") as queue:
+    queue = bus.subscribe("db_writer")
+    try:
         while True:
             try:
                 await queue.get()
                 # no-op: episode persistence moved to _process_trade() (EPISODE-FIX)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 log.debug("[flow_store] _bus_signal_listener exception: %s", exc)
+    finally:
+        bus.unsubscribe("db_writer", queue)
+
+
+# ---------------------------------------------------------------------------
+# Module-level async helpers (used by tests and WebSocket consumers)
+# ---------------------------------------------------------------------------
+
+_store = FlowStore()
+
+_MAX_FLOWS_PER_TICKER = 200
+_FLOW_TTL_S = 86_400  # 24 hours
+
+
+async def add_flow(flow: dict) -> None:
+    """Add a flow event to the in-memory store."""
+    _store.add_flow(flow)
+
+
+async def get_flows(ticker: str) -> list:
+    """Return all stored flows for ticker (not expired)."""
+    now = __import__("time").time()
+    return [
+        f for f in _store.get_flows()
+        if isinstance(f, dict)
+        and f.get("ticker") == ticker
+        and (now - f.get("timestamp", now)) < _FLOW_TTL_S
+    ]
+
+
+async def clear_flows() -> None:
+    """Clear all in-memory flows."""
+    _store.clear()
