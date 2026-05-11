@@ -39,6 +39,31 @@ FIX (2026-05-08 ING-008/ING-009):
     call to the fake URL, and captured_rows stayed empty.
     Fix: patch `_insert_rows_with_episode_id` with a fake that accepts the
     5-arg signature and appends the row dict to captured_rows.
+
+FIX (REARCH-002 2026-05-10):
+  Bug F — _ingestion_processor not patched.
+    REARCH-002 wired IngestionProcessor into _process_trade(). Without patching
+    _ingestion_processor, the real processor runs gate checks against a MagicMock
+    ev. Numeric comparisons on MagicMock attributes are non-deterministic and
+    the processor returns None, dropping the tick before build_composite is
+    reached — composite stays None, then composite.score raises AttributeError.
+    Fix: patch "services.tradier_stream._ingestion_processor" with a pass-through
+    mock (process returns ev unchanged) in both process_trade tests.
+
+FIX (REARCH-002-TEST 2026-05-10):
+  Bug G — build_composite patched to return None in Test 2.
+    The LAT-1 guard (`if composite is None: return`) fires before bus.publish_all
+    is ever called, so published stays empty and the signal assertion fails.
+    Fix: patch build_composite to return a MagicMock with a real score float
+    in Test 2 (and Test 1 for consistency — None path is covered by LAT-1 tests).
+
+  Bug H — bus.publish_all side_effect only captured the first positional arg.
+    _process_trade calls `await bus.publish_all("composite_signal", {...})`.
+    `side_effect=lambda m: published.append(m)` binds only the first arg (the
+    topic string "composite_signal"), never the payload dict.
+    Fix: side_effect=lambda *a, **kw: published.append(a) captures all positional
+    args; assertion updated to inspect a[1] (the payload dict) instead of
+    looking for a "type"=="signal" key that was never in the payload.
 """
 import asyncio
 import datetime
@@ -110,6 +135,23 @@ def _make_cache_entry(prior_days_active: int):
     return entry
 
 
+def _make_mock_composite(score: float = 0.75):
+    """
+    Build a minimal composite stub with a real score float.
+    build_composite() returning None triggers the LAT-1 early-return guard;
+    returning a mock with a real score lets the bus.publish_all path complete.
+    """
+    c = MagicMock()
+    c.score = score
+    c.s1_score = 0.1
+    c.s2_score = 0.1
+    c.s3_score = 0.1
+    c.s4_score = 0.1
+    c.s5_score = 0.1
+    c.s6_score = 0.2
+    return c
+
+
 # ---------------------------------------------------------------------------
 # Test 1: cache hit / prior_days=0  ->  is_multi_day_repeat=False
 # ---------------------------------------------------------------------------
@@ -132,16 +174,22 @@ async def test_process_trade_is_multi_day_repeat_false_when_prior_days_zero():
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
+    # REARCH-002: pass-through mock so real gate logic does not run on mock ev.
+    mock_ingestion_processor = MagicMock()
+    mock_ingestion_processor.process = MagicMock(return_value=ev)
+
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
          patch("services.tradier_stream.bus") as mock_bus, \
          patch("services.tradier_stream.accumulator") as mock_acc, \
          patch("services.tradier_stream.flow_dedup") as mock_dedup, \
-         patch("services.tradier_stream.build_composite", return_value=None), \
+         patch("services.tradier_stream.build_composite", return_value=_make_mock_composite()), \
+         patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
          patch("services.tradier_stream._lbc", mock_lbc), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):
+         patch("services.tradier_stream._lbc_fresh", return_value=True), \
+         patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor):
 
         mock_bus.publish_all = AsyncMock()
         mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
@@ -191,18 +239,25 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     mock_lbc = MagicMock()
     mock_lbc.get = MagicMock(return_value=cache_entry)
 
+    # REARCH-002: pass-through mock so real gate logic does not run on mock ev.
+    mock_ingestion_processor = MagicMock()
+    mock_ingestion_processor.process = MagicMock(return_value=ev)
+
     with patch("services.tradier_stream.persist_flow_event", new=AsyncMock()), \
          patch("services.tradier_stream.persist_flow_episode", new=AsyncMock()) as mock_persist_ep, \
          patch("services.tradier_stream.enqueue_lookback") as mock_enqueue, \
          patch("services.tradier_stream.bus") as mock_bus, \
          patch("services.tradier_stream.accumulator") as mock_acc, \
          patch("services.tradier_stream.flow_dedup") as mock_dedup, \
-         patch("services.tradier_stream.build_composite", return_value=None), \
+         patch("services.tradier_stream.build_composite", return_value=_make_mock_composite()), \
+         patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
          patch("services.tradier_stream.is_directionally_aggressive", return_value=True), \
          patch("services.tradier_stream._lbc", mock_lbc), \
-         patch("services.tradier_stream._lbc_fresh", return_value=True):
+         patch("services.tradier_stream._lbc_fresh", return_value=True), \
+         patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor):
 
-        mock_bus.publish_all = AsyncMock(side_effect=lambda m: published.append(m))
+        # Bug H fix: capture all positional args — publish_all("composite_signal", {...})
+        mock_bus.publish_all = AsyncMock(side_effect=lambda *a, **kw: published.append(a))
         mock_acc.ingest_tick       = AsyncMock(return_value=sig_ep)
         mock_acc.get_signal        = AsyncMock(return_value=sig_ep)
         mock_acc.get_alert_level   = MagicMock(return_value="CONVICTION")
@@ -224,9 +279,11 @@ async def test_process_trade_is_multi_day_repeat_true_when_prior_days_positive()
     call_kwargs = mock_persist_ep.call_args[0][0]
     assert call_kwargs["is_multi_day_repeat"] is True
 
-    signal_msgs = [m for m in published if m.get("type") == "signal"]
-    assert signal_msgs, "No signal published"
-    assert signal_msgs[0]["data"]["is_multi_day_repeat"] is True
+    # published entries are (topic, payload) tuples — topic is "composite_signal"
+    signal_calls = [a for a in published if a[0] == "composite_signal"]
+    assert signal_calls, "No composite_signal published to bus"
+    payload = signal_calls[0][1]
+    assert payload["is_multi_day_repeat"] is True
 
 
 # ---------------------------------------------------------------------------

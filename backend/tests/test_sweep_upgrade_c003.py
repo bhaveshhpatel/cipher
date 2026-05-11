@@ -20,6 +20,13 @@ Test IDs:
   C003-8  regression: qualifying canonical still writes to DB correctly
 
 Run: pytest backend/tests/test_sweep_upgrade_c003.py -v
+
+Fix (C003-6/C003-8 2026-05-10): persist_flow_event dispatched via create_task,
+  never directly awaited. assert_awaited_once() always reports 0.
+  Converted C003-6 and C003-8 to use _named_coro_mock + asyncio mock pattern
+  and assert via _scheduled_coro_names (same fix as C002-PBE-BLOCKING-1).
+  Added _make_ingestion_processor helper to satisfy REARCH-002 processor
+  pass-through without crashing on MagicMock attribute access.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -78,6 +85,7 @@ def _make_ep():
     ep.trade_count = 3
     ep.total_premium = 900_000.0
     ep.is_accelerating = False
+    ep.dominant_direction = "REPEAT_BUY"
     ep.summary_str.return_value = "AAPL CALL x3"
     return ep
 
@@ -95,6 +103,50 @@ def _make_raw(occ="AAPL  260521C00200000", exchange="C"):
             "date": 1745686200000,
         },
     }
+
+
+def _make_ingestion_processor(ev):
+    """Return a mock IngestionProcessor whose .process() passes ev through.
+
+    REARCH-002: _process_trade() uses the return value of
+    _ingestion_processor.process(ev, tier=...) as the new ev. Must return
+    the real ev object so downstream attribute access works.
+    """
+    proc = MagicMock()
+    proc.process.return_value = ev
+    return proc
+
+
+def _named_coro_mock(func_name: str) -> MagicMock:
+    """
+    Return a MagicMock callable whose every call produces a coroutine with
+    __name__ == func_name.
+
+    Required so _scheduled_coro_names() can match the coroutine by name when
+    asyncio.create_task is patched (AsyncMock produces __name__='_execute_mock_call').
+    """
+    async def _coro(*_args, **_kwargs):
+        pass
+
+    _coro.__name__ = func_name
+    _coro.__qualname__ = func_name
+
+    mock = MagicMock(side_effect=_coro)
+    mock.__name__ = func_name
+    return mock
+
+
+def _scheduled_coro_names(mock_create_task: MagicMock) -> list[str]:
+    """Extract coroutine __name__ from all asyncio.create_task() calls."""
+    names = []
+    for c in mock_create_task.call_args_list:
+        coro = c.args[0] if c.args else None
+        if coro is not None:
+            name = getattr(coro, "__name__", None) or getattr(coro, "__qualname__", "")
+            names.append(name)
+            if hasattr(coro, "close"):
+                coro.close()  # suppress RuntimeWarning: coroutine never awaited
+    return names
 
 
 class TestC003BelowThreshold:
@@ -246,14 +298,22 @@ class TestC003CanonicalSweepInline:
         ev = _make_ev(trade_type="BTO")
         ep = _make_ep()
         raw = _make_raw()
+        # persist_flow_event is fire-and-forget via create_task — use
+        # _named_coro_mock so the scheduled coro has __name__=='persist_flow_event'
+        # and _scheduled_coro_names() can match it.
+        mock_persist = _named_coro_mock("persist_flow_event")
+        mock_create_task = MagicMock(return_value=MagicMock())  # MagicMock task absorbs .add_done_callback()
 
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor(ev)), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
              patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.asyncio") as mock_asyncio, \
              patch("services.tradier_stream.bus") as mock_bus:
 
+            mock_asyncio.create_task = mock_create_task
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = True
             mock_dedup.get_exchange_count.return_value = 4
@@ -265,7 +325,10 @@ class TestC003CanonicalSweepInline:
             await ts._process_trade(raw)
 
         assert ev.trade_type == "SWEEP", f"Expected ev.trade_type='SWEEP', got '{ev.trade_type}'"
-        mock_persist.assert_awaited_once()
+        scheduled = _scheduled_coro_names(mock_create_task)
+        assert "persist_flow_event" in scheduled, (
+            f"persist_flow_event not scheduled via create_task. Scheduled: {scheduled}"
+        )
 
 
 class TestC003DedupRegressionCheck:
@@ -301,14 +364,21 @@ class TestC003QualifyingCanonicalRegression:
         ev = _make_ev()
         ep = _make_ep()
         raw = _make_raw()
+        # persist_flow_event is fire-and-forget via create_task — use
+        # _named_coro_mock + asyncio mock pattern (same as C002/C003-6).
+        mock_persist = _named_coro_mock("persist_flow_event")
+        mock_create_task = MagicMock(return_value=MagicMock())  # MagicMock task absorbs .add_done_callback()
 
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", _make_ingestion_processor(ev)), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
              patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.asyncio") as mock_asyncio, \
              patch("services.tradier_stream.bus") as mock_bus:
 
+            mock_asyncio.create_task = mock_create_task
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick = AsyncMock(return_value=ep)
@@ -318,7 +388,12 @@ class TestC003QualifyingCanonicalRegression:
 
             await ts._process_trade(raw)
 
-        mock_persist.assert_awaited_once()
+        scheduled = _scheduled_coro_names(mock_create_task)
+        assert "persist_flow_event" in scheduled, (
+            f"persist_flow_event not scheduled via create_task. Scheduled: {scheduled}"
+        )
+        # Payload assertions — mock_persist records calls from _named_coro_mock side_effect.
+        assert mock_persist.called, "persist_flow_event was never called"
         args = mock_persist.call_args[0][0]
         assert args["ticker"] == "AAPL"
         assert args["trade_type"] == "BTO"

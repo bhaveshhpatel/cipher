@@ -27,12 +27,43 @@ Fix (2026-05-01): Reset module-level _signal_last_emit and _stats["ticks"] befor
   does not suppress signals in subsequent tests (C008-2, C008-4 were failing because
   the first-crossing emit-key written by C008-1/C008-3 caused _should_emit_signal to
   return should_emit=False in later tests).
+
+Fix (REARCH-002 2026-05-10): patch _ingestion_processor in all _process_trade tests.
+  With REARCH-002 wired, the real IngestionProcessor runs against the MagicMock ev;
+  its numeric gate checks (ev.dte >= min_dte, ev.open_interest >= min_oi, etc.) get
+  MagicMock values back and the processor returns None, dropping the tick before
+  persist_flow_event is ever reached. Fix: mock _ingestion_processor.process to
+  return ev (pass-through) in every test that calls _process_trade.
+
+Fix (REARCH-002 composite 2026-05-10): C008-2 and C008-4 patched build_composite
+  to return_value=None, which hits the LAT-1 'if composite is None: return' guard
+  and exits before bus.publish_all. Fix: replace None patch with a mock composite
+  object that has .score and .s1_score-.s6_score so the log line and bus.publish_all
+  can execute.
+
+Fix (PBE-BLOCKING-1 2026-05-10): persist_flow_event is fire-and-forget via
+  asyncio.create_task() — it is never directly awaited in _process_trade.
+  assert_awaited_once() always reports 0 awaits regardless of whether the
+  call fires. Fix for C008-1/2/4: patch asyncio.create_task, capture all
+  scheduled coroutine names, assert persist_flow_event coroutine was (or
+  was not) scheduled. C008-3/8 unaffected — they assert mock_persist
+  is never called at all (code returns before create_task line).
+
+Fix (PBE-CORO-NAME 2026-05-10): AsyncMock coroutines have __name__="_execute_mock_call".
+  When patch("...persist_flow_event", new_callable=AsyncMock) is used and
+  _process_trade calls persist_flow_event({...}), the coroutine handed to
+  create_task has __name__="_execute_mock_call", not "persist_flow_event".
+  _scheduled_coro_names therefore never found "persist_flow_event" in the list.
+  Fix: use _named_coro_mock(name) — a helper that creates a regular MagicMock
+  whose side_effect is an async def with the correct __name__ attribute. The
+  coroutine passed to create_task now has __name__=="persist_flow_event" exactly
+  as the assertion expects. _scheduled_coro_names is unchanged.
 """
 import asyncio
 import sys
 import os
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
@@ -109,6 +140,48 @@ def _make_ep(trade_count=3, total_premium=300_000.0):
     return ep
 
 
+def _make_composite():
+    """Mock composite object with all fields accessed by _process_trade after build_composite()."""
+    c = MagicMock()
+    c.score = 0.75
+    c.s1_score = 0.8
+    c.s2_score = 0.7
+    c.s3_score = 0.75
+    c.s4_score = 0.6
+    c.s5_score = 0.8
+    c.s6_score = 0.7
+    return c
+
+
+def _named_coro_mock(func_name: str) -> MagicMock:
+    """
+    Return a MagicMock callable whose every call produces a coroutine with
+    __name__ == func_name.
+
+    WHY THIS EXISTS (PBE-CORO-NAME):
+      AsyncMock.__call__ returns a coroutine whose __name__ is always
+      "_execute_mock_call" (the internal AsyncMock machinery).  When
+      _process_trade calls persist_flow_event({...}) and the result is handed
+      to asyncio.create_task(), _scheduled_coro_names reads coro.__name__ and
+      gets "_execute_mock_call" instead of "persist_flow_event".  The assertion
+      `"persist_flow_event" in scheduled` therefore always fails.
+
+      This helper builds a real async def with the desired __name__ and wraps it
+      in a MagicMock so callers can still use .assert_not_called() etc.  The
+      coroutine that lands in create_task now has the correct __name__ and
+      _scheduled_coro_names finds it.
+    """
+    async def _coro(*_args, **_kwargs):
+        pass
+
+    _coro.__name__ = func_name
+    _coro.__qualname__ = func_name
+
+    mock = MagicMock(side_effect=_coro)
+    mock.__name__ = func_name
+    return mock
+
+
 def _reset_stream_state():
     """Reset module-level mutable state in tradier_stream between tests.
 
@@ -124,6 +197,32 @@ def _reset_stream_state():
     ts._stats["sig_debounced"] = 0
 
 
+def _scheduled_coro_names(mock_create_task: MagicMock) -> list[str]:
+    """
+    Extract coroutine function names from all asyncio.create_task() calls.
+
+    persist_flow_event and persist_flow_episode are dispatched as
+    asyncio.create_task(coroutine) — never directly awaited (PBE-BLOCKING-1).
+    This helper inspects each call's first positional argument and returns its
+    __name__ (or __qualname__) so tests can assert which coroutines were scheduled
+    without relying on assert_awaited_once().
+
+    PBE-CORO-NAME: callers must use _named_coro_mock() (not AsyncMock) for
+    persist_flow_event so that the coroutine's __name__ is "persist_flow_event"
+    rather than AsyncMock's internal "_execute_mock_call".
+    """
+    names = []
+    for c in mock_create_task.call_args_list:
+        coro = c.args[0] if c.args else None
+        if coro is not None:
+            name = getattr(coro, "__name__", None) or getattr(coro, "__qualname__", "")
+            names.append(name)
+            # Always close the coroutine to suppress RuntimeWarning.
+            if hasattr(coro, "close"):
+                coro.close()
+    return names
+
+
 # ---------------------------------------------------------------------------
 # C008-1: qualifying tick during cooldown -> persist fires, bus does NOT
 # ---------------------------------------------------------------------------
@@ -137,21 +236,34 @@ class TestC008PersistDuringCooldown:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_create_task = MagicMock()
+        # PBE-CORO-NAME: use _named_coro_mock so the coroutine __name__ is correct.
+        mock_persist = _named_coro_mock("persist_flow_event")
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
+             patch("services.tradier_stream.asyncio") as mock_asyncio, \
              patch("services.tradier_stream.bus") as mock_bus:
 
+            mock_asyncio.create_task = mock_create_task
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
-            mock_acc.get_signal = AsyncMock(return_value=None)
+            mock_acc.get_signal = AsyncMock(return_value=None)  # cooldown: no signal
             mock_bus.publish_all = AsyncMock()
 
             await ts._process_trade(raw)
 
-        mock_persist.assert_awaited_once()
+        scheduled = _scheduled_coro_names(mock_create_task)
+        assert "persist_flow_event" in scheduled, (
+            f"persist_flow_event was not scheduled via create_task. Scheduled: {scheduled}"
+        )
         mock_bus.publish_all.assert_not_called()
 
 
@@ -168,13 +280,25 @@ class TestC008BothFireAfterCooldown:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_composite = _make_composite()
+        mock_create_task = MagicMock()
+        # PBE-CORO-NAME: use _named_coro_mock so the coroutine __name__ is correct.
+        mock_persist = _named_coro_mock("persist_flow_event")
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
+             patch("services.tradier_stream.build_composite", return_value=mock_composite), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream.asyncio") as mock_asyncio, \
              patch("services.tradier_stream.bus") as mock_bus:
 
+            mock_asyncio.create_task = mock_create_task
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
@@ -184,7 +308,10 @@ class TestC008BothFireAfterCooldown:
 
             await ts._process_trade(raw)
 
-        mock_persist.assert_awaited_once()
+        scheduled = _scheduled_coro_names(mock_create_task)
+        assert "persist_flow_event" in scheduled, (
+            f"persist_flow_event was not scheduled via create_task. Scheduled: {scheduled}"
+        )
         mock_bus.publish_all.assert_called_once()
 
 
@@ -200,15 +327,23 @@ class TestC008SubThresholdNeither:
         ev = _make_ev()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        # C008-3 asserts mock_persist.assert_not_called() — _named_coro_mock
+        # is a MagicMock so .assert_not_called() works here too.
+        mock_persist = _named_coro_mock("persist_flow_event")
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
              patch("services.tradier_stream.bus") as mock_bus:
 
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
-            mock_acc.ingest_tick = AsyncMock(return_value=None)
+            mock_acc.ingest_tick = AsyncMock(return_value=None)  # sub-threshold
             mock_acc.get_signal = AsyncMock(return_value=None)
             mock_bus.publish_all = AsyncMock()
 
@@ -231,13 +366,25 @@ class TestC008FirstCrossingBothFire:
         persist_ep = _make_ep()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_composite = _make_composite()
+        mock_create_task = MagicMock()
+        # PBE-CORO-NAME: use _named_coro_mock so the coroutine __name__ is correct.
+        mock_persist = _named_coro_mock("persist_flow_event")
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
-             patch("services.tradier_stream.build_composite", return_value=None), \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
+             patch("services.tradier_stream.build_composite", return_value=mock_composite), \
+             patch("services.tradier_stream.episode_influence_tier", return_value="T1"), \
+             patch("services.tradier_stream.asyncio") as mock_asyncio, \
              patch("services.tradier_stream.bus") as mock_bus:
 
+            mock_asyncio.create_task = mock_create_task
             mock_dedup.is_duplicate.return_value = False
             mock_dedup.is_sweep.return_value = False
             mock_acc.ingest_tick = AsyncMock(return_value=persist_ep)
@@ -247,7 +394,10 @@ class TestC008FirstCrossingBothFire:
 
             await ts._process_trade(raw)
 
-        mock_persist.assert_awaited_once()
+        scheduled = _scheduled_coro_names(mock_create_task)
+        assert "persist_flow_event" in scheduled, (
+            f"persist_flow_event was not scheduled via create_task. Scheduled: {scheduled}"
+        )
         mock_bus.publish_all.assert_called_once()
 
 
@@ -360,10 +510,16 @@ class TestC008DedupRegression:
         ev = _make_ev()
         raw = _make_raw()
 
+        mock_ingestion_processor = MagicMock()
+        mock_ingestion_processor.process = MagicMock(return_value=ev)
+
+        mock_persist = _named_coro_mock("persist_flow_event")
+
         with patch("services.tradier_stream.parse_tradier_trade", return_value=ev), \
+             patch("services.tradier_stream._ingestion_processor", mock_ingestion_processor), \
              patch("services.tradier_stream.flow_dedup") as mock_dedup, \
              patch("services.tradier_stream.accumulator") as mock_acc, \
-             patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock) as mock_persist, \
+             patch("services.tradier_stream.persist_flow_event", mock_persist), \
              patch("services.tradier_stream.asyncio.create_task"):
 
             mock_dedup.is_duplicate.return_value = True

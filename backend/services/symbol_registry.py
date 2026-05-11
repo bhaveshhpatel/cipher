@@ -27,7 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build().
+  always doing a full rebuild after the first build()`.
   Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
@@ -63,15 +63,18 @@ FIX B-ZERO-PRICE (2026-04-29): When _fetch_stock_prices() returns 0 prices,
     bypasses the ATM filter (atm_low=0, atm_high=inf) rather than returning.
     DTE gating via tier params still applies normally.
 
-FIX ING-010 (2026-05-07): Add influence_tier_int() and influence_tier_string().
-  _resolve_min_premium() in tradier_stream.py calls influence_tier_string(ticker)
-  to resolve the per-ticker flow-influence bucket (WHALE/INSTITUTIONAL/LARGE/
-  RETAIL) before looking up the gate floor in gate_config_store.
-  influence_tier_int() exposes the raw _tier_map int for callers that need
-  the numeric key directly (e.g. gate_config_store.get("min_premium", tier_int)).
-  Both methods fall back to the most conservative value (3 / "RETAIL") when
-  the ticker is absent from _tier_map, matching the T3 defaults in
-  gate_config_store and the _DEFAULT_TIER_INT constant in tradier_stream.
+FIX ING-010 (2026-05-07): Add influence_tier_int() as the sole tier accessor.
+  _resolve_min_premium() in tradier_stream.py calls influence_tier_int(ticker)
+  directly to get the integer tier (1/2/3) and passes it straight to
+  gate_config_store.get("min_premium", tier_int). No string intermediary.
+  Fallback: 3 (most conservative / T3 defaults) for unknown tickers.
+
+  NOTE: The former influence_tier_string() method and _INT_TIER_TO_STRING dict
+  have been removed (ING-012). The int→string→int round-trip they introduced
+  was pure overhead — influence_tier_int() already returns the int directly.
+  episode_influence_tier() in composite_signal_engine.py is a separate,
+  orthogonal function that classifies episode premium size (WHALE/INSTITUTIONAL/
+  LARGE/RETAIL) and is unrelated to symbol tier; it is untouched.
 
 ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
   self.epoch: int is initialised to 0 in __init__ and incremented inside the
@@ -85,6 +88,31 @@ ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
   load_from_db() does NOT increment epoch — only build() does, so callers
   can rely on epoch > 0 as a "fully built from Tradier" signal (same
   semantics as _build_complete).
+
+FIX QQ1-A (2026-05-09): Use real tier_params on cold-start build — remove
+  bootstrap_params.
+  bootstrap_params collapsed all tiers to T3 params ({1: T3, 2: T3, 3: T3})
+  during the first build(), meaning T1 tickers (NVDA, AAPL, TSLA etc.) had
+  their chains fetched using T3's narrow atm_pct=0.10 / max_dte=30 instead
+  of T1's atm_pct=0.20 / max_dte=90. Any institutional contract outside
+  that window (e.g. 45-DTE NVDA CALL at 115% moneyness) was silently absent
+  from the registry. At stream time, lookup() returned None for these OCC
+  symbols and the trade was dropped before accumulator, persist, and signal.
+  Fix: pass tier_params directly to _build_ticker() on every call, including
+  cold-start. The OI gate is already independently controlled per-tier via
+  params.min_oi (baked into _build_tier_params from global_min_oi + thresh
+  t{n}_min_oi). bootstrap_params variable removed entirely.
+  SA/PBE impact: T1 institutional prints on contracts outside the former T3
+  window now register and flow through accumulator + persist from epoch 1.
+
+FIX QQ1-B (2026-05-09): Round OI average instead of integer floor division.
+  _build_ticker() and load_from_db() both used `total_oi // count` (integer
+  floor division) to compute the per-ticker average OI written to
+  _oi_by_ticker. For borderline tickers whose true average sits just above
+  t1_min_oi=1000 or t2_min_oi=500, truncation silently mis-classified them
+  one tier lower (T2 instead of T1, or T3 instead of T2), applying a higher
+  min_premium gate floor to all their flow events.
+  Fix: round(total_oi / count) in both sites.
 """
 import asyncio
 import logging
@@ -103,24 +131,6 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 log = logging.getLogger("symbol_registry")
 
 _DEFAULT_BUILD_CONCURRENCY = 50
-
-# ---------------------------------------------------------------------------
-# ING-010: int tier -> influence string mapping.
-# Kept at module level so tests can import and assert against it directly
-# without needing a live SymbolRegistry instance.
-#
-# T1 maps to "INSTITUTIONAL" (not "WHALE") because SymbolRegistry tier
-# assignment via assign_tiers() produces ints 1/2/3 and has no separate
-# "WHALE" bucket at the registry level. tradier_stream._INFLUENCE_TIER_TO_INT
-# maps both "WHALE" and "INSTITUTIONAL" to T1, so either label resolves
-# to the same gate floor. "INSTITUTIONAL" is chosen as the canonical T1
-# label to avoid confusion about what the registry actually knows.
-# ---------------------------------------------------------------------------
-_INT_TIER_TO_STRING: dict[int, str] = {
-    1: "INSTITUTIONAL",
-    2: "LARGE",
-    3: "RETAIL",
-}
 
 
 @dataclass
@@ -228,44 +238,27 @@ class SymbolRegistry:
         return dict(self._oi_by_ticker)
 
     # -----------------------------------------------------------------------
-    # ING-010: Tier accessors used by _resolve_min_premium() in
+    # ING-010: Tier accessor used by _resolve_min_premium() in
     # tradier_stream.py to resolve the per-ticker gate floor.
+    #
+    # influence_tier_int() is the sole accessor — returns the int tier
+    # directly so callers can pass it straight to
+    # gate_config_store.get("min_premium", tier_int) with no string hop.
     # -----------------------------------------------------------------------
 
     def influence_tier_int(self, ticker: str) -> int:
         """
         Return the integer tier (1/2/3) for ticker from _tier_map.
 
-        Fallback: 3 (RETAIL / most conservative floor) for any ticker not
-        present in the map. This matches _DEFAULT_TIER_INT in tradier_stream
-        and the T3 defaults seeded into gate_config_store.
+        Fallback: 3 (most conservative / T3 defaults) for any ticker not
+        present in the map. This matches the fallback constant formerly
+        named _DEFAULT_TIER_INT in tradier_stream and the T3 defaults
+        seeded into gate_config_store.
 
         Thread-safe for reads: _tier_map is replaced atomically at the end of
         build() inside the build lock; dict.get() is safe under the GIL.
         """
         return self._tier_map.get(ticker, 3)
-
-    def influence_tier_string(self, ticker: str) -> str:
-        """
-        Return the human-readable influence tier label for ticker.
-
-        Resolution: _tier_map int -> _INT_TIER_TO_STRING.
-
-        Return values: "INSTITUTIONAL" | "LARGE" | "RETAIL"
-        Fallback:      "RETAIL" for unknown tickers or unexpected int values.
-
-        Used by _resolve_min_premium() in tradier_stream.py:
-          tier_str = reg.influence_tier_string(ticker)  # e.g. "INSTITUTIONAL"
-          tier_int = _INFLUENCE_TIER_TO_INT.get(tier_str, 3)  # -> 1
-          floor    = gate_config_store.get("min_premium", tier_int)  # -> 5_000
-
-        Note: tradier_stream._INFLUENCE_TIER_TO_INT also maps "WHALE" -> 1.
-        The registry has no separate WHALE bucket (assign_tiers produces
-        1/2/3 only), so "INSTITUTIONAL" is the canonical T1 string here.
-        Both map to the same gate floor via tradier_stream's dict.
-        """
-        tier_int = self._tier_map.get(ticker, 3)
-        return _INT_TIER_TO_STRING.get(tier_int, "RETAIL")
 
     async def load_from_db(self, snapshot_id: str) -> int:
         chain = await load_chain(snapshot_id)
@@ -288,8 +281,10 @@ class SymbolRegistry:
         oi_acc: dict[str, list[int]] = {}
         for meta in chain.values():
             oi_acc.setdefault(meta.ticker, []).append(meta.open_interest)
+        # QQ1-B: use round() instead of floor division so borderline tickers
+        # are not silently mis-classified one tier lower.
         self._oi_by_ticker = {
-            t: int(sum(v) / len(v)) for t, v in oi_acc.items() if v
+            t: round(sum(v) / len(v)) for t, v in oi_acc.items() if v
         }
         log.info(
             "[symbol_registry] load_from_db: seeded %d OCC contracts from DB "
@@ -337,12 +332,24 @@ class SymbolRegistry:
           self._build_complete = True. Epoch is never incremented by
           load_from_db() — only by build(). epoch == 0 means "not yet
           built from Tradier"; epoch >= 1 means "build generation N".
+
+        QQ1-A - real tier_params on cold-start (bootstrap_params removed):
+          _build_ticker() now always receives the real tier_params dict
+          (T1/T2/T3 keyed by their actual thresholds). The former
+          bootstrap_params that collapsed all tiers to T3 params has been
+          removed. T1 tickers now get atm_pct=0.20 / max_dte=90 from the
+          first build epoch, preventing silent contract-universe gaps that
+          caused institutional flow on >30-DTE or >±10% ATM contracts to
+          be dropped at stream time (lookup() → None).
         """
         from services.symbols_loader import SymbolQuote
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
-        tier_params      = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
-        bootstrap_params = {1: tier_params[3], 2: tier_params[3], 3: tier_params[3]}
+        # QQ1-A: real per-tier params used from the first build.
+        # bootstrap_params ({1: T3, 2: T3, 3: T3}) removed — it caused T1
+        # tickers to be fetched with T3's narrow atm/DTE window on cold start,
+        # silently dropping institutional contracts outside that window.
+        tier_params = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
 
         build_concurrency = int(cfg.get("REGISTRY_BUILD_CONCURRENCY", _DEFAULT_BUILD_CONCURRENCY))
         sem = asyncio.Semaphore(build_concurrency)
@@ -418,7 +425,7 @@ class SymbolRegistry:
                             ticker_price,
                             new_registry,
                             new_oi_by_ticker,
-                            bootstrap_params,
+                            tier_params,
                             zero_price_fallback=zero_price_fallback,
                         )
 
@@ -604,6 +611,12 @@ class SymbolRegistry:
             (atm_low=0, atm_high=inf). DTE gating still applies.
             Log WARNING and continue; do NOT skip.
           - zero_price_fallback=False -> skip as before (regression guard).
+
+        QQ1-A: tier_params now always carries real per-tier thresholds
+          (T1: atm_pct=0.20/max_dte=90, T2: 0.15/60, T3: 0.10/30).
+          The former bootstrap_params collapse to T3 for all tiers has
+          been removed in build(). _build_ticker() is unchanged here —
+          it always read tier_params[tier]; the fix is in the caller.
         """
         if stock_price <= 0:
             if zero_price_fallback:
@@ -691,7 +704,9 @@ class SymbolRegistry:
         )
         count = sum(1 for m in registry.values() if m.ticker == ticker)
         if count > 0:
-            oi_by_ticker[ticker] = total_oi // count
+            # QQ1-B: round() instead of floor division so borderline tickers
+            # are not silently mis-classified one tier lower by truncation.
+            oi_by_ticker[ticker] = round(total_oi / count)
 
 
 # ---------------------------------------------------------------------------
