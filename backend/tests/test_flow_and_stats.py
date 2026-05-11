@@ -107,8 +107,11 @@ def test_reset_episode_state_is_idempotent():
 # ---------------------------------------------------------------------------
 # _classify_bid_ask
 #
-# Boundary spec (REARCH-003): fill >= ask * 0.98 → ASK; fill <= bid * 1.02 → BID.
-# Mid test must use a fill clearly inside mid territory, NOT on the boundary.
+# Boundary spec (REARCH-003): fill >= ask * 0.98 → ASK (boundary inclusive);
+# fill <= bid * 1.02 → BID.
+# Mid test must use a fill strictly inside mid territory:
+#   bid * 1.02 = 4.896  |  ask * 0.98 = 4.900
+#   fill = 4.897 is strictly between both thresholds → MID
 # ---------------------------------------------------------------------------
 
 def test_classify_bid_ask_ask_side():
@@ -124,9 +127,10 @@ def test_classify_bid_ask_bid_side():
 
 
 def test_classify_bid_ask_mid():
-    # 4.80 * 1.02 = 4.896  |  5.00 * 0.98 = 4.90
-    # fill=4.92 is strictly between both thresholds → MID
-    cls, is_ask = fs._classify_bid_ask(4.92, 4.80, 5.00)
+    # bid=4.80, ask=5.00
+    # bid * 1.02 = 4.896  |  ask * 0.98 = 4.900
+    # fill=4.897 is strictly between both thresholds → MID
+    cls, is_ask = fs._classify_bid_ask(4.897, 4.80, 5.00)
     assert cls == "MID"
     assert is_ask is False
 
