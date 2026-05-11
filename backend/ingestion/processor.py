@@ -28,6 +28,7 @@ Public API:
   IngestionConfig                     frozen dataclass — immutable config snapshot
   IngestionProcessor                  main class
   IngestionProcessor.process(ev, tier=None)      Optional[OptionsFlowEvent]
+  IngestionProcessor.enrich_tags(ev_dict)        dict  (REARCH-003)
   get_ingestion_config()              -> IngestionConfig  (cached, TTL=30 s)
   invalidate_ingestion_config_cache() -> None             (admin PATCH side-effect)
 
@@ -43,6 +44,28 @@ Fix (REARCH-010 2026-05-10): resolve influence_tier removal in _apply_gates.
   takes precedence over any residual ev.influence_tier attribute.
   tradier_stream.py passes _ev_tier_int (resolved pre-parse from registry) so
   the correct per-ticker floor is enforced.
+
+REARCH-003 (2026-05-10): enrich_tags() static method.
+  Computes three new dimensional fields on the flow_events row:
+
+    dte_bucket       TEXT    — DTE bracket for downstream aggregation
+    notional_tier    TEXT    — premium size bucket (WATCH/NOTEWORTHY/BLOCK/GOLDEN)
+    event_cipher_score SMALLINT — sum of 4 binary Steamroom dimensions (0–4)
+
+  Dimensions scored (1 point each):
+    Dim 1 — is_ask_side  (fill >= ask * 0.98)
+    Dim 2 — vol_oi_signal == 'HIGH'  (volume / OI >= 0.5)
+    Dim 3 — notional_tier in ('BLOCK', 'GOLDEN')  (premium >= $50k)
+    Dim 4 — dte_bucket in ('1-4', '5-60')  (near-term expiry)
+
+  Dim 5 (multi-day repeat conviction) is REARCH-004 scope.
+  Score is intentionally capped at 4 here; REARCH-004 will extend to 5.
+
+  enrich_tags() is a static method so it can be called without an
+  IngestionProcessor instance and is trivially testable without the gate
+  machinery. It is called from flow_store.persist_flow_event() after
+  ING-008 vol/OI resolution — not from process() — so it always has
+  contract_volume_snapshot and contract_oi available in the ev_dict.
 """
 from __future__ import annotations
 
@@ -64,6 +87,23 @@ _CACHE_TTL_SECONDS: float = 30.0
 _TIER_T1 = "INSTITUTIONAL"
 _TIER_T2 = "LARGE"
 _TIER_T3 = "RETAIL"
+
+# ---------------------------------------------------------------------------
+# REARCH-003: enrich_tags() constants
+# ---------------------------------------------------------------------------
+
+# notional_tier premium thresholds (inclusive lower bound)
+_NOTIONAL_GOLDEN:     int = 500_000   # $500k+
+_NOTIONAL_BLOCK:      int = 100_000   # $100k–$499k
+_NOTIONAL_NOTEWORTHY: int = 50_000    # $50k–$99k
+# < $50k → WATCH
+
+# DTE bucket boundaries
+_DTE_0DTE_MAX:    int = 0    # 0DTE  (0–0)
+_DTE_NEAR_MAX:    int = 4    # 1-4
+_DTE_MID_MAX:     int = 60   # 5-60
+_DTE_FAR_MAX:     int = 90   # 61-90
+# > 90 → 90+
 
 # ---------------------------------------------------------------------------
 # Tier int -> string conversion (REARCH-010 fix)
@@ -235,6 +275,85 @@ def _premium_floor(cfg: IngestionConfig, tier: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# REARCH-003: enrich_tags helpers (module-level, pure)
+# ---------------------------------------------------------------------------
+
+def _compute_dte_bucket(dte: Optional[int]) -> str:
+    """
+    Map a DTE integer to its Steamroom bracket string.
+
+      0        → '0DTE'
+      1–4      → '1-4'
+      5–60     → '5-60'
+      61–90    → '61-90'
+      91+      → '90+'
+      None/neg → '90+'  (conservative — no near-term signal)
+    """
+    if dte is None or dte < 0:
+        return "90+"
+    if dte == 0:
+        return "0DTE"
+    if dte <= _DTE_NEAR_MAX:
+        return "1-4"
+    if dte <= _DTE_MID_MAX:
+        return "5-60"
+    if dte <= _DTE_FAR_MAX:
+        return "61-90"
+    return "90+"
+
+
+def _compute_notional_tier(premium: Optional[float]) -> str:
+    """
+    Map premium to its Steamroom notional tier.
+
+      >= $500k → 'GOLDEN'
+      >= $100k → 'BLOCK'
+      >= $50k  → 'NOTEWORTHY'
+      < $50k   → 'WATCH'
+      None/0   → 'WATCH'
+    """
+    p = premium or 0.0
+    if p >= _NOTIONAL_GOLDEN:
+        return "GOLDEN"
+    if p >= _NOTIONAL_BLOCK:
+        return "BLOCK"
+    if p >= _NOTIONAL_NOTEWORTHY:
+        return "NOTEWORTHY"
+    return "WATCH"
+
+
+def _compute_cipher_score(
+    is_ask_side: bool,
+    vol_oi_signal: str,
+    notional_tier: str,
+    dte_bucket: str,
+) -> int:
+    """
+    REARCH-003: Compute event_cipher_score as the sum of 4 binary Steamroom
+    dimensions.  Range: 0–4.  Dim 5 (multi-day repeat) is REARCH-004 scope.
+
+    Dim 1 — ask-side aggression  : is_ask_side == True
+    Dim 2 — vol/OI conviction    : vol_oi_signal == 'HIGH'
+    Dim 3 — notional size        : notional_tier in ('BLOCK', 'GOLDEN')
+    Dim 4 — near-term expiry     : dte_bucket in ('1-4', '5-60')
+
+    None-safety: all inputs are coerced to their zero-score default if
+    None is passed (False for bool, 'UNKNOWN'/'WATCH'/'90+' for strings).
+    Score arithmetic never raises.
+    """
+    score = 0
+    if is_ask_side:
+        score += 1
+    if (vol_oi_signal or "UNKNOWN") == "HIGH":
+        score += 1
+    if (notional_tier or "WATCH") in ("BLOCK", "GOLDEN"):
+        score += 1
+    if (dte_bucket or "90+") in ("1-4", "5-60"):
+        score += 1
+    return score
+
+
+# ---------------------------------------------------------------------------
 # IngestionProcessor
 # ---------------------------------------------------------------------------
 
@@ -260,10 +379,15 @@ class IngestionProcessor:
     REARCH-010: process() and process_with_config() accept an optional `tier`
     int (1/2/3) to replace the now-removed ev.influence_tier attribute.  When
     supplied, `tier` takes precedence over any residual ev.influence_tier.
+
+    REARCH-003: enrich_tags() is a static method that computes dte_bucket,
+    notional_tier, and event_cipher_score from an ev_dict that already
+    contains is_ask_side, vol_oi_signal, premium, and dte.  It is called
+    from flow_store.persist_flow_event() after ING-008 vol/OI resolution.
     """
 
     # ------------------------------------------------------------------
-    # Public
+    # Public — gate
     # ------------------------------------------------------------------
 
     def process(self, ev: object, tier: Optional[int] = None) -> Optional[object]:
@@ -296,6 +420,49 @@ class IngestionProcessor:
         tier: optional int — same semantics as process().
         """
         return self._apply_gates(ev, cfg, tier=tier)
+
+    # ------------------------------------------------------------------
+    # Public — REARCH-003 enrichment
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def enrich_tags(ev_dict: dict) -> dict:
+        """
+        REARCH-003: Compute and inject dte_bucket, notional_tier, and
+        event_cipher_score into ev_dict in-place, then return it.
+
+        Reads from ev_dict (all must already be present from prior steps):
+          dte              int    — from parsed event
+          premium          float  — from parsed event
+          is_ask_side      bool   — set by flow_store._classify_bid_ask()
+          vol_oi_signal    str    — set by flow_store._compute_vol_oi_signal()
+
+        Writes into ev_dict:
+          dte_bucket           TEXT      — '0DTE'|'1-4'|'5-60'|'61-90'|'90+'
+          notional_tier        TEXT      — 'WATCH'|'NOTEWORTHY'|'BLOCK'|'GOLDEN'
+          event_cipher_score   SMALLINT  — 0–4 (Dim 5 added in REARCH-004)
+
+        None-safety: missing keys default to zero-score values.  Never raises.
+        Returns the same dict object (mutated in place) for call-site brevity.
+        """
+        dte           = ev_dict.get("dte")
+        premium       = ev_dict.get("premium")
+        is_ask_side   = ev_dict.get("is_ask_side", False)
+        vol_oi_signal = ev_dict.get("vol_oi_signal", "UNKNOWN")
+
+        dte_bucket    = _compute_dte_bucket(dte)
+        notional_tier = _compute_notional_tier(premium)
+        cipher_score  = _compute_cipher_score(
+            is_ask_side   = is_ask_side,
+            vol_oi_signal = vol_oi_signal,
+            notional_tier = notional_tier,
+            dte_bucket    = dte_bucket,
+        )
+
+        ev_dict["dte_bucket"]          = dte_bucket
+        ev_dict["notional_tier"]       = notional_tier
+        ev_dict["event_cipher_score"]  = cipher_score
+        return ev_dict
 
     # ------------------------------------------------------------------
     # Internal
