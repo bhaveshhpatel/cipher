@@ -97,10 +97,13 @@ Bug fixes applied:
           — computed by module-level pure helpers (_classify_bid_ask,
             _compute_vol_oi_signal, _compute_normalized_premium).
         dte_bucket, notional_tier, event_cipher_score
-          — computed by IngestionProcessor.enrich_tags() (REARCH-003 static
-            method on processor.py), called after the tag block above.
-      All seven fields are derived from values already in ev_dict or
-      contract vol/OI cache — zero new I/O, zero new blocking calls.
+          — computed by IngestionProcessor.enrich_tags() (static method,
+            processor.py), called after the tag block above.
+            enrich_tags() reads is_ask_side/vol_oi_signal already in the row
+            dict. Local import avoids circular dependency.
+            Failure is non-fatal — NULLs written, same policy as ING-008.
+      All seven fields are derived from values already in ev_dict or the
+      chain_store vol/OI cache — zero new I/O, zero new blocking calls.
       Migrations 026 (ADD COLUMN) and 027 (backfill) accompany this change.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
@@ -224,13 +227,15 @@ REARCH-003 event quality tag semantics:
 
   flow_events.notional_tier
     Premium size bucket: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
-    Thresholds: WATCH <$50k, NOTEWORTHY $50k-$99k, BLOCK $100k-$499k, GOLDEN $500k+
+    Thresholds: WATCH <$50k, NOTEWORTHY $50k–$99k, BLOCK $100k–$499k, GOLDEN $500k+
     Computed by IngestionProcessor.enrich_tags() via _compute_notional_tier().
 
   flow_events.event_cipher_score
     Sum of 4 binary Steamroom dimensions (0–4). Dim 5 is REARCH-004 scope.
-    Dim 1: is_ask_side, Dim 2: vol_oi_signal=='HIGH',
-    Dim 3: notional_tier in ('BLOCK','GOLDEN'), Dim 4: dte_bucket in ('1-4','5-60')
+    Dim 1: is_ask_side
+    Dim 2: vol_oi_signal == 'HIGH'
+    Dim 3: notional_tier in ('BLOCK', 'GOLDEN')
+    Dim 4: dte_bucket in ('1-4', '5-60')
     Computed by IngestionProcessor.enrich_tags() via _compute_cipher_score().
     None inputs treated as zero-score defaults — never raises.
 """
@@ -540,8 +545,8 @@ async def persist_flow_event(ev_dict: dict):
             pass  # enrichment failure is non-fatal
 
     # -----------------------------------------------------------------------
-    # REARCH-003: compute event quality tags from already-available fields.
-    # All helpers are pure functions — zero I/O.
+    # REARCH-003 tag group 1: bid/ask classification, vol/OI signal,
+    # normalized premium. All pure helpers — zero I/O.
     # -----------------------------------------------------------------------
     fill_price       = ev_dict.get("fill_price", 0.0)
     bid              = ev_dict.get("bid", 0.0)
@@ -579,23 +584,27 @@ async def persist_flow_event(ev_dict: dict):
         # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
-        # REARCH-003: event quality tags (group 1 — bid/ask + vol/OI + normalised premium)
+        # REARCH-003: tag group 1
         "is_ask_side":              is_ask_side,
         "vol_oi_signal":            vol_oi_signal,
         "normalized_premium":       normalized_premium,
     }
 
     # -----------------------------------------------------------------------
-    # REARCH-003: inject dte_bucket, notional_tier, event_cipher_score.
-    # enrich_tags() reads is_ask_side and vol_oi_signal already in `row`,
-    # plus dte and premium — mutates row in place and returns it.
+    # REARCH-003 tag group 2: dte_bucket, notional_tier, event_cipher_score.
+    # enrich_tags() reads dte, premium, is_ask_side, vol_oi_signal from row
+    # (all already set above), mutates row in place, and returns it.
     # Local import avoids circular: flow_store ← processor ← supabase_client.
+    # Failure is non-fatal — same enrichment policy as ING-008 vol/OI.
     # -----------------------------------------------------------------------
     try:
         from ingestion.processor import IngestionProcessor
         IngestionProcessor.enrich_tags(row)
-    except Exception as exc:  # enrichment failure is non-fatal — same policy as ING-008
-        log.warning("[flow_store] enrich_tags failed — dte_bucket/notional_tier/cipher_score NULL: %s", exc)
+    except Exception as exc:
+        log.warning(
+            "[flow_store] enrich_tags failed — dte_bucket/notional_tier/cipher_score NULL: %s",
+            exc,
+        )
         row.setdefault("dte_bucket",         None)
         row.setdefault("notional_tier",      None)
         row.setdefault("event_cipher_score", None)
@@ -803,3 +812,370 @@ def _compute_vol_oi_ratio(
     if volume is None or oi is None or oi == 0:
         return None
     return round(volume / oi, 4)
+
+
+async def persist_flow_episode(signal_data: dict):
+    """
+    ING-009: Upsert one episode into flow_episodes.
+
+    On first qualifying print for a contract within the session window:
+      INSERT a new episode row. Increments _episode_stats["created_episodes"].
+
+    On subsequent qualifying print for an open episode within
+    _EPISODE_MERGE_WINDOW_S:
+      PATCH the existing row:
+        trade_count  += 1
+        total_premium += new premium
+        signal_ts     = new timestamp
+      Increments _episode_stats["merged_episodes"].
+
+    ING-009-RACE: serialised per-contract via _get_episode_lock(key).
+    _episode_in_flight cache allows the second concurrent waiter to PATCH
+    without a DB round-trip after the first waiter's INSERT commits.
+
+    ING-008: vol/OI captured at INSERT (contract_oi_at_open) and PATCH
+    (contract_volume_at_close + volume_oi_ratio).
+    """
+    if not _is_configured():
+        return
+
+    ticker        = signal_data.get("ticker", "UNKNOWN")
+    direction     = signal_data.get("direction", "UNKNOWN")
+    contract_type = signal_data.get("contract_type", "UNKNOWN")
+    strike        = signal_data.get("strike", 0.0)
+    expiry        = signal_data.get("expiry", "")
+    premium       = signal_data.get("premium", 0.0)
+    signal_ts     = signal_data.get("signal_ts") or datetime.now(timezone.utc).isoformat()
+    is_multi_day  = signal_data.get("is_multi_day_repeat", False)
+    occ_symbol    = signal_data.get("occ_symbol")
+
+    # ING-008: vol/OI at episode open
+    contract_oi_at_open: Optional[int] = None
+    if occ_symbol:
+        try:
+            from services.chain_store import get_contract_vol_oi
+            _, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
+        except Exception:
+            pass
+
+    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
+    lock = _get_episode_lock(key)
+
+    async with lock:
+        # --- Check in-flight cache first (avoids DB round-trip on race) ---
+        in_flight = _episode_in_flight.get(key)
+        if in_flight:
+            new_trade_count  = in_flight["trade_count"] + 1
+            new_total_prem   = in_flight["total_premium"] + premium
+            row_id           = in_flight["id"]
+
+            # ING-008: vol/OI at close (latest available)
+            contract_volume_at_close: Optional[int] = None
+            volume_oi_ratio: Optional[float] = None
+            if occ_symbol:
+                try:
+                    from services.chain_store import get_contract_vol_oi
+                    contract_volume_at_close, oi_snap = get_contract_vol_oi(occ_symbol)
+                    volume_oi_ratio = _compute_vol_oi_ratio(contract_volume_at_close, contract_oi_at_open)
+                except Exception:
+                    pass
+
+            ok = await _patch_episode(
+                row_id=row_id,
+                trade_count=new_trade_count,
+                total_premium=new_total_prem,
+                new_ts=signal_ts,
+                ticker=ticker,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                contract_volume_at_close=contract_volume_at_close,
+                volume_oi_ratio=volume_oi_ratio,
+            )
+            if ok:
+                _set_episode_in_flight(key, row_id, new_trade_count, new_total_prem)
+                _episode_stats["merged_episodes"] += 1
+            return
+
+        # --- No in-flight entry: check DB ---
+        existing = await _lookup_open_episode(ticker, direction, contract_type, strike, expiry)
+
+        if existing:
+            row_id           = existing["id"]
+            new_trade_count  = existing["trade_count"] + 1
+            new_total_prem   = existing["total_premium"] + premium
+
+            contract_volume_at_close: Optional[int] = None
+            volume_oi_ratio: Optional[float] = None
+            if occ_symbol:
+                try:
+                    from services.chain_store import get_contract_vol_oi
+                    contract_volume_at_close, _ = get_contract_vol_oi(occ_symbol)
+                    oi_open = existing.get("contract_oi_at_open")
+                    volume_oi_ratio = _compute_vol_oi_ratio(contract_volume_at_close, oi_open)
+                except Exception:
+                    pass
+
+            ok = await _patch_episode(
+                row_id=row_id,
+                trade_count=new_trade_count,
+                total_premium=new_total_prem,
+                new_ts=signal_ts,
+                ticker=ticker,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                contract_volume_at_close=contract_volume_at_close,
+                volume_oi_ratio=volume_oi_ratio,
+            )
+            if ok:
+                _set_episode_in_flight(key, row_id, new_trade_count, new_total_prem)
+                _episode_stats["merged_episodes"] += 1
+            return
+
+        # --- No existing episode: INSERT ---
+        insert_row: dict = {
+            "ticker":           ticker,
+            "direction":        direction,
+            "contract_type":    contract_type,
+            "strike":           strike,
+            "expiry":           expiry,
+            "total_premium":    premium,
+            "trade_count":      1,
+            "signal_ts":        signal_ts,
+            "is_multi_day_repeat": is_multi_day,
+        }
+        if contract_oi_at_open is not None:
+            insert_row["contract_oi_at_open"] = contract_oi_at_open
+        if occ_symbol:
+            insert_row["occ_symbol"] = occ_symbol
+
+        insert_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+        insert_headers = {
+            "apikey":        _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=representation",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(insert_url, headers=insert_headers, json=insert_row)
+
+            if resp.status_code in (200, 201):
+                returned = resp.json()
+                new_id = returned[0]["id"] if returned else None
+                prem_str = f"${premium:,.0f}"
+                log.info(
+                    "[flow_store] flow_episode created: %s %s %s strike=%s expiry=%s "
+                    "prem=%s multi_day=%s (id=%s)",
+                    ticker, direction, contract_type, strike, expiry,
+                    prem_str, is_multi_day, new_id,
+                )
+                if new_id is not None:
+                    _set_episode_in_flight(key, new_id, 1, premium)
+                _episode_stats["created_episodes"] += 1
+            else:
+                log.warning(
+                    "[flow_store] flow_episode INSERT failed: %d -- %s "
+                    "(ticker=%s dir=%s %s $%.0f %s)",
+                    resp.status_code, resp.text[:200],
+                    ticker, direction, contract_type, strike, expiry,
+                )
+        except Exception as exc:
+            log.warning(
+                "[flow_store] flow_episode INSERT exception: %s "
+                "(ticker=%s dir=%s %s $%.0f %s)",
+                exc, ticker, direction, contract_type, strike, expiry,
+            )
+
+
+async def _update_episode_multiday(
+    ticker: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+    is_multi_day_repeat: bool,
+) -> None:
+    """
+    ING-007: Two-step GET+PATCH to set is_multi_day_repeat on the most
+    recent flow_episodes row for a contract (PBE-F2 fix).
+
+    Step 1: GET the bigserial id of the target row (order=signal_ts.desc, limit=1).
+    Step 2: PATCH that specific row by id.
+
+    Logs at INFO on GET-returns-empty (SA-F3) so cold-miss rate is observable.
+    """
+    if not _is_configured():
+        return
+
+    get_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Accept":        "application/json",
+    }
+    get_url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+        f"?ticker=eq.{quote(ticker)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+        f"&order=signal_ts.desc"
+        f"&limit=1"
+        f"&select=id"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            get_resp = await client.get(get_url, headers=get_headers)
+
+        if get_resp.status_code != 200:
+            log.warning(
+                "[flow_store] _update_episode_multiday GET failed: %d -- %s "
+                "(ticker=%s %s $%.0f %s)",
+                get_resp.status_code, get_resp.text[:200],
+                ticker, contract_type, strike, expiry,
+            )
+            return
+
+        rows = get_resp.json()
+        if not rows:
+            log.info(  # SA-F3: elevated from DEBUG so cold-miss is observable in Railway
+                "[flow_store] _update_episode_multiday: no episode row found "
+                "(ticker=%s %s $%.0f %s) — skipping multiday patch",
+                ticker, contract_type, strike, expiry,
+            )
+            return
+
+        row_id = rows[0]["id"]
+
+        patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
+        patch_headers = {
+            "apikey":        _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=minimal",
+        }
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            patch_resp = await client.patch(
+                patch_url,
+                headers=patch_headers,
+                json={"is_multi_day_repeat": is_multi_day_repeat},
+            )
+
+        if patch_resp.status_code in (200, 204):
+            log.info(
+                "[flow_store] flow_episode multiday updated: %s %s $%.0f %s → %s (id=%d)",
+                ticker, contract_type, strike, expiry, is_multi_day_repeat, row_id,
+            )
+        else:
+            log.warning(
+                "[flow_store] flow_episode multiday PATCH failed: %d -- %s (id=%d)",
+                patch_resp.status_code, patch_resp.text[:200], row_id,
+            )
+
+    except Exception as exc:
+        log.warning(
+            "[flow_store] _update_episode_multiday exception: %s "
+            "(ticker=%s %s $%.0f %s)",
+            exc, ticker, contract_type, strike, expiry,
+        )
+
+
+async def start_lookback_worker(accumulator=None) -> None:
+    """
+    ING-007: Background worker that drains _lookback_queue and patches
+    flow_episodes rows with is_multi_day_repeat.
+
+    Each item dequeued is a ContractKey = (ticker, contract_type, strike, expiry).
+    The worker fetches the lookback result from contract_day_cache, applies a
+    quality filter (min_premium from accumulator DTE tiers), then calls
+    _update_episode_multiday() on the most recent episode row for that contract.
+
+    SA-F1 fix: correct attr name (_dte_tiers, not _dte_premium_tiers) and
+    correct traversal for List[Tuple[int, Dict[int, float]]].
+
+    PBE-F5 fix: log the resolved min_premium per key at DEBUG.
+    """
+    log.info("[lookback_worker] starting")
+
+    # SA-F1: correct attr name + correct traversal
+    dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+    try:
+        min_premium: float = min(
+            floor
+            for _, floors in dte_tiers
+            for floor in floors.values()
+        )
+    except (ValueError, TypeError):
+        min_premium = 10_000.0  # hardcoded floor when accumulator has no tiers
+
+    while True:
+        try:
+            key = await _lookback_queue.get()
+            ticker, contract_type, strike, expiry = key
+
+            # PBE-F5: log resolved floor so Railway surfaces which tier applies
+            log.debug(
+                "[lookback_worker] processing %s %s $%.0f %s (min_premium=%.0f)",
+                ticker, contract_type, strike, expiry, min_premium,
+            )
+
+            # Fetch from contract_day_cache (populated by lookback RPC)
+            try:
+                from services.contract_day_cache import get_contract_prior_days
+                result = get_contract_prior_days(ticker, contract_type, strike, expiry)
+            except Exception as exc:
+                log.debug("[lookback_worker] cache miss for %s: %s", key, exc)
+                _lookback_queue.task_done()
+                continue
+
+            if result is None:
+                _lookback_queue.task_done()
+                continue
+
+            prior_days, total_prem = result
+            is_repeat = prior_days > 0 and total_prem >= min_premium
+
+            await _update_episode_multiday(
+                ticker=ticker,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                is_multi_day_repeat=is_repeat,
+            )
+
+        except asyncio.CancelledError:
+            log.info("[lookback_worker] cancelled — shutting down")
+            break
+        except Exception as exc:
+            log.warning("[lookback_worker] unhandled exception: %s", exc)
+        finally:
+            try:
+                _lookback_queue.task_done()
+            except ValueError:
+                pass
+
+
+async def start_flow_writer() -> None:
+    """
+    Entry point — call once from main.py lifespan.
+    Starts the bus listener and the periodic flush task.
+    """
+    asyncio.create_task(_flush_flow_events())
+    asyncio.create_task(_bus_signal_listener())
+    log.info("[flow_store] flow writer started")
+
+
+async def _bus_signal_listener() -> None:
+    """
+    Retained for future use. Acts as a no-op consumer of the db_writer
+    channel after EPISODE-FIX moved persist_flow_episode() to _process_trade().
+    """
+    async with bus.subscribe("db_writer") as queue:
+        while True:
+            try:
+                await queue.get()
+                # no-op: episode persistence moved to _process_trade() (EPISODE-FIX)
+            except Exception as exc:
+                log.debug("[flow_store] _bus_signal_listener exception: %s", exc)
