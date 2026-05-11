@@ -130,6 +130,20 @@ Bug fixes applied:
       b. _insert_rows_with_episode_id() oi_at_open parameter changed from required
          positional to optional (= None) to match test mock signatures
          `async def fake_insert(table, row, key, premium, current_oi=None)`.
+  15. ING-009-COUNTER-FIX (2026-05-10): two bugs in the INSERT path fixed:
+      a. _episode_stats["created_episodes"] was only incremented inside
+         _insert_rows_with_episode_id(). When tests patch that function with
+         AsyncMock(return_value=True), the real body never executes so the
+         counter stayed at 0. Counter is now incremented in persist_flow_episode()
+         immediately after _insert_rows_with_episode_id() returns True, making
+         it mock-safe. _insert_rows_with_episode_id() no longer touches the counter
+         (would double-count on non-patched production path if left in both places).
+      b. _insert_rows_with_episode_id() used returned[0]["id"] (hard key access).
+         When PostgREST returns a body with no "id" field (e.g. return=minimal or
+         an empty dict — E-16 test case), this raised KeyError, which was caught by
+         the except block, causing the function to return False instead of True.
+         Fixed to returned[0].get("id") so a missing id is treated as None
+         (in-flight cache not populated — safe fallback) and True is still returned.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -583,9 +597,18 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 #     args[3] = premium    (float)
 #     args[4] = oi_at_open (Optional[int]) = None   ← optional, matches test mocks
 #
-#   On 200/201: populates _episode_in_flight cache and increments
-#   _episode_stats["created_episodes"]. Returns True.
-#   On failure: logs warning. Returns False.
+#   On 200/201: populates _episode_in_flight cache (if id present in response).
+#   Returns True on success, False on failure.
+#
+#   ING-009-COUNTER-FIX (2026-05-10): _episode_stats["created_episodes"] counter
+#   removed from this function. It now lives exclusively in persist_flow_episode()
+#   so it increments correctly whether this function is real or patched by tests.
+#
+#   ING-009-COUNTER-FIX (2026-05-10): returned[0]["id"] → returned[0].get("id")
+#   Hard key access raised KeyError when PostgREST returns a body with no "id"
+#   field (e.g. return=minimal or empty dict — E-16 test case). Fixed to .get()
+#   so a missing id is treated as None (in-flight not populated — safe fallback)
+#   and True is still returned.
 # ---------------------------------------------------------------------------
 
 async def _insert_rows_with_episode_id(
@@ -601,6 +624,10 @@ async def _insert_rows_with_episode_id(
     Called exclusively from the INSERT branch of persist_flow_episode().
     Named so tests can patch services.flow_store._insert_rows_with_episode_id
     without affecting the generic _insert_rows used for flow_events batches.
+
+    NOTE: Does NOT increment _episode_stats["created_episodes"]. That counter
+    lives in persist_flow_episode() so it increments correctly whether this
+    function is real or patched by tests (ING-009-COUNTER-FIX).
     """
     if not _is_configured():
         return False
@@ -624,7 +651,9 @@ async def _insert_rows_with_episode_id(
 
         if resp.status_code in (200, 201):
             returned = resp.json()
-            new_id = returned[0]["id"] if returned else None
+            # ING-009-COUNTER-FIX: use .get("id") — hard access raises KeyError
+            # when PostgREST returns a body with no "id" field (E-16 test case).
+            new_id = returned[0].get("id") if returned else None
             prem_str = f"${premium:,.0f}"
             log.info(
                 "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
@@ -633,7 +662,6 @@ async def _insert_rows_with_episode_id(
             )
             if new_id is not None:
                 _set_episode_in_flight(key, new_id, 1, premium)
-            _episode_stats["created_episodes"] += 1
             return True
 
         log.warning(
@@ -1000,6 +1028,10 @@ async def persist_flow_episode(signal_data: dict):
     carry their own guard. The outer guard caused all E-1 through E-16 tests
     to return immediately because _SUPABASE_URL/_SUPABASE_KEY are None in the
     test environment, preventing patched sub-functions from ever being reached.
+
+    ING-009-COUNTER-FIX: _episode_stats["created_episodes"] is incremented here
+    (not inside _insert_rows_with_episode_id) so the counter increments correctly
+    whether _insert_rows_with_episode_id is real or patched by tests.
     """
     ticker        = signal_data.get("ticker", "UNKNOWN")
     direction     = signal_data.get("direction", "UNKNOWN")
@@ -1118,13 +1150,17 @@ async def persist_flow_episode(signal_data: dict):
         if occ_symbol:
             insert_row["occ_symbol"] = occ_symbol
 
-        await _insert_rows_with_episode_id(
+        # ING-009-COUNTER-FIX: increment created_episodes here so the counter
+        # fires whether _insert_rows_with_episode_id is real or patched by tests.
+        ok = await _insert_rows_with_episode_id(
             "flow_episodes",
             insert_row,
             key,
             premium,
             contract_oi_at_open,
         )
+        if ok:
+            _episode_stats["created_episodes"] += 1
 
 
 async def _update_episode_multiday(
