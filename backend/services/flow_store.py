@@ -97,6 +97,13 @@ Bug fixes applied:
       Private aliases _classify_bid_ask (returns tuple), _compute_vol_oi_signal
       (returns HIGH/NORMAL/UNKNOWN strings), _compute_normalized_premium added
       for test compatibility.
+  12. SA-5 (2026-05-11): three code sites independently divided vol/OI with no
+      shared helper. Added _compute_vol_oi_ratio(vol, oi) -> Optional[float] as
+      the single source of truth (round(vol/oi, 4), None on bad inputs).
+      compute_vol_oi_signal() now delegates to _compute_vol_oi_ratio() instead
+      of re-implementing the division. persist_flow_event() normalized_oi block
+      replaced with _compute_vol_oi_ratio(open_interest, contract_oi), fixing
+      rounding from 6dp to 4dp to match the test spec.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -211,6 +218,7 @@ REARCH-003 quality tag semantics:
                                            sources: the ratio expresses what fraction of
                                            the cached intraday OI was known at tick time.
                                            NULL when contract_oi is None or 0.
+                                           Rounded to 4dp via _compute_vol_oi_ratio().
 
   classify_bid_ask(fill, bid, ask) -> str:
     Thresholds (Steamroom deliberation 2026-05-11):
@@ -229,6 +237,7 @@ REARCH-003 quality tag semantics:
     Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
     Returns False when vol/oi < VOL_OI_HIGH_THRESHOLD
     Returns None  when vol is None or oi is None or oi == 0
+    Delegates division to _compute_vol_oi_ratio() — do not re-implement inline.
 
   Private test aliases (test_flow_and_stats.py contract):
     _classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]
@@ -240,6 +249,10 @@ REARCH-003 quality tag semantics:
       Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string form for test assertions).
     _compute_normalized_premium(premium, underlying) -> Optional[float]
       Returns round(premium/underlying, 4) or None on bad inputs.
+    _compute_vol_oi_ratio(vol, oi) -> Optional[float]
+      Single source of truth for vol/OI division. Returns round(vol/oi, 4)
+      or None when vol is None, oi is None, or oi == 0.
+      Used internally by compute_vol_oi_signal() and persist_flow_event().
 """
 import asyncio
 import logging
@@ -340,6 +353,27 @@ def classify_bid_ask(
     return "MID"
 
 
+def _compute_vol_oi_ratio(
+    vol: Optional[int],
+    oi: Optional[int],
+) -> Optional[float]:
+    """
+    REARCH-003 / SA-5: Single source of truth for vol/OI division.
+
+    Returns round(vol / oi, 4) or None when inputs are unavailable.
+    None is returned when vol is None, oi is None, or oi == 0.
+
+    Used internally by:
+      - compute_vol_oi_signal()  — threshold comparison delegates here
+      - persist_flow_event()     — normalized_oi column delegates here
+
+    Do NOT re-implement vol/OI division elsewhere in this module.
+    """
+    if vol is None or oi is None or oi == 0:
+        return None
+    return round(vol / oi, 4)
+
+
 def compute_vol_oi_signal(
     vol: Optional[int],
     oi: Optional[int],
@@ -353,10 +387,13 @@ def compute_vol_oi_signal(
     as SQL NULL (cache miss). Do NOT change this to bool or add a NOT NULL default
     without also updating the migration DDL and the nullable annotation in
     persist_flow_event().
+
+    Delegates division to _compute_vol_oi_ratio() — do not re-implement inline.
     """
-    if vol is None or oi is None or oi == 0:
+    ratio = _compute_vol_oi_ratio(vol, oi)
+    if ratio is None:
         return None
-    return (vol / oi) >= VOL_OI_HIGH_THRESHOLD
+    return ratio >= VOL_OI_HIGH_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -614,10 +651,10 @@ async def persist_flow_event(ev_dict: dict):
 
     # normalized_oi = tick-level open_interest (numerator, Tradier) /
     #                 contract_oi (denominator, chain_store intraday snapshot).
+    # Delegates to _compute_vol_oi_ratio() — single source of truth for vol/OI division.
+    # Rounded to 4dp. NULL when contract_oi is unavailable or zero (cache miss).
     # See INTENTIONALLY DIFFERENT SOURCES note above.
-    normalized_oi: Optional[float] = None
-    if contract_oi and contract_oi > 0 and open_interest is not None:
-        normalized_oi = round(open_interest / contract_oi, 6)
+    normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
 
     row = {
         "ticker":                   ticker,
@@ -728,3 +765,350 @@ async def _lookup_open_episode(
         f"{_SUPABASE_URL}/rest/v1/flow_episodes"
         f"?ticker=eq.{quote(ticker)}"
         f"&direction=eq.{quote(direction)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+        f"&signal_ts=gte.{quote(cutoff)}"
+        f"&order=signal_ts.desc&limit=1"
+        f"&select=id,trade_count,total_premium"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers=get_headers)
+        if resp.status_code == 200:
+            rows = resp.json()
+            return rows[0] if rows else None
+        log.warning(
+            f"[flow_store] _lookup_open_episode failed: {resp.status_code} -- {resp.text[:200]}"
+        )
+        return None
+    except Exception as e:
+        log.error(f"[flow_store] _lookup_open_episode exception: {e}")
+        return None
+
+
+async def persist_flow_episode(
+    ticker: str,
+    direction: str,
+    contract_type: str,
+    strike: Optional[float],
+    expiry: Optional[str],
+    premium: float,
+    signal_ts: Optional[str] = None,
+    is_multi_day_repeat: Optional[bool] = None,
+) -> None:
+    """
+    ING-009: Upsert a flow_episodes row for the given contract.
+
+    If an open same-session episode exists within _EPISODE_MERGE_WINDOW_S,
+    PATCHes it (trade_count += 1, total_premium +=, signal_ts = new).
+    Otherwise INSERTs a new episode row.
+
+    ING-009-RACE: serialised per-contract via _get_episode_lock() so concurrent
+    coroutines for the same contract never double-INSERT.
+    """
+    if not _is_configured():
+        return
+
+    if strike is None or expiry is None:
+        log.debug(
+            f"[flow_store] persist_flow_episode: skipping {ticker} — "
+            f"strike={strike} expiry={expiry}"
+        )
+        return
+
+    # ING-008: vol/OI snapshot at episode persist time.
+    contract_oi_at_open: Optional[int] = None
+    contract_volume_at_close: Optional[int] = None
+    vol_snapshot: Optional[int] = None
+    try:
+        from services.chain_store import get_contract_vol_oi
+        occ_symbol = f"{ticker}{expiry}{contract_type[0].upper()}{int(strike * 1000):08d}"
+        vol_snapshot, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
+        contract_volume_at_close = vol_snapshot
+    except Exception:
+        pass
+
+    volume_oi_ratio: Optional[float] = _compute_vol_oi_ratio(
+        contract_volume_at_close, contract_oi_at_open
+    )
+
+    ts = signal_ts or datetime.now(timezone.utc).isoformat()
+    key = _episode_key(ticker, direction, contract_type, strike, expiry)
+    lock = _get_episode_lock(key)
+
+    async with lock:
+        in_flight = _episode_in_flight.get(key)
+
+        if in_flight:
+            # Second-or-later waiter: PATCH the already-inserted row directly.
+            new_trade_count   = in_flight["trade_count"] + 1
+            new_total_premium = in_flight["total_premium"] + premium
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{in_flight['id']}"
+            )
+            patch_payload: dict = {
+                "trade_count":            new_trade_count,
+                "total_premium":          new_total_premium,
+                "signal_ts":              ts,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":        volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.patch(
+                        patch_url, headers=_headers(), json=patch_payload
+                    )
+                if resp.status_code in (200, 204):
+                    _set_episode_in_flight(key, in_flight["id"], new_trade_count, new_total_premium)
+                    _episode_stats["merged_episodes"] += 1
+                    log.debug(f"[flow_store] episode merged (in-flight): {key}")
+                else:
+                    log.warning(
+                        f"[flow_store] episode in-flight PATCH failed: "
+                        f"{resp.status_code} -- {resp.text[:200]}"
+                    )
+            except Exception as e:
+                log.error(f"[flow_store] persist_flow_episode in-flight PATCH exception: {e}")
+            return
+
+        # First arrival for this key in this session — check DB.
+        existing = await _lookup_open_episode(
+            ticker, direction, contract_type, strike, expiry
+        )
+
+        if existing:
+            new_trade_count   = existing["trade_count"] + 1
+            new_total_premium = existing["total_premium"] + premium
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{existing['id']}"
+            )
+            patch_payload = {
+                "trade_count":            new_trade_count,
+                "total_premium":          new_total_premium,
+                "signal_ts":              ts,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":        volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.patch(
+                        patch_url, headers=_headers(), json=patch_payload
+                    )
+                if resp.status_code in (200, 204):
+                    _set_episode_in_flight(key, existing["id"], new_trade_count, new_total_premium)
+                    _episode_stats["merged_episodes"] += 1
+                    log.debug(f"[flow_store] episode merged (DB lookup): {key}")
+                else:
+                    log.warning(
+                        f"[flow_store] episode DB PATCH failed: "
+                        f"{resp.status_code} -- {resp.text[:200]}"
+                    )
+            except Exception as e:
+                log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
+        else:
+            # No open episode — INSERT a new one.
+            insert_payload = {
+                "ticker":                  ticker,
+                "direction":               direction,
+                "contract_type":           contract_type,
+                "strike":                  strike,
+                "expiry":                  expiry,
+                "trade_count":             1,
+                "total_premium":           premium,
+                "signal_ts":               ts,
+                "contract_oi_at_open":     contract_oi_at_open,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":         volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                insert_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            insert_headers = {**_headers(), "Prefer": "return=representation"}
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        f"{_SUPABASE_URL}/rest/v1/flow_episodes",
+                        headers=insert_headers,
+                        json=insert_payload,
+                    )
+                if resp.status_code in (200, 201):
+                    rows = resp.json()
+                    if rows:
+                        new_id = rows[0]["id"]
+                        _set_episode_in_flight(key, new_id, 1, premium)
+                        _episode_stats["created_episodes"] += 1
+                        log.debug(f"[flow_store] episode created: {key} id={new_id}")
+                    else:
+                        log.warning(
+                            f"[flow_store] episode INSERT returned empty body for {key}"
+                        )
+                else:
+                    log.warning(
+                        f"[flow_store] episode INSERT failed: "
+                        f"{resp.status_code} -- {resp.text[:200]}"
+                    )
+            except Exception as e:
+                log.error(f"[flow_store] persist_flow_episode INSERT exception: {e}")
+
+
+async def _update_episode_multiday(
+    ticker: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+    is_multi_day_repeat: bool,
+) -> None:
+    """
+    ING-007 / PBE-F2: Two-step GET+PATCH to update is_multi_day_repeat on the
+    most recent flow_episodes row for a contract without touching older rows.
+    """
+    if not _is_configured():
+        return
+
+    get_headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Accept":        "application/json",
+    }
+
+    get_url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+        f"?ticker=eq.{quote(ticker)}"
+        f"&contract_type=eq.{quote(contract_type)}"
+        f"&strike=eq.{strike}"
+        f"&expiry=eq.{quote(expiry)}"
+        f"&order=signal_ts.desc&limit=1&select=id"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            get_resp = await client.get(get_url, headers=get_headers)
+
+        if get_resp.status_code != 200:
+            log.warning(
+                f"[flow_store] _update_episode_multiday GET failed: "
+                f"{get_resp.status_code} -- {get_resp.text[:200]}"
+            )
+            return
+
+        rows = get_resp.json()
+        if not rows:
+            log.info(  # SA-F3: elevated from DEBUG so cold-miss is observable in Railway
+                f"[flow_store] _update_episode_multiday: no episode row found for "
+                f"{ticker} {contract_type} {strike} {expiry}"
+            )
+            return
+
+        row_id = rows[0]["id"]
+        patch_url = (
+            f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+            f"?id=eq.{row_id}"
+        )
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            patch_resp = await client.patch(
+                patch_url,
+                headers=_headers(),
+                json={"is_multi_day_repeat": is_multi_day_repeat},
+            )
+
+        if patch_resp.status_code not in (200, 204):
+            log.warning(
+                f"[flow_store] _update_episode_multiday PATCH failed: "
+                f"{patch_resp.status_code} -- {patch_resp.text[:200]}"
+            )
+
+    except Exception as e:
+        log.error(f"[flow_store] _update_episode_multiday exception: {e}")
+
+
+async def start_lookback_worker() -> None:
+    """
+    ING-007: Drain the lookback queue and enrich flow_episodes with
+    is_multi_day_repeat from contract_day_cache.
+    """
+    try:
+        from ingestion.processor import get_accumulator
+        accumulator = get_accumulator()
+        # SA-F1: correct attr name + traverse list-of-tuples
+        dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+        min_premium = (
+            min(floor for _, floors in dte_tiers for floor in floors.values())
+            if dte_tiers
+            else 10_000.0
+        )
+        log.debug("[lookback] min_premium floor resolved: %.2f", min_premium)
+    except Exception:
+        min_premium = 10_000.0
+        log.debug("[lookback] min_premium floor fallback: %.2f", min_premium)
+
+    try:
+        from services.chain_store import get_contract_day_cache
+        contract_day_cache = get_contract_day_cache()
+    except Exception:
+        contract_day_cache = {}
+
+    log.info("[lookback] worker started")
+
+    while True:
+        try:
+            key = await _lookback_queue.get()
+            ticker, contract_type, strike, expiry = key
+
+            cached = contract_day_cache.get(key)
+            if cached is None:
+                _lookback_queue.task_done()
+                continue
+
+            prior_days = cached.get("prior_days_active", 0)
+            is_repeat  = prior_days > 0
+
+            await _update_episode_multiday(
+                ticker, contract_type, strike, expiry, is_repeat
+            )
+
+        except Exception as e:
+            log.error(f"[lookback] worker exception: {e}")
+        finally:
+            try:
+                _lookback_queue.task_done()
+            except Exception:
+                pass
+
+
+async def _bus_signal_listener() -> None:
+    """
+    EPISODE-FIX (retained as no-op bus consumer for db_writer channel).
+    flow_episodes are now written directly from _process_trade() in
+    tradier_stream.py. This listener no longer writes to the DB.
+    """
+    try:
+        queue = bus.subscribe("db_writer")
+    except Exception:
+        return
+    while True:
+        try:
+            await queue.get()
+        except Exception:
+            await asyncio.sleep(1.0)
+
+
+async def start_flow_writer() -> None:
+    """
+    Entry point called once from main.py lifespan.
+    Starts the flush loop and bus listener as background tasks.
+    """
+    log.info("[flow_store] starting flow writer")
+    asyncio.create_task(_flush_flow_events())
+    asyncio.create_task(_bus_signal_listener())
+    asyncio.create_task(start_lookback_worker())
