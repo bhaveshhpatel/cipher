@@ -115,6 +115,19 @@ Bug fixes applied:
       Enum values are the canonical Steamroom set:
         dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
         notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
+  15. FS-TEST-FIX (2026-05-11): three test failures addressed:
+      a) FlowStore class added — tests 5-12 in test_flow_store.py import
+         FlowStore directly and exercise add_flow, get_flows, get_flows_by_symbol,
+         get_stats, clear, size methods.
+      b) persist_flow_episode() signature changed to accept a single signal_data
+         dict (matching how tradier_stream._process_trade() calls it and how
+         the test suite invokes it). Positional-kwarg form is derived internally.
+         Empty expiry string is now coerced to None before the row is built.
+         Early-return guard relaxed to only block on strike=None (expiry=None
+         is legal and persisted as SQL NULL).
+      c) asyncio.sleep in _insert_rows_with_retry now calls the module-level
+         _async_sleep alias so tests can patch 'services.flow_store._async_sleep'
+         without patching the global asyncio.sleep (which affects the event loop).
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -302,6 +315,10 @@ _flow_event_buffer: list[dict] = []
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
+# Patchable alias for asyncio.sleep — tests patch 'services.flow_store._async_sleep'
+# instead of the global asyncio.sleep to avoid interfering with the event loop.
+_async_sleep = asyncio.sleep
+
 # ---------------------------------------------------------------------------
 # ING-009: same-session episode merge window
 # ---------------------------------------------------------------------------
@@ -319,6 +336,83 @@ _episode_in_flight: Dict[str, dict] = {}
 _BID_ASK_ASK_THRESHOLD: float = 0.98   # fill >= ask * 0.98 → ASK  (boundary inclusive)
 _BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02 → BID
 VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5      → True / "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# FlowStore — in-memory store used by tests and legacy callers
+# ---------------------------------------------------------------------------
+
+class FlowStore:
+    """
+    Simple in-memory store for options flow dicts.
+
+    Used directly by tests and by the module-level add_flow / get_flows /
+    clear_flows helpers below.  Not related to the Supabase persistence path
+    (persist_flow_event / persist_flow_episode).
+    """
+
+    def __init__(self) -> None:
+        self._flows: List[dict] = []
+
+    def add_flow(self, flow: dict) -> None:  # noqa: D401
+        """Append a flow dict to the in-memory store."""
+        self._flows.append(flow)
+
+    def get_flows(self, symbol: Optional[str] = None) -> List[dict]:
+        """Return a shallow copy of all stored flows (optionally filtered by ticker)."""
+        if symbol is not None:
+            return [
+                f for f in self._flows
+                if (f.get("ticker") == symbol or f.get("symbol") == symbol)
+            ]
+        return list(self._flows)
+
+    def get_flows_by_symbol(self, symbol: str) -> List[dict]:
+        """Return flows matching *symbol* via dict key or object attribute."""
+        result = []
+        for f in self._flows:
+            if isinstance(f, dict):
+                if f.get("symbol") == symbol or f.get("ticker") == symbol:
+                    result.append(f)
+            else:
+                if getattr(f, "symbol", None) == symbol:
+                    result.append(f)
+        return result
+
+    def get_stats(self) -> dict:
+        """Return aggregate stats dict."""
+        return {"total": len(self._flows)}
+
+    def clear(self) -> None:
+        """Remove all stored flows."""
+        self._flows.clear()
+
+    def size(self) -> int:
+        """Return the number of stored flows."""
+        return len(self._flows)
+
+
+# Module-level FlowStore instance used by the async helpers below.
+_store = FlowStore()
+
+
+# ---------------------------------------------------------------------------
+# Module-level async helpers (thin wrappers around _store)
+# ---------------------------------------------------------------------------
+
+async def add_flow(flow: dict) -> None:
+    """Append *flow* to the module-level in-memory store."""
+    _store.add_flow(flow)
+
+
+async def get_flows(ticker: str) -> List[dict]:
+    """Return flows for *ticker* from the module-level in-memory store."""
+    return _store.get_flows(ticker)
+
+
+async def clear_flows() -> None:
+    """Clear all flows from the module-level in-memory store."""
+    _store.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +669,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
                 f"[flow_store] insert into {table} failed (attempt {attempt}/{_RETRY_MAX}) "
                 f"-- retrying in {_RETRY_DELAY_S}s"
             )
-            await asyncio.sleep(_RETRY_DELAY_S)
+            await _async_sleep(_RETRY_DELAY_S)  # patched via services.flow_store._async_sleep
     log.error(
         f"[flow_store] insert into {table} failed after {_RETRY_MAX} attempts "
         f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
@@ -586,7 +680,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 async def _flush_flow_events():
     global _flow_event_buffer
     while True:
-        await asyncio.sleep(_FLUSH_INTERVAL)
+        await _async_sleep(_FLUSH_INTERVAL)
         if not _flow_event_buffer:
             continue
         batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
@@ -807,18 +901,18 @@ async def _lookup_open_episode(
         return None
 
 
-async def persist_flow_episode(
-    ticker: str,
-    direction: str,
-    contract_type: str,
-    strike: Optional[float],
-    expiry: Optional[str],
-    premium: float,
-    signal_ts: Optional[str] = None,
-    is_multi_day_repeat: Optional[bool] = None,
-) -> None:
+async def persist_flow_episode(signal_data: dict) -> None:
     """
     ING-009: Upsert a flow_episodes row for the given contract.
+
+    Accepts a single signal_data dict containing:
+      ticker, direction, contract_type, strike, expiry,
+      total_premium, trade_count (optional), signal_ts (optional),
+      is_multi_day_repeat (optional).
+
+    Empty-string expiry is coerced to None before the row is built.
+    The early-return guard only fires when strike is None — expiry=None
+    is legal and persisted as SQL NULL.
 
     If an open same-session episode exists within _EPISODE_MERGE_WINDOW_S,
     PATCHes it (trade_count += 1, total_premium +=, signal_ts = new).
@@ -830,10 +924,19 @@ async def persist_flow_episode(
     if not _is_configured():
         return
 
-    if strike is None or expiry is None:
+    ticker       = signal_data.get("ticker", "UNKNOWN")
+    direction    = signal_data.get("direction", "UNKNOWN")
+    contract_type = signal_data.get("contract_type", "CALL")
+    strike       = signal_data.get("strike")
+    # Coerce empty-string expiry to None (FS-TEST-FIX)
+    expiry       = signal_data.get("expiry") or None
+    premium      = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
+    signal_ts    = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
+    is_multi_day_repeat = signal_data.get("is_multi_day_repeat")
+
+    if strike is None:
         log.debug(
-            f"[flow_store] persist_flow_episode: skipping {ticker} — "
-            f"strike={strike} expiry={expiry}"
+            f"[flow_store] persist_flow_episode: skipping {ticker} — strike={strike}"
         )
         return
 
@@ -854,14 +957,13 @@ async def persist_flow_episode(
     )
 
     ts = signal_ts or datetime.now(timezone.utc).isoformat()
-    key = _episode_key(ticker, direction, contract_type, strike, expiry)
+    key = _episode_key(ticker, direction, contract_type, strike or 0, expiry or "")
     lock = _get_episode_lock(key)
 
     async with lock:
         in_flight = _episode_in_flight.get(key)
 
         if in_flight:
-            # Second-or-later waiter: PATCH the already-inserted row directly.
             new_trade_count   = in_flight["trade_count"] + 1
             new_total_premium = in_flight["total_premium"] + premium
             patch_url = (
@@ -896,9 +998,8 @@ async def persist_flow_episode(
                 log.error(f"[flow_store] persist_flow_episode in-flight PATCH exception: {e}")
             return
 
-        # First arrival for this key in this session — check DB.
         existing = await _lookup_open_episode(
-            ticker, direction, contract_type, strike, expiry
+            ticker, direction, contract_type, strike, expiry or ""
         )
 
         if existing:
@@ -935,7 +1036,6 @@ async def persist_flow_episode(
             except Exception as e:
                 log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
         else:
-            # No open episode — INSERT a new one.
             insert_payload = {
                 "ticker":                  ticker,
                 "direction":               direction,
@@ -1119,7 +1219,7 @@ async def _bus_signal_listener() -> None:
         try:
             await queue.get()
         except Exception:
-            await asyncio.sleep(1.0)
+            await _async_sleep(1.0)
 
 
 async def start_flow_writer() -> None:
