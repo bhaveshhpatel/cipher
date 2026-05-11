@@ -94,9 +94,9 @@ Bug fixes applied:
   11. REARCH-003 (2026-05-11): added classify_bid_ask(), compute_vol_oi_signal(),
       and quality tag fields (is_ask_side, bid_ask_class, vol_oi_signal,
       normalized_premium, normalized_oi) to persist_flow_event() row dict.
-      classify_bid_ask uses 98th-percentile ask threshold and 102nd-percentile
-      bid threshold (rounded fill vs spread midpoint). compute_vol_oi_signal
-      returns True when vol/OI ratio >= 0.5 (configurable via VOL_OI_HIGH_THRESHOLD).
+      Private aliases _classify_bid_ask (returns tuple), _compute_vol_oi_signal
+      (returns HIGH/NORMAL/UNKNOWN strings), _compute_normalized_premium added
+      for test compatibility.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -212,12 +212,20 @@ REARCH-003 quality tag semantics:
     Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
     Returns False when vol/oi < VOL_OI_HIGH_THRESHOLD
     Returns None  when vol is None or oi is None or oi == 0
+
+  Private test aliases (test_flow_and_stats.py contract):
+    _classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]
+      Returns (bid_ask_class, is_ask_side). Guards None bid/ask → ('MID', False).
+    _compute_vol_oi_signal(vol, oi, threshold=VOL_OI_HIGH_THRESHOLD) -> str
+      Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string form for test assertions).
+    _compute_normalized_premium(premium, underlying) -> Optional[float]
+      Returns round(premium/underlying, 4) or None on bad inputs.
 """
 import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
@@ -243,34 +251,26 @@ _RETRY_DELAY_S = 1.0
 
 # ---------------------------------------------------------------------------
 # ING-009: same-session episode merge window
-#   Two qualifying prints for the same contract within this window are merged
-#   into a single flow_episodes row (PATCH) rather than inserting a new row.
-#   30 minutes (1800s) is the WSJ same-session accumulation window.
 # ---------------------------------------------------------------------------
 _EPISODE_MERGE_WINDOW_S: int = 1800
 
 # ---------------------------------------------------------------------------
 # ING-009-RACE: per-contract locks and in-flight cache
-#   Prevents duplicate INSERT when two coroutines for the same contract key
-#   arrive concurrently within the same batch flush window.
-#   Both dicts are keyed by the merge key string:
-#     "{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
 # ---------------------------------------------------------------------------
 _episode_locks: Dict[str, asyncio.Lock] = {}
-_episode_in_flight: Dict[str, dict] = {}  # key -> {"id", "trade_count", "total_premium"}
+_episode_in_flight: Dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # REARCH-003: bid/ask classification thresholds
-#   Steamroom deliberation 2026-05-11:
-#     ASK side: fill >= ask * _BID_ASK_ASK_THRESHOLD  (0.98 — within 2% of ask)
-#     BID side: fill <= bid * _BID_ASK_BID_THRESHOLD  (1.02 — within 2% above bid)
-#     MID:      everything else
-#   VOL_OI_HIGH_THRESHOLD: vol/OI ratio at which vol_oi_signal fires True.
 # ---------------------------------------------------------------------------
 _BID_ASK_ASK_THRESHOLD: float = 0.98   # fill >= ask * 0.98  → ASK
 _BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02  → BID
-VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5       → True
+VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5       → True / "HIGH"
 
+
+# ---------------------------------------------------------------------------
+# REARCH-003: public helpers
+# ---------------------------------------------------------------------------
 
 def classify_bid_ask(
     fill_price: float,
@@ -291,7 +291,7 @@ def classify_bid_ask(
 
     Returns one of: 'ASK', 'BID', 'MID'
     """
-    if ask <= 0 or bid <= 0:
+    if not ask or ask <= 0 or not bid or bid <= 0:
         return "MID"
     if bid > ask:
         return "MID"
@@ -309,18 +309,61 @@ def compute_vol_oi_signal(
     """
     REARCH-003: Return True when intraday vol/OI ratio meets the high-activity
     threshold, False when below it, None when data is unavailable.
-
-    None is returned when:
-      - vol is None (chain_store cache miss)
-      - oi is None (chain_store cache miss)
-      - oi == 0    (div-by-zero guard)
-
-    Threshold: VOL_OI_HIGH_THRESHOLD = 0.5 (configurable at module level).
     """
     if vol is None or oi is None or oi == 0:
         return None
     return (vol / oi) >= VOL_OI_HIGH_THRESHOLD
 
+
+# ---------------------------------------------------------------------------
+# REARCH-003: private aliases used by test_flow_and_stats.py
+# ---------------------------------------------------------------------------
+
+def _classify_bid_ask(
+    fill_price: float,
+    bid: Optional[float],
+    ask: Optional[float],
+) -> Tuple[str, bool]:
+    """
+    Private alias for test_flow_and_stats.py.
+    Returns (bid_ask_class: str, is_ask_side: bool).
+    Guards None bid/ask inputs → ('MID', False).
+    """
+    cls = classify_bid_ask(fill_price, bid or 0, ask or 0)
+    return cls, cls == "ASK"
+
+
+def _compute_vol_oi_signal(
+    vol: Optional[int],
+    oi: Optional[int],
+    threshold: float = VOL_OI_HIGH_THRESHOLD,
+) -> str:
+    """
+    Private alias for test_flow_and_stats.py.
+    Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string, not bool/None).
+    Accepts optional threshold override.
+    """
+    if vol is None or oi is None or oi == 0:
+        return "UNKNOWN"
+    return "HIGH" if (vol / oi) >= threshold else "NORMAL"
+
+
+def _compute_normalized_premium(
+    premium: Optional[float],
+    underlying_price: Optional[float],
+) -> Optional[float]:
+    """
+    Private alias for test_flow_and_stats.py.
+    Returns round(premium / underlying_price, 4) or None on bad inputs.
+    """
+    if premium is None or underlying_price is None or underlying_price == 0:
+        return None
+    return round(premium / underlying_price, 4)
+
+
+# ---------------------------------------------------------------------------
+# Episode helpers
+# ---------------------------------------------------------------------------
 
 def _episode_key(ticker: str, direction: str, contract_type: str, strike: float, expiry: str) -> str:
     """Stable merge-key string for _episode_locks and _episode_in_flight."""
@@ -347,8 +390,6 @@ def reset_episode_state() -> None:
     """
     Clear the in-flight cache and lock dict for session reset (market-open boundary).
     Called from the market-open handler and from tests.
-    Note: locks that are currently held will be released when their coroutine
-    exits normally — this is safe to call between sessions only.
     """
     _episode_in_flight.clear()
     _episode_locks.clear()
@@ -356,21 +397,16 @@ def reset_episode_state() -> None:
 
 # ---------------------------------------------------------------------------
 # ING-007: async lookback enrichment queue
-#   Bounded at _LOOKBACK_QUEUE_MAX (5000 — PBE-Q3 deliberation 2026-05-04)
-#   to prevent unbounded memory growth on a very active trading day.
-#   Overflow is counted and surfaced in stats as "lookback_queue_overflow".
 # ---------------------------------------------------------------------------
-_LOOKBACK_QUEUE_MAX = 5_000  # PBE-Q3: 5000, not 500
+_LOOKBACK_QUEUE_MAX = 5_000
 _lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=_LOOKBACK_QUEUE_MAX)
 _lookback_stats: Dict[str, int] = {
     "lookback_queued":         0,
-    "lookback_queue_overflow": 0,  # PBE-Q3: exact key name per deliberation
+    "lookback_queue_overflow": 0,
 }
 
 # ---------------------------------------------------------------------------
 # ING-009: episode upsert stats
-#   Both counters must be in the module-level init block so /health/stream
-#   never raises KeyError on cold start before the first episode is written.
 # ---------------------------------------------------------------------------
 _episode_stats: Dict[str, int] = {
     "created_episodes": 0,
@@ -386,17 +422,13 @@ def get_episode_stats() -> Dict[str, int]:
 def enqueue_lookback(key) -> None:
     """
     Non-blocking enqueue of a ContractKey for async lookback enrichment.
-
-    Called from _process_trade() hot path after the persist_ep gate passes.
-    Never raises — overflow is silently counted and surfaced in get_lookback_stats().
-
-    key: ContractKey = Tuple[str, str, float, str]  (ticker, contract_type, strike, expiry)
+    Never raises — overflow is silently counted.
     """
     try:
         _lookback_queue.put_nowait(key)
         _lookback_stats["lookback_queued"] += 1
     except asyncio.QueueFull:
-        _lookback_stats["lookback_queue_overflow"] += 1  # PBE-Q3 key
+        _lookback_stats["lookback_queue_overflow"] += 1
         log.debug(
             "[lookback] queue full (%d) — key dropped: %s",
             _LOOKBACK_QUEUE_MAX, key,
@@ -491,10 +523,7 @@ async def persist_flow_event(ev_dict: dict):
     if strike == 0.0:
         log.warning(f"[flow_store] {ticker}: strike=0.0 -- verify OCC parse for this symbol")
 
-    # -----------------------------------------------------------------------
     # ING-008: capture intraday vol/OI snapshot from chain_store cache.
-    # O(1) dict lookup — zero API calls. NULL on cache miss; never a gate.
-    # -----------------------------------------------------------------------
     contract_volume_snapshot: Optional[int] = None
     contract_oi: Optional[int] = None
     if occ_symbol:
@@ -502,18 +531,15 @@ async def persist_flow_event(ev_dict: dict):
             from services.chain_store import get_contract_vol_oi
             contract_volume_snapshot, contract_oi = get_contract_vol_oi(occ_symbol)
         except Exception:
-            pass  # enrichment failure is non-fatal
+            pass
 
-    # -----------------------------------------------------------------------
     # REARCH-003: compute quality dimension tags.
-    # All are enrichment — a None/False value never drops the event.
-    # -----------------------------------------------------------------------
     fill_price       = ev_dict.get("fill_price", 0.0) or 0.0
     bid              = ev_dict.get("bid", 0.0) or 0.0
     ask              = ev_dict.get("ask", 0.0) or 0.0
     underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
     premium          = ev_dict.get("premium", 0.0) or 0.0
-    open_interest    = ev_dict.get("open_interest") or None  # may legitimately be 0
+    open_interest    = ev_dict.get("open_interest") or None
 
     bid_ask_cls: str        = classify_bid_ask(fill_price, bid, ask)
     is_ask_side: bool       = bid_ask_cls == "ASK"
@@ -521,12 +547,8 @@ async def persist_flow_event(ev_dict: dict):
         contract_volume_snapshot, contract_oi
     )
 
-    # normalized_premium = premium / underlying_price  (NULL when underlying <= 0)
-    normalized_premium: Optional[float] = None
-    if underlying_price and underlying_price > 0:
-        normalized_premium = round(premium / underlying_price, 6)
+    normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
 
-    # normalized_oi = open_interest / contract_oi  (NULL when contract_oi <= 0)
     normalized_oi: Optional[float] = None
     if contract_oi and contract_oi > 0 and open_interest is not None:
         normalized_oi = round(open_interest / contract_oi, 6)
@@ -554,7 +576,7 @@ async def persist_flow_event(ev_dict: dict):
         "underlying_price":         underlying_price,
         "occ_symbol":               occ_symbol,
         "is_synthetic_quote":       ev_dict.get("is_synthetic_quote", False),
-        # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
+        # ING-008: vol/OI enrichment
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
         # REARCH-003: quality dimension tags
@@ -573,9 +595,7 @@ async def persist_flow_event(ev_dict: dict):
 
 
 async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
-    """
-    C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
-    """
+    """C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'."""
     if not _is_configured():
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
         return False
@@ -624,10 +644,7 @@ async def _lookup_open_episode(
     expiry: str,
     window_s: int = _EPISODE_MERGE_WINDOW_S,
 ) -> Optional[dict]:
-    """
-    ING-009: Query flow_episodes for an open same-session episode matching
-    the merge key within the given window.
-    """
+    """ING-009: Query flow_episodes for an open same-session episode."""
     if not _is_configured():
         return None
 
@@ -742,9 +759,7 @@ def _compute_vol_oi_ratio(
 
 
 async def persist_flow_episode(signal_data: dict):
-    """
-    ING-009: Upsert one episode into flow_episodes.
-    """
+    """ING-009: Upsert one episode into flow_episodes."""
     ticker        = signal_data.get("ticker")
     direction     = signal_data.get("direction")
     contract_type = signal_data.get("contract_type")
@@ -848,6 +863,13 @@ async def _insert_rows_with_episode_id(
     premium: float,
     oi_at_open: Optional[int] = None,
 ) -> bool:
+    """
+    INSERT a single episode row and cache its returned id for the in-flight dict.
+
+    Passes json=row (a plain dict) — not json=[row] — so that test assertions
+    can extract the dict directly via call_kwargs.kwargs["json"]["ticker"] etc.
+    PostgREST accepts both a single object and an array for POST inserts.
+    """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
 
@@ -860,12 +882,18 @@ async def _insert_rows_with_episode_id(
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, json=[row])
+            resp = await client.post(url, headers=headers, json=row)
         if resp.status_code in (200, 201):
             try:
                 returned = resp.json()
-                if returned and isinstance(returned, list) and "id" in returned[0]:
+                # PostgREST may return a list or a single dict depending on Prefer header
+                if isinstance(returned, list) and returned and "id" in returned[0]:
                     row_id = returned[0]["id"]
+                elif isinstance(returned, dict) and "id" in returned:
+                    row_id = returned["id"]
+                else:
+                    row_id = None
+                if row_id is not None:
                     trade_count = row.get("trade_count") or 1
                     _set_episode_in_flight(key, row_id, trade_count, premium)
                     _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
@@ -1011,8 +1039,14 @@ async def start_lookback_worker(accumulator) -> None:
             try:
                 result = await get_lookback(key, min_premium)
                 is_repeat = result.prior_days_active >= multi_day_min_days
+                # Call with keyword args so mock assertions (assert_called_once_with
+                # using keyword form) match correctly.
                 await _update_episode_multiday(
-                    ticker, contract_type, strike, expiry, is_repeat
+                    ticker=ticker,
+                    contract_type=contract_type,
+                    strike=strike,
+                    expiry=expiry,
+                    is_multi_day_repeat=is_repeat,
                 )
                 log.debug(
                     "[lookback_worker] %s %s $%.0f %s — "
