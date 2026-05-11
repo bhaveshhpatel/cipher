@@ -105,6 +105,11 @@ Bug fixes applied:
       All seven fields are derived from values already in ev_dict or the
       chain_store vol/OI cache — zero new I/O, zero new blocking calls.
       Migrations 026 (ADD COLUMN) and 027 (backfill) accompany this change.
+  12. REARCH-003-FIX (2026-05-10): _classify_bid_ask used fp >= a * 0.98 for
+      the ASK boundary. With fill=4.90, bid=4.80, ask=5.00 the threshold is
+      4.90, so a fill exactly at mid was classified ASK instead of MID.
+      Fix: strict boundaries — fill >= ask → ASK, fill <= bid → BID, else MID.
+      No fuzz multipliers. is_ask_side remains True iff bid_ask_class == 'ASK'.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -201,7 +206,7 @@ ING-008 Vol/OI capture semantics:
 
 REARCH-003 event quality tag semantics:
   flow_events.is_ask_side
-    True when fill_price >= ask * 0.98 (ask-side aggression).
+    True when fill_price >= ask (strict ask boundary, no fuzz).
     False when ask is None or 0 (conservative fallback).
     Computed by _classify_bid_ask() — same function that determines bid_ask_class.
 
@@ -209,6 +214,7 @@ REARCH-003 event quality tag semantics:
     Already persisted. Now computed via shared _classify_bid_ask() helper
     to ensure is_ask_side and bid_ask_class are always consistent.
     Values: 'ASK' | 'BID' | 'MID'.
+    ASK: fill >= ask. BID: fill <= bid. MID: strictly between bid and ask.
 
   flow_events.vol_oi_signal
     'HIGH'    when contract_volume_snapshot / contract_oi >= _VOL_OI_HIGH_THRESHOLD (0.5)
@@ -409,20 +415,25 @@ def _classify_bid_ask(
 
     Returns (bid_ask_class, is_ask_side) where:
       bid_ask_class : 'ASK' | 'BID' | 'MID'
-      is_ask_side   : True when fill_price >= ask * 0.98
+      is_ask_side   : True iff bid_ask_class == 'ASK'
+
+    Boundaries (strict, no fuzz):
+      fill >= ask  → 'ASK', True
+      fill <= bid  → 'BID', False
+      otherwise    → 'MID', False
 
     Edge cases:
-      - ask is None or 0: bid_ask_class='MID', is_ask_side=False (conservative)
-      - bid is None or 0: bid_ask_class compared to ask only
+      - ask is None or 0: returns 'MID', False (conservative — no ask price available)
+      - bid is None or 0: bid boundary skipped, falls through to MID
       - fill_price is None: treated as 0.0
     """
-    fp  = fill_price or 0.0
-    b   = bid or 0.0
-    a   = ask or 0.0
+    fp = fill_price or 0.0
+    a  = ask or 0.0
+    b  = bid or 0.0
 
-    if a > 0 and fp >= a * 0.98:
+    if a > 0 and fp >= a:
         return "ASK", True
-    if b > 0 and fp <= b * 1.02:
+    if b > 0 and fp <= b:
         return "BID", False
     return "MID", False
 
@@ -1162,7 +1173,7 @@ async def start_lookback_worker(accumulator=None) -> None:
             )
 
         except asyncio.CancelledError:
-            log.info("[lookback_worker] cancelled \u2014 shutting down")
+            log.info("[lookback_worker] cancelled — shutting down")
             break
         except Exception as exc:
             log.warning("[lookback_worker] unhandled exception: %s", exc)
