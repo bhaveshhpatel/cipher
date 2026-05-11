@@ -15,6 +15,10 @@ import time. When pytest-asyncio creates a new event loop per test, the queue
 is still bound to the OLD loop causing RuntimeError. Fix: reset the queue
 module attribute to a fresh Queue inside each async test that calls
 start_lookback_worker, using asyncio.get_event_loop() to bind it correctly.
+
+FIX (2026-05-11): assert_called_once_with for _update_episode_multiday must
+use keyword-arg form to match the implementation which calls the function
+with all keyword arguments.
 """
 import asyncio
 import pytest
@@ -133,8 +137,13 @@ async def test_start_lookback_worker_processes_key_and_calls_update():
 
         await run_once()
 
+    # Implementation calls with keyword args — assert must match
     mock_update.assert_called_once_with(
-        "NVDA", "CALL", 900.0, "2026-06-20", True
+        ticker="NVDA",
+        contract_type="CALL",
+        strike=900.0,
+        expiry="2026-06-20",
+        is_multi_day_repeat=True,
     )
 
 
@@ -172,8 +181,13 @@ async def test_start_lookback_worker_is_repeat_false_when_below_min_days():
 
         await run_once()
 
+    # Implementation calls with keyword args — assert must match
     mock_update.assert_called_once_with(
-        "AMD", "PUT", 100.0, "2026-05-17", False
+        ticker="AMD",
+        contract_type="PUT",
+        strike=100.0,
+        expiry="2026-05-17",
+        is_multi_day_repeat=False,
     )
 
 
