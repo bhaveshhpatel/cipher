@@ -122,6 +122,14 @@ Bug fixes applied:
          AsyncEventBus.subscribe() returns asyncio.Queue, not an async CM.
          _bus_signal_listener now uses bus.subscribe()/bus.unsubscribe() with
          try/finally instead of `async with bus.subscribe(...) as queue`.
+  14. REARCH-003-TEST-FIX (2026-05-10): two fixes for E-1 through E-16 failures:
+      a. persist_flow_episode() top-level `if not _is_configured(): return` guard
+         removed. Sub-functions carry their own guards. The outer guard caused
+         every test to bail immediately because _SUPABASE_URL/_SUPABASE_KEY are
+         None in the test environment, so patched sub-functions were never reached.
+      b. _insert_rows_with_episode_id() oi_at_open parameter changed from required
+         positional to optional (= None) to match test mock signatures
+         `async def fake_insert(table, row, key, premium, current_oi=None)`.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -573,7 +581,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 #     args[1] = row        (dict)          full episode row dict
 #     args[2] = key        (str)           merge key
 #     args[3] = premium    (float)
-#     args[4] = oi_at_open (Optional[int])
+#     args[4] = oi_at_open (Optional[int]) = None   ← optional, matches test mocks
 #
 #   On 200/201: populates _episode_in_flight cache and increments
 #   _episode_stats["created_episodes"]. Returns True.
@@ -585,7 +593,7 @@ async def _insert_rows_with_episode_id(
     row: dict,
     key: str,
     premium: float,
-    oi_at_open: Optional[int],
+    oi_at_open: Optional[int] = None,  # REARCH-003-TEST-FIX: optional to match test mock signatures
 ) -> bool:
     """
     INSERT a new episode row and populate the in-flight cache on success.
@@ -986,10 +994,13 @@ async def persist_flow_episode(signal_data: dict):
 
     ING-008: vol/OI captured at INSERT (contract_oi_at_open) and PATCH
     (contract_volume_at_close + volume_oi_ratio).
-    """
-    if not _is_configured():
-        return
 
+    REARCH-003-TEST-FIX: the top-level _is_configured() guard has been removed.
+    Sub-functions (_lookup_open_episode, _insert_rows_with_episode_id) each
+    carry their own guard. The outer guard caused all E-1 through E-16 tests
+    to return immediately because _SUPABASE_URL/_SUPABASE_KEY are None in the
+    test environment, preventing patched sub-functions from ever being reached.
+    """
     ticker        = signal_data.get("ticker", "UNKNOWN")
     direction     = signal_data.get("direction", "UNKNOWN")
     contract_type = signal_data.get("contract_type", "UNKNOWN")
