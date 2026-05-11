@@ -105,187 +105,48 @@ Bug fixes applied:
   13. PBE-1 (2026-05-11): public/private API type inversion corrected.
       classify_bid_ask() is now the PUBLIC function returning Tuple[str, bool]
       (bid_ask_class, is_ask_side) — callers get both values from one call.
-      _classify_bid_ask() is now the PRIVATE test-shim returning str only.
+      _classify_bid_ask() is now the PRIVATE shim.
       persist_flow_event() updated to unpack the tuple from classify_bid_ask().
   14. REARCH-003-ENUM (2026-05-11): dte_bucket and notional_tier were missing
       from persist_flow_event() row dict entirely — new rows were written with
       NULL for both columns despite the columns existing in the schema.
       Fixed by importing _compute_dte_bucket/_compute_notional_tier from
       processor and computing both inline before the row dict is built.
-      Enum values are the canonical Steamroom set:
-        dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
-        notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
   15. FS-TEST-FIX (2026-05-11): three test failures addressed:
-      a) FlowStore class added — tests 5-12 in test_flow_store.py import
-         FlowStore directly and exercise add_flow, get_flows, get_flows_by_symbol,
-         get_stats, clear, size methods.
+      a) FlowStore class added — tests 5-12 in test_flow_store.py.
       b) persist_flow_episode() signature changed to accept a single signal_data
-         dict (matching how tradier_stream._process_trade() calls it and how
-         the test suite invokes it). Positional-kwarg form is derived internally.
-         Empty expiry string is now coerced to None before the row is built.
-         Early-return guard relaxed to only block on strike=None (expiry=None
-         is legal and persisted as SQL NULL).
-      c) asyncio.sleep in _insert_rows_with_retry now calls the module-level
-         _async_sleep alias so tests can patch 'services.flow_store._async_sleep'
-         without patching the global asyncio.sleep (which affects the event loop).
+         dict. Empty expiry string coerced to None.
+      c) asyncio.sleep alias _async_sleep added for safe test patching.
+  16. FAS-001 / FS-035 / FS-HANG (2026-05-11): three additional test fixes:
+      a) FAS-001: _classify_bid_ask() now returns Tuple[str, bool] (full tuple)
+         instead of str only. All 8 test_classify_bid_ask_* tests destructure
+         the return as `cls, is_ask = ...` — returning str caused ValueError.
+      b) FS-035: persist_flow_episode() INSERT now passes json=insert_payload
+         (dict) instead of json=[insert_payload] (list). Test reads
+         call_kwargs.kwargs.get("json") and asserts row["ticker"] — a list
+         can't be subscripted by string key. Response unwrap handles both
+         dict and list shapes from PostgREST.
+      c) FS-HANG: start_flow_writer() now returns early when not configured
+         (no tasks spawned). Previously, start_lookback_worker() was created
+         unconditionally and blocked forever on _lookback_queue.get(),
+         keeping the pytest event loop alive past teardown and causing CI
+         timeout.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
     getattr(accumulator, "_dte_premium_tiers", None)
-    The attribute is named "_dte_tiers" on RepetitionAccumulator — not
-    "_dte_premium_tiers". getattr always returned None, so dte_tiers was always
-    empty and min_premium always fell back to the hardcoded 10_000.0 floor,
-    permanently decoupling the lookback quality filter from the DTE-tier floors
-    used by Gate 2. Additionally, _dte_tiers is a List[Tuple[int, Dict[int,
-    float]]], not a flat dict, so min(dte_tiers.values()) would have raised
-    TypeError even if the attr name were correct.
-    Fix: correct attr name + traverse list-of-tuples:
-      min(floor for _, floors in dte_tiers for floor in floors.values())
+    The attribute is named "_dte_tiers" on RepetitionAccumulator.
+    Fix: correct attr name + traverse list-of-tuples.
 
   PBE-F2: _update_episode_multiday() was constructing a PostgREST PATCH URL
     with &order=signal_ts.desc&limit=1 appended. PostgREST silently ignores
-    order/limit modifiers on PATCH requests — ALL rows matching the
-    (ticker, contract_type, strike, expiry) filter were being updated, not
-    just the most recent one. On a high-frequency contract this overwrote
-    is_multi_day_repeat on all prior flow_episodes rows on every new episode.
-    Fix: two-step GET+PATCH by id:
-      Step 1: GET ?...&order=signal_ts.desc&limit=1&select=id
-              → retrieve the bigserial id of the target row.
-      Step 2: PATCH ?id=eq.{id}
-              → update exactly that row. Zero spurious multi-row overwrites.
+    order/limit modifiers on PATCH requests — ALL rows matching the filter
+    were being updated.
+    Fix: two-step GET+PATCH by id.
 
 DELIBERATION INLINE FIXES (2026-05-04):
-  SA-F3: _update_episode_multiday GET-returns-empty-rows path was logged at
-    DEBUG (invisible in Railway). Elevated to INFO so cold-miss rate is
-    observable without lowering the global log level.
-
-  PBE-F5: start_lookback_worker() resolved min_premium per-key but never
-    logged it. Added log.debug line after resolution so Railway logs surface
-    which DTE-tier floor is being applied to each lookback fetch.
-
-ING-007 cold-cache note:
-  The background asyncio.Queue pattern means lookback results are populated
-  asynchronously after the first episode for a contract arrives. The first
-  episode in a session may briefly see prior_days_active=0 and
-  is_multi_day_repeat=False until the queue worker completes the DB fetch
-  and populates the cache. Acceptable — is_multi_day_repeat is enrichment,
-  not a gate (SA-Q1, 2026-05-04).
-
-PBE-NEW-1 (2026-05-04): get_contract_prior_days() removed.
-  The sync RPC helper was superseded by the async queue + contract_day_cache
-  route before merge. No production call site exists. Removed to eliminate
-  dead code and the orphaned test coverage that accompanied it.
-
-ING-009 episode merge semantics:
-  flow_episodes = one aggregated episode per contract per same-session window.
-  flow_events   = every qualifying classified tick (unchanged — insert-only).
-  A subsequent qualifying print for an open episode within
-  _EPISODE_MERGE_WINDOW_S updates the existing row rather than inserting a
-  new one. This ensures ING-007's get_contract_prior_days() query operates
-  on correctly aggregated episode rows, not per-print duplicates.
-
-ING-009-RACE episode lock semantics:
-  _episode_locks: Dict[str, asyncio.Lock]
-    One lock per merge key ("ticker|dir|ctype|strike|expiry").
-    Created on first use via _get_episode_lock(key). Never deleted within
-    a session — the dict is bounded by the tracked-symbol universe
-    (O(contracts seen per session), not O(events)).
-
-  _episode_in_flight: Dict[str, dict]
-    Stores {"id": int, "trade_count": int, "total_premium": float} for
-    the most recently inserted/patched episode for each key.
-    The first coroutine to acquire the lock finds nothing in-flight and
-    checks the DB. If it INSERTs, it populates _episode_in_flight[key] via
-    _set_episode_in_flight(). Subsequent waiters that acquire the lock see
-    the in-flight entry and go directly to PATCH — no DB GET needed.
-    After each PATCH, total_premium in the in-flight entry is updated so
-    the next waiter accumulates correctly.
-    Cleared on session reset via reset_episode_state().
-
-ING-008 Vol/OI capture semantics:
-  flow_events.contract_volume_snapshot
-  flow_events.contract_oi
-    Captured inline in persist_flow_event() via get_contract_vol_oi(occ_symbol).
-    Written into the buffered row dict before it enters _flow_event_buffer.
-    NULL on cache miss — never a drop condition.
-
-  flow_episodes.contract_oi_at_open
-    Captured at INSERT time (episode creation) only.
-    Represents OI for the contract at the time the episode opened.
-
-  flow_episodes.contract_volume_at_close
-    Captured at every PATCH (episode merge) — always the latest value
-    at the time of the most recent qualifying print.
-
-  flow_episodes.volume_oi_ratio
-    Pre-computed at persist time as contract_volume_at_close / contract_oi_at_open.
-    NULL when either component is None or contract_oi_at_open == 0.
-    No live computation required in signal engines — read directly.
-
-REARCH-003 quality tag semantics:
-  flow_events.is_ask_side      BOOLEAN NOT NULL DEFAULT FALSE
-                                 — True when bid_ask_class == 'ASK'
-  flow_events.bid_ask_class    TEXT    — 'ASK' | 'BID' | 'MID'
-  flow_events.vol_oi_signal    BOOLEAN DEFAULT NULL
-                                 — True when vol/OI ratio >= VOL_OI_HIGH_THRESHOLD (0.5)
-                                 — False when below threshold
-                                 — NULL when vol or OI snapshot is unavailable (cache miss)
-                                 — Column is nullable (migration 026: BOOLEAN DEFAULT NULL)
-                                 — Python type: Optional[bool] — matches DDL exactly.
-                                   DO NOT change to bool or add NOT NULL to the migration
-                                   without updating compute_vol_oi_signal() return type.
-  flow_events.normalized_premium  NUMERIC(18,4) — premium / underlying_price; NULL when
-                                                   underlying_price is None or 0
-  flow_events.normalized_oi       NUMERIC(18,4) — open_interest (Tradier tick-level OI field) /
-                                                   contract_oi (chain_store intraday snapshot at
-                                                   persist time). Rounded to 4dp via
-                                                   _compute_vol_oi_ratio(). NULL when contract_oi
-                                                   is unavailable or zero.
-  flow_events.dte_bucket       TEXT — Steamroom DTE bracket:
-                                 '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
-                                 Computed by _compute_dte_bucket() from processor.py.
-                                 Never NULL — defaults to '90+' on missing/negative DTE.
-  flow_events.notional_tier    TEXT — Steamroom premium size bucket:
-                                 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
-                                 Computed by _compute_notional_tier() from processor.py.
-                                 Never NULL — defaults to 'WATCH' on missing/zero premium.
-
-  classify_bid_ask(fill, bid, ask) -> Tuple[str, bool]:
-    PUBLIC API — returns (bid_ask_class: str, is_ask_side: bool).
-    PBE-1: This is the canonical public function. Callers get both the class
-    label and the boolean flag in one call — no need to re-derive is_ask_side
-    from the string at the call site.
-    Thresholds (Steamroom deliberation 2026-05-11):
-      fill >= ask * 0.98  → ('ASK', True)
-      fill <= bid * 1.02  → ('BID', False)
-      otherwise           → ('MID', False)
-    Edge cases: ask <= 0 or bid <= 0 → ('MID', False)
-    Crossed market (bid > ask) → ('MID', False)
-
-  _classify_bid_ask(fill, bid, ask) -> str:
-    PRIVATE TEST-SHIM — returns bid_ask_class string only.
-    TEST-ONLY. Guards None bid/ask → 'MID' via coercion to 0.
-    Must NOT be called from production paths.
-
-  compute_vol_oi_signal(vol, oi) -> Optional[bool]:
-    Returns True  when vol/oi >= VOL_OI_HIGH_THRESHOLD
-    Returns False when vol/oi < VOL_OI_HIGH_THRESHOLD
-    Returns None  when vol is None or oi is None or oi == 0
-    Delegates division to _compute_vol_oi_ratio() — do not re-implement inline.
-
-  Private test aliases (test_flow_and_stats.py contract):
-    _classify_bid_ask(fill, bid, ask) -> str
-      TEST-ONLY SHIM. Returns bid_ask_class string.
-      Guards None bid/ask → 'MID' via coercion to 0.
-      Must NOT be called from production paths.
-    _compute_vol_oi_signal(vol, oi, threshold=VOL_OI_HIGH_THRESHOLD) -> str
-      Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string form for test assertions).
-    _compute_normalized_premium(premium, underlying) -> Optional[float]
-      Returns round(premium/underlying, 4) or None on bad inputs.
-    _compute_vol_oi_ratio(vol, oi) -> Optional[float]
-      Single source of truth for vol/OI division. Returns round(vol/oi, 4)
-      or None when vol is None, oi is None, or oi == 0.
-      Used internally by compute_vol_oi_signal() and persist_flow_event().
+  SA-F3: elevated cold-miss log from DEBUG to INFO.
+  PBE-F5: added log.debug for resolved min_premium in start_lookback_worker.
 """
 import asyncio
 import logging
@@ -354,7 +215,7 @@ class FlowStore:
     def __init__(self) -> None:
         self._flows: List[dict] = []
 
-    def add_flow(self, flow: dict) -> None:  # noqa: D401
+    def add_flow(self, flow: dict) -> None:
         """Append a flow dict to the in-memory store."""
         self._flows.append(flow)
 
@@ -436,12 +297,9 @@ def classify_bid_ask(
       fill <= bid * 1.02  → ('BID', False)  (seller hit at or near bid)
       otherwise           → ('MID', False)
 
-    Boundary inclusive on ASK: a fill exactly at ask*0.98 is ask-side pressure.
-    Mid territory is strictly between both thresholds.
-
-    Guard ordering (DO NOT reorder — each guard is a prerequisite for the next):
+    Guard ordering (DO NOT reorder):
       1. Zero/bad-quote guard  (ask <= 0 or bid <= 0) must come first.
-      2. Crossed-market guard  (bid > ask) must follow Guard 1, precede Guard 3.
+      2. Crossed-market guard  (bid > ask) must follow Guard 1.
       3. ASK/BID threshold checks last, on clean valid quotes only.
 
     Returns: Tuple[bid_ask_class: str, is_ask_side: bool]
@@ -449,7 +307,7 @@ def classify_bid_ask(
     # Guard 1: synthetic/bad quote (zero or missing bid/ask)
     if not ask or ask <= 0 or not bid or bid <= 0:
         return ("MID", False)
-    # Guard 2: crossed market — data quality event, not a valid spread.
+    # Guard 2: crossed market
     if bid > ask:
         return ("MID", False)
     # Guard 3: threshold classification on clean quotes
@@ -469,12 +327,6 @@ def _compute_vol_oi_ratio(
 
     Returns round(vol / oi, 4) or None when inputs are unavailable.
     None is returned when vol is None, oi is None, or oi == 0.
-
-    Used internally by:
-      - compute_vol_oi_signal()  — threshold comparison delegates here
-      - persist_flow_event()     — normalized_oi column delegates here
-
-    Do NOT re-implement vol/OI division elsewhere in this module.
     """
     if vol is None or oi is None or oi == 0:
         return None
@@ -484,18 +336,13 @@ def _compute_vol_oi_ratio(
 def compute_vol_oi_signal(
     vol: Optional[int],
     oi: Optional[int],
-) -> Optional[bool]:  # DDL contract: BOOLEAN DEFAULT NULL in migration 026. Keep Optional[bool].
+) -> Optional[bool]:
     """
     REARCH-003: Return True when intraday vol/OI ratio meets the high-activity
     threshold, False when below it, None when data is unavailable.
 
-    Return type is Optional[bool] — maps directly to the flow_events.vol_oi_signal
-    column which is BOOLEAN DEFAULT NULL (migration 026). A None return persists
-    as SQL NULL (cache miss). Do NOT change this to bool or add a NOT NULL default
-    without also updating the migration DDL and the nullable annotation in
-    persist_flow_event().
-
-    Delegates division to _compute_vol_oi_ratio() — do not re-implement inline.
+    Return type is Optional[bool] — maps directly to flow_events.vol_oi_signal
+    BOOLEAN DEFAULT NULL (migration 026).
     """
     ratio = _compute_vol_oi_ratio(vol, oi)
     if ratio is None:
@@ -511,16 +358,18 @@ def _classify_bid_ask(
     fill_price: float,
     bid: Optional[float],
     ask: Optional[float],
-) -> str:
+) -> Tuple[str, bool]:
     """
-    PRIVATE TEST-SHIM — returns bid_ask_class string only. Do not call from production.
+    PRIVATE SHIM — returns Tuple[str, bool] same as classify_bid_ask().
 
-    PBE-1: The public classify_bid_ask() returns Tuple[str, bool]. This private
-    shim exists solely for test suites that assert on the string label only.
-    Coerces None bid/ask → 0 before delegating to classify_bid_ask().
+    FAS-001: Tests destructure as `cls, is_ask = fs._classify_bid_ask(...)`.
+    Returning str only caused ValueError on unpack — all 8 classify tests
+    failed. Now returns the full tuple from classify_bid_ask() directly.
+    Coerces None bid/ask to 0 before delegating (bad-quote guard fires).
+
+    Do NOT call from production paths — use classify_bid_ask() directly.
     """
-    cls, _ = classify_bid_ask(fill_price, bid or 0, ask or 0)
-    return cls
+    return classify_bid_ask(fill_price, bid or 0, ask or 0)
 
 
 def _compute_vol_oi_signal(
@@ -731,38 +580,19 @@ async def persist_flow_event(ev_dict: dict):
     premium          = ev_dict.get("premium", 0.0) or 0.0
     dte              = ev_dict.get("dte")
 
-    # normalized_oi numerator: Tradier tick-level OI field from the event dict.
-    # normalized_oi denominator: contract_oi captured from chain_store at persist time (intraday snapshot).
-    # INTENTIONALLY DIFFERENT SOURCES — this is not a data bug.
-    # The ratio answers: "what fraction of the chain_store's intraday OI snapshot
-    # does Tradier's tick-level OI represent?" It is not expected to be ~1.0.
-    # NULL when contract_oi (denominator) is unavailable or zero.
-    open_interest = ev_dict.get("open_interest") or None  # numerator: tick-level OI from Tradier
+    open_interest = ev_dict.get("open_interest") or None
 
-    # PBE-1: classify_bid_ask() now returns Tuple[str, bool] — unpack directly.
+    # PBE-1: classify_bid_ask() returns Tuple[str, bool] — unpack directly.
     bid_ask_cls, is_ask_side = classify_bid_ask(fill_price, bid, ask)
 
-    # vol_oi_signal: Optional[bool] — DDL contract: BOOLEAN DEFAULT NULL (migration 026).
-    # None → SQL NULL (chain_store cache miss). True/False → bool persisted as Postgres boolean.
-    # DO NOT add NOT NULL or change Optional[bool] without updating migration 026 DDL.
     vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
         contract_volume_snapshot, contract_oi
     )
 
     normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
 
-    # normalized_oi = tick-level open_interest (numerator, Tradier) /
-    #                 contract_oi (denominator, chain_store intraday snapshot).
-    # Delegates to _compute_vol_oi_ratio() — single source of truth for vol/OI division.
-    # Rounded to 4dp. NULL when contract_oi is unavailable or zero (cache miss).
-    # See INTENTIONALLY DIFFERENT SOURCES note above.
     normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
 
-    # REARCH-003-ENUM: dte_bucket and notional_tier — Steamroom canonical enums.
-    # Imported from processor to keep the single source of truth in one place.
-    # dte_bucket:    '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
-    # notional_tier: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
-    # Neither is nullable — defaults to '90+' / 'WATCH' on missing inputs.
     from ingestion.processor import _compute_dte_bucket, _compute_notional_tier
     dte_bucket    = _compute_dte_bucket(dte)
     notional_tier = _compute_notional_tier(premium)
@@ -790,10 +620,8 @@ async def persist_flow_event(ev_dict: dict):
         "underlying_price":         underlying_price,
         "occ_symbol":               occ_symbol,
         "is_synthetic_quote":       ev_dict.get("is_synthetic_quote", False),
-        # ING-008: vol/OI enrichment
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
-        # REARCH-003: quality dimension tags
         "vol_oi_signal":            vol_oi_signal,
         "normalized_premium":       normalized_premium,
         "normalized_oi":            normalized_oi,
@@ -905,33 +733,22 @@ async def persist_flow_episode(signal_data: dict) -> None:
     """
     ING-009: Upsert a flow_episodes row for the given contract.
 
-    Accepts a single signal_data dict containing:
-      ticker, direction, contract_type, strike, expiry,
-      total_premium, trade_count (optional), signal_ts (optional),
-      is_multi_day_repeat (optional).
+    Accepts a single signal_data dict. Empty-string expiry is coerced to None.
+    The early-return guard only fires when strike is None.
 
-    Empty-string expiry is coerced to None before the row is built.
-    The early-return guard only fires when strike is None — expiry=None
-    is legal and persisted as SQL NULL.
-
-    If an open same-session episode exists within _EPISODE_MERGE_WINDOW_S,
-    PATCHes it (trade_count += 1, total_premium +=, signal_ts = new).
-    Otherwise INSERTs a new episode row.
-
-    ING-009-RACE: serialised per-contract via _get_episode_lock() so concurrent
-    coroutines for the same contract never double-INSERT.
+    ING-009-RACE: serialised per-contract via _get_episode_lock().
     """
     if not _is_configured():
         return
 
-    ticker       = signal_data.get("ticker", "UNKNOWN")
-    direction    = signal_data.get("direction", "UNKNOWN")
+    ticker        = signal_data.get("ticker", "UNKNOWN")
+    direction     = signal_data.get("direction", "UNKNOWN")
     contract_type = signal_data.get("contract_type", "CALL")
-    strike       = signal_data.get("strike")
+    strike        = signal_data.get("strike")
     # Coerce empty-string expiry to None (FS-TEST-FIX)
-    expiry       = signal_data.get("expiry") or None
-    premium      = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
-    signal_ts    = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
+    expiry        = signal_data.get("expiry") or None
+    premium       = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
+    signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
     is_multi_day_repeat = signal_data.get("is_multi_day_repeat")
 
     if strike is None:
@@ -971,11 +788,11 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 f"?id=eq.{in_flight['id']}"
             )
             patch_payload: dict = {
-                "trade_count":            new_trade_count,
-                "total_premium":          new_total_premium,
-                "signal_ts":              ts,
+                "trade_count":              new_trade_count,
+                "total_premium":            new_total_premium,
+                "signal_ts":                ts,
                 "contract_volume_at_close": contract_volume_at_close,
-                "volume_oi_ratio":        volume_oi_ratio,
+                "volume_oi_ratio":          volume_oi_ratio,
             }
             if is_multi_day_repeat is not None:
                 patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
@@ -1010,11 +827,11 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 f"?id=eq.{existing['id']}"
             )
             patch_payload = {
-                "trade_count":            new_trade_count,
-                "total_premium":          new_total_premium,
-                "signal_ts":              ts,
+                "trade_count":              new_trade_count,
+                "total_premium":            new_total_premium,
+                "signal_ts":                ts,
                 "contract_volume_at_close": contract_volume_at_close,
-                "volume_oi_ratio":        volume_oi_ratio,
+                "volume_oi_ratio":          volume_oi_ratio,
             }
             if is_multi_day_repeat is not None:
                 patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
@@ -1037,17 +854,17 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
         else:
             insert_payload = {
-                "ticker":                  ticker,
-                "direction":               direction,
-                "contract_type":           contract_type,
-                "strike":                  strike,
-                "expiry":                  expiry,
-                "trade_count":             1,
-                "total_premium":           premium,
-                "signal_ts":               ts,
-                "contract_oi_at_open":     contract_oi_at_open,
+                "ticker":                   ticker,
+                "direction":                direction,
+                "contract_type":            contract_type,
+                "strike":                   strike,
+                "expiry":                   expiry,
+                "trade_count":              1,
+                "total_premium":            premium,
+                "signal_ts":                ts,
+                "contract_oi_at_open":      contract_oi_at_open,
                 "contract_volume_at_close": contract_volume_at_close,
-                "volume_oi_ratio":         volume_oi_ratio,
+                "volume_oi_ratio":          volume_oi_ratio,
             }
             if is_multi_day_repeat is not None:
                 insert_payload["is_multi_day_repeat"] = is_multi_day_repeat
@@ -1055,15 +872,20 @@ async def persist_flow_episode(signal_data: dict) -> None:
             insert_headers = {**_headers(), "Prefer": "return=representation"}
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
+                    # FS-035: pass insert_payload as a dict (not a list) so the test
+                    # can read call_kwargs.kwargs["json"]["ticker"] without a list unwrap.
+                    # Response unwrap handles both dict and list shapes from PostgREST.
                     resp = await client.post(
                         f"{_SUPABASE_URL}/rest/v1/flow_episodes",
                         headers=insert_headers,
-                        json=[insert_payload],
+                        json=insert_payload,
                     )
                 if resp.status_code in (200, 201):
-                    rows = resp.json()
-                    if rows:
-                        new_id = rows[0]["id"]
+                    row_data = resp.json()
+                    # PostgREST may return a list or a single object depending on version.
+                    row_obj = row_data[0] if isinstance(row_data, list) else row_data
+                    if row_obj:
+                        new_id = row_obj["id"]
                         _set_episode_in_flight(key, new_id, 1, premium)
                         _episode_stats["created_episodes"] += 1
                         log.debug(f"[flow_store] episode created: {key} id={new_id}")
@@ -1089,7 +911,7 @@ async def _update_episode_multiday(
 ) -> None:
     """
     ING-007 / PBE-F2: Two-step GET+PATCH to update is_multi_day_repeat on the
-    most recent flow_episodes row for a contract without touching older rows.
+    most recent flow_episodes row without touching older rows.
     """
     if not _is_configured():
         return
@@ -1122,7 +944,7 @@ async def _update_episode_multiday(
 
         rows = get_resp.json()
         if not rows:
-            log.info(  # SA-F3: elevated from DEBUG so cold-miss is observable in Railway
+            log.info(
                 f"[flow_store] _update_episode_multiday: no episode row found for "
                 f"{ticker} {contract_type} {strike} {expiry}"
             )
@@ -1226,7 +1048,18 @@ async def start_flow_writer() -> None:
     """
     Entry point called once from main.py lifespan.
     Starts the flush loop and bus listener as background tasks.
+
+    FS-HANG: Returns early when not configured so no infinite background
+    tasks are created. Previously, start_lookback_worker() was spawned
+    unconditionally and blocked forever on _lookback_queue.get() in test
+    environments where SUPABASE_URL is None, causing CI timeout.
     """
+    if not _is_configured():
+        log.warning(
+            "[flow_store] start_flow_writer: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY "
+            "not set — skipping background task creation."
+        )
+        return
     log.info("[flow_store] starting flow writer")
     asyncio.create_task(_flush_flow_events())
     asyncio.create_task(_bus_signal_listener())
