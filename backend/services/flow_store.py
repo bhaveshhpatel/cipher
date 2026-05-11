@@ -91,12 +91,16 @@ Bug fixes applied:
       conviction_score from persist_flow_event() row dict — all three columns
       were dropped from flow_events in migration 024. Keeping them caused a
       PostgREST 400 on every event insert.
-  11. REARCH-003 (2026-05-10): added four event quality tag fields to the
-      flow_events row dict: is_ask_side, bid_ask_class (now computed via
-      shared helper), vol_oi_signal, normalized_premium.
-      Three pure helpers added: _classify_bid_ask(), _compute_vol_oi_signal(),
-      _compute_normalized_premium(). All computed from values already present
-      in ev_dict — zero new I/O, zero new blocking calls.
+  11. REARCH-003 (2026-05-10): full event quality tag suite written to
+      flow_events. Seven fields total:
+        is_ask_side, bid_ask_class, vol_oi_signal, normalized_premium
+          — computed by module-level pure helpers (_classify_bid_ask,
+            _compute_vol_oi_signal, _compute_normalized_premium).
+        dte_bucket, notional_tier, event_cipher_score
+          — computed by IngestionProcessor.enrich_tags() (REARCH-003 static
+            method on processor.py), called after the tag block above.
+      All seven fields are derived from values already in ev_dict or
+      contract vol/OI cache — zero new I/O, zero new blocking calls.
       Migrations 026 (ADD COLUMN) and 027 (backfill) accompany this change.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
@@ -213,6 +217,22 @@ REARCH-003 event quality tag semantics:
     premium / underlying_price, rounded to 4 decimal places.
     NULL when underlying_price is None or 0 (div-by-zero safe).
     Computed by _compute_normalized_premium().
+
+  flow_events.dte_bucket
+    DTE bracket: '0DTE' | '1-4' | '5-60' | '61-90' | '90+'
+    Computed by IngestionProcessor.enrich_tags() via _compute_dte_bucket().
+
+  flow_events.notional_tier
+    Premium size bucket: 'WATCH' | 'NOTEWORTHY' | 'BLOCK' | 'GOLDEN'
+    Thresholds: WATCH <$50k, NOTEWORTHY $50k-$99k, BLOCK $100k-$499k, GOLDEN $500k+
+    Computed by IngestionProcessor.enrich_tags() via _compute_notional_tier().
+
+  flow_events.event_cipher_score
+    Sum of 4 binary Steamroom dimensions (0–4). Dim 5 is REARCH-004 scope.
+    Dim 1: is_ask_side, Dim 2: vol_oi_signal=='HIGH',
+    Dim 3: notional_tier in ('BLOCK','GOLDEN'), Dim 4: dte_bucket in ('1-4','5-60')
+    Computed by IngestionProcessor.enrich_tags() via _compute_cipher_score().
+    None inputs treated as zero-score defaults — never raises.
 """
 import asyncio
 import logging
@@ -559,11 +579,27 @@ async def persist_flow_event(ev_dict: dict):
         # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
-        # REARCH-003: event quality tags
+        # REARCH-003: event quality tags (group 1 — bid/ask + vol/OI + normalised premium)
         "is_ask_side":              is_ask_side,
         "vol_oi_signal":            vol_oi_signal,
         "normalized_premium":       normalized_premium,
     }
+
+    # -----------------------------------------------------------------------
+    # REARCH-003: inject dte_bucket, notional_tier, event_cipher_score.
+    # enrich_tags() reads is_ask_side and vol_oi_signal already in `row`,
+    # plus dte and premium — mutates row in place and returns it.
+    # Local import avoids circular: flow_store ← processor ← supabase_client.
+    # -----------------------------------------------------------------------
+    try:
+        from ingestion.processor import IngestionProcessor
+        IngestionProcessor.enrich_tags(row)
+    except Exception as exc:  # enrichment failure is non-fatal — same policy as ING-008
+        log.warning("[flow_store] enrich_tags failed — dte_bucket/notional_tier/cipher_score NULL: %s", exc)
+        row.setdefault("dte_bucket",         None)
+        row.setdefault("notional_tier",      None)
+        row.setdefault("event_cipher_score", None)
+
     _flow_event_buffer.append(row)
 
     if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
@@ -767,17 +803,3 @@ def _compute_vol_oi_ratio(
     if volume is None or oi is None or oi == 0:
         return None
     return round(volume / oi, 4)
-
-
-async def persist_flow_episode(signal_data: dict):
-    """
-    ING-009: Upsert one episode into flow_episodes.
-
-    On first qualifying print for a contract within the session window:
-      INSERT a new episode row. Increments _episode_stats["created_episodes"].
-
-    On subsequent qualifying print for an open episode within
-    _EPISODE_MERGE_WINDOW_S:
-      PATCH the existing row:
-        trade_count  += 1
-        total_premi
