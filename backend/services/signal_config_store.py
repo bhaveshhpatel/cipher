@@ -253,6 +253,10 @@ def _fetch_from_db() -> Optional[dict[str, Any]]:
     """
     Fetch all rows from signal_config and return a typed dict.
 
+    Synchronous — used by the sync hot path (reload_signal_config, _maybe_refresh).
+    For async callers (router endpoints, async_reload_signal_config) use
+    _async_fetch_from_db() instead.
+
     Returns None on any network or parse error so the caller can
     distinguish a DB failure from an empty table.
     Returns an empty dict if the table is reachable but has no rows.
@@ -279,7 +283,17 @@ def _fetch_from_db() -> Optional[dict[str, Any]]:
 async def _async_fetch_from_db() -> Optional[dict[str, Any]]:
     """
     Async variant of _fetch_from_db() using httpx.AsyncClient.
-    Used directly by routers that need a non-blocking DB call.
+
+    Used by async_reload_signal_config() and any async caller that needs a
+    non-blocking DB read.  This is the correct function to mock in tests
+    that exercise the async reload path:
+
+        with patch(
+            "services.signal_config_store._async_fetch_from_db",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {"sig.min_dte": 10}
+            result = await async_reload_signal_config()
 
     Returns None on any error (same contract as sync _fetch_from_db).
     """
@@ -312,8 +326,7 @@ def reload_signal_config() -> dict[str, Any]:
     Force an immediate DB refresh and atomically swap the snapshot.
 
     Sync version — used by the signal engine hot path and startup.
-    For the async router version see async_reload_signal_config() which
-    is re-exported as the module-level name after both are defined.
+    For the async router version see async_reload_signal_config().
 
     Returns the new snapshot dict (a copy — callers must not mutate it).
     """
@@ -521,18 +534,22 @@ async def async_reload_signal_config() -> dict[str, Any]:
     """
     Async version of reload_signal_config().
 
-    Forces an immediate DB refresh using the patching-friendly _fetch_from_db
-    name (which tests mock via AsyncMock) so that test patches on
-    ``services.signal_config_store._fetch_from_db`` intercept this path
-    correctly.
+    Forces an immediate DB refresh using _async_fetch_from_db() (the correct
+    async variant using httpx.AsyncClient) and atomically swaps the snapshot.
 
-    Re-exported as ``reload_signal_config`` at module level so the router
-    can ``await reload_signal_config()`` without code changes.
+    To intercept this path in tests, mock _async_fetch_from_db:
+
+        with patch(
+            "services.signal_config_store._async_fetch_from_db",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {"sig.min_dte": 10}
+            result = await async_reload_signal_config()
+
+    Returns the new snapshot dict (a copy — callers must not mutate it).
     """
     global _snapshot, _snapshot_ts
-    fetched = await _fetch_from_db()  # type: ignore[misc]
-    # _fetch_from_db is replaced by AsyncMock in tests; in production it is
-    # the sync function above.  We call it here so patches always intercept.
+    fetched = await _async_fetch_from_db()
     fresh = {**_DEFAULTS, **(fetched or {})}
     _snapshot = fresh
     _snapshot_ts = time.monotonic()
@@ -544,8 +561,9 @@ async def async_get_signal_config(force_refresh: bool = False) -> dict[str, Any]
     """
     Async version of get_signal_config().
 
-    Returns the current snapshot, triggering an async refresh if the TTL
-    has expired OR if *force_refresh* is True.
+    Returns the current snapshot, triggering an async refresh via
+    async_reload_signal_config() (which calls _async_fetch_from_db()) if
+    the TTL has expired OR if *force_refresh* is True.
 
     Parameters
     ----------
@@ -553,9 +571,6 @@ async def async_get_signal_config(force_refresh: bool = False) -> dict[str, Any]
         When True, bypasses the TTL and forces an immediate DB fetch.
         Used by the admin PATCH endpoint (REARCH-008) after a successful
         write so operators see their change reflected immediately.
-
-    Re-exported as ``get_signal_config`` at module level so the router
-    can ``await get_signal_config()`` without code changes.
     """
     if force_refresh or (time.monotonic() - _snapshot_ts >= _CACHE_TTL):
         await async_reload_signal_config()
