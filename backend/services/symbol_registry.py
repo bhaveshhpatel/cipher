@@ -113,6 +113,31 @@ FIX QQ1-B (2026-05-09): Round OI average instead of integer floor division.
   one tier lower (T2 instead of T1, or T3 instead of T2), applying a higher
   min_premium gate floor to all their flow events.
   Fix: round(total_oi / count) in both sites.
+
+FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
+  quote or chain API stalled at the TCP layer before the httpx read timeout
+  fired. Both network phases inside build() now have hard asyncio.wait_for()
+  deadlines:
+
+  - _fetch_stock_prices(): 45s timeout. On expiry, logs ERROR and sets
+    zero_price_fallback=True so chain fetches still run with ATM filtering
+    bypassed (existing B-ZERO-PRICE path). _build_complete is guaranteed to
+    be set.
+
+  - asyncio.gather(*tasks) for chain fetches: 180s timeout (covers ~765
+    tickers at build_concurrency=50 with reasonable Tradier latency). On
+    expiry, logs ERROR and proceeds with whatever contracts were fetched
+    before the deadline; _build_complete is still set so stream workers
+    can spawn against the partial registry.
+
+  Both timeouts are wrapped in try/except asyncio.TimeoutError so the
+  outer non-fatal wrapper in main.py/_background_build_and_upsert is not
+  triggered — the build completes (possibly partial) rather than raising.
+
+  Root cause of 2026-05-12 incident: server deployed at 14:43 UTC, H3
+  incremental build logged '765 tickers to refresh' then went silent.
+  _build_complete never set → stream workers never spawned → no flow data
+  processed during market hours.
 """
 import asyncio
 import logging
@@ -131,6 +156,12 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 log = logging.getLogger("symbol_registry")
 
 _DEFAULT_BUILD_CONCURRENCY = 50
+
+# BUILD-HANG: hard timeouts for the two network-bound phases inside build().
+# These prevent an indefinite hang when Tradier stalls at the TCP layer
+# before the httpx read timeout fires.
+_PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3834 tickers × 200/batch = 20 batches
+_CHAIN_GATHER_TIMEOUT_S = 180   # asyncio.gather(*tasks): up to ~765 chain fetches at concurrency=50
 
 
 @dataclass
@@ -341,6 +372,13 @@ class SymbolRegistry:
           first build epoch, preventing silent contract-universe gaps that
           caused institutional flow on >30-DTE or >±10% ATM contracts to
           be dropped at stream time (lookup() → None).
+
+        BUILD-HANG - hard timeouts on network phases:
+          _fetch_stock_prices() is wrapped in asyncio.wait_for(timeout=45s).
+          asyncio.gather(*tasks) for chain fetches is wrapped in
+          asyncio.wait_for(timeout=180s). Both phases degrade gracefully
+          on timeout (zero-price fallback / partial registry) and always
+          set _build_complete=True so stream workers can spawn.
         """
         from services.symbols_loader import SymbolQuote
 
@@ -402,12 +440,33 @@ class SymbolRegistry:
                 if t in set(tickers_to_carry)
             }
 
-            prices, raw_quotes = await self._fetch_stock_prices()
+            # BUILD-HANG: hard 45s timeout on _fetch_stock_prices().
+            # A TCP-level stall on the Tradier quotes API will not block build()
+            # indefinitely. On timeout, degrade to zero_price_fallback=True
+            # (existing B-ZERO-PRICE path) so chain fetches still run.
+            zero_price_fallback = False
+            raw_quotes: dict[str, dict] = {}
+            try:
+                prices, raw_quotes = await asyncio.wait_for(
+                    self._fetch_stock_prices(),
+                    timeout=_PRICES_FETCH_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                log.error(
+                    "[symbol_registry] BUILD-HANG: _fetch_stock_prices() timed out "
+                    "after %ds — falling back to zero-price mode so chain fetches "
+                    "still run (ATM filter bypassed).",
+                    _PRICES_FETCH_TIMEOUT_S,
+                )
+                prices = {}
+                zero_price_fallback = True
+
             self._stock_prices = prices
             log.info("[symbol_registry] Stock prices fetched: %d tickers", len(prices))
 
-            zero_price_fallback = False
-            if tickers_to_refresh and not prices:
+            if tickers_to_refresh and not prices and not zero_price_fallback:
+                # B-ZERO-PRICE: explicit all-missing case (prices returned empty
+                # without timeout). zero_price_fallback already set on timeout above.
                 log.error(
                     "[symbol_registry] B-ZERO-PRICE: _fetch_stock_prices() returned 0 prices "
                     "for %d tickers - Tradier quote API may be down or rate-limited. "
@@ -433,7 +492,25 @@ class SymbolRegistry:
                     _build_with_sem(ticker)
                     for ticker in tickers_to_refresh
                 ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # BUILD-HANG: hard 180s timeout on the chain-fetch gather.
+                # Covers ~765 tickers at concurrency=50 with normal Tradier
+                # latency. On timeout, proceed with whatever contracts were
+                # fetched before the deadline; _build_complete is still set.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=_CHAIN_GATHER_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "[symbol_registry] BUILD-HANG: chain gather timed out after %ds "
+                        "(%d tickers queued). Proceeding with partial registry (%d contracts "
+                        "so far) — stream workers will spawn against partial data. "
+                        "Next refresh_loop() will complete the missing tickers.",
+                        _CHAIN_GATHER_TIMEOUT_S,
+                        len(tickers_to_refresh),
+                        len(new_registry),
+                    )
 
             synthetic_quotes = []
             for ticker in self._watchlist:
