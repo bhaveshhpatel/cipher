@@ -51,7 +51,7 @@ from signals.signal_engine import (
 # ---------------------------------------------------------------------------
 
 # Minimum valid config dict accepted by compute_conviction_score.
-# sig.noteworthy_premium=50_000 → watch_floor = 25_000 (D1 floor).
+# sig.noteworthy_premium=50_000 -> watch_floor = 25_000 (D1 floor).
 MIN_CFG = {
     "sig.ask_side_pct_floor": 0.6,
     "sig.min_trade_count": 3,
@@ -100,7 +100,7 @@ def _make_cfg(**overrides) -> dict:
 # compute_conviction_score — all 32 combinations (5 binary dimensions)
 # =============================================================================
 
-# Dimension index → (attr_name, passing_value, failing_value)
+# Dimension index -> (attr_name, passing_value, failing_value)
 # Each tuple defines what makes a dimension PASS or FAIL.
 #
 # D1: total_premium >= watch_floor (noteworthy_premium * 0.5 = 25_000)
@@ -146,7 +146,7 @@ def test_compute_conviction_score_all_32_combinations(vector: tuple[bool, ...]) 
     expected = sum(vector)
     result = compute_conviction_score(ep, cfg)
     assert result == expected, (
-        f"vector={vector!r} → expected score={expected}, got {result}. "
+        f"vector={vector!r} -> expected score={expected}, got {result}. "
         f"Episode attrs: total_premium={ep.total_premium}, ask_side_pct={ep.ask_side_pct}, "
         f"vol_oi_signal={ep.vol_oi_signal}, dte_bucket={ep.dte_bucket!r}, trade_count={ep.trade_count}"
     )
@@ -167,12 +167,12 @@ def test_conviction_d1_premium_at_exact_watch_floor_passes() -> None:
 def test_conviction_d1_premium_just_below_watch_floor_fails() -> None:
     """total_premium=24_999 (below watch_floor=25_000) must fail D1."""
     ep = EpisodeFaker(total_premium=24_999.0)
-    # Only D1 fails; D2–D5 pass → expect 4
+    # Only D1 fails; D2-D5 pass -> expect 4
     assert compute_conviction_score(ep, _make_cfg()) == 4
 
 
 def test_conviction_d1_premium_none_fails_d1() -> None:
-    """None total_premium coerces to 0.0, which is below watch_floor → D1 fail."""
+    """None total_premium coerces to 0.0, which is below watch_floor -> D1 fail."""
     ep = EpisodeFaker(total_premium=None)
     result = compute_conviction_score(ep, _make_cfg())
     assert result == 4  # D1 missed; D2-D5 pass
@@ -180,7 +180,7 @@ def test_conviction_d1_premium_none_fails_d1() -> None:
 
 def test_conviction_d1_custom_noteworthy_floor_from_cfg() -> None:
     """watch_floor is derived from cfg noteworthy_premium, not hardcoded."""
-    # Raise noteworthy to 200_000 → watch_floor = 100_000
+    # Raise noteworthy to 200_000 -> watch_floor = 100_000
     cfg_high = _make_cfg(**{"sig.noteworthy_premium": 200_000.0})
     ep_pass = EpisodeFaker(total_premium=100_000.0)  # exactly at new watch_floor
     ep_fail = EpisodeFaker(total_premium=99_999.0)   # just below
@@ -224,13 +224,13 @@ def test_conviction_notional_tier_not_a_scored_dimension() -> None:
 
 
 def test_conviction_dte_bucket_90plus_disqualifies() -> None:
-    """'90+' is in _DISQUALIFYING_DTE_BUCKETS → D4 fails."""
+    """'90+' is in _DISQUALIFYING_DTE_BUCKETS -> D4 fails."""
     ep = EpisodeFaker(dte_bucket="90+")
     assert compute_conviction_score(ep, _make_cfg()) == 4
 
 
 def test_conviction_dte_bucket_0_7_disqualifies() -> None:
-    """'0-7' is in _DISQUALIFYING_DTE_BUCKETS → D4 fails."""
+    """'0-7' is in _DISQUALIFYING_DTE_BUCKETS -> D4 fails."""
     ep = EpisodeFaker(dte_bucket="0-7")
     assert compute_conviction_score(ep, _make_cfg()) == 4
 
@@ -248,7 +248,7 @@ def test_conviction_trade_count_exact_floor_passes() -> None:
 
 
 def test_conviction_trade_count_below_floor_fails() -> None:
-    """trade_count=2 with min_trade_count=3 → D5 fails."""
+    """trade_count=2 with min_trade_count=3 -> D5 fails."""
     ep = EpisodeFaker(trade_count=2)
     assert compute_conviction_score(ep, _make_cfg()) == 4
 
@@ -355,7 +355,7 @@ def test_build_signal_row_direction_written_correctly() -> None:
 
 def test_build_signal_row_composite_score_normalised() -> None:
     """composite_score must equal conviction_score / 5.0 (3dp)."""
-    ep = _valid_episode()  # all dims pass → conviction=5
+    ep = _valid_episode()  # all dims pass -> conviction=5
     row = build_signal_row(ep, "GOLDEN", "BULLISH", _valid_cfg(), conviction_score=5)
     assert row["composite_score"] == 1.0
 
@@ -401,4 +401,127 @@ def test_build_signal_row_ask_side_pct_none_is_null() -> None:
 
 def test_build_signal_row_signal_ts_defaults_to_utcnow() -> None:
     """When signal_ts is not supplied, an ISO-8601 UTC timestamp must be generated."""
-    before = datetime.now(tz=
+    before = datetime.now(tz=timezone.utc)
+    row = build_signal_row(_valid_episode(), "GOLDEN", "BULLISH", _valid_cfg())
+    after = datetime.now(tz=timezone.utc)
+
+    ts_str = row["signal_ts"]
+    assert ts_str is not None, "signal_ts must not be None"
+    ts = datetime.fromisoformat(ts_str)
+    # Ensure the timestamp is timezone-aware
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    assert before <= ts <= after, (
+        f"signal_ts {ts_str!r} is outside the expected [{before.isoformat()}, {after.isoformat()}] window"
+    )
+
+
+def test_build_signal_row_explicit_signal_ts_preserved() -> None:
+    """An explicitly supplied signal_ts must be written verbatim to the row."""
+    fixed_ts = "2026-01-15T12:00:00+00:00"
+    row = build_signal_row(_valid_episode(), "GOLDEN", "BULLISH", _valid_cfg(), signal_ts=fixed_ts)
+    assert row["signal_ts"] == fixed_ts
+
+
+# =============================================================================
+# build_signal_row — ValueError on bad vocab
+# =============================================================================
+
+def test_build_signal_row_invalid_alert_level_raises() -> None:
+    """Unrecognised alert_level must raise ValueError with the bad value in the message."""
+    with pytest.raises(ValueError, match="alert_level"):
+        build_signal_row(_valid_episode(), "GARBAGE", "BULLISH", _valid_cfg())
+
+
+def test_build_signal_row_invalid_direction_raises() -> None:
+    """Unrecognised direction must raise ValueError with the bad value in the message."""
+    with pytest.raises(ValueError, match="direction"):
+        build_signal_row(_valid_episode(), "GOLDEN", "SIDEWAYS", _valid_cfg())
+
+
+# =============================================================================
+# build_signal_row — vol_oi_ratio derivation fallback
+# =============================================================================
+
+def test_build_signal_row_vol_oi_ratio_direct_attr() -> None:
+    """When vol_oi_ratio is present on the episode, it is used directly."""
+    ep = _valid_episode(vol_oi_ratio=2.5)
+    row = build_signal_row(ep, "GOLDEN", "BULLISH", _valid_cfg())
+    assert row["vol_oi_ratio"] == 2.5
+
+
+def test_build_signal_row_vol_oi_ratio_derived_from_volume_oi() -> None:
+    """When vol_oi_ratio is None but volume and OI attrs exist, ratio is derived."""
+    ep = _valid_episode(
+        vol_oi_ratio=None,
+        contract_volume_at_close=300,
+        contract_oi_at_open=100,
+    )
+    row = build_signal_row(ep, "GOLDEN", "BULLISH", _valid_cfg())
+    assert row["vol_oi_ratio"] == round(300 / 100, 4)
+
+
+def test_build_signal_row_vol_oi_ratio_none_when_oi_zero() -> None:
+    """OI of zero must result in vol_oi_ratio=None (no division by zero)."""
+    ep = _valid_episode(
+        vol_oi_ratio=None,
+        contract_volume_at_close=200,
+        contract_oi_at_open=0,
+    )
+    row = build_signal_row(ep, "GOLDEN", "BULLISH", _valid_cfg())
+    assert row["vol_oi_ratio"] is None
+
+
+def test_build_signal_row_vol_oi_ratio_none_when_both_missing() -> None:
+    """When all three vol_oi attrs are absent/None, vol_oi_ratio must be None."""
+    ep = _valid_episode(
+        vol_oi_ratio=None,
+        contract_volume_at_close=None,
+        contract_oi_at_open=None,
+    )
+    row = build_signal_row(ep, "GOLDEN", "BULLISH", _valid_cfg())
+    assert row["vol_oi_ratio"] is None
+
+
+# =============================================================================
+# _derive_recommendation — mapping conviction score to recommendation string
+# =============================================================================
+
+def test_derive_recommendation_score_5_bullish() -> None:
+    assert _derive_recommendation(5, "BULLISH") == "STRONG_BUY"
+
+
+def test_derive_recommendation_score_5_bearish() -> None:
+    assert _derive_recommendation(5, "BEARISH") == "STRONG_SELL"
+
+
+def test_derive_recommendation_score_3_bullish() -> None:
+    result = _derive_recommendation(3, "BULLISH")
+    assert result in ("BUY", "WATCH", "HOLD")  # implementation-defined for mid-range
+
+
+def test_derive_recommendation_score_0_neutral() -> None:
+    result = _derive_recommendation(0, "NEUTRAL")
+    assert result in ("HOLD", "WATCH", "NO_SIGNAL")  # implementation-defined
+
+
+def test_derive_recommendation_score_5_neutral() -> None:
+    """High conviction + neutral direction should not be BUY or SELL."""
+    result = _derive_recommendation(5, "NEUTRAL")
+    assert result not in ("STRONG_BUY", "STRONG_SELL", "BUY", "SELL")
+
+
+# =============================================================================
+# Module-level constants — quick sanity checks
+# =============================================================================
+
+def test_qualifying_tiers_contains_expected_values() -> None:
+    """_QUALIFYING_TIERS must contain at least GOLDEN, BLOCK, NOTEWORTHY."""
+    for tier in ("GOLDEN", "BLOCK", "NOTEWORTHY"):
+        assert tier in _QUALIFYING_TIERS, f"{tier!r} missing from _QUALIFYING_TIERS"
+
+
+def test_disqualifying_dte_buckets_contains_extremes() -> None:
+    """_DISQUALIFYING_DTE_BUCKETS must include the short-dated and xlong buckets."""
+    assert "0-7" in _DISQUALIFYING_DTE_BUCKETS
+    assert "90+" in _DISQUALIFYING_DTE_BUCKETS
