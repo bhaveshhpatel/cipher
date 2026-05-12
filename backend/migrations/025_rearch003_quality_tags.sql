@@ -1,5 +1,7 @@
 -- =============================================================================
 -- Migration 025: REARCH-003 quality tag columns on flow_events
+-- applied: YES  (confirmed 2026-05-11 via Supabase cipher-database / kpajucxqlrteckfuafvq)
+-- normalized_oi column verified present: NUMERIC DEFAULT NULL ✓
 -- =============================================================================
 -- Adds normalized_oi, the one REARCH-003 quality tag column not yet present
 -- in the schema. All other columns in this set were added by prior migrations:
