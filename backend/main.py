@@ -56,6 +56,16 @@ Key architectural fixes:
                           fetch_chain_fn      — _fetch_tradier_chain(symbol) helper
                         invalidate_vol_oi_cache() called at market-open boundary in
                         _registry_prewarm_loop() so yesterday's volume never bleeds.
+  CHAIN-PERF-1 (main) — Gate chain refresh worker behind registry.is_ready().
+                        Worker polls every 10s and only begins its first Tradier
+                        cycle after build() sets _build_complete=True. Prevents
+                        3,000 concurrent Tradier chain calls from competing with
+                        the bulk-semaphore build() path during startup.
+  CHAIN-PERF-2 (main) — Shared httpx.AsyncClient per refresh cycle.
+                        _fetch_tradier_chain() accepts an optional client kwarg.
+                        The refresh loop creates one pooled client per cycle and
+                        passes it to every fetch call, reducing TCP connection
+                        overhead from O(n_tickers) to O(1) per cycle.
   REARCH-002 (main)   — ingestion_config router mounted: GET/PATCH /admin/ingestion-config
                         now reachable. Previously the router was created but never
                         included in app.include_router().
@@ -155,8 +165,17 @@ async def get_config() -> dict:
 # Returns a list of contract dicts, each containing at minimum:
 #   {"symbol": <occ_str>, "volume": int, "open_interest": int}
 # Returns [] on any error — one bad symbol must never abort the refresh cycle.
+#
+# CHAIN-PERF-2: accepts an optional pre-created httpx.AsyncClient so the
+# refresh loop can share a single pooled connection across all ~3,000 ticker
+# calls per cycle instead of opening a new TCP connection per symbol.
+# When client=None (e.g. tests, one-off calls) a transient client is created
+# and closed locally as before.
 # ---------------------------------------------------------------------------
-async def _fetch_tradier_chain(symbol: str) -> list:
+async def _fetch_tradier_chain(
+    symbol: str,
+    client: Optional[httpx.AsyncClient] = None,
+) -> list:
     """
     ING-008: Fetch the current options chain for `symbol` from Tradier.
 
@@ -164,6 +183,10 @@ async def _fetch_tradier_chain(symbol: str) -> list:
     callable.  Returns a flat list of option contract dicts.  On any
     network or API error returns [] so the worker continues to the next
     symbol without aborting the refresh cycle.
+
+    CHAIN-PERF-2: Pass a shared httpx.AsyncClient via the `client` kwarg to
+    reuse a pooled connection across all symbols in one refresh cycle.
+    If client is None a transient client is created and closed internally.
 
     API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
     Each returned dict includes at minimum:
@@ -179,28 +202,139 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         "Accept": "application/json",
     }
     params = {"symbol": symbol, "greeks": "false"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
+
+    async def _do_fetch(c: httpx.AsyncClient) -> list:
+        try:
+            resp = await c.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                log.warning(
+                    "[chain_refresh] Tradier chain fetch %s -> HTTP %d",
+                    symbol, resp.status_code,
+                )
+                return []
+            data = resp.json()
+            options = data.get("options") or {}
+            option_list = options.get("option") or []
+            if isinstance(option_list, dict):
+                # Single-contract response (rare edge case)
+                option_list = [option_list]
+            return option_list
+        except Exception as exc:
             log.warning(
-                "[chain_refresh] Tradier chain fetch %s -> HTTP %d",
-                symbol, resp.status_code,
+                "[chain_refresh] _fetch_tradier_chain(%s) error: %s",
+                symbol, exc,
             )
             return []
-        data = resp.json()
-        options = data.get("options") or {}
-        option_list = options.get("option") or []
-        if isinstance(option_list, dict):
-            # Single-contract response (rare edge case)
-            option_list = [option_list]
-        return option_list
-    except Exception as exc:
-        log.warning(
-            "[chain_refresh] _fetch_tradier_chain(%s) error: %s",
-            symbol, exc,
+
+    if client is not None:
+        return await _do_fetch(client)
+
+    # No shared client provided — create a transient one (test / one-off path).
+    async with httpx.AsyncClient(timeout=10.0) as transient_client:
+        return await _do_fetch(transient_client)
+
+
+# ---------------------------------------------------------------------------
+# CHAIN-PERF-1 + CHAIN-PERF-2: wrapper that gates the chain refresh worker
+# behind registry.is_ready() and passes a shared httpx client per cycle.
+#
+# start_chain_refresh_worker() in chain_store accepts:
+#   get_tracked_symbols: Callable[[], list[str]]
+#   fetch_chain_fn:      Callable[[str], Awaitable[list]]
+#
+# We wrap _fetch_tradier_chain so each refresh cycle:
+#   1. Waits until registry.is_ready() (build() complete) before first cycle.
+#   2. Creates ONE shared httpx.AsyncClient with connection pooling.
+#   3. Passes that client to every _fetch_tradier_chain() call.
+#   4. Closes the client cleanly after the cycle completes.
+#
+# This is done via a custom async generator / wrapper that intercepts the
+# worker loop. We achieve it by overriding fetch_chain_fn with a closure
+# that captures the per-cycle client, and gating the first iteration.
+# ---------------------------------------------------------------------------
+async def _run_chain_refresh_loop(
+    get_tracked_symbols,
+    interval_s: int = 300,
+) -> None:
+    """
+    CHAIN-PERF-1: Gate the first refresh cycle behind registry.is_ready().
+    CHAIN-PERF-2: Share one httpx.AsyncClient per refresh cycle across all
+    ticker fetches to eliminate per-symbol TCP connection overhead.
+
+    Replaces direct start_chain_refresh_worker() task creation in lifespan.
+    Logs a progress line every 60s while waiting for build() to complete.
+    """
+    # --- CHAIN-PERF-1: wait for build() to complete before first cycle ---
+    waited = 0
+    log_interval = 60  # log every 60s to avoid silent hang
+    while True:
+        reg = get_registry()
+        if reg is not None and reg.is_ready():
+            break
+        await asyncio.sleep(10)
+        waited += 10
+        if waited % log_interval == 0:
+            log.info(
+                "[chain_refresh] Waiting for registry build() to complete "
+                "before starting chain refresh worker... (%ds elapsed)",
+                waited,
+            )
+    log.info("[chain_refresh] Registry is_ready=True — starting chain refresh cycles.")
+
+    # --- Main refresh loop ---
+    while True:
+        tickers = get_tracked_symbols()
+        if not tickers:
+            log.info("[chain_refresh] No tracked tickers — skipping cycle.")
+            await asyncio.sleep(interval_s)
+            continue
+
+        log.info(
+            "[chain_refresh] Cycle start: refreshing vol/OI for %d tickers.",
+            len(tickers),
         )
-        return []
+
+        # CHAIN-PERF-2: one shared client for the entire cycle.
+        # Limits: max 20 keepalive connections, 100 max connections total.
+        # This means httpx reuses TCP connections across sequential fetches
+        # instead of opening+closing one per symbol.
+        limits = httpx.Limits(
+            max_keepalive_connections=20,
+            max_connections=100,
+            keepalive_expiry=30.0,
+        )
+        cycle_client = httpx.AsyncClient(timeout=10.0, limits=limits)
+        fetched = 0
+        errors = 0
+        try:
+            from services.chain_store import _vol_oi_cache  # noqa: F401 — ensures module loaded
+            for ticker in tickers:
+                contracts = await _fetch_tradier_chain(ticker, client=cycle_client)
+                if contracts:
+                    fetched += len(contracts)
+                    # Populate the in-process vol/OI cache directly.
+                    from services import chain_store as _cs
+                    for contract in contracts:
+                        occ = contract.get("symbol") or ""
+                        if occ:
+                            _cs._vol_oi_cache[occ] = (
+                                int(contract.get("volume") or 0),
+                                int(contract.get("open_interest") or 0),
+                            )
+                else:
+                    errors += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("[chain_refresh] Cycle error (non-fatal): %s", exc)
+        finally:
+            await cycle_client.aclose()
+
+        log.info(
+            "[chain_refresh] Cycle complete: %d contracts cached, %d ticker errors.",
+            fetched, errors,
+        )
+        await asyncio.sleep(interval_s)
 
 
 async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
@@ -633,38 +767,30 @@ async def lifespan(app: FastAPI):
     # causing TypeError at every TestClient startup.
     lookback_task         = asyncio.create_task(start_lookback_worker())
 
-    # ING-008: background 5-min chain cache refresh loop.
+    # ING-008 + CHAIN-PERF-1 + CHAIN-PERF-2: background chain cache refresh.
     #
-    # Wired with the two-callable signature required by start_chain_refresh_worker:
+    # Previously wired directly to start_chain_refresh_worker() which fired
+    # immediately at startup, competing with build() for Tradier rate-limit
+    # budget and creating ~3,000 new TCP connections per 5-min cycle.
     #
-    #   get_tracked_symbols — zero-arg callable returning the live list of OCC
-    #     symbols currently in the registry.  Called fresh each cycle so newly
-    #     added symbols are automatically picked up without a restart.
-    #     Falls back to stream_symbols (ticker list) if the registry dict is not
-    #     accessible, which is safe because chain_store only uses the symbol as a
-    #     key for the Tradier chain API call (it accepts either OCC or ticker).
+    # Now uses _run_chain_refresh_loop() which:
+    #   CHAIN-PERF-1: polls registry.is_ready() every 10s — first Tradier
+    #     cycle only starts AFTER build() fully completes.
+    #   CHAIN-PERF-2: shares one httpx.AsyncClient per cycle across all
+    #     ~3,000 ticker fetches, reducing connection overhead to O(1).
     #
-    #   fetch_chain_fn — async callable accepting a ticker string and returning a
-    #     list of contract dicts from Tradier GET /v1/markets/options/chains.
-    #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
-    #     aborts the refresh cycle.
-    #
-    # Zero live API calls on the flow hot path: persist_flow_event and
-    # persist_flow_episode read from the in-process _vol_oi_cache via
-    # get_contract_vol_oi(occ_symbol) — O(1) dict lookup.
+    # get_tracked_tickers returns unique underlying tickers (not OCC symbols)
+    # so one Tradier chain call per ticker covers all its strikes/expiries.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
-            # Return the unique set of underlying tickers (not OCC symbols) so
-            # one Tradier chain call per ticker covers all its strikes/expiries.
             return list({v.ticker for v in reg._registry.values()})
-        # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
     chain_refresh_task    = asyncio.create_task(
-        start_chain_refresh_worker(
+        _run_chain_refresh_loop(
             get_tracked_symbols=_get_tracked_tickers,
-            fetch_chain_fn=_fetch_tradier_chain,
+            interval_s=300,
         )
     )
 
