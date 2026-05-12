@@ -22,6 +22,9 @@ omit =
     signals/ladder_detector.py
 
 [report]
+# Gate enforced here so it only fires on full-suite coverage report runs
+# (CI: coverage report after pytest --cov), not on targeted per-file runs.
+fail_under = 90
 exclude_lines =
     pragma: no cover
     def __repr__
