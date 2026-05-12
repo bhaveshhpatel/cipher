@@ -117,7 +117,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 | 1 | **REARCH-001** — Index Symbol Purge | [#102](https://github.com/bhaveshhpatel/cipher/issues/102) | `feat/rearch-001-index-purge` | ✅ Merged to aggregation branch | SA · PBE · QA | None |
 | 2 | **REARCH-002** — Ingestion Quality Floors | [#103](https://github.com/bhaveshhpatel/cipher/issues/103) | `feat/rearch-002-ingestion-floors` | ✅ Merged to aggregation branch | SA · PBE · QA | REARCH-001 |
 | 3 | **REARCH-003** — Flow Event Quality Tagging | [#104](https://github.com/bhaveshhpatel/cipher/issues/104) | `feat/rearch-003-event-quality-tags` | ✅ Merged to aggregation branch | SA · PBE · QA | REARCH-002 |
-| 4 | **REARCH-004** — Episode Quality Enrichment | [#105](https://github.com/bhaveshhpatel/cipher/issues/105) | `feat/rearch-004-episode-quality-enrichment` | 🔲 Not Started | SA · PBE · QA | REARCH-003 |
+| 4 | **REARCH-004** — Episode Quality Enrichment | [#105](https://github.com/bhaveshhpatel/cipher/issues/105) | `feat/rearch-004-episode-quality-enrichment` | ✅ Merged to aggregation branch | SA · PBE · QA | REARCH-003 |
 | 5 | **REARCH-005** — Signal Config Store | [#106](https://github.com/bhaveshhpatel/cipher/issues/106) | `feat/rearch-005-signal-config-store` | 🔲 Not Started | SA · PBE · QA | REARCH-002, REARCH-004 |
 | 6 | **REARCH-006** — Signal Engine Rewrite | [#107](https://github.com/bhaveshhpatel/cipher/issues/107) | `feat/rearch-006-signal-engine-rewrite` | 🔲 Not Started | SA · PBE · QA | REARCH-003, REARCH-004, REARCH-005 |
 | 7 | **REARCH-007** — Admin UI: Ingestion Config Panel | [#108](https://github.com/bhaveshhpatel/cipher/issues/108) | `feat/rearch-007-admin-ingestion-panel` | 🔲 Not Started | SA · PUX · PFE · PBF · QA | REARCH-002 |
@@ -147,7 +147,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 REARCH-001 (Index Purge) ✅
     └── REARCH-002 (Ingestion Floors) ✅
             ├── REARCH-003 (Event Tagging) ✅
-            │       └── REARCH-004 (Episode Enrichment)
+            │       └── REARCH-004 (Episode Enrichment) ✅
             │               └── REARCH-005 (Signal Config Store)
             │                       └── REARCH-006 (Signal Engine Rewrite)
             │                               ├── REARCH-008 (Admin: Signal Panel)
@@ -175,6 +175,8 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 > **REARCH-002 note:** ✅ Merged 2026-05-11 via [PR #126](https://github.com/bhaveshhpatel/cipher/pull/126). `IngestionProcessor` 4-gate pipeline shipped: G1 DTE floor (min_dte=1) → G2 DTE ceiling (max_dte=90) → G3 tier-aware premium floor (T1=$25K / T2=$15K / T3=$5K) → G4 OI floor (min_oi=50). DB-backed `ingestion_config` table with 30s TTL cache and GIL-safe atomic reference swap on hot path. `GET /admin/ingestion-config` and `PATCH /admin/ingestion-config` endpoints live. `apply_config()` now routes through `validate_symbol()` (closes REARCH-001 follow-on). 16 boundary-value tests passing. Migrations `create_ingestion_config_table.sql` and `seed_ingestion_config_defaults.sql` applied to Supabase production prior to merge. Unblocks: REARCH-003, REARCH-005, REARCH-007.
 
 > **REARCH-003 note:** ✅ Merged 2026-05-11 via [PR #127](https://github.com/bhaveshhpatel/cipher/pull/127). Three pure helpers shipped in `flow_store.py`: `classify_bid_ask()`, `compute_vol_oi_signal()`, `_compute_normalized_premium()` — all wired into `persist_flow_event()`. Five new quality tag columns on `flow_events`: `is_ask_side` (BOOLEAN NOT NULL), `bid_ask_class` (TEXT), `vol_oi_signal` (BOOLEAN DEFAULT NULL — cache-miss sentinel), `normalized_premium` (NUMERIC(18,4)), `normalized_oi` (NUMERIC(18,6)). Two partial indexes: `idx_flow_events_vol_oi_high`, `idx_flow_events_ask_side`. Blocker fixes: SA-1 (`vol_oi_signal` TEXT→BOOLEAN), SA-3 (backfill predicate `IS NULL` guards), bonus `normalized_oi` column missing from migration 026. 12 unit + integration tests (E1–E12) passing. Streaming boundary untouched. Unblocks: REARCH-004 (Signal Engine S1–S4 filters), REARCH-006 (Apex L1–L4 normalized column reads).
+
+> **REARCH-004 note:** ✅ Merged 2026-05-11 via [PR #128](https://github.com/bhaveshhpatel/cipher/pull/128). Four aggregate quality columns added to `flow_episodes`: `ask_side_count` (INTEGER NOT NULL), `ask_side_pct` (NUMERIC(5,4)), `dte_bucket` (TEXT), `notional_tier` (TEXT). SA-3 seed-only contract enforced on both PATCH code branches (in-flight and DB-lookup) — `dte_bucket` and `notional_tier` are locked at episode open and never overwritten. PBE-1 NULL COALESCE handled for pre-REARCH rows (`ask_side_count=NULL → COALESCE(NULL,0)` before increment). QA-4 stale-cache guard added (E-9/E-10): `_episode_in_flight` updated with merged aggregate values after every PATCH on both branches. Migration `028_add_episode_quality_aggregate_columns.sql` applied to Supabase production prior to merge. 10 tests (E1–E10) passing. Unblocks: REARCH-005, REARCH-006, REARCH-011, REARCH-013, REARCH-014.
 
 > **REARCH-010 note:** ✅ Merged 2026-05-10 via [PR #119](https://github.com/bhaveshhpatel/cipher/pull/119). Schema purge applied: 3 tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 pre-REARCH columns retired, CHECK constraints updated to REARCH vocabulary, 9 new Steamroom columns added. 410 Gone stubs added to `admin.py` for deprecated endpoints; removed once REARCH-012 cleans the admin frontend. All downstream stories (REARCH-003, REARCH-004, REARCH-006, REARCH-011, REARCH-012, REARCH-013) are now unblocked.
 
@@ -243,6 +245,29 @@ Migrations applied: `rearch_001_delete_index_tickers_from_tracked_symbols.sql` (
 - **Bonus** — `normalized_oi NUMERIC(18,6) DEFAULT NULL` added to migration 026; was missing, causing 400 on every insert
 
 > **Streaming boundary:** REARCH-003 only touches `backend/services/flow_store.py`, `supabase/migrations/`, and tests. No streaming files modified.
+
+### REARCH-004 — Episode Quality Enrichment ([#105](https://github.com/bhaveshhpatel/cipher/issues/105))
+✅ **Merged 2026-05-11** via [PR #128](https://github.com/bhaveshhpatel/cipher/pull/128). Adds four aggregate quality columns to `flow_episodes`, seeded from the first event of each episode and incrementally maintained on every subsequent PATCH. Enforces SA-3 seed-only semantics on both PATCH code branches, guards the PBE-1 NULL COALESCE contract for pre-REARCH rows, and adds QA-4 stale-cache protection on both in-flight and DB-lookup paths.
+
+**What shipped:**
+
+| Column | Type | Seed | PATCH Update |
+|---|---|---|---|
+| `ask_side_count` | `INTEGER NOT NULL` | `1` if ask-side, else `0` | `+= 1` per ask-side event |
+| `ask_side_pct` | `NUMERIC(5,4)` | `ask_side_count / 1` | `round(ask_side_count / trade_count, 4)` |
+| `dte_bucket` | `TEXT` | locked from seed event via `_compute_dte_bucket(dte)` | **never updated (SA-3)** |
+| `notional_tier` | `TEXT` | locked from seed event via `_compute_notional_tier(premium)` | **never updated (SA-3)** |
+
+**Key implementation details:**
+- SA-3 seed-only contract: `dte_bucket` and `notional_tier` absent from **both** PATCH branches (in-flight and DB-lookup) — tested independently by E-7 and E-7b
+- PBE-1 NULL contract: `(existing.get('ask_side_count') or 0)` COALESCE before increment — pre-REARCH rows have `NULL`, no `KeyError` or `ZeroDivisionError`
+- QA-4 stale-cache guard: `_episode_in_flight[merge_key]` updated with merged `ask_side_count` + `trade_count` after every PATCH; cold-start DB-lookup PATCH also populates cache to prevent race on next event
+- Missing `is_ask_side` key defaults to `False` (KeyError guard)
+- `ask_side_pct` rounded to 4dp before write (`NUMERIC(5,4)` contract)
+- Migration `028_add_episode_quality_aggregate_columns.sql` applied to Supabase production prior to merge
+- 10 tests (E1–E10) across QA-1 through QA-4 passing green
+
+> **Streaming boundary:** REARCH-004 only touches `backend/services/flow_store.py`, `supabase/migrations/`, and tests. No streaming files modified.
 
 ### REARCH-010 — DB Schema Purge ([#111](https://github.com/bhaveshhpatel/cipher/issues/111))
 ✅ **Merged 2026-05-10** via [PR #119](https://github.com/bhaveshhpatel/cipher/pull/119). Comprehensive schema cleanup against the live `cipher-database`. Three tables dropped (`backtest_results`, `gate_configs`, `gate_config_audit`), 11 columns retired across `flow_events` / `flow_episodes` / `signal_history` (all swarm columns, pre-REARCH tier/conviction columns), CHECK constraints updated to REARCH vocabulary (`WATCH/NOTEWORTHY/BLOCK/GOLDEN`, `BULLISH/BEARISH/NEUTRAL`), and 9 new Steamroom columns added to `flow_episodes` and `signal_history`. Full backfill applied to 28,504 existing `signal_history` rows before constraint swap. 410 Gone stubs added to `admin.py` for `GET /gate-config`, `POST /gate-config`, `PATCH /gate-config`, `GET /gate-config/history`, `GET /backtest-results` — will be removed in REARCH-012 once admin frontend stops calling them.
@@ -329,7 +354,7 @@ main
         ├── feat/rearch-001-index-purge        ✅ merged
         ├── feat/rearch-002-ingestion-floors   ✅ merged
         ├── feat/rearch-003-event-quality-tags ✅ merged
-        ├── feat/rearch-004-episode-quality-enrichment
+        ├── feat/rearch-004-episode-quality-enrichment ✅ merged
         ├── feat/rearch-005-signal-config-store
         ├── feat/rearch-006-signal-engine-rewrite
         ├── feat/rearch-007-admin-ingestion-panel
@@ -385,7 +410,7 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-002 | `seed_ingestion_config_defaults.sql` | ☑ |
 | REARCH-003 | `026_add_event_quality_tag_columns.sql` | ☑ (applied 2026-05-11) |
 | REARCH-003 | `027_backfill_event_quality_tags.sql` (batched, 10k rows/batch) | ☑ (applied 2026-05-11) |
-| REARCH-004 | `add_episode_quality_aggregate_columns.sql` | ☐ |
+| REARCH-004 | `028_add_episode_quality_aggregate_columns.sql` | ☑ (applied 2026-05-11) |
 | REARCH-005 | `create_signal_config_table.sql` | ☐ |
 | REARCH-005 | `seed_signal_config_steamroom_defaults.sql` | ☐ |
 | REARCH-010 | `backfill_signal_history_alert_level.sql` | ☑ |
@@ -397,6 +422,8 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-010 | `add_steamroom_columns_flow_episodes.sql` | ☑ |
 | REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☑ |
 | REARCH-013 | `create_index_signal_history_detail_swarm.sql` (GIN index on `detail->'swarm'`) | ☐ |
+
+> **REARCH-004 DB note (2026-05-11):** Migration `028_add_episode_quality_aggregate_columns.sql` applied to Supabase production prior to merge. Columns confirmed live via introspection: `ask_side_count` (INTEGER, NOT NULL), `ask_side_pct` (NUMERIC(5,4), nullable), `dte_bucket` (TEXT, nullable), `notional_tier` (TEXT, nullable). Pre-REARCH rows have NULL for all four columns; `ask_side_count` COALESCE handled in-process.
 
 > **REARCH-003 DB note (2026-05-11):** Migrations 026 and 027 applied to Supabase production and merged via [PR #127](https://github.com/bhaveshhpatel/cipher/pull/127). Columns `is_ask_side` (BOOLEAN NOT NULL DEFAULT FALSE), `vol_oi_signal` (BOOLEAN DEFAULT NULL), `normalized_premium` (NUMERIC(18,4)), `normalized_oi` (NUMERIC(18,6)) and partial indexes `idx_flow_events_vol_oi_high` / `idx_flow_events_ask_side` are live. Backfill run in batches of 10k rows; `vol_oi_signal` and `normalized_oi` intentionally left NULL for pre-REARCH rows (cannot reconstruct from historical data). Canonical migration path confirmed: `supabase/migrations/` only.
 
