@@ -12,6 +12,10 @@ Rearch-006 (2026-05-12):
   - persist_composite_signal() gains an optional EpisodeEvalResult parameter
     so callers that already have the eval result can pass it in and avoid a
     second engine evaluation.
+  - Fix E-18/E-19: GATE FAIL / GATE PASS log lines used %,.0f which is
+    f-string/str.format syntax and raises ValueError in %-style logging.
+    Premium is now pre-formatted as an f-string and passed as %s, matching
+    the existing pattern in persist_composite_signal().
 
 Rearch-010 (2026-05-09) — schema purge pass 2:
   - Removed flow_score from _build_row() (column dropped in migration 024;
@@ -525,19 +529,23 @@ async def _bus_signal_listener() -> None:
                 result = engine.evaluate_episode(ep)
 
                 if not result.passed:
+                    # Pre-format premium — %,.0f is f-string syntax, invalid in %-style logging
+                    premium_fmt = f"${result.premium:,.0f}"
                     log.info(
-                        "[signal_store] GATE FAIL  %s | dims=%s | premium=$%,.0f",
+                        "[signal_store] GATE FAIL  %s | dims=%s | premium=%s",
                         result.ticker or sig.get("ticker", "UNKNOWN"),
                         result.failing_dimensions,
-                        result.premium,
+                        premium_fmt,
                     )
                     continue
 
+                # Pre-format premium — %,.0f is f-string syntax, invalid in %-style logging
+                premium_fmt = f"${result.premium:,.0f}"
                 log.info(
-                    "[signal_store] GATE PASS  %s | alert=%s | premium=$%,.0f | trades=%d",
+                    "[signal_store] GATE PASS  %s | alert=%s | premium=%s | trades=%d",
                     result.ticker or sig.get("ticker", "UNKNOWN"),
                     result.alert_level,
-                    result.premium,
+                    premium_fmt,
                     int(ep.get("trade_count") or 0),
                 )
 

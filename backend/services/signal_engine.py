@@ -22,11 +22,19 @@ D5  Repetition          episode["trade_count"] >= config min_trade_count
 
 Alert Level Resolution
 -----------------------
-GOLDEN   — all 5 dimensions pass AND premium >= golden threshold for tier
-BLOCK    — all 5 pass AND premium >= block threshold for tier
+GOLDEN     — all 5 dimensions pass AND premium >= golden threshold for tier
+BLOCK      — all 5 pass AND premium >= block threshold for tier
 NOTEWORTHY — all 5 pass AND premium >= noteworthy threshold for tier
-WATCH    — all 5 pass (minimum qualifying premium cleared)
-FAIL     — one or more dimensions failed (no signal written)
+WATCH      — all 5 pass AND premium >= watch floor (noteworthy * 0.5) but
+             below NOTEWORTHY threshold
+FAIL       — one or more dimensions failed (no signal written)
+
+D1 Gate vs Alert Level Bands
+-----------------------------
+The D1 gate uses a WATCH floor = noteworthy_threshold * 0.5.  This means
+an episode can pass D1 but land in the WATCH alert band when its premium
+is in [watch_floor, noteworthy_threshold).  This keeps WATCH as a valid
+output rather than collapsing everything that clears D1 into NOTEWORTHY.
 
 Public API
 ----------
@@ -86,6 +94,11 @@ _CFG_MIN_TRADE_COUNT       = "min_trade_count"
 _CFG_GOLDEN_PREMIUM        = "golden_sweep_premium"
 _CFG_BLOCK_PREMIUM         = "block_premium"
 _CFG_NOTEWORTHY_PREMIUM    = "noteworthy_premium"
+
+# Fraction of noteworthy_threshold used as the D1 gate floor.
+# Premiums in [noteworthy_threshold * _WATCH_FLOOR_FACTOR, noteworthy_threshold)
+# pass D1 but resolve to WATCH alert level.
+_WATCH_FLOOR_FACTOR = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -161,20 +174,23 @@ class SignalEngine:
         cfg = self._cfg.get_all()
 
         # --- D1: Premium threshold ----------------------------------------
-        # Resolve the effective threshold for the NOTEWORTHY level (minimum
-        # qualifying bar) using the tier multiplier.  The alert level itself
-        # is resolved after all gates pass.
+        # The NOTEWORTHY threshold is the upper boundary of the WATCH band.
+        # The D1 gate floor is noteworthy_threshold * _WATCH_FLOOR_FACTOR so
+        # that episodes in [watch_floor, noteworthy_threshold) pass D1 but
+        # resolve to WATCH alert level rather than being rejected outright.
         noteworthy_threshold = self._cfg.get_effective_premium_threshold(
             _CFG_NOTEWORTHY_PREMIUM, tier
         )
         if noteworthy_threshold is None:
             noteworthy_threshold = 50_000.0  # hard-coded fallback if config missing
 
-        if premium < noteworthy_threshold:
+        watch_floor = noteworthy_threshold * _WATCH_FLOOR_FACTOR
+
+        if premium < watch_floor:
             failing.append("D1_PREMIUM")
             log.debug(
-                "[signal_engine] %s FAIL D1_PREMIUM premium=%.0f < threshold=%.0f (tier=%s)",
-                ticker, premium, noteworthy_threshold, tier,
+                "[signal_engine] %s FAIL D1_PREMIUM premium=%.0f < watch_floor=%.0f (tier=%s)",
+                ticker, premium, watch_floor, tier,
             )
 
         # --- D2: Ask-side execution ----------------------------------------
@@ -269,6 +285,9 @@ class SignalEngine:
 
         Thresholds are fetched from signal_config via get_effective_premium_threshold()
         which applies the T2/T3 multipliers from migration 031.
+
+        WATCH is the fallback for episodes that cleared the D1 watch_floor
+        (noteworthy_threshold * 0.5) but are below the NOTEWORTHY threshold.
         """
         for level_key, cfg_key in (
             ("GOLDEN",      _CFG_GOLDEN_PREMIUM),
@@ -281,9 +300,7 @@ class SignalEngine:
             if premium >= threshold:
                 return level_key
 
-        # Premium cleared the NOTEWORTHY floor (D1 gate passed) but is below
-        # NOTEWORTHY threshold — this means WATCH is the floor label.
-        # This branch is reached when the D1 gate uses a custom low threshold.
+        # Premium is in [watch_floor, noteworthy_threshold) — WATCH band.
         return "WATCH"
 
 
