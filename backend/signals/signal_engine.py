@@ -25,6 +25,12 @@
 #                       from the midpoint map triggered a fail; an empty
 #                       string or "EXPIRED" would raise KeyError → None →
 #                       fail, but only accidentally).
+#              Fix 4b: evaluate() now treats ALL gates as hard gates.
+#                      Any single gate failure → passed=False regardless
+#                      of steamroom_score.  The score_floor / steamroom_score
+#                      path was causing D2–D5 failures to be silently absorbed
+#                      when 3+ other gates passed (score=4 >= floor=3).
+#                      evaluate_episode() inherits the fix transparently.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -220,13 +226,14 @@ class SignalEngine:
         Defaults to None → uses live signal_config_store globals.
 
     strict_gate_1:
-        When True (default), passed=False if Gate 1 fails regardless of
-        steamroom_score.
+        Retained for API compatibility.  Has no effect — all gates are now
+        hard gates (any failure → passed=False).  Will be removed in a
+        future cleanup pass.
     """
 
     def __init__(self, config_store=None, strict_gate_1: bool = True) -> None:
         self._config_store = config_store
-        self._strict_gate_1 = strict_gate_1
+        self._strict_gate_1 = strict_gate_1  # kept for API compat; unused
 
     # ------------------------------------------------------------------
     # Internal helpers for config_store vs. global dispatch
@@ -249,30 +256,33 @@ class SignalEngine:
     # ------------------------------------------------------------------
 
     def evaluate(self, ep) -> GateResult:
-        """Evaluate *ep* against all five Steamroom conviction gates."""
+        """Evaluate *ep* against all five Steamroom conviction gates.
+
+        All gates are hard gates: any single failure sets passed=False.
+        The steamroom_score field still counts how many gates passed (useful
+        for logging / debugging) but is NOT used for the pass/fail decision.
+        """
         cfg = self._read_config_snapshot()
         gates: dict[str, GateVerdict] = {}
 
         g1, alert_level = self._eval_gate_1(ep, cfg)
-        gates[_GATE_PREMIUM] = g1
-        gates[_GATE_ASK_SIDE] = self._eval_gate_2(ep, cfg)
-        gates[_GATE_VOL_OI] = self._eval_gate_3(ep, cfg)
-        gates[_GATE_DTE] = self._eval_gate_4(ep, cfg)
+        gates[_GATE_PREMIUM]    = g1
+        gates[_GATE_ASK_SIDE]   = self._eval_gate_2(ep, cfg)
+        gates[_GATE_VOL_OI]     = self._eval_gate_3(ep, cfg)
+        gates[_GATE_DTE]        = self._eval_gate_4(ep, cfg)
         gates[_GATE_REPETITION] = self._eval_gate_5(ep, cfg)
 
         steamroom_score = sum(1 for g in gates.values() if g.passed)
 
-        score_floor: int = cfg.get("sig.steamroom_score_floor", cfg.get("steamroom_score_floor", 3))
-        passed = steamroom_score >= score_floor
+        # All gates are hard: episode passes only when every gate passes.
+        passed = all(g.passed for g in gates.values())
 
-        if self._strict_gate_1 and not gates[_GATE_PREMIUM].passed:
-            passed = False
-
-        if not passed and gates[_GATE_PREMIUM].passed and steamroom_score < score_floor:
+        if not passed:
             log.debug(
-                "[signal_engine] Episode rejected: score=%d/%d below floor=%d  ticker=%s",
-                steamroom_score, len(_ALL_GATE_NAMES), score_floor,
+                "[signal_engine] Episode rejected: score=%d/%d  ticker=%s  failing=%s",
+                steamroom_score, len(_ALL_GATE_NAMES),
                 getattr(ep, "ticker", "?"),
+                [name for name, g in gates.items() if not g.passed],
             )
 
         return GateResult(
