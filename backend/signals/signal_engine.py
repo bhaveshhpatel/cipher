@@ -51,6 +51,14 @@
 #                      Added FOLLOW_SWEEP to _VALID_RECOMMENDATIONS.
 #                      build_signal_row derives ask_side_confirmed from
 #                      episode.ask_side_pct vs cfg floor.
+#              SA-01:  build_signal_row: treat disabled D2 gate as
+#                      auto-confirmed for recommendation scoring.
+#                      ask_side_confirmed = (not require_ask_side)
+#                                           OR (pct >= floor)
+#                      Without this fix, require_ask_side=False silently
+#                      downgraded all FOLLOW_SWEEP/BUY_CALLS/BUY_PUTS
+#                      signals to WATCH with no log warning.
+#                      Added WARNING log when kill-switch is active.
 # ============================================================================
 
 from __future__ import annotations
@@ -690,7 +698,14 @@ def build_signal_row(
     raw_contract_type: str | None = getattr(episode, "contract_type", None)
     contract_type: str | None = raw_contract_type.upper() if raw_contract_type else None
 
-    # Derive ask_side_confirmed for recommendation: ask_side_pct >= cfg floor
+    # ---------------------------------------------------------------------------
+    # SA-01 fix: derive ask_side_confirmed honoring the require_ask_side kill-switch.
+    #
+    # When require_ask_side=False the gate auto-passes for hard-gate scoring, so
+    # recommendation derivation must also treat D2 as confirmed — otherwise a
+    # score=5 episode with a low ask_side_pct would silently resolve to WATCH
+    # instead of FOLLOW_SWEEP/BUY_CALLS/BUY_PUTS with no log warning.
+    # ---------------------------------------------------------------------------
     def _get_cfg(key: str, default):
         try:
             return getattr(cfg, key)
@@ -702,12 +717,30 @@ def build_signal_row(
             pass
         return default
 
+    require_ask_side: bool = bool(
+        _get_cfg("require_ask_side", _get_cfg("sig.require_ask_side", True))
+    )
     ask_floor: float = float(
         _get_cfg("ask_side_pct_floor", _get_cfg("sig.ask_side_pct_floor", 0.6))
     )
-    ask_side_confirmed: bool = (
-        ask_side_pct is not None and ask_side_pct >= ask_floor
-    )
+
+    if not require_ask_side:
+        # Gate is disabled — treat as auto-confirmed so recommendation is not
+        # silently downgraded.  Emit a WARNING so operators know the kill-switch
+        # is active; this is intentional noise to prevent silent surprises.
+        log.warning(
+            "[signal_engine] SA-01: require_ask_side=False (kill-switch active) — "
+            "D2 treated as confirmed for recommendation on ticker=%s. "
+            "ask_side_pct=%.2f (floor=%.2f ignored).",
+            ticker,
+            ask_side_pct if ask_side_pct is not None else 0.0,
+            ask_floor,
+        )
+        ask_side_confirmed: bool = True
+    else:
+        ask_side_confirmed = (
+            ask_side_pct is not None and ask_side_pct >= ask_floor
+        )
 
     recommendation: str = _derive_recommendation(
         conviction_score=conviction_score,

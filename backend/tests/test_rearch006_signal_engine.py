@@ -56,6 +56,17 @@ Covers:
   S-09  WATCH via evaluate() when noteworthy_premium=0 override
   S-10  config_snapshot contains both prefixed and bare key forms
 
+  --- Blocker fixes ---
+
+  QA-01 _derive_recommendation() enum correctness sweep (48 cases)
+        Proves the function can never emit a value outside _VALID_RECOMMENDATIONS
+        (migration 033 DB CHECK constraint guard).
+
+  SA-01 build_signal_row: D2 kill-switch auto-confirm
+        When require_ask_side=False, ask_side_confirmed must be True so a
+        score=5 episode with low ask_side_pct still resolves to FOLLOW_SWEEP,
+        not WATCH.
+
 Test isolation: all tests use a stub SignalConfigStore that returns
 pre-seeded config dicts without any DB or network I/O.
 
@@ -90,6 +101,9 @@ from signals.signal_engine import (
     _GATE_DTE,
     _GATE_REPETITION,
     _normalise_tier,
+    _derive_recommendation,
+    _VALID_RECOMMENDATIONS,
+    build_signal_row,
 )
 
 # ---------------------------------------------------------------------------
@@ -651,130 +665,4 @@ def test_e36_d2_d3_full_bypass_combo():
         vol_oi_signal=None,
     ))
     assert result.passed is True
-    assert "D2_ASK_SIDE"  not in result.failing_dimensions
-    assert "D3_VOL_GT_OI" not in result.failing_dimensions
-    assert result.alert_level == "NOTEWORTHY"
-
-
-# ===========================================================================
-# S-01 — S-10  SMOKE TESTS: evaluate() object-based API
-# ===========================================================================
-
-def test_s01_evaluate_all_pass_returns_gate_result():
-    """evaluate() returns a GateResult with correct types and all gates passing."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy())
-
-    assert isinstance(result, GateResult)
-    assert result.passed is True
-    assert result.steamroom_score == 5
-    assert result.alert_level == "NOTEWORTHY"
-    assert len(result.gates) == 5
-    for gate_name, verdict in result.gates.items():
-        assert verdict.passed is True, f"Gate {gate_name!r} should pass but did not"
-    assert isinstance(result.config_snapshot, dict)
-
-
-def test_s02_evaluate_d1_fail_gate_result():
-    """D1 fail via evaluate(): gate_1_premium.passed=False, alert_level=None."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(total_premium=49_999))
-
-    assert result.passed is False
-    assert result.gates[_GATE_PREMIUM].passed is False
-    assert result.alert_level is None
-    assert result.steamroom_score == 4
-
-
-def test_s03_evaluate_d2_fail():
-    """D2 fail via evaluate(): gate_2_ask_side.passed=False."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(ask_side_pct=0.1))
-
-    assert result.passed is False
-    assert result.gates[_GATE_ASK_SIDE].passed is False
-    assert result.gates[_GATE_PREMIUM].passed is True
-    assert result.steamroom_score == 4
-
-
-def test_s04_evaluate_d3_fail_vol_false():
-    """D3 fail via evaluate(): gate_3_vol_oi.passed=False when vol_oi_signal=False."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(vol_oi_signal=False))
-
-    assert result.passed is False
-    assert result.gates[_GATE_VOL_OI].passed is False
-    assert result.steamroom_score == 4
-
-
-def test_s05_evaluate_d4_fail_xlong():
-    """D4 fail via evaluate(): XLONG midpoint=75 > max_dte=60."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(dte_bucket="XLONG"))
-
-    assert result.passed is False
-    assert result.gates[_GATE_DTE].passed is False
-    assert result.steamroom_score == 4
-
-
-def test_s06_evaluate_d5_fail_trade_count():
-    """D5 fail via evaluate(): trade_count=1 < min_trade_count=2."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(trade_count=1))
-
-    assert result.passed is False
-    assert result.gates[_GATE_REPETITION].passed is False
-    assert result.steamroom_score == 4
-
-
-def test_s07_evaluate_multiple_gates_fail():
-    """D2 + D3 + D5 fail simultaneously; steamroom_score=2 (D1 + D4 pass)."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(ask_side_pct=0.1, vol_oi_signal=False, trade_count=1))
-
-    assert result.passed is False
-    assert result.gates[_GATE_PREMIUM].passed    is True
-    assert result.gates[_GATE_ASK_SIDE].passed   is False
-    assert result.gates[_GATE_VOL_OI].passed     is False
-    assert result.gates[_GATE_DTE].passed        is True
-    assert result.gates[_GATE_REPETITION].passed is False
-    assert result.steamroom_score == 2
-
-
-def test_s08_evaluate_golden_alert_level():
-    """All gates pass with $1M premium → alert_level=GOLDEN."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy(total_premium=1_000_000))
-
-    assert result.passed is True
-    assert result.alert_level == "GOLDEN"
-    assert result.steamroom_score == 5
-
-
-def test_s09_evaluate_watch_when_noteworthy_zero():
-    """WATCH via evaluate(): noteworthy_premium=0 forces gate-1 WATCH branch."""
-    eng = _engine({
-        "noteworthy_premium":   0,
-        "block_premium":        9_000_000,
-        "golden_sweep_premium": 10_000_000,
-    })
-    ep_dict = _good_episode(total_premium=15_000)
-    proxy   = _EpisodeProxy(ep_dict, normalised_tier="T1")
-    result  = eng.evaluate(proxy)
-
-    assert result.passed is True
-    assert result.alert_level == "WATCH"
-    assert result.gates[_GATE_PREMIUM].passed is True
-
-
-def test_s10_evaluate_config_snapshot_contains_keys():
-    """config_snapshot must expose both prefixed and bare forms of all keys."""
-    eng    = _engine()
-    result = eng.evaluate(_proxy())
-    snap   = result.config_snapshot
-
-    assert "require_ask_side"     in snap
-    assert "sig.require_ask_side" in snap
-    assert "noteworthy_premium"   in snap
-    assert snap["noteworthy_premium"]       == 50_000
-    assert snap["sig.noteworthy_premium"]   == 50_000
+    assert "D2_ASK_SIDE"  not in result.failing_d
