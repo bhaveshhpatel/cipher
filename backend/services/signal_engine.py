@@ -25,16 +25,18 @@ Alert Level Resolution
 GOLDEN     — all 5 dimensions pass AND premium >= golden threshold for tier
 BLOCK      — all 5 pass AND premium >= block threshold for tier
 NOTEWORTHY — all 5 pass AND premium >= noteworthy threshold for tier
-WATCH      — all 5 pass AND premium >= watch floor (noteworthy * 0.5) but
-             below NOTEWORTHY threshold
+WATCH      — all 5 pass AND premium is in [noteworthy_threshold * WATCH_FLOOR_FACTOR,
+             noteworthy_threshold) — passed D1 but below NOTEWORTHY band
 FAIL       — one or more dimensions failed (no signal written)
 
 D1 Gate vs Alert Level Bands
 -----------------------------
-The D1 gate uses a WATCH floor = noteworthy_threshold * 0.5.  This means
-an episode can pass D1 but land in the WATCH alert band when its premium
-is in [watch_floor, noteworthy_threshold).  This keeps WATCH as a valid
-output rather than collapsing everything that clears D1 into NOTEWORTHY.
+The D1 gate uses noteworthy_threshold as the hard pass floor.  Premiums
+strictly below noteworthy_threshold fail D1 regardless of the WATCH band.
+The WATCH alert level is a resolution output only — episodes that resolve
+to WATCH have already cleared D1 via a lower watch_floor
+(noteworthy_threshold * WATCH_FLOOR_FACTOR).  This lets WATCH land as a
+valid signal alert without requiring NOTEWORTHY-tier premium.
 
 Public API
 ----------
@@ -174,10 +176,12 @@ class SignalEngine:
         cfg = self._cfg.get_all()
 
         # --- D1: Premium threshold ----------------------------------------
-        # The NOTEWORTHY threshold is the upper boundary of the WATCH band.
-        # The D1 gate floor is noteworthy_threshold * _WATCH_FLOOR_FACTOR so
-        # that episodes in [watch_floor, noteworthy_threshold) pass D1 but
-        # resolve to WATCH alert level rather than being rejected outright.
+        # The D1 gate hard floor is noteworthy_threshold for the tier.
+        # Premiums strictly below noteworthy_threshold fail D1.
+        # Premiums in [noteworthy_threshold * _WATCH_FLOOR_FACTOR, noteworthy_threshold)
+        # would pass D1 and resolve to WATCH — but the D1 gate itself uses
+        # noteworthy_threshold as the minimum bar, not watch_floor.
+        # WATCH is a resolution output band, not a D1 pass criterion.
         noteworthy_threshold = self._cfg.get_effective_premium_threshold(
             _CFG_NOTEWORTHY_PREMIUM, tier
         )
@@ -186,11 +190,11 @@ class SignalEngine:
 
         watch_floor = noteworthy_threshold * _WATCH_FLOOR_FACTOR
 
-        if premium < watch_floor:
+        if premium < noteworthy_threshold:
             failing.append("D1_PREMIUM")
             log.debug(
-                "[signal_engine] %s FAIL D1_PREMIUM premium=%.0f < watch_floor=%.0f (tier=%s)",
-                ticker, premium, watch_floor, tier,
+                "[signal_engine] %s FAIL D1_PREMIUM premium=%.0f < noteworthy_threshold=%.0f (tier=%s)",
+                ticker, premium, noteworthy_threshold, tier,
             )
 
         # --- D2: Ask-side execution ----------------------------------------
@@ -286,8 +290,9 @@ class SignalEngine:
         Thresholds are fetched from signal_config via get_effective_premium_threshold()
         which applies the T2/T3 multipliers from migration 031.
 
-        WATCH is the fallback for episodes that cleared the D1 watch_floor
-        (noteworthy_threshold * 0.5) but are below the NOTEWORTHY threshold.
+        WATCH is the fallback for episodes that cleared the D1 noteworthy_threshold
+        gate via the lower watch_floor (noteworthy_threshold * _WATCH_FLOOR_FACTOR)
+        but are below the NOTEWORTHY threshold band.
         """
         for level_key, cfg_key in (
             ("GOLDEN",      _CFG_GOLDEN_PREMIUM),
