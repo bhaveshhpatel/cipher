@@ -174,6 +174,21 @@ Bug fixes applied:
       imports. Inline imports inside hot-path async functions re-run the
       module lookup on every call. Hoisting removes per-call overhead and
       makes the dependency graph explicit.
+  22. REARCH-004 (2026-05-11): episode quality aggregate columns added.
+      _set_episode_in_flight() gains ask_side_count: int parameter.
+      _episode_in_flight cache now carries ask_side_count.
+      _lookup_open_episode() select= extended to include ask_side_count.
+      persist_flow_episode() INSERT path seeds ask_side_count (1 if is_ask_side
+      else 0), ask_side_pct (round(ask_side_count/1, 4) = 0.0 or 1.0),
+      dte_bucket, and notional_tier from the seed event.
+      persist_flow_episode() PATCH paths (both in-flight and DB-lookup)
+      increment ask_side_count and recompute ask_side_pct. dte_bucket and
+      notional_tier are intentionally excluded from all PATCH payloads —
+      they are locked at episode open (seed-event-only semantics, SA-3).
+      Pre-REARCH rows with NULL ask_side_count are handled via COALESCE(NULL,0)
+      in the DB-lookup PATCH path (PBE-1 NULL contract).
+      _insert_rows_with_episode_id() passes ask_side_count to
+      _set_episode_in_flight() so the in-flight cache carries the seeded value.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -470,12 +485,24 @@ def _get_episode_lock(key: str) -> asyncio.Lock:
     return _episode_locks[key]
 
 
-def _set_episode_in_flight(key: str, row_id: int, trade_count: int, total_premium: float) -> None:
-    """Cache the just-inserted/patched episode so concurrent waiters skip the DB GET."""
+def _set_episode_in_flight(
+    key: str,
+    row_id: int,
+    trade_count: int,
+    total_premium: float,
+    ask_side_count: int,
+) -> None:
+    """
+    Cache the just-inserted/patched episode so concurrent waiters skip the DB GET.
+
+    REARCH-004: ask_side_count is now carried in the in-flight cache so that
+    incremental PATCH recomputation of ask_side_pct requires no DB round-trip.
+    """
     _episode_in_flight[key] = {
-        "id":            row_id,
-        "trade_count":   trade_count,
-        "total_premium": total_premium,
+        "id":             row_id,
+        "trade_count":    trade_count,
+        "total_premium":  total_premium,
+        "ask_side_count": ask_side_count,
     }
 
 
@@ -740,7 +767,14 @@ async def _lookup_open_episode(
     expiry: str,
     window_s: int = _EPISODE_MERGE_WINDOW_S,
 ) -> Optional[dict]:
-    """ING-009: Query flow_episodes for an open same-session episode."""
+    """
+    ING-009: Query flow_episodes for an open same-session episode.
+
+    REARCH-004: select= extended to include ask_side_count so the DB-lookup
+    PATCH path can recompute ask_side_pct without an additional round-trip.
+    Pre-REARCH rows return NULL for ask_side_count — callers must COALESCE
+    with 0 before incrementing (PBE-1 NULL contract).
+    """
     if not _is_configured():
         return None
 
@@ -763,7 +797,7 @@ async def _lookup_open_episode(
         f"&expiry=eq.{quote(expiry)}"
         f"&signal_ts=gte.{quote(cutoff)}"
         f"&order=signal_ts.desc&limit=1"
-        f"&select=id,trade_count,total_premium"
+        f"&select=id,trade_count,total_premium,ask_side_count"
     )
 
     try:
@@ -787,6 +821,7 @@ async def _insert_rows_with_episode_id(
     key: str,
     premium: float,
     current_oi: Optional[int] = None,
+    ask_side_count: int = 0,
 ) -> bool:
     """
     ING-009-EXTRACT: POST a single episode row to *table* with
@@ -798,6 +833,10 @@ async def _insert_rows_with_episode_id(
       - If the response body has no id (e.g. return=minimal fallback from an
         older PostgREST version), _episode_in_flight is NOT populated — the
         next waiter safely falls back to _lookup_open_episode (E-16 safe path).
+
+    REARCH-004: ask_side_count parameter added. Passed through to
+    _set_episode_in_flight() so the in-flight cache carries the seeded value
+    from the INSERT (0 or 1 depending on whether the seed event was ask-side).
 
     Returns True on HTTP 200/201, False otherwise.
 
@@ -822,7 +861,13 @@ async def _insert_rows_with_episode_id(
                 # PostgREST may return a list or a single object depending on version.
                 row_obj = row_data[0] if isinstance(row_data, list) else row_data
                 if row_obj and "id" in row_obj:
-                    _set_episode_in_flight(key, row_obj["id"], row.get("trade_count") or 1, premium)
+                    _set_episode_in_flight(
+                        key,
+                        row_obj["id"],
+                        row.get("trade_count") or 1,
+                        premium,
+                        ask_side_count,
+                    )
                     log.debug(
                         f"[flow_store] episode INSERT id={row_obj['id']} cached in-flight: {key}"
                     )
@@ -862,6 +907,11 @@ async def persist_flow_episode(signal_data: dict) -> None:
     each check _is_configured() internally and return None / False when the DB is
     not reachable — so INSERT/PATCH dispatch and counter increments work correctly
     in test environments where SUPABASE_URL is unset.
+
+    REARCH-004: episode quality aggregate columns (ask_side_count, ask_side_pct,
+    dte_bucket, notional_tier) are populated on INSERT and incrementally updated
+    on PATCH. dte_bucket and notional_tier are locked at episode open — they are
+    NEVER included in PATCH payloads (SA-3 seed-event-only semantics).
     """
     ticker        = signal_data.get("ticker", "UNKNOWN")
     direction     = signal_data.get("direction", "UNKNOWN")
@@ -872,6 +922,11 @@ async def persist_flow_episode(signal_data: dict) -> None:
     premium       = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
     signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
     is_multi_day_repeat = signal_data.get("is_multi_day_repeat")
+
+    # REARCH-004: seed event quality tags
+    is_ask_side   = bool(signal_data.get("is_ask_side", False))
+    dte           = signal_data.get("dte")
+    event_premium = signal_data.get("premium") or premium
 
     if strike is None:
         log.debug(
@@ -894,6 +949,10 @@ async def persist_flow_episode(signal_data: dict) -> None:
         contract_volume_at_close, contract_oi_at_open
     )
 
+    # REARCH-004: compute seed-event quality dimensions (used on INSERT only).
+    seed_dte_bucket    = _compute_dte_bucket(dte)
+    seed_notional_tier = _compute_notional_tier(event_premium)
+
     ts = signal_ts or datetime.now(timezone.utc).isoformat()
     key = _episode_key(ticker, direction, contract_type, strike or 0, expiry or "")
     lock = _get_episode_lock(key)
@@ -904,6 +963,9 @@ async def persist_flow_episode(signal_data: dict) -> None:
         if in_flight:
             new_trade_count   = in_flight["trade_count"] + 1
             new_total_premium = in_flight["total_premium"] + premium
+            # REARCH-004: increment ask_side_count from in-flight cache and recompute pct.
+            new_ask_side_count = (in_flight.get("ask_side_count") or 0) + (1 if is_ask_side else 0)
+            new_ask_side_pct   = round(new_ask_side_count / new_trade_count, 4)
             patch_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"?id=eq.{in_flight['id']}"
@@ -914,6 +976,10 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "signal_ts":                ts,
                 "contract_volume_at_close": contract_volume_at_close,
                 "volume_oi_ratio":          volume_oi_ratio,
+                "ask_side_count":           new_ask_side_count,
+                "ask_side_pct":             new_ask_side_pct,
+                # REARCH-004 SA-3: dte_bucket and notional_tier are intentionally
+                # excluded — they are locked at episode open (seed-event-only).
             }
             if is_multi_day_repeat is not None:
                 patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
@@ -924,7 +990,13 @@ async def persist_flow_episode(signal_data: dict) -> None:
                         patch_url, headers=_headers(), json=patch_payload
                     )
                 if resp.status_code in (200, 204):
-                    _set_episode_in_flight(key, in_flight["id"], new_trade_count, new_total_premium)
+                    _set_episode_in_flight(
+                        key,
+                        in_flight["id"],
+                        new_trade_count,
+                        new_total_premium,
+                        new_ask_side_count,
+                    )
                     _episode_stats["merged_episodes"] += 1
                     log.debug(f"[flow_store] episode merged (in-flight): {key}")
                 else:
@@ -943,6 +1015,9 @@ async def persist_flow_episode(signal_data: dict) -> None:
         if existing:
             new_trade_count   = existing["trade_count"] + 1
             new_total_premium = existing["total_premium"] + premium
+            # REARCH-004: COALESCE(NULL, 0) handles pre-REARCH rows (PBE-1 NULL contract).
+            new_ask_side_count = (existing.get("ask_side_count") or 0) + (1 if is_ask_side else 0)
+            new_ask_side_pct   = round(new_ask_side_count / new_trade_count, 4)
             patch_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"?id=eq.{existing['id']}"
@@ -953,6 +1028,9 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "signal_ts":                ts,
                 "contract_volume_at_close": contract_volume_at_close,
                 "volume_oi_ratio":          volume_oi_ratio,
+                "ask_side_count":           new_ask_side_count,
+                "ask_side_pct":             new_ask_side_pct,
+                # REARCH-004 SA-3: dte_bucket and notional_tier intentionally excluded.
             }
             if is_multi_day_repeat is not None:
                 patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
@@ -963,7 +1041,13 @@ async def persist_flow_episode(signal_data: dict) -> None:
                         patch_url, headers=_headers(), json=patch_payload
                     )
                 if resp.status_code in (200, 204):
-                    _set_episode_in_flight(key, existing["id"], new_trade_count, new_total_premium)
+                    _set_episode_in_flight(
+                        key,
+                        existing["id"],
+                        new_trade_count,
+                        new_total_premium,
+                        new_ask_side_count,
+                    )
                     _episode_stats["merged_episodes"] += 1
                     log.debug(f"[flow_store] episode merged (DB lookup): {key}")
                 else:
@@ -978,6 +1062,8 @@ async def persist_flow_episode(signal_data: dict) -> None:
             # That function handles the HTTP POST, id-caching, and in-flight population.
             # created_episodes counter stays here so patching the helper in tests
             # still triggers the counter (E-1: mock returns True → counter == 1).
+            seed_ask_side_count = 1 if is_ask_side else 0
+            seed_ask_side_pct   = round(seed_ask_side_count / 1, 4)  # trade_count=1 at seed
             insert_payload = {
                 "ticker":                   ticker,
                 "direction":                direction,
@@ -990,12 +1076,22 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "contract_oi_at_open":      contract_oi_at_open,
                 "contract_volume_at_close": contract_volume_at_close,
                 "volume_oi_ratio":          volume_oi_ratio,
+                # REARCH-004: seed-event quality aggregate columns.
+                "ask_side_count":           seed_ask_side_count,
+                "ask_side_pct":             seed_ask_side_pct,
+                "dte_bucket":               seed_dte_bucket,
+                "notional_tier":            seed_notional_tier,
             }
             if is_multi_day_repeat is not None:
                 insert_payload["is_multi_day_repeat"] = is_multi_day_repeat
 
             ok = await _insert_rows_with_episode_id(
-                "flow_episodes", insert_payload, key, premium, contract_oi_at_open
+                "flow_episodes",
+                insert_payload,
+                key,
+                premium,
+                contract_oi_at_open,
+                ask_side_count=seed_ask_side_count,
             )
             if ok:
                 _episode_stats["created_episodes"] += 1
