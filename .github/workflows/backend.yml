@@ -83,23 +83,23 @@ jobs:
         run: pytest --cov=. --cov-fail-under=92 --tb=short
 
   # -------------------------------------------------------------------------
-  # Job 3: Deploy to Railway on push to main (backend changes only)
-  # Requires RAILWAY_TOKEN secret set in GitHub repo settings.
+  # Job 3: Deploy to Render on push to main (backend changes only)
+  # Requires RENDER_DEPLOY_HOOK_URL secret set in GitHub repo settings.
+  # To get this URL:
+  #   1. Go to your Render service dashboard
+  #   2. Settings → Deploy Hook → copy the URL
+  #   3. Add it as a GitHub secret named RENDER_DEPLOY_HOOK_URL
   # -------------------------------------------------------------------------
   deploy:
-    name: Deploy to Railway
+    name: Deploy to Render
     runs-on: ubuntu-latest
     needs: [lint, regression]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy to Railway
-        working-directory: backend
-        run: railway up --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Trigger Render deploy hook
+        run: |
+          curl --silent --show-error --fail \
+            --request POST \
+            "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+        shell: bash
