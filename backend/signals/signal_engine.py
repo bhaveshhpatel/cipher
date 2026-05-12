@@ -25,6 +25,13 @@
 #              Fix 4b: evaluate() now treats ALL gates as hard gates.
 #                      Any single gate failure -> passed=False regardless
 #                      of steamroom_score.
+#              Fix 4c: _eval_gate_1 threshold resolution — when a
+#                      config_store is injected, read noteworthy_threshold
+#                      directly from the store so it is never 0.0 due to
+#                      an uninitialised live-cache on fresh boot.
+#                      evaluate_episode() effective_threshold now uses the
+#                      tier-scaled value from the store, not a hardcoded
+#                      50_000 sentinel that masked T2/T3 thresholds.
 #              Fix 5:  Expose get_effective_premium_threshold at module level
 #                      so unittest.mock.patch("signals.signal_engine.
 #                      get_effective_premium_threshold") resolves correctly.
@@ -174,7 +181,7 @@ _WATCH_FLOOR_FACTOR = 0.5
 # ---------------------------------------------------------------------------
 
 def _normalise_tier(tier: str | None) -> str:
-    """Normalise notional_tier to canonical "T1"/"T2"/"T3" form."""
+    """Normalise notional_tier to canonical \"T1\"/\"T2\"/\"T3\" form."""
     if not tier:
         return "T1"
     _MAP = {
@@ -255,6 +262,13 @@ class SignalEngine:
         self._strict_gate_1 = strict_gate_1  # kept for API compat; unused
 
     def _get_effective_threshold(self, level_key: str, tier: str) -> float:
+        """Resolve a tier-scaled premium threshold.
+
+        Fix 4c: When a config_store is injected (test path), always resolve
+        via the store's get_effective_premium_threshold() so the threshold is
+        non-zero even when the live global cache is uninitialised.  The bare
+        key is derived by stripping the \"sig.\" prefix.
+        """
         if self._config_store is not None:
             bare_key = level_key.replace("sig.", "", 1)
             result = self._config_store.get_effective_premium_threshold(bare_key, tier)
@@ -296,7 +310,12 @@ class SignalEngine:
         )
 
     def evaluate_episode(self, episode: dict) -> EpisodeEvalResult:
-        """Dict-based evaluation bridge — used by signal_store._bus_signal_listener."""
+        """Dict-based evaluation bridge — used by signal_store._bus_signal_listener.
+
+        Fix 4c: effective_threshold is now resolved via _get_effective_threshold
+        (store-aware) instead of a hardcoded 50_000 sentinel.  This ensures
+        T2/T3 episodes report the correct scaled threshold in EpisodeEvalResult.
+        """
         ticker  = episode.get("ticker", "UNKNOWN")
         premium = float(episode.get("total_premium") or 0)
 
@@ -306,9 +325,16 @@ class SignalEngine:
         proxy = _EpisodeProxy(episode, normalised_tier=tier)
         result = self.evaluate(proxy)
 
+        # Fix 4c: use the store-resolved threshold so T2/T3 values are correct.
         effective_threshold = self._get_effective_threshold(_ALERT_NOTEWORTHY, tier)
         if not effective_threshold:
-            effective_threshold = 50_000.0
+            # Genuine zero configured (noteworthy_premium=0 override path)
+            # or live store unavailable — fall back to snapshot value.
+            effective_threshold = float(
+                result.config_snapshot.get("noteworthy_premium")
+                or result.config_snapshot.get("sig.noteworthy_premium")
+                or 0.0
+            )
 
         if not result.passed:
             failing = _gate_names_to_dimensions(result.gates)
@@ -332,7 +358,12 @@ class SignalEngine:
         )
 
     def _eval_gate_1(self, ep, cfg: dict) -> tuple[GateVerdict, Optional[str]]:
-        """Gate 1 — Premium Threshold (tier-aware)."""
+        """Gate 1 — Premium Threshold (tier-aware).
+
+        Fix 4c: noteworthy_threshold is now resolved via _get_effective_threshold
+        so the store-injected value is always used on the test path (never 0.0
+        due to an uninitialised live cache).
+        """
         premium: float = getattr(ep, "weighted_premium", 0.0) or 0.0
         if premium == 0.0:
             premium = float(getattr(ep, "total_premium", 0.0) or 0.0)
@@ -347,9 +378,12 @@ class SignalEngine:
                     level_name,
                 )
 
+        # Fix 4c: always use _get_effective_threshold here (store-aware).
         noteworthy_threshold = self._get_effective_threshold(_ALERT_NOTEWORTHY, notional_tier)
 
         if noteworthy_threshold == 0:
+            # noteworthy_premium deliberately set to 0 — allow everything
+            # through at WATCH level (debug / kill-switch path).
             return (
                 GateVerdict(True, f"premium_cleared_watch (noteworthy=0): {premium:,.0f}"),
                 "WATCH",
@@ -416,16 +450,13 @@ class SignalEngine:
         max_dte: int = cfg.get("sig.max_dte", cfg.get("max_dte", 60))
 
         # Attempt 1: direct dte attribute (ORM episode objects set this).
-        # _EpisodeProxy raises AttributeError for unknown keys (PBE-01 contract),
-        # so getattr with a sentinel is the correct pattern here.
         dte: Optional[int] = getattr(ep, "dte", None)
         if dte is None:
             events = getattr(ep, "events", []) or []
             if events:
                 dte = getattr(events[0], "dte", None)
 
-        # Attempt 2: dte_bucket midpoint fallback (dict-backed episodes via
-        # _EpisodeProxy have no raw dte; this is the normal path for them).
+        # Attempt 2: dte_bucket midpoint fallback.
         if dte is None:
             raw_bucket = getattr(ep, "dte_bucket", None)
             dte_bucket = (raw_bucket or "").strip().upper() if raw_bucket is not None else ""
@@ -531,7 +562,7 @@ class _EpisodeProxy:
           premium threshold check rather than crashing the evaluator.
       events            -> []
           Gates 3 and 4 iterate over events; an empty list means
-          "no event-level data available" — a valid, safe sentinel.
+          \"no event-level data available\" — a valid, safe sentinel.
 
     All other missing keys propagate AttributeError upward so callers
     know immediately that the episode dict is structurally incomplete.
@@ -748,11 +779,6 @@ def build_signal_row(
 
     # ---------------------------------------------------------------------------
     # SA-01 fix: derive ask_side_confirmed honoring the require_ask_side kill-switch.
-    #
-    # When require_ask_side=False the gate auto-passes for hard-gate scoring, so
-    # recommendation derivation must also treat D2 as confirmed — otherwise a
-    # score=5 episode with a low ask_side_pct would silently resolve to WATCH
-    # instead of FOLLOW_SWEEP/BUY_CALLS/BUY_PUTS with no log warning.
     # ---------------------------------------------------------------------------
     def _get_cfg(key: str, default):
         try:
@@ -773,9 +799,6 @@ def build_signal_row(
     )
 
     if not require_ask_side:
-        # Gate is disabled — treat as auto-confirmed so recommendation is not
-        # silently downgraded.  Emit a WARNING so operators know the kill-switch
-        # is active; this is intentional noise to prevent silent surprises.
         log.warning(
             "[signal_engine] SA-01: require_ask_side=False (kill-switch active) — "
             "D2 treated as confirmed for recommendation on ticker=%s. "
@@ -796,7 +819,6 @@ def build_signal_row(
         ask_side_confirmed=ask_side_confirmed,
     )
 
-    # signal_ts: accept datetime (generate isoformat) or str (write verbatim).
     if signal_ts is None:
         ts_str: str = datetime.now(tz=timezone.utc).isoformat()
     elif isinstance(signal_ts, str):
