@@ -150,6 +150,14 @@ Bug fixes applied:
       True (counter stays at the call site so mocking the helper still
       triggers the counter correctly — E-1 asserts created_episodes == 1
       after patching _insert_rows_with_episode_id to return True).
+  19. ING-009-GUARD (2026-05-11): removed _is_configured() early-return guard
+      from persist_flow_episode(). When SUPABASE_URL/KEY are unset (test env),
+      the guard caused the function to return immediately — all 16 E-* tests
+      saw created_episodes == 0 and merged_episodes == 0.
+      The guard is redundant here: _lookup_open_episode() and
+      _insert_rows_with_episode_id() each check _is_configured() internally
+      and return None / False safely. The in-process counter increments and
+      lock/in-flight logic must always run regardless of DB connectivity.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -823,10 +831,13 @@ async def persist_flow_episode(signal_data: dict) -> None:
     The early-return guard only fires when strike is None.
 
     ING-009-RACE: serialised per-contract via _get_episode_lock().
-    """
-    if not _is_configured():
-        return
 
+    ING-009-GUARD: No _is_configured() guard here. The in-process lock/counter
+    logic must always run. _lookup_open_episode() and _insert_rows_with_episode_id()
+    each check _is_configured() internally and return None / False when the DB is
+    not reachable — so INSERT/PATCH dispatch and counter increments work correctly
+    in test environments where SUPABASE_URL is unset.
+    """
     ticker        = signal_data.get("ticker", "UNKNOWN")
     direction     = signal_data.get("direction", "UNKNOWN")
     contract_type = signal_data.get("contract_type", "CALL")
