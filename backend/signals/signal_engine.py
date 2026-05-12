@@ -50,7 +50,7 @@
 #     Independent of SignalEngine.evaluate() — used by build_signal_row() and
 #     any caller that needs a bare integer score without the full GateResult
 #     overhead.  Mirrors the 5 gate dimensions but reads REARCH-004 episode
-#     attributes directly (ask_side_pct, vol_oi_signal, notional_tier,
+#     attributes directly (total_premium, ask_side_pct, vol_oi_signal,
 #     dte_bucket, trade_count) rather than going through the per-gate methods.
 #
 #   build_signal_row(episode, alert_level, direction, cfg, **kwargs) -> dict
@@ -144,7 +144,7 @@ _ALL_GATE_NAMES: tuple[str, ...] = (
 # Chunk 4 — vocab sets (shared by compute_conviction_score + build_signal_row)
 # ---------------------------------------------------------------------------
 
-# Tiers that satisfy D3 (premium quality)
+# Tiers that satisfy D3 (premium quality) — kept for _eval_gate_1 internal use
 _QUALIFYING_TIERS: frozenset[str] = frozenset({"NOTEWORTHY", "BLOCK", "GOLDEN"})
 
 # DTE buckets that FAIL D4 (too short-dated or too far out)
@@ -710,15 +710,15 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     Each of the five Steamroom dimensions contributes one point.
 
-    D-dimension mapping (aligned with gate numbering — D1=premium, D2=ask-side,
-    D3=vol-oi, D4=DTE, D5=repetition — consistent with roadmap and all other
-    references in the codebase):
+    D-dimension mapping (aligned with gate numbering in _eval_gate_N and the
+    STEAMROOM_REARCH_ROADMAP.md gate spec):
 
-      D1 — Premium tier          notional_tier in {NOTEWORTHY, BLOCK, GOLDEN}
-      D2 — Ask-side execution    ask_side_pct >= cfg.ask_side_pct_floor
+      D1 — Premium floor          total_premium >= noteworthy_floor * _WATCH_FLOOR_FACTOR
+                                  (mirrors _eval_gate_1 watch-band check exactly)
+      D2 — Ask-side execution     ask_side_pct >= cfg.ask_side_pct_floor
       D3 — Volume > Open Interest vol_oi_signal == True
-      D4 — DTE in signal window  dte_bucket NOT in {0-7, 90+}
-      D5 — Repetition / cluster  trade_count >= cfg.min_trade_count
+      D4 — DTE in signal window   dte_bucket NOT in {0-7, 90+}
+      D5 — Repetition / cluster   trade_count >= cfg.min_trade_count
     """
     def _get(key: str, default):
         try:
@@ -733,9 +733,14 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     score = 0
 
-    # D1 — Premium tier qualifies (NOTEWORTHY, BLOCK, or GOLDEN)
-    notional_tier: str | None = getattr(episode, "notional_tier", None)
-    if notional_tier in _QUALIFYING_TIERS:
+    # D1 — Premium meets watch-band floor (consistent with _eval_gate_1)
+    # watch_floor = noteworthy_premium * _WATCH_FLOOR_FACTOR
+    noteworthy_floor: float = float(
+        _get("noteworthy_premium", _get("sig.noteworthy_premium", 50_000.0))
+    )
+    watch_floor: float = noteworthy_floor * _WATCH_FLOOR_FACTOR
+    total_premium: float = float(getattr(episode, "total_premium", 0.0) or 0.0)
+    if total_premium >= watch_floor:
         score += 1
 
     # D2 — Ask-side execution dominance
