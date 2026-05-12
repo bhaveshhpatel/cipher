@@ -40,6 +40,12 @@ NOTE — import discipline:
   This ensures patch.object(fs, ...), _reset_episode_stats(), and all
   assertions operate on the same live object, regardless of how pytest
   caches sys.modules between test runs.
+
+REARCH-004 compatibility note (2026-05-12):
+  _set_episode_in_flight() gained a required `ask_side_count` parameter.
+  _insert_rows_with_episode_id() now receives `ask_side_count` as a keyword
+  argument in the INSERT payload dict (passed through **kwargs in local fakes).
+  All call-sites in this file updated accordingly; no logic changes.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -268,7 +274,10 @@ async def test_e9_strike_expiry_populated_on_insert():
 
     captured_rows = []
 
-    async def capture_insert(table, row, key, premium, current_oi=None):
+    # REARCH-004: _insert_rows_with_episode_id now receives ask_side_count
+    # (and potentially other new kwargs) inside the row dict.  Accept **kwargs
+    # so this test stays forward-compatible with future payload additions.
+    async def capture_insert(table, row, key, premium, current_oi=None, **kwargs):
         captured_rows.append(row)
         return True
 
@@ -380,9 +389,16 @@ async def test_e12_concurrent_same_key_produces_one_insert():
 
     patch_call_payloads = []
 
-    async def fake_insert(table, row, key, premium, current_oi=None):
+    # REARCH-004: fake_insert now receives ask_side_count (and potentially
+    # future new kwargs) — accept **kwargs to stay forward-compatible.
+    async def fake_insert(table, row, key, premium, current_oi=None, **kwargs):
         # Simulate PostgREST returning the id — populate in-flight.
-        fs._set_episode_in_flight(key, INSERTED_ID, row.get("trade_count") or 1, premium)
+        fs._set_episode_in_flight(
+            key, INSERTED_ID,
+            row.get("trade_count") or 1,
+            premium,
+            ask_side_count=row.get("ask_side_count", 0),
+        )
         return True
 
     mock_patch_resp = MagicMock()
@@ -426,7 +442,8 @@ async def test_e13_different_keys_concurrent_no_blocking():
 
     insert_calls = []
 
-    async def fake_insert(table, row, key, premium, current_oi=None):
+    # REARCH-004: accept **kwargs so new payload fields don't break this test.
+    async def fake_insert(table, row, key, premium, current_oi=None, **kwargs):
         insert_calls.append(key)
         return True
 
@@ -460,7 +477,8 @@ async def test_e14_in_flight_cache_hit_skips_db_get():
     _reset_all_state()
 
     key = fs._episode_key("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
-    fs._set_episode_in_flight(key, 999, 1, 15000.0)
+    # REARCH-004: _set_episode_in_flight now requires ask_side_count.
+    fs._set_episode_in_flight(key, 999, 1, 15000.0, ask_side_count=0)
 
     signal = _make_signal(total_premium=12000.0)
 
@@ -495,7 +513,8 @@ async def test_e15_reset_episode_state_clears_cache():
     _reset_all_state()
 
     key = fs._episode_key("AAPL", "BULLISH", "CALL", 200.0, "2026-06-20")
-    fs._set_episode_in_flight(key, 111, 3, 45000.0)
+    # REARCH-004: _set_episode_in_flight now requires ask_side_count.
+    fs._set_episode_in_flight(key, 111, 3, 45000.0, ask_side_count=2)
     assert key in fs._episode_in_flight
 
     fs.reset_episode_state()
@@ -714,11 +733,13 @@ def test_reset_episode_state_idempotent_on_empty():
 def test_set_episode_in_flight_roundtrip():
     _reset_all_state()
     key = "TEST|BUL|CALL|100.0|2026-01-01"
-    fs._set_episode_in_flight(key, 42, 3, 55000.0)
+    # REARCH-004: _set_episode_in_flight now requires ask_side_count.
+    fs._set_episode_in_flight(key, 42, 3, 55000.0, ask_side_count=1)
     assert fs._episode_in_flight[key] == {
         "id": 42,
         "trade_count": 3,
         "total_premium": 55000.0,
+        "ask_side_count": 1,
     }
 
 
