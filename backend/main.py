@@ -17,6 +17,7 @@ Startup sequence:
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
      h. start_chain_refresh_worker() — ING-008: 5-min chain cache refresh loop
+     i. _self_ping_worker()          — RENDER: pings /health every 10 min to prevent spin-down
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -68,10 +69,17 @@ Key architectural fixes:
                         its own accumulator internally via get_accumulator() — it
                         takes 0 positional args. Removed stale registry.accumulator
                         argument from the create_task() call site.
+  RENDER-KEEPALIVE    — _self_ping_worker() pings GET /health every 10 minutes.
+                        Reads RENDER_EXTERNAL_URL env var (injected automatically by
+                        Render). No-ops locally when the var is absent. Prevents
+                        free-tier spin-down (15-min idle threshold). Does NOT prevent
+                        restarts caused by deploys, crashes, or OOM — reconnect logic
+                        in tradier_stream already handles those cases.
 """
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 from contextlib import asynccontextmanager
@@ -146,6 +154,37 @@ async def get_config() -> dict:
         "app_env":   settings.APP_ENV,
         "log_level": settings.LOG_LEVEL,
     }
+
+
+# ---------------------------------------------------------------------------
+# RENDER-KEEPALIVE: Self-ping worker to prevent free-tier spin-down.
+#
+# Render's free tier spins down a service after 15 minutes of no inbound
+# traffic. This worker pings GET /health every 10 minutes to keep the
+# instance alive.
+#
+# RENDER_EXTERNAL_URL is injected automatically by Render (e.g.
+# https://cipher-backend.onrender.com). When absent (local dev, other
+# platforms) the worker exits immediately — no-op.
+#
+# This only prevents idle spin-down. It does NOT prevent restarts caused
+# by deploys, crashes, or OOM — tradier_stream reconnect logic handles those.
+# ---------------------------------------------------------------------------
+async def _self_ping_worker() -> None:
+    """Keeps the Render free-tier instance alive by pinging /health every 10 min."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        log.info("[keepalive] RENDER_EXTERNAL_URL not set — self-ping disabled (non-Render env)")
+        return
+    log.info("[keepalive] Self-ping worker started — target: %s/health (every 10 min)", url)
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(600)  # 10 minutes
+            try:
+                resp = await client.get(f"{url}/health", timeout=10)
+                log.debug("[keepalive] Ping OK — HTTP %d", resp.status_code)
+            except Exception as exc:
+                log.warning("[keepalive] Ping failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +707,10 @@ async def lifespan(app: FastAPI):
         )
     )
 
+    # RENDER-KEEPALIVE: prevent free-tier idle spin-down (15-min threshold).
+    # Pings GET /health every 10 minutes. No-ops when RENDER_EXTERNAL_URL is unset.
+    self_ping_task        = asyncio.create_task(_self_ping_worker())
+
     yield
 
     log.info("[shutdown] Closing Tradier stream connections first...")
@@ -686,6 +729,7 @@ async def lifespan(app: FastAPI):
     db_write_task.cancel()
     signal_write_task.cancel()
     chain_refresh_task.cancel()  # ING-008
+    self_ping_task.cancel()      # RENDER-KEEPALIVE
     for task in (
         build_task,
         db_write_task,
@@ -695,6 +739,7 @@ async def lifespan(app: FastAPI):
         prewarm_task,
         lookback_task,
         chain_refresh_task,  # ING-008
+        self_ping_task,      # RENDER-KEEPALIVE
     ):
         try:
             await task
