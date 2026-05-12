@@ -93,6 +93,18 @@ The re-architecture is built on one core principle: **ingestion captures and tag
 | **4. DTE Quality** | Hard floor min_dte=1, ceiling max_dte=90 | Gate: DTE BETWEEN `sig.min_dte` AND `sig.max_dte` (default 5-60) | `sig.min_dte`, `sig.max_dte` |
 | **5. Repetition/Clustering** | Episode merge (30-min window, ING-009) | Gate: `trade_count >= sig.min_trade_count` | `sig.min_trade_count` |
 
+### Dimension-1 Effective Threshold Matrix (live defaults)
+
+Tier multipliers scale the base dollar threshold down for smaller-cap names so that a $200K flow on a $2 stock is treated as BLOCK-level rather than WATCH.
+
+| Alert Level | Tier-1 base | Tier-2 (×0.5) | Tier-3 (×0.2) |
+|---|---|---|---|
+| **GOLDEN** | $1,000,000 | $500,000 | $200,000 |
+| **BLOCK** | $500,000 | $250,000 | $100,000 |
+| **NOTEWORTHY** | $50,000 | $25,000 | $10,000 |
+
+> **Future enhancement (REARCH-015):** Dollar thresholds will be replaced by an ADV-normalized gate (`sig.normalized_premium_floor`, default 2.0×). Dollar thresholds are retained as soft label classifiers. Depends on `adv_cache` table + nightly refresh job. **Post-launch, does not block REARCH-006.**
+
 ---
 
 ## Alert Level Vocabulary (REARCH)
@@ -172,10 +184,18 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
     ✗ NOT IN THIS GRAPH — frozen, out of scope, no stories touch these components
 ```
 
+---
+
+## Merge Notes
+
 > **REARCH-001 note:** ✅ Merged 2026-05-10 via [PR #121](https://github.com/bhaveshhpatel/cipher/pull/121). Index symbol purge complete: `validate_symbol()` now rejects all 11 index tickers + `$`-prefixed symbols via `is_index_symbol()` frozenset gate. `chk_options_universe_symbols_no_index` CHECK constraint applied to Supabase production. 33 unit tests passing. Follow-on items tracked: `apply_config()` admin-path bypass verification (resolved in REARCH-002), `flow_events`/`signal_history` index constraint coverage (candidate for REARCH-003 scope).
 
 > **REARCH-002 note:** ✅ Merged 2026-05-11 via [PR #126](https://github.com/bhaveshhpatel/cipher/pull/126). `IngestionProcessor` 4-gate pipeline shipped: G1 DTE floor (min_dte=1) → G2 DTE ceiling (max_dte=90) → G3 tier-aware premium floor (T1=$25K / T2=$15K / T3=$5K) → G4 OI floor (min_oi=50). DB-backed `ingestion_config` table with 30s TTL cache and GIL-safe atomic reference swap on hot path. `GET /admin/ingestion-config` and `PATCH /admin/ingestion-config` endpoints live. `apply_config()` now routes through `validate_symbol()` (closes REARCH-001 follow-on). 16 boundary-value tests passing. Migrations `create_ingestion_config_table.sql` and `seed_ingestion_config_defaults.sql` applied to Supabase production prior to merge. Unblocks: REARCH-003, REARCH-005, REARCH-007.
 
 > **REARCH-003 note:** ✅ Merged 2026-05-11 via [PR #127](https://github.com/bhaveshhpatel/cipher/pull/127). Three pure helpers shipped in `flow_store.py`: `classify_bid_ask()`, `compute_vol_oi_signal()`, `_compute_normalized_premium()` — all wired into `persist_flow_event()`. Five new quality tag columns on `flow_events`: `is_ask_side` (BOOLEAN NOT NULL), `bid_ask_class` (TEXT), `vol_oi_signal` (BOOLEAN DEFAULT NULL — cache-miss sentinel), `normalized_premium` (NUMERIC(18,4)), `normalized_oi` (NUMERIC(18,6)). Two partial indexes: `idx_flow_events_vol_oi_high`, `idx_flow_events_ask_side`. Blocker fixes: SA-1 (`vol_oi_signal` TEXT→BOOLEAN), SA-3 (backfill predicate `IS NULL` guards), bonus `normalized_oi` column missing from migration 026. 12 unit + integration tests (E1–E12) passing. Streaming boundary untouched. Unblocks: REARCH-004 (Signal Engine S1–S4 filters), REARCH-006 (Apex L1–L4 normalized column reads).
 
-> **REARCH-004 note:** ✅ Merged 2026-05-11 via [PR #128](https://github.com/bhaveshhpatel/cipher/pull/128). Four aggregate quality columns added to `flow_episodes`: `ask_side_count` (INTEGER NOT NULL), `ask_side_pct` (NUMERIC(5,4)), `dte_bucket` (TEXT), `notional_tier` (TEXT). SA-3 seed-only contract enforced on both PATCH code branches (in-flight and DB-lookup) — `dte_bucket` and `notional_tier` are locked at episode open and never overwritten. PBE-1 NULL COALESCE handled for pre-REARCH rows (`ask_side_count=NULL → COALESCE(NULL,0)` before increment). QA-4 stale-cache guard added (E-9/E-10): `_
+> **REARCH-004 note:** ✅ Merged 2026-05-11 via [PR #128](https://github.com/bhaveshhpatel/cipher/pull/128). Four aggregate quality columns added to `flow_episodes`: `ask_side_count` (INTEGER NOT NULL), `ask_side_pct` (NUMERIC(5,4)), `dte_bucket` (TEXT), `notional_tier` (TEXT). SA-3 seed-only contract enforced on both PATCH code branches (in-flight and DB-lookup) — `dte_bucket` and `notional_tier` are locked at episode open and never overwritten. PBE-1 NULL COALESCE handled for pre-REARCH rows (`ask_side_count=NULL → COALESCE(NULL,0)` before increment). QA-4 stale-cache guard added (E-9/E-10): `_load_episode_from_db()` path now refreshes `notional_tier` and `dte_bucket` from DB on cache miss rather than inheriting stale in-memory values. Migrations `027_add_episode_quality_columns.sql` and `028_backfill_episode_quality_columns.sql` applied to Supabase production. 14 unit + integration tests (E-1 through E-14) passing. Unblocks: REARCH-005 (notional_tier read for signal config store), REARCH-006 (all 4 columns are Signal Engine Dimension gate inputs).
+
+> **REARCH-005 note:** ✅ Merged to aggregation branch 2026-05-11. `signal_config` DB-backed store shipped: `signal_config_store.py` with typed `get_int()`, `get_float()`, `get_bool()` accessors, 30s TTL cache, and `get_effective_premium_threshold(alert_level_key, notional_tier)` — the single Dimension-1 call point for REARCH-006. **16 config rows live in Supabase production** (10 base Steamroom knobs + 6 tier multipliers). Base knobs: `sig.golden_sweep_premium=$1M`, `sig.block_premium=$500K`, `sig.noteworthy_premium=$50K`, `sig.require_ask_side=true`, `sig.ask_side_pct_floor=0.6`, `sig.require_vol_gt_oi=true`, `sig.min_dte=5`, `sig.max_dte=60`, `sig.min_trade_count=2`, `sig.steamroom_score_floor=3`. Tier multipliers: `sig.*_t2_mult=0.5`, `sig.*_t3_mult=0.2` for GOLDEN, BLOCK, NOTEWORTHY. PBE extension: `_TIER_MULT_KEYS` dict centralises multiplier key naming; unrecognised tier falls back to base with WARNING log (never returns zero). Migrations `029_create_signal_config_table.sql`, `030_seed_signal_config_steamroom_defaults.sql`, `031_seed_signal_config_tier_multipliers.sql` applied. **Future REARCH-015** will add `sig.normalized_premium_floor` to demote dollar gates to soft labels in favour of ADV-normalized gate — post-launch, does not block this story or REARCH-006. Unblocks: REARCH-006 (full Signal Engine Rewrite).
+
+> **REARCH-015 note:** 🔲 Not Started (post-launch). Tracked in [#129](https://github.com/bhaveshhpatel/cipher/issues/129). Adds `adv_cache` table (20-day rolling options premium ADV per ticker, computed from `flow_events` history — no external data provider needed), nightly refresh job, `sig.normalized_premium_floor` config key (default 2.0×), and changes Signal Engine Dimension-1 from a dollar gate to an ADV-normalized gate. Dollar thresholds (GOLDEN/BLOCK/NOTEWORTHY) are demoted to soft label classifiers only. Staleness fallback policy (F1: fall back to tier-multiplier dollar gate on cache miss) requires SA · PBE · QA deliberation before branch is cut. **Blocked on REARCH-006 merged and live.**
