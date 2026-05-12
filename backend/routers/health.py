@@ -15,8 +15,15 @@ GET /api/health/stream
     last_reconnect_at: ISO-8601 UTC timestamp of last reconnect (null if never)
     uptime_seconds  : seconds since process started
 
-Auth: Bearer token required (same as all other /api/* routes).
-This endpoint is admin-visible but intentionally lightweight — no DB queries.
+GET /stats  (unauthenticated)
+  Full raw stats dict from tradier_stream.get_stats() for quick ops debugging.
+  Includes all funnel counters: ticks, parsed, parse_failed, below_min_premium,
+  index_filtered, deduped, classified, accumulator_gated, persisted, signals,
+  sig_debounced, errors, composite_errors, reconnects, gate_epoch, uptime_seconds,
+  plus parser stats, dedup stats, lookback stats, and ingestion drop counters.
+
+Auth: Bearer token required for /api/health/stream.
+      /stats is intentionally unauthenticated — internal ops use only.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -27,7 +34,7 @@ from pydantic import BaseModel
 from core.auth import get_current_user, TokenData
 from services.tradier_stream import get_stats
 
-router = APIRouter(prefix="/api/health", tags=["health"])
+router = APIRouter(tags=["health"])
 
 
 class StreamHealthOut(BaseModel):
@@ -50,7 +57,7 @@ def _epoch_to_iso(ts: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-@router.get("/stream", response_model=StreamHealthOut)
+@router.get("/api/health/stream", response_model=StreamHealthOut)
 async def get_stream_health(_: TokenData = Depends(get_current_user)):
     """
     B-008: Returns live stream pipeline health.
@@ -70,3 +77,28 @@ async def get_stream_health(_: TokenData = Depends(get_current_user)):
         last_reconnect_at = _epoch_to_iso(s.get("last_reconnect_at")),
         uptime_seconds    = s.get("uptime_seconds", 0.0),
     )
+
+
+@router.get("/stats")
+async def get_full_stats():
+    """
+    Unauthenticated full stats dump for ops/debugging.
+
+    Returns the complete raw dict from tradier_stream.get_stats(), including
+    all funnel counters, parser stats, dedup stats, lookback stats, and
+    ingestion drop counters. Use this to diagnose silent drops on Render:
+
+      ticks             — raw events received from Tradier WebSocket
+      parsed            — events that passed parse + ingestion gates
+      parse_failed      — events where parse_tradier_trade returned None
+      below_min_premium — events silently dropped at premium floor (no log)
+      index_filtered    — events dropped by ING-011 index ETF gate
+      accumulator_gated — events dropped below DTE-adjusted premium floor
+      deduped           — events dropped by DedupCache
+      persisted         — events written to options_flow_events
+      signals           — composite signals emitted to bus
+      sig_debounced     — signals suppressed by debounce
+      ing_dropped.*     — breakdown from IngestionProcessor gates
+      gate_epoch        — current gate_config_store epoch (0 = not loaded)
+    """
+    return get_stats()
