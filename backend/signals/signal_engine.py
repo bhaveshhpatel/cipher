@@ -3,6 +3,7 @@
 #
 # REARCH-006 — Chunk 2: SignalEngine skeleton + Gate 1–5 evaluators.
 #              Chunk 4: compute_conviction_score() + build_signal_row()
+#              Chunk 5: _derive_recommendation() (SA/PBE/QA deliberation)
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -52,6 +53,25 @@
 #     post-REARCH-010 schema (migration 024_rearch010_schema_purge.sql).
 #     Validates vocab, normalises types, snapshots Steamroom quality columns,
 #     and intentionally omits all retired columns.
+#
+# Chunk 5 addition:
+#
+#   _derive_recommendation(conviction_score, direction, ask_side_confirmed) -> str
+#     Private pure function.  Returns one of the 5 machine-readable Steamroom
+#     recommendation enum values:
+#       BUY_CALLS    — Bullish, conviction >= 3, ask-side confirmed
+#       BUY_PUTS     — Bearish, conviction >= 3, ask-side confirmed
+#       FOLLOW_SWEEP — conviction == 5 (GOLDEN), ask-side confirmed
+#       WATCH        — conviction 1–2, OR conviction >= 3 but ask-side failed
+#       NO_ACTION    — conviction 0, or NEUTRAL/ambiguous direction
+#
+#     Ask-side confirmation is a HARD GATE for BUY_* recommendations:
+#     conviction=4 with ask_side failed → WATCH (not BUY_*).  A partial-score
+#     episode without confirmed execution quality is a known Steamroom
+#     disqualifier (QA deliberation consensus).
+#
+#     FOLLOW_SWEEP takes precedence and is checked first: conviction==5
+#     with ask-side confirmed overrides the directional BUY_* path.
 #
 # Deploy notes:
 #   - No DB I/O in evaluate() — all config via get_param() snapshot reads.
@@ -117,6 +137,29 @@ _DISQUALIFYING_DTE_BUCKETS: frozenset[str] = frozenset({"0-7", "90+"})
 # Valid REARCH-010 vocab for signal_history columns
 _VALID_ALERT_LEVELS: frozenset[str] = frozenset({"WATCH", "NOTEWORTHY", "BLOCK", "GOLDEN"})
 _VALID_DIRECTIONS:   frozenset[str] = frozenset({"BULLISH", "BEARISH", "NEUTRAL"})
+
+# ---------------------------------------------------------------------------
+# Chunk 5 — recommendation enum vocab
+# ---------------------------------------------------------------------------
+
+# The 5-value Steamroom recommendation enum (machine-readable verdict).
+# CHECK constraint in migration 033 enforces this set in the DB.
+_RECOMMENDATION_BUY_CALLS    = "BUY_CALLS"
+_RECOMMENDATION_BUY_PUTS     = "BUY_PUTS"
+_RECOMMENDATION_FOLLOW_SWEEP = "FOLLOW_SWEEP"
+_RECOMMENDATION_WATCH        = "WATCH"
+_RECOMMENDATION_NO_ACTION    = "NO_ACTION"
+
+_VALID_RECOMMENDATIONS: frozenset[str] = frozenset({
+    _RECOMMENDATION_BUY_CALLS,
+    _RECOMMENDATION_BUY_PUTS,
+    _RECOMMENDATION_FOLLOW_SWEEP,
+    _RECOMMENDATION_WATCH,
+    _RECOMMENDATION_NO_ACTION,
+})
+
+# Conviction floor for directional buy recommendations.
+_BUY_CONVICTION_FLOOR = 3
 
 
 # ---------------------------------------------------------------------------
@@ -532,12 +575,106 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
 
 # ============================================================================
+# CHUNK 5  _derive_recommendation()
+#
+# Private pure function — no I/O, no side effects.
+#
+# Derives the machine-readable Steamroom recommendation enum from three
+# inputs: conviction_score [0–5], direction string, and a boolean flag
+# indicating whether ask-side execution was confirmed.
+#
+# Decision tree (evaluated top-to-bottom; first match wins):
+#
+#   1. conviction == 0, OR direction == NEUTRAL
+#         → NO_ACTION
+#         Rationale: zero-conviction or ambiguous-direction episodes carry no
+#         actionable information.
+#
+#   2. conviction == 5 AND ask_side_confirmed
+#         → FOLLOW_SWEEP
+#         Rationale: perfect-score + confirmed execution = "follow the big
+#         money directly" (WSJ Steamroom highest-conviction signal).
+#         NOTE: conviction==5 WITHOUT ask_side_confirmed falls through to
+#         the BUY_* / WATCH branches below — FOLLOW_SWEEP requires both.
+#
+#   3. conviction >= 3 AND ask_side_confirmed AND direction == BULLISH
+#         → BUY_CALLS
+#
+#   4. conviction >= 3 AND ask_side_confirmed AND direction == BEARISH
+#         → BUY_PUTS
+#
+#   5. All remaining cases (conviction 1–2, OR conviction >= 3 with
+#      ask_side failed, OR direction outside BULLISH/BEARISH)
+#         → WATCH
+#         Rationale: flow is emerging but execution quality or score is
+#         insufficient for a directional recommendation.  Ask-side is a hard
+#         gate — conviction=4 without confirmed execution → WATCH, not BUY_*.
+#
+# The reasoning column carries the narrative; recommendation is the verdict.
+# ============================================================================
+
+def _derive_recommendation(
+    conviction_score: int,
+    direction: str,
+    ask_side_confirmed: bool,
+) -> str:
+    """Derive the Steamroom recommendation enum from score + direction + ask-side.
+
+    Parameters
+    ----------
+    conviction_score:
+        Integer in [0, 5] from ``compute_conviction_score()``.
+    direction:
+        One of ``"BULLISH"`` | ``"BEARISH"`` | ``"NEUTRAL"``.  Any other
+        value is treated as NEUTRAL (→ NO_ACTION).
+    ask_side_confirmed:
+        True when the ask-side execution gate passed (Gate 2 cleared or
+        ask_side_pct >= floor).  This is a hard gate for BUY_* and
+        FOLLOW_SWEEP — unconfirmed execution at any conviction level yields
+        WATCH, not a buy recommendation.
+
+    Returns
+    -------
+    str
+        One of: ``BUY_CALLS`` | ``BUY_PUTS`` | ``FOLLOW_SWEEP`` |
+        ``WATCH`` | ``NO_ACTION``.
+        Always a member of ``_VALID_RECOMMENDATIONS``.
+    """
+    # ── Branch 1: No conviction or neutral direction → NO_ACTION ─────────────
+    if conviction_score == 0 or direction not in ("BULLISH", "BEARISH"):
+        return _RECOMMENDATION_NO_ACTION
+
+    # ── Branch 2: FOLLOW_SWEEP — perfect score + confirmed execution ─────────
+    # Must be checked before the BUY_* branches because conviction==5 with
+    # ask-side confirmed supersedes the directional path.
+    if conviction_score == 5 and ask_side_confirmed:
+        return _RECOMMENDATION_FOLLOW_SWEEP
+
+    # ── Branch 3 & 4: Directional BUY — conviction floor + confirmed ask-side ─
+    # Ask-side is a hard gate: conviction >= 3 without confirmed execution
+    # falls through to WATCH (QA deliberation consensus).
+    if conviction_score >= _BUY_CONVICTION_FLOOR and ask_side_confirmed:
+        if direction == "BULLISH":
+            return _RECOMMENDATION_BUY_CALLS
+        if direction == "BEARISH":
+            return _RECOMMENDATION_BUY_PUTS
+
+    # ── Branch 5: All remaining cases → WATCH ────────────────────────────────
+    # Covers:
+    #   - conviction 1–2 (any direction, any ask-side)
+    #   - conviction >= 3 but ask_side_confirmed == False
+    #   - conviction == 5 but ask_side_confirmed == False
+    return _RECOMMENDATION_WATCH
+
+
+# ============================================================================
 # CHUNK 4-B  build_signal_row()
 #
 # Assembles the insert dict for signal_history.
 #
 # Column set is authoritative against migration 024_rearch010_schema_purge.sql
-# (post-REARCH-010 schema).  No retired columns are written.
+# (post-REARCH-010 schema) and migration 033_rearch006_recommendation_enum.sql
+# (recommendation enum hardening).
 #
 # Columns written
 # ───────────────
@@ -550,6 +687,8 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 #   ask_side_pct                      ← migration 024 Section 9
 #   vol_oi_ratio                      ← migration 024 Section 9
 #   episode_id                        ← FK to flow_episodes.id
+#   recommendation                    ← enum via _derive_recommendation()
+#                                        DEFAULT 'NO_ACTION' (migration 033)
 #
 # Columns intentionally NOT written (retired by REARCH-010)
 # ─────────────────────────────────────────────────────────
@@ -557,7 +696,6 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 #   influence_tier          (dropped in migration 024 Section 6)
 #   volume_premium_factor   (dropped in migration 024 Section 6)
 #   swarm_*                 (dropped in migration 024 Section 6)
-#   recommendation          (nullable, deprecated — DB default 'HOLD' is fine)
 # ============================================================================
 
 def build_signal_row(
@@ -666,6 +804,32 @@ def build_signal_row(
     raw_contract_type: str | None = getattr(episode, "contract_type", None)
     contract_type: str | None = raw_contract_type.upper() if raw_contract_type else None
 
+    # ── Ask-side confirmed flag (used by _derive_recommendation) ────────────
+    # Mirror the Gate 2 logic: ask_side_pct must meet the floor from cfg.
+    # Absent ask_side_pct degrades to unconfirmed (False), matching Gate 2.
+    def _get_cfg(key: str, default):
+        try:
+            return getattr(cfg, key)
+        except AttributeError:
+            pass
+        try:
+            return cfg[key]
+        except (KeyError, TypeError):
+            pass
+        return default
+
+    ask_floor: float = float(_get_cfg("ask_side_pct_floor", _get_cfg("sig.ask_side_pct_floor", 0.6)))
+    ask_side_confirmed: bool = (
+        ask_side_pct is not None and ask_side_pct >= ask_floor
+    )
+
+    # ── Recommendation — machine-readable Steamroom verdict ─────────────────
+    recommendation: str = _derive_recommendation(
+        conviction_score=conviction_score,
+        direction=direction,
+        ask_side_confirmed=ask_side_confirmed,
+    )
+
     # ── Emission timestamp ───────────────────────────────────────────────────
     if signal_ts is None:
         signal_ts = datetime.now(tz=timezone.utc)
@@ -693,8 +857,10 @@ def build_signal_row(
         "reasoning":                reasoning,
         "is_accelerating":          is_accelerating,
         "signal_ts":                signal_ts.isoformat(),
+        # Recommendation — enum via _derive_recommendation() (migration 033)
+        # CHECK constraint: BUY_CALLS | BUY_PUTS | FOLLOW_SWEEP | WATCH | NO_ACTION
+        "recommendation":           recommendation,
         # NOTE: created_at is omitted intentionally — owned by Postgres DEFAULT now().
-        # NOTE: recommendation omitted intentionally — deprecated (REARCH-010); DB default 'HOLD'.
         # NOTE: flow_score, influence_tier, volume_premium_factor, swarm_* all
         #       dropped in migration 024 Section 6 — do not add them back here.
     }
