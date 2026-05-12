@@ -199,15 +199,34 @@ def test_c020_5_after_ttl_not_duplicate():
 # ---------------------------------------------------------------------------
 
 def test_c020_6_wall_clock_magnitude():
-    """Sanity check: time.time() > 1e9, time.monotonic() < 1e6 in practice."""
+    """
+    Sanity check: time.time() is epoch-scale (> 1e9).
+    time.monotonic() is uptime-scale (seconds since some arbitrary point).
+
+    The invariants that are always true regardless of machine uptime:
+      - wall > 1e9          (UNIX epoch is currently ~1.78e9)
+      - wall > mono         (epoch always exceeds uptime in seconds)
+      - mono < 1e7          (< 115 days uptime; reasonable CI/dev box bound)
+
+    We do NOT assert wall > mono * 1000 because that breaks on machines
+    with uptime > ~11.5 days (monotonic > 1e6s → mono*1000 > 1e9 > wall).
+    The meaningful distinction — wall is epoch-scale, mono is not — is
+    fully captured by `wall > 1e9` and `mono < 1e7`.
+    """
     import time as t
     wall = t.time()
     mono = t.monotonic()
 
-    assert wall > 1_000_000_000, f"time.time() should be epoch-scale, got {wall}"
-    assert wall > mono * 1000, (
-        f"time.time() ({wall:.0f}) should be orders of magnitude larger than "
-        f"time.monotonic() ({mono:.1f}). If not, the clock mismatch bug is present."
+    assert wall > 1_000_000_000, (
+        f"time.time() should be epoch-scale (> 1e9), got {wall:.0f}"
+    )
+    assert wall > mono, (
+        f"time.time() ({wall:.0f}) should always exceed time.monotonic() ({mono:.1f}) "
+        f"in absolute magnitude — epoch seconds > uptime seconds."
+    )
+    assert mono < 10_000_000, (
+        f"time.monotonic() ({mono:.1f}s) exceeds 115 days of uptime — "
+        f"unexpected in a CI or dev environment. Clock source may be wrong."
     )
 
 
