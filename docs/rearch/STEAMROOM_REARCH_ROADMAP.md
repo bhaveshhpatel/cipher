@@ -116,7 +116,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 |---|---|---|---|---|---|---|
 | 1 | **REARCH-001** — Index Symbol Purge | [#102](https://github.com/bhaveshhpatel/cipher/issues/102) | `feat/rearch-001-index-purge` | ✅ Merged to aggregation branch | SA · PBE · QA | None |
 | 2 | **REARCH-002** — Ingestion Quality Floors | [#103](https://github.com/bhaveshhpatel/cipher/issues/103) | `feat/rearch-002-ingestion-floors` | ✅ Merged to aggregation branch | SA · PBE · QA | REARCH-001 |
-| 3 | **REARCH-003** — Flow Event Quality Tagging | [#104](https://github.com/bhaveshhpatel/cipher/issues/104) | `feat/rearch-003-event-quality-tags` | 🔲 Not Started | SA · PBE · QA | REARCH-002 |
+| 3 | **REARCH-003** — Flow Event Quality Tagging | [#104](https://github.com/bhaveshhpatel/cipher/issues/104) | `feat/rearch-003-event-quality-tags` | 🟠 In Review (PR #127) | SA · PBE · QA | REARCH-002 |
 | 4 | **REARCH-004** — Episode Quality Enrichment | [#105](https://github.com/bhaveshhpatel/cipher/issues/105) | `feat/rearch-004-episode-quality-enrichment` | 🔲 Not Started | SA · PBE · QA | REARCH-003 |
 | 5 | **REARCH-005** — Signal Config Store | [#106](https://github.com/bhaveshhpatel/cipher/issues/106) | `feat/rearch-005-signal-config-store` | 🔲 Not Started | SA · PBE · QA | REARCH-002, REARCH-004 |
 | 6 | **REARCH-006** — Signal Engine Rewrite | [#107](https://github.com/bhaveshhpatel/cipher/issues/107) | `feat/rearch-006-signal-engine-rewrite` | 🔲 Not Started | SA · PBE · QA | REARCH-003, REARCH-004, REARCH-005 |
@@ -362,8 +362,9 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-001 | `rearch_001_add_index_blacklist_constraint.sql` | ☑ |
 | REARCH-002 | `create_ingestion_config_table.sql` | ☑ |
 | REARCH-002 | `seed_ingestion_config_defaults.sql` | ☑ |
-| REARCH-003 | `add_event_quality_tag_columns_to_flow_events.sql` | ☐ |
-| REARCH-003 | `backfill_event_quality_tags.sql` (batched) | ☐ |
+| REARCH-003 | `add_event_quality_tag_columns_to_flow_events.sql` | ☑ (applied 2026-05-11) |
+| REARCH-003 | `backfill_event_quality_tags.sql` (batched) | ⚠ Pending — Supabase executor timeout; run manually |
+| REARCH-003 | `add_event_quality_tag_constraints.sql` | ⚠ Pending — run after backfill completes |
 | REARCH-004 | `add_episode_quality_aggregate_columns.sql` | ☐ |
 | REARCH-005 | `create_signal_config_table.sql` | ☐ |
 | REARCH-005 | `seed_signal_config_steamroom_defaults.sql` | ☐ |
@@ -376,6 +377,8 @@ Deliberation results must be documented as comments on the GitHub issue before t
 | REARCH-010 | `add_steamroom_columns_flow_episodes.sql` | ☑ |
 | REARCH-010 | `add_steamroom_snapshot_columns_signal_history.sql` | ☑ |
 | REARCH-013 | `create_index_signal_history_detail_swarm.sql` (GIN index on `detail->'swarm'`) | ☐ |
+
+> **REARCH-003 DB note (2026-05-11):** `add_event_quality_tag_columns_to_flow_events.sql` applied to Supabase production — columns `is_ask_side`, `bid_ask_class`, `vol_oi_signal`, `normalized_premium`, `dte_bucket`, `notional_tier` and partial indexes `idx_flow_events_dte_bucket` / `idx_flow_events_notional_tier` are live. `backfill_event_quality_tags.sql` and `add_event_quality_tag_constraints.sql` hit a Supabase executor timeout and must be run manually via Supabase SQL editor before PR #127 is merged. Canonical migration path confirmed: `supabase/migrations/` (not `backend/db/migrations/`). Old copies in `backend/db/migrations/` replaced with redirect stubs.
 
 > **REARCH-001 DB note:** Both migrations applied to Supabase production 2026-05-10. `chk_options_universe_symbols_no_index` is live. Note: `tracked_symbols` table does not exist in the cipher schema — both migrations operate on `options_universe_symbols` only.
 
@@ -406,25 +409,4 @@ The following pre-REARCH terms must not appear in any new code, component, API r
 | `gate_configs` (table) | `ingestion_config` | DB table, admin Gate Config panel |
 | `gate_config_audit` (table) | `admin_activity_log` | DB table |
 | `seed_episode` (column) | Removed; no replacement | `flow_episodes` |
-| `ensemble_runner.run_ensemble()` | `SwarmCoordinator.invoke()` with `SwarmTier.DEEP` (REARCH-013) | `backend/simulation/ensemble_runner.py` |
-
----
-
-## Merge-to-Main Readiness Checklist
-
-- [ ] REARCH-001 through REARCH-014 all status ✅ (merged to aggregation branch)
-- [ ] REARCH-009 integration test suite: all scenarios green in CI (includes swarm and backtest integration tests)
-- [x] REARCH-010 DB schema purge applied and verified with `get_advisors` scan
-- [x] REARCH-001 index symbol purge applied: `chk_options_universe_symbols_no_index` live on Supabase production
-- [x] REARCH-002 ingestion floors applied: `ingestion_config` table live, 7 default rows seeded, router mounted
-- [ ] No index ticker in `flow_events` (verified by query)
-- [ ] No retired vocabulary in any API response, DB column, or UI component
-- [ ] Admin UI: ingestion panel and signal panel both render and save correctly
-- [ ] Dashboard: signal feed shows REARCH alert levels; no swarm UI present; Steamroom pip indicator renders correctly
-- [ ] Signal engine: at least 5 trading session dry-runs with side-by-side comparison to old pipeline
-- [ ] **Swarm:** `POST /admin/swarm/invoke` endpoint functional; `build_composite()` sync path verified unmodified; circuit breaker trips and resets correctly; `ensemble_runner.py` deprecated with `DeprecationWarning`
-- [ ] **Backtest:** `GET /admin/signal-config/backtest` returns valid `BacktestResult`; `dry_run=True` hardcoded; no writes to any table; swarm excluded flag confirmed in all responses
-- [ ] `docs/SIGNAL_ENGINE.md` updated: tiered swarm architecture, circuit breaker behavior table, backtest engine contract, explicit-invocation-only contract documented
-- [ ] **Streaming boundary audit:** Confirm zero diff in any of the following files between `cipher-rearch` and `main`: Tradier client, streaming worker, OCC parser, chain cache, registry sync workers. If any diff exists, it must be explained and approved as an intentional exception.
-- [ ] `main` branch PR reviewed by SA + PBE + QA before merge
-- [ ] Railway deployment: zero-downtime deploy confirmed (no restart-required config changes)
+| `ensemble_runner.run_ensemble()` | `SwarmCoordinator.invoke()` with `Swar
