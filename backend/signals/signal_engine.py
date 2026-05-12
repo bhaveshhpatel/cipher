@@ -59,6 +59,17 @@
 #                      downgraded all FOLLOW_SWEEP/BUY_CALLS/BUY_PUTS
 #                      signals to WATCH with no log warning.
 #                      Added WARNING log when kill-switch is active.
+#              PBE-01: _EpisodeProxy.__getattr__ contract clarified.
+#                      Previous docstring said "returns None for missing
+#                      fields" but the code raised AttributeError — the
+#                      root cause of last sprint's test confusion.
+#                      Decision: RAISE AttributeError (Python data-model
+#                      default, consistent with getattr() fallback).
+#                      Two sentinel exceptions remain (documented inline):
+#                        weighted_premium -> 0.0  (Gate 1 needs a numeric 0)
+#                        events           -> []   (Gate 3/4 iterate safely)
+#                      The dte sentinel (raise AttributeError) is removed;
+#                      Gate 4 already handles None dte via dte_bucket path.
 # ============================================================================
 
 from __future__ import annotations
@@ -404,12 +415,17 @@ class SignalEngine:
         min_dte: int = cfg.get("sig.min_dte", cfg.get("min_dte", 5))
         max_dte: int = cfg.get("sig.max_dte", cfg.get("max_dte", 60))
 
+        # Attempt 1: direct dte attribute (ORM episode objects set this).
+        # _EpisodeProxy raises AttributeError for unknown keys (PBE-01 contract),
+        # so getattr with a sentinel is the correct pattern here.
         dte: Optional[int] = getattr(ep, "dte", None)
         if dte is None:
             events = getattr(ep, "events", []) or []
             if events:
                 dte = getattr(events[0], "dte", None)
 
+        # Attempt 2: dte_bucket midpoint fallback (dict-backed episodes via
+        # _EpisodeProxy have no raw dte; this is the normal path for them).
         if dte is None:
             raw_bucket = getattr(ep, "dte_bucket", None)
             dte_bucket = (raw_bucket or "").strip().upper() if raw_bucket is not None else ""
@@ -499,7 +515,27 @@ engine = get_engine()
 # ---------------------------------------------------------------------------
 
 class _EpisodeProxy:
-    """Thin wrapper that exposes episode dict keys as attributes."""
+    """Thin wrapper that exposes episode dict keys as object attributes.
+
+    Contract (PBE-01)
+    -----------------
+    * Unknown attribute names RAISE AttributeError — standard Python
+      data-model behaviour, consistent with getattr(obj, name, default).
+      Do NOT rely on this class silently returning None for missing keys;
+      use ``getattr(proxy, name, None)`` at the call-site if you need a
+      safe fallback.
+
+    Sentinel exceptions (the only two that do NOT raise):
+      weighted_premium  -> float(total_premium) or 0.0
+          Gate 1 always needs a numeric value; 0.0 correctly fails the
+          premium threshold check rather than crashing the evaluator.
+      events            -> []
+          Gates 3 and 4 iterate over events; an empty list means
+          "no event-level data available" — a valid, safe sentinel.
+
+    All other missing keys propagate AttributeError upward so callers
+    know immediately that the episode dict is structurally incomplete.
+    """
     __slots__ = ("_d", "_tier")
 
     def __init__(self, d: dict, normalised_tier: str = "T1") -> None:
@@ -508,17 +544,30 @@ class _EpisodeProxy:
 
     def __getattr__(self, name: str):
         d = object.__getattribute__(self, "_d")
+
         if name == "notional_tier":
+            # Always return the normalised form stored at construction time.
             return object.__getattribute__(self, "_tier")
+
         if name in d:
             return d[name]
+
+        # Sentinel: Gate 1 needs a numeric zero, not AttributeError.
         if name == "weighted_premium":
             return float(d.get("total_premium") or 0.0)
+
+        # Sentinel: Gates 3/4 iterate events; empty list is safe and correct.
         if name == "events":
             return []
-        if name == "dte":
-            raise AttributeError(name)
-        raise AttributeError(name)
+
+        # All other missing attributes follow the Python data-model contract:
+        # raise AttributeError so getattr(proxy, name, default) works properly
+        # and callers are not surprised by silent None returns.
+        raise AttributeError(
+            f"_EpisodeProxy has no attribute {name!r} and the episode dict "
+            f"does not contain key {name!r}. "
+            "Use getattr(proxy, name, default) if a fallback is acceptable."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +624,6 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
     score = 0
 
     # D1 — Ask-side execution dominance
-    # None means the field is absent — no point awarded (graceful degrade).
     ask_pct: float | None = getattr(episode, "ask_side_pct", None)
     floor: float = float(_get("ask_side_pct_floor", _get("sig.ask_side_pct_floor", 0.6)))
     if ask_pct is not None and ask_pct >= floor:
