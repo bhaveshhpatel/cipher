@@ -59,6 +59,11 @@ Key architectural fixes:
   REARCH-002 (main)   — ingestion_config router mounted: GET/PATCH /admin/ingestion-config
                         now reachable. Previously the router was created but never
                         included in app.include_router().
+  REARCH-005 (main)   — signal_config router mounted: GET/PATCH /admin/signal-config
+                        now reachable. Reads/writes signal_config table; enforces
+                        premium pyramid, DTE window, tier multiplier, and floor
+                        ordering invariants. Calls reload_signal_config() on every
+                        successful PATCH for immediate in-process snapshot refresh.
   MAIN-FIX-001        — start_lookback_worker() was refactored (FS-HANG) to fetch
                         its own accumulator internally via get_accumulator() — it
                         takes 0 positional args. Removed stale registry.accumulator
@@ -84,6 +89,7 @@ from routers import history
 from routers import admin
 from routers import health
 from routers import ingestion_config as ingestion_config_router  # REARCH-002
+from routers import signal_config as signal_config_router        # REARCH-005
 from core.auth import get_current_user
 from services.flow_store import start_flow_writer, start_lookback_worker
 from services.chain_store import start_chain_refresh_worker, invalidate_vol_oi_cache  # ING-008
@@ -735,6 +741,7 @@ app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
 app.include_router(ingestion_config_router.router)  # REARCH-002: /admin/ingestion-config GET+PATCH
+app.include_router(signal_config_router.router)     # REARCH-005: /admin/signal-config GET+PATCH
 
 
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
