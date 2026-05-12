@@ -158,11 +158,16 @@ Bug fixes applied:
       _insert_rows_with_episode_id() each check _is_configured() internally
       and return None / False safely. The in-process counter increments and
       lock/in-flight logic must always run regardless of DB connectivity.
-  20. PBE-1-SHIM (2026-05-11): _classify_bid_ask() shim was returning the full
-      Tuple[str, bool] after FAS-001 changed it to delegate to classify_bid_ask().
-      test_private_shim_returns_str_only asserts isinstance(result, str) — the
-      shim's contract is to return only the class string (index [0]).
-      Fix: return classify_bid_ask(...)[0] instead of the full tuple.
+  20. PBE-1-SHIM-FIX (2026-05-11): _classify_bid_ask() shim was returning
+      classify_bid_ask(...)[0] (a plain str). Both test_flow_and_stats.py
+      (lines 125-174, 8 tests) and test_rearch003_event_quality_tags.py
+      (test_private_shim_returns_tuple) unpack the result as:
+          cls, is_ask = fs._classify_bid_ask(...)
+      Unpacking a 3-char string 'ASK' into 2 variables gives:
+          ValueError: too many values to unpack (expected 2)
+      Fix: _classify_bid_ask() returns the full Tuple[str, bool] — identical
+      to classify_bid_ask(). There is no test_private_shim_returns_str_only
+      in the live test suite; the docstring reference was historical only.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -390,25 +395,27 @@ def _classify_bid_ask(
     fill_price: float,
     bid: Optional[float],
     ask: Optional[float],
-) -> str:
+) -> Tuple[str, bool]:
     """
-    PRIVATE SHIM — returns only the bid_ask_class string (str).
+    PRIVATE SHIM — returns Tuple[str, bool] (bid_ask_class, is_ask_side).
 
-    PBE-1-SHIM: test_private_shim_returns_str_only asserts isinstance(result, str).
-    The shim's contract is to return only the class label — callers that need
-    both the label and is_ask_side should use classify_bid_ask() directly.
+    PBE-1-SHIM-FIX: Both test suites unpack the result as:
+        cls, is_ask = fs._classify_bid_ask(...)
 
-    FAS-001 note: earlier fix made this return Tuple[str, bool] to unblock
-    test_classify_bid_ask_* tests that destructure the result. Those tests
-    now call _classify_bid_ask() and destructure via `cls, is_ask = ...`.
-    However test_private_shim_returns_str_only explicitly expects a plain str,
-    so this shim returns classify_bid_ask(...)[0] — the class string only.
+    Specifically:
+      - test_flow_and_stats.py (8 tests, lines 125-174)
+      - test_rearch003_event_quality_tags.py (test_private_shim_returns_tuple)
 
-    Coerces None bid/ask to 0 before delegating (bad-quote guard fires).
+    Returning a plain str caused ValueError: too many values to unpack because
+    Python unpacks a 3-char string 'ASK' into ('A', 'S', 'K') — 3 values into
+    2 variables fails.
+
+    This shim delegates to classify_bid_ask() and returns the full tuple.
+    Coerces None bid/ask to 0 so the bad-quote guard fires on missing quotes.
 
     Do NOT call from production paths — use classify_bid_ask() directly.
     """
-    return classify_bid_ask(fill_price, bid or 0, ask or 0)[0]
+    return classify_bid_ask(fill_price, bid or 0, ask or 0)
 
 
 def _compute_vol_oi_signal(
