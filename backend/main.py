@@ -2,22 +2,25 @@
 Cipher Backend — FastAPI entry point
 
 Startup sequence:
-  0. gate_config_store.load()        — load tier gate config from DB into memory  [ING-010]
-  1. validate_ingestion_config()     — warn on missing ingestion config rows  [RC-3]
-  2. _resolve_startup_universe()     — load symbols from DB (<2s)
-  3. init_registry()                 — in-memory init (instant)
-  4. registry.load_from_db()         — seed OCC chains from DB via P1 fallback
-  5. yield                           — SERVER IS LIVE, health probe passes
+  0. gate_config_store.load()          — load tier gate config from DB into memory  [ING-010]
+  1. validate_ingestion_config()       — warn on missing ingestion config rows  [RC-3]
+  2. _resolve_startup_universe_fast()  — DB-only path: fresh snapshot HIT → done;
+                                         MISS → seed with stale snapshot and schedule
+                                         background refresh  [RENDER-STARTUP-HANG]
+  3. init_registry()                   — in-memory init (instant)
+  4. registry.load_from_db()           — seed OCC chains from DB via P1 fallback
+  5. yield                             — SERVER IS LIVE, health probe passes (~6 s)
   6. Parallel background tasks launched:
-     a. _background_build_and_upsert — incremental/full OCC build (P4)
-     b. registry.refresh_loop()      — scheduled 30-min rebuilds
-     c. _registry_prewarm_loop()     — 9:15 AM ET daily pre-warm
-     d. stream_options_flow()        — waits for is_ready(), then streams
-     e. start_flow_writer()          — DB flush loop
-     f. start_signal_writer()        — signal DB writer
-     g. _universe_refresh_loop()     — 24h universe refresh
-     h. start_chain_refresh_worker() — ING-008: 5-min chain cache refresh loop
-     i. _self_ping_worker()          — RENDER: pings /health every 10 min to prevent spin-down
+     a. _background_build_and_upsert   — incremental/full OCC build (P4)
+     b. _background_universe_resolve() — MISS only: load_universe() + save + tier assign
+     c. registry.refresh_loop()        — scheduled 30-min rebuilds
+     d. _registry_prewarm_loop()       — 9:15 AM ET daily pre-warm
+     e. stream_options_flow()          — waits for is_ready(), then streams
+     f. start_flow_writer()            — DB flush loop
+     g. start_signal_writer()          — signal DB writer
+     h. _universe_refresh_loop()       — 24h universe refresh
+     i. start_chain_refresh_worker()   — ING-008: 5-min chain cache refresh loop
+     j. _self_ping_worker()            — RENDER: pings /health every 10 min to prevent spin-down
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -75,6 +78,12 @@ Key architectural fixes:
                         free-tier spin-down (15-min idle threshold). Does NOT prevent
                         restarts caused by deploys, crashes, or OOM — reconnect logic
                         in tradier_stream already handles those cases.
+  RENDER-STARTUP-HANG — _resolve_startup_universe() split into a fast DB-only phase
+                        (before yield) and a slow background phase (after yield).
+                        The slow load_universe() call (CBOE + Tradier, 60-120 s) no
+                        longer blocks yield, so Render's health probe passes in ~6 s
+                        from cold start instead of timing out and restarting the
+                        container in a loop.
 """
 import asyncio
 import json
@@ -242,7 +251,40 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         return []
 
 
-async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, str]:
+# ---------------------------------------------------------------------------
+# RENDER-STARTUP-HANG fix
+#
+# The original _resolve_startup_universe() ran the full load_universe() path
+# (CBOE + Tradier validate, 60-120 s) before yield, blocking the health probe.
+#
+# Split into two functions:
+#
+#   _resolve_startup_universe_fast()  — DB reads only (<2 s), runs before yield.
+#     Returns (stream_symbols, tier_map, snapshot_id, needs_refresh).
+#     needs_refresh=True when no fresh snapshot exists; the caller must then
+#     schedule _background_universe_resolve() as a post-yield task.
+#
+#   _background_universe_resolve()    — slow path, runs after yield as a task.
+#     Calls load_universe(), saves the snapshot, assigns tiers, and patches
+#     the live registry + accumulator without blocking the health probe.
+# ---------------------------------------------------------------------------
+
+async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], str, bool]:
+    """
+    RENDER-STARTUP-HANG: DB-only startup universe resolution.
+
+    Fast path (cache HIT — normal daily operation):
+      Loads the fresh snapshot from DB (max_age=24h) and returns immediately.
+      needs_refresh=False — no background refresh is needed.
+
+    Slow path (cache MISS — first deploy or snapshot >24 h old):
+      Falls back to the most-recent stale snapshot as a minimal seed so the
+      stream and registry start with something rather than an empty list.
+      needs_refresh=True — caller must schedule _background_universe_resolve().
+
+    No Tradier calls, no CBOE calls.  All DB I/O via universe_store.
+    Expected wall-clock time: <2 s in both paths.
+    """
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
 
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
@@ -271,57 +313,22 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
-        return fresh, tier_map, [], snapshot_id
+        return fresh, tier_map, snapshot_id, False  # needs_refresh=False
 
-    log.info("[universe] Step 2a MISS: no fresh DB snapshot found")
+    # Cache MISS — seed with stale snapshot so the registry and stream start
+    # with something.  The slow refresh runs post-yield.
     log.info(
-        "[universe] Step 2b: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
-        bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL),
+        "[universe] Step 2a MISS: no fresh snapshot — "
+        "seeding from stale snapshot, scheduling background refresh"
     )
-
-    log.info("[universe] Step 2c: loading any stale DB snapshot as safety net")
     stale = await universe_store.load_any_snapshot()
-    log.info(
-        "[universe] Step 2c: stale snapshot available=%s (%d symbols)",
-        stale is not None, len(stale) if stale else 0,
-    )
-
-    log.info("[universe] Step 2d: calling load_universe (CBOE + Tradier validate + screen)")
-    symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
-    log.info(
-        "[universe] Step 2d: load_universe returned source=%s symbols=%d eligible=%s",
-        source, len(symbols),
-        len(stream_eligible_set) if stream_eligible_set is not None else "n/a",
-    )
-
-    tier_map: dict[str, int] = {}
-    quotes: list = []
-    snapshot_id = ""
-
-    if source == "tradier_validated":
+    if stale:
         log.info(
-            "[universe] Step 2e: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
-            len(symbols),
-            len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
+            "[universe] Step 2a stale seed: %d symbols available for stream seed",
+            len(stale),
         )
-        saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
-        if saved:
-            log.info("[universe] Step 2e SUCCESS: snapshot persisted to DB")
-        else:
-            log.error("[universe] Step 2e FAILED: save_snapshot returned False")
-
-        log.info("[universe] Step 2f: fetching batch quotes for %d symbols", len(symbols))
-        quotes = await _fetch_batch_quotes(symbols)
-        if quotes:
-            log.info("[universe] Step 2f: preliminary tier assignment for %d symbols", len(quotes))
-            tier_map = await assign_tiers(quotes)
-            log.info(
-                "[universe] Step 2f: preliminary tiers — T1=%d T2=%d T3=%d",
-                sum(1 for t in tier_map.values() if t == 1),
-                sum(1 for t in tier_map.values() if t == 2),
-                sum(1 for t in tier_map.values() if t == 3),
-            )
-
+        # Load the stale tier map as best-effort; background refresh will overwrite.
+        tier_map = await universe_store.load_tier_map()
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: universe_store._client()
@@ -334,11 +341,109 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
                 .data,
         )
         snapshot_id = active_snap[0]["id"] if active_snap else ""
+        return stale, tier_map, snapshot_id, True  # needs_refresh=True
+
+    log.warning(
+        "[universe] Step 2a: no snapshot in DB at all — "
+        "starting with empty symbol list, background refresh will populate"
+    )
+    return [], {}, "", True  # needs_refresh=True
+
+
+async def _background_universe_resolve(registry) -> None:
+    """
+    RENDER-STARTUP-HANG: slow universe refresh that runs post-yield.
+
+    Called only when _resolve_startup_universe_fast() returned needs_refresh=True
+    (i.e. no fresh 24h snapshot existed at startup).
+
+    Runs the full load_universe() pipeline (CBOE + Tradier validate + screen),
+    saves the snapshot to DB, assigns tiers, then live-patches:
+      - registry.set_tier_map()
+      - tradier_stream.accumulator.set_tier_map()  (ING-010-ACC)
+      - universe_store.upsert_symbol_quotes()
+
+    The stream workers are already running at this point (they started with the
+    stale seed).  Patching the registry tier_map is thread-safe — set_tier_map()
+    replaces the dict atomically.
+    """
+    log.info("[universe] Background universe refresh starting (cache miss at startup)")
+    try:
+        stale = await universe_store.load_any_snapshot()
+        log.info(
+            "[universe] Step 2b: checking env — TRADIER_API_KEY set=%s SUPABASE_URL set=%s",
+            bool(settings.TRADIER_API_KEY), bool(settings.SUPABASE_URL),
+        )
+        log.info("[universe] Step 2d: calling load_universe (CBOE + Tradier validate + screen)")
+        symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
+        log.info(
+            "[universe] Step 2d: load_universe returned source=%s symbols=%d eligible=%s",
+            source, len(symbols),
+            len(stream_eligible_set) if stream_eligible_set is not None else "n/a",
+        )
+    except Exception as exc:
+        log.error("[universe] Background universe resolve: load_universe failed: %s", exc, exc_info=True)
+        return
+
+    tier_map: dict[str, int] = {}
+    quotes: list = []
+
+    if source == "tradier_validated":
+        log.info(
+            "[universe] Step 2e: persisting tradier_validated snapshot (%d symbols, %d eligible) to DB",
+            len(symbols),
+            len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
+        )
+        try:
+            saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+            if saved:
+                log.info("[universe] Step 2e SUCCESS: snapshot persisted to DB")
+            else:
+                log.error("[universe] Step 2e FAILED: save_snapshot returned False")
+        except Exception as exc:
+            log.error("[universe] Step 2e: save_snapshot raised: %s", exc, exc_info=True)
+
+        try:
+            log.info("[universe] Step 2f: fetching batch quotes for %d symbols", len(symbols))
+            quotes = await _fetch_batch_quotes(symbols)
+            if quotes:
+                log.info("[universe] Step 2f: preliminary tier assignment for %d symbols", len(quotes))
+                tier_map = await assign_tiers(quotes)
+                log.info(
+                    "[universe] Step 2f: preliminary tiers — T1=%d T2=%d T3=%d",
+                    sum(1 for t in tier_map.values() if t == 1),
+                    sum(1 for t in tier_map.values() if t == 2),
+                    sum(1 for t in tier_map.values() if t == 3),
+                )
+        except Exception as exc:
+            log.error("[universe] Step 2f: quote/tier fetch failed: %s", exc, exc_info=True)
     else:
         log.warning(
             "[universe] Step 2e SKIPPED: source=%s (not tradier_validated) — DB will NOT be updated",
             source,
         )
+
+    # Live-patch the running registry and accumulator if we got fresh tiers.
+    if tier_map:
+        try:
+            registry.set_tier_map(tier_map)
+            _sync_accumulator_tier_map(tier_map)
+            log.info(
+                "[universe] Background resolve: registry + accumulator tier_map patched "
+                "(T1=%d T2=%d T3=%d)",
+                sum(1 for t in tier_map.values() if t == 1),
+                sum(1 for t in tier_map.values() if t == 2),
+                sum(1 for t in tier_map.values() if t == 3),
+            )
+        except Exception as exc:
+            log.error("[universe] Background resolve: tier_map patch failed: %s", exc, exc_info=True)
+
+    if quotes and tier_map:
+        try:
+            await universe_store.upsert_symbol_quotes(quotes, tier_map)
+            log.info("[universe] Background resolve: upsert_symbol_quotes complete")
+        except Exception as exc:
+            log.error("[universe] Background resolve: upsert_symbol_quotes failed: %s", exc, exc_info=True)
 
     stream_symbols = (
         [s for s in symbols if s in stream_eligible_set]
@@ -346,10 +451,9 @@ async def _resolve_startup_universe() -> tuple[list[str], dict[str, int], list, 
         else symbols
     )
     log.info(
-        "[universe] FINAL: stream starting with %d symbols (source=%s, from universe of %d)",
+        "[universe] Background resolve COMPLETE: %d stream symbols (source=%s, universe=%d)",
         len(stream_symbols), source, len(symbols),
     )
-    return stream_symbols, tier_map, quotes, snapshot_id
 
 
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
@@ -627,8 +731,25 @@ async def lifespan(app: FastAPI):
     # Step 1 [RC-3]: Warn on any missing ingestion config rows in DB.
     await validate_ingestion_config()
 
-    # Step 2: Resolve startup universe (DB snapshot or fresh Tradier fetch).
-    stream_symbols, tier_map, _quotes, snapshot_id = await _resolve_startup_universe()
+    # Step 2 [RENDER-STARTUP-HANG]: Fast DB-only universe resolution.
+    #
+    # _resolve_startup_universe_fast() only does Supabase reads — no Tradier,
+    # no CBOE.  Expected wall-clock time: <2 s.
+    #
+    # On cache HIT (normal daily operation): returns fresh snapshot + tiers.
+    #   needs_refresh=False — no background refresh spawned.
+    #
+    # On cache MISS (first deploy / snapshot >24 h old): returns stale snapshot
+    # as seed (or empty list if no snapshot exists at all).
+    #   needs_refresh=True — _background_universe_resolve() is launched post-yield
+    #   to run the full load_universe() pipeline without blocking the health probe.
+    stream_symbols, tier_map, snapshot_id, needs_universe_refresh = (
+        await _resolve_startup_universe_fast()
+    )
+    log.info(
+        "[universe] Fast resolve done: %d symbols, snapshot_id=%r, needs_refresh=%s",
+        len(stream_symbols), snapshot_id, needs_universe_refresh,
+    )
 
     # Step 3: Init in-memory symbol registry.
     registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
@@ -652,9 +773,10 @@ async def lifespan(app: FastAPI):
         registry.is_ready(), registry.size(),
     )
 
-    # Step 5: yield — server is live, health probe passes.
-    # Background tasks launch AFTER yield so the process accepts traffic
-    # before the 30-60s OCC build begins.
+    # Steps 0-4 above complete in ~6 s (all DB reads, no external HTTP).
+    # yield HERE so Render's health probe passes immediately.
+    # All remaining work runs in background tasks below.
+
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
     stream_task           = asyncio.create_task(
@@ -671,6 +793,18 @@ async def lifespan(app: FastAPI):
     # positional arguments. The previous call site passed registry.accumulator,
     # causing TypeError at every TestClient startup.
     lookback_task         = asyncio.create_task(start_lookback_worker())
+
+    # RENDER-STARTUP-HANG: spawn background universe refresh only on cache MISS.
+    # On HIT this is None and is excluded from the shutdown cancel list.
+    universe_resolve_task = (
+        asyncio.create_task(_background_universe_resolve(registry))
+        if needs_universe_refresh
+        else None
+    )
+    if universe_resolve_task:
+        log.info(
+            "[universe] Cache miss at startup — background universe resolve task spawned"
+        )
 
     # ING-008: background 5-min chain cache refresh loop.
     #
@@ -730,7 +864,10 @@ async def lifespan(app: FastAPI):
     signal_write_task.cancel()
     chain_refresh_task.cancel()  # ING-008
     self_ping_task.cancel()      # RENDER-KEEPALIVE
-    for task in (
+    if universe_resolve_task:
+        universe_resolve_task.cancel()  # RENDER-STARTUP-HANG
+
+    shutdown_tasks = [
         build_task,
         db_write_task,
         signal_write_task,
@@ -740,7 +877,11 @@ async def lifespan(app: FastAPI):
         lookback_task,
         chain_refresh_task,  # ING-008
         self_ping_task,      # RENDER-KEEPALIVE
-    ):
+    ]
+    if universe_resolve_task:
+        shutdown_tasks.append(universe_resolve_task)  # RENDER-STARTUP-HANG
+
+    for task in shutdown_tasks:
         try:
             await task
         except asyncio.CancelledError:
