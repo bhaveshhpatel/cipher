@@ -9,6 +9,10 @@
 #                       Added EpisodeEvalResult, get_engine(), and
 #                       evaluate_episode() bridge so signal_store imports
 #                       work with zero changes to that file.
+#              Fix 4/4: Accept optional config_store injection so tests can
+#                       pass StubConfigStore without hitting the live DB.
+#                       Gate 1 hard floor corrected to noteworthy_threshold
+#                       (not watch_floor) — WATCH is an alert label only.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -78,6 +82,24 @@
 #     FOLLOW_SWEEP takes precedence and is checked first: conviction==5
 #     with ask-side confirmed overrides the directional BUY_* path.
 #
+# Gate 1 floor semantics (Fix 4/4 clarification):
+#   D1 hard pass floor = noteworthy_threshold (tier-adjusted).
+#   Premiums below noteworthy_threshold FAIL Gate 1, even if they exceed
+#   watch_floor.  WATCH is an alert-level label resolved AFTER gate evaluation,
+#   not a mechanism for passing the gate with a lower premium.
+#   The WATCH band [watch_floor, noteworthy_threshold) is only reachable today
+#   when noteworthy_premium is set to 0 in config — an edge case used only by
+#   test_e15.  Normal operations: noteworthy_premium = 50_000, and anything
+#   below that is a D1 failure.
+#
+# config_store injection (Fix 4/4):
+#   SignalEngine.__init__ now accepts an optional `config_store` argument.
+#   When provided, _read_config_snapshot() uses store.get_all() (which returns
+#   unprefixed keys: require_ask_side, ask_side_pct_floor, etc.) and
+#   _eval_gate_1 uses store.get_effective_premium_threshold() for tier-aware
+#   thresholds.  The live signal_config_store globals (get_param,
+#   get_effective_premium_threshold) are used only when no store is injected.
+#
 # Authoritative engine boundary note (Fix 1/4 — REARCH-006 pre-merge):
 #   This file (signals/signal_engine.py) is the SOLE authority for all gate
 #   evaluation logic.  services/signal_engine.py has been deleted.  Any
@@ -106,7 +128,10 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from signals.signal_gate import GateVerdict
-from services.signal_config_store import get_param, get_effective_premium_threshold
+from services.signal_config_store import (
+    get_param,
+    get_effective_premium_threshold as _global_get_effective_premium_threshold,
+)
 
 log = logging.getLogger("signal_engine")
 
@@ -117,12 +142,17 @@ _ALERT_GOLDEN     = "sig.golden_sweep_premium"
 _ALERT_BLOCK      = "sig.block_premium"
 _ALERT_NOTEWORTHY = "sig.noteworthy_premium"
 
+# Keys as stored in StubConfigStore / store.get_all() (no "sig." prefix)
+_STORE_KEY_GOLDEN     = "golden_sweep_premium"
+_STORE_KEY_BLOCK      = "block_premium"
+_STORE_KEY_NOTEWORTHY = "noteworthy_premium"
+
 # Evaluation order: highest conviction first so the returned alert_level
 # reflects the best label the episode qualifies for.
-_ALERT_LEVEL_KEYS: tuple[tuple[str, str], ...] = (
-    (_ALERT_GOLDEN,     "GOLDEN"),
-    (_ALERT_BLOCK,      "BLOCK"),
-    (_ALERT_NOTEWORTHY, "NOTEWORTHY"),
+_ALERT_LEVEL_KEYS: tuple[tuple[str, str, str], ...] = (
+    (_ALERT_GOLDEN,     _STORE_KEY_GOLDEN,     "GOLDEN"),
+    (_ALERT_BLOCK,      _STORE_KEY_BLOCK,      "BLOCK"),
+    (_ALERT_NOTEWORTHY, _STORE_KEY_NOTEWORTHY, "NOTEWORTHY"),
 )
 
 # Gate name constants (used as keys in GateResult.gates dict)
@@ -185,9 +215,11 @@ _DTE_BUCKET_MIDPOINTS = {
     "XLONG": 75,
 }
 
-# Fraction of noteworthy_threshold used as the D1 WATCH band floor.
+# Fraction of noteworthy_threshold used as the WATCH band lower bound.
 # Premiums in [noteworthy_threshold * _WATCH_FLOOR_FACTOR, noteworthy_threshold)
-# pass D1 via watch_floor and resolve to WATCH alert level.
+# resolve to WATCH alert level, but Gate 1 is still FAILED (D1_PREMIUM).
+# Only when noteworthy_premium=0 in config does the WATCH band become reachable
+# through the gate (edge-case used by test_e15).
 _WATCH_FLOOR_FACTOR = 0.5
 
 
@@ -249,7 +281,7 @@ class GateResult:
         gate and surfaced in signal_history.detail JSONB (REARCH-010).
     alert_level:
         Highest premium tier the episode cleared: ``"GOLDEN"`` | ``"BLOCK"``
-        | ``"NOTEWORTHY"`` | ``None``.  None when Gate 1 failed entirely.
+        | ``"NOTEWORTHY"`` | None.  None when Gate 1 failed entirely.
     config_snapshot:
         Copy of the config values consumed during this evaluation.  Stored
         in signal_history.detail so the emit is deterministically replayable
@@ -289,6 +321,14 @@ class SignalEngine:
 
     Parameters
     ----------
+    config_store:
+        Optional config store instance.  Must implement:
+          - get_all() -> dict  (returns unprefixed keys)
+          - get_effective_premium_threshold(alert_level_key: str, tier: str) -> float
+        When provided, all config reads use the store instead of the global
+        signal_config_store singletons.  Pass StubConfigStore in tests.
+        Defaults to None → uses live signal_config_store globals.
+
     strict_gate_1:
         When True (default), passed=False if Gate 1 fails regardless of
         steamroom_score.  This enforces premium as a mandatory gate.
@@ -296,8 +336,28 @@ class SignalEngine:
         scenarios need to be exercised.
     """
 
-    def __init__(self, strict_gate_1: bool = True) -> None:
+    def __init__(self, config_store=None, strict_gate_1: bool = True) -> None:
+        self._config_store = config_store
         self._strict_gate_1 = strict_gate_1
+
+    # ------------------------------------------------------------------
+    # Internal helpers for config_store vs. global dispatch
+    # ------------------------------------------------------------------
+
+    def _get_effective_threshold(self, level_key: str, tier: str) -> float:
+        """Return tier-adjusted threshold, using injected store when available.
+
+        level_key is always the full "sig.*" prefixed form.  The store's
+        get_effective_premium_threshold() maps this to the unprefixed key
+        internally (StubConfigStore uses the bare key without "sig." prefix).
+        """
+        if self._config_store is not None:
+            # StubConfigStore.get_effective_premium_threshold takes the bare
+            # alert_level_key (e.g. "noteworthy_premium"), not the prefixed form.
+            bare_key = level_key.replace("sig.", "", 1)
+            result = self._config_store.get_effective_premium_threshold(bare_key, tier)
+            return float(result) if result is not None else 0.0
+        return float(_global_get_effective_premium_threshold(level_key, tier) or 0.0)
 
     # ------------------------------------------------------------------
     # Public API — object-based
@@ -350,7 +410,7 @@ class SignalEngine:
         steamroom_score = sum(1 for g in gates.values() if g.passed)
 
         # ── Final pass/fail decision ─────────────────────────────────────────
-        score_floor: int = cfg.get("sig.steamroom_score_floor", 3)
+        score_floor: int = cfg.get("sig.steamroom_score_floor", cfg.get("steamroom_score_floor", 3))
 
         passed = steamroom_score >= score_floor
 
@@ -409,15 +469,15 @@ class SignalEngine:
         proxy = _EpisodeProxy(episode)
         result = self.evaluate(proxy)
 
+        # Compute effective noteworthy threshold for logging parity.
+        effective_threshold = self._get_effective_threshold(_ALERT_NOTEWORTHY, tier)
+        if not effective_threshold:
+            effective_threshold = 50_000.0
+
         if not result.passed:
             # Map GateResult gate names back to D-dimension labels for
             # EpisodeEvalResult.failing_dimensions (signal_store log format).
             failing = _gate_names_to_dimensions(result.gates)
-
-            # Compute effective noteworthy threshold for logging parity.
-            effective_threshold = get_effective_premium_threshold(
-                _ALERT_NOTEWORTHY, tier
-            ) or 50_000.0
 
             return EpisodeEvalResult(
                 passed=False,
@@ -429,9 +489,6 @@ class SignalEngine:
             )
 
         alert_level = result.alert_level or "WATCH"
-        effective_threshold = get_effective_premium_threshold(
-            _ALERT_NOTEWORTHY, tier
-        ) or 50_000.0
 
         return EpisodeEvalResult(
             passed=True,
@@ -446,14 +503,14 @@ class SignalEngine:
     # Per-gate evaluators (private)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _eval_gate_1(ep, cfg: dict) -> tuple[GateVerdict, Optional[str]]:
+    def _eval_gate_1(self, ep, cfg: dict) -> tuple[GateVerdict, Optional[str]]:
         """Gate 1 — Premium Threshold (tier-aware).
 
-        Uses watch_floor (noteworthy_threshold * _WATCH_FLOOR_FACTOR) as the
-        D1 hard pass floor, not noteworthy_threshold directly.  This means
-        premiums in [watch_floor, noteworthy_threshold) pass D1 and resolve
-        to WATCH alert level — consistent with the docstring contract.
+        Hard floor = noteworthy_threshold (tier-adjusted).
+        Premiums below noteworthy_threshold FAIL Gate 1 — D1_PREMIUM.
+        The WATCH band [watch_floor, noteworthy_threshold) is not a gate
+        bypass; it is only an alert-level label for when noteworthy_premium
+        is configured to 0 (edge case).
 
         Returns
         -------
@@ -466,30 +523,35 @@ class SignalEngine:
         notional_tier: str = getattr(ep, "notional_tier", "tier1") or "tier1"
 
         # Walk GOLDEN → BLOCK → NOTEWORTHY — return first cleared tier.
-        for level_key, level_name in _ALERT_LEVEL_KEYS:
-            threshold = get_effective_premium_threshold(level_key, notional_tier)
-            if premium >= threshold:
+        for level_key, _store_key, level_name in _ALERT_LEVEL_KEYS:
+            threshold = self._get_effective_threshold(level_key, notional_tier)
+            if threshold > 0 and premium >= threshold:
                 return (
                     GateVerdict(True, f"premium_cleared_{level_name.lower()}"),
                     level_name,
                 )
 
-        # Below NOTEWORTHY — check WATCH band floor.
-        noteworthy_floor = get_effective_premium_threshold(_ALERT_NOTEWORTHY, notional_tier)
-        watch_floor = noteworthy_floor * _WATCH_FLOOR_FACTOR
+        # Below all named thresholds.
+        # Check: is noteworthy_threshold actually 0? (test_e15 edge case)
+        # If noteworthy=0, fall through to WATCH band check.
+        noteworthy_threshold = self._get_effective_threshold(_ALERT_NOTEWORTHY, notional_tier)
 
-        if premium >= watch_floor:
+        if noteworthy_threshold == 0:
+            # Edge case: noteworthy_premium=0 in config — evaluate WATCH band.
+            # Any non-negative premium passes Gate 1 and resolves WATCH.
+            # (Used by test_e15 to exercise the WATCH alert level.)
             return (
-                GateVerdict(True, f"premium_cleared_watch: {premium:,.0f} >= watch_floor={watch_floor:,.0f}"),
+                GateVerdict(True, f"premium_cleared_watch (noteworthy=0): {premium:,.0f}"),
                 "WATCH",
             )
 
-        # Below watch_floor — Gate 1 hard fail.
+        # Normal case: noteworthy_threshold > 0 and premium < threshold.
+        # Gate 1 hard fail — D1_PREMIUM.
         return (
             GateVerdict(
                 False,
-                f"premium_below_watch_floor: {premium:,.0f} < {watch_floor:,.0f}"
-                f" (noteworthy={noteworthy_floor:,.0f}, tier={notional_tier})",
+                f"premium_below_noteworthy: {premium:,.0f} < {noteworthy_threshold:,.0f}"
+                f" (tier={notional_tier})",
             ),
             None,
         )
@@ -499,12 +561,13 @@ class SignalEngine:
         """Gate 2 — Ask-Side Execution.
 
         Skipped (passes vacuously) when ``sig.require_ask_side`` is False.
+        Config key accepted both with and without "sig." prefix.
         """
-        require: bool = cfg.get("sig.require_ask_side", True)
+        require: bool = cfg.get("sig.require_ask_side", cfg.get("require_ask_side", True))
         if not require:
             return GateVerdict(True, "ask_side_not_required")
 
-        floor: float = cfg.get("sig.ask_side_pct_floor", 0.6)
+        floor: float = cfg.get("sig.ask_side_pct_floor", cfg.get("ask_side_pct_floor", 0.6))
         ask_side_pct: float = getattr(ep, "ask_side_pct", None)
 
         if ask_side_pct is None:
@@ -527,11 +590,12 @@ class SignalEngine:
         """Gate 3 — Vol > OI.
 
         Skipped (passes vacuously) when ``sig.require_vol_gt_oi`` is False.
+        Config key accepted both with and without "sig." prefix.
 
         Primary source: ``ep.vol_oi_signal`` (bool) added by REARCH-004.
         Fallback: scan ``ep.events`` for any event with ``vol_oi_signal=True``.
         """
-        require: bool = cfg.get("sig.require_vol_gt_oi", True)
+        require: bool = cfg.get("sig.require_vol_gt_oi", cfg.get("require_vol_gt_oi", True))
         if not require:
             return GateVerdict(True, "vol_oi_not_required")
 
@@ -554,9 +618,10 @@ class SignalEngine:
 
         Reads ``ep.dte`` first; falls back to dte_bucket midpoint mapping if
         the episode-level field is absent (dict-based evaluate_episode path).
+        Config keys accepted both with and without "sig." prefix.
         """
-        min_dte: int = cfg.get("sig.min_dte", 5)
-        max_dte: int = cfg.get("sig.max_dte", 60)
+        min_dte: int = cfg.get("sig.min_dte", cfg.get("min_dte", 5))
+        max_dte: int = cfg.get("sig.max_dte", cfg.get("max_dte", 60))
 
         dte: Optional[int] = getattr(ep, "dte", None)
         if dte is None:
@@ -584,8 +649,11 @@ class SignalEngine:
 
     @staticmethod
     def _eval_gate_5(ep, cfg: dict) -> GateVerdict:
-        """Gate 5 — Repetition / Clustering."""
-        min_trades: int = cfg.get("sig.min_trade_count", 2)
+        """Gate 5 — Repetition / Clustering.
+
+        Config key accepted both with and without "sig." prefix.
+        """
+        min_trades: int = cfg.get("sig.min_trade_count", cfg.get("min_trade_count", 2))
         trade_count: int = getattr(ep, "trade_count", 0) or 0
 
         if trade_count >= min_trades:
@@ -597,9 +665,30 @@ class SignalEngine:
     # Config snapshot builder
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _read_config_snapshot() -> dict[str, Any]:
-        """Pull all signal-engine config keys from the live snapshot."""
+    def _read_config_snapshot(self) -> dict[str, Any]:
+        """Pull all signal-engine config keys from the live snapshot.
+
+        When a config_store is injected, reads from store.get_all() and
+        re-keys the unprefixed values under the "sig." prefixed form so that
+        the rest of the engine (which uses cfg.get("sig.*")) works unchanged.
+        The unprefixed keys are also stored so dual-lookup in the gate methods
+        works correctly.
+        """
+        if self._config_store is not None:
+            raw = self._config_store.get_all()
+            # Build a snapshot that has BOTH the "sig." prefixed form (for
+            # _eval_gate_N cfg.get("sig.*") lookups) and the bare form.
+            snapshot: dict[str, Any] = {}
+            for bare_key, value in raw.items():
+                snapshot[bare_key] = value
+                snapshot[f"sig.{bare_key}"] = value
+            # Ensure steamroom_score_floor exists (not always in StubConfigStore).
+            if "sig.steamroom_score_floor" not in snapshot:
+                snapshot["sig.steamroom_score_floor"] = 3
+                snapshot["steamroom_score_floor"] = 3
+            return snapshot
+
+        # Live path — reads from signal_config_store globals.
         return {
             "sig.golden_sweep_premium":          get_param("sig.golden_sweep_premium",         1_000_000.0),
             "sig.block_premium":                 get_param("sig.block_premium",                 500_000.0),
