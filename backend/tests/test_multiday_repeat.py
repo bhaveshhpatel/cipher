@@ -64,6 +64,15 @@ FIX (REARCH-002-TEST 2026-05-10):
     Fix: side_effect=lambda *a, **kw: published.append(a) captures all positional
     args; assertion updated to inspect a[1] (the payload dict) instead of
     looking for a "type"=="signal" key that was never in the payload.
+
+FIX (REARCH-004 2026-05-12):
+  Bug I — Test 3 fake_insert() missing **kwargs.
+    REARCH-004 added ask_side_count (and potentially future fields) to the
+    _insert_rows_with_episode_id call-site. The tight positional-only signature
+    `fake_insert(table, row, key, premium, current_oi=None)` raises TypeError
+    on unexpected keyword arguments.
+    Fix: add **kwargs to fake_insert so it stays forward-compatible with any
+    future payload additions. No logic change.
 """
 import asyncio
 import datetime
@@ -300,7 +309,10 @@ async def test_persist_flow_episode_writes_is_multi_day_repeat():
 
     captured_rows: list = []
 
-    async def fake_insert(table, row, key, premium, current_oi=None):
+    # REARCH-004: _insert_rows_with_episode_id now receives ask_side_count (and
+    # potentially future new kwargs) in the call.  Accept **kwargs so this test
+    # stays forward-compatible with any future payload additions.
+    async def fake_insert(table, row, key, premium, current_oi=None, **kwargs):
         if table == "flow_episodes":
             captured_rows.append(row)
         return True
