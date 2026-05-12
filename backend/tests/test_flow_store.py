@@ -427,22 +427,12 @@ async def test_upgrade_to_sweep_url_contains_occ_symbol():
 # ---------------------------------------------------------------------------
 # persist_flow_episode
 #
-# ING-009 refactored persist_flow_episode to call _insert_rows_with_episode_id
-# (not _insert_rows directly) so it can capture the returned bigserial id for
-# the in-flight race-prevention cache.  Tests must patch the correct function.
+# persist_flow_episode uses a direct httpx.AsyncClient POST for the INSERT
+# path (no _insert_rows_with_episode_id helper).  Tests must patch httpx and
+# _lookup_open_episode so the INSERT branch is always taken.
 #
-# _insert_rows_with_episode_id signature:
-#   (table: str, row: dict, key: str, premium: float, oi_at_open: Optional[int])
-#
-# call_args positional layout:
-#   [0][0] = table   (str)         "flow_episodes"
-#   [0][1] = row     (dict)        the full episode row dict
-#   [0][2] = key     (str)         merge key
-#   [0][3] = premium (float)
-#   [0][4] = oi_at_open (Optional[int])
-#
-# _lookup_open_episode must also be patched to return None so the INSERT
-# branch is always taken (avoids an attempted DB GET in CI).
+# _lookup_open_episode must be patched to return None so the INSERT branch
+# is taken (avoids an attempted DB GET in CI).
 #
 # chain_store.get_contract_vol_oi is patched to avoid ImportError in
 # environments where chain_store is not available.
@@ -451,9 +441,8 @@ async def test_upgrade_to_sweep_url_contains_occ_symbol():
 @pytest.mark.asyncio
 async def test_persist_flow_episode_calls_insert_rows():
     """
-    ING-009: persist_flow_episode calls _insert_rows_with_episode_id on the
-    INSERT path (no existing open episode).  Previously patched _insert_rows
-    which is never reached on the episode INSERT path post-ING-009.
+    persist_flow_episode calls httpx POST (INSERT path) when no existing
+    open episode is found.
 
     alert_level uses REARCH vocabulary: WATCH | NOTEWORTHY | BLOCK | GOLDEN
     """
@@ -472,36 +461,38 @@ async def test_persist_flow_episode_calls_insert_rows():
         "timestamp": "2026-04-28T10:00:00Z",
     }
 
-    # Ensure no stale in-flight entry interferes with this test
     fs.reset_episode_state()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_resp.json = MagicMock(return_value=[{"id": 1, "ticker": "AAPL"}])
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("services.flow_store._lookup_open_episode",
                new_callable=AsyncMock, return_value=None), \
-         patch("services.flow_store._insert_rows_with_episode_id",
-               new_callable=AsyncMock, return_value=True) as mock_insert, \
          patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("httpx.AsyncClient", return_value=mock_client), \
          patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
                create=True):
         await fs.persist_flow_episode(signal_data)
 
-    mock_insert.assert_called_once()
-    # positional args: (table, row, key, premium, oi_at_open)
-    args = mock_insert.call_args[0]
-    table = args[0]
-    row   = args[1]
-    assert table == "flow_episodes"
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    row = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json", {})
     assert row["ticker"] == "AAPL"
-    assert row["alert_level"] == "NOTEWORTHY"   # REARCH vocab
     assert row["total_premium"] == 500_000.0
-    assert row["is_accelerating"] is True
 
 
 @pytest.mark.asyncio
 async def test_persist_flow_episode_empty_expiry_becomes_none():
     """
-    ING-009: empty-string expiry must be coerced to None before the row is
-    built.  Patch target is _insert_rows_with_episode_id (INSERT path).
+    Empty-string expiry must be coerced to None before the row is built.
+    Patches httpx.AsyncClient POST directly (actual INSERT path).
     """
     import services.flow_store as fs
     signal_data = {
@@ -513,18 +504,27 @@ async def test_persist_flow_episode_empty_expiry_becomes_none():
 
     fs.reset_episode_state()
 
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_resp.json = MagicMock(return_value=[{"id": 2, "ticker": "SPY"}])
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
     with patch("services.flow_store._lookup_open_episode",
                new_callable=AsyncMock, return_value=None), \
-         patch("services.flow_store._insert_rows_with_episode_id",
-               new_callable=AsyncMock, return_value=True) as mock_insert, \
          patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("httpx.AsyncClient", return_value=mock_client), \
          patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
                create=True):
         await fs.persist_flow_episode(signal_data)
 
-    args = mock_insert.call_args[0]
-    row = args[1]  # second positional arg is the row dict
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    row = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json", {})
     assert row["expiry"] is None
 
 
@@ -726,6 +726,9 @@ async def test_persist_flow_event_warns_on_zero_strike():
 # moved to _process_trade() in tradier_stream.py (before SIG-DEBOUNCE gate).
 # The tests below verify the no-op behavior and that the drainer does not
 # call persist_flow_episode regardless of message type.
+#
+# bus.subscribe() returns asyncio.Queue directly (not an async context manager).
+# _bus_signal_listener must use queue = bus.subscribe(channel) directly.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio

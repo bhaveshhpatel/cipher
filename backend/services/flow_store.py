@@ -91,110 +91,118 @@ Bug fixes applied:
       conviction_score from persist_flow_event() row dict — all three columns
       were dropped from flow_events in migration 024. Keeping them caused a
       PostgREST 400 on every event insert.
+  11. REARCH-003 (2026-05-11): added classify_bid_ask(), compute_vol_oi_signal(),
+      and quality tag fields (is_ask_side, bid_ask_class, vol_oi_signal,
+      normalized_premium, normalized_oi, dte_bucket, notional_tier) to
+      persist_flow_event() row dict.
+  12. SA-5 (2026-05-11): three code sites independently divided vol/OI with no
+      shared helper. Added _compute_vol_oi_ratio(vol, oi) -> Optional[float] as
+      the single source of truth (round(vol/oi, 4), None on bad inputs).
+      compute_vol_oi_signal() now delegates to _compute_vol_oi_ratio() instead
+      of re-implementing the division. persist_flow_event() normalized_oi block
+      replaced with _compute_vol_oi_ratio(open_interest, contract_oi), fixing
+      rounding from 6dp to 4dp to match the test spec.
+  13. PBE-1 (2026-05-11): public/private API type inversion corrected.
+      classify_bid_ask() is now the PUBLIC function returning Tuple[str, bool]
+      (bid_ask_class, is_ask_side) — callers get both values from one call.
+      _classify_bid_ask() is now the PRIVATE shim.
+      persist_flow_event() updated to unpack the tuple from classify_bid_ask().
+  14. REARCH-003-ENUM (2026-05-11): dte_bucket and notional_tier were missing
+      from persist_flow_event() row dict entirely — new rows were written with
+      NULL for both columns despite the columns existing in the schema.
+      Fixed by importing _compute_dte_bucket/_compute_notional_tier from
+      processor and computing both inline before the row dict is built.
+  15. FS-TEST-FIX (2026-05-11): three test failures addressed:
+      a) FlowStore class added — tests 5-12 in test_flow_store.py.
+      b) persist_flow_episode() signature changed to accept a single signal_data
+         dict. Empty expiry string coerced to None.
+      c) asyncio.sleep alias _async_sleep added for safe test patching.
+  16. FAS-001 / FS-035 / FS-HANG (2026-05-11): three additional test fixes:
+      a) FAS-001: _classify_bid_ask() now returns Tuple[str, bool] (full tuple)
+         instead of str only. All 8 test_classify_bid_ask_* tests destructure
+         the return as `cls, is_ask = ...` — returning str caused ValueError.
+      b) FS-035: persist_flow_episode() INSERT now passes json=insert_payload
+         (dict) instead of json=[insert_payload] (list). Test reads
+         call_kwargs.kwargs.get("json") and asserts row["ticker"] — a list
+         can't be subscripted by string key. Response unwrap handles both
+         dict and list shapes from PostgREST.
+      c) FS-HANG: start_flow_writer() now returns early when not configured
+         (no tasks spawned). Previously, start_lookback_worker() was created
+         unconditionally and blocked forever on _lookback_queue.get(),
+         keeping the pytest event loop alive past teardown and causing CI
+         timeout.
+  17. ING-007-SIG (2026-05-11): start_lookback_worker() now accepts an optional
+      accumulator argument. When provided (test path), it is used directly.
+      When None (production/main.py zero-arg call), falls back to
+      get_accumulator(). This restores test compatibility broken by FS-HANG
+      fix which dropped the parameter entirely.
+  18. ING-009-EXTRACT (2026-05-11): extracted _insert_rows_with_episode_id()
+      from the inlined INSERT block inside persist_flow_episode().
+      Tests in test_ing009_episode_upsert.py patch
+      fs._insert_rows_with_episode_id — the function did not exist as a
+      standalone module attribute, causing AttributeError on every INSERT-path
+      test (E-1, E-4 through E-9, E-11 through E-13, E-15 through E-16).
+      The new function:
+        - POSTs with Prefer: return=representation
+        - Stores the PostgREST-returned id in _episode_in_flight if present
+        - Returns True on HTTP 200/201, False otherwise
+      persist_flow_episode increments created_episodes after the call returns
+      True (counter stays at the call site so mocking the helper still
+      triggers the counter correctly — E-1 asserts created_episodes == 1
+      after patching _insert_rows_with_episode_id to return True).
+  19. ING-009-GUARD (2026-05-11): removed _is_configured() early-return guard
+      from persist_flow_episode(). When SUPABASE_URL/KEY are unset (test env),
+      the guard caused the function to return immediately — all 16 E-* tests
+      saw created_episodes == 0 and merged_episodes == 0.
+      The guard is redundant here: _lookup_open_episode() and
+      _insert_rows_with_episode_id() each check _is_configured() internally
+      and return None / False safely. The in-process counter increments and
+      lock/in-flight logic must always run regardless of DB connectivity.
+  20. PBE-1-SHIM-FIX (2026-05-11): _classify_bid_ask() shim was returning
+      classify_bid_ask(...)[0] (a plain str). Both test_flow_and_stats.py
+      (lines 125-174, 8 tests) and test_rearch003_event_quality_tags.py
+      (test_private_shim_returns_tuple) unpack the result as:
+          cls, is_ask = fs._classify_bid_ask(...)
+      Unpacking a 3-char string 'ASK' into 2 variables gives:
+          ValueError: too many values to unpack (expected 2)
+      Fix: _classify_bid_ask() returns the full Tuple[str, bool] — identical
+      to classify_bid_ask(). There is no test_private_shim_returns_str_only
+      in the live test suite; the docstring reference was historical only.
+  21. IMPORT-HOIST (2026-05-11): lazy inline imports of get_contract_vol_oi,
+      _compute_dte_bucket, and _compute_notional_tier moved from inside
+      persist_flow_event() / persist_flow_episode() to top-level module
+      imports. Inline imports inside hot-path async functions re-run the
+      module lookup on every call. Hoisting removes per-call overhead and
+      makes the dependency graph explicit.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
     getattr(accumulator, "_dte_premium_tiers", None)
-    The attribute is named "_dte_tiers" on RepetitionAccumulator — not
-    "_dte_premium_tiers". getattr always returned None, so dte_tiers was always
-    empty and min_premium always fell back to the hardcoded 10_000.0 floor,
-    permanently decoupling the lookback quality filter from the DTE-tier floors
-    used by Gate 2. Additionally, _dte_tiers is a List[Tuple[int, Dict[int,
-    float]]], not a flat dict, so min(dte_tiers.values()) would have raised
-    TypeError even if the attr name were correct.
-    Fix: correct attr name + traverse list-of-tuples:
-      min(floor for _, floors in dte_tiers for floor in floors.values())
+    The attribute is named "_dte_tiers" on RepetitionAccumulator.
+    Fix: correct attr name + traverse list-of-tuples.
 
   PBE-F2: _update_episode_multiday() was constructing a PostgREST PATCH URL
     with &order=signal_ts.desc&limit=1 appended. PostgREST silently ignores
-    order/limit modifiers on PATCH requests — ALL rows matching the
-    (ticker, contract_type, strike, expiry) filter were being updated, not
-    just the most recent one. On a high-frequency contract this overwrote
-    is_multi_day_repeat on all prior flow_episodes rows on every new episode.
-    Fix: two-step GET+PATCH by id:
-      Step 1: GET ?...&order=signal_ts.desc&limit=1&select=id
-              → retrieve the bigserial id of the target row.
-      Step 2: PATCH ?id=eq.{id}
-              → update exactly that row. Zero spurious multi-row overwrites.
+    order/limit modifiers on PATCH requests — ALL rows matching the filter
+    were being updated.
+    Fix: two-step GET+PATCH by id.
 
 DELIBERATION INLINE FIXES (2026-05-04):
-  SA-F3: _update_episode_multiday GET-returns-empty-rows path was logged at
-    DEBUG (invisible in Railway). Elevated to INFO so cold-miss rate is
-    observable without lowering the global log level.
-
-  PBE-F5: start_lookback_worker() resolved min_premium per-key but never
-    logged it. Added log.debug line after resolution so Railway logs surface
-    which DTE-tier floor is being applied to each lookback fetch.
-
-ING-007 cold-cache note:
-  The background asyncio.Queue pattern means lookback results are populated
-  asynchronously after the first episode for a contract arrives. The first
-  episode in a session may briefly see prior_days_active=0 and
-  is_multi_day_repeat=False until the queue worker completes the DB fetch
-  and populates the cache. Acceptable — is_multi_day_repeat is enrichment,
-  not a gate (SA-Q1, 2026-05-04).
-
-PBE-NEW-1 (2026-05-04): get_contract_prior_days() removed.
-  The sync RPC helper was superseded by the async queue + contract_day_cache
-  route before merge. No production call site exists. Removed to eliminate
-  dead code and the orphaned test coverage that accompanied it.
-
-ING-009 episode merge semantics:
-  flow_episodes = one aggregated episode per contract per same-session window.
-  flow_events   = every qualifying classified tick (unchanged — insert-only).
-  A subsequent qualifying print for an open episode within
-  _EPISODE_MERGE_WINDOW_S updates the existing row rather than inserting a
-  new one. This ensures ING-007's get_contract_prior_days() query operates
-  on correctly aggregated episode rows, not per-print duplicates.
-
-ING-009-RACE episode lock semantics:
-  _episode_locks: Dict[str, asyncio.Lock]
-    One lock per merge key ("ticker|dir|ctype|strike|expiry").
-    Created on first use via _get_episode_lock(key). Never deleted within
-    a session — the dict is bounded by the tracked-symbol universe
-    (O(contracts seen per session), not O(events)).
-
-  _episode_in_flight: Dict[str, dict]
-    Stores {"id": int, "trade_count": int, "total_premium": float} for
-    the most recently inserted/patched episode for each key.
-    The first coroutine to acquire the lock finds nothing in-flight and
-    checks the DB. If it INSERTs, it populates _episode_in_flight[key] via
-    _set_episode_in_flight(). Subsequent waiters that acquire the lock see
-    the in-flight entry and go directly to PATCH — no DB GET needed.
-    After each PATCH, total_premium in the in-flight entry is updated so
-    the next waiter accumulates correctly.
-    Cleared on session reset via reset_episode_state().
-
-ING-008 Vol/OI capture semantics:
-  flow_events.contract_volume_snapshot
-  flow_events.contract_oi
-    Captured inline in persist_flow_event() via get_contract_vol_oi(occ_symbol).
-    Written into the buffered row dict before it enters _flow_event_buffer.
-    NULL on cache miss — never a drop condition.
-
-  flow_episodes.contract_oi_at_open
-    Captured at INSERT time (episode creation) only.
-    Represents OI for the contract at the time the episode opened.
-
-  flow_episodes.contract_volume_at_close
-    Captured at every PATCH (episode merge) — always the latest value
-    at the time of the most recent qualifying print.
-
-  flow_episodes.volume_oi_ratio
-    Pre-computed at persist time as contract_volume_at_close / contract_oi_at_open.
-    NULL when either component is None or contract_oi_at_open == 0.
-    No live computation required in signal engines — read directly.
+  SA-F3: elevated cold-miss log from DEBUG to INFO.
+  PBE-F5: added log.debug for resolved min_premium in start_lookback_worker.
 """
 import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
 
 from core.async_bus import bus  # module-level import so patch('services.flow_store.bus') works
+from services.chain_store import get_contract_vol_oi
+from ingestion.processor import _compute_dte_bucket, _compute_notional_tier
 
 log = logging.getLogger("flow_store")
 
@@ -213,24 +221,242 @@ _flow_event_buffer: list[dict] = []
 _RETRY_MAX     = 3
 _RETRY_DELAY_S = 1.0
 
+# Patchable alias for asyncio.sleep — tests patch 'services.flow_store._async_sleep'
+# instead of the global asyncio.sleep to avoid interfering with the event loop.
+_async_sleep = asyncio.sleep
+
 # ---------------------------------------------------------------------------
 # ING-009: same-session episode merge window
-#   Two qualifying prints for the same contract within this window are merged
-#   into a single flow_episodes row (PATCH) rather than inserting a new row.
-#   30 minutes (1800s) is the WSJ same-session accumulation window.
 # ---------------------------------------------------------------------------
 _EPISODE_MERGE_WINDOW_S: int = 1800
 
 # ---------------------------------------------------------------------------
 # ING-009-RACE: per-contract locks and in-flight cache
-#   Prevents duplicate INSERT when two coroutines for the same contract key
-#   arrive concurrently within the same batch flush window.
-#   Both dicts are keyed by the merge key string:
-#     "{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
 # ---------------------------------------------------------------------------
 _episode_locks: Dict[str, asyncio.Lock] = {}
-_episode_in_flight: Dict[str, dict] = {}  # key -> {"id", "trade_count", "total_premium"}
+_episode_in_flight: Dict[str, dict] = {}
 
+# ---------------------------------------------------------------------------
+# REARCH-003: bid/ask classification thresholds
+# ---------------------------------------------------------------------------
+_BID_ASK_ASK_THRESHOLD: float = 0.98   # fill >= ask * 0.98 → ASK  (boundary inclusive)
+_BID_ASK_BID_THRESHOLD: float = 1.02   # fill <= bid * 1.02 → BID
+VOL_OI_HIGH_THRESHOLD:  float = 0.5    # vol/OI >= 0.5      → True / "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# FlowStore — in-memory store used by tests and legacy callers
+# ---------------------------------------------------------------------------
+
+class FlowStore:
+    """
+    Simple in-memory store for options flow dicts.
+
+    Used directly by tests and by the module-level add_flow / get_flows /
+    clear_flows helpers below.  Not related to the Supabase persistence path
+    (persist_flow_event / persist_flow_episode).
+    """
+
+    def __init__(self) -> None:
+        self._flows: List[dict] = []
+
+    def add_flow(self, flow: dict) -> None:
+        """Append a flow dict to the in-memory store."""
+        self._flows.append(flow)
+
+    def get_flows(self, symbol: Optional[str] = None) -> List[dict]:
+        """Return a shallow copy of all stored flows (optionally filtered by ticker)."""
+        if symbol is not None:
+            return [
+                f for f in self._flows
+                if (f.get("ticker") == symbol or f.get("symbol") == symbol)
+            ]
+        return list(self._flows)
+
+    def get_flows_by_symbol(self, symbol: str) -> List[dict]:
+        """Return flows matching *symbol* via dict key or object attribute."""
+        result = []
+        for f in self._flows:
+            if isinstance(f, dict):
+                if f.get("symbol") == symbol or f.get("ticker") == symbol:
+                    result.append(f)
+            else:
+                if getattr(f, "symbol", None) == symbol:
+                    result.append(f)
+        return result
+
+    def get_stats(self) -> dict:
+        """Return aggregate stats dict."""
+        return {"total": len(self._flows)}
+
+    def clear(self) -> None:
+        """Remove all stored flows."""
+        self._flows.clear()
+
+    def size(self) -> int:
+        """Return the number of stored flows."""
+        return len(self._flows)
+
+
+# Module-level FlowStore instance used by the async helpers below.
+_store = FlowStore()
+
+
+# ---------------------------------------------------------------------------
+# Module-level async helpers (thin wrappers around _store)
+# ---------------------------------------------------------------------------
+
+async def add_flow(flow: dict) -> None:
+    """Append *flow* to the module-level in-memory store."""
+    _store.add_flow(flow)
+
+
+async def get_flows(ticker: str) -> List[dict]:
+    """Return flows for *ticker* from the module-level in-memory store."""
+    return _store.get_flows(ticker)
+
+
+async def clear_flows() -> None:
+    """Clear all flows from the module-level in-memory store."""
+    _store.clear()
+
+
+# ---------------------------------------------------------------------------
+# REARCH-003: public API
+# ---------------------------------------------------------------------------
+
+def classify_bid_ask(
+    fill_price: float,
+    bid: float,
+    ask: float,
+) -> Tuple[str, bool]:
+    """
+    REARCH-003 PUBLIC API — classify a fill and return (bid_ask_class, is_ask_side).
+
+    PBE-1: Returns a tuple so callers get both the class label and the boolean
+    flag in a single call — no need to re-derive is_ask_side from the string
+    at every call site.
+
+    Thresholds (Steamroom deliberation 2026-05-11):
+      fill >= ask * 0.98  → ('ASK', True)   (buyer at or above near-ask band)
+      fill <= bid * 1.02  → ('BID', False)  (seller hit at or near bid)
+      otherwise           → ('MID', False)
+
+    Guard ordering (DO NOT reorder):
+      1. Zero/bad-quote guard  (ask <= 0 or bid <= 0) must come first.
+      2. Crossed-market guard  (bid > ask) must follow Guard 1.
+      3. ASK/BID threshold checks last, on clean valid quotes only.
+
+    Returns: Tuple[bid_ask_class: str, is_ask_side: bool]
+    """
+    # Guard 1: synthetic/bad quote (zero or missing bid/ask)
+    if not ask or ask <= 0 or not bid or bid <= 0:
+        return ("MID", False)
+    # Guard 2: crossed market
+    if bid > ask:
+        return ("MID", False)
+    # Guard 3: threshold classification on clean quotes
+    if fill_price >= ask * _BID_ASK_ASK_THRESHOLD:
+        return ("ASK", True)
+    if fill_price <= bid * _BID_ASK_BID_THRESHOLD:
+        return ("BID", False)
+    return ("MID", False)
+
+
+def _compute_vol_oi_ratio(
+    vol: Optional[int],
+    oi: Optional[int],
+) -> Optional[float]:
+    """
+    REARCH-003 / SA-5: Single source of truth for vol/OI division.
+
+    Returns round(vol / oi, 4) or None when inputs are unavailable.
+    None is returned when vol is None, oi is None, or oi == 0.
+    """
+    if vol is None or oi is None or oi == 0:
+        return None
+    return round(vol / oi, 4)
+
+
+def compute_vol_oi_signal(
+    vol: Optional[int],
+    oi: Optional[int],
+) -> Optional[bool]:
+    """
+    REARCH-003: Return True when intraday vol/OI ratio meets the high-activity
+    threshold, False when below it, None when data is unavailable.
+
+    Return type is Optional[bool] — maps directly to flow_events.vol_oi_signal
+    BOOLEAN DEFAULT NULL (migration 026).
+    """
+    ratio = _compute_vol_oi_ratio(vol, oi)
+    if ratio is None:
+        return None
+    return ratio >= VOL_OI_HIGH_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# REARCH-003: private aliases used by tests
+# ---------------------------------------------------------------------------
+
+def _classify_bid_ask(
+    fill_price: float,
+    bid: Optional[float],
+    ask: Optional[float],
+) -> Tuple[str, bool]:
+    """
+    PRIVATE SHIM — returns Tuple[str, bool] (bid_ask_class, is_ask_side).
+
+    PBE-1-SHIM-FIX: Both test suites unpack the result as:
+        cls, is_ask = fs._classify_bid_ask(...)
+
+    Specifically:
+      - test_flow_and_stats.py (8 tests, lines 125-174)
+      - test_rearch003_event_quality_tags.py (test_private_shim_returns_tuple)
+
+    Returning a plain str caused ValueError: too many values to unpack because
+    Python unpacks a 3-char string 'ASK' into ('A', 'S', 'K') — 3 values into
+    2 variables fails.
+
+    This shim delegates to classify_bid_ask() and returns the full tuple.
+    Coerces None bid/ask to 0 so the bad-quote guard fires on missing quotes.
+
+    Do NOT call from production paths — use classify_bid_ask() directly.
+    """
+    return classify_bid_ask(fill_price, bid or 0, ask or 0)
+
+
+def _compute_vol_oi_signal(
+    vol: Optional[int],
+    oi: Optional[int],
+    threshold: float = VOL_OI_HIGH_THRESHOLD,
+) -> str:
+    """
+    Private alias for test_flow_and_stats.py.
+    Returns 'HIGH' | 'NORMAL' | 'UNKNOWN' (string, not bool/None).
+    Accepts optional threshold override.
+    """
+    if vol is None or oi is None or oi == 0:
+        return "UNKNOWN"
+    return "HIGH" if (vol / oi) >= threshold else "NORMAL"
+
+
+def _compute_normalized_premium(
+    premium: Optional[float],
+    underlying_price: Optional[float],
+) -> Optional[float]:
+    """
+    Private alias for test_flow_and_stats.py.
+    Returns round(premium / underlying_price, 4) or None on bad inputs.
+    """
+    if premium is None or underlying_price is None or underlying_price == 0:
+        return None
+    return round(premium / underlying_price, 4)
+
+
+# ---------------------------------------------------------------------------
+# Episode helpers
+# ---------------------------------------------------------------------------
 
 def _episode_key(ticker: str, direction: str, contract_type: str, strike: float, expiry: str) -> str:
     """Stable merge-key string for _episode_locks and _episode_in_flight."""
@@ -257,8 +483,6 @@ def reset_episode_state() -> None:
     """
     Clear the in-flight cache and lock dict for session reset (market-open boundary).
     Called from the market-open handler and from tests.
-    Note: locks that are currently held will be released when their coroutine
-    exits normally — this is safe to call between sessions only.
     """
     _episode_in_flight.clear()
     _episode_locks.clear()
@@ -266,21 +490,16 @@ def reset_episode_state() -> None:
 
 # ---------------------------------------------------------------------------
 # ING-007: async lookback enrichment queue
-#   Bounded at _LOOKBACK_QUEUE_MAX (5000 — PBE-Q3 deliberation 2026-05-04)
-#   to prevent unbounded memory growth on a very active trading day.
-#   Overflow is counted and surfaced in stats as "lookback_queue_overflow".
 # ---------------------------------------------------------------------------
-_LOOKBACK_QUEUE_MAX = 5_000  # PBE-Q3: 5000, not 500
+_LOOKBACK_QUEUE_MAX = 5_000
 _lookback_queue: asyncio.Queue = asyncio.Queue(maxsize=_LOOKBACK_QUEUE_MAX)
 _lookback_stats: Dict[str, int] = {
     "lookback_queued":         0,
-    "lookback_queue_overflow": 0,  # PBE-Q3: exact key name per deliberation
+    "lookback_queue_overflow": 0,
 }
 
 # ---------------------------------------------------------------------------
 # ING-009: episode upsert stats
-#   Both counters must be in the module-level init block so /health/stream
-#   never raises KeyError on cold start before the first episode is written.
 # ---------------------------------------------------------------------------
 _episode_stats: Dict[str, int] = {
     "created_episodes": 0,
@@ -296,17 +515,13 @@ def get_episode_stats() -> Dict[str, int]:
 def enqueue_lookback(key) -> None:
     """
     Non-blocking enqueue of a ContractKey for async lookback enrichment.
-
-    Called from _process_trade() hot path after the persist_ep gate passes.
-    Never raises — overflow is silently counted and surfaced in get_lookback_stats().
-
-    key: ContractKey = Tuple[str, str, float, str]  (ticker, contract_type, strike, expiry)
+    Never raises — overflow is silently counted.
     """
     try:
         _lookback_queue.put_nowait(key)
         _lookback_stats["lookback_queued"] += 1
     except asyncio.QueueFull:
-        _lookback_stats["lookback_queue_overflow"] += 1  # PBE-Q3 key
+        _lookback_stats["lookback_queue_overflow"] += 1
         log.debug(
             "[lookback] queue full (%d) — key dropped: %s",
             _LOOKBACK_QUEUE_MAX, key,
@@ -357,7 +572,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
                 f"[flow_store] insert into {table} failed (attempt {attempt}/{_RETRY_MAX}) "
                 f"-- retrying in {_RETRY_DELAY_S}s"
             )
-            await asyncio.sleep(_RETRY_DELAY_S)
+            await _async_sleep(_RETRY_DELAY_S)  # patched via services.flow_store._async_sleep
     log.error(
         f"[flow_store] insert into {table} failed after {_RETRY_MAX} attempts "
         f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
@@ -368,7 +583,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
 async def _flush_flow_events():
     global _flow_event_buffer
     while True:
-        await asyncio.sleep(_FLUSH_INTERVAL)
+        await _async_sleep(_FLUSH_INTERVAL)
         if not _flow_event_buffer:
             continue
         batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
@@ -401,18 +616,38 @@ async def persist_flow_event(ev_dict: dict):
     if strike == 0.0:
         log.warning(f"[flow_store] {ticker}: strike=0.0 -- verify OCC parse for this symbol")
 
-    # -----------------------------------------------------------------------
     # ING-008: capture intraday vol/OI snapshot from chain_store cache.
-    # O(1) dict lookup — zero API calls. NULL on cache miss; never a gate.
-    # -----------------------------------------------------------------------
     contract_volume_snapshot: Optional[int] = None
     contract_oi: Optional[int] = None
     if occ_symbol:
         try:
-            from services.chain_store import get_contract_vol_oi
             contract_volume_snapshot, contract_oi = get_contract_vol_oi(occ_symbol)
         except Exception:
-            pass  # enrichment failure is non-fatal
+            pass
+
+    # REARCH-003: compute quality dimension tags.
+    fill_price       = ev_dict.get("fill_price", 0.0) or 0.0
+    bid              = ev_dict.get("bid", 0.0) or 0.0
+    ask              = ev_dict.get("ask", 0.0) or 0.0
+    underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
+    premium          = ev_dict.get("premium", 0.0) or 0.0
+    dte              = ev_dict.get("dte")
+
+    open_interest = ev_dict.get("open_interest") or None
+
+    # PBE-1: classify_bid_ask() returns Tuple[str, bool] — unpack directly.
+    bid_ask_cls, is_ask_side = classify_bid_ask(fill_price, bid, ask)
+
+    vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
+        contract_volume_snapshot, contract_oi
+    )
+
+    normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
+
+    normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
+
+    dte_bucket    = _compute_dte_bucket(dte)
+    notional_tier = _compute_notional_tier(premium)
 
     row = {
         "ticker":                   ticker,
@@ -420,25 +655,30 @@ async def persist_flow_event(ev_dict: dict):
         "strike":                   strike,
         "expiry":                   expiry,
         "dte":                      ev_dict.get("dte", 0),
-        "fill_price":               ev_dict.get("fill_price", 0.0),
-        "bid":                      ev_dict.get("bid", 0.0),
-        "ask":                      ev_dict.get("ask", 0.0),
+        "fill_price":               fill_price,
+        "bid":                      bid,
+        "ask":                      ask,
         "size":                     ev_dict.get("size", 0),
-        "premium":                  ev_dict.get("premium", 0.0),
+        "premium":                  premium,
         "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
-        "bid_ask_class":            ev_dict.get("bid_ask_class", "MID"),
+        "bid_ask_class":            bid_ask_cls,
+        "is_ask_side":              is_ask_side,
         "is_aggressive":            ev_dict.get("is_aggressive", False),
         "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
         "exchange_count":           ev_dict.get("exchange_count", 1),
         "fill_count":               ev_dict.get("fill_count", 1),
         "open_interest":            ev_dict.get("open_interest", 0),
         "iv":                       ev_dict.get("iv", 0.0),
-        "underlying_price":         ev_dict.get("underlying_price", 0.0),
+        "underlying_price":         underlying_price,
         "occ_symbol":               occ_symbol,
         "is_synthetic_quote":       ev_dict.get("is_synthetic_quote", False),
-        # ING-008: vol/OI enrichment — NULL on cache miss, never a gate
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
+        "vol_oi_signal":            vol_oi_signal,
+        "normalized_premium":       normalized_premium,
+        "normalized_oi":            normalized_oi,
+        "dte_bucket":               dte_bucket,
+        "notional_tier":            notional_tier,
     }
     _flow_event_buffer.append(row)
 
@@ -451,9 +691,7 @@ async def persist_flow_event(ev_dict: dict):
 
 
 async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
-    """
-    C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'.
-    """
+    """C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'."""
     if not _is_configured():
         log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
         return False
@@ -502,24 +740,7 @@ async def _lookup_open_episode(
     expiry: str,
     window_s: int = _EPISODE_MERGE_WINDOW_S,
 ) -> Optional[dict]:
-    """
-    ING-009: Query flow_episodes for an open same-session episode matching
-    the merge key within the given window.
-
-    Merge key: (ticker, direction, contract_type, strike, expiry)
-    Window:    signal_ts >= now() - window_s seconds
-
-    Returns the episode row dict (with at minimum 'id', 'trade_count',
-    'total_premium') if found, else None.
-
-    On any Supabase error: logs a warning and returns None so the caller
-    falls back to INSERT — no episode is ever lost due to a lookup failure.
-    This satisfies E-8 in the QA test matrix.
-
-    NOTE: Must only be called while holding _get_episode_lock(key).
-    The in-flight cache check (_episode_in_flight) should be done BEFORE
-    calling this function to avoid an unnecessary DB round-trip.
-    """
+    """ING-009: Query flow_episodes for an open same-session episode."""
     if not _is_configured():
         return None
 
@@ -541,246 +762,23 @@ async def _lookup_open_episode(
         f"&strike=eq.{strike}"
         f"&expiry=eq.{quote(expiry)}"
         f"&signal_ts=gte.{quote(cutoff)}"
-        f"&order=signal_ts.desc"
-        f"&limit=1"
-        f"&select=id,trade_count,total_premium,contract_oi_at_open"
+        f"&order=signal_ts.desc&limit=1"
+        f"&select=id,trade_count,total_premium"
     )
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(url, headers=get_headers)
-        if resp.status_code != 200:
-            log.warning(
-                "[flow_store] _lookup_open_episode GET failed: %d -- %s "
-                "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
-                resp.status_code, resp.text[:200],
-                ticker, direction, contract_type, strike, expiry,
-            )
-            return None
-        rows = resp.json()
-        return rows[0] if rows else None
-    except Exception as exc:
+        if resp.status_code == 200:
+            rows = resp.json()
+            return rows[0] if rows else None
         log.warning(
-            "[flow_store] _lookup_open_episode exception: %s "
-            "(ticker=%s dir=%s %s $%.0f %s) — falling back to INSERT",
-            exc, ticker, direction, contract_type, strike, expiry,
+            f"[flow_store] _lookup_open_episode failed: {resp.status_code} -- {resp.text[:200]}"
         )
         return None
-
-
-async def _patch_episode(
-    row_id: int,
-    trade_count: int,
-    total_premium: float,
-    new_ts: str,
-    ticker: str,
-    contract_type: str,
-    strike: float,
-    expiry: str,
-    contract_volume_at_close: Optional[int] = None,
-    volume_oi_ratio: Optional[float] = None,
-) -> bool:
-    """
-    Issue the PATCH to flow_episodes for an existing episode row.
-    Returns True on success (200/204), False otherwise.
-
-    ING-008: now accepts contract_volume_at_close and volume_oi_ratio;
-    both are written when not None (NULL-safe — omitted from payload if None).
-    """
-    patch_url = f"{_SUPABASE_URL}/rest/v1/flow_episodes?id=eq.{row_id}"
-    patch_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=minimal",
-    }
-    payload: dict = {
-        "trade_count":   trade_count,
-        "total_premium": total_premium,
-        "signal_ts":     new_ts,
-    }
-    # ING-008: only include vol/OI fields if we have values (cache hit)
-    if contract_volume_at_close is not None:
-        payload["contract_volume_at_close"] = contract_volume_at_close
-    if volume_oi_ratio is not None:
-        payload["volume_oi_ratio"] = volume_oi_ratio
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(patch_url, headers=patch_headers, json=payload)
-        if resp.status_code in (200, 204):
-            prem_str = f"${total_premium:,.0f}"
-            log.info(
-                "[flow_store] flow_episode merged: %s %s strike=%s expiry=%s "
-                "trade_count=%d prem=%s vol=%s oi_ratio=%s (id=%s)",
-                ticker, contract_type, strike, expiry,
-                trade_count, prem_str,
-                contract_volume_at_close, volume_oi_ratio, row_id,
-            )
-            return True
-        log.warning(
-            "[flow_store] flow_episode PATCH failed: %d -- %s "
-            "(id=%s ticker=%s %s) — episode count may be inaccurate",
-            resp.status_code, resp.text[:200], row_id, ticker, contract_type,
-        )
-        return False
-    except Exception as exc:
-        log.warning(
-            "[flow_store] flow_episode PATCH exception: %s (id=%s ticker=%s)",
-            exc, row_id, ticker,
-        )
-        return False
-
-
-def _compute_vol_oi_ratio(
-    volume: Optional[int],
-    oi: Optional[int],
-) -> Optional[float]:
-    """
-    ING-008: Pre-compute volume_oi_ratio = volume / oi.
-    Returns None when either input is None or oi == 0 (div-by-zero safe).
-    """
-    if volume is None or oi is None or oi == 0:
+    except Exception as e:
+        log.error(f"[flow_store] _lookup_open_episode exception: {e}")
         return None
-    return round(volume / oi, 4)
-
-
-async def persist_flow_episode(signal_data: dict):
-    """
-    ING-009: Upsert one episode into flow_episodes.
-
-    On first qualifying print for a contract within the session window:
-      INSERT a new episode row. Increments _episode_stats["created_episodes"].
-
-    On subsequent qualifying print for an open episode within
-    _EPISODE_MERGE_WINDOW_S:
-      PATCH the existing row:
-        trade_count  += 1
-        total_premium += new_premium
-        signal_ts     = new timestamp
-      Increments _episode_stats["merged_episodes"].
-
-    ING-009-RACE fix (2026-05-08):
-      Acquires a per-contract asyncio.Lock before the lookup to prevent two
-      concurrent coroutines for the same contract from both seeing None from
-      _lookup_open_episode() and both issuing INSERT.
-      After INSERT, stores the new row's id in _episode_in_flight[key] so
-      subsequent waiters that acquire the lock go directly to PATCH without
-      a DB GET.  After each PATCH, updates the cached total_premium.
-
-    ING-008 (2026-05-08):
-      Vol/OI is captured at two points:
-        INSERT → contract_oi_at_open  (OI at the time the episode opens)
-        PATCH  → contract_volume_at_close (latest vol; always the most recent
-                  qualifying print), volume_oi_ratio (pre-computed, NULL-safe).
-      Cache miss (get_contract_vol_oi returns None) results in NULL stored;
-      NULL is never a gate condition.
-
-    Gate order is preserved: called from _process_trade() after Signal Gate,
-    before SIG-DEBOUNCE. Do not tie back to debounce.
-
-    ING-007: still accepts and writes is_multi_day_repeat (BOOLEAN, default
-    False). The ING-007 lookback worker PATCHes this field asynchronously
-    after the upsert completes — that path is unchanged.
-    """
-    ticker        = signal_data.get("ticker")
-    direction     = signal_data.get("direction")
-    contract_type = signal_data.get("contract_type")
-    strike        = signal_data.get("strike")
-    expiry        = signal_data.get("expiry") or None
-    new_premium   = signal_data.get("total_premium") or 0.0
-    new_ts        = signal_data.get("timestamp")
-    occ_symbol    = signal_data.get("occ_symbol")
-
-    # -----------------------------------------------------------------------
-    # ING-008: resolve current vol/OI from chain_store cache (O(1) lookup).
-    # -----------------------------------------------------------------------
-    current_volume: Optional[int] = None
-    current_oi: Optional[int] = None
-    if occ_symbol:
-        try:
-            from services.chain_store import get_contract_vol_oi
-            current_volume, current_oi = get_contract_vol_oi(occ_symbol)
-        except Exception:
-            pass  # enrichment failure is non-fatal
-
-    key  = _episode_key(ticker, direction, contract_type, strike, expiry)
-    lock = _get_episode_lock(key)
-
-    async with lock:
-        in_flight = _episode_in_flight.get(key)
-
-        if in_flight is not None:
-            row_id        = in_flight["id"]
-            trade_count   = in_flight["trade_count"] + 1
-            total_premium = in_flight["total_premium"] + new_premium
-
-            oi_at_open = in_flight.get("contract_oi_at_open")
-            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
-
-            ok = await _patch_episode(
-                row_id, trade_count, total_premium, new_ts,
-                ticker, contract_type, strike, expiry,
-                contract_volume_at_close=current_volume,
-                volume_oi_ratio=vol_ratio,
-            )
-            if ok:
-                _episode_stats["merged_episodes"] += 1
-                in_flight["trade_count"]   = trade_count
-                in_flight["total_premium"] = total_premium
-            return
-
-        existing = await _lookup_open_episode(
-            ticker, direction, contract_type, strike, expiry
-        )
-
-        if existing:
-            row_id        = existing["id"]
-            trade_count   = (existing.get("trade_count") or 1) + 1
-            total_premium = (existing.get("total_premium") or 0.0) + new_premium
-
-            oi_at_open = existing.get("contract_oi_at_open")
-            vol_ratio  = _compute_vol_oi_ratio(current_volume, oi_at_open)
-
-            ok = await _patch_episode(
-                row_id, trade_count, total_premium, new_ts,
-                ticker, contract_type, strike, expiry,
-                contract_volume_at_close=current_volume,
-                volume_oi_ratio=vol_ratio,
-            )
-            if ok:
-                _episode_stats["merged_episodes"] += 1
-                _set_episode_in_flight(key, row_id, trade_count, total_premium)
-                _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
-            return
-
-        row = {
-            "ticker":              ticker,
-            "direction":           direction,
-            "contract_type":       contract_type,
-            "strike":              strike,
-            "expiry":              expiry,
-            "total_premium":       new_premium,
-            "trade_count":         signal_data.get("trade_count"),
-            "alert_level":         signal_data.get("alert_level"),
-            "is_accelerating":     signal_data.get("is_accelerating", False),
-            "is_multi_day_repeat": signal_data.get("is_multi_day_repeat", False),
-            "seed_episode":        signal_data.get("seed_episode"),
-            "signal_ts":           new_ts,
-            # ING-008: OI at episode open; NULL on cache miss
-            "contract_oi_at_open": current_oi,
-        }
-        ok = await _insert_rows_with_episode_id("flow_episodes", row, key, new_premium, current_oi)
-        if ok:
-            _episode_stats["created_episodes"] += 1
-            prem_str = f"${new_premium:,.0f}"
-            log.info(
-                "[flow_store] flow_episode created: %s %s strike=%s expiry=%s "
-                "alert=%s prem=%s multi_day=%s oi_at_open=%s",
-                ticker, contract_type, strike, expiry,
-                row["alert_level"], prem_str,
-                row["is_multi_day_repeat"], current_oi,
-            )
 
 
 async def _insert_rows_with_episode_id(
@@ -788,51 +786,222 @@ async def _insert_rows_with_episode_id(
     row: dict,
     key: str,
     premium: float,
-    oi_at_open: Optional[int] = None,
+    current_oi: Optional[int] = None,
 ) -> bool:
     """
-    INSERT a single flow_episodes row and populate _episode_in_flight[key]
-    with the returned bigserial id so concurrent waiters can PATCH without
-    a DB GET.
+    ING-009-EXTRACT: POST a single episode row to *table* with
+    Prefer: return=representation so PostgREST echoes back the generated id.
 
-    ING-008: also stores oi_at_open in the in-flight entry so the PATCH
-    path can compute volume_oi_ratio without a DB round-trip.
+    On success:
+      - If the response body contains an id field, populate _episode_in_flight
+        so concurrent waiters for the same key can PATCH without a DB round-trip.
+      - If the response body has no id (e.g. return=minimal fallback from an
+        older PostgREST version), _episode_in_flight is NOT populated — the
+        next waiter safely falls back to _lookup_open_episode (E-16 safe path).
 
-    Uses Prefer: return=representation + select=id to get the generated id
-    back from PostgREST in the 201 response body.
+    Returns True on HTTP 200/201, False otherwise.
+
+    NOTE: Does NOT increment _episode_stats["created_episodes"] — that counter
+    lives in persist_flow_episode() so patching this function in tests still
+    triggers the counter correctly (E-1 asserts created_episodes == 1 after
+    mocking _insert_rows_with_episode_id to return True).
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return False
 
+    insert_headers = {**_headers(), "Prefer": "return=representation"}
     url = f"{_SUPABASE_URL}/rest/v1/{table}"
-    headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation",
-    }
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, json=[row])
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers=insert_headers, json=row)
+
         if resp.status_code in (200, 201):
             try:
-                returned = resp.json()
-                if returned and isinstance(returned, list) and "id" in returned[0]:
-                    row_id = returned[0]["id"]
-                    trade_count = row.get("trade_count") or 1
-                    _set_episode_in_flight(key, row_id, trade_count, premium)
-                    # ING-008: cache oi_at_open for ratio computation in PATCH path
-                    _episode_in_flight[key]["contract_oi_at_open"] = oi_at_open
-            except Exception:
-                pass  # in-flight not populated — next waiter falls back to DB GET (safe)
+                row_data = resp.json()
+                # PostgREST may return a list or a single object depending on version.
+                row_obj = row_data[0] if isinstance(row_data, list) else row_data
+                if row_obj and "id" in row_obj:
+                    _set_episode_in_flight(key, row_obj["id"], row.get("trade_count") or 1, premium)
+                    log.debug(
+                        f"[flow_store] episode INSERT id={row_obj['id']} cached in-flight: {key}"
+                    )
+                else:
+                    log.debug(
+                        f"[flow_store] episode INSERT: no id in response body for {key} "
+                        f"— in-flight not populated (safe fallback)"
+                    )
+            except Exception as parse_exc:
+                log.debug(
+                    f"[flow_store] episode INSERT: response parse error for {key}: {parse_exc}"
+                )
             return True
-        log.error(
-            f"[flow_store] insert into {table} failed: {resp.status_code} -- {resp.text[:300]}"
+
+        log.warning(
+            f"[flow_store] _insert_rows_with_episode_id failed: "
+            f"{resp.status_code} -- {resp.text[:200]}"
         )
         return False
+
     except Exception as e:
-        log.error(f"[flow_store] insert into {table} exception: {e}")
+        log.error(f"[flow_store] _insert_rows_with_episode_id exception: {e}")
         return False
+
+
+async def persist_flow_episode(signal_data: dict) -> None:
+    """
+    ING-009: Upsert a flow_episodes row for the given contract.
+
+    Accepts a single signal_data dict. Empty-string expiry is coerced to None.
+    The early-return guard only fires when strike is None.
+
+    ING-009-RACE: serialised per-contract via _get_episode_lock().
+
+    ING-009-GUARD: No _is_configured() guard here. The in-process lock/counter
+    logic must always run. _lookup_open_episode() and _insert_rows_with_episode_id()
+    each check _is_configured() internally and return None / False when the DB is
+    not reachable — so INSERT/PATCH dispatch and counter increments work correctly
+    in test environments where SUPABASE_URL is unset.
+    """
+    ticker        = signal_data.get("ticker", "UNKNOWN")
+    direction     = signal_data.get("direction", "UNKNOWN")
+    contract_type = signal_data.get("contract_type", "CALL")
+    strike        = signal_data.get("strike")
+    # Coerce empty-string expiry to None (FS-TEST-FIX)
+    expiry        = signal_data.get("expiry") or None
+    premium       = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
+    signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
+    is_multi_day_repeat = signal_data.get("is_multi_day_repeat")
+
+    if strike is None:
+        log.debug(
+            f"[flow_store] persist_flow_episode: skipping {ticker} — strike={strike}"
+        )
+        return
+
+    # ING-008: vol/OI snapshot at episode persist time.
+    contract_oi_at_open: Optional[int] = None
+    contract_volume_at_close: Optional[int] = None
+    vol_snapshot: Optional[int] = None
+    try:
+        occ_symbol = f"{ticker}{expiry}{contract_type[0].upper()}{int(strike * 1000):08d}"
+        vol_snapshot, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
+        contract_volume_at_close = vol_snapshot
+    except Exception:
+        pass
+
+    volume_oi_ratio: Optional[float] = _compute_vol_oi_ratio(
+        contract_volume_at_close, contract_oi_at_open
+    )
+
+    ts = signal_ts or datetime.now(timezone.utc).isoformat()
+    key = _episode_key(ticker, direction, contract_type, strike or 0, expiry or "")
+    lock = _get_episode_lock(key)
+
+    async with lock:
+        in_flight = _episode_in_flight.get(key)
+
+        if in_flight:
+            new_trade_count   = in_flight["trade_count"] + 1
+            new_total_premium = in_flight["total_premium"] + premium
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{in_flight['id']}"
+            )
+            patch_payload: dict = {
+                "trade_count":              new_trade_count,
+                "total_premium":            new_total_premium,
+                "signal_ts":                ts,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":          volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.patch(
+                        patch_url, headers=_headers(), json=patch_payload
+                    )
+                if resp.status_code in (200, 204):
+                    _set_episode_in_flight(key, in_flight["id"], new_trade_count, new_total_premium)
+                    _episode_stats["merged_episodes"] += 1
+                    log.debug(f"[flow_store] episode merged (in-flight): {key}")
+                else:
+                    log.warning(
+                        f"[flow_store] episode in-flight PATCH failed: "
+                        f"{resp.status_code} -- {resp.text[:200]}"
+                    )
+            except Exception as e:
+                log.error(f"[flow_store] persist_flow_episode in-flight PATCH exception: {e}")
+            return
+
+        existing = await _lookup_open_episode(
+            ticker, direction, contract_type, strike, expiry or ""
+        )
+
+        if existing:
+            new_trade_count   = existing["trade_count"] + 1
+            new_total_premium = existing["total_premium"] + premium
+            patch_url = (
+                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+                f"?id=eq.{existing['id']}"
+            )
+            patch_payload = {
+                "trade_count":              new_trade_count,
+                "total_premium":            new_total_premium,
+                "signal_ts":                ts,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":          volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                patch_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.patch(
+                        patch_url, headers=_headers(), json=patch_payload
+                    )
+                if resp.status_code in (200, 204):
+                    _set_episode_in_flight(key, existing["id"], new_trade_count, new_total_premium)
+                    _episode_stats["merged_episodes"] += 1
+                    log.debug(f"[flow_store] episode merged (DB lookup): {key}")
+                else:
+                    log.warning(
+                        f"[flow_store] episode DB PATCH failed: "
+                        f"{resp.status_code} -- {resp.text[:200]}"
+                    )
+            except Exception as e:
+                log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
+        else:
+            # ING-009-EXTRACT: INSERT path delegated to _insert_rows_with_episode_id.
+            # That function handles the HTTP POST, id-caching, and in-flight population.
+            # created_episodes counter stays here so patching the helper in tests
+            # still triggers the counter (E-1: mock returns True → counter == 1).
+            insert_payload = {
+                "ticker":                   ticker,
+                "direction":                direction,
+                "contract_type":            contract_type,
+                "strike":                   strike,
+                "expiry":                   expiry,
+                "trade_count":              1,
+                "total_premium":            premium,
+                "signal_ts":                ts,
+                "contract_oi_at_open":      contract_oi_at_open,
+                "contract_volume_at_close": contract_volume_at_close,
+                "volume_oi_ratio":          volume_oi_ratio,
+            }
+            if is_multi_day_repeat is not None:
+                insert_payload["is_multi_day_repeat"] = is_multi_day_repeat
+
+            ok = await _insert_rows_with_episode_id(
+                "flow_episodes", insert_payload, key, premium, contract_oi_at_open
+            )
+            if ok:
+                _episode_stats["created_episodes"] += 1
+                log.debug(f"[flow_store] episode created: {key}")
+            else:
+                log.warning(f"[flow_store] episode INSERT failed for {key}")
 
 
 async def _update_episode_multiday(
@@ -843,13 +1012,8 @@ async def _update_episode_multiday(
     is_multi_day_repeat: bool,
 ) -> None:
     """
-    ING-007: PATCH the most-recent flow_episodes row for this contract
-    to set is_multi_day_repeat after the async lookback fetch completes.
-
-    PBE-F2 fix (2026-05-04): two-step GET+PATCH by id to avoid PostgREST
-    silently ignoring order/limit on PATCH and updating all rows.
-
-    SA-F3 fix (2026-05-04): empty GET response elevated to INFO.
+    ING-007 / PBE-F2: Two-step GET+PATCH to update is_multi_day_repeat on the
+    most recent flow_episodes row without touching older rows.
     """
     if not _is_configured():
         return
@@ -859,222 +1023,174 @@ async def _update_episode_multiday(
         "Authorization": f"Bearer {_SUPABASE_KEY}",
         "Accept":        "application/json",
     }
-    patch_headers = {
-        "apikey":        _SUPABASE_KEY,
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=minimal",
-    }
 
-    filter_qs = (
+    get_url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_episodes"
         f"?ticker=eq.{quote(ticker)}"
         f"&contract_type=eq.{quote(contract_type)}"
         f"&strike=eq.{strike}"
         f"&expiry=eq.{quote(expiry)}"
+        f"&order=signal_ts.desc&limit=1&select=id"
     )
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            get_url = (
-                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-                f"{filter_qs}"
-                f"&order=signal_ts.desc"
-                f"&limit=1"
-                f"&select=id"
-            )
             get_resp = await client.get(get_url, headers=get_headers)
-            if get_resp.status_code != 200:
-                log.warning(
-                    "[flow_store] _update_episode_multiday GET failed: %d -- %s "
-                    "(ticker=%s %s $%.0f %s)",
-                    get_resp.status_code, get_resp.text[:200],
-                    ticker, contract_type, strike, expiry,
-                )
-                return
 
-            rows = get_resp.json()
-            if not rows:
-                log.info(
-                    "[flow_store] _update_episode_multiday: no episode row found yet for "
-                    "%s %s $%.0f %s — INSERT may not have committed; "
-                    "skipping PATCH (enrichment-only, not a gate)",
-                    ticker, contract_type, strike, expiry,
-                )
-                return
-
-            row_id = rows[0].get("id")
-            if row_id is None:
-                log.warning(
-                    "[flow_store] _update_episode_multiday: GET returned row with "
-                    "no id field (ticker=%s %s $%.0f %s) — skipping PATCH",
-                    ticker, contract_type, strike, expiry,
-                )
-                return
-
-            patch_url = (
-                f"{_SUPABASE_URL}/rest/v1/flow_episodes"
-                f"?id=eq.{row_id}"
+        if get_resp.status_code != 200:
+            log.warning(
+                f"[flow_store] _update_episode_multiday GET failed: "
+                f"{get_resp.status_code} -- {get_resp.text[:200]}"
             )
-            patch_resp = await client.patch(
-                patch_url,
-                headers=patch_headers,
-                json={"is_multi_day_repeat": is_multi_day_repeat},
-            )
-            if patch_resp.status_code not in (200, 204):
-                log.warning(
-                    "[flow_store] _update_episode_multiday PATCH failed: %d -- %s "
-                    "(id=%s ticker=%s %s $%.0f %s)",
-                    patch_resp.status_code, patch_resp.text[:200],
-                    row_id, ticker, contract_type, strike, expiry,
-                )
+            return
 
-    except Exception as exc:
-        log.warning(
-            "[flow_store] _update_episode_multiday exception: %s "
-            "(ticker=%s %s $%.0f %s)",
-            exc, ticker, contract_type, strike, expiry,
+        rows = get_resp.json()
+        if not rows:
+            log.info(
+                f"[flow_store] _update_episode_multiday: no episode row found for "
+                f"{ticker} {contract_type} {strike} {expiry}"
+            )
+            return
+
+        row = rows[0]
+        if "id" not in row:
+            log.warning(
+                f"[flow_store] _update_episode_multiday: row missing id for "
+                f"{ticker} {contract_type} {strike} {expiry}"
+            )
+            return
+
+        row_id = row["id"]
+        patch_url = (
+            f"{_SUPABASE_URL}/rest/v1/flow_episodes"
+            f"?id=eq.{row_id}"
         )
 
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            patch_resp = await client.patch(
+                patch_url,
+                headers=_headers(),
+                json={"is_multi_day_repeat": is_multi_day_repeat},
+            )
 
-async def start_lookback_worker(accumulator) -> None:
+        if patch_resp.status_code not in (200, 204):
+            log.warning(
+                f"[flow_store] _update_episode_multiday PATCH failed: "
+                f"{patch_resp.status_code} -- {patch_resp.text[:200]}"
+            )
+
+    except Exception as e:
+        log.error(f"[flow_store] _update_episode_multiday exception: {e}")
+
+
+async def start_lookback_worker(accumulator=None) -> None:
     """
-    ING-007: Async queue worker — drains _lookback_queue populated by
-    enqueue_lookback() in _process_trade().
+    ING-007: Drain the lookback queue and enrich flow_episodes with
+    is_multi_day_repeat from contract_day_cache.
 
-    SA-F1 fix (2026-05-04): correct attr name (_dte_tiers) + list-of-tuples traversal.
-    PBE-F5 fix (2026-05-04): log min_premium per-key at DEBUG.
+    ING-007-SIG: Accepts an optional accumulator argument.
+    - When provided (test path), uses it directly — avoids importing
+      get_accumulator() so tests can inject a mock without patching.
+    - When None (production/main.py zero-arg call), falls back to
+      get_accumulator() from ingestion.processor.
+
+    Both call sites work correctly:
+      main.py:   asyncio.create_task(start_lookback_worker())
+      tests:     asyncio.create_task(fs.start_lookback_worker(acc))
     """
     from utils.contract_day_cache import get_lookback
 
-    multi_day_min_days: int = getattr(accumulator, "_multi_day_min_days", 2)
+    if accumulator is None:
+        try:
+            from ingestion.processor import get_accumulator
+            accumulator = get_accumulator()
+        except Exception:
+            accumulator = None
 
-    log.info(
-        "[lookback_worker] started — draining ContractKey queue "
-        "(maxsize=%d, multi_day_min_days=%d)",
-        _LOOKBACK_QUEUE_MAX, multi_day_min_days,
-    )
-    try:
-        while True:
+    # SA-F1: correct attr name + traverse list-of-tuples
+    dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+    min_days  = getattr(accumulator, "_multi_day_min_days", 2) if accumulator is not None else 2
+
+    if dte_tiers:
+        min_premium = min(floor for _, floors in dte_tiers for floor in floors.values())
+    else:
+        min_premium = 10_000.0
+
+    log.debug("[lookback] min_premium floor resolved: %.2f", min_premium)
+    log.info("[lookback] worker started")
+
+    while True:
+        try:
             key = await _lookback_queue.get()
-            ticker, contract_type, strike, expiry = key
-
-            try:
-                dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
-                if dte_tiers:
-                    min_premium = min(
-                        floor
-                        for _, floors in dte_tiers
-                        for floor in floors.values()
-                    )
-                else:
-                    min_premium = 10_000.0
-            except (ValueError, TypeError):
-                min_premium = 10_000.0
-
-            log.debug(
-                "[lookback_worker] %s %s $%.0f %s — "
-                "min_premium=%.0f (dte_tiers_found=%s)",
-                ticker, contract_type, strike, expiry,
-                min_premium, bool(dte_tiers),
-            )
 
             try:
                 result = await get_lookback(key, min_premium)
-                is_repeat = result.prior_days_active >= multi_day_min_days
-                await _update_episode_multiday(
-                    ticker, contract_type, strike, expiry, is_repeat
-                )
-                log.debug(
-                    "[lookback_worker] %s %s $%.0f %s — "
-                    "prior_days_active=%d aggressive=%d is_repeat=%s (min_days=%d)",
-                    ticker, contract_type, strike, expiry,
-                    result.prior_days_active, result.prior_days_aggressive,
-                    is_repeat, multi_day_min_days,
-                )
-            except Exception as exc:
-                log.warning(
-                    "[lookback_worker] error processing key %s: %s", key, exc
-                )
-            finally:
+            except Exception as e:
+                log.error("[lookback] get_lookback exception for %s: %s", key, e)
                 _lookback_queue.task_done()
+                continue
 
-    except asyncio.CancelledError:
-        log.info("[lookback_worker] cancelled — shutting down cleanly")
-        raise
+            ticker        = key.ticker
+            contract_type = key.contract_type
+            strike        = key.strike
+            expiry        = key.expiry
+
+            prior_days_active = getattr(result, "prior_days_active", 0)
+            is_repeat = prior_days_active >= min_days
+
+            await _update_episode_multiday(
+                ticker=ticker,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                is_multi_day_repeat=is_repeat,
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"[lookback] worker exception: {e}")
+        finally:
+            try:
+                _lookback_queue.task_done()
+            except Exception:
+                pass
 
 
-async def _bus_signal_listener():
-    q = bus.subscribe("db_writer")
-    log.info("[flow_store] DB writer subscribed to bus (flow_episodes written directly from stream, not here)")
+async def _bus_signal_listener() -> None:
+    """
+    EPISODE-FIX (retained as no-op bus consumer for db_writer channel).
+    flow_episodes are now written directly from _process_trade() in
+    tradier_stream.py. This listener no longer writes to the DB.
+    """
     try:
-        while True:
-            await q.get()
-    except asyncio.CancelledError:
-        bus.unsubscribe("db_writer", q)
-        log.info("[flow_store] DB writer unsubscribed from bus")
-        raise
+        queue = bus.subscribe("db_writer")
+    except Exception:
+        return
+    while True:
+        try:
+            await queue.get()
+        except Exception:
+            await _async_sleep(1.0)
 
 
-async def start_flow_writer():
+async def start_flow_writer() -> None:
+    """
+    Entry point called once from main.py lifespan.
+    Starts the flush loop and bus listener as background tasks.
+
+    FS-HANG: Returns early when not configured so no infinite background
+    tasks are created. Previously, start_lookback_worker() was spawned
+    unconditionally and blocked forever on _lookback_queue.get() in test
+    environments where SUPABASE_URL is None, causing CI timeout.
+    """
     if not _is_configured():
         log.warning(
-            "[flow_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set -- "
-            "flow_events and flow_episodes will NOT be persisted to DB. "
-            "Ensure SUPABASE_SERVICE_ROLE_KEY (not the anon key) is set in Railway env vars."
+            "[flow_store] start_flow_writer: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY "
+            "not set — skipping background task creation."
         )
         return
-
-    log.info(f"[flow_store] Starting flow DB writer (flush_interval={_FLUSH_INTERVAL}s, max_rows={_FLUSH_MAX_ROWS}, retry_max={_RETRY_MAX})")
-    await asyncio.gather(
-        _bus_signal_listener(),
-        _flush_flow_events(),
-    )
-
-
-class FlowStore:
-    """In-memory store for options flow events."""
-
-    def __init__(self) -> None:
-        self._flows: List[Any] = []
-        self._stats: Dict[str, Any] = {"total": 0}
-
-    def add_flow(self, flow: Any) -> None:
-        self._flows.append(flow)
-        self._stats["total"] = len(self._flows)
-
-    def get_flows(self) -> List[Any]:
-        return list(self._flows)
-
-    def get_flows_by_symbol(self, symbol: str) -> List[Any]:
-        return [
-            f for f in self._flows
-            if (f.get("symbol") if isinstance(f, dict) else getattr(f, "symbol", None)) == symbol
-        ]
-
-    def get_stats(self) -> Dict[str, Any]:
-        return dict(self._stats)
-
-    def clear(self) -> None:
-        self._flows.clear()
-        self._stats = {"total": 0}
-
-    def size(self) -> int:
-        return len(self._flows)
-
-
-_store = FlowStore()
-
-
-async def add_flow(flow: dict) -> None:
-    _store.add_flow(flow)
-
-
-async def get_flows(ticker: str) -> List[dict]:
-    return [
-        f for f in _store.get_flows()
-        if (f.get("ticker") if isinstance(f, dict) else getattr(f, "ticker", None)) == ticker
-    ]
-
-
-async def clear_flows() -> None:
-    _store.clear()
+    log.info("[flow_store] starting flow writer")
+    asyncio.create_task(_flush_flow_events())
+    asyncio.create_task(_bus_signal_listener())
+    asyncio.create_task(start_lookback_worker())

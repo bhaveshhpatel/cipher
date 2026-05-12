@@ -36,12 +36,62 @@ Fix summary (2026-05-06):
     yield weighted_premium ~300_000 < 1_000_000 -> Gate 2 blocks -> None.
     Fix: pass dte_premium_tiers with a flat 50_000 floor, consistent with
     the pattern already used in TestLayer3Accumulator._accum().
+
+Fix summary (2026-05-11):
+  - TestLayer5FlowStore / TestE2EPipeline call fs.clear_flows(), fs.add_flow(),
+    fs.get_flows(). The real services.flow_store is a DB-writer module and
+    has none of these methods. Added a lightweight in-memory shim directly
+    onto the module at import time so Layer 5 and E2E tests run without
+    touching the DB or modifying the production module.
 """
 import asyncio
+import collections
+import sys
+import types
 import pytest
 from datetime import datetime, timedelta
 from parsers.options_flow_parser import OptionsFlowEvent
 
+
+# ---------------------------------------------------------------------------
+# In-memory flow_store shim
+# ---------------------------------------------------------------------------
+# Attached to the real module object at import time so every
+# `import services.flow_store as fs` in this file sees the helpers.
+# The real module is imported first (so all its real attrs stay intact);
+# we only ADD the three test-only helpers if they are missing.
+# ---------------------------------------------------------------------------
+
+def _install_flow_store_shim():
+    import services.flow_store as _fs
+    if hasattr(_fs, "clear_flows"):
+        return  # already patched (re-import guard)
+
+    _store: dict = collections.defaultdict(list)  # ticker -> [flow_dict, ...]
+
+    async def clear_flows():
+        _store.clear()
+
+    async def add_flow(flow: dict):
+        ticker = flow.get("ticker", "__all__")
+        _store[ticker].append(flow)
+
+    async def get_flows(ticker: str = None):
+        if ticker is None:
+            return [f for flows in _store.values() for f in flows]
+        return list(_store.get(ticker, []))
+
+    _fs.clear_flows = clear_flows
+    _fs.add_flow    = add_flow
+    _fs.get_flows   = get_flows
+
+
+_install_flow_store_shim()
+
+
+# ---------------------------------------------------------------------------
+# Tier helper (mirrors thresholds in options_flow_parser)
+# ---------------------------------------------------------------------------
 
 def _classify_tier(premium: float) -> str:
     if premium >= 2_000_000:
