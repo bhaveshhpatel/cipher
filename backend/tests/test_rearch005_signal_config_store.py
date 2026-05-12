@@ -19,7 +19,7 @@ Covers five QA contracts:
     T-1  tier1: returns base unchanged (no multiplier applied)
     T-2  tier2: returns base * t2_mult  (GOLDEN, BLOCK, NOTEWORTHY)
     T-3  tier3: returns base * t3_mult
-    T-4  unknown notional_tier: falls back to base (no KeyError, no zero result)
+    T-4  unknown notional_tier: falls back to base (not None, not 0.0, no KeyError)
     T-5  unknown alert_level_key: returns 0.0 (key absent from snapshot + _DEFAULTS)
 
   R-4 — get_signal_config() TTL cache and atomic snapshot swap:
@@ -30,7 +30,11 @@ Covers five QA contracts:
     S-5  successful fetch: snapshot atomically swapped and returned copy is correct
 
   R-5 — SIGNAL_CONFIG_TYPES completeness:
-    K-1  all 19 expected keys are present in SIGNAL_CONFIG_TYPES
+    K-1  all 16 expected keys are present in SIGNAL_CONFIG_TYPES
+         (3 base + 6 tier-mults + 2 ask-side + 1 vol-oi + 2 dte + 1 trade + 1 score = 16)
+         NOTE: The module docstring previously referenced 19 keys — this is a
+         documentation error. 16 is the authoritative count per the REARCH-005
+         spec. Resolve in the implementation spec before cutting the impl branch.
     K-2  all declared type_strings are one of {"float", "int", "bool"}
     K-3  every key in SIGNAL_CONFIG_TYPES has a corresponding entry in _DEFAULTS
     K-4  _DEFAULTS values are correctly typed relative to SIGNAL_CONFIG_TYPES
@@ -42,8 +46,16 @@ Design notes:
   - _fetch_from_db is patched with AsyncMock for all DB-path tests.
   - _snapshot and _snapshot_ts are reset in setUp to prevent cross-test leakage.
   - asyncio.run() is used for all async calls (Python 3.10+ / 3.12 safe).
+    This suite intentionally avoids pytest-asyncio; asyncio.run() is explicit
+    and does not require event-loop fixture configuration. If pytest-asyncio is
+    added to the project later, migrate to @pytest.mark.asyncio to avoid nested
+    event-loop conflicts.
   - get_effective_premium_threshold() is synchronous (reads _snapshot directly)
     and does not require asyncio.run().
+  - Implementation constraint: get_signal_config() MUST use time.monotonic()
+    (not time.time()) for TTL comparison. S-1 sets _snapshot_ts = time.monotonic()
+    to simulate a fresh cache; if the implementation uses time.time() the TTL
+    logic diverges and S-1 will produce false negatives.
 """
 
 import asyncio
@@ -340,20 +352,29 @@ class TestGetEffectivePremiumThreshold:
     def test_t4_unknown_notional_tier_falls_back_to_base(self):
         """
         T-4: An unrecognised notional_tier (e.g. "tier4", "UNKNOWN") must
-        return the base threshold unchanged — not raise a KeyError, not
-        return 0.0.
+        return the base threshold unchanged — not None, not 0.0, no KeyError.
 
         REARCH-006 reads notional_tier from flow_episodes rows written by
         REARCH-004.  If a new tier value is introduced later, the signal
         engine must not silently pass or block all episodes; it must degrade
         gracefully to the base Tier-1 threshold.
+
+        Three assertions — weakest to strongest:
+          1. result is not None  — a swallowed KeyError returning None would
+             cause TypeError on the approx comparison below, masking the bug.
+          2. result > 0.0        — 0.0 would disable the premium gate entirely.
+          3. result ≈ 1_000_000  — must be the Tier-1 base, not an arbitrary value.
         """
         result = scs.get_effective_premium_threshold("sig.golden_sweep_premium", "tier99")
-        assert result == pytest.approx(1_000_000.0), (
-            f"Expected base 1_000_000.0 for unknown tier, got {result!r}"
+        assert result is not None, (
+            "Unknown tier returned None — likely a swallowed KeyError. "
+            "Must fall back to base threshold, not None."
         )
         assert result > 0.0, (
             "Unknown tier must not return 0.0 — would disable the premium gate entirely"
+        )
+        assert result == pytest.approx(1_000_000.0), (
+            f"Expected base 1_000_000.0 for unknown tier, got {result!r}"
         )
 
     def test_t5_unknown_alert_level_key_returns_zero(self):
@@ -393,6 +414,12 @@ class TestGetSignalConfigCache:
 
         A fresh _snapshot_ts is simulated by setting it to time.monotonic()
         (i.e. "just refreshed").  _fetch_from_db must not be called.
+
+        Implementation constraint: get_signal_config() MUST use time.monotonic()
+        for its TTL comparison — not time.time(). This test sets _snapshot_ts
+        via time.monotonic(); if the implementation compares against time.time()
+        the TTL will always appear expired and this test will produce a false
+        negative (fetch called when it shouldn't be).
         """
         scs._snapshot = dict(scs._DEFAULTS)
         scs._snapshot_ts = time.monotonic()  # just refreshed — TTL not expired
@@ -546,9 +573,24 @@ class TestSignalConfigTypesCompleteness:
     contract that REARCH-006 and REARCH-008 can rely on.
     """
 
-    # The 19 keys documented in the roadmap and signal_config_store module docstring.
+    # Authoritative key count: 16
+    #   3 base premiums       (golden_sweep, block, noteworthy)
+    #   6 tier multipliers    (t2 + t3 for each of the 3 base keys)
+    #   2 ask-side            (require_ask_side, ask_side_pct_floor)
+    #   1 vol-oi              (require_vol_gt_oi)
+    #   2 dte                 (min_dte, max_dte)
+    #   1 trade count         (min_trade_count)
+    #   1 score floor         (steamroom_score_floor)
+    #   ──────────────────────
+    #   16 total
+    #
+    # NOTE: A prior version of the module docstring referenced 19 keys. That
+    # was a documentation error. 16 is the correct count per the REARCH-005
+    # spec deliberation. The implementation spec must declare 16 as canonical
+    # before the impl branch is cut — K-1 will immediately fail if the module
+    # ships with a different count.
     _EXPECTED_KEYS: frozenset[str] = frozenset({
-        # Dimension 1 — base (Tier-1)
+        # Dimension 1 — base premiums (Tier-1 thresholds)
         "sig.golden_sweep_premium",
         "sig.block_premium",
         "sig.noteworthy_premium",
@@ -559,29 +601,23 @@ class TestSignalConfigTypesCompleteness:
         "sig.block_premium_t3_mult",
         "sig.noteworthy_premium_t2_mult",
         "sig.noteworthy_premium_t3_mult",
-        # Dimension 2
+        # Dimension 2 — ask-side quality gates
         "sig.require_ask_side",
         "sig.ask_side_pct_floor",
-        # Dimension 3
+        # Dimension 3 — vol/OI quality gate
         "sig.require_vol_gt_oi",
-        # Dimension 4
+        # Dimension 4 — DTE window
         "sig.min_dte",
         "sig.max_dte",
-        # Dimension 5
+        # Dimension 5 — trade count floor
         "sig.min_trade_count",
-        # Scoring
+        # Scoring — Steamroom score gate
         "sig.steamroom_score_floor",
-        # Tier mult for noteworthy (2 keys already covered above)
-        # total: 3 base + 6 mults + 2 ask + 1 vol + 2 dte + 1 trade + 1 score = 16
-        # REARCH-005 roadmap spec lists 19; confirm remaining 3:
-        # noteworthy_premium_t2_mult and noteworthy_premium_t3_mult already in the set above.
-        # The 19th key is NOT declared in the public spec — 16 is the correct count.
-        # (The set above intentionally has 16 entries — this assertion validates the actual module.)
     })
 
     def test_k1_all_expected_keys_present_in_signal_config_types(self):
         """
-        K-1: Every key enumerated in _EXPECTED_KEYS must appear in
+        K-1: Every key enumerated in _EXPECTED_KEYS (16 total) must appear in
         SIGNAL_CONFIG_TYPES.  A missing key means _cast() will fall back to
         the row's own value_type column (which may differ or be absent) and
         the admin PATCH endpoint will reject writes for that key as "unknown".
