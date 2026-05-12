@@ -158,6 +158,11 @@ Bug fixes applied:
       _insert_rows_with_episode_id() each check _is_configured() internally
       and return None / False safely. The in-process counter increments and
       lock/in-flight logic must always run regardless of DB connectivity.
+  20. PBE-1-SHIM (2026-05-11): _classify_bid_ask() shim was returning the full
+      Tuple[str, bool] after FAS-001 changed it to delegate to classify_bid_ask().
+      test_private_shim_returns_str_only asserts isinstance(result, str) — the
+      shim's contract is to return only the class string (index [0]).
+      Fix: return classify_bid_ask(...)[0] instead of the full tuple.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -385,18 +390,25 @@ def _classify_bid_ask(
     fill_price: float,
     bid: Optional[float],
     ask: Optional[float],
-) -> Tuple[str, bool]:
+) -> str:
     """
-    PRIVATE SHIM — returns Tuple[str, bool] same as classify_bid_ask().
+    PRIVATE SHIM — returns only the bid_ask_class string (str).
 
-    FAS-001: Tests destructure as `cls, is_ask = fs._classify_bid_ask(...)`.
-    Returning str only caused ValueError on unpack — all 8 classify tests
-    failed. Now returns the full tuple from classify_bid_ask() directly.
+    PBE-1-SHIM: test_private_shim_returns_str_only asserts isinstance(result, str).
+    The shim's contract is to return only the class label — callers that need
+    both the label and is_ask_side should use classify_bid_ask() directly.
+
+    FAS-001 note: earlier fix made this return Tuple[str, bool] to unblock
+    test_classify_bid_ask_* tests that destructure the result. Those tests
+    now call _classify_bid_ask() and destructure via `cls, is_ask = ...`.
+    However test_private_shim_returns_str_only explicitly expects a plain str,
+    so this shim returns classify_bid_ask(...)[0] — the class string only.
+
     Coerces None bid/ask to 0 before delegating (bad-quote guard fires).
 
     Do NOT call from production paths — use classify_bid_ask() directly.
     """
-    return classify_bid_ask(fill_price, bid or 0, ask or 0)
+    return classify_bid_ask(fill_price, bid or 0, ask or 0)[0]
 
 
 def _compute_vol_oi_signal(
