@@ -2,6 +2,7 @@
 # signals/signal_engine.py
 #
 # REARCH-006 — Chunk 2: SignalEngine skeleton + Gate 1–5 evaluators.
+#              Chunk 4: compute_conviction_score() + build_signal_row()
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -37,6 +38,21 @@
 #     Alert level is determined by the highest-tier premium threshold cleared.
 #     Episode only emits when steamroom_score >= sig.steamroom_score_floor (default 3).
 #
+# Chunk 4 additions (module-level pure functions):
+#
+#   compute_conviction_score(episode, cfg) -> int [0-5]
+#     Independent of SignalEngine.evaluate() — used by build_signal_row() and
+#     any caller that needs a bare integer score without the full GateResult
+#     overhead.  Mirrors the 5 gate dimensions but reads REARCH-004 episode
+#     attributes directly (ask_side_pct, vol_oi_signal, notional_tier,
+#     dte_bucket, trade_count) rather than going through the per-gate methods.
+#
+#   build_signal_row(episode, alert_level, direction, cfg, **kwargs) -> dict
+#     Assembles the exact insert dict for signal_history keyed to the
+#     post-REARCH-010 schema (migration 024_rearch010_schema_purge.sql).
+#     Validates vocab, normalises types, snapshots Steamroom quality columns,
+#     and intentionally omits all retired columns.
+#
 # Deploy notes:
 #   - No DB I/O in evaluate() — all config via get_param() snapshot reads.
 #   - One SignalEngine instance shared across workers; evaluate() is thread-safe
@@ -50,6 +66,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from signals.signal_gate import GateVerdict
@@ -86,6 +103,20 @@ _ALL_GATE_NAMES: tuple[str, ...] = (
     _GATE_DTE,
     _GATE_REPETITION,
 )
+
+# ---------------------------------------------------------------------------
+# Chunk 4 — vocab sets (shared by compute_conviction_score + build_signal_row)
+# ---------------------------------------------------------------------------
+
+# Tiers that satisfy D3 (premium quality)
+_QUALIFYING_TIERS: frozenset[str] = frozenset({"NOTEWORTHY", "BLOCK", "GOLDEN"})
+
+# DTE buckets that FAIL D4 (too short-dated or too far out)
+_DISQUALIFYING_DTE_BUCKETS: frozenset[str] = frozenset({"0-7", "90+"})
+
+# Valid REARCH-010 vocab for signal_history columns
+_VALID_ALERT_LEVELS: frozenset[str] = frozenset({"WATCH", "NOTEWORTHY", "BLOCK", "GOLDEN"})
+_VALID_DIRECTIONS:   frozenset[str] = frozenset({"BULLISH", "BEARISH", "NEUTRAL"})
 
 
 # ---------------------------------------------------------------------------
@@ -410,3 +441,262 @@ class SignalEngine:
 # rather than importing this singleton.
 # ---------------------------------------------------------------------------
 engine = SignalEngine()
+
+
+# ============================================================================
+# CHUNK 4-A  compute_conviction_score()
+#
+# Pure function — no I/O, no side effects.  Returns int [0, 5].
+#
+# Mirrors the 5 Steamroom gate dimensions but reads REARCH-004 episode
+# attributes directly (ask_side_pct, vol_oi_signal, notional_tier,
+# dte_bucket, trade_count) rather than going through the per-gate class
+# methods.  This keeps the function dependency-free so it can be called
+# from build_signal_row(), tests, and backtest replay without needing a
+# SignalEngine instance or a cfg dict that's fully populated.
+#
+# Dimension mapping (parallel to SignalEngine._eval_gate_N):
+#   D1 — Ask-side execution    ask_side_pct >= cfg.ask_side_pct_floor
+#   D2 — Volume > Open Interest vol_oi_signal == True
+#   D3 — Premium tier          notional_tier in {NOTEWORTHY, BLOCK, GOLDEN}
+#   D4 — DTE in signal window  dte_bucket NOT in {0-7, 90+}
+#   D5 — Repetition / cluster  trade_count >= cfg.min_trade_count
+# ============================================================================
+
+def compute_conviction_score(episode: Any, cfg: Any) -> int:
+    """Compute the WSJ Steamroom conviction score (0–5) for a RepetitionEpisode.
+
+    Each of the five Steamroom dimensions contributes one point.  The caller
+    decides the minimum pass threshold (typically ``cfg.min_conviction_score``
+    or the ``sig.steamroom_score_floor`` config param, default 3).
+
+    Parameters
+    ----------
+    episode:
+        Enriched RepetitionEpisode (REARCH-004 attributes expected).
+        Missing attributes degrade gracefully to dimension-fail rather than
+        raising — safe against pre-REARCH-004 episode objects in cold-start.
+    cfg:
+        Any object or dict-like that exposes ``ask_side_pct_floor`` and
+        ``min_trade_count``.  A ``SignalConfig`` namedtuple or the plain dict
+        returned by ``SignalEngine._read_config_snapshot()`` both work.
+        Attribute access is tried first; dict key access is the fallback.
+
+    Returns
+    -------
+    int
+        Score in [0, 5].
+    """
+    def _get(key: str, default):
+        # Support both object attributes (SignalConfig) and dict keys
+        # (config snapshot dict from _read_config_snapshot).
+        try:
+            return getattr(cfg, key)
+        except AttributeError:
+            pass
+        try:
+            return cfg[key]
+        except (KeyError, TypeError):
+            pass
+        return default
+
+    score = 0
+
+    # D1 — Ask-side execution dominance
+    ask_pct: float | None = getattr(episode, "ask_side_pct", None)
+    floor: float = float(_get("ask_side_pct_floor", _get("sig.ask_side_pct_floor", 0.6)))
+    if ask_pct is not None and ask_pct >= floor:
+        score += 1
+
+    # D2 — Volume > Open Interest
+    if getattr(episode, "vol_oi_signal", False):
+        score += 1
+
+    # D3 — Premium tier qualifies (NOTEWORTHY, BLOCK, or GOLDEN)
+    notional_tier: str | None = getattr(episode, "notional_tier", None)
+    if notional_tier in _QUALIFYING_TIERS:
+        score += 1
+
+    # D4 — DTE in signal window (not 0-7 days, not 90+ days)
+    dte_bucket: str | None = getattr(episode, "dte_bucket", None)
+    if dte_bucket is not None and dte_bucket not in _DISQUALIFYING_DTE_BUCKETS:
+        score += 1
+
+    # D5 — Repetition / clustering
+    trade_count: int = int(getattr(episode, "trade_count", 0) or 0)
+    min_trades: int = int(_get("min_trade_count", _get("sig.min_trade_count", 3)))
+    if trade_count >= min_trades:
+        score += 1
+
+    return score
+
+
+# ============================================================================
+# CHUNK 4-B  build_signal_row()
+#
+# Assembles the insert dict for signal_history.
+#
+# Column set is authoritative against migration 024_rearch010_schema_purge.sql
+# (post-REARCH-010 schema).  No retired columns are written.
+#
+# Columns written
+# ───────────────
+#   ticker, alert_level, direction
+#   composite_score, backtest_score
+#   reasoning, contract_type
+#   total_premium, trade_count
+#   is_accelerating, signal_ts
+#   episode_steamroom_score           ← migration 024 Section 9
+#   ask_side_pct                      ← migration 024 Section 9
+#   vol_oi_ratio                      ← migration 024 Section 9
+#   episode_id                        ← FK to flow_episodes.id
+#
+# Columns intentionally NOT written (retired by REARCH-010)
+# ─────────────────────────────────────────────────────────
+#   flow_score              (dropped in migration 024 Section 6)
+#   influence_tier          (dropped in migration 024 Section 6)
+#   volume_premium_factor   (dropped in migration 024 Section 6)
+#   swarm_*                 (dropped in migration 024 Section 6)
+#   recommendation          (nullable, deprecated — DB default 'HOLD' is fine)
+# ============================================================================
+
+def build_signal_row(
+    episode: Any,
+    alert_level: str,
+    direction: str,
+    cfg: Any,
+    *,
+    conviction_score: int | None = None,
+    backtest_score: float = 0.0,
+    reasoning: str | None = None,
+    is_accelerating: bool = False,
+    signal_ts: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the signal_history insert dict from an enriched RepetitionEpisode.
+
+    Parameters
+    ----------
+    episode:
+        Enriched RepetitionEpisode (REARCH-003/004 attributes populated).
+    alert_level:
+        One of ``WATCH`` | ``NOTEWORTHY`` | ``BLOCK`` | ``GOLDEN``.
+        Raises ``ValueError`` on unrecognised values — protects the DB
+        CHECK constraint added in migration 024 Section 7.
+    direction:
+        One of ``BULLISH`` | ``BEARISH`` | ``NEUTRAL``.
+        Raises ``ValueError`` on unrecognised values — protects the DB
+        CHECK constraint added in migration 024 Section 7.
+    cfg:
+        Live config snapshot from SignalConfigStore (or a SignalConfig object).
+        Passed through to ``compute_conviction_score`` if ``conviction_score``
+        is not pre-supplied.
+    conviction_score:
+        Pre-computed score [0-5].  If None, computed here via
+        ``compute_conviction_score()``.  Pass it in when the caller already ran
+        that function to avoid double computation.
+    backtest_score:
+        Backtest quality score in [0.0, 1.0].  Defaults to 0.0.
+    reasoning:
+        Human-readable rationale string for the signal.  Optional.
+    is_accelerating:
+        True when episode trade velocity is increasing within the observation
+        window.  Defaults to False.
+    signal_ts:
+        Emission timestamp (timezone-aware).  Defaults to ``utcnow()`` when
+        not provided.
+
+    Returns
+    -------
+    dict[str, Any]
+        Ready for ``supabase.table("signal_history").insert(row).execute()``.
+
+    Raises
+    ------
+    ValueError
+        ``alert_level`` or ``direction`` are not valid REARCH-010 vocab.
+    ValueError
+        ``episode`` has no ``symbol`` or ``ticker`` attribute.
+    """
+    # ── Vocab guard — fail loudly before touching the DB ────────────────────
+    if alert_level not in _VALID_ALERT_LEVELS:
+        raise ValueError(
+            f"build_signal_row: invalid alert_level={alert_level!r}. "
+            f"Must be one of {sorted(_VALID_ALERT_LEVELS)}"
+        )
+    if direction not in _VALID_DIRECTIONS:
+        raise ValueError(
+            f"build_signal_row: invalid direction={direction!r}. "
+            f"Must be one of {sorted(_VALID_DIRECTIONS)}"
+        )
+
+    # ── Ticker — required ────────────────────────────────────────────────────
+    ticker: str | None = getattr(episode, "symbol", None) or getattr(episode, "ticker", None)
+    if not ticker:
+        raise ValueError(
+            "build_signal_row: episode has no symbol/ticker attribute — "
+            "cannot build a signal_history row without a ticker"
+        )
+
+    # ── Conviction score ─────────────────────────────────────────────────────
+    if conviction_score is None:
+        conviction_score = compute_conviction_score(episode, cfg)
+
+    # ── composite_score — conviction normalised to [0.000, 1.000] ───────────
+    # Rounded to 3dp to fit NUMERIC(5,3) column precision.
+    # Intentional simplification: conviction is the sole scoring dimension for
+    # REARCH-006.  When REARCH-011 (backtest integration) lands, this becomes:
+    #   composite_score = round(0.7 * conviction_norm + 0.3 * backtest_score, 3)
+    composite_score: float = round(conviction_score / 5.0, 3)
+
+    # ── Snapshot fields pulled from episode ─────────────────────────────────
+    total_premium: float | None = getattr(episode, "total_premium", None)
+    trade_count:   int   | None = getattr(episode, "trade_count", None)
+    ask_side_pct:  float | None = getattr(episode, "ask_side_pct", None)
+    episode_id:    str   | None = getattr(episode, "episode_id", None)
+
+    # vol_oi_ratio: prefer explicit attribute; derive from raw vol/oi if absent.
+    vol_oi_ratio: float | None = getattr(episode, "vol_oi_ratio", None)
+    if vol_oi_ratio is None:
+        vol = getattr(episode, "contract_volume_at_close", None)
+        oi  = getattr(episode, "contract_oi_at_open", None)
+        if vol is not None and oi and oi > 0:
+            vol_oi_ratio = round(float(vol) / float(oi), 4)
+
+    # contract_type: normalise to uppercase or None
+    raw_contract_type: str | None = getattr(episode, "contract_type", None)
+    contract_type: str | None = raw_contract_type.upper() if raw_contract_type else None
+
+    # ── Emission timestamp ───────────────────────────────────────────────────
+    if signal_ts is None:
+        signal_ts = datetime.now(tz=timezone.utc)
+
+    # ── Assemble row ─────────────────────────────────────────────────────────
+    row: dict[str, Any] = {
+        # Core identity
+        "ticker":                   ticker,
+        "alert_level":              alert_level,
+        "direction":                direction,
+        # Scores
+        "composite_score":          composite_score,
+        "backtest_score":           round(float(backtest_score), 3),
+        # Episode fields
+        "total_premium":            float(total_premium) if total_premium is not None else None,
+        "trade_count":              int(trade_count) if trade_count is not None else None,
+        "contract_type":            contract_type,
+        # Steamroom quality snapshot (migration 024 Section 9 columns)
+        "episode_steamroom_score":  conviction_score,
+        "ask_side_pct":             round(float(ask_side_pct), 4) if ask_side_pct is not None else None,
+        "vol_oi_ratio":             float(vol_oi_ratio) if vol_oi_ratio is not None else None,
+        # Episode FK
+        "episode_id":               str(episode_id) if episode_id is not None else None,
+        # Metadata
+        "reasoning":                reasoning,
+        "is_accelerating":          is_accelerating,
+        "signal_ts":                signal_ts.isoformat(),
+        # NOTE: created_at is omitted intentionally — owned by Postgres DEFAULT now().
+        # NOTE: recommendation omitted intentionally — deprecated (REARCH-010); DB default 'HOLD'.
+        # NOTE: flow_score, influence_tier, volume_premium_factor, swarm_* all
+        #       dropped in migration 024 Section 6 — do not add them back here.
+    }
+
+    return row
