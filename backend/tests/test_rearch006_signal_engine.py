@@ -16,7 +16,7 @@ Covers:
   E-12  Multiple dimensions fail — all reported in failing_dimensions
   E-13  Alert level GOLDEN: premium >= 1_000_000 (T1)
   E-14  Alert level BLOCK: premium >= 500K but < 1M
-  E-15  Alert level WATCH: premium above watch_floor but below NOTEWORTHY threshold
+  E-15  Alert level WATCH: noteworthy_premium=0 override so gate passes → WATCH
   E-16  Tier multiplier: T2 NOTEWORTHY threshold scaled to 25K
   E-17  Tier multiplier: T3 NOTEWORTHY threshold scaled to 10K
   E-18  bus listener discards failed episode — no persist_composite_signal call
@@ -43,6 +43,19 @@ Covers:
   E-36  D2+D3 full bypass combo — both require_ask_side=False AND
         require_vol_gt_oi=False simultaneously with worst-case episode
 
+  --- Smoke tests: evaluate() object-based API ---
+
+  S-01  All 5 gates pass — GateResult shape, types, and all-pass assertion
+  S-02  D1 fail via evaluate() — gate_1_premium fails, alert_level=None
+  S-03  D2 fail via evaluate() — gate_2_ask_side fails
+  S-04  D3 fail via evaluate() — gate_3_vol_oi fails (vol_oi_signal=False)
+  S-05  D4 fail via evaluate() — gate_4_dte fails (XLONG bucket)
+  S-06  D5 fail via evaluate() — gate_5_repetition fails (trade_count=1)
+  S-07  Multiple gates fail — steamroom_score reflects actual pass count
+  S-08  GOLDEN alert_level via evaluate()
+  S-09  WATCH via evaluate() when noteworthy_premium=0 override
+  S-10  config_snapshot contains both prefixed and bare key forms
+
 Test isolation: all tests use a stub SignalConfigStore that returns
 pre-seeded config dicts without any DB or network I/O.
 
@@ -68,6 +81,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from services.signal_engine import EpisodeEvalResult, SignalEngine
+from signals.signal_engine import (
+    GateResult,
+    _EpisodeProxy,
+    _GATE_PREMIUM,
+    _GATE_ASK_SIDE,
+    _GATE_VOL_OI,
+    _GATE_DTE,
+    _GATE_REPETITION,
+    _normalise_tier,
+)
 
 # ---------------------------------------------------------------------------
 # Stub SignalConfigStore
@@ -135,15 +158,22 @@ def _good_episode(**kwargs) -> dict:
         "direction":               "BULLISH",
         "contract_type":           "CALL",
         "trade_type":              "SWEEP",
-        "episode_steamroom_score": 3,           # used for conviction tests
+        "episode_steamroom_score": 3,
         "is_multi_day_repeat":     False,
     }
     base.update(kwargs)
     return base
 
 
+def _proxy(**ep_kwargs) -> _EpisodeProxy:
+    """Return an _EpisodeProxy wrapping a good episode for evaluate() calls."""
+    ep_dict = _good_episode(**ep_kwargs)
+    raw_tier = ep_dict.get("notional_tier", "T1")
+    return _EpisodeProxy(ep_dict, normalised_tier=_normalise_tier(raw_tier))
+
+
 # ===========================================================================
-# E-01 — E-19  (original suite — unchanged)
+# E-01 — E-19  (original suite)
 # ===========================================================================
 
 def test_e01_all_pass_noteworthy():
@@ -156,6 +186,7 @@ def test_e01_all_pass_noteworthy():
 
 
 def test_e02_d1_premium_fail():
+    """D1 gate: premium=49_999 is strictly below noteworthy_threshold=50_000 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=49_999))
     assert result.passed is False
@@ -163,6 +194,7 @@ def test_e02_d1_premium_fail():
 
 
 def test_e03_d2_ask_side_fail():
+    """D2 gate: ask_side_pct=0.4 is below floor=0.6 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(ask_side_pct=0.4))
     assert result.passed is False
@@ -177,6 +209,7 @@ def test_e04_d2_ask_side_bypass():
 
 
 def test_e05_d3_vol_oi_false_fail():
+    """D3 gate: vol_oi_signal=False with require_vol_gt_oi=True → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(vol_oi_signal=False))
     assert result.passed is False
@@ -184,6 +217,7 @@ def test_e05_d3_vol_oi_false_fail():
 
 
 def test_e06_d3_vol_oi_none_fail():
+    """D3 gate: vol_oi_signal=None (cache miss) with require_vol_gt_oi=True → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(vol_oi_signal=None))
     assert result.passed is False
@@ -198,6 +232,7 @@ def test_e07_d3_vol_oi_bypass():
 
 
 def test_e08_d4_dte_xlong_fail():
+    """D4 gate: XLONG midpoint=75 > max_dte=60 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(dte_bucket="XLONG"))
     assert result.passed is False
@@ -205,6 +240,7 @@ def test_e08_d4_dte_xlong_fail():
 
 
 def test_e09_d4_dte_short_fail():
+    """D4 gate: SHORT midpoint=4 < min_dte=5 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(dte_bucket="SHORT"))
     assert result.passed is False
@@ -213,6 +249,7 @@ def test_e09_d4_dte_short_fail():
 
 @pytest.mark.parametrize("bucket", [None, "", "UNKNOWN", "EXPIRED"])
 def test_e10_d4_dte_unknown_bucket_fail(bucket):
+    """D4 gate: unrecognised / None / empty / EXPIRED dte_bucket → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(dte_bucket=bucket))
     assert result.passed is False
@@ -220,6 +257,7 @@ def test_e10_d4_dte_unknown_bucket_fail(bucket):
 
 
 def test_e11_d5_repetition_fail():
+    """D5 gate: trade_count=1 < min_trade_count=2 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(trade_count=1))
     assert result.passed is False
@@ -255,40 +293,14 @@ def test_e14_alert_level_block():
 
 
 def test_e15_alert_level_watch_floor():
-    # noteworthy_premium=20_000 so that total_premium=15_000 is in the
-    # WATCH band: watch_floor = 20_000 * 0.5 = 10_000 <= 15_000 < 20_000.
-    # D1 gate passes (15_000 >= noteworthy_threshold=20_000 is FALSE so
-    # this tests the WATCH band via _resolve_alert_level fallback).
-    # With D1 using noteworthy_threshold as the hard floor, 15_000 < 20_000
-    # would fail D1 — so we need total_premium above noteworthy_threshold
-    # for WATCH to be reachable. Use noteworthy_premium=10_000 and
-    # total_premium=15_000: 15_000 >= 10_000 passes D1, then
-    # _resolve_alert_level: GOLDEN=10M no, BLOCK=9M no, NOTEWORTHY=10K —
-    # wait, 15_000 >= 10_000 resolves to NOTEWORTHY not WATCH.
-    #
-    # Correct fixture for WATCH: noteworthy must be below total_premium
-    # so D1 passes, but the resolve loop must not match NOTEWORTHY.
-    # That requires noteworthy_threshold > total_premium, which contradicts
-    # D1 passing. WATCH is only reachable when D1 uses watch_floor as gate.
-    #
-    # With the fixed D1 gate (uses noteworthy_threshold), the WATCH alert
-    # band is unreachable in the current engine design — D1 fails anything
-    # below noteworthy_threshold. This test is updated to reflect that:
-    # use total_premium exactly at noteworthy_threshold; it passes D1 and
-    # resolves to NOTEWORTHY (the lowest passing alert level above WATCH).
-    # A dedicated WATCH test requires a config where noteworthy_threshold=0
-    # or similar edge case outside normal operation.
-    #
-    # To properly test WATCH we configure noteworthy_premium=50_000 (default)
-    # and pass total_premium=50_000 — this passes D1 and resolves NOTEWORTHY.
-    # For a true WATCH result the engine would need a separate watch_premium
-    # config key below noteworthy. Since no such key exists, WATCH is the
-    # _resolve_alert_level fallback only when none of the 3 thresholds match —
-    # which cannot happen with valid config unless noteworthy_threshold > premium
-    # (but then D1 fails). Architecturally WATCH requires watch_floor < D1 floor.
-    #
-    # Fix: set noteworthy_premium=0 so D1 always passes and _resolve falls
-    # through to WATCH for any premium below the other thresholds.
+    """WATCH is reachable when noteworthy_premium=0 overrides the floor to zero.
+
+    With noteworthy_premium=0 the D1 hard-floor check short-circuits to
+    GateVerdict(True, "premium_cleared_watch (noteworthy=0)") regardless of
+    the raw premium value, so a $15K episode passes D1 and resolves to WATCH
+    because none of the higher-tier thresholds (GOLDEN=$10M, BLOCK=$9M) are
+    met.
+    """
     eng = _engine({
         "noteworthy_premium":   0,
         "block_premium":        9_000_000,
@@ -309,6 +321,7 @@ def test_e16_tier_t2_noteworthy_threshold():
 
 
 def test_e16b_tier_t2_noteworthy_fail_below_scaled_threshold():
+    """T2 scaled noteworthy threshold = 25_000; premium=24_999 → D1 fail."""
     eng    = _engine()
     result = eng.evaluate_episode(
         _good_episode(total_premium=24_999, notional_tier="T2")
@@ -327,6 +340,7 @@ def test_e17_tier_t3_noteworthy_threshold():
 
 
 def test_e17b_tier_t3_noteworthy_fail_below_scaled_threshold():
+    """T3 scaled noteworthy threshold = 10_000; premium=9_999 → D1 fail."""
     eng    = _engine()
     result = eng.evaluate_episode(
         _good_episode(total_premium=9_999, notional_tier="T3")
@@ -405,28 +419,17 @@ async def test_e19_bus_listener_persists_passing_episode():
 # E-20 — E-36  GAP TESTS: Issue #107 AC coverage
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# E-20: AC-1 — T1 GOLDEN: full Steamroom description match
-#   $1M premium, ask_side_pct=1.0 (3 ask-side prints), vol>OI, DTE=MID (~15d)
-#   Must produce alert_level=GOLDEN with all 5 gates passing.
-# ---------------------------------------------------------------------------
-
 def test_e20_ac1_t1_golden_full_description():
-    """
-    AC: A GOLDEN episode on a Tier-1 name (premium $1M+, 3 ask-side prints,
-    vol>OI, DTE 15) generates alert='GOLDEN'.
-    ask_side_pct=1.0 models 3/3 prints at ask; MID bucket midpoint=19 is
-    the closest bucket to DTE=15 within config window [5, 60].
-    """
+    """AC: T1 $1M premium, 3 ask-side prints, vol>OI, DTE=MID → GOLDEN."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         ticker="SPY",
         total_premium=1_000_000,
         notional_tier="T1",
-        ask_side_pct=1.0,       # 3 ask-side prints out of 3
+        ask_side_pct=1.0,
         ask_side_count=3,
         vol_oi_signal=True,
-        dte_bucket="MID",       # midpoint=19 ≈ DTE 15, inside [5, 60]
+        dte_bucket="MID",
         trade_count=3,
     ))
     assert result.passed is True
@@ -434,17 +437,8 @@ def test_e20_ac1_t1_golden_full_description():
     assert result.failing_dimensions == []
 
 
-# ---------------------------------------------------------------------------
-# E-21: AC-2 — T3 GOLDEN at exactly $200K (1_000_000 × 0.2)
-#   The $200K T3 GOLDEN AC is specifically called out in the issue as a
-#   key spec item. Must produce GOLDEN, not BLOCK.
-# ---------------------------------------------------------------------------
-
 def test_e21_ac2_t3_golden_200k_exactly():
-    """
-    AC: A GOLDEN episode on a Tier-3 name (premium $200K+) also generates
-    alert='GOLDEN' via tier multiplier (1M × 0.2 = 200K threshold).
-    """
+    """AC: T3 $200K exactly (1M × 0.2) → GOLDEN."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=200_000,
@@ -454,16 +448,8 @@ def test_e21_ac2_t3_golden_200k_exactly():
     assert result.alert_level == "GOLDEN"
 
 
-# ---------------------------------------------------------------------------
-# E-22: T3 $199_999 — one dollar below GOLDEN threshold → BLOCK
-#   Confirms the GOLDEN/BLOCK boundary is a hard >= comparison.
-# ---------------------------------------------------------------------------
-
 def test_e22_t3_199999_is_block_not_golden():
-    """
-    T3 GOLDEN threshold = $200K. $199_999 must resolve to BLOCK,
-    not GOLDEN. Verifies the boundary is strict >=.
-    """
+    """T3 GOLDEN threshold=$200K; $199_999 → BLOCK."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=199_999,
@@ -473,17 +459,8 @@ def test_e22_t3_199999_is_block_not_golden():
     assert result.alert_level == "BLOCK"
 
 
-# ---------------------------------------------------------------------------
-# E-23: AC-3 — T3 BLOCK at $150K
-#   $150K is above $100K (T3 BLOCK threshold = 500K × 0.2) and below
-#   $200K (T3 GOLDEN threshold = 1M × 0.2). Must resolve to BLOCK.
-# ---------------------------------------------------------------------------
-
 def test_e23_ac3_t3_block_150k():
-    """
-    AC: A Tier-3 episode with $150K total_premium generates alert='BLOCK'
-    (above $100K BLOCK threshold, below $200K GOLDEN threshold).
-    """
+    """AC: T3 $150K → BLOCK (above $100K BLOCK, below $200K GOLDEN)."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=150_000,
@@ -493,12 +470,8 @@ def test_e23_ac3_t3_block_150k():
     assert result.alert_level == "BLOCK"
 
 
-# ---------------------------------------------------------------------------
-# E-24: T3 BLOCK exact lower boundary — $100_000 exactly
-#   500_000 × 0.2 = 100_000. At exactly threshold must be BLOCK.
-# ---------------------------------------------------------------------------
-
 def test_e24_t3_block_exact_boundary_100k():
+    """T3 BLOCK threshold=$100K exactly → BLOCK."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=100_000,
@@ -508,16 +481,8 @@ def test_e24_t3_block_exact_boundary_100k():
     assert result.alert_level == "BLOCK"
 
 
-# ---------------------------------------------------------------------------
-# E-25: T3 $99_999 — one dollar below BLOCK threshold → NOTEWORTHY
-#   Confirms BLOCK/NOTEWORTHY boundary for T3.
-# ---------------------------------------------------------------------------
-
 def test_e25_t3_99999_is_noteworthy_not_block():
-    """
-    T3 BLOCK threshold = $100K. $99_999 must resolve to NOTEWORTHY
-    (above T3 NOTEWORTHY threshold of $10K = 50K × 0.2).
-    """
+    """T3 $99_999 — one dollar below BLOCK threshold → NOTEWORTHY."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=99_999,
@@ -527,11 +492,8 @@ def test_e25_t3_99999_is_noteworthy_not_block():
     assert result.alert_level == "NOTEWORTHY"
 
 
-# ---------------------------------------------------------------------------
-# E-26: T2 GOLDEN — $500K on T2 (1_000_000 × 0.5 = 500_000)
-# ---------------------------------------------------------------------------
-
 def test_e26_t2_golden_500k():
+    """T2 GOLDEN threshold=$500K (1M × 0.5) exactly → GOLDEN."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=500_000,
@@ -541,11 +503,8 @@ def test_e26_t2_golden_500k():
     assert result.alert_level == "GOLDEN"
 
 
-# ---------------------------------------------------------------------------
-# E-27: T2 $499_999 — one dollar below T2 GOLDEN threshold → BLOCK
-# ---------------------------------------------------------------------------
-
 def test_e27_t2_499999_is_block_not_golden():
+    """T2 $499_999 — one dollar below GOLDEN threshold → BLOCK."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=499_999,
@@ -555,11 +514,8 @@ def test_e27_t2_499999_is_block_not_golden():
     assert result.alert_level == "BLOCK"
 
 
-# ---------------------------------------------------------------------------
-# E-28: T2 BLOCK — $250K on T2 (500_000 × 0.5 = 250_000)
-# ---------------------------------------------------------------------------
-
 def test_e28_t2_block_250k():
+    """T2 BLOCK threshold=$250K (500K × 0.5) exactly → BLOCK."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=250_000,
@@ -569,15 +525,8 @@ def test_e28_t2_block_250k():
     assert result.alert_level == "BLOCK"
 
 
-# ---------------------------------------------------------------------------
-# E-29: T2 $249_999 — one dollar below T2 BLOCK threshold → NOTEWORTHY
-# ---------------------------------------------------------------------------
-
 def test_e29_t2_249999_is_noteworthy_not_block():
-    """
-    T2 BLOCK threshold = $250K. $249_999 must resolve to NOTEWORTHY
-    (above T2 NOTEWORTHY threshold of $25K = 50K × 0.5).
-    """
+    """T2 $249_999 — one dollar below BLOCK threshold → NOTEWORTHY."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(
         total_premium=249_999,
@@ -587,13 +536,8 @@ def test_e29_t2_249999_is_noteworthy_not_block():
     assert result.alert_level == "NOTEWORTHY"
 
 
-# ---------------------------------------------------------------------------
-# E-30: D1 exact floor boundary (T1)
-#   $50_000 exactly passes D1; $49_999 fails D1.
-#   Verifies the gate uses >= not >.
-# ---------------------------------------------------------------------------
-
 def test_e30_d1_floor_boundary_passes_at_exactly_50k():
+    """D1 gate uses >=: $50_000 exactly must pass."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=50_000))
     assert result.passed is True
@@ -602,56 +546,44 @@ def test_e30_d1_floor_boundary_passes_at_exactly_50k():
 
 
 def test_e30b_d1_floor_boundary_fails_at_49999():
+    """D1 gate: $49_999 is strictly below noteworthy_threshold=50_000 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=49_999))
     assert result.passed is False
     assert "D1_PREMIUM" in result.failing_dimensions
 
 
-# ---------------------------------------------------------------------------
-# E-31: D2 ask_side_pct exact boundary
-#   0.6 exactly passes (floor=0.6, gate is >=); 0.5999 fails.
-# ---------------------------------------------------------------------------
-
 def test_e31_d2_ask_side_pct_exact_floor_passes():
-    eng    = _engine()  # ask_side_pct_floor=0.6
+    """D2 gate uses >=: ask_side_pct=0.6 exactly must pass."""
+    eng    = _engine()
     result = eng.evaluate_episode(_good_episode(ask_side_pct=0.6))
     assert result.passed is True
     assert "D2_ASK_SIDE" not in result.failing_dimensions
 
 
 def test_e31b_d2_ask_side_pct_just_below_floor_fails():
+    """D2 gate: ask_side_pct=0.5999 is strictly below floor=0.6 → fail."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(ask_side_pct=0.5999))
     assert result.passed is False
     assert "D2_ASK_SIDE" in result.failing_dimensions
 
 
-# ---------------------------------------------------------------------------
-# E-32: D5 trade_count exact floor
-#   trade_count=2 passes (min=2, gate is >=); trade_count=1 fails.
-# ---------------------------------------------------------------------------
-
 def test_e32_d5_trade_count_exact_floor_passes():
-    eng    = _engine()  # min_trade_count=2
+    """D5 gate uses >=: trade_count=2 exactly must pass."""
+    eng    = _engine()
     result = eng.evaluate_episode(_good_episode(trade_count=2))
     assert result.passed is True
     assert "D5_REPETITION" not in result.failing_dimensions
 
 
 def test_e32b_d5_trade_count_one_below_floor_fails():
-    """AC: An episode with trade_count=1 never generates a signal when min_trade_count=2."""
+    """AC: trade_count=1 with min_trade_count=2 → D5 fail; no signal generated."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(trade_count=1))
     assert result.passed is False
     assert "D5_REPETITION" in result.failing_dimensions
 
-
-# ---------------------------------------------------------------------------
-# E-33: All 4 valid DTE buckets pass when config window is widened to [1, 90]
-#   SHORT midpoint=4, MID=19, LONG=45, XLONG=75 — all inside [1, 90].
-#   Verifies the bucket→midpoint mapping for every recognised bucket.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("bucket,midpoint", [
     ("SHORT", 4),
@@ -660,7 +592,7 @@ def test_e32b_d5_trade_count_one_below_floor_fails():
     ("XLONG", 75),
 ])
 def test_e33_all_valid_dte_buckets_pass_with_wide_window(bucket, midpoint):
-    """All 4 recognised DTE buckets must pass D4 when config window covers all midpoints."""
+    """All 4 recognised DTE buckets must pass D4 when window is [1, 90]."""
     eng    = _engine({"min_dte": 1, "max_dte": 90})
     result = eng.evaluate_episode(_good_episode(dte_bucket=bucket))
     assert result.passed is True, (
@@ -669,50 +601,34 @@ def test_e33_all_valid_dte_buckets_pass_with_wide_window(bucket, midpoint):
     assert "D4_DTE" not in result.failing_dimensions
 
 
-# ---------------------------------------------------------------------------
-# E-34: LONG bucket (midpoint=45) passes default config [5, 60]
-#   This specific bucket was not covered by E-01 through E-19 (those used MID).
-# ---------------------------------------------------------------------------
-
 def test_e34_long_dte_bucket_passes_default_config():
-    """
-    LONG bucket midpoint=45. Default config: min_dte=5, max_dte=60.
-    45 is inside [5, 60] — D4 must pass.
-    """
+    """LONG bucket midpoint=45 is inside default [5, 60] — D4 must pass."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(dte_bucket="LONG"))
     assert result.passed is True
     assert "D4_DTE" not in result.failing_dimensions
 
 
-# ---------------------------------------------------------------------------
-# E-35: effective_threshold field is populated on both pass and fail results
-#   On pass: effective_threshold == noteworthy threshold for the tier.
-#   On fail (D1): effective_threshold still reflects the threshold that was
-#   checked so callers can log "premium X failed threshold Y".
-# ---------------------------------------------------------------------------
-
 def test_e35_effective_threshold_populated_on_pass():
+    """effective_threshold == T1 noteworthy threshold (50_000) on a passing episode."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=75_000, notional_tier="T1"))
-    # T1 noteworthy threshold = 50_000 (no multiplier)
     assert result.effective_threshold == 50_000.0
 
 
 def test_e35b_effective_threshold_populated_on_t2_pass():
+    """effective_threshold == T2 noteworthy threshold (25_000) on a passing T2 episode."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=30_000, notional_tier="T2"))
-    # T2 noteworthy threshold = 50_000 × 0.5 = 25_000
     assert result.effective_threshold == 25_000.0
 
 
 def test_e35c_effective_threshold_populated_on_d1_fail():
-    """effective_threshold must be set even when D1 fails — callers need it for logging."""
+    """effective_threshold is populated even when D1 fails — needed for logging."""
     eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=1_000, notional_tier="T1"))
     assert result.passed is False
     assert "D1_PREMIUM" in result.failing_dimensions
-    # threshold is still reported so caller can log "premium=1000 < threshold=50000"
     assert result.effective_threshold == 50_000.0
 
 
@@ -724,31 +640,141 @@ def test_e35d_effective_threshold_t3_on_fail():
     assert result.effective_threshold == 10_000.0
 
 
-# ---------------------------------------------------------------------------
-# E-36: Full D2+D3 bypass combo
-#   require_ask_side=False AND require_vol_gt_oi=False simultaneously.
-#   Worst-case episode: ask_side_pct=0.0 and vol_oi_signal=None.
-#   Neither D2 nor D3 should appear in failing_dimensions — episode passes
-#   on D1 / D4 / D5 alone.
-#   AC: "Changing sig.require_ask_side=false via admin PATCH allows bid-side
-#   episodes to signal" — extended here to also cover simultaneous vol bypass.
-# ---------------------------------------------------------------------------
-
 def test_e36_d2_d3_full_bypass_combo():
-    """
-    When both require_ask_side and require_vol_gt_oi are disabled, an episode
-    with ask_side_pct=0.0 and vol_oi_signal=None must still pass on the
-    remaining three dimensions (D1, D4, D5).
-    """
+    """With both require_* flags disabled, worst-case episode passes on D1/D4/D5."""
     eng    = _engine({
         "require_ask_side":  False,
         "require_vol_gt_oi": False,
     })
     result = eng.evaluate_episode(_good_episode(
-        ask_side_pct=0.0,       # worst-case: fully bid-side
-        vol_oi_signal=None,     # worst-case: cache miss / no vol>OI data
+        ask_side_pct=0.0,
+        vol_oi_signal=None,
     ))
     assert result.passed is True
     assert "D2_ASK_SIDE"  not in result.failing_dimensions
     assert "D3_VOL_GT_OI" not in result.failing_dimensions
     assert result.alert_level == "NOTEWORTHY"
+
+
+# ===========================================================================
+# S-01 — S-10  SMOKE TESTS: evaluate() object-based API
+# ===========================================================================
+
+def test_s01_evaluate_all_pass_returns_gate_result():
+    """evaluate() returns a GateResult with correct types and all gates passing."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy())
+
+    assert isinstance(result, GateResult)
+    assert result.passed is True
+    assert result.steamroom_score == 5
+    assert result.alert_level == "NOTEWORTHY"
+    assert len(result.gates) == 5
+    for gate_name, verdict in result.gates.items():
+        assert verdict.passed is True, f"Gate {gate_name!r} should pass but did not"
+    assert isinstance(result.config_snapshot, dict)
+
+
+def test_s02_evaluate_d1_fail_gate_result():
+    """D1 fail via evaluate(): gate_1_premium.passed=False, alert_level=None."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(total_premium=49_999))
+
+    assert result.passed is False
+    assert result.gates[_GATE_PREMIUM].passed is False
+    assert result.alert_level is None
+    assert result.steamroom_score == 4
+
+
+def test_s03_evaluate_d2_fail():
+    """D2 fail via evaluate(): gate_2_ask_side.passed=False."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(ask_side_pct=0.1))
+
+    assert result.passed is False
+    assert result.gates[_GATE_ASK_SIDE].passed is False
+    assert result.gates[_GATE_PREMIUM].passed is True
+    assert result.steamroom_score == 4
+
+
+def test_s04_evaluate_d3_fail_vol_false():
+    """D3 fail via evaluate(): gate_3_vol_oi.passed=False when vol_oi_signal=False."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(vol_oi_signal=False))
+
+    assert result.passed is False
+    assert result.gates[_GATE_VOL_OI].passed is False
+    assert result.steamroom_score == 4
+
+
+def test_s05_evaluate_d4_fail_xlong():
+    """D4 fail via evaluate(): XLONG midpoint=75 > max_dte=60."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(dte_bucket="XLONG"))
+
+    assert result.passed is False
+    assert result.gates[_GATE_DTE].passed is False
+    assert result.steamroom_score == 4
+
+
+def test_s06_evaluate_d5_fail_trade_count():
+    """D5 fail via evaluate(): trade_count=1 < min_trade_count=2."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(trade_count=1))
+
+    assert result.passed is False
+    assert result.gates[_GATE_REPETITION].passed is False
+    assert result.steamroom_score == 4
+
+
+def test_s07_evaluate_multiple_gates_fail():
+    """D2 + D3 + D5 fail simultaneously; steamroom_score=2 (D1 + D4 pass)."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(ask_side_pct=0.1, vol_oi_signal=False, trade_count=1))
+
+    assert result.passed is False
+    assert result.gates[_GATE_PREMIUM].passed    is True
+    assert result.gates[_GATE_ASK_SIDE].passed   is False
+    assert result.gates[_GATE_VOL_OI].passed     is False
+    assert result.gates[_GATE_DTE].passed        is True
+    assert result.gates[_GATE_REPETITION].passed is False
+    assert result.steamroom_score == 2
+
+
+def test_s08_evaluate_golden_alert_level():
+    """All gates pass with $1M premium → alert_level=GOLDEN."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(total_premium=1_000_000))
+
+    assert result.passed is True
+    assert result.alert_level == "GOLDEN"
+    assert result.steamroom_score == 5
+
+
+def test_s09_evaluate_watch_when_noteworthy_zero():
+    """WATCH via evaluate(): noteworthy_premium=0 forces gate-1 WATCH branch."""
+    eng = _engine({
+        "noteworthy_premium":   0,
+        "block_premium":        9_000_000,
+        "golden_sweep_premium": 10_000_000,
+    })
+    ep_dict = _good_episode(total_premium=15_000)
+    proxy   = _EpisodeProxy(ep_dict, normalised_tier="T1")
+    result  = eng.evaluate(proxy)
+
+    assert result.passed is True
+    assert result.alert_level == "WATCH"
+    assert result.gates[_GATE_PREMIUM].passed is True
+
+
+def test_s10_evaluate_config_snapshot_contains_keys():
+    """config_snapshot must expose both prefixed and bare forms of all keys."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy())
+    snap   = result.config_snapshot
+
+    assert "require_ask_side"     in snap
+    assert "sig.require_ask_side" in snap
+    assert "noteworthy_premium"   in snap
+    assert snap["noteworthy_premium"]       == 50_000
+    assert snap["sig.noteworthy_premium"]   == 50_000
