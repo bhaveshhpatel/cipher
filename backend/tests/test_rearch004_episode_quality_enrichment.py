@@ -29,6 +29,26 @@ PBE-1 NULL contract: pre-REARCH rows have NULL ask_side_count; the DB-lookup
 PATCH path uses COALESCE(NULL, 0) before incrementing. This is tested via the
 in-flight PATCH path which exercises the same arithmetic on the in-process
 cache value seeded during INSERT.
+
+FIX (REARCH-004 2026-05-12):
+  Bug A — fs._stats does not exist; the module dict is fs._episode_stats.
+    All references to fs._stats[...] replaced with fs._episode_stats[...].
+
+  Bug B — _fake_insert() in _run_episode() had wrong signature.
+    persist_flow_episode() calls:
+      _insert_rows_with_episode_id(table, row, key, premium, current_oi, ask_side_count=N)
+    The old fake accepted (payload, merge_key) which never matched, causing
+    the patch to be a no-op and captured{} to stay empty.
+    Fix: match the real signature (table, row, key, premium, current_oi=None, **kwargs)
+    and capture `row` (the insert payload dict).
+
+  Bug C — _run_episode_patch() built the merge key with ":" separators.
+    flow_store._episode_key() uses "|" separators:
+      f"{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
+    The mismatch meant _episode_in_flight was seeded under a key that
+    persist_flow_episode() never looked up, so in_flight was always None
+    and the test took the INSERT path instead of the PATCH path.
+    Fix: mirror the exact _episode_key() format using "|" separators.
 """
 import asyncio
 import os
@@ -93,29 +113,38 @@ def _run_episode(
 
     Patches:
       - _lookup_open_episode()          → returns existing_episode (None = INSERT path)
-      - _insert_rows_with_episode_id()  → captures call kwargs, returns True
+      - _insert_rows_with_episode_id()  → captures the row dict, returns True
       - _async_sleep                    → no-op (avoids real delay)
 
-    Returns the dict passed as the first positional argument to
-    _insert_rows_with_episode_id(), which is the insert_payload.
+    Bug B fix: _fake_insert matches the real signature
+      _insert_rows_with_episode_id(table, row, key, premium, current_oi=None, **kwargs)
+    and captures `row` (the second positional arg = the insert payload dict).
     """
     fs._episode_in_flight.clear()
-    fs._stats["created_episodes"] = 0
-    fs._stats["merged_episodes"]  = 0
-    # Clear per-contract lock cache so each test gets a fresh lock
+    # Bug A fix: correct dict name is _episode_stats, not _stats.
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
     fs._episode_locks.clear()
 
     captured: dict = {}
 
-    async def _fake_insert(payload: dict, merge_key: str) -> bool:
-        captured.update(payload)
-        # Simulate PostgREST returning an id so _set_episode_in_flight is called
+    async def _fake_insert(
+        table: str,
+        row: dict,
+        key: str,
+        premium: float,
+        current_oi=None,
+        **kwargs,
+    ) -> bool:
+        # Capture the insert payload (row dict) for assertion.
+        captured.update(row)
+        # Simulate PostgREST returning an id so _set_episode_in_flight is called.
         fs._set_episode_in_flight(
-            merge_key,
-            episode_id=999,
+            key,
+            row_id=999,
             trade_count=1,
-            total_premium=payload.get("total_premium", 0.0),
-            ask_side_count=payload.get("ask_side_count", 0),
+            total_premium=row.get("total_premium", 0.0),
+            ask_side_count=row.get("ask_side_count", 0),
         )
         return True
 
@@ -143,16 +172,21 @@ def _run_episode_patch(signal_data: dict, in_flight_episode: dict) -> dict:
 
     Seeds _episode_in_flight with in_flight_episode so the function takes the
     in-flight branch. Patches httpx.AsyncClient.patch() to capture the payload.
+
+    Bug C fix: merge key uses "|" separators to match flow_store._episode_key().
+    Old code used ":" separators which caused a key-miss — in_flight was never
+    found and the test silently fell through to the INSERT path.
     """
     fs._episode_in_flight.clear()
     fs._episode_locks.clear()
-    fs._stats["created_episodes"] = 0
-    fs._stats["merged_episodes"]  = 0
+    # Bug A fix: correct dict name.
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
 
-    # Build the merge key the same way flow_store does
+    # Mirror _episode_key() exactly: "|" separators.
     merge_key = (
-        f"{signal_data['ticker']}:{signal_data['direction']}:"
-        f"{signal_data['contract_type']}:{signal_data['strike']}:"
+        f"{signal_data['ticker']}|{signal_data['direction']}|"
+        f"{signal_data['contract_type']}|{signal_data['strike']}|"
         f"{signal_data['expiry']}"
     )
     fs._episode_in_flight[merge_key] = in_flight_episode
@@ -265,10 +299,10 @@ class TestInsertPathSeedsAggregateColumns:
         E-6: created_episodes stat counter must increment by 1 after a
         successful INSERT (ING-009 counter contract).
         """
-        fs._stats["created_episodes"] = 0
+        fs._episode_stats["created_episodes"] = 0
         _run_episode(_make_signal_data())
-        assert fs._stats["created_episodes"] == 1, (
-            f"Expected created_episodes=1 after INSERT, got {fs._stats['created_episodes']}"
+        assert fs._episode_stats["created_episodes"] == 1, (
+            f"Expected created_episodes=1 after INSERT, got {fs._episode_stats['created_episodes']}"
         )
 
 
