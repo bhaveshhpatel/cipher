@@ -13,6 +13,8 @@ Covers three QA contracts:
 
   QA-2 — PATCH paths never touch dte_bucket / notional_tier (SA-3 seed-only):
     E-7  in-flight PATCH payload excludes dte_bucket and notional_tier
+    E-7b DB-lookup PATCH payload excludes dte_bucket and notional_tier
+         (SA-3 deliberation finding — second distinct code branch)
 
   QA-3 — ask_side_pct precision contract (NUMERIC(5,4)):
     E-8  ask_side_pct rounded to 4 decimal places
@@ -26,9 +28,9 @@ Design notes:
   - asyncio.run() is used for all async calls (Python 3.10+ / 3.12 safe).
 
 PBE-1 NULL contract: pre-REARCH rows have NULL ask_side_count; the DB-lookup
-PATCH path uses COALESCE(NULL, 0) before incrementing. This is tested via the
-in-flight PATCH path which exercises the same arithmetic on the in-process
-cache value seeded during INSERT.
+PATCH path uses COALESCE(NULL, 0) before incrementing. This is tested directly
+in E-7b: the existing row returned by _lookup_open_episode has ask_side_count=None
+and the resulting ask_side_pct must still be computed correctly.
 
 FIX (REARCH-004 2026-05-12):
   Bug A — fs._stats does not exist; the module dict is fs._episode_stats.
@@ -40,7 +42,7 @@ FIX (REARCH-004 2026-05-12):
     The old fake accepted (payload, merge_key) which never matched, causing
     the patch to be a no-op and captured{} to stay empty.
     Fix: match the real signature (table, row, key, premium, current_oi=None, **kwargs)
-    and capture `row` (the insert payload dict).
+    and capture `row` (the second positional arg = the insert payload dict).
 
   Bug C — _run_episode_patch() built the merge key with ":" separators.
     flow_store._episode_key() uses "|" separators:
@@ -240,6 +242,61 @@ def _run_episode_patch(signal_data: dict, in_flight_episode: dict) -> dict:
     return captured_patch
 
 
+def _run_episode_db_lookup_patch(signal_data: dict, existing_db_row: dict) -> dict:
+    """
+    Drive persist_flow_episode() for the DB-lookup PATCH path and return the
+    PATCH payload sent to the httpx client.
+
+    This is the distinct second PATCH branch: _episode_in_flight is empty
+    (cache miss / cold-start) and _lookup_open_episode returns an existing
+    DB row, triggering the DB-lookup PATCH code path.
+
+    Used by E-7b to assert SA-3 compliance on this branch independently of
+    the in-flight PATCH branch tested by E-7.
+
+    PBE-1: existing_db_row may have ask_side_count=None (pre-REARCH row);
+    the production code uses `(existing.get("ask_side_count") or 0)` to
+    COALESCE before incrementing.
+    """
+    # Leave _episode_in_flight empty — forces DB-lookup branch.
+    fs._episode_in_flight.clear()
+    fs._episode_locks.clear()
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
+
+    captured_patch: dict = {}
+
+    async def _fake_patch(url, **kwargs):
+        captured_patch.update(kwargs.get("json", {}))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        return mock_resp
+
+    async def _run():
+        with patch(
+            # Returns the existing DB row — triggers the DB-lookup PATCH branch.
+            "services.flow_store._lookup_open_episode",
+            new=AsyncMock(return_value=existing_db_row),
+        ), patch(
+            # Should NOT be called on a PATCH path.
+            "services.flow_store._insert_rows_with_episode_id",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "services.flow_store._async_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "httpx.AsyncClient.patch",
+            new=AsyncMock(side_effect=_fake_patch),
+        ), patch(
+            "services.flow_store._is_configured",
+            return_value=True,
+        ):
+            await fs.persist_flow_episode(signal_data)
+
+    asyncio.run(_run())
+    return captured_patch
+
+
 # ---------------------------------------------------------------------------
 # QA-1: INSERT path seeds all four aggregate columns (E-1 through E-6)
 # ---------------------------------------------------------------------------
@@ -344,7 +401,7 @@ class TestInsertPathSeedsAggregateColumns:
 
 
 # ---------------------------------------------------------------------------
-# QA-2: PATCH payload guard — dte_bucket / notional_tier excluded (E-7)
+# QA-2: PATCH payload guard — dte_bucket / notional_tier excluded (E-7, E-7b)
 # ---------------------------------------------------------------------------
 
 class TestPatchPayloadExcludesLockedColumns:
@@ -352,6 +409,11 @@ class TestPatchPayloadExcludesLockedColumns:
     QA-2: SA-3 seed-only semantics — dte_bucket and notional_tier must NEVER
     appear in any PATCH payload. They are locked at episode open and must not
     be overwritten by subsequent events in the same episode.
+
+    Two distinct PATCH code branches exist in persist_flow_episode():
+      E-7  — in-flight branch  (episode found in _episode_in_flight cache)
+      E-7b — DB-lookup branch  (cache miss; episode found via _lookup_open_episode)
+    Both must be tested independently for SA-3 compliance.
     """
 
     def test_e7_in_flight_patch_excludes_dte_bucket_and_notional_tier(self):
@@ -394,6 +456,63 @@ class TestPatchPayloadExcludesLockedColumns:
         # After merge: trade_count=2, ask_side_count=1 → ask_side_pct=0.5
         assert patch_payload["ask_side_pct"] == pytest.approx(0.5, rel=1e-4), (
             f"Expected ask_side_pct=0.5 after 1 ask / 2 total, "
+            f"got {patch_payload.get('ask_side_pct')!r}"
+        )
+
+    def test_e7b_db_lookup_patch_excludes_dte_bucket_and_notional_tier(self):
+        """
+        E-7b: SA-3 compliance for the DB-lookup PATCH branch.
+
+        When the in-flight cache is empty (cold-start / evicted entry) and
+        _lookup_open_episode returns an existing DB row, persist_flow_episode()
+        takes the DB-lookup PATCH branch. This branch is distinct code from
+        the in-flight branch — SA-3 must be asserted independently.
+
+        Also exercises PBE-1 NULL contract: existing row has ask_side_count=None
+        (pre-REARCH row). The production code's `(existing.get("ask_side_count")
+        or 0)` COALESCE must produce a correct ask_side_pct without KeyError
+        or ZeroDivisionError.
+
+        Setup:
+          - existing DB row: trade_count=3, ask_side_count=None (pre-REARCH NULL)
+          - incoming event:  is_ask_side=True
+          - Expected after merge: ask_side_count = COALESCE(None,0)+1 = 1
+                                  ask_side_pct   = round(1/4, 4) = 0.25
+        """
+        existing_db_row = {
+            "id":              888,
+            "trade_count":     3,
+            "total_premium":   15300.0,
+            "ask_side_count":  None,   # pre-REARCH row — PBE-1 NULL contract
+        }
+        sd = _make_signal_data(is_ask_side=True)
+        patch_payload = _run_episode_db_lookup_patch(sd, existing_db_row=existing_db_row)
+
+        # SA-3: locked columns must be absent from DB-lookup PATCH payload
+        assert "dte_bucket" not in patch_payload, (
+            f"SA-3 violation (DB-lookup branch): dte_bucket must not appear in PATCH payload. "
+            f"Got keys: {list(patch_payload.keys())}"
+        )
+        assert "notional_tier" not in patch_payload, (
+            f"SA-3 violation (DB-lookup branch): notional_tier must not appear in PATCH payload. "
+            f"Got keys: {list(patch_payload.keys())}"
+        )
+
+        # ask_side_count and ask_side_pct must be present and correctly computed
+        assert "ask_side_count" in patch_payload, (
+            "ask_side_count must be present in DB-lookup PATCH payload (running aggregate)"
+        )
+        assert "ask_side_pct" in patch_payload, (
+            "ask_side_pct must be present in DB-lookup PATCH payload (running aggregate)"
+        )
+
+        # PBE-1: COALESCE(None, 0) + 1 ask-side event out of 4 total = 0.25
+        assert patch_payload["ask_side_count"] == 1, (
+            f"Expected ask_side_count=1 (COALESCE(NULL,0)+1), "
+            f"got {patch_payload.get('ask_side_count')!r}"
+        )
+        assert patch_payload["ask_side_pct"] == pytest.approx(0.25, rel=1e-4), (
+            f"Expected ask_side_pct=0.25 (1 ask / 4 total after NULL COALESCE), "
             f"got {patch_payload.get('ask_side_pct')!r}"
         )
 
