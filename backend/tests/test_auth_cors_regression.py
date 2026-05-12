@@ -70,6 +70,14 @@ def client():
         mock.patch("main._registry_prewarm_loop", side_effect=_async_noop),
         mock.patch("services.flow_store.start_flow_writer", side_effect=_async_noop),
         mock.patch("services.signal_store.start_signal_writer", side_effect=_async_noop),
+        # FIX: start_lookback_worker was called with registry.accumulator arg
+        # (old signature) — FS-HANG refactor made it take 0 args and fetch its
+        # own accumulator internally. Mock it here so the lifespan never reaches
+        # the real function regardless of call-site signature.
+        mock.patch("services.flow_store.start_lookback_worker", side_effect=_async_noop),
+        # FIX: start_chain_refresh_worker makes live Tradier + chain-store I/O.
+        # Must be stubbed out to keep unit tests hermetic.
+        mock.patch("main.start_chain_refresh_worker", side_effect=_async_noop),
     ):
         from main import app
         with TestClient(app, raise_server_exceptions=True) as c:
@@ -187,7 +195,7 @@ def test_cors_headers_on_register_response(client):
         json={"email": _unique_email(), "password": "Secure123!"},
         headers={"Origin": ORIGIN},
     )
-    # TestClient with allowed_origins=[\"*\"] will echo back the header
+    # TestClient with allowed_origins=["*"] will echo back the header
     assert r.status_code == 201
     # The response body must be valid JSON (not an empty CORS rejection)
     assert r.json().get("message") == "Account created successfully"

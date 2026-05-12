@@ -4,13 +4,21 @@ Targets: _insert_signal, _insert_signal_with_retry, persist_composite_signal,
          _bus_signal_listener, start_signal_writer, save_signal SDK path,
          get_signals SDK path.
 
-Fix 7 note: _build_row() now uses WHALE/INSTITUTIONAL/LARGE vocab
-(not the old STRONG_SIGNAL/ALERT/WATCH vocab) per the DB constraint update.
-Tests updated to match.
+Rearch-010 note: score-to-alert_level mapping is now REARCH vocab:
+  score >= 0.85 or >= 0.70 -> BLOCK
+  score >= 0.55            -> NOTEWORTHY
+  score < 0.55             -> WATCH
+  GOLDEN requires all Steamroom dimensions — cannot be score-derived.
+
+Swarm columns (swarm_direction, swarm_confidence, swarm_agents,
+swarm_bull_votes, swarm_bear_votes, swarm_hold_votes) were dropped in
+migration 024 (rearch-010 pass 1) and are no longer written to
+signal_history by _build_row().
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from services.signal_engine import EpisodeEvalResult
 from services.signal_store import (
     _clear_signal_memory,
     _build_row,
@@ -52,64 +60,84 @@ def test_coerce_fallback_empty():
     assert isinstance(result, dict)
 
 
-# --- _build_row alert_level branches ---
-# Fix 7: score-to-label mapping is now WHALE/INSTITUTIONAL/LARGE (not STRONG_SIGNAL/ALERT/WATCH)
+# --- _build_row alert_level branches (rearch-010 REARCH vocab) ---
+# CONVICTION/STRONG_SIGNAL/WHALE/etc. are legacy names bridged by
+# _normalise_alert_level(); score branches emit WATCH/NOTEWORTHY/BLOCK.
 
-def test_build_row_conviction_score():
-    row = _build_row({"composite_score": 0.90, "flow_score": 0.9, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.9})
-    assert row["alert_level"] == "CONVICTION"
+def test_build_row_high_score_maps_to_block():
+    """score >= 0.85 maps to BLOCK (rearch-010 — was CONVICTION)."""
+    row = _build_row({"composite_score": 0.90, "ticker": "AAPL",
+                      "recommendation": "BUY"})
+    assert row["alert_level"] == "BLOCK"
 
-def test_build_row_strong_signal():
-    """score >= 0.70 maps to WHALE (Fix 7 — was STRONG_SIGNAL)."""
-    row = _build_row({"composite_score": 0.75, "flow_score": 0.7, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.7})
-    assert row["alert_level"] == "WHALE"
+def test_build_row_strong_signal_maps_to_block():
+    """score >= 0.70 maps to BLOCK (rearch-010 — was WHALE/STRONG_SIGNAL)."""
+    row = _build_row({"composite_score": 0.75, "ticker": "AAPL",
+                      "recommendation": "BUY"})
+    assert row["alert_level"] == "BLOCK"
 
-def test_build_row_alert():
-    """score >= 0.55 maps to INSTITUTIONAL (Fix 7 — was ALERT)."""
-    row = _build_row({"composite_score": 0.60, "flow_score": 0.6, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.6})
-    assert row["alert_level"] == "INSTITUTIONAL"
+def test_build_row_mid_score_maps_to_noteworthy():
+    """score >= 0.55 maps to NOTEWORTHY (rearch-010 — was INSTITUTIONAL/ALERT)."""
+    row = _build_row({"composite_score": 0.60, "ticker": "AAPL",
+                      "recommendation": "BUY"})
+    assert row["alert_level"] == "NOTEWORTHY"
 
-def test_build_row_watch():
-    """score < 0.55 maps to LARGE (Fix 7 — was WATCH)."""
-    row = _build_row({"composite_score": 0.30, "flow_score": 0.3, "ticker": "AAPL",
-                      "recommendation": "HOLD", "backtest_score": 0.3})
-    assert row["alert_level"] == "LARGE"
+def test_build_row_low_score_maps_to_watch():
+    """score < 0.55 maps to WATCH (rearch-010 — was LARGE/WATCH)."""
+    row = _build_row({"composite_score": 0.30, "ticker": "AAPL",
+                      "recommendation": "HOLD"})
+    assert row["alert_level"] == "WATCH"
 
 def test_build_row_explicit_alert_level_wins():
+    """
+    Explicit alert_level in sig overrides score derivation.
+    rearch-010: 'CONVICTION' is a legacy name — bridge maps it to 'BLOCK'.
+    """
     row = _build_row({"composite_score": 0.10, "alert_level": "CONVICTION",
-                      "flow_score": 0.1, "ticker": "X", "recommendation": "HOLD",
-                      "backtest_score": 0.1})
-    assert row["alert_level"] == "CONVICTION"
+                      "ticker": "X", "recommendation": "HOLD"})
+    assert row["alert_level"] == "BLOCK"
+
+def test_build_row_explicit_rearch_alert_level_passthrough():
+    """Valid REARCH vocab passed explicitly passes through unchanged."""
+    row = _build_row({"composite_score": 0.10, "alert_level": "GOLDEN",
+                      "ticker": "X", "recommendation": "HOLD"})
+    assert row["alert_level"] == "GOLDEN"
 
 def test_build_row_sentiment_from_ctype_call():
-    row = _build_row({"composite_score": 0.5, "flow_score": 0.5, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.5},
+    row = _build_row({"composite_score": 0.5, "ticker": "AAPL",
+                      "recommendation": "BUY"},
                      ep={"contract_type": "CALL", "direction": ""})
     assert row["sentiment"] == "BULLISH"
 
 def test_build_row_sentiment_from_ctype_put():
-    row = _build_row({"composite_score": 0.5, "flow_score": 0.5, "ticker": "AAPL",
-                      "recommendation": "SELL", "backtest_score": 0.5},
+    row = _build_row({"composite_score": 0.5, "ticker": "AAPL",
+                      "recommendation": "SELL"},
                      ep={"contract_type": "PUT", "direction": ""})
     assert row["sentiment"] == "BEARISH"
 
 def test_build_row_sentiment_explicit_wins():
-    row = _build_row({"composite_score": 0.5, "flow_score": 0.5, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.5,
+    row = _build_row({"composite_score": 0.5, "ticker": "AAPL",
+                      "recommendation": "BUY",
                       "sentiment": "NEUTRAL"})
     assert row["sentiment"] == "NEUTRAL"
 
-def test_build_row_swarm_fields():
-    row = _build_row({"composite_score": 0.5, "flow_score": 0.5, "ticker": "AAPL",
-                      "recommendation": "BUY", "backtest_score": 0.5,
+def test_build_row_swarm_fields_not_in_row():
+    """
+    rearch-010: swarm columns dropped in migration 024.
+    _build_row() must NOT write swarm_direction, swarm_bull_votes, etc.
+    to the row — doing so would cause a 400 from Supabase REST (unknown column).
+    """
+    row = _build_row({"composite_score": 0.5, "ticker": "AAPL",
+                      "recommendation": "BUY",
                       "swarm_direction": "BUY", "swarm_confidence": 0.8,
                       "swarm_bull_votes": 4, "swarm_bear_votes": 1, "swarm_hold_votes": 1,
                       "swarm_agents": [{"role": "A", "verdict": "BUY"}]})
-    assert row["swarm_direction"] == "BUY"
-    assert row["swarm_bull_votes"] == 4
+    assert "swarm_direction"   not in row
+    assert "swarm_bull_votes"  not in row
+    assert "swarm_bear_votes"  not in row
+    assert "swarm_hold_votes"  not in row
+    assert "swarm_confidence"  not in row
+    assert "swarm_agents"      not in row
 
 
 # --- _insert_signal ---
@@ -298,12 +326,39 @@ def test_start_signal_writer_configured_cancels():
 # --- _bus_signal_listener ---
 
 def test_bus_signal_listener_processes_composite_signal_and_cancels():
+    """
+    Verify _bus_signal_listener calls persist_composite_signal when the
+    engine gate passes.
+
+    REARCH-006: the listener now calls get_engine().evaluate_episode(ep)
+    before any persist.  Without patching get_engine() the singleton would
+    attempt real DB I/O and the sparse test episode would fail all gates
+    (no notional_tier, ask_side_pct, dte_bucket, etc.), causing
+    result.passed=False and persist to be skipped.
+
+    Fix: patch get_engine to return a stub whose evaluate_episode always
+    returns a passing EpisodeEvalResult.  E-18/E-19 in
+    test_rearch006_signal_engine.py own the gate logic coverage — this test
+    owns the persist-path wiring only.
+    """
     from services import signal_store
 
     call_log = []
 
-    async def _fake_persist(sig, ep):
+    async def _fake_persist(sig, ep, eval_result=None):
         call_log.append(sig)
+
+    # Stub engine — always passes, alert=NOTEWORTHY
+    _pass_result = EpisodeEvalResult(
+        passed=True,
+        alert_level="NOTEWORTHY",
+        failing_dimensions=[],
+        effective_threshold=50_000.0,
+        premium=200_000.0,
+        ticker="AAPL",
+    )
+    stub_engine = MagicMock()
+    stub_engine.evaluate_episode.return_value = _pass_result
 
     async def _run():
         q = asyncio.Queue()
@@ -313,6 +368,7 @@ def test_bus_signal_listener_processes_composite_signal_and_cancels():
         }})
 
         with patch.object(signal_store, "persist_composite_signal", side_effect=_fake_persist), \
+             patch("services.signal_store.get_engine", return_value=stub_engine), \
              patch("services.signal_store.bus") as mock_bus:
             mock_bus.subscribe.return_value = q
             mock_bus.unsubscribe = MagicMock()

@@ -21,7 +21,7 @@ Tests in this file:
   C020-8  Regression: existing dedup edge-case tests still pass
 """
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -117,6 +117,12 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
     The spy accepts **kwargs so it remains forward-proof against new keyword
     args added to the is_duplicate() call site (e.g. tier_int= from ING-010).
     Only the `ts` kwarg is inspected — that is the sole contract being tested.
+
+    Note: _ingestion_processor is patched to pass-through (return ev unchanged)
+    so the REARCH-002 DTE gate does not drop the test event before dedup is
+    reached. The test symbol (TSLA260425C00375000) has an expiry in the past,
+    which would fail Gate 1 (min_dte=1) under real config. Ingestion gate
+    correctness is covered by test_rearch002_ingestion_floors.py.
     """
     import services.tradier_stream as ts_module
 
@@ -127,9 +133,14 @@ async def test_c020_3_process_trade_uses_wall_clock_arrival_ts():
             captured_ts.append(ts)
         return False
 
+    def _passthrough_process(ev, tier=None):
+        """Return ev unchanged — bypass ingestion gate for this test."""
+        return ev
+
     raw = _make_timesale_raw()
 
     with patch.object(ts_module.flow_dedup, "is_duplicate", side_effect=_spy_is_duplicate), \
+         patch.object(ts_module._ingestion_processor, "process", side_effect=_passthrough_process), \
          patch.object(ts_module, "persist_flow_event", new_callable=AsyncMock), \
          patch.object(ts_module, "bus") as mock_bus:
         mock_bus.publish_all = AsyncMock()
@@ -188,15 +199,34 @@ def test_c020_5_after_ttl_not_duplicate():
 # ---------------------------------------------------------------------------
 
 def test_c020_6_wall_clock_magnitude():
-    """Sanity check: time.time() > 1e9, time.monotonic() < 1e6 in practice."""
+    """
+    Sanity check: time.time() is epoch-scale (> 1e9).
+    time.monotonic() is uptime-scale (seconds since some arbitrary point).
+
+    The invariants that are always true regardless of machine uptime:
+      - wall > 1e9          (UNIX epoch is currently ~1.78e9)
+      - wall > mono         (epoch always exceeds uptime in seconds)
+      - mono < 1e7          (< 115 days uptime; reasonable CI/dev box bound)
+
+    We do NOT assert wall > mono * 1000 because that breaks on machines
+    with uptime > ~11.5 days (monotonic > 1e6s → mono*1000 > 1e9 > wall).
+    The meaningful distinction — wall is epoch-scale, mono is not — is
+    fully captured by `wall > 1e9` and `mono < 1e7`.
+    """
     import time as t
     wall = t.time()
     mono = t.monotonic()
 
-    assert wall > 1_000_000_000, f"time.time() should be epoch-scale, got {wall}"
-    assert wall > mono * 1000, (
-        f"time.time() ({wall:.0f}) should be orders of magnitude larger than "
-        f"time.monotonic() ({mono:.1f}). If not, the clock mismatch bug is present."
+    assert wall > 1_000_000_000, (
+        f"time.time() should be epoch-scale (> 1e9), got {wall:.0f}"
+    )
+    assert wall > mono, (
+        f"time.time() ({wall:.0f}) should always exceed time.monotonic() ({mono:.1f}) "
+        f"in absolute magnitude — epoch seconds > uptime seconds."
+    )
+    assert mono < 10_000_000, (
+        f"time.monotonic() ({mono:.1f}s) exceeds 115 days of uptime — "
+        f"unexpected in a CI or dev environment. Clock source may be wrong."
     )
 
 

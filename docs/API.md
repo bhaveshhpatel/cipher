@@ -1,6 +1,6 @@
 # Cipher — API Reference
 
-> Last updated: 2026-04-28 (branch: stable/ingestion-flow-2026-04-28)
+> Last updated: 2026-05-09 (branch: cipher-rearch)
 > Base URL (production): `https://cipher-backend.up.railway.app`
 > All `/api/*` routes require `Authorization: Bearer <jwt>` unless noted.
 
@@ -61,8 +61,8 @@ Paginated scan of persisted flow episodes.
 |-------|------|---------|-------------|
 | `ticker` | string | — | Filter by underlying symbol (e.g. `SPY`) |
 | `min_premium` | float | — | Minimum total premium on episode |
-| `direction` | string | — | `BUY` \| `SELL` \| `HOLD` |
-| `alert_level` | string | — | `CONVICTION` \| `STRONG_SIGNAL` \| `ALERT` \| `WATCH` |
+| `direction` | string | — | `BULLISH` \| `BEARISH` \| `NEUTRAL` |
+| `alert_level` | string | — | `WATCH` \| `NOTEWORTHY` \| `BLOCK` \| `GOLDEN` |
 | `limit` | int | 50 | Max rows returned (max 200) |
 | `offset` | int | 0 | Pagination offset |
 
@@ -73,8 +73,8 @@ Paginated scan of persisted flow episodes.
     {
       "id": "uuid",
       "ticker": "SPY",
-      "direction": "BUY",
-      "alert_level": "CONVICTION",
+      "direction": "BULLISH",
+      "alert_level": "GOLDEN",
       "total_premium": 1250000.0,
       "trade_count": 12,
       "first_seen_at": "2026-04-28T14:30:00Z",
@@ -88,7 +88,9 @@ Paginated scan of persisted flow episodes.
 }
 ```
 
-> **Note:** `alert_level` is one of `CONVICTION / STRONG_SIGNAL / ALERT / WATCH` driven by `RepetitionAccumulator.get_alert_level()`. Fixed 2026-04-28 — previously always returned `WATCH`.
+> **Note:** `alert_level` is one of `WATCH / NOTEWORTHY / BLOCK / GOLDEN` (REARCH-010).
+> Pre-REARCH values (`CONVICTION`, `STRONG_SIGNAL`, `ALERT`, `WHALE`, `INSTITUTIONAL`, `LARGE`, `RETAIL`) are retired — do not use.
+> `direction` is one of `BULLISH / BEARISH / NEUTRAL` (REARCH-010). Pre-REARCH values (`BUY`, `SELL`, `HOLD`) are retired.
 
 ---
 
@@ -107,17 +109,13 @@ Returns the latest composite signal for a ticker. Hits live DB first, falls back
 ```json
 {
   "ticker": "AAPL",
-  "direction": "BUY",
+  "direction": "BULLISH",
   "composite_score": 0.82,
   "flow_score": 0.91,
   "backtest_score": 0.75,
-  "volume_premium_factor": 0.68,
   "conviction": 0.82,
   "tier": "T1",
-  "alert_level": "CONVICTION",
-  "swarm_direction": "BUY",
-  "swarm_confidence": 0.87,
-  "swarm_votes": { "BUY": 9, "SELL": 2, "HOLD": 1 },
+  "alert_level": "GOLDEN",
   "generated_at": "2026-04-28T14:30:00Z",
   "source": "live"
 }
@@ -125,9 +123,13 @@ Returns the latest composite signal for a ticker. Hits live DB first, falls back
 
 **Score Formula**
 ```
-composite_score = flow_score × 0.55 + backtest_score × 0.35 + volume_premium_factor × 0.10
-direction       = "BUY" | "SELL" if composite_score ≥ 0.65, else "HOLD"
+composite_score = flow_score × 0.55 + backtest_score × 0.35 + steamroom_score × 0.10
+direction       = "BULLISH" | "BEARISH" if composite_score ≥ 0.65, else "NEUTRAL"
 ```
+
+> **REARCH-010:** `volume_premium_factor`, `swarm_direction`, `swarm_confidence`, and
+> `swarm_votes` have been removed from this response. Swarm results are stored as a JSONB
+> patch to `signal_history.detail['swarm']` and are not surfaced here.
 
 ---
 
@@ -139,7 +141,7 @@ Paginated list of composite signals with optional filters.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ticker` | string | — | Filter by symbol |
-| `direction` | string | — | `BUY` \| `SELL` \| `HOLD` |
+| `direction` | string | — | `BULLISH` \| `BEARISH` \| `NEUTRAL` |
 | `tier` | string | — | `T1` \| `T2` \| `T3` |
 | `min_conviction` | float | — | Minimum composite score (0.0–1.0) |
 | `limit` | int | 20 | Max rows (max 100) |
@@ -164,7 +166,7 @@ Paginated signal history from `signal_history` table.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ticker` | string | — | Filter by symbol |
-| `direction` | string | — | `BUY` \| `SELL` \| `HOLD` |
+| `direction` | string | — | `BULLISH` \| `BEARISH` \| `NEUTRAL` |
 | `tier` | string | — | `T1` \| `T2` \| `T3` |
 | `min_conviction` | float | — | Minimum conviction score |
 | `limit` | int | 50 | Max rows (max 200) |
@@ -183,7 +185,7 @@ Runs the AI swarm against a provided flow event. Returns ensemble result.
 ```json
 {
   "ticker": "SPY",
-  "direction": "BUY",
+  "direction": "BULLISH",
   "premium": 500000,
   "conviction": 0.88,
   "n_agents": 6,
@@ -199,19 +201,19 @@ Runs the AI swarm against a provided flow event. Returns ensemble result.
 **Response `200`**
 ```json
 {
-  "direction": "BUY",
+  "direction": "BULLISH",
   "confidence": 0.83,
   "bull_count": 5,
   "bear_count": 1,
   "hold_count": 0,
   "agents": [
-    { "name": "MomentumAgent", "vote": "BUY", "confidence": 0.91 }
+    { "name": "MomentumAgent", "vote": "BULLISH", "confidence": 0.91 }
   ],
   "source": "groq"
 }
 ```
 
-> Without `GROQ_API_KEY` set, returns `HOLD` with `source: "fallback"`.
+> Without `GROQ_API_KEY` set, returns `NEUTRAL` with `source: "fallback"`.
 
 ---
 

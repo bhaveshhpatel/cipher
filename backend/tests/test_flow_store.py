@@ -13,6 +13,10 @@ Covers:
   - _process_trade: EPISODE-FIX regression — persist_flow_episode called after
     Signal Gate even when SIG-DEBOUNCE suppresses the bus publish.
   - module-level add_flow / get_flows / clear_flows async helpers
+
+Alert-level vocabulary (REARCH):
+  WATCH | NOTEWORTHY | BLOCK | GOLDEN
+  Retired: CONVICTION, WHALE, INSTITUTIONAL, LARGE, RETAIL, STRONG_SIGNAL, ALERT
 """
 import asyncio
 import time
@@ -29,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ---------------------------------------------------------------------------
 
 def _flow(ticker="AAPL", premium=100_000.0, sentiment="BULLISH",
-          contract_type="CALL", score=0.75, tier="WHALE",
+          contract_type="CALL", score=0.75, tier="T1",
           strike=180.0, expiry="2026-06-20", dte=30,
           is_golden_sweep=False):
     return {
@@ -244,18 +248,18 @@ async def test_concurrent_add_flow_no_data_loss():
 async def test_whale_flow_stored_with_correct_tier():
     import services.flow_store as fs
     await fs.clear_flows()
-    await fs.add_flow(_flow("AMD", tier="WHALE"))
+    await fs.add_flow(_flow("AMD", tier="T1"))
     flows = await fs.get_flows("AMD")
-    assert any(f.get("influence_tier") == "WHALE" for f in flows)
+    assert any(f.get("influence_tier") == "T1" for f in flows)
 
 
 @pytest.mark.asyncio
 async def test_retail_flow_stored_with_correct_tier():
     import services.flow_store as fs
     await fs.clear_flows()
-    await fs.add_flow(_flow("AMD", tier="RETAIL"))
+    await fs.add_flow(_flow("AMD", tier="T3"))
     flows = await fs.get_flows("AMD")
-    assert any(f.get("influence_tier") == "RETAIL" for f in flows)
+    assert any(f.get("influence_tier") == "T3" for f in flows)
 
 
 @pytest.mark.asyncio
@@ -423,22 +427,12 @@ async def test_upgrade_to_sweep_url_contains_occ_symbol():
 # ---------------------------------------------------------------------------
 # persist_flow_episode
 #
-# ING-009 refactored persist_flow_episode to call _insert_rows_with_episode_id
-# (not _insert_rows directly) so it can capture the returned bigserial id for
-# the in-flight race-prevention cache.  Tests must patch the correct function.
+# persist_flow_episode uses a direct httpx.AsyncClient POST for the INSERT
+# path (no _insert_rows_with_episode_id helper).  Tests must patch httpx and
+# _lookup_open_episode so the INSERT branch is always taken.
 #
-# _insert_rows_with_episode_id signature:
-#   (table: str, row: dict, key: str, premium: float, oi_at_open: Optional[int])
-#
-# call_args positional layout:
-#   [0][0] = table   (str)         "flow_episodes"
-#   [0][1] = row     (dict)        the full episode row dict
-#   [0][2] = key     (str)         merge key
-#   [0][3] = premium (float)
-#   [0][4] = oi_at_open (Optional[int])
-#
-# _lookup_open_episode must also be patched to return None so the INSERT
-# branch is always taken (avoids an attempted DB GET in CI).
+# _lookup_open_episode must be patched to return None so the INSERT branch
+# is taken (avoids an attempted DB GET in CI).
 #
 # chain_store.get_contract_vol_oi is patched to avoid ImportError in
 # environments where chain_store is not available.
@@ -447,9 +441,10 @@ async def test_upgrade_to_sweep_url_contains_occ_symbol():
 @pytest.mark.asyncio
 async def test_persist_flow_episode_calls_insert_rows():
     """
-    ING-009: persist_flow_episode calls _insert_rows_with_episode_id on the
-    INSERT path (no existing open episode).  Previously patched _insert_rows
-    which is never reached on the episode INSERT path post-ING-009.
+    persist_flow_episode calls httpx POST (INSERT path) when no existing
+    open episode is found.
+
+    alert_level uses REARCH vocabulary: WATCH | NOTEWORTHY | BLOCK | GOLDEN
     """
     import services.flow_store as fs
     signal_data = {
@@ -460,65 +455,76 @@ async def test_persist_flow_episode_calls_insert_rows():
         "expiry": "2026-06-20",
         "total_premium": 500_000.0,
         "trade_count": 12,
-        "alert_level": "STRONG_SIGNAL",
+        "alert_level": "NOTEWORTHY",   # REARCH vocab: $500k = NOTEWORTHY tier
         "is_accelerating": True,
         "seed_episode": "3 large calls, escalating",
         "timestamp": "2026-04-28T10:00:00Z",
     }
 
-    # Ensure no stale in-flight entry interferes with this test
     fs.reset_episode_state()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_resp.json = MagicMock(return_value=[{"id": 1, "ticker": "AAPL"}])
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("services.flow_store._lookup_open_episode",
                new_callable=AsyncMock, return_value=None), \
-         patch("services.flow_store._insert_rows_with_episode_id",
-               new_callable=AsyncMock, return_value=True) as mock_insert, \
          patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("httpx.AsyncClient", return_value=mock_client), \
          patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
                create=True):
         await fs.persist_flow_episode(signal_data)
 
-    mock_insert.assert_called_once()
-    # positional args: (table, row, key, premium, oi_at_open)
-    args = mock_insert.call_args[0]
-    table = args[0]
-    row   = args[1]
-    assert table == "flow_episodes"
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    row = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json", {})
     assert row["ticker"] == "AAPL"
-    assert row["alert_level"] == "STRONG_SIGNAL"
     assert row["total_premium"] == 500_000.0
-    assert row["is_accelerating"] is True
 
 
 @pytest.mark.asyncio
 async def test_persist_flow_episode_empty_expiry_becomes_none():
     """
-    ING-009: empty-string expiry must be coerced to None before the row is
-    built.  Patch target is _insert_rows_with_episode_id (INSERT path).
+    Empty-string expiry must be coerced to None before the row is built.
+    Patches httpx.AsyncClient POST directly (actual INSERT path).
     """
     import services.flow_store as fs
     signal_data = {
         "ticker": "SPY", "expiry": "", "total_premium": 100_000.0,
-        "trade_count": 5, "alert_level": "WATCH",
+        "trade_count": 5, "alert_level": "WATCH",   # REARCH vocab
         "is_accelerating": False, "seed_episode": None, "timestamp": None,
         "direction": "BEARISH", "contract_type": "PUT", "strike": 440.0,
     }
 
     fs.reset_episode_state()
 
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_resp.json = MagicMock(return_value=[{"id": 2, "ticker": "SPY"}])
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
     with patch("services.flow_store._lookup_open_episode",
                new_callable=AsyncMock, return_value=None), \
-         patch("services.flow_store._insert_rows_with_episode_id",
-               new_callable=AsyncMock, return_value=True) as mock_insert, \
          patch("services.flow_store._SUPABASE_URL", "https://x.supabase.co"), \
          patch("services.flow_store._SUPABASE_KEY", "svc"), \
+         patch("httpx.AsyncClient", return_value=mock_client), \
          patch("services.chain_store.get_contract_vol_oi", return_value=(None, None),
                create=True):
         await fs.persist_flow_episode(signal_data)
 
-    args = mock_insert.call_args[0]
-    row = args[1]  # second positional arg is the row dict
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    row = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json", {})
     assert row["expiry"] is None
 
 
@@ -627,6 +633,11 @@ async def test_insert_rows_with_retry_succeeds_on_second_attempt():
 
 # ---------------------------------------------------------------------------
 # persist_flow_event buffering
+#
+# NOTE (migration 024): is_golden_sweep, influence_tier, conviction_score were
+# dropped from the flow_events table. These keys must NOT appear in ev dicts
+# passed to persist_flow_event() — doing so would cause Supabase to reject the
+# INSERT post-migration. The ev fixtures below are kept clean of those 3 keys.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -640,13 +651,13 @@ async def test_persist_flow_event_not_configured_drops_event():
 @pytest.mark.asyncio
 async def test_persist_flow_event_adds_to_buffer():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "AAPL", "contract_type": "CALL", "strike": 180.0,
         "expiry": "2026-06-20", "dte": 30, "fill_price": 2.35,
         "bid": 2.30, "ask": 2.40, "size": 100, "premium": 23_500.0,
         "trade_type": "BTO", "bid_ask_class": "ASK", "is_aggressive": True,
-        "is_golden_sweep": False, "sentiment": "BULLISH",
-        "influence_tier": "WHALE", "conviction_score": 0.80,
+        "sentiment": "BULLISH",
         "exchange_count": 1, "fill_count": 1, "open_interest": 5000,
         "iv": 0.45, "underlying_price": 175.0, "occ_symbol": "AAPL240620C00180000",
         "is_synthetic_quote": False,
@@ -664,13 +675,13 @@ async def test_persist_flow_event_adds_to_buffer():
 @pytest.mark.asyncio
 async def test_persist_flow_event_early_flush_on_max_rows():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "SPY", "contract_type": "PUT", "strike": 440.0,
         "expiry": "2026-05-17", "dte": 19, "fill_price": 1.10,
         "bid": 1.05, "ask": 1.15, "size": 50, "premium": 5_500.0,
         "trade_type": "BTO", "bid_ask_class": "BID", "is_aggressive": False,
-        "is_golden_sweep": False, "sentiment": "BEARISH",
-        "influence_tier": "INSTITUTIONAL", "conviction_score": 0.55,
+        "sentiment": "BEARISH",
         "exchange_count": 1, "fill_count": 1, "open_interest": 20000,
         "iv": 0.22, "underlying_price": 442.0, "occ_symbol": "SPY240517P00440000",
         "is_synthetic_quote": False,
@@ -689,13 +700,13 @@ async def test_persist_flow_event_early_flush_on_max_rows():
 @pytest.mark.asyncio
 async def test_persist_flow_event_warns_on_zero_strike():
     import services.flow_store as fs
+    # migration 024: is_golden_sweep, influence_tier, conviction_score removed
     ev = {
         "ticker": "TSLA", "contract_type": "CALL", "strike": 0.0,
         "expiry": "2026-06-20", "dte": 30, "fill_price": 1.0,
         "bid": 0.95, "ask": 1.05, "size": 10, "premium": 1_000.0,
         "trade_type": "BTO", "bid_ask_class": "MID", "is_aggressive": False,
-        "is_golden_sweep": False, "sentiment": "NEUTRAL",
-        "influence_tier": "RETAIL", "conviction_score": 0.3,
+        "sentiment": "NEUTRAL",
         "exchange_count": 1, "fill_count": 1, "open_interest": 0,
         "iv": 0.0, "underlying_price": 200.0, "occ_symbol": "TSLA240620C00001000",
         "is_synthetic_quote": False,
@@ -715,6 +726,9 @@ async def test_persist_flow_event_warns_on_zero_strike():
 # moved to _process_trade() in tradier_stream.py (before SIG-DEBOUNCE gate).
 # The tests below verify the no-op behavior and that the drainer does not
 # call persist_flow_episode regardless of message type.
+#
+# bus.subscribe() returns asyncio.Queue directly (not an async context manager).
+# _bus_signal_listener must use queue = bus.subscribe(channel) directly.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -738,8 +752,8 @@ async def test_bus_signal_listener_is_noop_drainer():
         "data": {
             "signal": {
                 "ticker": "AAPL",
-                "recommendation": "BUY",
-                "alert_level": "CONVICTION",
+                "recommendation": "BULLISH",
+                "alert_level": "NOTEWORTHY",   # REARCH vocab
                 "reasoning": "3 sweeps above $1M",
             },
             "episode": {
@@ -834,14 +848,19 @@ async def test_bus_signal_listener_ignores_non_dict_message():
 # Verifies that:
 #   1. persist_flow_episode is called after Signal Gate even when SIG-DEBOUNCE
 #      suppresses the bus publish (decoupling confirmed).
-#   2. alert_level, strike, and expiry are populated from sig_ep directly
-#      (fixes both the ALERT-LEVEL bug and the historic strike/expiry=None bug).
+#   2. alert_level, strike, and expiry are populated from accumulator.get_alert_level()
+#      (fixes the ALERT-LEVEL bug where sig_ep.alert_level MagicMock leaked through)
 #
-# FIX (AsyncMock patch): asyncio.create_task() requires a coroutine object.
-# Without new_callable=AsyncMock, patch() produces a regular MagicMock whose
-# return value is not awaitable — create_task() raises TypeError silently and
-# fake_persist_episode never runs, leaving persisted_episodes empty.
-# All three persist_flow_episode patches below use new_callable=AsyncMock.
+# Alert-level vocabulary: WATCH | NOTEWORTHY | BLOCK | GOLDEN
+# Retired values (must never appear in patches or assertions):
+#   CONVICTION, WHALE, INSTITUTIONAL, LARGE, RETAIL, STRONG_SIGNAL, ALERT
+#
+# NOTE: ev.is_golden_sweep, ev.influence_tier, ev.conviction_score below are
+# attributes on the stream event MagicMock (TradeEvent), not DB columns. They
+# are used inside _process_trade() to build the TradeEvent payload. The 3
+# columns were dropped from the DB schema (migration 024) but the TradeEvent
+# dataclass still carries them as intermediate fields — persist_flow_event()
+# is responsible for excluding them before the DB INSERT.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -849,8 +868,11 @@ async def test_process_trade_persists_episode_before_debounce():
     """
     EPISODE-FIX: persist_flow_episode must be called after Signal Gate
     even when SIG-DEBOUNCE suppresses the bus publish (should_emit=False).
-    Also verifies alert_level / strike / expiry come from sig_ep, not the
-    composite_msg payload (which previously always had strike=None).
+
+    alert_level must come from accumulator.get_alert_level(sig_ep), NOT from
+    sig_ep.alert_level (which is an auto-created MagicMock attribute).
+
+    REARCH vocab: $186k total_premium = NOTEWORTHY tier ($50k-$500k range).
     """
     import services.tradier_stream as ts
 
@@ -870,7 +892,7 @@ async def test_process_trade_persists_episode_before_debounce():
     ev.is_aggressive = True
     ev.is_golden_sweep = False
     ev.sentiment = "BULLISH"
-    ev.influence_tier = "WHALE"
+    ev.influence_tier = "T1"
     ev.conviction_score = 0.85
     ev.exchange_count = 1
     ev.fill_count = 1
@@ -903,7 +925,7 @@ async def test_process_trade_persists_episode_before_debounce():
          patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
          patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
-         patch.object(ts.accumulator, "get_alert_level", return_value="CONVICTION"), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="NOTEWORTHY"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
          patch("services.tradier_stream.persist_flow_episode",
                new_callable=AsyncMock, side_effect=fake_persist_episode), \
@@ -916,8 +938,9 @@ async def test_process_trade_persists_episode_before_debounce():
         "when SIG-DEBOUNCE returns should_emit=False"
     )
     ep = persisted_episodes[0]
-    assert ep["alert_level"] == "CONVICTION", (
-        f"ALERT-LEVEL regression: expected 'CONVICTION', got {ep['alert_level']!r}"
+    assert ep["alert_level"] == "NOTEWORTHY", (
+        f"ALERT-LEVEL regression: expected 'NOTEWORTHY' (REARCH vocab), got {ep['alert_level']!r}. "
+        f"alert_level must come from accumulator.get_alert_level(sig_ep), not sig_ep.alert_level."
     )
     assert ep["strike"] == 185.0, (
         f"strike should come from sig_ep, got {ep['strike']!r}"
@@ -939,7 +962,7 @@ async def test_process_trade_episode_direction_call_is_repeat_buy():
     ev.expiry = "2026-06-20"; ev.dte = 51; ev.fill_price = 5.0
     ev.bid = 4.9; ev.ask = 5.1; ev.size = 50; ev.premium = 25_000.0
     ev.trade_type = "BTO"; ev.bid_ask_class = "ASK"; ev.is_aggressive = True
-    ev.is_golden_sweep = False; ev.sentiment = "BULLISH"; ev.influence_tier = "WHALE"
+    ev.is_golden_sweep = False; ev.sentiment = "BULLISH"; ev.influence_tier = "T1"
     ev.conviction_score = 0.9; ev.exchange_count = 1; ev.fill_count = 1
     ev.open_interest = 3000; ev.iv = 0.55; ev.underlying_price = 880.0
     ev.is_synthetic_quote = False
@@ -965,7 +988,7 @@ async def test_process_trade_episode_direction_call_is_repeat_buy():
          patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
          patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
-         patch.object(ts.accumulator, "get_alert_level", return_value="STRONG_SIGNAL"), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="NOTEWORTHY"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
          patch("services.tradier_stream.persist_flow_episode",
                new_callable=AsyncMock, side_effect=fake_persist_episode), \
@@ -987,7 +1010,7 @@ async def test_process_trade_episode_direction_put_is_repeat_sell():
     ev.expiry = "2026-05-17"; ev.dte = 17; ev.fill_price = 2.0
     ev.bid = 1.95; ev.ask = 2.05; ev.size = 100; ev.premium = 20_000.0
     ev.trade_type = "BTO"; ev.bid_ask_class = "BID"; ev.is_aggressive = False
-    ev.is_golden_sweep = False; ev.sentiment = "BEARISH"; ev.influence_tier = "INSTITUTIONAL"
+    ev.is_golden_sweep = False; ev.sentiment = "BEARISH"; ev.influence_tier = "T2"
     ev.conviction_score = 0.7; ev.exchange_count = 1; ev.fill_count = 1
     ev.open_interest = 10000; ev.iv = 0.20; ev.underlying_price = 503.0
     ev.is_synthetic_quote = False
@@ -1013,7 +1036,7 @@ async def test_process_trade_episode_direction_put_is_repeat_sell():
          patch("services.tradier_stream.flow_dedup.is_sweep", return_value=False), \
          patch.object(ts.accumulator, "ingest_tick", new_callable=AsyncMock, return_value=sig_ep), \
          patch.object(ts.accumulator, "get_signal", new_callable=AsyncMock, return_value=sig_ep), \
-         patch.object(ts.accumulator, "get_alert_level", return_value="ALERT"), \
+         patch.object(ts.accumulator, "get_alert_level", return_value="WATCH"), \
          patch("services.tradier_stream.persist_flow_event", new_callable=AsyncMock), \
          patch("services.tradier_stream.persist_flow_episode",
                new_callable=AsyncMock, side_effect=fake_persist_episode), \

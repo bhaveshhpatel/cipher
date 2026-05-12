@@ -218,8 +218,9 @@ class TestDemoModeCancellable:
 
         published = []
 
-        async def _capture(signal):
-            published.append(signal)
+        async def _capture(channel, payload):
+            # bus.publish_all(channel, payload) — capture only the payload
+            published.append(payload)
 
         with patch("services.tradier_stream.bus") as mock_bus:
             mock_bus.publish_all = _capture
@@ -231,6 +232,7 @@ class TestDemoModeCancellable:
             except asyncio.CancelledError:
                 pass
 
+        assert len(published) > 0, "Expected at least one signal to be emitted"
         for sig in published:
             assert sig["type"] == "signal"
             assert "ticker" in sig["data"]

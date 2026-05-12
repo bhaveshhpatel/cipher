@@ -1,0 +1,9 @@
+-- MOVED: this file has been relocated to the canonical Supabase migration path.
+-- New location: supabase/migrations/add_event_quality_tag_columns_to_flow_events.sql
+--
+-- The backend/db/migrations/ directory is NOT the active migration runner.
+-- All REARCH migrations are applied manually to Supabase production via
+-- supabase/migrations/ per docs/rearch/STEAMROOM_REARCH_ROADMAP.md.
+--
+-- This stub is kept to avoid a confusing deletion diff in git history.
+-- Do not apply this file.

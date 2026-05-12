@@ -45,7 +45,7 @@ Key architectural fixes:
                         .set_tier_map() is also called so the module-level hot-path
                         accumulator receives the same tier map. Without this, Gate 2
                         in _get_episode_min_premium() resolves every ticker to tier 1
-                        (strict cold-start default) for the entire session.
+                        (strict cold-start default) for the entire trading session.
   ING-008 (main)      — start_chain_refresh_worker() launched as a background task
                         after yield. Refreshes options chain vol/OI for all
                         stream_eligible symbols every 5 minutes via Tradier chain API.
@@ -56,6 +56,18 @@ Key architectural fixes:
                           fetch_chain_fn      — _fetch_tradier_chain(symbol) helper
                         invalidate_vol_oi_cache() called at market-open boundary in
                         _registry_prewarm_loop() so yesterday's volume never bleeds.
+  REARCH-002 (main)   — ingestion_config router mounted: GET/PATCH /admin/ingestion-config
+                        now reachable. Previously the router was created but never
+                        included in app.include_router().
+  REARCH-005 (main)   — signal_config router mounted: GET/PATCH /admin/signal-config
+                        now reachable. Reads/writes signal_config table; enforces
+                        premium pyramid, DTE window, tier multiplier, and floor
+                        ordering invariants. Calls reload_signal_config() on every
+                        successful PATCH for immediate in-process snapshot refresh.
+  MAIN-FIX-001        — start_lookback_worker() was refactored (FS-HANG) to fetch
+                        its own accumulator internally via get_accumulator() — it
+                        takes 0 positional args. Removed stale registry.accumulator
+                        argument from the create_task() call site.
 """
 import asyncio
 import json
@@ -76,6 +88,8 @@ from routers.smart_signals import stream_stats
 from routers import history
 from routers import admin
 from routers import health
+from routers import ingestion_config as ingestion_config_router  # REARCH-002
+from routers import signal_config as signal_config_router        # REARCH-005
 from core.auth import get_current_user
 from services.flow_store import start_flow_writer, start_lookback_worker
 from services.chain_store import start_chain_refresh_worker, invalidate_vol_oi_cache  # ING-008
@@ -613,16 +627,11 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
-    # SA-F1 (ING-007): registry.accumulator is passed here but may be None if the
-    # SymbolRegistry implementation does not expose an .accumulator attribute.
-    # start_lookback_worker() handles None gracefully (defaults to 10_000.0 floor).
-    # NOTE: The production accumulator used by the streaming hot path is the
-    # module-level `accumulator` in services/tradier_stream.py — not this registry
-    # attribute. The worker's accumulator reference is used only to resolve the
-    # DTE-tier min_premium floor for lookback DB queries; it does NOT gate flow.
-    lookback_task         = asyncio.create_task(
-        start_lookback_worker(registry.accumulator if hasattr(registry, "accumulator") else None)
-    )
+    # MAIN-FIX-001: start_lookback_worker() was refactored (FS-HANG fix) to
+    # fetch its own accumulator internally via get_accumulator() — it takes 0
+    # positional arguments. The previous call site passed registry.accumulator,
+    # causing TypeError at every TestClient startup.
+    lookback_task         = asyncio.create_task(start_lookback_worker())
 
     # ING-008: background 5-min chain cache refresh loop.
     #
@@ -731,6 +740,8 @@ app.include_router(smart_signals.router)
 app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
+app.include_router(ingestion_config_router.router)  # REARCH-002: /admin/ingestion-config GET+PATCH
+app.include_router(signal_config_router.router)     # REARCH-005: /admin/signal-config GET+PATCH
 
 
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
