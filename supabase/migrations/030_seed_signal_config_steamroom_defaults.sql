@@ -1,5 +1,6 @@
 -- 030_seed_signal_config_steamroom_defaults.sql  [REARCH-005]
--- Seeds the 11 WSJ Steamroom default knob rows into signal_config.
+-- Seeds the 10 base WSJ Steamroom knob rows into signal_config.
+-- The 6 tier-multiplier rows are seeded in 031_seed_signal_config_tier_multipliers.sql.
 --
 -- Uses INSERT ... ON CONFLICT DO NOTHING so this migration is idempotent:
 -- re-running it (e.g. after a branch reset) never overwrites a live-tuned value.
@@ -13,6 +14,7 @@
 --
 -- WSJ Steamroom 5-Dimension mapping:
 --   Dim 1  Premium Threshold  sig.golden_sweep_premium / sig.block_premium / sig.noteworthy_premium
+--                             + tier multipliers in 031 (t2/t3 per threshold)
 --   Dim 2  Ask-Side           sig.require_ask_side / sig.ask_side_pct_floor
 --   Dim 3  Vol > OI           sig.require_vol_gt_oi
 --   Dim 4  DTE Quality        sig.min_dte / sig.max_dte
@@ -21,30 +23,32 @@
 
 INSERT INTO signal_config (key, value, value_type, description) VALUES
 
-    -- Dimension 1: Premium Threshold -------------------------------------------
+    -- Dimension 1: Premium Threshold (Tier-1 / large-cap base values) ----------
+    -- Effective threshold for Tier-2 = base * sig.<name>_t2_mult  (031)
+    -- Effective threshold for Tier-3 = base * sig.<name>_t3_mult  (031)
     (
         'sig.golden_sweep_premium',
         '1000000.0',
         'float',
-        'Minimum total notional premium (USD) for a GOLDEN alert. '
-        'Episode notional >= this value AND all 5 Steamroom dimensions pass -> GOLDEN. '
+        'Tier-1 base minimum notional premium (USD) for a GOLDEN alert. '
+        'Tier-2/3 effective thresholds = this value * sig.golden_sweep_premium_t2_mult / t3_mult. '
         'WSJ Steamroom default: $1,000,000.'
     ),
     (
         'sig.block_premium',
         '500000.0',
         'float',
-        'Minimum total notional premium (USD) for a BLOCK alert. '
-        'Episode notional in [block_premium, golden_sweep_premium) -> BLOCK. '
+        'Tier-1 base minimum notional premium (USD) for a BLOCK alert. '
+        'Tier-2/3 effective thresholds = this value * sig.block_premium_t2_mult / t3_mult. '
         'WSJ Steamroom default: $500,000.'
     ),
     (
         'sig.noteworthy_premium',
         '50000.0',
         'float',
-        'Minimum total notional premium (USD) for a NOTEWORTHY alert. '
-        'Episode notional in [noteworthy_premium, block_premium) -> NOTEWORTHY. '
-        'Below this (but above ingestion floor) -> WATCH. '
+        'Tier-1 base minimum notional premium (USD) for a NOTEWORTHY alert. '
+        'Tier-2/3 effective thresholds = this value * sig.noteworthy_premium_t2_mult / t3_mult. '
+        'Below tier-effective threshold (but above ingestion floor) -> WATCH. '
         'WSJ Steamroom default: $50,000.'
     ),
 
@@ -117,23 +121,6 @@ INSERT INTO signal_config (key, value, value_type, description) VALUES
 
 ON CONFLICT (key) DO NOTHING;
 
--- Verify: confirm all 11 rows are present after seed.
--- This DO block logs a WARNING to postgres logs if any row is missing,
--- mirroring the startup-validator pattern in signal_config_store.validate_signal_config().
-DO $$
-DECLARE
-    expected_count INT := 11;
-    actual_count   INT;
-BEGIN
-    SELECT COUNT(*) INTO actual_count FROM signal_config;
-    IF actual_count < expected_count THEN
-        RAISE WARNING
-            '[REARCH-005] signal_config has % rows after seed; expected %. '
-            'Check for ON CONFLICT skips on duplicate keys.',
-            actual_count, expected_count;
-    ELSE
-        RAISE NOTICE
-            '[REARCH-005] signal_config seed OK: % rows present.', actual_count;
-    END IF;
- END;
-$$;
+-- Note: total expected rows after BOTH 030 + 031 = 16.
+-- Verification DO block is in 031_seed_signal_config_tier_multipliers.sql
+-- so it runs after both seeds complete.

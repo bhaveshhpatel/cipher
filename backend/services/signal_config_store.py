@@ -17,6 +17,9 @@ Design:
     called from the admin PATCH endpoint after a write succeeds.
   - get_param(key, default) is the hot-path accessor — reads from the
     current snapshot with a typed fallback, never hits the DB.
+  - get_effective_premium_threshold(alert_level, notional_tier) is the
+    tier-aware threshold helper for REARCH-006.  It applies the PBE
+    multiplier extension: base_threshold * tier_multiplier.
   - SIGNAL_CONFIG_TYPES is the authoritative type registry for all known
     signal config keys.  Used by the admin PATCH endpoint (REARCH-008) for
     422 validation and by _cast() for typed DB reads.
@@ -25,11 +28,22 @@ Design:
 
 WSJ Steamroom 5-Dimension Knob Map:
 
-  Dimension 1 — Premium Threshold (alert tier boundaries):
-    sig.golden_sweep_premium    float   1_000_000   >= this → GOLDEN
-    sig.block_premium           float   500_000     >= this → BLOCK
-    sig.noteworthy_premium      float   50_000      >= this → NOTEWORTHY
-    (below noteworthy_premium + above ingestion floor → WATCH)
+  Dimension 1 — Premium Threshold (tier-aware via PBE multiplier extension):
+    sig.golden_sweep_premium        float   1_000_000   Tier-1 base >= this → GOLDEN
+    sig.block_premium               float   500_000     Tier-1 base >= this → BLOCK
+    sig.noteworthy_premium          float   50_000      Tier-1 base >= this → NOTEWORTHY
+    sig.golden_sweep_premium_t2_mult float  0.5         Tier-2 multiplier for GOLDEN base
+    sig.golden_sweep_premium_t3_mult float  0.2         Tier-3 multiplier for GOLDEN base
+    sig.block_premium_t2_mult       float   0.5         Tier-2 multiplier for BLOCK base
+    sig.block_premium_t3_mult       float   0.2         Tier-3 multiplier for BLOCK base
+    sig.noteworthy_premium_t2_mult  float   0.5         Tier-2 multiplier for NOTEWORTHY base
+    sig.noteworthy_premium_t3_mult  float   0.2         Tier-3 multiplier for NOTEWORTHY base
+
+  Effective thresholds at defaults:
+    Alert Level   Tier-1      Tier-2      Tier-3
+    GOLDEN        $1,000,000  $500,000    $200,000
+    BLOCK         $500,000    $250,000    $100,000
+    NOTEWORTHY    $50,000     $25,000     $10,000
 
   Dimension 2 — Ask-Side Execution:
     sig.require_ask_side        bool    True        gate: episode must be ask-side dominant
@@ -76,6 +90,26 @@ _TABLE = "signal_config"
 _CACHE_TTL = 30  # seconds — shorter than ingestion_config (60s) for faster signal-knob propagation
 
 # ---------------------------------------------------------------------------
+# Tier-multiplier key map — used by get_effective_premium_threshold()
+#
+# Maps (alert_level_key, notional_tier) -> multiplier_config_key.
+# Tier-1 always uses a multiplier of 1.0 (no scaling — it IS the base).
+# notional_tier values match flow_episodes.notional_tier from REARCH-004:
+#   "tier1", "tier2", "tier3"
+# ---------------------------------------------------------------------------
+_TIER_MULT_KEYS: dict[tuple[str, str], Optional[str]] = {
+    ("sig.golden_sweep_premium", "tier1"): None,   # 1.0 — base is Tier-1
+    ("sig.golden_sweep_premium", "tier2"): "sig.golden_sweep_premium_t2_mult",
+    ("sig.golden_sweep_premium", "tier3"): "sig.golden_sweep_premium_t3_mult",
+    ("sig.block_premium",        "tier1"): None,
+    ("sig.block_premium",        "tier2"): "sig.block_premium_t2_mult",
+    ("sig.block_premium",        "tier3"): "sig.block_premium_t3_mult",
+    ("sig.noteworthy_premium",   "tier1"): None,
+    ("sig.noteworthy_premium",   "tier2"): "sig.noteworthy_premium_t2_mult",
+    ("sig.noteworthy_premium",   "tier3"): "sig.noteworthy_premium_t3_mult",
+}
+
+# ---------------------------------------------------------------------------
 # SIGNAL_CONFIG_TYPES — authoritative type registry
 #
 # Every key that REARCH-006 reads must be declared here.
@@ -89,53 +123,70 @@ _CACHE_TTL = 30  # seconds — shorter than ingestion_config (60s) for faster si
 # Valid type_string values: "float", "int", "bool"
 # ---------------------------------------------------------------------------
 SIGNAL_CONFIG_TYPES: dict[str, str] = {
-    # Dimension 1 — Premium Threshold
-    "sig.golden_sweep_premium": "float",
-    "sig.block_premium":        "float",
-    "sig.noteworthy_premium":   "float",
+    # Dimension 1 — Premium Threshold (base, Tier-1)
+    "sig.golden_sweep_premium":          "float",
+    "sig.block_premium":                 "float",
+    "sig.noteworthy_premium":            "float",
+
+    # Dimension 1 — Tier multipliers (PBE extension)
+    "sig.golden_sweep_premium_t2_mult":  "float",
+    "sig.golden_sweep_premium_t3_mult":  "float",
+    "sig.block_premium_t2_mult":         "float",
+    "sig.block_premium_t3_mult":         "float",
+    "sig.noteworthy_premium_t2_mult":    "float",
+    "sig.noteworthy_premium_t3_mult":    "float",
 
     # Dimension 2 — Ask-Side Execution
-    "sig.require_ask_side":     "bool",
-    "sig.ask_side_pct_floor":   "float",
+    "sig.require_ask_side":              "bool",
+    "sig.ask_side_pct_floor":            "float",
 
     # Dimension 3 — Vol > OI
-    "sig.require_vol_gt_oi":    "bool",
+    "sig.require_vol_gt_oi":             "bool",
 
     # Dimension 4 — DTE Quality (signal-layer, above ingestion floors)
-    "sig.min_dte":              "int",
-    "sig.max_dte":              "int",
+    "sig.min_dte":                       "int",
+    "sig.max_dte":                       "int",
 
     # Dimension 5 — Repetition / Clustering
-    "sig.min_trade_count":      "int",
+    "sig.min_trade_count":               "int",
 
     # Scoring gate
-    "sig.steamroom_score_floor": "int",
+    "sig.steamroom_score_floor":         "int",
 }
 
 # _DEFAULTS: used as a last-resort fallback when Supabase is unreachable.
 # All values reflect the WSJ Steamroom defaults documented in the roadmap.
+# Must stay in sync with migration seeds 030 + 031.
 _DEFAULTS: dict[str, Any] = {
-    # Dimension 1
-    "sig.golden_sweep_premium": 1_000_000.0,
-    "sig.block_premium":        500_000.0,
-    "sig.noteworthy_premium":   50_000.0,
+    # Dimension 1 — base (Tier-1)
+    "sig.golden_sweep_premium":         1_000_000.0,
+    "sig.block_premium":                500_000.0,
+    "sig.noteworthy_premium":           50_000.0,
+
+    # Dimension 1 — tier multipliers
+    "sig.golden_sweep_premium_t2_mult": 0.5,
+    "sig.golden_sweep_premium_t3_mult": 0.2,
+    "sig.block_premium_t2_mult":        0.5,
+    "sig.block_premium_t3_mult":        0.2,
+    "sig.noteworthy_premium_t2_mult":   0.5,
+    "sig.noteworthy_premium_t3_mult":   0.2,
 
     # Dimension 2
-    "sig.require_ask_side":     True,
-    "sig.ask_side_pct_floor":   0.6,
+    "sig.require_ask_side":             True,
+    "sig.ask_side_pct_floor":           0.6,
 
     # Dimension 3
-    "sig.require_vol_gt_oi":    True,
+    "sig.require_vol_gt_oi":            True,
 
     # Dimension 4
-    "sig.min_dte":              5,
-    "sig.max_dte":              60,
+    "sig.min_dte":                      5,
+    "sig.max_dte":                      60,
 
     # Dimension 5
-    "sig.min_trade_count":      2,
+    "sig.min_trade_count":              2,
 
     # Scoring gate
-    "sig.steamroom_score_floor": 3,
+    "sig.steamroom_score_floor":        3,
 }
 
 # All keys that MUST have a row in the signal_config DB table.
@@ -245,6 +296,53 @@ def get_param(key: str, default: Any = None) -> Any:
         The typed value from the current snapshot, or `default` if missing.
     """
     return _snapshot.get(key, default)
+
+
+def get_effective_premium_threshold(alert_level_key: str, notional_tier: str) -> float:
+    """
+    Return the tier-adjusted effective premium threshold for a given alert level.
+
+    This is the primary REARCH-006 entry point for Dimension-1 evaluation.
+    It replaces raw get_param("sig.golden_sweep_premium") calls with a
+    tier-aware computation so the Signal Engine never needs to know about
+    the multiplier key naming convention.
+
+    Args:
+        alert_level_key:  One of "sig.golden_sweep_premium", "sig.block_premium",
+                          "sig.noteworthy_premium".
+        notional_tier:    Episode notional_tier value from flow_episodes:
+                          "tier1", "tier2", or "tier3".
+
+    Returns:
+        Effective float threshold = base * multiplier.
+        Falls back to the base threshold alone if tier is unrecognised,
+        so an unexpected notional_tier value never silently drops to zero.
+
+    Examples:
+        get_effective_premium_threshold("sig.golden_sweep_premium", "tier2")
+        -> 1_000_000.0 * 0.5 = 500_000.0
+
+        get_effective_premium_threshold("sig.block_premium", "tier3")
+        -> 500_000.0 * 0.2 = 100_000.0
+
+        get_effective_premium_threshold("sig.noteworthy_premium", "tier1")
+        -> 50_000.0 * 1.0 = 50_000.0  (base unchanged for Tier-1)
+    """
+    base: float = _snapshot.get(alert_level_key, _DEFAULTS.get(alert_level_key, 0.0))
+
+    mult_key = _TIER_MULT_KEYS.get((alert_level_key, notional_tier))
+    if mult_key is None:
+        # Tier-1 path (no multiplier key) OR unrecognised tier — use base as-is.
+        if notional_tier not in ("tier1", "tier2", "tier3"):
+            log.warning(
+                "[signal_config_store] get_effective_premium_threshold: "
+                "unrecognised notional_tier=%r for key=%r — using base threshold %.0f",
+                notional_tier, alert_level_key, base,
+            )
+        return base
+
+    mult: float = _snapshot.get(mult_key, _DEFAULTS.get(mult_key, 1.0))
+    return base * mult
 
 
 async def get_all_rows() -> list[dict]:
