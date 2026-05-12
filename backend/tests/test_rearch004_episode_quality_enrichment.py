@@ -49,6 +49,19 @@ FIX (REARCH-004 2026-05-12):
     persist_flow_episode() never looked up, so in_flight was always None
     and the test took the INSERT path instead of the PATCH path.
     Fix: mirror the exact _episode_key() format using "|" separators.
+
+  Bug D (2026-05-12) — E-3 / E-4: stale pre-deliberation bucket/tier names.
+    production ignores signal_data['dte_bucket'] / signal_data['notional_tier']
+    and recomputes from signal_data['dte'] and signal_data['premium'] via
+    _compute_dte_bucket() / _compute_notional_tier().
+
+    E-3 was asserting 'dte_bucket' == '0-7d' — not a valid _compute_dte_bucket()
+    output.  Without a 'dte' key, dte=None → '90+'.
+    Fix: add dte=3 to _make_signal_data; E-3 passes dte=3 → asserts '1-4'.
+
+    E-4 was asserting 'notional_tier' == 'WHALE' — renamed to 'GOLDEN' in
+    REARCH-003 deliberation.  Default premium=5100.0 < $50k → 'WATCH'.
+    Fix: E-4 passes premium=500_000 (>= _NOTIONAL_GOLDEN=$500k) → asserts 'GOLDEN'.
 """
 import asyncio
 import os
@@ -77,13 +90,19 @@ def _make_signal_data(
     strike: float = 150.0,
     expiry: str = "2026-06-20",
     premium: float = 5100.0,
+    dte: int = 3,
     size: int = 10,
     trade_type: str = "BTO",
     is_ask_side: bool = True,
-    dte_bucket: str = "30-60d",
-    notional_tier: str = "MEDIUM",
 ) -> dict:
-    """Minimal signal_data dict matching the shape accepted by persist_flow_episode()."""
+    """Minimal signal_data dict matching the shape accepted by persist_flow_episode().
+
+    Note: dte_bucket and notional_tier are NOT included here.
+    persist_flow_episode() computes them from `dte` and `premium` via
+    _compute_dte_bucket() / _compute_notional_tier() (SA-3 / REARCH-003).
+    Passing stale pre-deliberation values ('0-7d', 'WHALE') would be silently
+    ignored and the computed values would differ — see Bug D in the header.
+    """
     return {
         "ticker":        ticker,
         "direction":     direction,
@@ -91,11 +110,10 @@ def _make_signal_data(
         "strike":        strike,
         "expiry":        expiry,
         "premium":       premium,
+        "dte":           dte,
         "size":          size,
         "trade_type":    trade_type,
         "is_ask_side":   is_ask_side,
-        "dte_bucket":    dte_bucket,
-        "notional_tier": notional_tier,
         "alert":         "WATCH",
         "signal_ts":     "2026-05-12T00:00:00+00:00",
         "occ_symbol":    "AAPL260620C00150000",
@@ -260,22 +278,41 @@ class TestInsertPathSeedsAggregateColumns:
 
     def test_e3_dte_bucket_written_to_insert_payload(self):
         """
-        E-3: dte_bucket from signal_data must appear in the INSERT payload.
-        SA-3 semantics: value is locked at episode open from the seed event.
+        E-3: dte_bucket computed from signal_data['dte'] must appear in the
+        INSERT payload.  SA-3 semantics: value is locked at episode open from
+        the seed event's raw dte field via _compute_dte_bucket().
+
+        dte=3 → _compute_dte_bucket(3) → '1-4'  (1 <= 3 <= _DTE_NEAR_MAX=4)
+
+        Bug D: previous test passed dte_bucket='0-7d' directly — not a valid
+        _compute_dte_bucket() output.  Production ignores signal_data['dte_bucket']
+        and recomputes from signal_data['dte']; without 'dte' in the fixture,
+        None → '90+'.  Fix: supply dte=3, assert against computed value '1-4'.
         """
-        payload = _run_episode(_make_signal_data(dte_bucket="0-7d"))
-        assert payload.get("dte_bucket") == "0-7d", (
-            f"Expected dte_bucket='0-7d' in INSERT payload, got {payload.get('dte_bucket')!r}"
+        payload = _run_episode(_make_signal_data(dte=3))
+        assert payload.get("dte_bucket") == "1-4", (
+            f"Expected dte_bucket='1-4' (dte=3 → _compute_dte_bucket) in INSERT payload, "
+            f"got {payload.get('dte_bucket')!r}"
         )
 
     def test_e4_notional_tier_written_to_insert_payload(self):
         """
-        E-4: notional_tier from signal_data must appear in the INSERT payload.
-        SA-3 semantics: value is locked at episode open from the seed event.
+        E-4: notional_tier computed from signal_data['premium'] must appear in
+        the INSERT payload.  SA-3 semantics: value is locked at episode open
+        from the seed event's raw premium via _compute_notional_tier().
+
+        premium=500_000 → _compute_notional_tier(500_000) → 'GOLDEN'
+        (_NOTIONAL_GOLDEN threshold = $500k, inclusive)
+
+        Bug D: previous test passed notional_tier='WHALE' — renamed to 'GOLDEN'
+        in REARCH-003 deliberation.  Production ignores signal_data['notional_tier']
+        and recomputes from signal_data['premium']; default premium=5100.0 < $50k
+        → 'WATCH'.  Fix: supply premium=500_000, assert against 'GOLDEN'.
         """
-        payload = _run_episode(_make_signal_data(notional_tier="WHALE"))
-        assert payload.get("notional_tier") == "WHALE", (
-            f"Expected notional_tier='WHALE' in INSERT payload, got {payload.get('notional_tier')!r}"
+        payload = _run_episode(_make_signal_data(premium=500_000))
+        assert payload.get("notional_tier") == "GOLDEN", (
+            f"Expected notional_tier='GOLDEN' (premium=$500k → _compute_notional_tier) "
+            f"in INSERT payload, got {payload.get('notional_tier')!r}"
         )
 
     def test_e5_missing_is_ask_side_defaults_to_false(self):
@@ -332,7 +369,7 @@ class TestPatchPayloadExcludesLockedColumns:
             "total_premium":   5100.0,
             "ask_side_count":  1,   # first event was ask-side
         }
-        sd = _make_signal_data(is_ask_side=False, dte_bucket="7-14d", notional_tier="LARGE")
+        sd = _make_signal_data(is_ask_side=False)
         patch_payload = _run_episode_patch(sd, in_flight_episode=in_flight)
 
         # SA-3: locked columns must be absent
