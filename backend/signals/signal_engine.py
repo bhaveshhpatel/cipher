@@ -37,6 +37,14 @@
 #                      Previously only imported as the private alias
 #                      _global_get_effective_premium_threshold, which caused
 #                      AttributeError in TestBuildSignalRowRecommendationWiring.
+#              Fix 6:  Remap compute_conviction_score D1-D3 to match test spec.
+#                      D1 = ask_side_pct dominance (None → no point).
+#                      D2 = vol_oi_signal.
+#                      D3 = notional_tier in _QUALIFYING_TIERS.
+#                      The watch_floor/premium check removed from this function
+#                      — SignalEngine._eval_gate_1 handles the premium hard gate
+#                      separately.  compute_conviction_score is the pure 0-5
+#                      additive score for recommendation derivation only.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -105,7 +113,7 @@ _ALL_GATE_NAMES: tuple[str, ...] = (
 # Chunk 4 — vocab sets (shared by compute_conviction_score + build_signal_row)
 # ---------------------------------------------------------------------------
 
-# Tiers that satisfy D3 (premium quality) — kept for _eval_gate_1 internal use
+# Tiers that satisfy D3 (premium quality) in the conviction score
 _QUALIFYING_TIERS: frozenset[str] = frozenset({"NOTEWORTHY", "BLOCK", "GOLDEN"})
 
 # DTE buckets that FAIL D4 (too short-dated or too far out)
@@ -612,7 +620,20 @@ def _gate_names_to_dimensions(gates: dict[str, GateVerdict]) -> list[str]:
 # ============================================================================
 
 def compute_conviction_score(episode: Any, cfg: Any) -> int:
-    """Compute the WSJ Steamroom conviction score (0–5) for a RepetitionEpisode."""
+    """Compute the WSJ Steamroom conviction score (0–5) for a RepetitionEpisode.
+
+    This is a pure additive score (0–5) used for recommendation derivation and
+    the composite_score field in signal_history.  It is NOT the hard gate used
+    by SignalEngine.evaluate() — premium threshold enforcement lives there.
+
+    Dimension mapping
+    -----------------
+    D1 — Ask-side execution dominance  (ask_side_pct >= floor; None → 0)
+    D2 — Volume > Open Interest        (vol_oi_signal is True)
+    D3 — Qualifying notional tier      (notional_tier in NOTEWORTHY/BLOCK/GOLDEN)
+    D4 — DTE in signal window          (dte_bucket not in 0-7 or 90+, and not None)
+    D5 — Repetition / clustering       (trade_count >= min_trade_count)
+    """
     def _get(key: str, default):
         try:
             return getattr(cfg, key)
@@ -626,26 +647,23 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     score = 0
 
-    # D1 — Premium meets watch-band floor
-    noteworthy_floor: float = float(
-        _get("noteworthy_premium", _get("sig.noteworthy_premium", 50_000.0))
-    )
-    watch_floor: float = noteworthy_floor * _WATCH_FLOOR_FACTOR
-    total_premium: float = float(getattr(episode, "total_premium", 0.0) or 0.0)
-    if total_premium >= watch_floor:
-        score += 1
-
-    # D2 — Ask-side execution dominance
+    # D1 — Ask-side execution dominance
+    # None means the field is absent — no point awarded (graceful degrade).
     ask_pct: float | None = getattr(episode, "ask_side_pct", None)
     floor: float = float(_get("ask_side_pct_floor", _get("sig.ask_side_pct_floor", 0.6)))
     if ask_pct is not None and ask_pct >= floor:
         score += 1
 
-    # D3 — Volume > Open Interest
+    # D2 — Volume > Open Interest
     if getattr(episode, "vol_oi_signal", False):
         score += 1
 
-    # D4 — DTE in signal window (not 0-7 days, not 90+ days)
+    # D3 — Qualifying notional tier (NOTEWORTHY / BLOCK / GOLDEN)
+    notional_tier: str | None = getattr(episode, "notional_tier", None)
+    if notional_tier in _QUALIFYING_TIERS:
+        score += 1
+
+    # D4 — DTE in signal window (not 0-7 days, not 90+ days, not None)
     dte_bucket: str | None = getattr(episode, "dte_bucket", None)
     if dte_bucket is not None and dte_bucket not in _DISQUALIFYING_DTE_BUCKETS:
         score += 1
