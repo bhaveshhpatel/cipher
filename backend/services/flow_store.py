@@ -131,6 +131,11 @@ Bug fixes applied:
          unconditionally and blocked forever on _lookback_queue.get(),
          keeping the pytest event loop alive past teardown and causing CI
          timeout.
+  17. ING-007-SIG (2026-05-11): start_lookback_worker() now accepts an optional
+      accumulator argument. When provided (test path), it is used directly.
+      When None (production/main.py zero-arg call), falls back to
+      get_accumulator(). This restores test compatibility broken by FS-HANG
+      fix which dropped the parameter entirely.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -950,7 +955,15 @@ async def _update_episode_multiday(
             )
             return
 
-        row_id = rows[0]["id"]
+        row = rows[0]
+        if "id" not in row:
+            log.warning(
+                f"[flow_store] _update_episode_multiday: row missing id for "
+                f"{ticker} {contract_type} {strike} {expiry}"
+            )
+            return
+
+        row_id = row["id"]
         patch_url = (
             f"{_SUPABASE_URL}/rest/v1/flow_episodes"
             f"?id=eq.{row_id}"
@@ -973,51 +986,71 @@ async def _update_episode_multiday(
         log.error(f"[flow_store] _update_episode_multiday exception: {e}")
 
 
-async def start_lookback_worker() -> None:
+async def start_lookback_worker(accumulator=None) -> None:
     """
     ING-007: Drain the lookback queue and enrich flow_episodes with
     is_multi_day_repeat from contract_day_cache.
+
+    ING-007-SIG: Accepts an optional accumulator argument.
+    - When provided (test path), uses it directly — avoids importing
+      get_accumulator() so tests can inject a mock without patching.
+    - When None (production/main.py zero-arg call), falls back to
+      get_accumulator() from ingestion.processor.
+
+    Both call sites work correctly:
+      main.py:   asyncio.create_task(start_lookback_worker())
+      tests:     asyncio.create_task(fs.start_lookback_worker(acc))
     """
-    try:
-        from ingestion.processor import get_accumulator
-        accumulator = get_accumulator()
-        # SA-F1: correct attr name + traverse list-of-tuples
-        dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
-        min_premium = (
-            min(floor for _, floors in dte_tiers for floor in floors.values())
-            if dte_tiers
-            else 10_000.0
-        )
-        log.debug("[lookback] min_premium floor resolved: %.2f", min_premium)
-    except Exception:
+    from utils.contract_day_cache import get_lookback
+
+    if accumulator is None:
+        try:
+            from ingestion.processor import get_accumulator
+            accumulator = get_accumulator()
+        except Exception:
+            accumulator = None
+
+    # SA-F1: correct attr name + traverse list-of-tuples
+    dte_tiers = getattr(accumulator, "_dte_tiers", None) or []
+    min_days  = getattr(accumulator, "_multi_day_min_days", 2) if accumulator is not None else 2
+
+    if dte_tiers:
+        min_premium = min(floor for _, floors in dte_tiers for floor in floors.values())
+    else:
         min_premium = 10_000.0
-        log.debug("[lookback] min_premium floor fallback: %.2f", min_premium)
 
-    try:
-        from services.chain_store import get_contract_day_cache
-        contract_day_cache = get_contract_day_cache()
-    except Exception:
-        contract_day_cache = {}
-
+    log.debug("[lookback] min_premium floor resolved: %.2f", min_premium)
     log.info("[lookback] worker started")
 
     while True:
         try:
             key = await _lookback_queue.get()
-            ticker, contract_type, strike, expiry = key
 
-            cached = contract_day_cache.get(key)
-            if cached is None:
+            try:
+                result = await get_lookback(key, min_premium)
+            except Exception as e:
+                log.error("[lookback] get_lookback exception for %s: %s", key, e)
                 _lookback_queue.task_done()
                 continue
 
-            prior_days = cached.get("prior_days_active", 0)
-            is_repeat  = prior_days > 0
+            ticker        = key.ticker
+            contract_type = key.contract_type
+            strike        = key.strike
+            expiry        = key.expiry
+
+            prior_days_active = getattr(result, "prior_days_active", 0)
+            is_repeat = prior_days_active >= min_days
 
             await _update_episode_multiday(
-                ticker, contract_type, strike, expiry, is_repeat
+                ticker=ticker,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                is_multi_day_repeat=is_repeat,
             )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.error(f"[lookback] worker exception: {e}")
         finally:
