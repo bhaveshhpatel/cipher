@@ -18,6 +18,7 @@ signal_history by _build_row().
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from services.signal_engine import EpisodeEvalResult
 from services.signal_store import (
     _clear_signal_memory,
     _build_row,
@@ -325,12 +326,39 @@ def test_start_signal_writer_configured_cancels():
 # --- _bus_signal_listener ---
 
 def test_bus_signal_listener_processes_composite_signal_and_cancels():
+    """
+    Verify _bus_signal_listener calls persist_composite_signal when the
+    engine gate passes.
+
+    REARCH-006: the listener now calls get_engine().evaluate_episode(ep)
+    before any persist.  Without patching get_engine() the singleton would
+    attempt real DB I/O and the sparse test episode would fail all gates
+    (no notional_tier, ask_side_pct, dte_bucket, etc.), causing
+    result.passed=False and persist to be skipped.
+
+    Fix: patch get_engine to return a stub whose evaluate_episode always
+    returns a passing EpisodeEvalResult.  E-18/E-19 in
+    test_rearch006_signal_engine.py own the gate logic coverage — this test
+    owns the persist-path wiring only.
+    """
     from services import signal_store
 
     call_log = []
 
-    async def _fake_persist(sig, ep):
+    async def _fake_persist(sig, ep, eval_result=None):
         call_log.append(sig)
+
+    # Stub engine — always passes, alert=NOTEWORTHY
+    _pass_result = EpisodeEvalResult(
+        passed=True,
+        alert_level="NOTEWORTHY",
+        failing_dimensions=[],
+        effective_threshold=50_000.0,
+        premium=200_000.0,
+        ticker="AAPL",
+    )
+    stub_engine = MagicMock()
+    stub_engine.evaluate_episode.return_value = _pass_result
 
     async def _run():
         q = asyncio.Queue()
@@ -340,6 +368,7 @@ def test_bus_signal_listener_processes_composite_signal_and_cancels():
         }})
 
         with patch.object(signal_store, "persist_composite_signal", side_effect=_fake_persist), \
+             patch("services.signal_store.get_engine", return_value=stub_engine), \
              patch("services.signal_store.bus") as mock_bus:
             mock_bus.subscribe.return_value = q
             mock_bus.unsubscribe = MagicMock()

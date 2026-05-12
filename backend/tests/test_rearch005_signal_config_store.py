@@ -23,8 +23,8 @@ Covers five QA contracts:
     T-5  unknown alert_level_key: returns 0.0 (key absent from snapshot + _DEFAULTS)
 
   R-4 — get_signal_config() TTL cache and atomic snapshot swap:
-    S-1  cache hit: _fetch_from_db NOT called when snapshot is fresh (< 30s)
-    S-2  force_refresh=True: _fetch_from_db called even when TTL has not expired
+    S-1  cache hit: _async_fetch_from_db NOT called when snapshot is fresh (< 30s)
+    S-2  force_refresh=True: _async_fetch_from_db called even when TTL has not expired
     S-3  DB error path: stale snapshot returned (no exception raised)
     S-4  DB error + empty snapshot: _DEFAULTS dict returned (no exception raised)
     S-5  successful fetch: snapshot atomically swapped and returned copy is correct
@@ -43,7 +43,12 @@ Covers five QA contracts:
 Design notes:
   - All Supabase env vars are stripped at module import time so
     signal_config_store runs in no-DB mode by default.
-  - _fetch_from_db is patched with AsyncMock for all DB-path tests.
+  - _async_fetch_from_db is patched with AsyncMock for all DB-path tests
+    (R-4 / S-1..S-5).  The module-level name get_signal_config is rebound
+    to async_get_signal_config at import time, which calls
+    async_reload_signal_config() → _async_fetch_from_db().  The sync
+    _fetch_from_db is NOT on this code path and must NOT be patched for
+    these tests.
   - _snapshot and _snapshot_ts are reset in setUp to prevent cross-test leakage.
   - asyncio.run() is used for all async calls (Python 3.10+ / 3.12 safe).
     This suite intentionally avoids pytest-asyncio; asyncio.run() is explicit
@@ -402,6 +407,14 @@ class TestGetSignalConfigCache:
     force_refresh=True, and never raise on DB errors.
 
     All DB calls are patched so no Supabase URL is required.
+
+    IMPORTANT — correct patch target:
+      The module-level name `get_signal_config` is rebound to
+      `async_get_signal_config` at import time.  That function calls
+      `async_reload_signal_config()` which calls `_async_fetch_from_db()`.
+      Tests must therefore patch `_async_fetch_from_db`, NOT the sync
+      `_fetch_from_db`.  Patching `_fetch_from_db` here has no effect on
+      the async code path and will silently produce wrong results.
     """
 
     def setup_method(self):
@@ -413,7 +426,7 @@ class TestGetSignalConfigCache:
         get_signal_config() must return the cached snapshot without hitting the DB.
 
         A fresh _snapshot_ts is simulated by setting it to time.monotonic()
-        (i.e. "just refreshed").  _fetch_from_db must not be called.
+        (i.e. "just refreshed").  _async_fetch_from_db must not be called.
 
         Implementation constraint: get_signal_config() MUST use time.monotonic()
         for its TTL comparison — not time.time(). This test sets _snapshot_ts
@@ -425,7 +438,7 @@ class TestGetSignalConfigCache:
         scs._snapshot_ts = time.monotonic()  # just refreshed — TTL not expired
 
         fetch_mock = AsyncMock(return_value=None)
-        with patch("services.signal_config_store._fetch_from_db", new=fetch_mock):
+        with patch("services.signal_config_store._async_fetch_from_db", new=fetch_mock):
             result = asyncio.run(scs.get_signal_config())
 
         fetch_mock.assert_not_called()
@@ -434,7 +447,7 @@ class TestGetSignalConfigCache:
 
     def test_s2_force_refresh_calls_fetch_from_db_despite_fresh_ttl(self):
         """
-        S-2: force_refresh=True must bypass the TTL and call _fetch_from_db
+        S-2: force_refresh=True must bypass the TTL and call _async_fetch_from_db
         even when the snapshot was loaded less than 30 seconds ago.
 
         Called from reload_signal_config() (admin PATCH endpoint, REARCH-008)
@@ -448,7 +461,7 @@ class TestGetSignalConfigCache:
         refreshed_snapshot["sig.min_dte"] = 7  # operator just changed this
 
         fetch_mock = AsyncMock(return_value=refreshed_snapshot)
-        with patch("services.signal_config_store._fetch_from_db", new=fetch_mock):
+        with patch("services.signal_config_store._async_fetch_from_db", new=fetch_mock):
             result = asyncio.run(scs.get_signal_config(force_refresh=True))
 
         fetch_mock.assert_called_once()
@@ -458,7 +471,7 @@ class TestGetSignalConfigCache:
 
     def test_s3_db_error_returns_stale_snapshot_without_raising(self):
         """
-        S-3: When _fetch_from_db returns None (network error / non-200 HTTP),
+        S-3: When _async_fetch_from_db returns None (network error / non-200 HTTP),
         get_signal_config() must return the current stale snapshot and must
         NOT raise an exception.
 
@@ -471,7 +484,7 @@ class TestGetSignalConfigCache:
         scs._snapshot_ts = 0.0  # TTL expired — forces a fetch attempt
 
         fetch_mock = AsyncMock(return_value=None)  # simulates DB error
-        with patch("services.signal_config_store._fetch_from_db", new=fetch_mock):
+        with patch("services.signal_config_store._async_fetch_from_db", new=fetch_mock):
             try:
                 result = asyncio.run(scs.get_signal_config())
             except Exception as exc:
@@ -487,7 +500,7 @@ class TestGetSignalConfigCache:
 
     def test_s4_db_error_with_empty_snapshot_returns_defaults(self):
         """
-        S-4: When _fetch_from_db returns None AND _snapshot is empty
+        S-4: When _async_fetch_from_db returns None AND _snapshot is empty
         (cold-start with no prior successful fetch), get_signal_config() must
         return _DEFAULTS without raising.
 
@@ -499,7 +512,7 @@ class TestGetSignalConfigCache:
         scs._snapshot_ts = 0.0
 
         fetch_mock = AsyncMock(return_value=None)
-        with patch("services.signal_config_store._fetch_from_db", new=fetch_mock):
+        with patch("services.signal_config_store._async_fetch_from_db", new=fetch_mock):
             try:
                 result = asyncio.run(scs.get_signal_config())
             except Exception as exc:
@@ -515,7 +528,7 @@ class TestGetSignalConfigCache:
 
     def test_s5_successful_fetch_atomically_swaps_snapshot(self):
         """
-        S-5: When _fetch_from_db returns a valid dict, get_signal_config() must:
+        S-5: When _async_fetch_from_db returns a valid dict, get_signal_config() must:
           1. Replace _snapshot with the new dict (atomic swap)
           2. Update _snapshot_ts to the current monotonic time
           3. Return a COPY of the new snapshot (not the internal reference)
@@ -531,7 +544,7 @@ class TestGetSignalConfigCache:
 
         fetch_mock = AsyncMock(return_value=updated_snapshot)
         before_ts = time.monotonic()
-        with patch("services.signal_config_store._fetch_from_db", new=fetch_mock):
+        with patch("services.signal_config_store._async_fetch_from_db", new=fetch_mock):
             result = asyncio.run(scs.get_signal_config())
         after_ts = time.monotonic()
 

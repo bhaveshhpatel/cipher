@@ -74,7 +74,7 @@ parser, chain cache, or registry sync.
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 
@@ -216,280 +216,452 @@ def _headers() -> dict:
     }
 
 
-def _cast(value: str, value_type: str) -> Any:
-    """Coerce a raw DB text value to the Python type declared in SIGNAL_CONFIG_TYPES."""
-    try:
-        if value_type == "int":
-            return int(float(value))
-        if value_type == "float":
-            return float(value)
-        if value_type == "bool":
-            return str(value).lower() in ("1", "true", "yes", "on")
-        return value
-    except (TypeError, ValueError):
-        return value
+def _cast(raw: str, type_str: str) -> Any:
+    """Cast a raw DB string value to the Python type indicated by *type_str*.
 
+    Parameters
+    ----------
+    raw : str
+        The raw string value from the DB (or any source).
+    type_str : str
+        One of "float", "int", "bool".  Any other value causes a raw
+        string passthrough (no exception raised).
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-async def get_signal_config(force_refresh: bool = False) -> dict[str, Any]:
+    Returns
+    -------
+    float | int | bool | str
+        The coerced value, or *raw* unchanged on unknown type_str or
+        unparseable numeric strings.
     """
-    Return a copy of the current signal config snapshot.
+    if type_str == "float":
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return raw
+    if type_str == "int":
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return raw
+    if type_str == "bool":
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    # Unknown type_str — passthrough
+    return raw
 
-    Uses a 30-second TTL cache.  Falls back to _DEFAULTS on DB error so the
-    Signal Engine always has a valid config to run against.
 
-    Callers on the hot path should prefer get_param() to avoid the overhead
-    of copying the full dict on every episode evaluation.
+def _fetch_from_db() -> Optional[dict[str, Any]]:
+    """
+    Fetch all rows from signal_config and return a typed dict.
+
+    Synchronous — used by the sync hot path (reload_signal_config, _maybe_refresh).
+    For async callers (router endpoints, async_reload_signal_config) use
+    _async_fetch_from_db() instead.
+
+    Returns None on any network or parse error so the caller can
+    distinguish a DB failure from an empty table.
+    Returns an empty dict if the table is reachable but has no rows.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.warning("[signal_config_store] SUPABASE_URL/KEY not set — using defaults")
+        return None
+
+    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key,value,value_type"
+    try:
+        resp = httpx.get(url, headers=_headers(), timeout=5.0)
+        resp.raise_for_status()
+        rows = resp.json()
+        return {
+            row["key"]: _cast(str(row["value"]), row.get("value_type", "float"))
+            for row in rows
+            if "key" in row and "value" in row
+        }
+    except Exception as exc:
+        log.error("[signal_config_store] DB fetch failed: %s", exc)
+        return None
+
+
+async def _async_fetch_from_db() -> Optional[dict[str, Any]]:
+    """
+    Async variant of _fetch_from_db() using httpx.AsyncClient.
+
+    Used by async_reload_signal_config() and any async caller that needs a
+    non-blocking DB read.  This is the correct function to mock in tests
+    that exercise the async reload path:
+
+        with patch(
+            "services.signal_config_store._async_fetch_from_db",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {"sig.min_dte": 10}
+            result = await async_reload_signal_config()
+
+    Returns None on any error (same contract as sync _fetch_from_db).
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.warning("[signal_config_store] SUPABASE_URL/KEY not set — using defaults")
+        return None
+
+    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key,value,value_type"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=_headers(), timeout=5.0)
+        resp.raise_for_status()
+        rows = resp.json()
+        return {
+            row["key"]: _cast(str(row["value"]), row.get("value_type", "float"))
+            for row in rows
+            if "key" in row and "value" in row
+        }
+    except Exception as exc:
+        log.error("[signal_config_store] async DB fetch failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Public module-level API — sync (used by signal engine hot path)
+# ---------------------------------------------------------------------------
+
+def reload_signal_config() -> dict[str, Any]:
+    """
+    Force an immediate DB refresh and atomically swap the snapshot.
+
+    Sync version — used by the signal engine hot path and startup.
+    For the async router version see async_reload_signal_config().
+
+    Returns the new snapshot dict (a copy — callers must not mutate it).
     """
     global _snapshot, _snapshot_ts
-
-    if not force_refresh and _snapshot and (time.monotonic() - _snapshot_ts) < _CACHE_TTL:
-        return dict(_snapshot)
-
-    refreshed = await _fetch_from_db()
-    if refreshed is not None:
-        _snapshot = refreshed          # atomic reference swap
-        _snapshot_ts = time.monotonic()
-        return dict(_snapshot)
-
-    # DB unreachable — return current snapshot (may be stale) or defaults
-    if _snapshot:
-        log.warning("[signal_config_store] DB unreachable — serving stale snapshot (age=%.0fs)",
-                    time.monotonic() - _snapshot_ts)
-        return dict(_snapshot)
-
-    log.warning("[signal_config_store] DB unreachable and no snapshot — using hardcoded defaults")
-    return dict(_DEFAULTS)
+    fetched = _fetch_from_db()
+    fresh = {**_DEFAULTS, **(fetched or {})}
+    _snapshot = fresh
+    _snapshot_ts = time.monotonic()
+    log.info("[signal_config_store] config reloaded (%d keys)", len(fresh))
+    return dict(fresh)
 
 
-async def reload_signal_config() -> dict[str, Any]:
+def _maybe_refresh() -> None:
+    """Refresh the snapshot if the TTL has expired."""
+    global _snapshot, _snapshot_ts
+    if time.monotonic() - _snapshot_ts >= _CACHE_TTL:
+        reload_signal_config()
+
+
+def get_signal_config() -> dict[str, Any]:
     """
-    Force an immediate DB refresh and atomic snapshot swap.
+    Return a copy of the current config snapshot (sync).
 
-    Called from the admin PATCH endpoint (REARCH-008) immediately after a
-    successful write so the Signal Engine picks up the change within milliseconds
-    rather than waiting up to 30s for the TTL to expire.
-
-    Returns the freshly-loaded config dict (or the current snapshot on DB error).
+    Triggers a DB refresh if the 30s TTL has expired.  Callers receive a
+    fresh copy and must not hold references across evaluation cycles.
     """
-    return await get_signal_config(force_refresh=True)
+    _maybe_refresh()
+    return dict(_snapshot)
 
 
 def get_param(key: str, default: Any = None) -> Any:
     """
-    Hot-path accessor — returns a single value from the current snapshot
-    without copying the full dict or touching the DB.
+    Hot-path accessor.  Returns the typed value for *key* from the current
+    snapshot, or *default* if the key is absent.
 
-    This is the function REARCH-006 calls on every episode evaluation.
-    Thread-safe under CPython GIL: dict reads are atomic for key lookups.
-
-    Args:
-        key:     A key from SIGNAL_CONFIG_TYPES (e.g. "sig.min_dte").
-        default: Returned if key is absent from the current snapshot.
-                 Callers should pass a typed literal so downstream code
-                 never receives None from a missing config row.
-
-    Returns:
-        The typed value from the current snapshot, or `default` if missing.
+    Never hits the DB directly — reads only from _snapshot.
     """
     return _snapshot.get(key, default)
 
 
 def get_effective_premium_threshold(alert_level_key: str, notional_tier: str) -> float:
     """
-    Return the tier-adjusted effective premium threshold for a given alert level.
+    Return the tier-adjusted dollar threshold for *alert_level_key*.
 
-    This is the primary REARCH-006 entry point for Dimension-1 evaluation.
-    It replaces raw get_param("sig.golden_sweep_premium") calls with a
-    tier-aware computation so the Signal Engine never needs to know about
-    the multiplier key naming convention.
+    Applies the PBE multiplier extension:
+        effective = base_threshold * tier_multiplier
 
-    Args:
-        alert_level_key:  One of "sig.golden_sweep_premium", "sig.block_premium",
-                          "sig.noteworthy_premium".
-        notional_tier:    Episode notional_tier value from flow_episodes:
-                          "tier1", "tier2", or "tier3".
+    Parameters
+    ----------
+    alert_level_key : str
+        One of the premium config keys, e.g. "sig.golden_sweep_premium".
+        Accepts both bare keys ("golden_sweep_premium") and prefixed keys
+        ("sig.golden_sweep_premium") for callers that use either convention.
+    notional_tier : str
+        One of "T1", "T2", "T3" / "tier1", "tier2", "tier3".
+        Unknown tier values fall back to the base (Tier-1) threshold.
 
-    Returns:
-        Effective float threshold = base * multiplier.
-        Falls back to the base threshold alone if tier is unrecognised,
-        so an unexpected notional_tier value never silently drops to zero.
-
-    Examples:
-        get_effective_premium_threshold("sig.golden_sweep_premium", "tier2")
-        -> 1_000_000.0 * 0.5 = 500_000.0
-
-        get_effective_premium_threshold("sig.block_premium", "tier3")
-        -> 500_000.0 * 0.2 = 100_000.0
-
-        get_effective_premium_threshold("sig.noteworthy_premium", "tier1")
-        -> 50_000.0 * 1.0 = 50_000.0  (base unchanged for Tier-1)
+    Returns
+    -------
+    float
+        The effective threshold.
+        Returns 0.0 if the base key is not in the snapshot or _DEFAULTS
+        (distinguishable sentinel — callers in REARCH-006 treat 0.0 as a
+        config error and skip the episode rather than crashing).
     """
-    base: float = _snapshot.get(alert_level_key, _DEFAULTS.get(alert_level_key, 0.0))
+    _maybe_refresh()
 
-    mult_key = _TIER_MULT_KEYS.get((alert_level_key, notional_tier))
+    # Normalise key — accept both "golden_sweep_premium" and "sig.golden_sweep_premium"
+    if not alert_level_key.startswith("sig."):
+        alert_level_key = f"sig.{alert_level_key}"
+
+    # Normalise tier — "T1"/"T2"/"T3" → "tier1"/"tier2"/"tier3"
+    tier_norm = notional_tier.strip().upper()
+    tier_map  = {"T1": "tier1", "T2": "tier2", "T3": "tier3",
+                 "TIER1": "tier1", "TIER2": "tier2", "TIER3": "tier3"}
+    tier_key  = tier_map.get(tier_norm, "tier1")
+
+    base = _snapshot.get(alert_level_key)
+    if base is None:
+        log.warning("[signal_config_store] base key %r not in snapshot", alert_level_key)
+        return 0.0  # T-5 contract: unknown key → 0.0 sentinel
+
+    # Unknown tier (not in _TIER_MULT_KEYS): fall back to base (T-4 contract)
+    if (alert_level_key, tier_key) not in _TIER_MULT_KEYS:
+        return float(base)
+
+    mult_key = _TIER_MULT_KEYS[(alert_level_key, tier_key)]
     if mult_key is None:
-        # Tier-1 path (no multiplier key) OR unrecognised tier — use base as-is.
-        if notional_tier not in ("tier1", "tier2", "tier3"):
-            log.warning(
-                "[signal_config_store] get_effective_premium_threshold: "
-                "unrecognised notional_tier=%r for key=%r — using base threshold %.0f",
-                notional_tier, alert_level_key, base,
-            )
-        return base
+        # Tier-1 — no multiplier, base IS the threshold
+        return float(base)
 
-    mult: float = _snapshot.get(mult_key, _DEFAULTS.get(mult_key, 1.0))
-    return base * mult
+    mult = _snapshot.get(mult_key)
+    if mult is None:
+        log.warning("[signal_config_store] multiplier key %r not in snapshot", mult_key)
+        return float(base)
+
+    return float(base) * float(mult)
 
 
-async def get_all_rows() -> list[dict]:
+def validate_signal_config() -> None:
     """
-    Return full rows (key, value, value_type, description, updated_at, updated_by)
-    for the admin Signal Strategy panel (REARCH-008).
+    Warn at startup for any expected DB keys that are absent from the snapshot.
+
+    Does not raise — missing keys fall back to _DEFAULTS so the pipeline
+    keeps running.  Operators should treat these warnings as configuration
+    drift alerts.
+    """
+    _maybe_refresh()
+    missing = _EXPECTED_DB_KEYS - set(_snapshot.keys())
+    if missing:
+        log.warning(
+            "[signal_config_store] %d expected key(s) missing from DB, using hardcoded defaults: %s",
+            len(missing),
+            sorted(missing),
+        )
+    else:
+        log.info("[signal_config_store] all %d signal config keys present", len(_EXPECTED_DB_KEYS))
+
+
+# ---------------------------------------------------------------------------
+# Async DB API — used by routers/signal_config.py (FastAPI async endpoints)
+#
+# These functions use httpx.AsyncClient so they do not block the event loop.
+# The sync hot path (signal engine, get_param) is unaffected.
+# ---------------------------------------------------------------------------
+
+async def get_all_rows() -> List[dict]:
+    """
+    Fetch all rows from the signal_config table with full metadata.
+
+    Returns a list of dicts with keys: key, value, value_type,
+    description, updated_at, updated_by.
+
+    Used by GET /admin/signal-config to return rich row metadata that the
+    snapshot dict alone does not carry (description, updated_at, updated_by).
+
+    Returns an empty list on any network or parse error so the router can
+    fall back to the in-process snapshot.
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.warning("[signal_config_store] get_all_rows: SUPABASE creds not set")
         return []
 
     url = (
         f"{_SUPABASE_URL}/rest/v1/{_TABLE}"
-        "?select=key,value,value_type,description,updated_at,updated_by&order=id.asc"
+        "?select=key,value,value_type,description,updated_at,updated_by"
+        "&order=key.asc"
     )
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url, headers=_headers())
-        if resp.status_code == 200:
-            return resp.json()
-        log.error("[signal_config_store] get_all_rows HTTP %d: %s",
-                  resp.status_code, resp.text[:200])
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=_headers(), timeout=5.0)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as exc:
-        log.error("[signal_config_store] get_all_rows error: %s", exc)
-    return []
+        log.error("[signal_config_store] get_all_rows failed: %s", exc)
+        return []
 
 
 async def update_signal_config(key: str, value: str, updated_by: str = "admin") -> bool:
     """
-    Update a single config key in the DB and immediately reload the snapshot.
+    Upsert a single signal config key in the DB.
 
-    Args:
-        key:        Must be a key present in SIGNAL_CONFIG_TYPES; caller is
-                    responsible for 422-validating unknown keys before calling.
-        value:      Raw string value (DB stores everything as text).
-        updated_by: Audit trail field; defaults to "admin".
+    Parameters
+    ----------
+    key : str
+        The config key to update (must exist in SIGNAL_CONFIG_TYPES).
+    value : str
+        The new value serialised as a string (type coercion is the
+        caller's responsibility — see routers/signal_config.py).
+    updated_by : str
+        Identity tag written to the updated_by column (default: "admin").
 
-    Returns:
-        True on success, False on any DB or network error.
+    Returns
+    -------
+    bool
+        True on success, False on any DB error.
     """
-    global _snapshot_ts
-
     if not _SUPABASE_URL or not _SUPABASE_KEY:
-        log.error("[signal_config_store] Cannot update — Supabase not configured")
+        log.error("[signal_config_store] update_signal_config: SUPABASE creds not set")
         return False
 
     url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?key=eq.{key}"
-    payload = {"value": str(value), "updated_by": updated_by}
-    headers = {**_headers(), "Prefer": "return=minimal"}
-
+    payload = {"value": value, "updated_by": updated_by}
+    headers = {
+        **_headers(),
+        "Prefer": "resolution=merge-duplicates,return=representation",
+    }
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(url, headers=headers, json=payload)
-        if resp.status_code in (200, 204):
-            _snapshot_ts = 0.0   # invalidate TTL so next get_signal_config() forces reload
-            log.info("[signal_config_store] Updated %s=%s by %s", key, value, updated_by)
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(url, headers=headers, json=payload, timeout=5.0)
+        if resp.status_code in (200, 201, 204):
+            log.info("[signal_config_store] updated %s = %s", key, value)
             return True
-        log.error("[signal_config_store] Update failed for %s: HTTP %d — %s",
-                  key, resp.status_code, resp.text[:200])
-    except Exception as exc:
-        log.error("[signal_config_store] Update error for %s: %s", key, exc)
-    return False
-
-
-async def validate_signal_config() -> list[str]:
-    """
-    Startup validator — checks that every key in _EXPECTED_DB_KEYS has a
-    corresponding row in the signal_config DB table.
-
-    Called from main.py lifespan on startup (non-blocking, non-fatal).
-    Returns a list of missing key names.  Logs WARNING for each missing key
-    so operators know which Signal Engine knobs are silently using defaults.
-
-    If Supabase is not configured (e.g. local dev without env vars), returns
-    [] immediately — nothing to validate.
-    """
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
-        return []
-
-    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url, headers=_headers())
-        if resp.status_code != 200:
-            log.warning(
-                "[signal_config_store] validate: DB fetch failed HTTP %d — skipping validation",
-                resp.status_code,
-            )
-            return []
-        db_keys = {row["key"] for row in resp.json() if row.get("key")}
-        missing = sorted(_EXPECTED_DB_KEYS - db_keys)
-        if missing:
-            for key in missing:
-                log.warning(
-                    "[signal_config_store] MISSING DB ROW: key='%s' default=%r "
-                    "— using hardcoded default.  Insert row into signal_config to enable "
-                    "live tuning without restart.",
-                    key,
-                    _DEFAULTS.get(key),
-                )
-        else:
-            log.info(
-                "[signal_config_store] All %d expected signal config keys present in DB",
-                len(_EXPECTED_DB_KEYS),
-            )
-        return missing
-    except Exception as exc:
-        log.warning("[signal_config_store] validate error (non-fatal): %s", exc)
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Internal DB fetch — separated so reload_signal_config() can call it cleanly
-# ---------------------------------------------------------------------------
-
-async def _fetch_from_db() -> Optional[dict[str, Any]]:
-    """
-    Fetch all rows from `signal_config`, cast values using SIGNAL_CONFIG_TYPES,
-    and return a new snapshot dict seeded with _DEFAULTS.
-
-    Returns None if Supabase is not configured or the request fails, so callers
-    can distinguish "no data" from an empty config.
-    """
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
-        log.warning("[signal_config_store] Supabase not configured — using defaults")
-        return None
-
-    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key,value,value_type"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url, headers=_headers())
-        if resp.status_code == 200:
-            rows = resp.json()
-            result = dict(_DEFAULTS)   # seed with defaults so missing rows never produce None
-            for row in rows:
-                key        = row.get("key", "")
-                raw_value  = row.get("value", "")
-                # Prefer SIGNAL_CONFIG_TYPES for the canonical type; fall back to
-                # the row's own value_type column so future ad-hoc keys still work.
-                value_type = SIGNAL_CONFIG_TYPES.get(key) or row.get("value_type", "float")
-                if key:
-                    result[key] = _cast(raw_value, value_type)
-            log.debug("[signal_config_store] Loaded %d signal config keys from DB", len(rows))
-            return result
-        log.warning(
-            "[signal_config_store] DB fetch failed: HTTP %d — keeping current snapshot",
-            resp.status_code,
+        log.error(
+            "[signal_config_store] update_signal_config %s status=%d body=%s",
+            key, resp.status_code, resp.text[:200],
         )
+        return False
     except Exception as exc:
-        log.warning("[signal_config_store] DB fetch error: %s — keeping current snapshot", exc)
-    return None
+        log.error("[signal_config_store] update_signal_config %s failed: %s", key, exc)
+        return False
+
+
+async def async_reload_signal_config() -> dict[str, Any]:
+    """
+    Async version of reload_signal_config().
+
+    Forces an immediate DB refresh using _async_fetch_from_db() (the correct
+    async variant using httpx.AsyncClient) and atomically swaps the snapshot.
+
+    To intercept this path in tests, mock _async_fetch_from_db:
+
+        with patch(
+            "services.signal_config_store._async_fetch_from_db",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {"sig.min_dte": 10}
+            result = await async_reload_signal_config()
+
+    Returns the new snapshot dict (a copy — callers must not mutate it).
+    """
+    global _snapshot, _snapshot_ts
+    fetched = await _async_fetch_from_db()
+    fresh = {**_DEFAULTS, **(fetched or {})}
+    _snapshot = fresh
+    _snapshot_ts = time.monotonic()
+    log.info("[signal_config_store] config reloaded async (%d keys)", len(fresh))
+    return dict(fresh)
+
+
+async def async_get_signal_config(force_refresh: bool = False) -> dict[str, Any]:
+    """
+    Async version of get_signal_config().
+
+    Returns the current snapshot, triggering an async refresh via
+    async_reload_signal_config() (which calls _async_fetch_from_db()) if
+    the TTL has expired OR if *force_refresh* is True.
+
+    Parameters
+    ----------
+    force_refresh : bool
+        When True, bypasses the TTL and forces an immediate DB fetch.
+        Used by the admin PATCH endpoint (REARCH-008) after a successful
+        write so operators see their change reflected immediately.
+    """
+    if force_refresh or (time.monotonic() - _snapshot_ts >= _CACHE_TTL):
+        await async_reload_signal_config()
+    return dict(_snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Re-export async versions under the names the router expects.
+#
+# routers/signal_config.py does:
+#   from services.signal_config_store import get_signal_config, reload_signal_config
+# and then awaits both.  We replace the sync module-level names with the
+# async coroutine functions here.  The sync hot path is preserved via the
+# _sync aliases below for any code that needs the blocking version.
+#
+# IMPORTANT: This must appear AFTER both the sync and async definitions.
+# ---------------------------------------------------------------------------
+
+# Keep sync originals accessible under explicit names for signal engine + tests
+get_signal_config_sync    = get_signal_config
+reload_signal_config_sync = reload_signal_config
+
+# Replace module-level names with async versions for router compatibility
+get_signal_config    = async_get_signal_config    # type: ignore[assignment]
+reload_signal_config = async_reload_signal_config  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# SignalConfigStore — class wrapper for dependency injection
+#
+# signal_engine.py (REARCH-006) uses constructor injection so tests can pass
+# a pre-seeded stub without touching the DB or the 30s TTL cache.
+#
+# This class is a thin facade over the module-level functional API above.
+# All state lives in the module-level _snapshot dict — the class itself is
+# stateless and instances are interchangeable.
+#
+# NOTE: get_all() delegates to get_signal_config_sync() (not the async
+# re-export) because SignalEngine.evaluate_episode() is a sync call.
+# ---------------------------------------------------------------------------
+
+class SignalConfigStore:
+    """
+    Thin class wrapper over the module-level signal config functions.
+
+    Exists solely so SignalEngine can accept a config_store via constructor
+    injection (enabling clean test stubs) while production code continues to
+    use the module-level singleton pattern via get_signal_config_store().
+
+    All methods delegate directly to the module-level functions — there is
+    no per-instance state.
+    """
+
+    def get_all(self) -> dict[str, Any]:
+        """Return a copy of the current config snapshot (sync, delegates to get_signal_config_sync())."""
+        return get_signal_config_sync()
+
+    def get_param(self, key: str, default: Any = None) -> Any:
+        """Hot-path single-key accessor (delegates to module-level get_param())."""
+        return get_param(key, default)
+
+    def get_effective_premium_threshold(
+        self, alert_level_key: str, notional_tier: str
+    ) -> float:
+        """
+        Tier-adjusted threshold accessor (delegates to module-level
+        get_effective_premium_threshold()).
+        """
+        return get_effective_premium_threshold(alert_level_key, notional_tier)
+
+    def reload(self) -> dict[str, Any]:
+        """Force a sync DB refresh (delegates to reload_signal_config_sync())."""
+        return reload_signal_config_sync()
+
+
+# ---------------------------------------------------------------------------
+# Module-level SignalConfigStore singleton
+# ---------------------------------------------------------------------------
+
+_store_singleton: Optional[SignalConfigStore] = None
+
+
+def get_signal_config_store() -> SignalConfigStore:
+    """
+    Return the module-level SignalConfigStore singleton.
+
+    Used by get_engine() in signal_engine.py to wire up the production
+    config store without constructing a new instance per evaluation cycle.
+    """
+    global _store_singleton
+    if _store_singleton is None:
+        _store_singleton = SignalConfigStore()
+        log.info("[signal_config_store] SignalConfigStore singleton initialised")
+    return _store_singleton

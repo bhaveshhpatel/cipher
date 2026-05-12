@@ -1,6 +1,22 @@
 """
 signal_store.py — Supabase DB writer for composite signals.
 
+Rearch-006 (2026-05-12):
+  - Imported get_engine from signal_engine.
+  - _bus_signal_listener now calls get_engine().evaluate_episode(ep) before
+    any DB write.  If result.passed is False, the episode is logged at INFO
+    and discarded — no signal_history row is written.
+  - _build_row() alert_level is now sourced from the EpisodeEvalResult
+    returned by the engine rather than being score-derived heuristically.
+    The engine is the single source of truth for alert level from this point.
+  - persist_composite_signal() gains an optional EpisodeEvalResult parameter
+    so callers that already have the eval result can pass it in and avoid a
+    second engine evaluation.
+  - Fix E-18/E-19: GATE FAIL / GATE PASS log lines used %,.0f which is
+    f-string/str.format syntax and raises ValueError in %-style logging.
+    Premium is now pre-formatted as an f-string and passed as %s, matching
+    the existing pattern in persist_composite_signal().
+
 Rearch-010 (2026-05-09) — schema purge pass 2:
   - Removed flow_score from _build_row() (column dropped in migration 024;
     was a write-only orphan — never read by any SELECT in any router or service).
@@ -90,6 +106,7 @@ from typing import Optional
 import httpx
 
 from core.async_bus import bus  # module-level import so patch('services.signal_store.bus') works
+from services.signal_engine import EpisodeEvalResult, get_engine
 
 log = logging.getLogger("signal_store")
 
@@ -302,27 +319,41 @@ def _coerce_to_dict(sig) -> dict:
         return {}
 
 
-def _build_row(sig, ep: Optional[dict] = None) -> dict:
+def _build_row(
+    sig,
+    ep: Optional[dict] = None,
+    eval_result: Optional[EpisodeEvalResult] = None,
+) -> dict:
+    """
+    Build the signal_history INSERT dict from a signal and episode.
+
+    REARCH-006: alert_level is now sourced from EpisodeEvalResult when
+    provided.  This makes the signal engine the single authority for alert
+    level — no more score-derived heuristics in the store layer.
+
+    Falls back to score-derived heuristic when eval_result is None so that
+    save_signal() (used by legacy callers and tests that bypass the bus) still
+    works without requiring an EpisodeEvalResult.
+    """
     sig = _coerce_to_dict(sig)
     episode = ep or {}
 
     score = sig.get("composite_score") or 0.0
 
-    # Derive alert_level from score, then validate through _normalise_alert_level
-    # to guard against out-of-constraint values from upstream or in-flight callers.
-    # Rearch-010: score branches updated to REARCH vocab (WATCH/NOTEWORTHY/BLOCK/GOLDEN).
-    # Note: GOLDEN cannot be score-derived — it requires all 5 Steamroom dimensions
-    # confirmed at the episode level. Score alone only gets up to BLOCK.
-    if sig.get("alert_level"):
+    # REARCH-006: prefer engine output; fall back to score heuristic for
+    # legacy/direct callers that don't go through the bus listener.
+    if eval_result is not None:
+        alert_level = eval_result.alert_level
+    elif sig.get("alert_level"):
         alert_level = _normalise_alert_level(sig["alert_level"])
     elif score >= 0.85:
-        alert_level = "BLOCK"       # rearch-010: was CONVICTION
+        alert_level = "BLOCK"
     elif score >= 0.70:
-        alert_level = "BLOCK"       # rearch-010: was WHALE; both map to BLOCK
+        alert_level = "BLOCK"
     elif score >= 0.55:
-        alert_level = "NOTEWORTHY"  # rearch-010: was INSTITUTIONAL
+        alert_level = "NOTEWORTHY"
     else:
-        alert_level = "WATCH"       # rearch-010: was LARGE
+        alert_level = "WATCH"
 
     ctype   = episode.get("contract_type") or sig.get("contract_type", "")
     raw_dir = episode.get("direction", sig.get("direction", ""))
@@ -426,18 +457,30 @@ async def get_recent_signals(ticker: Optional[str] = None, limit: int = 50) -> l
     return await get_signals(ticker=ticker, limit=limit)
 
 
-async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None:
+async def persist_composite_signal(
+    sig: dict,
+    ep: Optional[dict] = None,
+    eval_result: Optional[EpisodeEvalResult] = None,
+) -> None:
+    """
+    Persist a composite signal to signal_history.
+
+    REARCH-006: accepts an optional EpisodeEvalResult so that
+    _bus_signal_listener can pass the engine output through to _build_row()
+    without re-evaluating.  When eval_result is None the alert_level falls
+    back to the score-derived heuristic for backward compat.
+    """
     if not _is_configured():
         log.warning(
             "[signal_store] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set "
             "-- composite signal for %s stored in memory (not persisted to DB).",
             sig.get("ticker", "UNKNOWN"),
         )
-        row = _build_row(sig, ep)
+        row = _build_row(sig, ep, eval_result=eval_result)
         _store_in_memory(row)
         return
 
-    row = _build_row(sig, ep)
+    row = _build_row(sig, ep, eval_result=eval_result)
     ok  = await _insert_signal_with_retry(row)
     if ok:
         premium_val = row["premium"]
@@ -447,7 +490,7 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
             "%s | %s | dir=%s | score=%.3f | alert=%s | "
             "sentiment=%s | type=%s | premium=%s",
             row["ticker"], row["recommendation"], row["direction"],
-            row["composite_score"], row["alert_level"],
+            row["composite_score"] or 0.0, row["alert_level"],
             row["sentiment"], row["trade_type"], premium_fmt,
         )
     else:
@@ -458,8 +501,20 @@ async def persist_composite_signal(sig: dict, ep: Optional[dict] = None) -> None
 
 
 async def _bus_signal_listener() -> None:
+    """
+    Consume composite_signal events from the async bus.
+
+    REARCH-006: Every episode is evaluated by SignalEngine before the DB
+    write.  Episodes that fail any conviction dimension are logged and
+    discarded — no signal_history row is written.
+
+    Gate decision log format (INFO):
+      [signal_store] GATE PASS  AAPL | alert=BLOCK | premium=$650,000 | trades=3
+      [signal_store] GATE FAIL  AAPL | dims=[D2_ASK_SIDE, D5_REPETITION] | premium=$55,000
+    """
     q = bus.subscribe("signal_writer")
     log.info("[signal_store] signal writer subscribed to bus")
+    engine = get_engine()
     try:
         while True:
             msg = await q.get()
@@ -467,8 +522,34 @@ async def _bus_signal_listener() -> None:
                 data = msg.get("data", {})
                 sig  = data.get("signal", {})
                 ep   = data.get("episode", {})
-                if sig:
-                    await persist_composite_signal(sig, ep)
+                if not sig:
+                    continue
+
+                # REARCH-006: run conviction gate before any DB write
+                result = engine.evaluate_episode(ep)
+
+                if not result.passed:
+                    # Pre-format premium — %,.0f is f-string syntax, invalid in %-style logging
+                    premium_fmt = f"${result.premium:,.0f}"
+                    log.info(
+                        "[signal_store] GATE FAIL  %s | dims=%s | premium=%s",
+                        result.ticker or sig.get("ticker", "UNKNOWN"),
+                        result.failing_dimensions,
+                        premium_fmt,
+                    )
+                    continue
+
+                # Pre-format premium — %,.0f is f-string syntax, invalid in %-style logging
+                premium_fmt = f"${result.premium:,.0f}"
+                log.info(
+                    "[signal_store] GATE PASS  %s | alert=%s | premium=%s | trades=%d",
+                    result.ticker or sig.get("ticker", "UNKNOWN"),
+                    result.alert_level,
+                    premium_fmt,
+                    int(ep.get("trade_count") or 0),
+                )
+
+                await persist_composite_signal(sig, ep, eval_result=result)
     except asyncio.CancelledError:
         bus.unsubscribe("signal_writer", q)
         log.info("[signal_store] signal writer unsubscribed from bus")
