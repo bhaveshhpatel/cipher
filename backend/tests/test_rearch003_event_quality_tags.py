@@ -15,9 +15,9 @@ Covers:
   E11 persist_flow_event integration — all quality tag fields present in buffered row
   E12 REARCH-010 regression guard — purged columns absent from row dict
 
-PBE-1 note: classify_bid_ask() now returns Tuple[str, bool]. Tests that assert
-on the string label call the private _classify_bid_ask() shim which returns str.
-Tests that call classify_bid_ask() directly unpack the tuple.
+PBE-1 note: classify_bid_ask() returns Tuple[str, bool] (public API).
+_classify_bid_ask() is also the full Tuple[str, bool] implementation
+(not a str-only shim) — consistent with test_flow_and_stats.py contract.
 """
 import asyncio
 import os
@@ -114,6 +114,7 @@ class TestClassifyBidAsk:
 
     PBE-1: classify_bid_ask() returns Tuple[str, bool]. Each test unpacks
     the tuple and asserts on both components.
+    _classify_bid_ask() is the full implementation — also returns Tuple[str, bool].
     """
 
     def test_e1_ask_side_98pct_threshold(self):
@@ -174,11 +175,12 @@ class TestClassifyBidAsk:
         assert cls == "BID"
         assert is_ask is False
 
-    def test_private_shim_returns_str_only(self):
-        """PBE-1: _classify_bid_ask() private shim returns str, not tuple."""
-        result = fs._classify_bid_ask(5.20, bid=4.80, ask=5.20)
-        assert isinstance(result, str)
-        assert result == "ASK"
+    def test_private_shim_returns_tuple(self):
+        """FAS-SHIM: _classify_bid_ask() is the full implementation — returns Tuple[str, bool]."""
+        cls, is_ask = fs._classify_bid_ask(5.20, bid=4.80, ask=5.20)
+        assert isinstance(cls, str)
+        assert cls == "ASK"
+        assert is_ask is True
 
 
 # ---------------------------------------------------------------------------
