@@ -27,7 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build()`.
+  always doing a full rebuild after the first build()`.\
   Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
@@ -138,6 +138,21 @@ FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
   incremental build logged '765 tickers to refresh' then went silent.
   _build_complete never set → stream workers never spawned → no flow data
   processed during market hours.
+
+FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
+  and re-raises immediately instead of letting it propagate through
+  `async with sem:` as an unhandled future exception.
+
+  Root cause: when build_task is cancelled during lifespan shutdown,
+  asyncio.gather(*tasks, return_exceptions=True) inside build() injects
+  CancelledError into each _build_with_sem sub-coroutine. The sub-coroutines
+  are blocked on sem.acquire() at that point. With return_exceptions=True,
+  Python keeps each finished future alive but the owning coroutine is gone —
+  asyncio logs every one as '_GatheringFuture exception was never retrieved'.
+
+  Fix: explicit try/except asyncio.CancelledError inside _build_with_sem
+  re-raises the error so asyncio retires the future cleanly. No logic change —
+  the shutdown behaviour is identical; only the stderr noise is eliminated.
 """
 import asyncio
 import logging
@@ -379,6 +394,12 @@ class SymbolRegistry:
           asyncio.wait_for(timeout=180s). Both phases degrade gracefully
           on timeout (zero-price fallback / partial registry) and always
           set _build_complete=True so stream workers can spawn.
+
+        SHUTDOWN-CANCEL - clean CancelledError propagation:
+          _build_with_sem catches CancelledError and re-raises immediately
+          so asyncio can retire each gather future without logging it as
+          '_GatheringFuture exception was never retrieved'. No behaviour
+          change — only shutdown log noise is eliminated.
         """
         from services.symbols_loader import SymbolQuote
 
@@ -477,16 +498,22 @@ class SymbolRegistry:
 
             if tickers_to_refresh:
                 async def _build_with_sem(ticker):
-                    async with sem:
-                        ticker_price = prices.get(ticker, 0.0)
-                        await self._build_ticker(
-                            ticker,
-                            ticker_price,
-                            new_registry,
-                            new_oi_by_ticker,
-                            tier_params,
-                            zero_price_fallback=zero_price_fallback,
-                        )
+                    # SHUTDOWN-CANCEL: catch CancelledError and re-raise immediately
+                    # so asyncio can retire the gather future cleanly without logging
+                    # '_GatheringFuture exception was never retrieved' on shutdown.
+                    try:
+                        async with sem:
+                            ticker_price = prices.get(ticker, 0.0)
+                            await self._build_ticker(
+                                ticker,
+                                ticker_price,
+                                new_registry,
+                                new_oi_by_ticker,
+                                tier_params,
+                                zero_price_fallback=zero_price_fallback,
+                            )
+                    except asyncio.CancelledError:
+                        raise
 
                 tasks = [
                     _build_with_sem(ticker)
