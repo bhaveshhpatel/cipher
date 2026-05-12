@@ -22,9 +22,10 @@ omit =
     signals/ladder_detector.py
 
 [report]
-# Gate enforced here so it only fires on full-suite coverage report runs
-# (CI: coverage report after pytest --cov), not on targeted per-file runs.
-fail_under = 90
+# fail_under is NOT set here. The 90% gate is enforced in CI only via:
+#   coverage report --fail-under=90
+# run after the full test suite completes. Setting it here causes
+# pytest-cov to apply the gate on every targeted per-file invocation.
 exclude_lines =
     pragma: no cover
     def __repr__
