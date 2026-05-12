@@ -1,7 +1,7 @@
 """
 REARCH-004: Episode Quality Enrichment — test suite
 
-Covers three QA contracts:
+Covers four QA contracts:
 
   QA-1 — INSERT path seeds all four aggregate columns correctly:
     E-1  ask-side seed event → ask_side_count=1, ask_side_pct=1.0
@@ -19,6 +19,12 @@ Covers three QA contracts:
   QA-3 — ask_side_pct precision contract (NUMERIC(5,4)):
     E-8  ask_side_pct rounded to 4 decimal places
 
+  QA-4 — in-flight cache reflects merged state after every PATCH (stale-cache):
+    E-9  in-flight PATCH branch: cache entry updated with new ask_side_count
+         and trade_count after PATCH completes
+    E-10 DB-lookup PATCH branch: cache entry created/updated with merged
+         values after PATCH completes (cold-start re-population)
+
 Design notes:
   - All tests drive persist_flow_episode() directly with a signal_data dict.
   - _insert_rows_with_episode_id() and _lookup_open_episode() are patched so
@@ -31,6 +37,12 @@ PBE-1 NULL contract: pre-REARCH rows have NULL ask_side_count; the DB-lookup
 PATCH path uses COALESCE(NULL, 0) before incrementing. This is tested directly
 in E-7b: the existing row returned by _lookup_open_episode has ask_side_count=None
 and the resulting ask_side_pct must still be computed correctly.
+
+Stale-cache risk (QA-4): if _episode_in_flight is NOT updated after a PATCH,
+the next event in the same episode reads the old ask_side_count and trade_count
+from cache, computes a wrong ask_side_pct, and writes silent garbage to the DB.
+E-9 and E-10 guard this by inspecting _episode_in_flight[merge_key] immediately
+after persist_flow_episode() returns.
 
 FIX (REARCH-004 2026-05-12):
   Bug A — fs._stats does not exist; the module dict is fs._episode_stats.
@@ -62,8 +74,9 @@ FIX (REARCH-004 2026-05-12):
     Fix: add dte=3 to _make_signal_data; E-3 passes dte=3 → asserts '1-4'.
 
     E-4 was asserting 'notional_tier' == 'WHALE' — renamed to 'GOLDEN' in
-    REARCH-003 deliberation.  Default premium=5100.0 < $50k → 'WATCH'.
-    Fix: E-4 passes premium=500_000 (>= _NOTIONAL_GOLDEN=$500k) → asserts 'GOLDEN'.
+    REARCH-003 deliberation.  Production ignores signal_data['notional_tier']
+    and recomputes from signal_data['premium']; default premium=5100.0 < $50k
+    → 'WATCH'.  Fix: supply premium=500_000 (>= _NOTIONAL_GOLDEN=$500k) → asserts 'GOLDEN'.
 """
 import asyncio
 import os
@@ -120,6 +133,20 @@ def _make_signal_data(
         "signal_ts":     "2026-05-12T00:00:00+00:00",
         "occ_symbol":    "AAPL260620C00150000",
     }
+
+
+def _make_merge_key(signal_data: dict) -> str:
+    """Build the episode merge key matching flow_store._episode_key() exactly.
+
+    _episode_key() format: "{ticker}|{direction}|{contract_type}|{strike}|{expiry}"
+    Using "|" separators — see Bug C in the module docstring.
+    Centralised here so all helpers and tests use the identical key format.
+    """
+    return (
+        f"{signal_data['ticker']}|{signal_data['direction']}|"
+        f"{signal_data['contract_type']}|{signal_data['strike']}|"
+        f"{signal_data['expiry']}"
+    )
 
 
 def _run_episode(
@@ -203,12 +230,7 @@ def _run_episode_patch(signal_data: dict, in_flight_episode: dict) -> dict:
     fs._episode_stats["created_episodes"] = 0
     fs._episode_stats["merged_episodes"]  = 0
 
-    # Mirror _episode_key() exactly: "|" separators.
-    merge_key = (
-        f"{signal_data['ticker']}|{signal_data['direction']}|"
-        f"{signal_data['contract_type']}|{signal_data['strike']}|"
-        f"{signal_data['expiry']}"
-    )
+    merge_key = _make_merge_key(signal_data)
     fs._episode_in_flight[merge_key] = in_flight_episode
 
     captured_patch: dict = {}
@@ -240,6 +262,61 @@ def _run_episode_patch(signal_data: dict, in_flight_episode: dict) -> dict:
 
     asyncio.run(_run())
     return captured_patch
+
+
+def _run_episode_patch_with_cache(
+    signal_data: dict,
+    in_flight_episode: dict,
+) -> tuple[dict, dict | None]:
+    """
+    Drive persist_flow_episode() for an in-flight PATCH and return
+    (patch_payload, cache_entry_after) where cache_entry_after is the value
+    of _episode_in_flight[merge_key] immediately after the call completes.
+
+    Used by QA-4 / E-9 to assert that the in-flight cache is updated with
+    the merged aggregate values — not left stale at the pre-PATCH seed values.
+
+    Returns (patch_payload, None) if the merge key is absent from the cache
+    after the call (which itself is a QA-4 failure — see E-9 assertion).
+    """
+    fs._episode_in_flight.clear()
+    fs._episode_locks.clear()
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
+
+    merge_key = _make_merge_key(signal_data)
+    fs._episode_in_flight[merge_key] = in_flight_episode
+
+    captured_patch: dict = {}
+
+    async def _fake_patch(url, **kwargs):
+        captured_patch.update(kwargs.get("json", {}))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        return mock_resp
+
+    async def _run():
+        with patch(
+            "services.flow_store._lookup_open_episode",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "services.flow_store._insert_rows_with_episode_id",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "services.flow_store._async_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "httpx.AsyncClient.patch",
+            new=AsyncMock(side_effect=_fake_patch),
+        ), patch(
+            "services.flow_store._is_configured",
+            return_value=True,
+        ):
+            await fs.persist_flow_episode(signal_data)
+
+    asyncio.run(_run())
+    cache_entry = fs._episode_in_flight.get(merge_key)
+    return captured_patch, cache_entry
 
 
 def _run_episode_db_lookup_patch(signal_data: dict, existing_db_row: dict) -> dict:
@@ -295,6 +372,60 @@ def _run_episode_db_lookup_patch(signal_data: dict, existing_db_row: dict) -> di
 
     asyncio.run(_run())
     return captured_patch
+
+
+def _run_episode_db_lookup_patch_with_cache(
+    signal_data: dict,
+    existing_db_row: dict,
+) -> tuple[dict, dict | None]:
+    """
+    Drive persist_flow_episode() for the DB-lookup PATCH path and return
+    (patch_payload, cache_entry_after) where cache_entry_after is the value
+    of _episode_in_flight[merge_key] immediately after the call completes.
+
+    Used by QA-4 / E-10 to assert that the in-flight cache is populated after
+    a DB-lookup PATCH (cold-start re-population contract): if the cache is NOT
+    written here, the very next event for this episode will miss the cache,
+    hit _lookup_open_episode() again, and race against the PATCH just issued.
+
+    Returns (patch_payload, None) if the merge key is absent from the cache
+    after the call (which itself is a QA-4 failure — see E-10 assertion).
+    """
+    fs._episode_in_flight.clear()
+    fs._episode_locks.clear()
+    fs._episode_stats["created_episodes"] = 0
+    fs._episode_stats["merged_episodes"]  = 0
+
+    captured_patch: dict = {}
+
+    async def _fake_patch(url, **kwargs):
+        captured_patch.update(kwargs.get("json", {}))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        return mock_resp
+
+    async def _run():
+        with patch(
+            "services.flow_store._lookup_open_episode",
+            new=AsyncMock(return_value=existing_db_row),
+        ), patch(
+            "services.flow_store._insert_rows_with_episode_id",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "services.flow_store._async_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "httpx.AsyncClient.patch",
+            new=AsyncMock(side_effect=_fake_patch),
+        ), patch(
+            "services.flow_store._is_configured",
+            return_value=True,
+        ):
+            await fs.persist_flow_episode(signal_data)
+
+    asyncio.run(_run())
+    cache_entry = fs._episode_in_flight.get(_make_merge_key(signal_data))
+    return captured_patch, cache_entry
 
 
 # ---------------------------------------------------------------------------
@@ -559,4 +690,151 @@ class TestAskSidePctPrecision:
         assert decimal_digits <= 4, (
             f"ask_side_pct has {decimal_digits} decimal digits — exceeds NUMERIC(5,4) precision. "
             f"Value: {pct!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# QA-4: in-flight cache reflects merged state after PATCH (E-9, E-10)
+# ---------------------------------------------------------------------------
+
+class TestInFlightCacheStateAfterPatch:
+    """
+    QA-4: _episode_in_flight must be updated with the merged aggregate values
+    after every successful PATCH — on both the in-flight branch and the
+    DB-lookup branch.
+
+    Stale-cache risk: if the cache is NOT updated after a PATCH, the very next
+    event in the same episode reads the old ask_side_count and trade_count,
+    recomputes ask_side_pct against stale totals, and writes silent garbage to
+    the DB.  This is a data-corruption path with no error signal — it silently
+    produces wrong percentages for high-frequency episodes with many events.
+
+    Two sub-contracts:
+
+      E-9  — in-flight PATCH branch (cache hit scenario):
+             Cache entry for the episode must be updated with the new
+             ask_side_count and trade_count AFTER the PATCH completes.
+             Specifically: cache[ask_side_count] must equal the merged count,
+             not the pre-PATCH seed value.
+
+      E-10 — DB-lookup PATCH branch (cold-start / cache-miss scenario):
+             Cache was empty before the call. After the DB-lookup PATCH
+             completes, _episode_in_flight[merge_key] must be populated so
+             the next event in this episode finds it in cache and does not
+             hit _lookup_open_episode() again (avoids redundant DB round-trips
+             and the race condition of two concurrent PATCHes on the same row).
+    """
+
+    def test_e9_in_flight_cache_updated_after_in_flight_patch(self):
+        """
+        E-9: After a successful in-flight PATCH, the cache entry for the
+        episode must reflect the merged ask_side_count and trade_count, not
+        the stale pre-PATCH values.
+
+        Setup:
+          - In-flight seed: trade_count=2, ask_side_count=1 (1 ask / 2 total)
+          - Incoming event: is_ask_side=True (ask-side)
+          - Expected post-PATCH cache: ask_side_count=2, trade_count=3
+
+        If the cache still shows ask_side_count=1 and trade_count=2 after the
+        call, the next event will compute ask_side_pct=2/4=0.5 instead of the
+        correct 3/4=0.75 — silent data corruption.
+        """
+        in_flight_seed = {
+            "id":             999,
+            "trade_count":    2,
+            "total_premium":  10200.0,
+            "ask_side_count": 1,   # 1 ask-side out of 2 so far
+        }
+        sd = _make_signal_data(is_ask_side=True)  # third event, ask-side
+        patch_payload, cache_entry = _run_episode_patch_with_cache(
+            sd, in_flight_episode=in_flight_seed
+        )
+
+        merge_key = _make_merge_key(sd)
+
+        # Cache entry must exist after the PATCH
+        assert cache_entry is not None, (
+            f"QA-4 / E-9: _episode_in_flight['{merge_key}'] is None after in-flight PATCH — "
+            f"stale-cache risk: next event will re-seed instead of merge."
+        )
+
+        # ask_side_count must be the merged value (seed 1 + this ask-side event = 2)
+        cached_ask_count = cache_entry.get("ask_side_count")
+        assert cached_ask_count == 2, (
+            f"QA-4 / E-9 stale-cache: expected cache ask_side_count=2 after merging "
+            f"ask-side event into seed (ask_side_count=1), got {cached_ask_count!r}. "
+            f"Next event would compute pct against stale count."
+        )
+
+        # trade_count must be the merged value (seed 2 + this event = 3)
+        cached_trade_count = cache_entry.get("trade_count")
+        assert cached_trade_count == 3, (
+            f"QA-4 / E-9 stale-cache: expected cache trade_count=3 after merging "
+            f"event into seed (trade_count=2), got {cached_trade_count!r}. "
+            f"Next event would divide by stale denominator."
+        )
+
+        # Sanity: PATCH payload must also reflect the merged values
+        assert patch_payload.get("ask_side_count") == 2, (
+            f"PATCH payload ask_side_count should also be 2, "
+            f"got {patch_payload.get('ask_side_count')!r}"
+        )
+
+    def test_e10_in_flight_cache_populated_after_db_lookup_patch(self):
+        """
+        E-10: After a successful DB-lookup PATCH (cold-start path), the
+        in-flight cache must be populated with the merged values for this
+        episode so the next event finds it in cache.
+
+        Setup:
+          - Cache empty before call (cold-start)
+          - DB row returned: trade_count=4, ask_side_count=2 (2 ask / 4 total)
+          - Incoming event: is_ask_side=True (ask-side)
+          - Expected post-PATCH cache: ask_side_count=3, trade_count=5
+
+        If the cache is NOT populated after this call, the next event will:
+          1. Miss the cache again
+          2. Call _lookup_open_episode() again (redundant DB round-trip)
+          3. Potentially race with the PATCH just issued (concurrent PATCH
+             on the same row with stale base values)
+        """
+        existing_db_row = {
+            "id":              777,
+            "trade_count":     4,
+            "total_premium":   20400.0,
+            "ask_side_count":  2,   # 2 ask-side out of 4 so far
+        }
+        sd = _make_signal_data(is_ask_side=True)  # fifth event, ask-side
+        patch_payload, cache_entry = _run_episode_db_lookup_patch_with_cache(
+            sd, existing_db_row=existing_db_row
+        )
+
+        merge_key = _make_merge_key(sd)
+
+        # Cache entry must be created after the DB-lookup PATCH
+        assert cache_entry is not None, (
+            f"QA-4 / E-10: _episode_in_flight['{merge_key}'] is None after DB-lookup PATCH — "
+            f"cold-start re-population failed: next event will hit DB again and risk "
+            f"a concurrent PATCH race on the same episode row."
+        )
+
+        # ask_side_count must be the merged value (DB 2 + this ask-side event = 3)
+        cached_ask_count = cache_entry.get("ask_side_count")
+        assert cached_ask_count == 3, (
+            f"QA-4 / E-10 stale-cache: expected cache ask_side_count=3 after merging "
+            f"ask-side event into DB row (ask_side_count=2), got {cached_ask_count!r}."
+        )
+
+        # trade_count must be the merged value (DB 4 + this event = 5)
+        cached_trade_count = cache_entry.get("trade_count")
+        assert cached_trade_count == 5, (
+            f"QA-4 / E-10 stale-cache: expected cache trade_count=5 after merging "
+            f"event into DB row (trade_count=4), got {cached_trade_count!r}."
+        )
+
+        # Sanity: PATCH payload must also reflect the merged values
+        assert patch_payload.get("ask_side_count") == 3, (
+            f"PATCH payload ask_side_count should also be 3, "
+            f"got {patch_payload.get('ask_side_count')!r}"
         )
