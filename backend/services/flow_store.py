@@ -168,6 +168,12 @@ Bug fixes applied:
       Fix: _classify_bid_ask() returns the full Tuple[str, bool] — identical
       to classify_bid_ask(). There is no test_private_shim_returns_str_only
       in the live test suite; the docstring reference was historical only.
+  21. IMPORT-HOIST (2026-05-11): lazy inline imports of get_contract_vol_oi,
+      _compute_dte_bucket, and _compute_notional_tier moved from inside
+      persist_flow_event() / persist_flow_episode() to top-level module
+      imports. Inline imports inside hot-path async functions re-run the
+      module lookup on every call. Hoisting removes per-call overhead and
+      makes the dependency graph explicit.
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -195,6 +201,8 @@ from urllib.parse import quote
 import httpx
 
 from core.async_bus import bus  # module-level import so patch('services.flow_store.bus') works
+from services.chain_store import get_contract_vol_oi
+from ingestion.processor import _compute_dte_bucket, _compute_notional_tier
 
 log = logging.getLogger("flow_store")
 
@@ -613,7 +621,6 @@ async def persist_flow_event(ev_dict: dict):
     contract_oi: Optional[int] = None
     if occ_symbol:
         try:
-            from services.chain_store import get_contract_vol_oi
             contract_volume_snapshot, contract_oi = get_contract_vol_oi(occ_symbol)
         except Exception:
             pass
@@ -639,7 +646,6 @@ async def persist_flow_event(ev_dict: dict):
 
     normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
 
-    from ingestion.processor import _compute_dte_bucket, _compute_notional_tier
     dte_bucket    = _compute_dte_bucket(dte)
     notional_tier = _compute_notional_tier(premium)
 
@@ -878,7 +884,6 @@ async def persist_flow_episode(signal_data: dict) -> None:
     contract_volume_at_close: Optional[int] = None
     vol_snapshot: Optional[int] = None
     try:
-        from services.chain_store import get_contract_vol_oi
         occ_symbol = f"{ticker}{expiry}{contract_type[0].upper()}{int(strike * 1000):08d}"
         vol_snapshot, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
         contract_volume_at_close = vol_snapshot
