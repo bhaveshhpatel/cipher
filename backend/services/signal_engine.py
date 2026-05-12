@@ -121,7 +121,7 @@ class EpisodeEvalResult:
                         Empty list when passed=True.
     effective_threshold The tier-adjusted dollar threshold that was applied for
                         the Dimension-1 gate (useful for logging / backtest).
-    premium             Raw total_premium from the episode (for caller logging).
+    premium             Raw total_premium from the episode (for caller logging)
     ticker              Episode ticker (for caller logging).
     """
     passed:               bool
@@ -290,6 +290,10 @@ class SignalEngine:
         Thresholds are fetched from signal_config via get_effective_premium_threshold()
         which applies the T2/T3 multipliers from migration 031.
 
+        A threshold of None or 0 is treated as unset / disabled and skipped —
+        a zero threshold would always match (premium >= 0) and prevent the
+        WATCH fallthrough from ever being reached.
+
         WATCH is the fallback for episodes that cleared the D1 noteworthy_threshold
         gate via the lower watch_floor (noteworthy_threshold * _WATCH_FLOOR_FACTOR)
         but are below the NOTEWORTHY threshold band.
@@ -300,12 +304,12 @@ class SignalEngine:
             ("NOTEWORTHY",  _CFG_NOTEWORTHY_PREMIUM),
         ):
             threshold = self._cfg.get_effective_premium_threshold(cfg_key, tier)
-            if threshold is None:
+            if not threshold:  # None or 0 — treat as disabled/unset, skip
                 continue
             if premium >= threshold:
                 return level_key
 
-        # Premium is in [watch_floor, noteworthy_threshold) — WATCH band.
+        # Premium cleared no named band — resolve to WATCH.
         return "WATCH"
 
 
