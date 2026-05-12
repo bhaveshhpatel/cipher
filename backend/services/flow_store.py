@@ -136,6 +136,20 @@ Bug fixes applied:
       When None (production/main.py zero-arg call), falls back to
       get_accumulator(). This restores test compatibility broken by FS-HANG
       fix which dropped the parameter entirely.
+  18. ING-009-EXTRACT (2026-05-11): extracted _insert_rows_with_episode_id()
+      from the inlined INSERT block inside persist_flow_episode().
+      Tests in test_ing009_episode_upsert.py patch
+      fs._insert_rows_with_episode_id — the function did not exist as a
+      standalone module attribute, causing AttributeError on every INSERT-path
+      test (E-1, E-4 through E-9, E-11 through E-13, E-15 through E-16).
+      The new function:
+        - POSTs with Prefer: return=representation
+        - Stores the PostgREST-returned id in _episode_in_flight if present
+        - Returns True on HTTP 200/201, False otherwise
+      persist_flow_episode increments created_episodes after the call returns
+      True (counter stays at the call site so mocking the helper still
+      triggers the counter correctly — E-1 asserts created_episodes == 1
+      after patching _insert_rows_with_episode_id to return True).
 
 PRE-MERGE BLOCKER FIXES (2026-05-04):
   SA-F1: start_lookback_worker() was calling
@@ -734,6 +748,73 @@ async def _lookup_open_episode(
         return None
 
 
+async def _insert_rows_with_episode_id(
+    table: str,
+    row: dict,
+    key: str,
+    premium: float,
+    current_oi: Optional[int] = None,
+) -> bool:
+    """
+    ING-009-EXTRACT: POST a single episode row to *table* with
+    Prefer: return=representation so PostgREST echoes back the generated id.
+
+    On success:
+      - If the response body contains an id field, populate _episode_in_flight
+        so concurrent waiters for the same key can PATCH without a DB round-trip.
+      - If the response body has no id (e.g. return=minimal fallback from an
+        older PostgREST version), _episode_in_flight is NOT populated — the
+        next waiter safely falls back to _lookup_open_episode (E-16 safe path).
+
+    Returns True on HTTP 200/201, False otherwise.
+
+    NOTE: Does NOT increment _episode_stats["created_episodes"] — that counter
+    lives in persist_flow_episode() so patching this function in tests still
+    triggers the counter correctly (E-1 asserts created_episodes == 1 after
+    mocking _insert_rows_with_episode_id to return True).
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return False
+
+    insert_headers = {**_headers(), "Prefer": "return=representation"}
+    url = f"{_SUPABASE_URL}/rest/v1/{table}"
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers=insert_headers, json=row)
+
+        if resp.status_code in (200, 201):
+            try:
+                row_data = resp.json()
+                # PostgREST may return a list or a single object depending on version.
+                row_obj = row_data[0] if isinstance(row_data, list) else row_data
+                if row_obj and "id" in row_obj:
+                    _set_episode_in_flight(key, row_obj["id"], row.get("trade_count") or 1, premium)
+                    log.debug(
+                        f"[flow_store] episode INSERT id={row_obj['id']} cached in-flight: {key}"
+                    )
+                else:
+                    log.debug(
+                        f"[flow_store] episode INSERT: no id in response body for {key} "
+                        f"— in-flight not populated (safe fallback)"
+                    )
+            except Exception as parse_exc:
+                log.debug(
+                    f"[flow_store] episode INSERT: response parse error for {key}: {parse_exc}"
+                )
+            return True
+
+        log.warning(
+            f"[flow_store] _insert_rows_with_episode_id failed: "
+            f"{resp.status_code} -- {resp.text[:200]}"
+        )
+        return False
+
+    except Exception as e:
+        log.error(f"[flow_store] _insert_rows_with_episode_id exception: {e}")
+        return False
+
+
 async def persist_flow_episode(signal_data: dict) -> None:
     """
     ING-009: Upsert a flow_episodes row for the given contract.
@@ -858,6 +939,10 @@ async def persist_flow_episode(signal_data: dict) -> None:
             except Exception as e:
                 log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
         else:
+            # ING-009-EXTRACT: INSERT path delegated to _insert_rows_with_episode_id.
+            # That function handles the HTTP POST, id-caching, and in-flight population.
+            # created_episodes counter stays here so patching the helper in tests
+            # still triggers the counter (E-1: mock returns True → counter == 1).
             insert_payload = {
                 "ticker":                   ticker,
                 "direction":                direction,
@@ -874,37 +959,14 @@ async def persist_flow_episode(signal_data: dict) -> None:
             if is_multi_day_repeat is not None:
                 insert_payload["is_multi_day_repeat"] = is_multi_day_repeat
 
-            insert_headers = {**_headers(), "Prefer": "return=representation"}
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    # FS-035: pass insert_payload as a dict (not a list) so the test
-                    # can read call_kwargs.kwargs["json"]["ticker"] without a list unwrap.
-                    # Response unwrap handles both dict and list shapes from PostgREST.
-                    resp = await client.post(
-                        f"{_SUPABASE_URL}/rest/v1/flow_episodes",
-                        headers=insert_headers,
-                        json=insert_payload,
-                    )
-                if resp.status_code in (200, 201):
-                    row_data = resp.json()
-                    # PostgREST may return a list or a single object depending on version.
-                    row_obj = row_data[0] if isinstance(row_data, list) else row_data
-                    if row_obj:
-                        new_id = row_obj["id"]
-                        _set_episode_in_flight(key, new_id, 1, premium)
-                        _episode_stats["created_episodes"] += 1
-                        log.debug(f"[flow_store] episode created: {key} id={new_id}")
-                    else:
-                        log.warning(
-                            f"[flow_store] episode INSERT returned empty body for {key}"
-                        )
-                else:
-                    log.warning(
-                        f"[flow_store] episode INSERT failed: "
-                        f"{resp.status_code} -- {resp.text[:200]}"
-                    )
-            except Exception as e:
-                log.error(f"[flow_store] persist_flow_episode INSERT exception: {e}")
+            ok = await _insert_rows_with_episode_id(
+                "flow_episodes", insert_payload, key, premium, contract_oi_at_open
+            )
+            if ok:
+                _episode_stats["created_episodes"] += 1
+                log.debug(f"[flow_store] episode created: {key}")
+            else:
+                log.warning(f"[flow_store] episode INSERT failed for {key}")
 
 
 async def _update_episode_multiday(
