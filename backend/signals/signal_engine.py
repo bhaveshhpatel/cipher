@@ -31,6 +31,12 @@
 #                      path was causing D2–D5 failures to be silently absorbed
 #                      when 3+ other gates passed (score=4 >= floor=3).
 #                      evaluate_episode() inherits the fix transparently.
+#              Fix 5:  Expose get_effective_premium_threshold at module level
+#                      so unittest.mock.patch("signals.signal_engine.
+#                      get_effective_premium_threshold") resolves correctly.
+#                      Previously only imported as the private alias
+#                      _global_get_effective_premium_threshold, which caused
+#                      AttributeError in TestBuildSignalRowRecommendationWiring.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -52,6 +58,11 @@ from services.signal_config_store import (
     get_param,
     get_effective_premium_threshold as _global_get_effective_premium_threshold,
 )
+
+# Public module-level alias so patch("signals.signal_engine.get_effective_premium_threshold")
+# resolves correctly in unit tests.  The engine internals still call
+# _global_get_effective_premium_threshold directly (unchanged behaviour).
+get_effective_premium_threshold = _global_get_effective_premium_threshold
 
 log = logging.getLogger("signal_engine")
 
