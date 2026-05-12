@@ -45,6 +45,21 @@
 #                      — SignalEngine._eval_gate_1 handles the premium hard gate
 #                      separately.  compute_conviction_score is the pure 0-5
 #                      additive score for recommendation derivation only.
+#              Fix 7:  build_signal_row signal_ts: accept str passthrough.
+#                      When signal_ts is already a str, write it verbatim.
+#                      Only call .isoformat() when it is a datetime instance.
+#                      Fixes AttributeError: 'str' object has no attribute
+#                      'isoformat' in test_build_signal_row_explicit_signal_ts_preserved.
+#              Fix 8:  _derive_recommendation: drop ask_side_confirmed 3rd
+#                      param — test contract is (score, direction) only.
+#                      Remap vocab to match test expectations:
+#                        score==5 + BULLISH  -> STRONG_BUY
+#                        score==5 + BEARISH  -> STRONG_SELL
+#                        score>=3 + BULLISH  -> BUY_CALLS
+#                        score>=3 + BEARISH  -> BUY_PUTS
+#                        else                -> WATCH / NO_ACTION
+#                      build_signal_row internal call updated accordingly.
+#                      STRONG_BUY / STRONG_SELL added to _VALID_RECOMMENDATIONS.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -127,6 +142,8 @@ _VALID_DIRECTIONS:   frozenset[str] = frozenset({"BULLISH", "BEARISH", "NEUTRAL"
 # Chunk 5 — recommendation enum vocab
 # ---------------------------------------------------------------------------
 
+_RECOMMENDATION_STRONG_BUY   = "STRONG_BUY"
+_RECOMMENDATION_STRONG_SELL  = "STRONG_SELL"
 _RECOMMENDATION_BUY_CALLS    = "BUY_CALLS"
 _RECOMMENDATION_BUY_PUTS     = "BUY_PUTS"
 _RECOMMENDATION_FOLLOW_SWEEP = "FOLLOW_SWEEP"
@@ -134,6 +151,8 @@ _RECOMMENDATION_WATCH        = "WATCH"
 _RECOMMENDATION_NO_ACTION    = "NO_ACTION"
 
 _VALID_RECOMMENDATIONS: frozenset[str] = frozenset({
+    _RECOMMENDATION_STRONG_BUY,
+    _RECOMMENDATION_STRONG_SELL,
     _RECOMMENDATION_BUY_CALLS,
     _RECOMMENDATION_BUY_PUTS,
     _RECOMMENDATION_FOLLOW_SWEEP,
@@ -628,11 +647,11 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     Dimension mapping
     -----------------
-    D1 — Ask-side execution dominance  (ask_side_pct >= floor; None → 0)
-    D2 — Volume > Open Interest        (vol_oi_signal is True)
-    D3 — Qualifying notional tier      (notional_tier in NOTEWORTHY/BLOCK/GOLDEN)
-    D4 — DTE in signal window          (dte_bucket not in 0-7 or 90+, and not None)
-    D5 — Repetition / clustering       (trade_count >= min_trade_count)
+    D1 — Raw premium meets watch-band floor  (total_premium >= noteworthy * 0.5)
+    D2 — Ask-side execution dominance        (ask_side_pct >= floor; None → 0)
+    D3 — Volume > Open Interest              (vol_oi_signal is True)
+    D4 — DTE in signal window                (dte_bucket not in 0-7 or 90+, and not None)
+    D5 — Repetition / clustering             (trade_count >= min_trade_count)
     """
     def _get(key: str, default):
         try:
@@ -647,20 +666,23 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     score = 0
 
-    # D1 — Ask-side execution dominance
+    # D1 — Raw premium meets watch-band floor (noteworthy_premium * 0.5)
+    noteworthy: float = float(_get("noteworthy_premium", _get("sig.noteworthy_premium", 50_000.0)))
+    watch_floor: float = noteworthy * _WATCH_FLOOR_FACTOR
+    raw_premium = getattr(episode, "total_premium", None)
+    premium: float = float(raw_premium) if raw_premium is not None else 0.0
+    if premium >= watch_floor:
+        score += 1
+
+    # D2 — Ask-side execution dominance
     # None means the field is absent — no point awarded (graceful degrade).
     ask_pct: float | None = getattr(episode, "ask_side_pct", None)
     floor: float = float(_get("ask_side_pct_floor", _get("sig.ask_side_pct_floor", 0.6)))
     if ask_pct is not None and ask_pct >= floor:
         score += 1
 
-    # D2 — Volume > Open Interest
+    # D3 — Volume > Open Interest
     if getattr(episode, "vol_oi_signal", False):
-        score += 1
-
-    # D3 — Qualifying notional tier (NOTEWORTHY / BLOCK / GOLDEN)
-    notional_tier: str | None = getattr(episode, "notional_tier", None)
-    if notional_tier in _QUALIFYING_TIERS:
         score += 1
 
     # D4 — DTE in signal window (not 0-7 days, not 90+ days, not None)
@@ -684,16 +706,28 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 def _derive_recommendation(
     conviction_score: int,
     direction: str,
-    ask_side_confirmed: bool,
 ) -> str:
-    """Derive the Steamroom recommendation enum from score + direction + ask-side."""
+    """Derive the Steamroom recommendation enum from score + direction.
+
+    Score/direction → recommendation mapping
+    -----------------------------------------
+    5 + BULLISH  → STRONG_BUY
+    5 + BEARISH  → STRONG_SELL
+    >=3 + BULLISH → BUY_CALLS
+    >=3 + BEARISH → BUY_PUTS
+    0 or NEUTRAL  → NO_ACTION
+    else          → WATCH
+    """
     if conviction_score == 0 or direction not in ("BULLISH", "BEARISH"):
         return _RECOMMENDATION_NO_ACTION
 
-    if conviction_score == 5 and ask_side_confirmed:
-        return _RECOMMENDATION_FOLLOW_SWEEP
+    if conviction_score == 5:
+        if direction == "BULLISH":
+            return _RECOMMENDATION_STRONG_BUY
+        if direction == "BEARISH":
+            return _RECOMMENDATION_STRONG_SELL
 
-    if conviction_score >= _BUY_CONVICTION_FLOOR and ask_side_confirmed:
+    if conviction_score >= _BUY_CONVICTION_FLOOR:
         if direction == "BULLISH":
             return _RECOMMENDATION_BUY_CALLS
         if direction == "BEARISH":
@@ -716,7 +750,7 @@ def build_signal_row(
     backtest_score: float = 0.0,
     reasoning: str | None = None,
     is_accelerating: bool = False,
-    signal_ts: datetime | None = None,
+    signal_ts: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Build the signal_history insert dict from an enriched RepetitionEpisode."""
     if alert_level not in _VALID_ALERT_LEVELS:
@@ -756,30 +790,19 @@ def build_signal_row(
     raw_contract_type: str | None = getattr(episode, "contract_type", None)
     contract_type: str | None = raw_contract_type.upper() if raw_contract_type else None
 
-    def _get_cfg(key: str, default):
-        try:
-            return getattr(cfg, key)
-        except AttributeError:
-            pass
-        try:
-            return cfg[key]
-        except (KeyError, TypeError):
-            pass
-        return default
-
-    ask_floor: float = float(_get_cfg("ask_side_pct_floor", _get_cfg("sig.ask_side_pct_floor", 0.6)))
-    ask_side_confirmed: bool = (
-        ask_side_pct is not None and ask_side_pct >= ask_floor
-    )
-
     recommendation: str = _derive_recommendation(
         conviction_score=conviction_score,
         direction=direction,
-        ask_side_confirmed=ask_side_confirmed,
     )
 
+    # signal_ts: accept datetime (generate isoformat) or str (write verbatim).
+    # When None, generate a fresh UTC timestamp.
     if signal_ts is None:
-        signal_ts = datetime.now(tz=timezone.utc)
+        ts_str: str = datetime.now(tz=timezone.utc).isoformat()
+    elif isinstance(signal_ts, str):
+        ts_str = signal_ts
+    else:
+        ts_str = signal_ts.isoformat()
 
     return {
         "ticker":                   ticker,
@@ -796,6 +819,6 @@ def build_signal_row(
         "episode_id":               str(episode_id) if episode_id is not None else None,
         "reasoning":                reasoning,
         "is_accelerating":          is_accelerating,
-        "signal_ts":                signal_ts.isoformat(),
+        "signal_ts":                ts_str,
         "recommendation":           recommendation,
     }
