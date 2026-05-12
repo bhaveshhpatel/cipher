@@ -74,7 +74,7 @@ parser, chain cache, or registry sync.
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 
@@ -250,17 +250,38 @@ def _fetch_from_db() -> dict[str, Any]:
         return {}
 
 
+async def _async_fetch_from_db() -> dict[str, Any]:
+    """
+    Async variant of _fetch_from_db() using httpx.AsyncClient.
+    Used by get_all_rows() and async_reload_signal_config().
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.warning("[signal_config_store] SUPABASE_URL/KEY not set — using defaults")
+        return {}
+
+    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?select=key,value"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=_headers(), timeout=5.0)
+        resp.raise_for_status()
+        rows = resp.json()
+        return {row["key"]: _cast(row["key"], str(row["value"])) for row in rows if "key" in row and "value" in row}
+    except Exception as exc:
+        log.error("[signal_config_store] async DB fetch failed: %s", exc)
+        return {}
+
+
 # ---------------------------------------------------------------------------
-# Public module-level API
+# Public module-level API — sync (used by signal engine hot path)
 # ---------------------------------------------------------------------------
 
 def reload_signal_config() -> dict[str, Any]:
     """
     Force an immediate DB refresh and atomically swap the snapshot.
 
-    Called by the admin PATCH endpoint after a successful write so that
-    operators see their change take effect within the next evaluation cycle
-    without waiting for the 30s TTL to expire.
+    Sync version — used by the signal engine hot path and startup.
+    For the async router version see reload_signal_config() below which
+    is re-exported as an awaitable via the async alias.
 
     Returns the new snapshot dict (a copy — callers must not mutate it).
     """
@@ -281,7 +302,7 @@ def _maybe_refresh() -> None:
 
 def get_signal_config() -> dict[str, Any]:
     """
-    Return a copy of the current config snapshot.
+    Return a copy of the current config snapshot (sync).
 
     Triggers a DB refresh if the 30s TTL has expired.  Callers receive a
     fresh copy and must not hold references across evaluation cycles.
@@ -380,6 +401,144 @@ def validate_signal_config() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Async DB API — used by routers/signal_config.py (FastAPI async endpoints)
+#
+# These functions use httpx.AsyncClient so they do not block the event loop.
+# The sync hot path (signal engine, get_param) is unaffected.
+# ---------------------------------------------------------------------------
+
+async def get_all_rows() -> List[dict]:
+    """
+    Fetch all rows from the signal_config table with full metadata.
+
+    Returns a list of dicts with keys: key, value, value_type,
+    description, updated_at, updated_by.
+
+    Used by GET /admin/signal-config to return rich row metadata that the
+    snapshot dict alone does not carry (description, updated_at, updated_by).
+
+    Returns an empty list on any network or parse error so the router can
+    fall back to the in-process snapshot.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.warning("[signal_config_store] get_all_rows: SUPABASE creds not set")
+        return []
+
+    url = (
+        f"{_SUPABASE_URL}/rest/v1/{_TABLE}"
+        "?select=key,value,value_type,description,updated_at,updated_by"
+        "&order=key.asc"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=_headers(), timeout=5.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        log.error("[signal_config_store] get_all_rows failed: %s", exc)
+        return []
+
+
+async def update_signal_config(key: str, value: str, updated_by: str = "admin") -> bool:
+    """
+    Upsert a single signal config key in the DB.
+
+    Parameters
+    ----------
+    key : str
+        The config key to update (must exist in SIGNAL_CONFIG_TYPES).
+    value : str
+        The new value serialised as a string (type coercion is the
+        caller's responsibility — see routers/signal_config.py).
+    updated_by : str
+        Identity tag written to the updated_by column (default: "admin").
+
+    Returns
+    -------
+    bool
+        True on success, False on any DB error.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        log.error("[signal_config_store] update_signal_config: SUPABASE creds not set")
+        return False
+
+    url = f"{_SUPABASE_URL}/rest/v1/{_TABLE}?key=eq.{key}"
+    payload = {"value": value, "updated_by": updated_by}
+    # Use PATCH (update existing row) with upsert fallback via Prefer header.
+    headers = {
+        **_headers(),
+        "Prefer": "resolution=merge-duplicates,return=representation",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(url, headers=headers, json=payload, timeout=5.0)
+        if resp.status_code in (200, 201, 204):
+            log.info("[signal_config_store] updated %s = %s", key, value)
+            return True
+        log.error(
+            "[signal_config_store] update_signal_config %s status=%d body=%s",
+            key, resp.status_code, resp.text[:200],
+        )
+        return False
+    except Exception as exc:
+        log.error("[signal_config_store] update_signal_config %s failed: %s", key, exc)
+        return False
+
+
+async def async_reload_signal_config() -> dict[str, Any]:
+    """
+    Async version of reload_signal_config().
+
+    Forces an immediate DB refresh using httpx.AsyncClient so it can be
+    safely awaited from FastAPI async route handlers without blocking the
+    event loop.
+
+    Re-exported as `reload_signal_config` at module level so the router
+    can `await reload_signal_config()` without code changes.
+    """
+    global _snapshot, _snapshot_ts
+    fresh = {**_DEFAULTS, **await _async_fetch_from_db()}
+    _snapshot = fresh
+    _snapshot_ts = time.monotonic()
+    log.info("[signal_config_store] config reloaded async (%d keys)", len(fresh))
+    return dict(fresh)
+
+
+async def async_get_signal_config() -> dict[str, Any]:
+    """
+    Async version of get_signal_config().
+
+    Returns the current snapshot (triggering an async refresh if the TTL
+    has expired).  Re-exported as `get_signal_config` at module level so
+    the router can `await get_signal_config()` without code changes.
+    """
+    if time.monotonic() - _snapshot_ts >= _CACHE_TTL:
+        await async_reload_signal_config()
+    return dict(_snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Re-export async versions under the names the router expects.
+#
+# routers/signal_config.py does:
+#   from services.signal_config_store import get_signal_config, reload_signal_config
+# and then awaits both.  We replace the sync module-level names with the
+# async coroutine functions here.  The sync hot path is preserved via the
+# _sync aliases below for any code that needs the blocking version.
+#
+# IMPORTANT: This must appear AFTER both the sync and async definitions.
+# ---------------------------------------------------------------------------
+
+# Keep sync originals accessible under explicit names for signal engine + tests
+get_signal_config_sync   = get_signal_config
+reload_signal_config_sync = reload_signal_config
+
+# Replace module-level names with async versions for router compatibility
+get_signal_config    = async_get_signal_config    # type: ignore[assignment]
+reload_signal_config = async_reload_signal_config  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
 # SignalConfigStore — class wrapper for dependency injection
 #
 # signal_engine.py (REARCH-006) uses constructor injection so tests can pass
@@ -388,6 +547,9 @@ def validate_signal_config() -> None:
 # This class is a thin facade over the module-level functional API above.
 # All state lives in the module-level _snapshot dict — the class itself is
 # stateless and instances are interchangeable.
+#
+# NOTE: get_all() delegates to get_signal_config_sync() (not the async
+# re-export) because SignalEngine.evaluate_episode() is a sync call.
 # ---------------------------------------------------------------------------
 
 class SignalConfigStore:
@@ -403,8 +565,8 @@ class SignalConfigStore:
     """
 
     def get_all(self) -> dict[str, Any]:
-        """Return a copy of the current config snapshot (delegates to get_signal_config())."""
-        return get_signal_config()
+        """Return a copy of the current config snapshot (sync, delegates to get_signal_config_sync())."""
+        return get_signal_config_sync()
 
     def get_param(self, key: str, default: Any = None) -> Any:
         """Hot-path single-key accessor (delegates to module-level get_param())."""
@@ -420,8 +582,8 @@ class SignalConfigStore:
         return get_effective_premium_threshold(alert_level_key, notional_tier)
 
     def reload(self) -> dict[str, Any]:
-        """Force a DB refresh (delegates to reload_signal_config())."""
-        return reload_signal_config()
+        """Force a sync DB refresh (delegates to reload_signal_config_sync())."""
+        return reload_signal_config_sync()
 
 
 # ---------------------------------------------------------------------------
