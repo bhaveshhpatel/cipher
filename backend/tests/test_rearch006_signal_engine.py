@@ -91,9 +91,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.signal_engine import EpisodeEvalResult, SignalEngine
+# ---------------------------------------------------------------------------
+# Canonical import path — services/signal_engine.py was deleted by Fix 1.
+# All symbols now live in signals/signal_engine.py.
+# ---------------------------------------------------------------------------
 from signals.signal_engine import (
+    EpisodeEvalResult,
     GateResult,
+    SignalEngine,
     _EpisodeProxy,
     _GATE_PREMIUM,
     _GATE_ASK_SIDE,
@@ -181,7 +186,7 @@ def _good_episode(**kwargs) -> dict:
 
 def _proxy(**ep_kwargs) -> _EpisodeProxy:
     """Return an _EpisodeProxy wrapping a good episode for evaluate() calls."""
-    ep_dict = _good_episode(**ep_kwargs)
+    ep_dict  = _good_episode(**ep_kwargs)
     raw_tier = ep_dict.get("notional_tier", "T1")
     return _EpisodeProxy(ep_dict, normalised_tier=_normalise_tier(raw_tier))
 
@@ -191,7 +196,7 @@ def _proxy(**ep_kwargs) -> _EpisodeProxy:
 # ===========================================================================
 
 def test_e01_all_pass_noteworthy():
-    eng = _engine()
+    eng    = _engine()
     result = eng.evaluate_episode(_good_episode(total_premium=75_000))
     assert result.passed is True
     assert result.alert_level == "NOTEWORTHY"
@@ -665,4 +670,390 @@ def test_e36_d2_d3_full_bypass_combo():
         vol_oi_signal=None,
     ))
     assert result.passed is True
-    assert "D2_ASK_SIDE"  not in result.failing_d
+    assert "D2_ASK_SIDE"  not in result.failing_dimensions
+    assert "D3_VOL_GT_OI" not in result.failing_dimensions
+
+
+# ===========================================================================
+# S-01 — S-10  SMOKE TESTS: evaluate() object-based API
+# ===========================================================================
+
+def test_s01_evaluate_all_pass_shape():
+    """S-01: all 5 gates pass — GateResult shape, types, steamroom_score=5."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy())
+
+    assert isinstance(result, GateResult)
+    assert result.passed is True
+    assert result.steamroom_score == 5
+    assert result.alert_level == "NOTEWORTHY"
+    assert isinstance(result.gates, dict)
+    assert set(result.gates.keys()) == {
+        _GATE_PREMIUM, _GATE_ASK_SIDE, _GATE_VOL_OI, _GATE_DTE, _GATE_REPETITION
+    }
+    for gate_name, verdict in result.gates.items():
+        assert verdict.passed is True, f"{gate_name} should pass for a clean episode"
+    assert isinstance(result.config_snapshot, dict)
+
+
+def test_s02_evaluate_d1_fail():
+    """S-02: D1 fail via evaluate() — gate_1_premium fails, alert_level=None."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(total_premium=1_000))
+
+    assert result.passed is False
+    assert result.gates[_GATE_PREMIUM].passed is False
+    assert result.alert_level is None
+    assert result.steamroom_score < 5
+
+
+def test_s03_evaluate_d2_fail():
+    """S-03: D2 fail via evaluate() — gate_2_ask_side fails."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(ask_side_pct=0.1))
+
+    assert result.passed is False
+    assert result.gates[_GATE_ASK_SIDE].passed is False
+    # D1 still passes (premium is fine)
+    assert result.gates[_GATE_PREMIUM].passed is True
+
+
+def test_s04_evaluate_d3_fail():
+    """S-04: D3 fail via evaluate() — gate_3_vol_oi fails (vol_oi_signal=False)."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(vol_oi_signal=False))
+
+    assert result.passed is False
+    assert result.gates[_GATE_VOL_OI].passed is False
+
+
+def test_s05_evaluate_d4_fail():
+    """S-05: D4 fail via evaluate() — gate_4_dte fails (XLONG bucket)."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(dte_bucket="XLONG"))
+
+    assert result.passed is False
+    assert result.gates[_GATE_DTE].passed is False
+
+
+def test_s06_evaluate_d5_fail():
+    """S-06: D5 fail via evaluate() — gate_5_repetition fails (trade_count=1)."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(trade_count=1))
+
+    assert result.passed is False
+    assert result.gates[_GATE_REPETITION].passed is False
+
+
+def test_s07_evaluate_multiple_gates_steamroom_score():
+    """S-07: Multiple gates fail — steamroom_score reflects actual pass count."""
+    eng    = _engine()
+    # Fail D2, D3, D5 → 3 gates fail, 2 pass (D1, D4)
+    result = eng.evaluate(_proxy(
+        ask_side_pct=0.0,
+        vol_oi_signal=False,
+        trade_count=1,
+    ))
+
+    assert result.passed is False
+    assert result.gates[_GATE_ASK_SIDE].passed is False
+    assert result.gates[_GATE_VOL_OI].passed is False
+    assert result.gates[_GATE_REPETITION].passed is False
+    assert result.gates[_GATE_PREMIUM].passed is True
+    assert result.gates[_GATE_DTE].passed is True
+    assert result.steamroom_score == 2
+
+
+def test_s08_evaluate_golden_alert_level():
+    """S-08: GOLDEN alert_level via evaluate() when premium >= 1M."""
+    eng    = _engine()
+    result = eng.evaluate(_proxy(total_premium=1_000_000))
+
+    assert result.passed is True
+    assert result.alert_level == "GOLDEN"
+    assert result.steamroom_score == 5
+
+
+def test_s09_evaluate_watch_via_noteworthy_zero_override():
+    """S-09: WATCH via evaluate() when noteworthy_premium=0 override allows sub-floor premium."""
+    eng    = _engine({
+        "noteworthy_premium":   0,
+        "block_premium":        9_000_000,
+        "golden_sweep_premium": 10_000_000,
+    })
+    result = eng.evaluate(_proxy(total_premium=15_000))
+
+    assert result.passed is True
+    assert result.alert_level == "WATCH"
+    assert result.gates[_GATE_PREMIUM].passed is True
+
+
+def test_s10_config_snapshot_has_prefixed_and_bare_keys():
+    """S-10: config_snapshot contains both 'sig.' prefixed and bare key forms."""
+    eng      = _engine()
+    result   = eng.evaluate(_proxy())
+    snapshot = result.config_snapshot
+
+    # Bare form
+    assert "require_ask_side"     in snapshot
+    assert "ask_side_pct_floor"   in snapshot
+    assert "require_vol_gt_oi"    in snapshot
+    assert "min_dte"              in snapshot
+    assert "max_dte"              in snapshot
+    assert "min_trade_count"      in snapshot
+
+    # Prefixed form
+    assert "sig.require_ask_side"     in snapshot
+    assert "sig.ask_side_pct_floor"   in snapshot
+    assert "sig.require_vol_gt_oi"    in snapshot
+    assert "sig.min_dte"              in snapshot
+    assert "sig.max_dte"              in snapshot
+    assert "sig.min_trade_count"      in snapshot
+
+    # Values are consistent between forms
+    assert snapshot["require_ask_side"] == snapshot["sig.require_ask_side"]
+    assert snapshot["min_dte"]          == snapshot["sig.min_dte"]
+
+
+# ===========================================================================
+# QA-01 — _derive_recommendation() enum correctness sweep
+#
+# Migration 033 adds a DB CHECK constraint on the recommendation column
+# enforcing exactly the 5 values in _VALID_RECOMMENDATIONS.  This parametrized
+# sweep proves that _derive_recommendation() can never emit a 6th value for
+# any combination of valid inputs, so a rogue value cannot reach the DB.
+#
+# Input space: score in {0,1,2,3,4,5} × direction in {"BULLISH","BEARISH","NEUTRAL"}
+#              × ask_side_confirmed in {True, False}
+# That is 6 × 3 × 2 = 36 combos, all enumerated explicitly below.
+# ===========================================================================
+
+_ALL_SCORES     = [0, 1, 2, 3, 4, 5]
+_ALL_DIRECTIONS = ["BULLISH", "BEARISH", "NEUTRAL"]
+_ALL_CONFIRMED  = [True, False]
+
+_QA01_PARAMS = [
+    (score, direction, confirmed)
+    for score     in _ALL_SCORES
+    for direction in _ALL_DIRECTIONS
+    for confirmed in _ALL_CONFIRMED
+]
+
+
+@pytest.mark.parametrize("score,direction,confirmed", _QA01_PARAMS)
+def test_qa01_derive_recommendation_always_valid_enum(score, direction, confirmed):
+    """QA-01: _derive_recommendation() must always return a value in _VALID_RECOMMENDATIONS."""
+    result = _derive_recommendation(
+        conviction_score=score,
+        direction=direction,
+        ask_side_confirmed=confirmed,
+    )
+    assert result in _VALID_RECOMMENDATIONS, (
+        f"_derive_recommendation(score={score}, direction={direction!r}, "
+        f"confirmed={confirmed}) returned {result!r} which is not in "
+        f"_VALID_RECOMMENDATIONS={sorted(_VALID_RECOMMENDATIONS)}"
+    )
+
+
+def test_qa01_follow_sweep_requires_score5_and_confirmed():
+    """FOLLOW_SWEEP is only reachable at score=5 with ask_side_confirmed=True."""
+    assert _derive_recommendation(5, "BULLISH", True)  == "FOLLOW_SWEEP"
+    assert _derive_recommendation(5, "BEARISH", True)  == "FOLLOW_SWEEP"
+    # score=5 but not confirmed → WATCH, not FOLLOW_SWEEP
+    assert _derive_recommendation(5, "BULLISH", False) == "WATCH"
+    assert _derive_recommendation(5, "BEARISH", False) == "WATCH"
+
+
+def test_qa01_buy_calls_only_bullish_confirmed():
+    """BUY_CALLS requires score>=3, BULLISH, confirmed=True."""
+    assert _derive_recommendation(3, "BULLISH", True) == "BUY_CALLS"
+    assert _derive_recommendation(4, "BULLISH", True) == "BUY_CALLS"
+    # BEARISH confirmed → BUY_PUTS, not BUY_CALLS
+    assert _derive_recommendation(3, "BEARISH", True) == "BUY_PUTS"
+    # Not confirmed → WATCH
+    assert _derive_recommendation(3, "BULLISH", False) == "WATCH"
+
+
+def test_qa01_buy_puts_only_bearish_confirmed():
+    """BUY_PUTS requires score>=3, BEARISH, confirmed=True."""
+    assert _derive_recommendation(3, "BEARISH", True) == "BUY_PUTS"
+    assert _derive_recommendation(4, "BEARISH", True) == "BUY_PUTS"
+    # BULLISH confirmed → BUY_CALLS, not BUY_PUTS
+    assert _derive_recommendation(3, "BULLISH", True) == "BUY_CALLS"
+
+
+def test_qa01_no_action_on_neutral_or_zero_score():
+    """NO_ACTION for NEUTRAL direction at any score, or score=0 for any direction."""
+    for confirmed in [True, False]:
+        assert _derive_recommendation(0, "BULLISH",  confirmed) == "NO_ACTION"
+        assert _derive_recommendation(0, "BEARISH",  confirmed) == "NO_ACTION"
+        assert _derive_recommendation(0, "NEUTRAL",  confirmed) == "NO_ACTION"
+        assert _derive_recommendation(5, "NEUTRAL",  confirmed) == "NO_ACTION"
+        assert _derive_recommendation(3, "NEUTRAL",  confirmed) == "NO_ACTION"
+
+
+def test_qa01_watch_on_low_score():
+    """score=1 and score=2 → WATCH regardless of direction and confirmed."""
+    for direction in ["BULLISH", "BEARISH"]:
+        for confirmed in [True, False]:
+            assert _derive_recommendation(1, direction, confirmed) == "WATCH"
+            assert _derive_recommendation(2, direction, confirmed) == "WATCH"
+
+
+# ===========================================================================
+# SA-01 — build_signal_row D2 kill-switch auto-confirm
+#
+# When require_ask_side=False (debug kill-switch), the gate auto-passes in the
+# hard-gate scorer.  build_signal_row must mirror this by treating
+# ask_side_confirmed=True regardless of ask_side_pct so that a score=5
+# episode with a low ask_side_pct still resolves to FOLLOW_SWEEP, not WATCH.
+#
+# Without SA-01 fix: require_ask_side=False + low ask_side_pct → confirmed=False
+#                    → FOLLOW_SWEEP silently downgraded to WATCH with no log.
+# With SA-01 fix:    require_ask_side=False → confirmed=True
+#                    → FOLLOW_SWEEP emitted + WARNING log.
+# ===========================================================================
+
+class _StubEpisode:
+    """Minimal episode object for build_signal_row() calls."""
+    def __init__(self, **kwargs):
+        defaults = {
+            "ticker":       "AAPL",
+            "symbol":       "AAPL",
+            "total_premium": 1_000_000,
+            "trade_count":  5,
+            "ask_side_pct": 0.1,        # deliberately below floor
+            "vol_oi_signal": True,
+            "dte_bucket":   "MID",
+            "notional_tier": "T1",
+            "contract_type": "CALL",
+            "episode_id":   "ep-sa01",
+        }
+        defaults.update(kwargs)
+        for k, v in defaults.items():
+            setattr(self, k, v)
+
+
+def test_sa01_kill_switch_off_low_ask_pct_resolves_follow_sweep():
+    """SA-01: require_ask_side=False + score=5 + low ask_side_pct → FOLLOW_SWEEP.
+
+    The kill-switch disables D2 for hard-gate scoring.  build_signal_row must
+    treat ask_side_confirmed=True in this case so the recommendation path
+    produces FOLLOW_SWEEP (not WATCH).
+    """
+    cfg = {
+        "require_ask_side":     False,   # kill-switch ON
+        "ask_side_pct_floor":   0.6,
+        "require_vol_gt_oi":    True,
+        "min_dte":              5,
+        "max_dte":              60,
+        "min_trade_count":      2,
+    }
+    ep = _StubEpisode(ask_side_pct=0.1)  # below floor — would fail if gate were active
+
+    row = build_signal_row(
+        episode=ep,
+        alert_level="GOLDEN",
+        direction="BULLISH",
+        cfg=cfg,
+        conviction_score=5,
+    )
+
+    assert row["recommendation"] == "FOLLOW_SWEEP", (
+        f"Expected FOLLOW_SWEEP with kill-switch active, got {row['recommendation']!r}. "
+        "SA-01 fix: require_ask_side=False must auto-set ask_side_confirmed=True."
+    )
+
+
+def test_sa01_kill_switch_off_bearish_resolves_follow_sweep():
+    """SA-01: require_ask_side=False + score=5 + BEARISH + low ask_side_pct → FOLLOW_SWEEP."""
+    cfg = {
+        "require_ask_side":   False,
+        "ask_side_pct_floor": 0.6,
+        "min_trade_count":    2,
+    }
+    ep  = _StubEpisode(ask_side_pct=0.0)
+
+    row = build_signal_row(
+        episode=ep,
+        alert_level="GOLDEN",
+        direction="BEARISH",
+        cfg=cfg,
+        conviction_score=5,
+    )
+    assert row["recommendation"] == "FOLLOW_SWEEP"
+
+
+def test_sa01_kill_switch_on_normal_ask_pct_still_uses_pct():
+    """SA-01 baseline: with require_ask_side=True, ask_side_pct drives confirmed."""
+    cfg = {
+        "require_ask_side":   True,
+        "ask_side_pct_floor": 0.6,
+        "min_trade_count":    2,
+    }
+
+    # High ask_side_pct → confirmed=True → FOLLOW_SWEEP at score=5
+    ep_high = _StubEpisode(ask_side_pct=0.8)
+    row_high = build_signal_row(
+        episode=ep_high,
+        alert_level="GOLDEN",
+        direction="BULLISH",
+        cfg=cfg,
+        conviction_score=5,
+    )
+    assert row_high["recommendation"] == "FOLLOW_SWEEP"
+
+    # Low ask_side_pct → confirmed=False → WATCH at score=5 (gate enabled)
+    ep_low = _StubEpisode(ask_side_pct=0.1)
+    row_low = build_signal_row(
+        episode=ep_low,
+        alert_level="GOLDEN",
+        direction="BULLISH",
+        cfg=cfg,
+        conviction_score=5,
+    )
+    assert row_low["recommendation"] == "WATCH"
+
+
+def test_sa01_kill_switch_off_score3_bullish_resolves_buy_calls():
+    """SA-01: require_ask_side=False + score=3 + BULLISH → BUY_CALLS (not WATCH)."""
+    cfg = {
+        "require_ask_side":   False,
+        "ask_side_pct_floor": 0.6,
+        "min_trade_count":    2,
+    }
+    ep = _StubEpisode(ask_side_pct=0.0)
+
+    row = build_signal_row(
+        episode=ep,
+        alert_level="NOTEWORTHY",
+        direction="BULLISH",
+        cfg=cfg,
+        conviction_score=3,
+    )
+    assert row["recommendation"] == "BUY_CALLS", (
+        f"Expected BUY_CALLS, got {row['recommendation']!r}. "
+        "SA-01: kill-switch must auto-confirm so score=3+BULLISH → BUY_CALLS."
+    )
+
+
+def test_sa01_kill_switch_off_score3_bearish_resolves_buy_puts():
+    """SA-01: require_ask_side=False + score=3 + BEARISH → BUY_PUTS (not WATCH)."""
+    cfg = {
+        "require_ask_side":   False,
+        "ask_side_pct_floor": 0.6,
+        "min_trade_count":    2,
+    }
+    ep = _StubEpisode(ask_side_pct=0.0)
+
+    row = build_signal_row(
+        episode=ep,
+        alert_level="NOTEWORTHY",
+        direction="BEARISH",
+        cfg=cfg,
+        conviction_score=3,
+    )
+    assert row["recommendation"] == "BUY_PUTS", (
+        f"Expected BUY_PUTS, got {row['recommendation']!r}. "
+        "SA-01: kill-switch must auto-confirm so score=3+BEARISH → BUY_PUTS."
+    )
