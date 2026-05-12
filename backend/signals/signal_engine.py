@@ -4,6 +4,11 @@
 # REARCH-006 — Chunk 2: SignalEngine skeleton + Gate 1–5 evaluators.
 #              Chunk 4: compute_conviction_score() + build_signal_row()
 #              Chunk 5: _derive_recommendation() (SA/PBE/QA deliberation)
+#              Fix 1/4: Collapse dual engine — this file is the single
+#                       authority.  services/signal_engine.py is deleted.
+#                       Added EpisodeEvalResult, get_engine(), and
+#                       evaluate_episode() bridge so signal_store imports
+#                       work with zero changes to that file.
 #
 # Implements the WSJ Steamroom 5-dimension conviction gate over enriched
 # RepetitionEpisode objects.  Called once per episode close from the stream
@@ -73,6 +78,17 @@
 #     FOLLOW_SWEEP takes precedence and is checked first: conviction==5
 #     with ask-side confirmed overrides the directional BUY_* path.
 #
+# Authoritative engine boundary note (Fix 1/4 — REARCH-006 pre-merge):
+#   This file (signals/signal_engine.py) is the SOLE authority for all gate
+#   evaluation logic.  services/signal_engine.py has been deleted.  Any
+#   future gate param changes belong here exclusively.
+#
+#   Two public APIs are exposed for historical callers:
+#     evaluate(ep)          — object-based API, returns GateResult
+#     evaluate_episode(ep)  — dict-based API, returns EpisodeEvalResult
+#                             (used by signal_store._bus_signal_listener)
+#   Both delegate to the same internal _eval_gate_N() methods.
+#
 # Deploy notes:
 #   - No DB I/O in evaluate() — all config via get_param() snapshot reads.
 #   - One SignalEngine instance shared across workers; evaluate() is thread-safe
@@ -87,7 +103,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from signals.signal_gate import GateVerdict
 from services.signal_config_store import get_param, get_effective_premium_threshold
@@ -161,6 +177,53 @@ _VALID_RECOMMENDATIONS: frozenset[str] = frozenset({
 # Conviction floor for directional buy recommendations.
 _BUY_CONVICTION_FLOOR = 3
 
+# DTE bucket → representative midpoint (days) — mirrors ingestion/processor.py
+_DTE_BUCKET_MIDPOINTS = {
+    "SHORT": 4,
+    "MID":   19,
+    "LONG":  45,
+    "XLONG": 75,
+}
+
+# Fraction of noteworthy_threshold used as the D1 WATCH band floor.
+# Premiums in [noteworthy_threshold * _WATCH_FLOOR_FACTOR, noteworthy_threshold)
+# pass D1 via watch_floor and resolve to WATCH alert level.
+_WATCH_FLOOR_FACTOR = 0.5
+
+
+# ---------------------------------------------------------------------------
+# EpisodeEvalResult — dict-caller API result type (used by signal_store)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EpisodeEvalResult:
+    """
+    Output of SignalEngine.evaluate_episode().
+
+    This is the result type used by dict-based callers (signal_store) that
+    pass episode dicts rather than RepetitionEpisode objects.  It mirrors the
+    former services/signal_engine.EpisodeEvalResult contract exactly so
+    signal_store requires zero changes.
+
+    Attributes
+    ----------
+    passed              True when all enabled dimensions cleared.
+    alert_level         GOLDEN / BLOCK / NOTEWORTHY / WATCH / FAIL.
+                        FAIL means passed=False (no signal should be written).
+    failing_dimensions  Non-empty list of dimension names ("D1_PREMIUM" etc)
+                        when passed=False.  Empty list when passed=True.
+    effective_threshold The tier-adjusted dollar threshold applied for the
+                        D1 gate (useful for logging / backtest).
+    premium             Raw total_premium from the episode (for caller logging).
+    ticker              Episode ticker (for caller logging).
+    """
+    passed:              bool
+    alert_level:         str
+    failing_dimensions:  List[str] = field(default_factory=list)
+    effective_threshold: float = 0.0
+    premium:             float = 0.0
+    ticker:              str = ""
+
 
 # ---------------------------------------------------------------------------
 # GateResult — returned by SignalEngine.evaluate()
@@ -210,6 +273,20 @@ class SignalEngine:
     All configuration is read from the live signal_config_store snapshot at
     call time — no constructor arguments required for runtime tuning.
 
+    Two evaluation APIs are provided:
+
+    evaluate(ep) -> GateResult
+        Object-based API.  ep must be a RepetitionEpisode with object
+        attributes (weighted_premium, ask_side_pct, etc.).
+        Used by stream_worker and any future pipeline stage that has the
+        episode object directly.
+
+    evaluate_episode(ep: dict) -> EpisodeEvalResult
+        Dict-based bridge API.  ep is a plain dict with the same keys as
+        a flow_episodes DB row.  Adapts to the object-based path internally
+        and returns EpisodeEvalResult so signal_store callers work unchanged.
+        This is the API formerly exported by services/signal_engine.py.
+
     Parameters
     ----------
     strict_gate_1:
@@ -223,7 +300,7 @@ class SignalEngine:
         self._strict_gate_1 = strict_gate_1
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — object-based
     # ------------------------------------------------------------------
 
     def evaluate(self, ep) -> GateResult:
@@ -297,6 +374,75 @@ class SignalEngine:
         )
 
     # ------------------------------------------------------------------
+    # Public API — dict-based bridge (EpisodeEvalResult)
+    # ------------------------------------------------------------------
+
+    def evaluate_episode(self, episode: dict) -> EpisodeEvalResult:
+        """Dict-based evaluation bridge — used by signal_store._bus_signal_listener.
+
+        Accepts the same dict schema as a flow_episodes DB row (or bus message
+        payload) and returns an EpisodeEvalResult with the same field contract
+        as the former services/signal_engine.SignalEngine.evaluate_episode().
+
+        Internally wraps the episode dict in a lightweight _EpisodeProxy so
+        the object-attribute-based evaluate() path can be reused unchanged.
+        This is the single code path for all gate evaluation — no duplication.
+
+        Parameters
+        ----------
+        episode : dict
+            Must contain at minimum:
+              ticker, total_premium, notional_tier, ask_side_pct,
+              vol_oi_signal, dte_bucket, trade_count.
+
+        Returns
+        -------
+        EpisodeEvalResult
+            passed, alert_level, failing_dimensions, effective_threshold,
+            premium, ticker.
+        """
+        ticker  = episode.get("ticker", "UNKNOWN")
+        premium = float(episode.get("total_premium") or 0)
+        tier    = episode.get("notional_tier") or "tier1"
+
+        # Wrap dict in a proxy so evaluate()'s getattr() calls work.
+        proxy = _EpisodeProxy(episode)
+        result = self.evaluate(proxy)
+
+        if not result.passed:
+            # Map GateResult gate names back to D-dimension labels for
+            # EpisodeEvalResult.failing_dimensions (signal_store log format).
+            failing = _gate_names_to_dimensions(result.gates)
+
+            # Compute effective noteworthy threshold for logging parity.
+            effective_threshold = get_effective_premium_threshold(
+                _ALERT_NOTEWORTHY, tier
+            ) or 50_000.0
+
+            return EpisodeEvalResult(
+                passed=False,
+                alert_level="FAIL",
+                failing_dimensions=failing,
+                effective_threshold=effective_threshold,
+                premium=premium,
+                ticker=ticker,
+            )
+
+        alert_level = result.alert_level or "WATCH"
+        effective_threshold = get_effective_premium_threshold(
+            _ALERT_NOTEWORTHY, tier
+        ) or 50_000.0
+
+        return EpisodeEvalResult(
+            passed=True,
+            alert_level=alert_level,
+            failing_dimensions=[],
+            effective_threshold=effective_threshold,
+            premium=premium,
+            ticker=ticker,
+        )
+
+    # ------------------------------------------------------------------
     # Per-gate evaluators (private)
     # ------------------------------------------------------------------
 
@@ -304,16 +450,22 @@ class SignalEngine:
     def _eval_gate_1(ep, cfg: dict) -> tuple[GateVerdict, Optional[str]]:
         """Gate 1 — Premium Threshold (tier-aware).
 
-        Determines both pass/fail and the alert_level label in one pass so
-        we only iterate _ALERT_LEVEL_KEYS once.
+        Uses watch_floor (noteworthy_threshold * _WATCH_FLOOR_FACTOR) as the
+        D1 hard pass floor, not noteworthy_threshold directly.  This means
+        premiums in [watch_floor, noteworthy_threshold) pass D1 and resolve
+        to WATCH alert level — consistent with the docstring contract.
 
         Returns
         -------
         (GateVerdict, alert_level | None)
         """
         premium: float = getattr(ep, "weighted_premium", 0.0) or 0.0
+        # Dict proxy: also check total_premium for evaluate_episode() path.
+        if premium == 0.0:
+            premium = float(getattr(ep, "total_premium", 0.0) or 0.0)
         notional_tier: str = getattr(ep, "notional_tier", "tier1") or "tier1"
 
+        # Walk GOLDEN → BLOCK → NOTEWORTHY — return first cleared tier.
         for level_key, level_name in _ALERT_LEVEL_KEYS:
             threshold = get_effective_premium_threshold(level_key, notional_tier)
             if premium >= threshold:
@@ -322,13 +474,22 @@ class SignalEngine:
                     level_name,
                 )
 
-        # Below NOTEWORTHY floor — Gate 1 fails.
+        # Below NOTEWORTHY — check WATCH band floor.
         noteworthy_floor = get_effective_premium_threshold(_ALERT_NOTEWORTHY, notional_tier)
+        watch_floor = noteworthy_floor * _WATCH_FLOOR_FACTOR
+
+        if premium >= watch_floor:
+            return (
+                GateVerdict(True, f"premium_cleared_watch: {premium:,.0f} >= watch_floor={watch_floor:,.0f}"),
+                "WATCH",
+            )
+
+        # Below watch_floor — Gate 1 hard fail.
         return (
             GateVerdict(
                 False,
-                f"premium_below_floor: {premium:,.0f} < {noteworthy_floor:,.0f}"
-                f" (tier={notional_tier})",
+                f"premium_below_watch_floor: {premium:,.0f} < {watch_floor:,.0f}"
+                f" (noteworthy={noteworthy_floor:,.0f}, tier={notional_tier})",
             ),
             None,
         )
@@ -347,7 +508,6 @@ class SignalEngine:
         ask_side_pct: float = getattr(ep, "ask_side_pct", None)
 
         if ask_side_pct is None:
-            # REARCH-004 field absent — degrade gracefully: treat as 0.0.
             log.debug(
                 "[signal_engine] Gate 2: ep.ask_side_pct missing on ticker=%s — treating as 0.0",
                 getattr(ep, "ticker", "?"),
@@ -370,21 +530,17 @@ class SignalEngine:
 
         Primary source: ``ep.vol_oi_signal`` (bool) added by REARCH-004.
         Fallback: scan ``ep.events`` for any event with ``vol_oi_signal=True``.
-        The fallback handles cold-start windows where the episode object was
-        created before REARCH-004 enrichment was deployed.
         """
         require: bool = cfg.get("sig.require_vol_gt_oi", True)
         if not require:
             return GateVerdict(True, "vol_oi_not_required")
 
-        # Primary: episode-level aggregate from REARCH-004.
         ep_vol_oi = getattr(ep, "vol_oi_signal", None)
         if ep_vol_oi is not None:
             if ep_vol_oi:
                 return GateVerdict(True, "vol_oi_signal=True (episode-aggregate)")
             return GateVerdict(False, "vol_oi_signal=False (episode-aggregate)")
 
-        # Fallback: per-event scan (pre-REARCH-004 episode objects).
         events = getattr(ep, "events", []) or []
         for ev in events:
             if getattr(ev, "vol_oi_signal", False):
@@ -396,19 +552,23 @@ class SignalEngine:
     def _eval_gate_4(ep, cfg: dict) -> GateVerdict:
         """Gate 4 — DTE Quality.
 
-        Reads ``ep.dte`` first; falls back to ``ep.events[0].dte`` if the
-        episode-level field is absent.  0DTE is handled: min_dte default is 5
-        but can be set to 0 via the admin UI to include 0DTE sweeps.
+        Reads ``ep.dte`` first; falls back to dte_bucket midpoint mapping if
+        the episode-level field is absent (dict-based evaluate_episode path).
         """
         min_dte: int = cfg.get("sig.min_dte", 5)
         max_dte: int = cfg.get("sig.max_dte", 60)
 
         dte: Optional[int] = getattr(ep, "dte", None)
         if dte is None:
-            # Fallback to first event's DTE.
+            # Fallback 1: first event's DTE.
             events = getattr(ep, "events", []) or []
             if events:
                 dte = getattr(events[0], "dte", None)
+
+        if dte is None:
+            # Fallback 2: dte_bucket midpoint (dict path from evaluate_episode).
+            dte_bucket = (getattr(ep, "dte_bucket", "") or "").upper()
+            dte = _DTE_BUCKET_MIDPOINTS.get(dte_bucket)
 
         if dte is None:
             return GateVerdict(False, "dte_unknown: cannot evaluate DTE gate")
@@ -424,11 +584,7 @@ class SignalEngine:
 
     @staticmethod
     def _eval_gate_5(ep, cfg: dict) -> GateVerdict:
-        """Gate 5 — Repetition / Clustering.
-
-        Compares ``ep.trade_count`` against ``sig.min_trade_count``.
-        trade_count is a property on RepetitionEpisode returning len(ep.events).
-        """
+        """Gate 5 — Repetition / Clustering."""
         min_trades: int = cfg.get("sig.min_trade_count", 2)
         trade_count: int = getattr(ep, "trade_count", 0) or 0
 
@@ -443,17 +599,8 @@ class SignalEngine:
 
     @staticmethod
     def _read_config_snapshot() -> dict[str, Any]:
-        """Pull all signal-engine config keys from the live snapshot.
-
-        Returns a plain dict so GateResult.config_snapshot is self-contained
-        and can be serialised into signal_history.detail JSONB without any
-        further processing.
-
-        Reads are all get_param() calls — no DB I/O, GIL-safe, O(1) per key.
-        """
+        """Pull all signal-engine config keys from the live snapshot."""
         return {
-            # Dimension 1 — base thresholds (tier multipliers applied inside
-            # get_effective_premium_threshold; stored here for audit trail)
             "sig.golden_sweep_premium":          get_param("sig.golden_sweep_premium",         1_000_000.0),
             "sig.block_premium":                 get_param("sig.block_premium",                 500_000.0),
             "sig.noteworthy_premium":            get_param("sig.noteworthy_premium",            50_000.0),
@@ -463,76 +610,117 @@ class SignalEngine:
             "sig.block_premium_t3_mult":         get_param("sig.block_premium_t3_mult",         0.2),
             "sig.noteworthy_premium_t2_mult":    get_param("sig.noteworthy_premium_t2_mult",    0.5),
             "sig.noteworthy_premium_t3_mult":    get_param("sig.noteworthy_premium_t3_mult",    0.2),
-            # Dimension 2
             "sig.require_ask_side":              get_param("sig.require_ask_side",              True),
             "sig.ask_side_pct_floor":            get_param("sig.ask_side_pct_floor",            0.6),
-            # Dimension 3
             "sig.require_vol_gt_oi":             get_param("sig.require_vol_gt_oi",             True),
-            # Dimension 4
             "sig.min_dte":                       get_param("sig.min_dte",                       5),
             "sig.max_dte":                       get_param("sig.max_dte",                       60),
-            # Dimension 5
             "sig.min_trade_count":               get_param("sig.min_trade_count",               2),
-            # Scoring
             "sig.steamroom_score_floor":         get_param("sig.steamroom_score_floor",         3),
         }
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton — shared by stream_worker and any other consumer.
-# Backtest contexts should instantiate their own SignalEngine(strict_gate_1=False)
-# rather than importing this singleton.
+# Module-level singleton
 # ---------------------------------------------------------------------------
-engine = SignalEngine()
+
+_engine_singleton: Optional[SignalEngine] = None
+
+
+def get_engine() -> SignalEngine:
+    """Return the module-level SignalEngine singleton.
+
+    Equivalent to the former services/signal_engine.get_engine() — same
+    contract, same lazy-init pattern.  Production callers (signal_store,
+    stream_worker) call this; tests should instantiate SignalEngine() directly
+    and patch as needed.
+
+    The singleton does not hold any DB connection — it is safe to call from
+    any thread or async context.
+    """
+    global _engine_singleton
+    if _engine_singleton is None:
+        _engine_singleton = SignalEngine()
+        log.info("[signal_engine] singleton initialised (signals/ authority)")
+    return _engine_singleton
+
+
+# module-level alias — stream_worker imports `engine` directly
+engine = get_engine()
+
+
+# ---------------------------------------------------------------------------
+# _EpisodeProxy — adapts a dict to the attribute-access contract of evaluate()
+# ---------------------------------------------------------------------------
+
+class _EpisodeProxy:
+    """Thin wrapper that exposes episode dict keys as attributes.
+
+    Used internally by evaluate_episode() so the dict-based API can reuse
+    evaluate()'s object-attribute path without copying logic.
+    """
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict) -> None:
+        object.__setattr__(self, "_d", d)
+
+    def __getattr__(self, name: str):
+        d = object.__getattribute__(self, "_d")
+        if name in d:
+            return d[name]
+        # Attributes evaluate() depends on that dict keys may not have:
+        # weighted_premium → total_premium fallback
+        if name == "weighted_premium":
+            return float(d.get("total_premium") or 0.0)
+        # events — Gate 3/4 fallback; dict episodes typically don't carry it
+        if name == "events":
+            return []
+        # dte — Gate 4 falls back to dte_bucket midpoint internally
+        raise AttributeError(name)
+
+
+# ---------------------------------------------------------------------------
+# _gate_names_to_dimensions — maps GateResult gate keys → D-label strings
+# ---------------------------------------------------------------------------
+
+_GATE_TO_DIMENSION: dict[str, str] = {
+    _GATE_PREMIUM:    "D1_PREMIUM",
+    _GATE_ASK_SIDE:   "D2_ASK_SIDE",
+    _GATE_VOL_OI:     "D3_VOL_GT_OI",
+    _GATE_DTE:        "D4_DTE",
+    _GATE_REPETITION: "D5_REPETITION",
+}
+
+
+def _gate_names_to_dimensions(gates: dict[str, GateVerdict]) -> list[str]:
+    """Return failing D-dimension labels for EpisodeEvalResult.failing_dimensions."""
+    return [
+        _GATE_TO_DIMENSION[gate_name]
+        for gate_name, verdict in gates.items()
+        if not verdict.passed and gate_name in _GATE_TO_DIMENSION
+    ]
 
 
 # ============================================================================
 # CHUNK 4-A  compute_conviction_score()
-#
-# Pure function — no I/O, no side effects.  Returns int [0, 5].
-#
-# Mirrors the 5 Steamroom gate dimensions but reads REARCH-004 episode
-# attributes directly (ask_side_pct, vol_oi_signal, notional_tier,
-# dte_bucket, trade_count) rather than going through the per-gate class
-# methods.  This keeps the function dependency-free so it can be called
-# from build_signal_row(), tests, and backtest replay without needing a
-# SignalEngine instance or a cfg dict that's fully populated.
-#
-# Dimension mapping (parallel to SignalEngine._eval_gate_N):
-#   D1 — Ask-side execution    ask_side_pct >= cfg.ask_side_pct_floor
-#   D2 — Volume > Open Interest vol_oi_signal == True
-#   D3 — Premium tier          notional_tier in {NOTEWORTHY, BLOCK, GOLDEN}
-#   D4 — DTE in signal window  dte_bucket NOT in {0-7, 90+}
-#   D5 — Repetition / cluster  trade_count >= cfg.min_trade_count
 # ============================================================================
 
 def compute_conviction_score(episode: Any, cfg: Any) -> int:
     """Compute the WSJ Steamroom conviction score (0–5) for a RepetitionEpisode.
 
-    Each of the five Steamroom dimensions contributes one point.  The caller
-    decides the minimum pass threshold (typically ``cfg.min_conviction_score``
-    or the ``sig.steamroom_score_floor`` config param, default 3).
+    Each of the five Steamroom dimensions contributes one point.
 
-    Parameters
-    ----------
-    episode:
-        Enriched RepetitionEpisode (REARCH-004 attributes expected).
-        Missing attributes degrade gracefully to dimension-fail rather than
-        raising — safe against pre-REARCH-004 episode objects in cold-start.
-    cfg:
-        Any object or dict-like that exposes ``ask_side_pct_floor`` and
-        ``min_trade_count``.  A ``SignalConfig`` namedtuple or the plain dict
-        returned by ``SignalEngine._read_config_snapshot()`` both work.
-        Attribute access is tried first; dict key access is the fallback.
+    D-dimension mapping (aligned with gate numbering — D1=premium, D2=ask-side,
+    D3=vol-oi, D4=DTE, D5=repetition — consistent with roadmap and all other
+    references in the codebase):
 
-    Returns
-    -------
-    int
-        Score in [0, 5].
+      D1 — Premium tier          notional_tier in {NOTEWORTHY, BLOCK, GOLDEN}
+      D2 — Ask-side execution    ask_side_pct >= cfg.ask_side_pct_floor
+      D3 — Volume > Open Interest vol_oi_signal == True
+      D4 — DTE in signal window  dte_bucket NOT in {0-7, 90+}
+      D5 — Repetition / cluster  trade_count >= cfg.min_trade_count
     """
     def _get(key: str, default):
-        # Support both object attributes (SignalConfig) and dict keys
-        # (config snapshot dict from _read_config_snapshot).
         try:
             return getattr(cfg, key)
         except AttributeError:
@@ -545,19 +733,19 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
     score = 0
 
-    # D1 — Ask-side execution dominance
+    # D1 — Premium tier qualifies (NOTEWORTHY, BLOCK, or GOLDEN)
+    notional_tier: str | None = getattr(episode, "notional_tier", None)
+    if notional_tier in _QUALIFYING_TIERS:
+        score += 1
+
+    # D2 — Ask-side execution dominance
     ask_pct: float | None = getattr(episode, "ask_side_pct", None)
     floor: float = float(_get("ask_side_pct_floor", _get("sig.ask_side_pct_floor", 0.6)))
     if ask_pct is not None and ask_pct >= floor:
         score += 1
 
-    # D2 — Volume > Open Interest
+    # D3 — Volume > Open Interest
     if getattr(episode, "vol_oi_signal", False):
-        score += 1
-
-    # D3 — Premium tier qualifies (NOTEWORTHY, BLOCK, or GOLDEN)
-    notional_tier: str | None = getattr(episode, "notional_tier", None)
-    if notional_tier in _QUALIFYING_TIERS:
         score += 1
 
     # D4 — DTE in signal window (not 0-7 days, not 90+ days)
@@ -576,41 +764,6 @@ def compute_conviction_score(episode: Any, cfg: Any) -> int:
 
 # ============================================================================
 # CHUNK 5  _derive_recommendation()
-#
-# Private pure function — no I/O, no side effects.
-#
-# Derives the machine-readable Steamroom recommendation enum from three
-# inputs: conviction_score [0–5], direction string, and a boolean flag
-# indicating whether ask-side execution was confirmed.
-#
-# Decision tree (evaluated top-to-bottom; first match wins):
-#
-#   1. conviction == 0, OR direction == NEUTRAL
-#         → NO_ACTION
-#         Rationale: zero-conviction or ambiguous-direction episodes carry no
-#         actionable information.
-#
-#   2. conviction == 5 AND ask_side_confirmed
-#         → FOLLOW_SWEEP
-#         Rationale: perfect-score + confirmed execution = "follow the big
-#         money directly" (WSJ Steamroom highest-conviction signal).
-#         NOTE: conviction==5 WITHOUT ask_side_confirmed falls through to
-#         the BUY_* / WATCH branches below — FOLLOW_SWEEP requires both.
-#
-#   3. conviction >= 3 AND ask_side_confirmed AND direction == BULLISH
-#         → BUY_CALLS
-#
-#   4. conviction >= 3 AND ask_side_confirmed AND direction == BEARISH
-#         → BUY_PUTS
-#
-#   5. All remaining cases (conviction 1–2, OR conviction >= 3 with
-#      ask_side failed, OR direction outside BULLISH/BEARISH)
-#         → WATCH
-#         Rationale: flow is emerging but execution quality or score is
-#         insufficient for a directional recommendation.  Ask-side is a hard
-#         gate — conviction=4 without confirmed execution → WATCH, not BUY_*.
-#
-# The reasoning column carries the narrative; recommendation is the verdict.
 # ============================================================================
 
 def _derive_recommendation(
@@ -618,84 +771,24 @@ def _derive_recommendation(
     direction: str,
     ask_side_confirmed: bool,
 ) -> str:
-    """Derive the Steamroom recommendation enum from score + direction + ask-side.
-
-    Parameters
-    ----------
-    conviction_score:
-        Integer in [0, 5] from ``compute_conviction_score()``.
-    direction:
-        One of ``"BULLISH"`` | ``"BEARISH"`` | ``"NEUTRAL"``.  Any other
-        value is treated as NEUTRAL (→ NO_ACTION).
-    ask_side_confirmed:
-        True when the ask-side execution gate passed (Gate 2 cleared or
-        ask_side_pct >= floor).  This is a hard gate for BUY_* and
-        FOLLOW_SWEEP — unconfirmed execution at any conviction level yields
-        WATCH, not a buy recommendation.
-
-    Returns
-    -------
-    str
-        One of: ``BUY_CALLS`` | ``BUY_PUTS`` | ``FOLLOW_SWEEP`` |
-        ``WATCH`` | ``NO_ACTION``.
-        Always a member of ``_VALID_RECOMMENDATIONS``.
-    """
-    # ── Branch 1: No conviction or neutral direction → NO_ACTION ─────────────
+    """Derive the Steamroom recommendation enum from score + direction + ask-side."""
     if conviction_score == 0 or direction not in ("BULLISH", "BEARISH"):
         return _RECOMMENDATION_NO_ACTION
 
-    # ── Branch 2: FOLLOW_SWEEP — perfect score + confirmed execution ─────────
-    # Must be checked before the BUY_* branches because conviction==5 with
-    # ask-side confirmed supersedes the directional path.
     if conviction_score == 5 and ask_side_confirmed:
         return _RECOMMENDATION_FOLLOW_SWEEP
 
-    # ── Branch 3 & 4: Directional BUY — conviction floor + confirmed ask-side ─
-    # Ask-side is a hard gate: conviction >= 3 without confirmed execution
-    # falls through to WATCH (QA deliberation consensus).
     if conviction_score >= _BUY_CONVICTION_FLOOR and ask_side_confirmed:
         if direction == "BULLISH":
             return _RECOMMENDATION_BUY_CALLS
         if direction == "BEARISH":
             return _RECOMMENDATION_BUY_PUTS
 
-    # ── Branch 5: All remaining cases → WATCH ────────────────────────────────
-    # Covers:
-    #   - conviction 1–2 (any direction, any ask-side)
-    #   - conviction >= 3 but ask_side_confirmed == False
-    #   - conviction == 5 but ask_side_confirmed == False
     return _RECOMMENDATION_WATCH
 
 
 # ============================================================================
 # CHUNK 4-B  build_signal_row()
-#
-# Assembles the insert dict for signal_history.
-#
-# Column set is authoritative against migration 024_rearch010_schema_purge.sql
-# (post-REARCH-010 schema) and migration 033_rearch006_recommendation_enum.sql
-# (recommendation enum hardening).
-#
-# Columns written
-# ───────────────
-#   ticker, alert_level, direction
-#   composite_score, backtest_score
-#   reasoning, contract_type
-#   total_premium, trade_count
-#   is_accelerating, signal_ts
-#   episode_steamroom_score           ← migration 024 Section 9
-#   ask_side_pct                      ← migration 024 Section 9
-#   vol_oi_ratio                      ← migration 024 Section 9
-#   episode_id                        ← FK to flow_episodes.id
-#   recommendation                    ← enum via _derive_recommendation()
-#                                        DEFAULT 'NO_ACTION' (migration 033)
-#
-# Columns intentionally NOT written (retired by REARCH-010)
-# ─────────────────────────────────────────────────────────
-#   flow_score              (dropped in migration 024 Section 6)
-#   influence_tier          (dropped in migration 024 Section 6)
-#   volume_premium_factor   (dropped in migration 024 Section 6)
-#   swarm_*                 (dropped in migration 024 Section 6)
 # ============================================================================
 
 def build_signal_row(
@@ -710,52 +803,7 @@ def build_signal_row(
     is_accelerating: bool = False,
     signal_ts: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build the signal_history insert dict from an enriched RepetitionEpisode.
-
-    Parameters
-    ----------
-    episode:
-        Enriched RepetitionEpisode (REARCH-003/004 attributes populated).
-    alert_level:
-        One of ``WATCH`` | ``NOTEWORTHY`` | ``BLOCK`` | ``GOLDEN``.
-        Raises ``ValueError`` on unrecognised values — protects the DB
-        CHECK constraint added in migration 024 Section 7.
-    direction:
-        One of ``BULLISH`` | ``BEARISH`` | ``NEUTRAL``.
-        Raises ``ValueError`` on unrecognised values — protects the DB
-        CHECK constraint added in migration 024 Section 7.
-    cfg:
-        Live config snapshot from SignalConfigStore (or a SignalConfig object).
-        Passed through to ``compute_conviction_score`` if ``conviction_score``
-        is not pre-supplied.
-    conviction_score:
-        Pre-computed score [0-5].  If None, computed here via
-        ``compute_conviction_score()``.  Pass it in when the caller already ran
-        that function to avoid double computation.
-    backtest_score:
-        Backtest quality score in [0.0, 1.0].  Defaults to 0.0.
-    reasoning:
-        Human-readable rationale string for the signal.  Optional.
-    is_accelerating:
-        True when episode trade velocity is increasing within the observation
-        window.  Defaults to False.
-    signal_ts:
-        Emission timestamp (timezone-aware).  Defaults to ``utcnow()`` when
-        not provided.
-
-    Returns
-    -------
-    dict[str, Any]
-        Ready for ``supabase.table("signal_history").insert(row).execute()``.
-
-    Raises
-    ------
-    ValueError
-        ``alert_level`` or ``direction`` are not valid REARCH-010 vocab.
-    ValueError
-        ``episode`` has no ``symbol`` or ``ticker`` attribute.
-    """
-    # ── Vocab guard — fail loudly before touching the DB ────────────────────
+    """Build the signal_history insert dict from an enriched RepetitionEpisode."""
     if alert_level not in _VALID_ALERT_LEVELS:
         raise ValueError(
             f"build_signal_row: invalid alert_level={alert_level!r}. "
@@ -767,32 +815,22 @@ def build_signal_row(
             f"Must be one of {sorted(_VALID_DIRECTIONS)}"
         )
 
-    # ── Ticker — required ────────────────────────────────────────────────────
     ticker: str | None = getattr(episode, "symbol", None) or getattr(episode, "ticker", None)
     if not ticker:
         raise ValueError(
-            "build_signal_row: episode has no symbol/ticker attribute — "
-            "cannot build a signal_history row without a ticker"
+            "build_signal_row: episode has no symbol/ticker attribute"
         )
 
-    # ── Conviction score ─────────────────────────────────────────────────────
     if conviction_score is None:
         conviction_score = compute_conviction_score(episode, cfg)
 
-    # ── composite_score — conviction normalised to [0.000, 1.000] ───────────
-    # Rounded to 3dp to fit NUMERIC(5,3) column precision.
-    # Intentional simplification: conviction is the sole scoring dimension for
-    # REARCH-006.  When REARCH-011 (backtest integration) lands, this becomes:
-    #   composite_score = round(0.7 * conviction_norm + 0.3 * backtest_score, 3)
     composite_score: float = round(conviction_score / 5.0, 3)
 
-    # ── Snapshot fields pulled from episode ─────────────────────────────────
     total_premium: float | None = getattr(episode, "total_premium", None)
     trade_count:   int   | None = getattr(episode, "trade_count", None)
     ask_side_pct:  float | None = getattr(episode, "ask_side_pct", None)
     episode_id:    str   | None = getattr(episode, "episode_id", None)
 
-    # vol_oi_ratio: prefer explicit attribute; derive from raw vol/oi if absent.
     vol_oi_ratio: float | None = getattr(episode, "vol_oi_ratio", None)
     if vol_oi_ratio is None:
         vol = getattr(episode, "contract_volume_at_close", None)
@@ -800,13 +838,9 @@ def build_signal_row(
         if vol is not None and oi and oi > 0:
             vol_oi_ratio = round(float(vol) / float(oi), 4)
 
-    # contract_type: normalise to uppercase or None
     raw_contract_type: str | None = getattr(episode, "contract_type", None)
     contract_type: str | None = raw_contract_type.upper() if raw_contract_type else None
 
-    # ── Ask-side confirmed flag (used by _derive_recommendation) ────────────
-    # Mirror the Gate 2 logic: ask_side_pct must meet the floor from cfg.
-    # Absent ask_side_pct degrades to unconfirmed (False), matching Gate 2.
     def _get_cfg(key: str, default):
         try:
             return getattr(cfg, key)
@@ -823,46 +857,30 @@ def build_signal_row(
         ask_side_pct is not None and ask_side_pct >= ask_floor
     )
 
-    # ── Recommendation — machine-readable Steamroom verdict ─────────────────
     recommendation: str = _derive_recommendation(
         conviction_score=conviction_score,
         direction=direction,
         ask_side_confirmed=ask_side_confirmed,
     )
 
-    # ── Emission timestamp ───────────────────────────────────────────────────
     if signal_ts is None:
         signal_ts = datetime.now(tz=timezone.utc)
 
-    # ── Assemble row ─────────────────────────────────────────────────────────
-    row: dict[str, Any] = {
-        # Core identity
+    return {
         "ticker":                   ticker,
         "alert_level":              alert_level,
         "direction":                direction,
-        # Scores
         "composite_score":          composite_score,
         "backtest_score":           round(float(backtest_score), 3),
-        # Episode fields
         "total_premium":            float(total_premium) if total_premium is not None else None,
         "trade_count":              int(trade_count) if trade_count is not None else None,
         "contract_type":            contract_type,
-        # Steamroom quality snapshot (migration 024 Section 9 columns)
         "episode_steamroom_score":  conviction_score,
         "ask_side_pct":             round(float(ask_side_pct), 4) if ask_side_pct is not None else None,
         "vol_oi_ratio":             float(vol_oi_ratio) if vol_oi_ratio is not None else None,
-        # Episode FK
         "episode_id":               str(episode_id) if episode_id is not None else None,
-        # Metadata
         "reasoning":                reasoning,
         "is_accelerating":          is_accelerating,
         "signal_ts":                signal_ts.isoformat(),
-        # Recommendation — enum via _derive_recommendation() (migration 033)
-        # CHECK constraint: BUY_CALLS | BUY_PUTS | FOLLOW_SWEEP | WATCH | NO_ACTION
         "recommendation":           recommendation,
-        # NOTE: created_at is omitted intentionally — owned by Postgres DEFAULT now().
-        # NOTE: flow_score, influence_tier, volume_premium_factor, swarm_* all
-        #       dropped in migration 024 Section 6 — do not add them back here.
     }
-
-    return row
