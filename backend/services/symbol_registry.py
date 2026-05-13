@@ -27,7 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build()`.
+  always doing a full rebuild after the first build()`。
   Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
@@ -191,7 +191,7 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
     p95 < _P95_RAMP_UP_THRESHOLD_S (1.0s)  -> ramp up by _ADAPT_STEP (5),
                                                capped at _CONCURRENCY_MAX (40)
     p95 > _P95_DROP_THRESHOLD_S    (5.0s)  -> drop down by _ADAPT_STEP (5),
-                                               floored at _CONCURRENCY_MIN (10)
+                                               floored at _CONCURRENCY_MIN (15)
     1.0s <= p95 <= 5.0s             (hold)  -> no change
 
   Starting concurrency: _DEFAULT_BUILD_CONCURRENCY=20 (unchanged baseline).
@@ -202,7 +202,7 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
       former fixed-50 setting on stable/ingestion-frontend-2026-04-29.
 
   Under degraded Tradier (p95 > 5s):
-    - Drops to 10 within one adapt cycle, reducing simultaneous inflight
+    - Drops to 15 within one adapt cycle, reducing simultaneous inflight
       calls and preventing the stall-slot saturation that caused the
       original BUILD-SEMAPHORE regression.
 
@@ -212,6 +212,11 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
 
   Concurrency adjustments are logged at INFO with p95 and direction so the
   build log makes Tradier health visible without extra instrumentation.
+
+FIX BUILD-ADAPTIVE-CONCURRENCY-MIN (2026-05-13): _CONCURRENCY_MIN 10 -> 15.
+  Original spec: p95 > 5s drops to floor of 15 (not 10). The prior
+  implementation used 10 as the floor — one extra _ADAPT_STEP (5) more
+  aggressive than specified. Corrected to match the approved spec exactly.
 """
 import asyncio
 import collections
@@ -246,7 +251,7 @@ _DEFAULT_BUILD_CONCURRENCY = 20
 # BUILD-ADAPTIVE-CONCURRENCY: concurrency bounds and p95 thresholds for
 # AdaptiveSemaphore. All values are module-level constants so they can be
 # adjusted without touching logic.
-_CONCURRENCY_MIN            = 10    # hard floor — never drop below this
+_CONCURRENCY_MIN            = 15    # hard floor — never drop below this (spec: drop to 15 under p95 > 5s)
 _CONCURRENCY_MAX            = 40    # hard ceiling — never ramp above this
 _ADAPT_STEP                 = 5     # concurrency delta per adapt cycle
 _ADAPT_SAMPLE_INTERVAL      = 20    # evaluate p95 every N slot completions
@@ -595,7 +600,7 @@ class SymbolRegistry:
         BUILD-ADAPTIVE-CONCURRENCY - p95-driven AdaptiveSemaphore:
           Replaces fixed asyncio.Semaphore(20) with AdaptiveSemaphore
           starting at _DEFAULT_BUILD_CONCURRENCY=20. Ramps toward 40 when
-          Tradier is responsive (p95 < 1s); drops toward 10 when Tradier
+          Tradier is responsive (p95 < 1s); drops toward 15 when Tradier
           is congested (p95 > 5s). See AdaptiveSemaphore docstring and
           module-level constants for full details.
 
@@ -612,6 +617,10 @@ class SymbolRegistry:
           Non-CancelledError exceptions in individual tasks are now counted
           and logged at WARNING so ops can distinguish timed-out tickers
           from errored tickers in the build log.
+
+        BUILD-ADAPTIVE-CONCURRENCY-MIN - _CONCURRENCY_MIN 10 -> 15:
+          Corrected floor to match the approved spec (drop to 15 under
+          p95 > 5s degradation, not 10).
         """
         from services.symbols_loader import SymbolQuote
 
