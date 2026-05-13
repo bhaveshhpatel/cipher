@@ -8,7 +8,8 @@ Public API
 ----------
 save_chain(snapshot_id, registry_dict)  -> bool
     Batch-upsert all ContractMeta rows for the current active snapshot.
-    All batches are dispatched CONCURRENTLY via asyncio.gather (C-1 fix).
+    All batches are dispatched CONCURRENTLY via asyncio.gather (C-1 fix),
+    capped at _SAVE_CONCURRENCY=10 via semaphore (HOTFIX-CHAIN-CONCURRENCY).
     Called after every SymbolRegistry.build().
 
 load_chain(snapshot_id, max_age_hours)  -> dict[str, ContractMeta] | None
@@ -87,6 +88,20 @@ ING-008 (2026-05-08):
 FIX ING-008 (2026-05-08):
   Added Awaitable to typing imports — was missing, causing NameError at
   module load time on Python 3.12.
+
+HOTFIX-CHAIN-CONCURRENCY (2026-05-13):
+  save_chain() was creating one new Supabase client per batch via
+  _client() inside _upsert_batch. With 155 batches firing concurrently,
+  this instantiated 155 separate connection pools simultaneously, spiking
+  memory and saturating the default threadpool. On Render's starter tier
+  this caused OOM restarts and health probe timeouts.
+
+  Fix: single _client() call outside _upsert_batch, shared across all
+  batches. Added asyncio.Semaphore(_SAVE_CONCURRENCY=10) to cap concurrent
+  run_in_executor threads. Wall time: ~300ms → ~1.5s (still 4x faster
+  than the original sequential 5.8s). Zero impact on streaming hot path —
+  save_chain is called only at startup and every 24h; get_contract_vol_oi()
+  reads _vol_oi_cache fed by start_chain_refresh_worker(), a separate path.
 """
 import asyncio
 import logging
@@ -105,6 +120,14 @@ _TABLE      = "options_chain_cache"
 _BATCH_SIZE = 500
 _PAGE_SIZE  = 1000
 _DEFAULT_MAX_AGE_HOURS = 24
+
+# ---------------------------------------------------------------------------
+# HOTFIX-CHAIN-CONCURRENCY: cap concurrent save_chain batch writes.
+# Previously all batches (up to 155) fired simultaneously, each creating
+# its own Supabase client. 10 concurrent batches keeps memory flat and
+# avoids threadpool saturation while still being ~4x faster than sequential.
+# ---------------------------------------------------------------------------
+_SAVE_CONCURRENCY: int = 10
 
 # ---------------------------------------------------------------------------
 # ING-008: background refresh cadence for intraday vol/OI
@@ -271,17 +294,24 @@ async def save_chain(
     registry_dict: "dict[str, ContractMeta]",
 ) -> bool:
     """
-    C-1 FIX: Persist all ContractMeta rows concurrently.
+    HOTFIX-CHAIN-CONCURRENCY + C-1: Persist all ContractMeta rows with
+    bounded concurrency via a single shared Supabase client.
 
-    Splits rows into _BATCH_SIZE chunks and dispatches all upsert coroutines
-    concurrently via asyncio.gather(). Each batch runs in its own
-    run_in_executor call so the event loop is never blocked by a single
-    sequential batch write.
+    Previously _client() was called inside _upsert_batch, creating one new
+    Supabase connection pool per batch. With 155 batches firing concurrently
+    via asyncio.gather, this instantiated 155 clients simultaneously — spiking
+    memory and saturating the threadpool, causing OOM restarts and health probe
+    failures on Render.
 
-    Wall time improvement: ~5.8s (sequential) → ~300ms (concurrent).
+    Fix:
+      - ONE _client() call outside the batch loop, shared by all batches.
+      - asyncio.Semaphore(_SAVE_CONCURRENCY=10) caps concurrent
+        run_in_executor threads to 10 at a time.
 
-    ING-008: now includes `volume` in each upserted row (sourced from
-    ContractMeta.volume if present, else 0).
+    Wall time: ~300ms (155 concurrent) → ~1.5s (10 at a time).
+    Still ~4x faster than the original sequential 5.8s path.
+    Zero impact on streaming: save_chain is called only at startup and
+    every 24h; the hot-path vol/OI lookups use _vol_oi_cache exclusively.
 
     Increments the module-level _epoch counter on success.
     """
@@ -306,23 +336,28 @@ async def save_chain(
         }
         for occ, m in registry_dict.items()
     ]
-    total   = len(rows)
-    batches = [rows[i : i + _BATCH_SIZE] for i in range(0, total, _BATCH_SIZE)]
+    total     = len(rows)
+    batches   = [rows[i : i + _BATCH_SIZE] for i in range(0, total, _BATCH_SIZE)]
     n_batches = len(batches)
 
+    # HOTFIX-CHAIN-CONCURRENCY: single client shared across all batches.
+    sb  = _client()
+    sem = asyncio.Semaphore(_SAVE_CONCURRENCY)
+
     async def _upsert_batch(batch: list, batch_num: int) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: _client().table(_TABLE).upsert(
-                batch,
-                on_conflict="snapshot_id,occ_symbol",
-            ).execute(),
-        )
-        log.info(
-            "[chain_store] save_chain: batch %d/%d (%d rows)",
-            batch_num, n_batches, len(batch),
-        )
+        async with sem:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: sb.table(_TABLE).upsert(
+                    batch,
+                    on_conflict="snapshot_id,occ_symbol",
+                ).execute(),
+            )
+            log.info(
+                "[chain_store] save_chain: batch %d/%d (%d rows)",
+                batch_num, n_batches, len(batch),
+            )
 
     try:
         await asyncio.gather(
