@@ -133,6 +133,20 @@ HOTFIX-SSL-EOF-2 (2026-05-13):
   supported public API for disabling HTTP/2 in supabase-py >=2.3.
   The post-construction patch block and its warning log are removed.
 
+HOTFIX-SSL-EOF-3 (2026-05-13):
+  ClientOptions.__init__() does not accept http_options in the installed
+  supabase-py version, causing a TypeError on every _client() call:
+    ClientOptions.__init__() got an unexpected keyword argument 'http_options'
+  This error was logged from symbol_registry._persist_to_db (non-fatal)
+  but meant every save_chain() / load_chain() call silently failed.
+
+  Fix: remove http_options from ClientOptions entirely. Force HTTP/1.1 by
+  constructing an httpx.Client (sync) with http2=False and passing it via
+  the httpx_client kwarg on create_client(). This is version-agnostic and
+  works on supabase-py 2.x regardless of whether ClientOptions exposes
+  http_options. The SSL-EOF root cause is still fully addressed —
+  HTTP/1.1 reconnects per-request so stale connection reuse is impossible.
+
 FIX #134 (2026-05-13): gate chain_refresh worker to market hours.
   start_chain_refresh_worker() previously ran 24/7 with no market-hours
   guard and no initial startup delay. On pre-market process restarts
@@ -430,7 +444,18 @@ async def start_chain_refresh_worker(
 
 def _client() -> Client:
     """
-    HOTFIX-SSL-EOF-2: force HTTP/1.1 via ClientOptions http_options.
+    HOTFIX-SSL-EOF-3: force HTTP/1.1 via a pre-built httpx.Client passed
+    to create_client() as httpx_client.
+
+    ClientOptions does not expose http_options in all supabase-py 2.x
+    versions, so passing it there raises:
+      TypeError: ClientOptions.__init__() got an unexpected keyword argument 'http_options'
+
+    Instead we build an httpx.Client with http2=False ourselves and hand it
+    directly to create_client(). supabase-py forwards this client to the
+    underlying postgrest-py SyncRequestsClient, bypassing HTTP/2 entirely.
+    HTTP/1.1 reconnects per-request so stale SSL connections (SSL-EOF) are
+    impossible regardless of idle time.
     """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
@@ -441,9 +466,9 @@ def _client() -> Client:
     options = ClientOptions(
         postgrest_client_timeout=30,
         storage_client_timeout=30,
-        http_options={"http2": False},
     )
-    return create_client(settings.SUPABASE_URL, key, options=options)
+    httpx_client = httpx.Client(http2=False)
+    return create_client(settings.SUPABASE_URL, key, options=options, httpx_client=httpx_client)
 
 
 async def save_chain(
