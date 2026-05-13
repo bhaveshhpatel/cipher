@@ -88,6 +88,13 @@ Key architectural fixes:
                         not `gate_config_store`. Fixed as `store as gate_config_store`.
                         This was crashing uvicorn on every boot with ImportError before
                         the lifespan even started.
+  HOTFIX-CHAIN-HOURS  — _fetch_tradier_chain() now returns [] immediately outside
+                        market hours (Mon-Fri 9:15 AM – 4:30 PM ET; never on weekends).
+                        Tradier's chain endpoint returns HTTP 400 when markets are
+                        closed, flooding logs with warnings all night. The guard is
+                        co-located in the fetch helper so the chain_refresh_task loop
+                        itself is untouched — it simply sleeps its normal interval
+                        between empty-return calls.
 """
 import asyncio
 import json
@@ -201,6 +208,29 @@ async def _self_ping_worker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# HOTFIX-CHAIN-HOURS: Market hours guard for Tradier chain fetches.
+#
+# Tradier's GET /v1/markets/options/chains returns HTTP 400 outside regular
+# market hours. The chain_refresh_task runs continuously 24/7, so without
+# this guard every symbol floods the warning log all night and on weekends.
+#
+# Window: Mon-Fri, 9:15 AM – 4:30 PM America/New_York.
+#   - 9:15 AM: 15-min pre-market buffer before the 9:30 open so the cache
+#     is warm by the time flow events start arriving.
+#   - 4:30 PM: 30-min post-close buffer to capture any late prints.
+# ---------------------------------------------------------------------------
+_ET = ZoneInfo("America/New_York")
+
+
+def _is_market_hours() -> bool:
+    """HOTFIX-CHAIN-HOURS: True only during Mon-Fri 9:15 AM – 4:30 PM ET."""
+    now = datetime.now(_ET)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return time(9, 15) <= now.time() <= time(16, 30)
+
+
+# ---------------------------------------------------------------------------
 # ING-008: Tradier chain fetch helper for the background refresh worker.
 #
 # Calls GET /v1/markets/options/chains?symbol=X&greeks=false.
@@ -217,12 +247,21 @@ async def _fetch_tradier_chain(symbol: str) -> list:
     network or API error returns [] so the worker continues to the next
     symbol without aborting the refresh cycle.
 
+    HOTFIX-CHAIN-HOURS: Returns [] immediately outside market hours
+    (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
+    are closed, so there is nothing useful to fetch.
+
     API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
     Each returned dict includes at minimum:
       - "symbol"        : str  (21-char OCC symbol)
       - "volume"        : int  (today's volume for this contract)
       - "open_interest" : int
     """
+    # HOTFIX-CHAIN-HOURS: skip entirely outside market hours.
+    if not _is_market_hours():
+        log.debug("[chain_refresh] %s — skipped (market closed)", symbol)
+        return []
+
     if not settings.TRADIER_API_KEY:
         return []
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
@@ -663,7 +702,6 @@ async def _universe_refresh_loop():
             log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
 
 
-_ET = ZoneInfo("America/New_York")
 _PREWARM_TIME = time(9, 15)
 
 
