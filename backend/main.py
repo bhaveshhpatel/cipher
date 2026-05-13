@@ -84,6 +84,10 @@ Key architectural fixes:
                         longer blocks yield, so Render's health probe passes in ~6 s
                         from cold start instead of timing out and restarting the
                         container in a loop.
+  HOTFIX-IMPORT-001   — gate_config_store import corrected: the module exports `store`,
+                        not `gate_config_store`. Fixed as `store as gate_config_store`.
+                        This was crashing uvicorn on every boot with ImportError before
+                        the lifespan even started.
 """
 import asyncio
 import json
@@ -117,7 +121,7 @@ from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow
-from services.gate_config_store import gate_config_store
+from services.gate_config_store import store as gate_config_store  # HOTFIX-IMPORT-001
 
 import httpx
 
