@@ -217,6 +217,40 @@ FIX BUILD-ADAPTIVE-CONCURRENCY-MIN (2026-05-13): _CONCURRENCY_MIN 10 -> 15.
   Original spec: p95 > 5s drops to floor of 15 (not 10). The prior
   implementation used 10 as the floor — one extra _ADAPT_STEP (5) more
   aggressive than specified. Corrected to match the approved spec exactly.
+
+FIX ADAPTIVE-LAZY-DRAIN (2026-05-13): fix AdaptiveSemaphore drop dead-zone
+  where drained=0 on every cycle when all permits were in-flight.
+
+  Root cause: the drop branch in _maybe_adapt() only called
+  self._sem.acquire() when self._sem._value > 0 (a free permit existed).
+  When all concurrency slots were occupied — exactly the degraded condition
+  that triggers a drop — self._sem._value == 0 so the inner loop was a
+  complete no-op. self._value was decremented only by `drained`, so with
+  drained=0 the ceiling never moved. The semaphore stayed at 40 while p95
+  climbed from 25s to 293s; the 300s gather timeout fired before enough
+  tasks completed to surface free permits.
+
+  Fix: two-phase lazy drain.
+
+  _maybe_adapt() drop branch:
+    1. Decrements self._value by the full `step` immediately — the ceiling
+       is authoritative from this point, independent of in-flight state.
+    2. Eagerly drains whatever permits are currently free (sem._value > 0).
+    3. Sets self._pending_drain += (step - drained) for the remainder.
+
+  __aexit__() before self._sem.release():
+    - If self._pending_drain > 0: decrement _pending_drain and skip the
+      release — the permit is absorbed (destroyed), permanently reducing
+      the live concurrency to match the already-updated self._value ceiling.
+    - Otherwise: release normally.
+
+  On the next adapt cycle after a drop signal, the log will show
+  pending_drain=N where N is the number of slots still draining, giving
+  observability into the lazy-drain progress without any extra polling.
+
+  The ramp-up path is unchanged. _pending_drain naturally converges to 0
+  as in-flight tasks complete; no explicit reset between adapt cycles is
+  needed (each absorbed release is one unit of drain consumed).
 """
 import asyncio
 import collections
@@ -300,9 +334,12 @@ class AdaptiveSemaphore:
         p95 < _P95_RAMP_UP_THRESHOLD_S  -> ramp up by _ADAPT_STEP
         p95 > _P95_DROP_THRESHOLD_S     -> drop down by _ADAPT_STEP
     - Ramp: releases (_ADAPT_STEP) extra internal-semaphore permits.
-    - Drop: acquires (_ADAPT_STEP) permits without releasing, reducing
-      the effective concurrency ceiling. Waits for each permit
-      non-blockingly (tries acquire; if already at 0 outstanding, no-op).
+    - Drop (lazy drain): self._value is decremented by the full step
+      immediately. Any permits currently free are eagerly consumed; the
+      remainder are stored in _pending_drain and absorbed one-by-one in
+      __aexit__() as inflight tasks complete and release their permits.
+      This guarantees the ceiling converges to the target within ~step
+      task completions even when all permits are busy at drop time.
     - Thread-safe for asyncio: all mutations happen inside the event loop.
     - .value property exposes current concurrency for logging.
     """
@@ -313,6 +350,11 @@ class AdaptiveSemaphore:
         self._samples: collections.deque = collections.deque(maxlen=_ADAPT_WINDOW)
         self._since_last_adapt = 0
         self._start_ts: Optional[float] = None
+        # ADAPTIVE-LAZY-DRAIN: number of permits that must be absorbed
+        # (destroyed) before being re-released in __aexit__(). Set by the
+        # drop branch of _maybe_adapt() when not all step permits could be
+        # eagerly drained from the semaphore because all slots were in-flight.
+        self._pending_drain: int = 0
 
     @property
     def value(self) -> int:
@@ -325,7 +367,16 @@ class AdaptiveSemaphore:
 
     async def __aexit__(self, *_):
         elapsed = _time.monotonic() - (self._start_ts or _time.monotonic())
-        self._sem.release()
+        # ADAPTIVE-LAZY-DRAIN: if a drop was signalled but not all permits
+        # could be eagerly consumed (because all slots were in-flight),
+        # absorb this returning permit instead of re-releasing it. Each
+        # absorbed release reduces live concurrency by 1 toward the target
+        # ceiling already reflected in self._value.
+        if self._pending_drain > 0:
+            self._pending_drain -= 1
+            # permit is consumed — do NOT call self._sem.release()
+        else:
+            self._sem.release()
         self._samples.append(elapsed)
         self._since_last_adapt += 1
         if self._since_last_adapt >= _ADAPT_SAMPLE_INTERVAL and len(self._samples) >= _ADAPT_SAMPLE_INTERVAL:
@@ -351,21 +402,25 @@ class AdaptiveSemaphore:
 
         elif p95 > _P95_DROP_THRESHOLD_S and self._value > _CONCURRENCY_MIN:
             step = min(_ADAPT_STEP, self._value - _CONCURRENCY_MIN)
-            # Drain `step` permits from the semaphore without blocking.
-            # acquire() is non-blocking here because the semaphore value
-            # reflects available (not in-use) slots — we only drain up to
-            # what is currently free, so inflight coroutines are unaffected.
+            # ADAPTIVE-LAZY-DRAIN: decrement self._value by the full step
+            # immediately so the ceiling is authoritative from this point.
+            # Eagerly drain whatever permits are currently free; store the
+            # remainder in _pending_drain so __aexit__() can absorb them as
+            # inflight tasks complete. This fixes the dead-zone where all
+            # permits are in-flight and drained=0 on every cycle.
+            self._value -= step
             drained = 0
             for _ in range(step):
                 if self._sem._value > 0:  # type: ignore[attr-defined]
                     await self._sem.acquire()
                     drained += 1
-            self._value -= drained
+            lazy = step - drained
+            self._pending_drain += lazy
             log.info(
                 "[symbol_registry] AdaptiveSemaphore: p95=%.2fs > %.1fs -> "
-                "drop concurrency %d -> %d (drained=%d permits)",
+                "drop concurrency %d -> %d (eager_drained=%d pending_drain=%d)",
                 p95, _P95_DROP_THRESHOLD_S,
-                self._value + drained, self._value, drained,
+                self._value + step, self._value, drained, self._pending_drain,
             )
 
         else:
@@ -621,6 +676,14 @@ class SymbolRegistry:
         BUILD-ADAPTIVE-CONCURRENCY-MIN - _CONCURRENCY_MIN 10 -> 15:
           Corrected floor to match the approved spec (drop to 15 under
           p95 > 5s degradation, not 10).
+
+        ADAPTIVE-LAZY-DRAIN - fix drop dead-zone when all permits in-flight:
+          AdaptiveSemaphore._value is now decremented by the full step
+          immediately on a drop signal. Permits currently free are eagerly
+          consumed; the remainder are stored in _pending_drain and absorbed
+          one-by-one as inflight tasks return their permits in __aexit__().
+          Concurrency now actually reaches the target ceiling within ~step
+          task completions instead of never when all slots are busy.
         """
         from services.symbols_loader import SymbolQuote
 
