@@ -839,11 +839,19 @@ async def lifespan(app: FastAPI):
 
     # Step 4: Seed OCC chains from DB (P1 fallback — no Tradier call).
     if snapshot_id:
-        seeded = await registry.load_from_db(snapshot_id)
+        _db_count = await registry.load_from_db(snapshot_id)
         log.info(
             "[registry] DB chain seed: %d OCC contracts pre-loaded "
             "(is_ready=%s — waiting for build() to complete)",
-            seeded, registry.is_ready(),
+            _db_count, registry.is_ready(),
+        )
+        log.info(
+            "[universe] Step 2a HIT — registry ready: %d OCC symbols "
+            "(db_seed=%d, epoch=%d) path=%s",
+            registry.size(),
+            _db_count,
+            registry.epoch,
+            "warm" if _db_count > 0 else "cold",
         )
 
     log.info(
