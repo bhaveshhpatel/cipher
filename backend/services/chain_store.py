@@ -129,11 +129,30 @@ HOTFIX-SSL-EOF-2 (2026-05-13):
   from the start. No internal attribute access needed — this is the
   supported public API for disabling HTTP/2 in supabase-py >=2.3.
   The post-construction patch block and its warning log are removed.
+
+FIX #134 (2026-05-13): gate chain_refresh worker to market hours.
+  start_chain_refresh_worker() previously ran 24/7 with no market-hours
+  guard and no initial startup delay. On pre-market process restarts
+  (common on Render deploys) the worker immediately fired and hammered
+  Tradier /v1/markets/options/chains for every symbol — returning HTTP 400
+  on every call because options data is not available pre-market. At ~3s
+  per symbol across 3,834 symbols, one full pre-market cycle took ~3.2h,
+  meaning the worker was still churning 400s when market opened at 9:30 ET,
+  delaying valid chain data and polluting logs during the most critical window.
+
+  Fix:
+    _ET, _MARKET_OPEN, _MARKET_CLOSE: timezone-aware market-hours constants.
+    _is_market_hours(): returns True only Mon–Fri 09:30–16:05 ET.
+    _sleep_until_market_open(): async sleep until next 9:30 AM ET weekday.
+    Worker startup: if not _is_market_hours(), sleep until open before
+      first fetch cycle — no pre-market 400 spam.
+    Between cycles: if not _is_market_hours(), log DEBUG and skip cycle.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Awaitable, Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import httpx
 from supabase import create_client, Client
@@ -152,32 +171,28 @@ _DEFAULT_MAX_AGE_HOURS = 24
 
 # ---------------------------------------------------------------------------
 # HOTFIX-CHAIN-CONCURRENCY: cap concurrent save_chain batch writes.
-# Previously all batches (up to 155) fired simultaneously, each creating
-# its own Supabase client. 10 concurrent batches keeps memory flat and
-# avoids threadpool saturation while still being ~4x faster than sequential.
 # ---------------------------------------------------------------------------
 _SAVE_CONCURRENCY: int = 10
 
 # ---------------------------------------------------------------------------
 # ING-008: background refresh cadence for intraday vol/OI
-# One Tradier chain call per symbol per cycle.
-# At 300s cadence and 50 symbols -> ~10 req/min (limit: 120 req/min).
-# Revisit when universe exceeds ~200 symbols.
 # ---------------------------------------------------------------------------
 _CHAIN_REFRESH_INTERVAL_S: int = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
+# FIX #134: market-hours constants for chain refresh gate.
+# ---------------------------------------------------------------------------
+_ET = ZoneInfo("America/New_York")
+_MARKET_OPEN  = dt_time(9, 30)
+_MARKET_CLOSE = dt_time(16, 5)
+
+# ---------------------------------------------------------------------------
 # ING-008: in-process vol/OI cache
-#   Keyed by OCC symbol string.
-#   Value: {"volume": int, "open_interest": int, "refreshed_at": float}
-#   Populated / refreshed by start_chain_refresh_worker().
-#   Invalidated at market open via invalidate_vol_oi_cache().
 # ---------------------------------------------------------------------------
 _vol_oi_cache: Dict[str, Dict] = {}
 
 # ---------------------------------------------------------------------------
 # Epoch counter -- incremented on every successful save_chain().
-# Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
 # ---------------------------------------------------------------------------
 _epoch: int = 0
 
@@ -185,6 +200,47 @@ _epoch: int = 0
 def get_epoch() -> int:
     """Return the current chain_store mutation epoch (incremented per save_chain success)."""
     return _epoch
+
+
+def _is_market_hours() -> bool:
+    """
+    FIX #134: Return True only during NYSE market hours (Mon–Fri, 09:30–16:05 ET).
+
+    Used to gate start_chain_refresh_worker() — Tradier's options chains
+    endpoint returns HTTP 400 outside these hours, so there is no point
+    making API calls when the market is closed.
+    """
+    now = datetime.now(_ET)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return _MARKET_OPEN <= now.time() <= _MARKET_CLOSE
+
+
+async def _sleep_until_market_open() -> None:
+    """
+    FIX #134: Async-sleep until the next 9:30 AM ET weekday open.
+
+    Called at chain refresh worker startup when the process starts
+    pre-market (or on a weekend) to prevent immediately flooding Tradier
+    with HTTP 400s before options data is available.
+
+    Handles midnight rollover: if 9:30 has already passed today, targets
+    the next calendar day, then skips forward past any weekend days.
+    """
+    now = datetime.now(_ET)
+    next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now >= next_open:
+        next_open += timedelta(days=1)
+    # Skip Saturday (5) and Sunday (6)
+    while next_open.weekday() >= 5:
+        next_open += timedelta(days=1)
+    secs = (next_open - now).total_seconds()
+    log.info(
+        "[chain_store] Pre-market: chain refresh sleeping %.1f min until market open (%s ET)",
+        secs / 60,
+        next_open.strftime("%Y-%m-%d %H:%M"),
+    )
+    await asyncio.sleep(secs)
 
 
 def get_contract_vol_oi(occ_symbol: str) -> Tuple[Optional[int], Optional[int]]:
@@ -222,53 +278,67 @@ async def start_chain_refresh_worker(
     ING-008: Background asyncio task that refreshes intraday chain data
     (volume + OI per OCC symbol) for all stream-eligible tracked symbols.
 
-    Runs every _CHAIN_REFRESH_INTERVAL_S seconds (default: 300s / 5 min).
+    Runs every _CHAIN_REFRESH_INTERVAL_S seconds (default: 300s / 5 min)
+    ONLY during market hours (Mon–Fri 09:30–16:05 ET).
+
+    FIX #134: Two problems in the original implementation:
+
+    Problem 1 — No initial sleep:
+      The original worker called asyncio.sleep(300) first, so it waited
+      5 minutes before the first cycle. But on a pre-market deploy, that
+      5-minute sleep still expired pre-market and the first fetch cycle
+      would spam Tradier with 400s before options data existed.
+
+    Problem 2 — No market-hours guard between cycles:
+      After each cycle the worker slept 300s and fired again regardless of
+      market hours. Outside 09:30–16:05 ET, every Tradier chain call
+      returns HTTP 400. With 3,834 symbols at ~3s/symbol, one full off-hours
+      cycle took ~3.2h — the worker could still be churning 400s when the
+      market opened, delaying valid chain data and polluting logs.
+
+    Fix:
+      - On startup: call _sleep_until_market_open() if _is_market_hours()
+        returns False. This defers the first fetch cycle until 09:30 ET,
+        eliminating all pre-market 400 noise on Render restarts.
+      - Between cycles: if _is_market_hours() is False, log at DEBUG and
+        skip the fetch — no Tradier API calls made outside market hours.
 
     Parameters
     ----------
     get_tracked_symbols : Callable[[], list]
-        Zero-argument callable that returns the current list of tracked
-        ticker symbols (e.g. lambda: list(registry.tickers())).  Called
-        fresh on each cycle so newly added symbols are picked up.
+        Zero-argument callable returning current list of tracked ticker
+        symbols. Called fresh each cycle so new symbols are picked up.
 
     fetch_chain_fn : Callable[[str], Awaitable[list]]
-        Async callable that accepts a ticker symbol string and returns a
-        list of contract dicts from Tradier GET /markets/options/chains.
-        Each dict must contain at minimum:
-          - "symbol"        : str  (OCC symbol)
-          - "volume"        : int
-          - "open_interest" : int
-        On error it should return [] (never raise) so one bad symbol does
-        not abort the entire refresh cycle.
+        Async callable accepting a ticker string, returning a list of
+        contract dicts from Tradier GET /markets/options/chains.
+        Must contain at minimum: "symbol" (str), "volume" (int),
+        "open_interest" (int). Must return [] on error (never raise).
 
     API budget
     ----------
-    One call per symbol per cycle.  At 300s cadence, 50 symbols -> 10 req/min.
-    Tradier rate limit: 120 req/min.  Headroom: ~110 req/min for stream.
-    Scale note: if symbol universe exceeds ~200, increase interval to 600s.
-
-    Cache population
-    ----------------
-    Writes directly into _vol_oi_cache[occ_symbol] = {
-        "volume": int, "open_interest": int, "refreshed_at": epoch_float
-    }.
-    flow_store.persist_flow_event and persist_flow_episode call
-    get_contract_vol_oi(occ_symbol) for a zero-API-call lookup.
-
-    Volume reset
-    ------------
-    _vol_oi_cache is NOT cleared here between cycles -- it is invalidated
-    at market open by calling invalidate_vol_oi_cache() from the stream
-    market-open handler.  This prevents yesterday's volume from bleeding
-    into pre-market / early-morning events.
+    One call per symbol per cycle. At 300s cadence, 50 symbols -> 10 req/min.
+    Tradier rate limit: 120 req/min. Scale: increase interval to 600s if
+    universe exceeds ~200 symbols.
     """
     log.info(
         "[chain_store] chain refresh worker started -- interval=%ds",
         _CHAIN_REFRESH_INTERVAL_S,
     )
+
+    # FIX #134 — Problem 1: sleep until market open on startup if pre-market.
+    if not _is_market_hours():
+        await _sleep_until_market_open()
+
     try:
         while True:
             await asyncio.sleep(_CHAIN_REFRESH_INTERVAL_S)
+
+            # FIX #134 — Problem 2: skip fetch cycles outside market hours.
+            if not _is_market_hours():
+                log.debug("[chain_store] Outside market hours — skipping chain refresh cycle")
+                continue
+
             symbols = get_tracked_symbols()
             if not symbols:
                 log.debug("[chain_store] chain refresh: no tracked symbols yet, skipping cycle")
@@ -311,19 +381,6 @@ async def start_chain_refresh_worker(
 def _client() -> Client:
     """
     HOTFIX-SSL-EOF-2: force HTTP/1.1 via ClientOptions http_options.
-
-    The previous approach patched client.postgrest._client.session after
-    construction, but supabase-py >=2.x builds the postgrest httpx client
-    lazily and the internal attribute path changed — the patch always fell
-    into the except branch and the "Could not patch" warning was logged.
-
-    Fix: pass http_options={"http2": False} through ClientOptions so
-    postgrest-py constructs its httpx.Client with HTTP/1.1 from the start.
-    This is the supported public API — no internal attribute access required.
-
-    HTTP/1.1 opens a fresh connection per request, making stale-connection
-    SSL EOF errors impossible. PostgREST upserts are not multiplexed so
-    there is no throughput regression from disabling HTTP/2.
     """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
@@ -346,24 +403,6 @@ async def save_chain(
     """
     HOTFIX-CHAIN-CONCURRENCY + C-1: Persist all ContractMeta rows with
     bounded concurrency via a single shared Supabase client.
-
-    Previously _client() was called inside _upsert_batch, creating one new
-    Supabase connection pool per batch. With 155 batches firing concurrently
-    via asyncio.gather, this instantiated 155 clients simultaneously -- spiking
-    memory and saturating the threadpool, causing OOM restarts and health probe
-    failures on Render.
-
-    Fix:
-      - ONE _client() call outside the batch loop, shared by all batches.
-      - asyncio.Semaphore(_SAVE_CONCURRENCY=10) caps concurrent
-        run_in_executor threads to 10 at a time.
-
-    Wall time: ~300ms (155 concurrent) -> ~1.5s (10 at a time).
-    Still ~4x faster than the original sequential 5.8s path.
-    Zero impact on streaming: save_chain is called only at startup and
-    every 24h; the hot-path vol/OI lookups use _vol_oi_cache exclusively.
-
-    Increments the module-level _epoch counter on success.
     """
     global _epoch
 
@@ -390,7 +429,6 @@ async def save_chain(
     batches   = [rows[i : i + _BATCH_SIZE] for i in range(0, total, _BATCH_SIZE)]
     n_batches = len(batches)
 
-    # HOTFIX-CHAIN-CONCURRENCY: single client shared across all batches.
     sb  = _client()
     sem = asyncio.Semaphore(_SAVE_CONCURRENCY)
 
@@ -510,8 +548,6 @@ def _paginate_chain(sb: Client, snapshot_id: str) -> "dict[str, 'ContractMeta']"
             open_interest = int(row["open_interest"]),
             tier          = int(row.get("tier") or 3),
         )
-        # ING-008: attach volume if the ContractMeta dataclass supports it;
-        # use setattr so this is non-breaking if the field hasn't been added yet.
         vol = row.get("volume")
         if vol is not None:
             try:
@@ -529,14 +565,6 @@ def _find_latest_cached_snapshot(
     """
     C-2 FIX: Return the snapshot_id of the most-recently inserted row in
     options_chain_cache that is within max_age_hours of now.
-
-    Previously returned ANY snapshot regardless of age, causing expired
-    contracts (DTE=0 or negative) to silently load on warm restart when
-    a chain from >24h ago was the only cached snapshot.
-
-    Now filters inserted_at >= (now - max_age_hours) before selecting.
-    Returns None if no snapshot within the window exists, forcing a fresh
-    build() rather than loading stale data.
     """
     try:
         cutoff = (
