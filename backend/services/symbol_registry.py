@@ -276,6 +276,20 @@ FIX SINGLETON (2026-05-13): add init_registry() / get_registry() module-level
   constructs the single SymbolRegistry instance; get_registry() returns it
   and raises RuntimeError if called before init_registry(). Pattern mirrors
   gate_config_store.init_store() / get_store() already used in this codebase.
+
+FIX REFRESH-LOOP (2026-05-13): add refresh_loop() method to SymbolRegistry.
+  main.py line 883 calls registry.refresh_loop() inside the lifespan context,
+  but the method was never ported from stable/ingestion-frontend-2026-04-29
+  to main. This caused an AttributeError crash on every deploy.
+
+  The loop:
+    - reads REGISTRY_EXPIRY_DAY_REFRESH_MINS and REGISTRY_REFRESH_MINS from
+      DB config via get_config()
+    - checks whether any loaded contract expires today to pick the interval
+    - sleeps the interval, then calls self.build() (H3 incremental on warm
+      restarts — only DTE=0 tickers are re-fetched)
+    - catches and logs any build() exceptions as non-fatal so the loop
+      continues on the next cycle
 """
 import asyncio
 import collections
@@ -881,233 +895,4 @@ class SymbolRegistry:
             except Exception as exc:
                 log.error(
                     "[symbol_registry] Post-build assign_tiers failed: %s — "
-                    "carrying forward prior tier map",
-                    exc,
-                )
-                new_tier_map = self._tier_map
-
-            # Stamp tier onto each ContractMeta
-            for meta in new_registry.values():
-                meta.tier = new_tier_map.get(meta.ticker, 3)
-
-            # Atomic swap
-            self._registry      = new_registry
-            self._oi_by_ticker  = new_oi_map
-            self._tier_map      = new_tier_map
-            self._last_build    = datetime.utcnow()
-            self._build_complete = True
-            self.epoch          += 1
-
-            t1 = sum(1 for m in new_registry.values() if m.tier == 1)
-            t2 = sum(1 for m in new_registry.values() if m.tier == 2)
-            t3 = sum(1 for m in new_registry.values() if m.tier == 3)
-            log.info(
-                "[symbol_registry] Build complete: %d OCC symbols (T1=%d T2=%d T3=%d) "
-                "(was %d, delta=%+d) | OI map: %d tickers | _build_complete=True epoch=%d "
-                "- stream workers may now spawn",
-                len(new_registry), t1, t2, t3,
-                len(self._registry) - len(new_registry),  # pre-swap size already replaced
-                len(new_registry),
-                len(new_oi_map),
-                self.epoch,
-            )
-
-        # Return (count, raw_quotes) — H1 contract
-        return len(new_registry), {}
-
-    async def _persist_to_db(self, snapshot_id: str) -> None:
-        from services.chain_store import save_chain
-        try:
-            await save_chain(snapshot_id, self._registry)
-            self._persisted_snapshot_id = snapshot_id
-            log.info(
-                "[symbol_registry] _persist_to_db: saved %d OCC contracts to snapshot %s",
-                len(self._registry), snapshot_id,
-            )
-        except Exception as exc:
-            log.warning(
-                "[symbol_registry] _persist_to_db error (non-fatal): %s", exc
-            )
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers (called by SymbolRegistry.build)
-# ---------------------------------------------------------------------------
-
-async def _fetch_stock_prices(tickers: list[str]) -> dict[str, float]:
-    """Batch-fetch last prices for all tickers via get_quotes_batch."""
-    if not tickers:
-        return {}
-    prices: dict[str, float] = {}
-    batch_size = 200
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i : i + batch_size]
-        try:
-            quotes = await get_quotes_batch(batch)
-            for q in quotes:
-                sym = getattr(q, "symbol", None) or q.get("symbol", "")
-                last = getattr(q, "last", None) or q.get("last", 0.0)
-                if sym and last and float(last) > 0:
-                    prices[sym] = float(last)
-        except Exception as exc:
-            log.warning("[symbol_registry] _fetch_stock_prices batch %d error: %s", i // batch_size, exc)
-    return prices
-
-
-async def _build_ticker(
-    ticker: str,
-    prices: dict[str, float],
-    tier_params: dict[int, "_TierParams"],
-    new_registry: dict[str, "ContractMeta"],
-    zero_price_fallback: bool,
-) -> None:
-    """Fetch all expiration chains for one ticker and populate new_registry."""
-    try:
-        expirations = await get_expirations(ticker)
-    except Exception as exc:
-        log.warning("[symbol_registry] get_expirations(%s) error: %s", ticker, exc)
-        return
-
-    if not expirations:
-        return
-
-    stock_price = prices.get(ticker, 0.0)
-    if stock_price <= 0 and not zero_price_fallback:
-        log.warning(
-            "[symbol_registry] No price for %s — using ATM bypass (zero_price_fallback)",
-            ticker,
-        )
-
-    # Determine tier for this ticker (default T3 if not yet classified)
-    # Use T3 params as the widest safe default for unknown tickers on cold build
-    tier = 3
-    params = tier_params[tier]
-
-    today = date.today()
-    for expiry_str in expirations:
-        try:
-            expiry_date = date.fromisoformat(expiry_str)
-        except ValueError:
-            continue
-        dte = (expiry_date - today).days
-        if dte < 0:
-            continue
-        if dte > params.max_dte:
-            continue
-
-        try:
-            chain = await asyncio.wait_for(
-                get_option_chain_bulk(ticker, expiry_str),
-                timeout=_CHAIN_REQUEST_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            log.warning(
-                "[symbol_registry] Chain fetch timeout (%ds): %s %s — skipping expiry",
-                _CHAIN_REQUEST_TIMEOUT_S, ticker, expiry_str,
-            )
-            continue
-        except Exception as exc:
-            log.warning(
-                "[symbol_registry] Chain fetch error: %s %s — %s",
-                ticker, expiry_str, exc,
-            )
-            continue
-
-        if not chain:
-            continue
-
-        for contract in chain:
-            occ    = getattr(contract, "symbol", None) or contract.get("symbol", "")
-            strike = float(getattr(contract, "strike", 0) or contract.get("strike", 0))
-            ctype  = getattr(contract, "option_type", "") or contract.get("option_type", "")
-            oi     = int(getattr(contract, "open_interest", 0) or contract.get("open_interest", 0))
-
-            if not occ:
-                continue
-
-            # ATM filter
-            if stock_price > 0 and not zero_price_fallback:
-                atm_low  = stock_price * (1 - params.atm_pct)
-                atm_high = stock_price * (1 + params.atm_pct)
-                if not (atm_low <= strike <= atm_high):
-                    continue
-
-            new_registry[occ] = ContractMeta(
-                ticker        = ticker,
-                strike        = strike,
-                expiry        = expiry_str,
-                contract_type = ctype,
-                dte           = dte,
-                open_interest = oi,
-                tier          = tier,
-            )
-
-    log.debug("[symbol_registry] _build_ticker(%s): %d contracts added", ticker, sum(
-        1 for m in new_registry.values() if m.ticker == ticker
-    ))
-
-
-# ---------------------------------------------------------------------------
-# Module-level singleton — mirrors gate_config_store pattern
-# ---------------------------------------------------------------------------
-# FIX SINGLETON (2026-05-13): main.py line 151 imports init_registry and
-# get_registry but neither was defined here, causing an ImportError on every
-# deploy. init_registry() constructs and stores the single SymbolRegistry
-# instance; get_registry() returns it, raising RuntimeError if called before
-# initialisation.
-
-_registry_instance: Optional[SymbolRegistry] = None
-
-
-def init_registry(
-    watchlist: Optional[list[str]] = None,
-    tier_map: Optional[dict[str, int]] = None,
-) -> SymbolRegistry:
-    """
-    Construct and store the process-wide SymbolRegistry singleton.
-
-    Call once during application startup (main.py lifespan) before any
-    consumer calls get_registry(). Calling a second time replaces the
-    existing instance — intentional for test isolation only.
-
-    Parameters
-    ----------
-    watchlist : list[str] | None
-        Ticker symbols to include in the registry build.
-    tier_map : dict[str, int] | None
-        Optional pre-seeded tier classification (ticker -> 1/2/3).
-        If omitted, tier map is populated by the first build() call.
-
-    Returns
-    -------
-    SymbolRegistry
-        The newly created singleton instance.
-    """
-    global _registry_instance
-    _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
-    log.info(
-        "[symbol_registry] init_registry: singleton created "
-        "(watchlist=%d tickers, tier_map=%d entries)",
-        len(watchlist or []),
-        len(tier_map or {}),
-    )
-    return _registry_instance
-
-
-def get_registry() -> SymbolRegistry:
-    """
-    Return the process-wide SymbolRegistry singleton.
-
-    Raises
-    ------
-    RuntimeError
-        If called before init_registry() has been called (programming error —
-        startup order violation).
-    """
-    if _registry_instance is None:
-        raise RuntimeError(
-            "get_registry() called before init_registry(). "
-            "Ensure init_registry() is invoked during application startup "
-            "before any consumer accesses the registry."
-        )
-    return _registry_instance
+                    "carrying forward prior tier 
