@@ -26,6 +26,17 @@ B-023 — Explicit 429 Handling:
   If Tradier returns HTTP 429, get_session_token() reads the
   Retry-After header (default 10s if absent) and sleeps that long before retrying.
 
+Fix (SEM-STREAM 2026-05-12): expose acquire_session_token_slot() for
+  tradier_stream._get_session_token() which has its own private token-fetch
+  implementation and previously bypassed _SESSION_SEM entirely. The slot
+  coroutine tries to acquire _SESSION_SEM within a derived timeout
+  (_SESSION_RETRY_DELAY * _SESSION_RETRY_MAX = 6s) and returns a bool
+  indicating whether the semaphore was acquired. The caller (tradier_stream)
+  is responsible for releasing _SESSION_SEM in its finally block.
+  This restores B-022 burst protection for all token-fetch paths while
+  preserving worker isolation — a timed-out acquire proceeds without the
+  semaphore rather than blocking indefinitely.
+
 Public API:
   get_quote(symbol)                          -> Optional[dict]
   get_quotes_batch(symbols)                  -> dict[str, dict]
@@ -35,6 +46,7 @@ Public API:
   get_options_chain(symbol, expiration)      -> list[dict]   (alias for get_option_chain)
   get_session_token()                        -> Optional[str]
   get_token()                                -> Optional[str]  (alias)
+  acquire_session_token_slot(timeout_s)      -> bool  (for tradier_stream)
 
 All methods return None / [] on error — callers must handle gracefully.
 """
@@ -58,11 +70,20 @@ _CHAIN_SEM       = asyncio.Semaphore(2)
 # 10 concurrent × ~0.6s/req = ~16 req/s; outer build sem(50) bounds ticker tasks
 _BULK_CHAIN_SEM  = asyncio.Semaphore(10)
 
-# B-022: max 3 concurrent session token fetches
+# B-022: max 3 concurrent session token fetches across ALL callers
+# (stream_worker.py via get_session_token() + tradier_stream.py via
+# acquire_session_token_slot()).  Both paths share this one semaphore.
 _SESSION_SEM     = asyncio.Semaphore(3)
 
 # B-023: fallback Retry-After sleep when header is absent
 _DEFAULT_RETRY_AFTER_S: float = 10.0
+
+# SEM-STREAM: semaphore-acquire timeout constants.
+# tradier_stream._get_session_token() uses _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
+# as its acquire timeout so a worker that cannot get a slot within one full
+# retry-round duration proceeds independently rather than blocking indefinitely.
+_SESSION_RETRY_DELAY: float = 2.0   # seconds between retry attempts
+_SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 
 
 def _headers() -> dict:
@@ -70,6 +91,40 @@ def _headers() -> dict:
         "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
         "Accept":        "application/json",
     }
+
+
+async def acquire_session_token_slot(
+    timeout_s: Optional[float] = None,
+) -> bool:
+    """
+    Try to acquire the shared _SESSION_SEM slot within timeout_s.
+
+    Returns True  if the slot was acquired (caller MUST release via
+                  _SESSION_SEM.release() in a finally block).
+    Returns False if timeout_s elapsed before a slot was available
+                  (caller proceeds without semaphore — isolation wins).
+
+    Default timeout = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6s).
+    Rationale: a worker that cannot get a slot in the time it would take
+    one full retry round to complete should proceed independently rather
+    than stalling behind a potentially hung peer.
+
+    SEM-STREAM (2026-05-12): introduced so tradier_stream._get_session_token()
+    can participate in the B-022 semaphore without merging its implementation
+    into get_session_token() (which would break worker isolation).
+    """
+    if timeout_s is None:
+        timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
+    try:
+        await asyncio.wait_for(_SESSION_SEM.acquire(), timeout=timeout_s)
+        return True
+    except asyncio.TimeoutError:
+        log.debug(
+            "[tradier_client] acquire_session_token_slot timed out after %.1fs — "
+            "proceeding without semaphore",
+            timeout_s,
+        )
+        return False
 
 
 async def get_quote(symbol: str) -> Optional[dict]:
@@ -141,7 +196,7 @@ async def get_option_chain(symbol: str, expiration: str) -> list[dict]:
     """
     Fetch full option chain for ticker + expiry.
     Uses _CHAIN_SEM(2) — conservative semaphore for the live streaming path.
-    Keeps flow ingestion well under Tradier’s 120 req/min rate limit.
+    Keeps flow ingestion well under Tradier's 120 req/min rate limit.
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
     async with _CHAIN_SEM:
@@ -187,7 +242,7 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
                     params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
                 )
             if resp.status_code == 429:
-                # Back off and retry once — don’t crash the whole build
+                # Back off and retry once — don't crash the whole build
                 retry_after = float(
                     resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER_S)
                 )
