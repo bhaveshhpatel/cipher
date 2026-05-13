@@ -260,6 +260,21 @@ Fix (BUG-REGISTRY-KWARG 2026-05-13): remove stale registry= kwarg from
   Fix: remove registry=registry from the call. min_premium= is unchanged.
   The registry enrichment inside parse_tradier_trade() uses get_registry()
   internally and never needed the caller to pass it.
+
+Fix (BUG-OCC-ATTR 2026-05-13): replace ev.occ_symbol with ev.occ in
+  IngestionProcessor drop log inside _process_trade().
+  OptionsFlowEvent exposes the OCC symbol as .occ, not .occ_symbol.
+  Accessing .occ_symbol raised AttributeError on every processor-dropped tick,
+  turning a routine gate drop into an unhandled exception and incrementing
+  _stats["errors"] spuriously.
+
+Fix (BUG-PERSIST-DICT 2026-05-13): pass ev.__dict__ to persist_flow_event().
+  persist_flow_event() expects a plain dict and accesses all fields via
+  ev_dict.get(). Passing the raw OptionsFlowEvent object caused
+  AttributeError: 'OptionsFlowEvent' object has no attribute 'get' on every
+  persisted tick, incrementing _stats["errors"] on every event and writing
+  zero rows to flow_events. Fix: call persist_flow_event(ev.__dict__) so the
+  function receives the correct dict representation of the event.
 """
 import asyncio
 import logging
@@ -992,9 +1007,10 @@ async def _process_trade(raw: dict, registry=None) -> None:
     # --- REARCH-002: IngestionProcessor 4-gate filter ---
     processed = _ingestion_processor.process(ev, tier=_ev_tier_int)
     if processed is None:
+        # BUG-OCC-ATTR: OptionsFlowEvent exposes the OCC symbol as .occ, not .occ_symbol.
         log.info(
             "[stream] tick dropped by IngestionProcessor: symbol=%r tier=%d",
-            ev.occ_symbol, _ev_tier_int,
+            ev.occ, _ev_tier_int,
         )
         return
     ev = processed
@@ -1010,20 +1026,22 @@ async def _process_trade(raw: dict, registry=None) -> None:
     sig_ep = accumulator.get_signal(ev)
 
     # --- Persist flow event (fire-and-forget) ---
-    t = asyncio.create_task(persist_flow_event(ev))
+    # BUG-PERSIST-DICT: persist_flow_event() expects a plain dict (uses .get()).
+    # Pass ev.__dict__ so all OptionsFlowEvent fields are accessible as dict keys.
+    t = asyncio.create_task(persist_flow_event(ev.__dict__))
     t.add_done_callback(_persist_done_cb)
     _stats["persisted"] += 1
     log.info(
         "[stream] persisted flow event: symbol=%r premium=$%.0f tier=%d",
-        ev.occ_symbol, ev.premium, _ev_tier_int,
+        ev.occ, ev.premium, _ev_tier_int,
     )
 
     # --- Sweep upgrade check ---
-    if ev.is_sweep and ev.occ_symbol:
-        dispatch_key = f"{ev.occ_symbol}|{ev.size}|{ev.fill_price}"
+    if ev.is_sweep and ev.occ:
+        dispatch_key = f"{ev.occ}|{ev.size}|{ev.fill_price}"
         if dispatch_key not in _sweep_upgrade_dispatched:
             _sweep_upgrade_dispatched[dispatch_key] = now
-            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol))
+            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ))
 
     if sig_ep is None:
         _stats["accumulator_gated"] += 1
@@ -1047,7 +1065,7 @@ async def _process_trade(raw: dict, registry=None) -> None:
     alert_level = accumulator.get_alert_level(sig_ep)
 
     # --- SIG-DEBOUNCE ---
-    emit_key = f"{ev.occ_symbol}"
+    emit_key = f"{ev.occ}"
     should_emit, reason = _should_emit_signal(
         emit_key=emit_key,
         alert_level=alert_level,
@@ -1057,7 +1075,7 @@ async def _process_trade(raw: dict, registry=None) -> None:
 
     if not should_emit:
         _stats["sig_debounced"] += 1
-        log.info("[stream] signal suppressed for %r: %s", ev.occ_symbol, reason)
+        log.info("[stream] signal suppressed for %r: %s", ev.occ, reason)
         return
 
     _signal_last_emit[emit_key] = {
@@ -1072,7 +1090,7 @@ async def _process_trade(raw: dict, registry=None) -> None:
         composite = build_composite(sig_ep, registry=registry)
     except Exception as exc:
         _stats["composite_errors"] += 1
-        log.warning("[stream] build_composite error for %r: %s", ev.occ_symbol, exc)
+        log.warning("[stream] build_composite error for %r: %s", ev.occ, exc)
 
     if composite is None:
         return
@@ -1082,13 +1100,13 @@ async def _process_trade(raw: dict, registry=None) -> None:
     _stats["signals"] += 1
     log.info(
         "[stream] SIGNAL %s | %s | alert=%s | premium=$%.0f | score=%.3f | reason=%s",
-        ev.ticker, ev.occ_symbol, alert_level,
+        ev.ticker, ev.occ, alert_level,
         sig_ep.total_premium, composite.score, reason,
     )
 
     # --- Multiday lookback result (cached) ---
     is_repeat: bool = False
-    lbc_key = ev.occ_symbol
+    lbc_key = ev.occ
     if lbc_key in _lookback_result_cache:
         is_repeat, _ = _lookback_result_cache[lbc_key]
     elif _lbc_fresh(lbc_key):
@@ -1100,7 +1118,7 @@ async def _process_trade(raw: dict, registry=None) -> None:
     # --- Publish composite signal ---
     payload = {
         "ticker":              ev.ticker,
-        "occ_symbol":          ev.occ_symbol,
+        "occ_symbol":          ev.occ,
         "contract_type":       ev.contract_type,
         "strike":              ev.strike,
         "expiry":              ev.expiry.isoformat() if ev.expiry else None,
