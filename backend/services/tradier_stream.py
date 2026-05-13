@@ -233,17 +233,16 @@ Fix (F8/F2 2026-05-10): add _demo_mode_once — cancellable supervised demo fall
   cancellable. On each tick it publishes a synthetic composite_signal payload so
   F8-emits test passes. CancelledError propagates cleanly.
 
-Fix (SESSION-SEM-STREAM 2026-05-12): wire _SESSION_SEM into _get_session_token.
-  tradier_stream._get_session_token() is a private implementation separate from
-  utils/tradier_client.get_session_token(). stream_worker.py calls the latter
-  (semaphore-protected); tradier_stream calls the former (unprotected). On a
-  simultaneous burst restart all stream reconnects bypass _SESSION_SEM entirely,
-  defeating B-022. Fix: import acquire_session_token_slot + _SESSION_SEM from
-  utils.tradier_client. Acquire a semaphore slot before the retry loop; release
-  in finally. If acquire times out (default 6s = _SESSION_RETRY_DELAY * max),
-  proceed without semaphore — isolation wins over burst protection at that point.
-  Worst-case per-worker block: acquire_wait(6s) + HTTP_timeout(15s) = 21s,
-  fully bounded. Hot path (_process_trade) is completely untouched.
+Fix (SEM-STREAM 2026-05-12): wire _SESSION_SEM into _get_session_token().
+  _get_session_token() was a private implementation that never called
+  utils.tradier_client.get_session_token() and therefore bypassed _SESSION_SEM
+  entirely. On a simultaneous Railway restart with many tradier_stream workers,
+  all workers burst-fetched tokens concurrently, negating B-022 protection.
+  Fix: _get_session_token() now calls acquire_session_token_slot() from
+  utils.tradier_client before its retry loop and releases _SESSION_SEM in a
+  finally block. timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6s).
+  If acquire times out, proceeds without semaphore — isolation preserved.
+  Hot path (_process_trade) is completely untouched.
 """
 import asyncio
 import logging
@@ -281,10 +280,17 @@ from utils.contract_day_cache import (
 # ING-010: tier-aware gate config store singleton.
 # The module exports `store`; aliased here so all internal references remain unchanged.
 from services.gate_config_store import store as gate_config_store
-# SESSION-SEM-STREAM: import semaphore primitives from utils.tradier_client so
-# _get_session_token() participates in the shared B-022 burst-protection semaphore
-# without merging implementations (which would lose worker isolation).
-from utils.tradier_client import acquire_session_token_slot, _SESSION_SEM
+# SEM-STREAM: shared session semaphore helpers from utils.tradier_client.
+# acquire_session_token_slot() tries to claim a _SESSION_SEM slot with a
+# bounded timeout so tradier_stream workers participate in B-022 burst
+# protection without merging their token-fetch implementation into
+# get_session_token() (which would break per-worker isolation).
+from utils.tradier_client import (
+    acquire_session_token_slot,
+    _SESSION_SEM as _tradier_session_sem,
+    _SESSION_RETRY_DELAY as _TC_RETRY_DELAY,
+    _SESSION_RETRY_MAX as _TC_RETRY_MAX,
+)
 
 log = logging.getLogger("tradier_stream")
 
@@ -511,6 +517,94 @@ async def _demo_mode_once(symbols: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SEM-STREAM: _get_session_token() — now participates in _SESSION_SEM.
+#
+# Previously this was a fully private implementation with no awareness of
+# the _SESSION_SEM semaphore defined in utils/tradier_client.py.  All
+# stream_worker.py workers use utils.tradier_client.get_session_token()
+# which is correctly guarded by _SESSION_SEM(3).  But tradier_stream workers
+# called this function instead, bypassing the semaphore entirely.
+#
+# Fix: acquire a _SESSION_SEM slot via acquire_session_token_slot() at the
+# top of this function.  The acquire uses a timeout of
+# _TC_RETRY_DELAY * _TC_RETRY_MAX (= 6s, same constants as tradier_client)
+# so a worker that cannot get a slot in one full retry-round proceeds
+# independently (isolation wins) rather than blocking indefinitely.
+# The slot is always released in the finally block.
+#
+# The retry loop, backoff constants, and return-value semantics are
+# completely unchanged — this is a pure wrapping change.
+# ---------------------------------------------------------------------------
+async def _get_session_token() -> Optional[str]:
+    """
+    Fetch a fresh Tradier streaming session token for this stream worker.
+
+    SEM-STREAM: acquires the shared _SESSION_SEM slot (max 3 concurrent across
+    ALL callers including stream_worker.py) via acquire_session_token_slot().
+    If the slot cannot be acquired within _TC_RETRY_DELAY * _TC_RETRY_MAX
+    seconds, proceeds without semaphore so this worker is never stalled by a
+    hung peer.  Slot is always released in the finally block.
+    """
+    url = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
+    headers = {
+        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+        "Accept":        "application/json",
+    }
+    # SEM-STREAM: acquire shared semaphore slot with bounded timeout.
+    _slot_acquired = await acquire_session_token_slot(
+        timeout_s=_TC_RETRY_DELAY * _TC_RETRY_MAX
+    )
+    try:
+        for attempt in range(_SESSION_RETRY_MAX):
+            try:
+                async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
+                    resp = await client.post(url, headers=headers, data={})
+
+                if resp.status_code == 429:
+                    retry_after = float(
+                        resp.headers.get("Retry-After", 10.0)
+                    )
+                    log.warning(
+                        "[stream] session token 429 — Retry-After %.0fs (attempt %d/%d)",
+                        retry_after, attempt + 1, _SESSION_RETRY_MAX,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                if resp.status_code == 401:
+                    log.error(
+                        "[stream] session token 401 — bad TRADIER_API_KEY "
+                        "(attempt %d/%d)",
+                        attempt + 1, _SESSION_RETRY_MAX,
+                    )
+                    return None
+
+                resp.raise_for_status()
+                token = resp.json().get("stream", {}).get("sessionid")
+                if token:
+                    return token
+                log.warning(
+                    "[stream] session response missing sessionid: %s",
+                    resp.text[:200],
+                )
+                return None
+
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                log.warning(
+                    "[stream] session fetch attempt %d/%d failed: %s",
+                    attempt + 1, _SESSION_RETRY_MAX, e,
+                )
+                if attempt < _SESSION_RETRY_MAX - 1:
+                    await asyncio.sleep(_SESSION_RETRY_DELAY)
+
+        return None
+    finally:
+        # SEM-STREAM: release slot only if we acquired it.
+        if _slot_acquired:
+            _tradier_session_sem.release()
+
+
+# ---------------------------------------------------------------------------
 # ING-010: Tier-aware min_premium resolver
 # ING-012: calls influence_tier_int() directly — influence_tier_string() deleted.
 # ---------------------------------------------------------------------------
@@ -554,14 +648,13 @@ def _resolve_min_premium(ticker: str) -> int:
 # ---------------------------------------------------------------------------
 def _resolve_tier_int(raw_ticker: str) -> int:
     """
-    Resolve the integer influence tier for a raw ticker symbol.
+    Resolve the dedup tier_int for a ticker using the symbol registry.
 
-    Resolution path (ING-012):
-      1. Ask the registry for the ticker's tier via influence_tier_int().
-         Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
+    Used by _process_trade() to pass tier_int to flow_dedup.is_duplicate()
+    without relying on ev.influence_tier (removed in REARCH-010/migration 024).
 
-    Falls back to _DEFAULT_TIER_INT (3) on any error or cold registry.
-    Never raises. Safe on the hot path.
+    Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
+    Never raises.
     """
     try:
         reg = None
@@ -576,111 +669,46 @@ def _resolve_tier_int(raw_ticker: str) -> int:
                 return reg.influence_tier_int(raw_ticker)
             except Exception:
                 pass
+
         return _DEFAULT_TIER_INT
     except Exception:
         return _DEFAULT_TIER_INT
 
 
 # ---------------------------------------------------------------------------
-# ING-010: Signal gate debounce resolver
+# ING-010-GATES: live signal_debounce_ms resolver
 # ---------------------------------------------------------------------------
 def _resolve_signal_debounce_s() -> float:
-    """
-    Resolve the live signal debounce in seconds from gate_config_store.
-    Falls back to _SIGNAL_DEBOUNCE_S (30s) when store is cold or key absent.
-    """
     try:
-        ms = gate_config_store.get("signal_debounce_ms", 1)  # T1 canonical row
-        if ms is not None:
-            return float(ms) / 1000.0
+        raw_ms = gate_config_store.get("signal_debounce_ms", 1)
+        if raw_ms is not None and raw_ms > 0:
+            return float(raw_ms) / 1000.0
     except Exception:
         pass
     return _SIGNAL_DEBOUNCE_S
 
 
 # ---------------------------------------------------------------------------
-# SESSION-SEM-STREAM: Session token fetch with shared semaphore protection.
-#
-# Wraps the private HTTP retry loop with acquire_session_token_slot() from
-# utils.tradier_client so concurrent stream reconnects are bounded by the
-# same _SESSION_SEM(3) that already protects stream_worker.py.
-#
-# Design:
-#   - acquire_session_token_slot(timeout_s) tries asyncio.wait_for(_SESSION_SEM.acquire())
-#   - Returns True (slot held) or False (timed out — proceed without semaphore)
-#   - If True: caller MUST release via _SESSION_SEM.release() in finally
-#   - timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6.0s) — derived,
-#     not magic. A worker that can't get a slot in one full retry round proceeds
-#     independently (isolation wins over burst protection at saturation).
-#
-# This function is intentionally NOT merged with utils.tradier_client.get_session_token()
-# to preserve worker isolation: each stream reconnect manages its own retry loop
-# and HTTP lifecycle independently.
+# ING-010-GATES: live signal_min_premium resolver
 # ---------------------------------------------------------------------------
-async def _get_session_token() -> Optional[str]:
-    """
-    Fetch a fresh Tradier streaming session token for stream reconnects.
-
-    SESSION-SEM-STREAM: acquires a slot from the shared _SESSION_SEM(3)
-    (B-022) before the retry loop to prevent simultaneous burst restarts
-    from flooding Tradier with concurrent token fetches. If the acquire
-    times out (default 6s), proceeds without semaphore — worker isolation
-    is preserved at the cost of burst protection for this one worker.
-
-    Returns sessionid string on success, None on all-retries-exhausted failure.
-    """
-    url = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
-    headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept":        "application/json",
-    }
-
-    # Acquire shared semaphore slot — bounded wait preserves worker isolation.
-    # timeout_s is derived: _SESSION_RETRY_DELAY(2.0) * _SESSION_RETRY_MAX(3) = 6.0s
-    slot_acquired = await acquire_session_token_slot(
-        timeout_s=_SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
-    )
+def _resolve_signal_min_premium() -> float:
     try:
-        for attempt in range(_SESSION_RETRY_MAX):
-            try:
-                async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
-                    resp = await client.post(url, headers=headers, data={})
+        val = gate_config_store.get("signal_min_premium", 1)
+        if val is not None and val > 0:
+            return float(val)
+    except Exception:
+        pass
+    return float(_SIGNAL_MIN_PREMIUM)
 
-                if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", 10.0))
-                    log.warning(
-                        "[stream] session token 429 — Retry-After %.0fs (attempt %d/%d)",
-                        retry_after, attempt + 1, _SESSION_RETRY_MAX,
-                    )
-                    await asyncio.sleep(retry_after)
-                    continue
 
-                if resp.status_code == 401:
-                    log.error("[stream] session token 401 — check TRADIER_API_KEY")
-                    return None
-
-                resp.raise_for_status()
-                token = resp.json().get("stream", {}).get("sessionid")
-                if token:
-                    log.debug("[stream] session token acquired (attempt %d)", attempt + 1)
-                    return token
-                log.warning(
-                    "[stream] session response missing sessionid: %s",
-                    resp.text[:200],
-                )
-                return None
-
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                log.warning(
-                    "[stream] session fetch attempt %d/%d failed: %s",
-                    attempt + 1, _SESSION_RETRY_MAX, e,
-                )
-                if attempt < _SESSION_RETRY_MAX - 1:
-                    await asyncio.sleep(_SESSION_RETRY_DELAY)
-
-        log.error("[stream] session token fetch exhausted %d attempts", _SESSION_RETRY_MAX)
-        return None
-
-    finally:
-        if slot_acquired:
-            _SESSION_SEM.release()
+# ---------------------------------------------------------------------------
+# ING-011: live exclude_indices gate resolver
+# ---------------------------------------------------------------------------
+def _resolve_exclude_indices() -> bool:
+    try:
+        val = gate_config_store.get("exclude_indices", 1)
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return True  # safe default: filter indices ON

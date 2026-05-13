@@ -26,14 +26,16 @@ B-023 — Explicit 429 Handling:
   If Tradier returns HTTP 429, get_session_token() reads the
   Retry-After header (default 10s if absent) and sleeps that long before retrying.
 
-Fix (SESSION-SEM-STREAM):
-  acquire_session_token_slot(timeout_s) exposes _SESSION_SEM to callers that
-  manage their own retry loop (specifically tradier_stream._get_session_token).
-  This closes the gap where stream reconnects bypassed the B-022 semaphore
-  entirely, while preserving worker isolation — a per-worker timeout prevents
-  a hung slot holder from blocking the queue indefinitely.
-  timeout_s defaults to _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6.0s) so
-  the constant is derived, not magic.
+Fix (SEM-STREAM 2026-05-12): expose acquire_session_token_slot() for
+  tradier_stream._get_session_token() which has its own private token-fetch
+  implementation and previously bypassed _SESSION_SEM entirely. The slot
+  coroutine tries to acquire _SESSION_SEM within a derived timeout
+  (_SESSION_RETRY_DELAY * _SESSION_RETRY_MAX = 6s) and returns a bool
+  indicating whether the semaphore was acquired. The caller (tradier_stream)
+  is responsible for releasing _SESSION_SEM in its finally block.
+  This restores B-022 burst protection for all token-fetch paths while
+  preserving worker isolation — a timed-out acquire proceeds without the
+  semaphore rather than blocking indefinitely.
 
 Public API:
   get_quote(symbol)                          -> Optional[dict]
@@ -44,7 +46,7 @@ Public API:
   get_options_chain(symbol, expiration)      -> list[dict]   (alias for get_option_chain)
   get_session_token()                        -> Optional[str]
   get_token()                                -> Optional[str]  (alias)
-  acquire_session_token_slot(timeout_s)      -> bool  (SESSION-SEM-STREAM)
+  acquire_session_token_slot(timeout_s)      -> bool  (for tradier_stream)
 
 All methods return None / [] on error — callers must handle gracefully.
 """
@@ -68,18 +70,20 @@ _CHAIN_SEM       = asyncio.Semaphore(2)
 # 10 concurrent × ~0.6s/req = ~16 req/s; outer build sem(50) bounds ticker tasks
 _BULK_CHAIN_SEM  = asyncio.Semaphore(10)
 
-# B-022: max 3 concurrent session token fetches
+# B-022: max 3 concurrent session token fetches across ALL callers
+# (stream_worker.py via get_session_token() + tradier_stream.py via
+# acquire_session_token_slot()).  Both paths share this one semaphore.
 _SESSION_SEM     = asyncio.Semaphore(3)
-
-# SESSION-SEM-STREAM: default acquire timeout for acquire_session_token_slot().
-# Derived from stream retry constants so it aligns naturally: a worker that
-# can't get a slot within one full retry round (_SESSION_RETRY_DELAY *
-# _SESSION_RETRY_MAX = 2.0 * 3 = 6.0s) proceeds independently rather than
-# blocking indefinitely. Isolation wins over burst protection at that point.
-_SESSION_SEM_ACQUIRE_TIMEOUT_S: float = 6.0  # _SESSION_RETRY_DELAY(2.0) * _SESSION_RETRY_MAX(3)
 
 # B-023: fallback Retry-After sleep when header is absent
 _DEFAULT_RETRY_AFTER_S: float = 10.0
+
+# SEM-STREAM: semaphore-acquire timeout constants.
+# tradier_stream._get_session_token() uses _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
+# as its acquire timeout so a worker that cannot get a slot within one full
+# retry-round duration proceeds independently rather than blocking indefinitely.
+_SESSION_RETRY_DELAY: float = 2.0   # seconds between retry attempts
+_SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 
 
 def _headers() -> dict:
@@ -90,41 +94,34 @@ def _headers() -> dict:
 
 
 async def acquire_session_token_slot(
-    timeout_s: float = _SESSION_SEM_ACQUIRE_TIMEOUT_S,
+    timeout_s: Optional[float] = None,
 ) -> bool:
     """
-    SESSION-SEM-STREAM: Try to acquire a _SESSION_SEM slot within timeout_s.
+    Try to acquire the shared _SESSION_SEM slot within timeout_s.
 
-    Designed for callers (tradier_stream._get_session_token) that manage their
-    own HTTP retry loop and cannot use the `async with _SESSION_SEM` pattern
-    directly without merging implementations and losing worker isolation.
+    Returns True  if the slot was acquired (caller MUST release via
+                  _SESSION_SEM.release() in a finally block).
+    Returns False if timeout_s elapsed before a slot was available
+                  (caller proceeds without semaphore — isolation wins).
 
-    Protocol:
-      slot_acquired = await acquire_session_token_slot()
-      try:
-          ... HTTP retry loop ...
-      finally:
-          if slot_acquired:
-              _SESSION_SEM.release()
+    Default timeout = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6s).
+    Rationale: a worker that cannot get a slot in the time it would take
+    one full retry round to complete should proceed independently rather
+    than stalling behind a potentially hung peer.
 
-    Returns:
-      True  — slot acquired; caller MUST release via _SESSION_SEM.release()
-              in a finally block.
-      False — timeout fired; caller proceeds WITHOUT semaphore protection.
-              This is intentional: isolation wins over burst protection when
-              all 3 slots are held for longer than timeout_s. A log warning
-              is emitted so ops can detect sustained semaphore contention.
-
-    The default timeout_s is _SESSION_SEM_ACQUIRE_TIMEOUT_S (6.0s), derived
-    from _SESSION_RETRY_DELAY(2.0) × _SESSION_RETRY_MAX(3) in tradier_stream.
+    SEM-STREAM (2026-05-12): introduced so tradier_stream._get_session_token()
+    can participate in the B-022 semaphore without merging its implementation
+    into get_session_token() (which would break worker isolation).
     """
+    if timeout_s is None:
+        timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
     try:
         await asyncio.wait_for(_SESSION_SEM.acquire(), timeout=timeout_s)
         return True
     except asyncio.TimeoutError:
-        log.warning(
+        log.debug(
             "[tradier_client] acquire_session_token_slot timed out after %.1fs — "
-            "proceeding without semaphore (worker isolation preserved)",
+            "proceeding without semaphore",
             timeout_s,
         )
         return False
