@@ -275,6 +275,15 @@ Fix (BUG-PERSIST-DICT 2026-05-13): pass ev.__dict__ to persist_flow_event().
   persisted tick, incrementing _stats["errors"] on every event and writing
   zero rows to flow_events. Fix: call persist_flow_event(ev.__dict__) so the
   function receives the correct dict representation of the event.
+
+Fix (STATS-BELOW-PREMIUM 2026-05-13): add below_min_premium to _stats dict.
+  The get_stats() docstring in health.py referenced "below_min_premium" as a
+  returned key but _stats never initialized it. When parse_tradier_trade()
+  returned the "below_premium" sentinel, _process_trade() silently returned
+  without incrementing any counter — below_min_premium was absent from /stats
+  output entirely, making the funnel look like those ticks vanished between
+  ticks and parsed. Fix: add "below_min_premium": 0 to _stats and increment
+  it on the "below_premium" sentinel path before returning.
 """
 import asyncio
 import logging
@@ -440,6 +449,7 @@ _last_gate_epoch: int = -1  # tracks last known gate_config_store epoch
 _stats = {
     "active_symbols":    0,
     "ticks":             0,
+    "below_min_premium": 0,   # STATS-BELOW-PREMIUM: ticks dropped at premium floor
     "parsed":            0,
     "parse_failed":      0,
     "classified":        0,
@@ -996,6 +1006,9 @@ async def _process_trade(raw: dict, registry=None) -> None:
     result = parse_tradier_trade(raw, min_premium=min_premium)
 
     if result == "below_premium":
+        # STATS-BELOW-PREMIUM: track ticks dropped at the premium floor so
+        # /stats shows the full funnel: ticks -> below_min_premium -> parsed.
+        _stats["below_min_premium"] += 1
         return
     if result is None:
         _stats["parse_failed"] += 1
@@ -1137,10 +1150,10 @@ async def _process_trade(raw: dict, registry=None) -> None:
     # --- Stats log (every N ticks) ---
     if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
         log.info(
-            "[stream] funnel | ticks=%d parsed=%d classified=%d "
+            "[stream] funnel | ticks=%d below_min_premium=%d parsed=%d classified=%d "
             "deduped=%d index_filtered=%d accumulator_gated=%d "
             "persisted=%d signals=%d sig_debounced=%d errors=%d",
-            _stats["ticks"], _stats["parsed"], _stats["classified"],
+            _stats["ticks"], _stats["below_min_premium"], _stats["parsed"], _stats["classified"],
             _stats["deduped"], _stats["index_filtered"], _stats["accumulator_gated"],
             _stats["persisted"], _stats["signals"], _stats["sig_debounced"],
             _stats["errors"],
