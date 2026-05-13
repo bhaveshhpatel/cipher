@@ -20,7 +20,7 @@ Startup sequence:
      g. start_signal_writer()          — signal DB writer
      h. _universe_refresh_loop()       — 24h universe refresh
      i. start_chain_refresh_worker()   — ING-008: 5-min chain cache refresh loop
-     j. _self_ping_worker()            — RENDER: pings /health every 10 min to prevent spin-down
+     j. _self_ping_worker()            — RENDER: pings /health every 5 min to prevent spin-down
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -72,12 +72,17 @@ Key architectural fixes:
                         its own accumulator internally via get_accumulator() — it
                         takes 0 positional args. Removed stale registry.accumulator
                         argument from the create_task() call site.
-  RENDER-KEEPALIVE    — _self_ping_worker() pings GET /health every 10 minutes.
+  RENDER-KEEPALIVE    — _self_ping_worker() pings GET /health every 5 minutes.
                         Reads RENDER_EXTERNAL_URL env var (injected automatically by
                         Render). No-ops locally when the var is absent. Prevents
-                        free-tier spin-down (15-min idle threshold). Does NOT prevent
-                        restarts caused by deploys, crashes, or OOM — reconnect logic
-                        in tradier_stream already handles those cases.
+                        free-tier spin-down (15-min idle threshold).
+                        Hardened (HOTFIX-KEEPALIVE-001):
+                          - 5-min interval (down from 10) — more headroom vs threshold
+                          - Fresh httpx.AsyncClient each cycle — avoids stale pool
+                          - fail_streak counter — log.warning per failure,
+                            log.error after 3 consecutive failures
+                        Does NOT prevent restarts caused by deploys, crashes, or OOM
+                        — tradier_stream reconnect logic handles those cases.
   RENDER-STARTUP-HANG — _resolve_startup_universe() split into a fast DB-only phase
                         (before yield) and a slow background phase (after yield).
                         The slow load_universe() call (CBOE + Tradier, 60-120 s) no
@@ -95,6 +100,14 @@ Key architectural fixes:
                         co-located in the fetch helper so the chain_refresh_task loop
                         itself is untouched — it simply sleeps its normal interval
                         between empty-return calls.
+  HOTFIX-KEEPALIVE-001 — _self_ping_worker() hardened:
+                        - interval dropped to 5 min (was 10) — more margin vs 15-min
+                          Render spin-down threshold
+                        - httpx.AsyncClient recreated each cycle — avoids stale
+                          connection pool that causes silent failures on Render
+                        - fail_streak counter replaces silent except-swallow;
+                          log.warning on every failure, log.error after streak >= 3
+                          with actionable guidance to check RENDER_EXTERNAL_URL
 """
 import asyncio
 import json
@@ -180,31 +193,50 @@ async def get_config() -> dict:
 # RENDER-KEEPALIVE: Self-ping worker to prevent free-tier spin-down.
 #
 # Render's free tier spins down a service after 15 minutes of no inbound
-# traffic. This worker pings GET /health every 10 minutes to keep the
-# instance alive.
+# traffic. This worker pings GET /health every 5 minutes to keep the
+# instance alive (well inside the 15-min threshold).
 #
 # RENDER_EXTERNAL_URL is injected automatically by Render (e.g.
 # https://cipher-backend.onrender.com). When absent (local dev, other
 # platforms) the worker exits immediately — no-op.
 #
+# HOTFIX-KEEPALIVE-001 hardening:
+#   - Interval dropped to 5 min (was 10) — more headroom vs threshold
+#   - Fresh AsyncClient per cycle — avoids stale connection pool on Render
+#   - fail_streak counter — visible log.warning per failure; log.error
+#     with actionable guidance after 3 consecutive failures
+#
 # This only prevents idle spin-down. It does NOT prevent restarts caused
 # by deploys, crashes, or OOM — tradier_stream reconnect logic handles those.
 # ---------------------------------------------------------------------------
 async def _self_ping_worker() -> None:
-    """Keeps the Render free-tier instance alive by pinging /health every 10 min."""
+    """RENDER-KEEPALIVE: pings /health every 5 min. First ping at T+5."""
     url = os.getenv("RENDER_EXTERNAL_URL")
     if not url:
         log.info("[keepalive] RENDER_EXTERNAL_URL not set — self-ping disabled (non-Render env)")
         return
-    log.info("[keepalive] Self-ping worker started — target: %s/health (every 10 min)", url)
-    async with httpx.AsyncClient() as client:
-        while True:
-            await asyncio.sleep(600)  # 10 minutes
-            try:
-                resp = await client.get(f"{url}/health", timeout=10)
-                log.debug("[keepalive] Ping OK — HTTP %d", resp.status_code)
-            except Exception as exc:
-                log.warning("[keepalive] Ping failed (non-fatal): %s", exc)
+    ping_url = f"{url}/health"
+    log.info("[keepalive] Self-ping worker started — target: %s (every 5 min)", ping_url)
+    fail_streak = 0
+    while True:
+        await asyncio.sleep(300)  # 5 minutes — well inside the 15-min threshold
+        try:
+            # Fresh client each cycle — avoids stale connection pool on Render
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(ping_url)
+            fail_streak = 0
+            log.debug("[keepalive] Ping OK — HTTP %d", resp.status_code)
+        except Exception as exc:
+            fail_streak += 1
+            log.warning(
+                "[keepalive] Ping FAILED (streak=%d): %s",
+                fail_streak, exc,
+            )
+            if fail_streak >= 3:
+                log.error(
+                    "[keepalive] 3 consecutive ping failures — "
+                    "Render may spin down. Check RENDER_EXTERNAL_URL and network.",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -884,7 +916,8 @@ async def lifespan(app: FastAPI):
     )
 
     # RENDER-KEEPALIVE: prevent free-tier idle spin-down (15-min threshold).
-    # Pings GET /health every 10 minutes. No-ops when RENDER_EXTERNAL_URL is unset.
+    # Pings GET /health every 5 minutes. No-ops when RENDER_EXTERNAL_URL is unset.
+    # HOTFIX-KEEPALIVE-001: hardened — fresh client per cycle, fail-streak logging.
     self_ping_task        = asyncio.create_task(_self_ping_worker())
 
     yield
