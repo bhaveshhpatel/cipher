@@ -11,10 +11,8 @@ services:
     name: cipher-backend
     runtime: python
     rootDir: backend
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.11"
     autoDeploy: false  # Deploys are triggered via GitHub Actions deploy hook on push to main
