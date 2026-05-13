@@ -70,7 +70,7 @@ FIX ING-010 (2026-05-07): Add influence_tier_int() as the sole tier accessor.
   Fallback: 3 (most conservative / T3 defaults) for unknown tickers.
 
   NOTE: The former influence_tier_string() method and _INT_TIER_TO_STRING dict
-  have been removed (ING-012). The int→string→int round-trip they introduced
+  have been removed (ING-012). The int->string->int round-trip they introduced
   was pure overhead — influence_tier_int() already returns the int directly.
   episode_influence_tier() in composite_signal_engine.py is a separate,
   orthogonal function that classifies episode premium size (WHALE/INSTITUTIONAL/
@@ -80,9 +80,9 @@ ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
   self.epoch: int is initialised to 0 in __init__ and incremented inside the
   build() lock immediately after self._build_complete = True.
   Contract (mirrors GateConfigStore.epoch):
-    - epoch == 0  → registry has never completed a full build().
-    - epoch > 0   → at least one build() has completed; value is the build
-                    generation count (1, 2, 3, …).
+    - epoch == 0  -> registry has never completed a full build().
+    - epoch > 0   -> at least one build() has completed; value is the build
+                    generation count (1, 2, 3, ...).
   Consumers (stream_worker, tradier_stream) can watch registry.epoch to
   detect tier-map refreshes without polling individual symbol keys.
   load_from_db() does NOT increment epoch — only build() does, so callers
@@ -124,8 +124,8 @@ FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
     bypassed (existing B-ZERO-PRICE path). _build_complete is guaranteed to
     be set.
 
-  - asyncio.gather(*tasks) for chain fetches: 180s timeout (covers ~765
-    tickers at build_concurrency=50 with reasonable Tradier latency). On
+  - asyncio.gather(*tasks) for chain fetches: 300s timeout (covers ~765
+    tickers at build_concurrency=20 with per-request 15s timeout). On
     expiry, logs ERROR and proceeds with whatever contracts were fetched
     before the deadline; _build_complete is still set so stream workers
     can spawn against the partial registry.
@@ -133,11 +133,6 @@ FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
   Both timeouts are wrapped in try/except asyncio.TimeoutError so the
   outer non-fatal wrapper in main.py/_background_build_and_upsert is not
   triggered — the build completes (possibly partial) rather than raising.
-
-  Root cause of 2026-05-12 incident: server deployed at 14:43 UTC, H3
-  incremental build logged '765 tickers to refresh' then went silent.
-  _build_complete never set → stream workers never spawned → no flow data
-  processed during market hours.
 
 FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
   and re-raises immediately instead of letting it propagate through
@@ -153,6 +148,37 @@ FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
   Fix: explicit try/except asyncio.CancelledError inside _build_with_sem
   re-raises the error so asyncio retires the future cleanly. No logic change —
   the shutdown behaviour is identical; only the stderr noise is eliminated.
+
+FIX BUILD-SEMAPHORE (2026-05-13): _DEFAULT_BUILD_CONCURRENCY 50 -> 20.
+  50 concurrent _build_ticker coroutines each iterating 5-8 expirations
+  created 250-400 simultaneous Tradier HTTP calls. Tradier rate-limits
+  silently — stalled slots held the semaphore until the 180s gather timeout
+  fired, killing all remaining tasks. 20 concurrency stays within Tradier's
+  safe rate-limit headroom. Realistic wall time is unchanged (~57s).
+
+FIX BUILD-PER-REQUEST-TIMEOUT (2026-05-13): add 15s per-request timeout
+  on every get_option_chain_bulk() call inside _build_ticker().
+  Previously a single stalled TCP connection held a semaphore slot for up
+  to 300s (the outer gather timeout). Now each chain fetch times out
+  independently at 15s, frees the slot immediately, and the gather keeps
+  cycling. 15s gives one full httpx read_timeout (~10s) + 5s buffer.
+  On timeout: log WARNING for the specific (ticker, expiry) pair and
+  continue to the next expiry — partial contracts already written to
+  new_registry are retained.
+
+FIX BUILD-GATHER-TIMEOUT (2026-05-13): _CHAIN_GATHER_TIMEOUT_S 180 -> 300.
+  With per-request 15s timeouts and concurrency=20, worst-case realistic
+  bound is ~300s (10% stall rate across 765 tickers). 180s fired too early
+  under modest Tradier degradation, killing mid-batch tasks that would have
+  succeeded. 300s matches the realistic bound while still guaranteeing the
+  build always terminates well within Render's health-probe window.
+
+FIX BUILD-EXCEPTION-VISIBILITY (2026-05-13): log per-task exceptions from
+  gather(return_exceptions=True) result list.
+  Non-CancelledError exceptions inside individual _build_with_sem tasks were
+  silently discarded. Now gather results are inspected and a WARNING is
+  logged with the exception count so ops can distinguish 'ticker timed out'
+  from 'ticker raised unexpectedly' in the build log.
 """
 import asyncio
 import logging
@@ -170,13 +196,29 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 
 log = logging.getLogger("symbol_registry")
 
-_DEFAULT_BUILD_CONCURRENCY = 50
+# BUILD-SEMAPHORE: reduced from 50 -> 20 to stay within Tradier rate-limit
+# headroom. 50 concurrent _build_ticker coroutines each iterating 5-8
+# expirations produced 250-400 simultaneous HTTP calls, causing silent
+# rate-limit stalls that consumed semaphore slots until the 180s gather
+# timeout fired and killed all remaining tasks.
+_DEFAULT_BUILD_CONCURRENCY = 20
 
 # BUILD-HANG: hard timeouts for the two network-bound phases inside build().
 # These prevent an indefinite hang when Tradier stalls at the TCP layer
 # before the httpx read timeout fires.
-_PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3834 tickers × 200/batch = 20 batches
-_CHAIN_GATHER_TIMEOUT_S = 180   # asyncio.gather(*tasks): up to ~765 chain fetches at concurrency=50
+_PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3834 tickers x 200/batch = 20 batches
+
+# BUILD-GATHER-TIMEOUT: raised from 180 -> 300 to match realistic worst-case
+# bound after adding per-request 15s timeouts. With concurrency=20 and a 10%
+# stall rate across 765 tickers, the realistic bound is ~300s. 180s was too
+# tight and fired before the final batches completed under Tradier degradation.
+_CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): ~765 tickers at concurrency=20
+
+# BUILD-PER-REQUEST-TIMEOUT: per-request timeout for each get_option_chain_bulk()
+# call inside _build_ticker(). Frees the semaphore slot immediately on stall
+# instead of holding it for up to _CHAIN_GATHER_TIMEOUT_S. 15s gives one full
+# httpx read_timeout (~10s) plus a 5s buffer for slow-but-not-stalled responses.
+_CHAIN_REQUEST_TIMEOUT_S = 15
 
 
 @dataclass
@@ -229,9 +271,9 @@ class SymbolRegistry:
         ``_build_complete`` is set to True.
 
         Contract (mirrors GateConfigStore.epoch):
-          - epoch == 0  → no completed build() yet (may be DB-seeded via
+          - epoch == 0  -> no completed build() yet (may be DB-seeded via
                           load_from_db, but Tradier chain data not yet fresh).
-          - epoch >= 1  → build() has completed at least once; value equals
+          - epoch >= 1  -> build() has completed at least once; value equals
                           the number of completed builds (1 on first build,
                           2 after first refresh_loop() rebuild, etc.).
 
@@ -385,13 +427,13 @@ class SymbolRegistry:
           bootstrap_params that collapsed all tiers to T3 params has been
           removed. T1 tickers now get atm_pct=0.20 / max_dte=90 from the
           first build epoch, preventing silent contract-universe gaps that
-          caused institutional flow on >30-DTE or >±10% ATM contracts to
-          be dropped at stream time (lookup() → None).
+          caused institutional flow on >30-DTE or >+-10% ATM contracts to
+          be dropped at stream time (lookup() -> None).
 
         BUILD-HANG - hard timeouts on network phases:
           _fetch_stock_prices() is wrapped in asyncio.wait_for(timeout=45s).
           asyncio.gather(*tasks) for chain fetches is wrapped in
-          asyncio.wait_for(timeout=180s). Both phases degrade gracefully
+          asyncio.wait_for(timeout=300s). Both phases degrade gracefully
           on timeout (zero-price fallback / partial registry) and always
           set _build_complete=True so stream workers can spawn.
 
@@ -400,6 +442,25 @@ class SymbolRegistry:
           so asyncio can retire each gather future without logging it as
           '_GatheringFuture exception was never retrieved'. No behaviour
           change — only shutdown log noise is eliminated.
+
+        BUILD-SEMAPHORE - concurrency 50 -> 20:
+          Reduces concurrent _build_ticker coroutines to stay within
+          Tradier rate-limit headroom and prevent semaphore-slot starvation
+          from stalled TCP connections consuming all 50 slots simultaneously.
+
+        BUILD-PER-REQUEST-TIMEOUT - 15s per get_option_chain_bulk() call:
+          Each chain fetch in _build_ticker is wrapped in wait_for(15s).
+          Frees semaphore slots immediately on stall rather than holding
+          them until the outer gather timeout fires.
+
+        BUILD-GATHER-TIMEOUT - 180s -> 300s:
+          Raised to match the realistic worst-case bound with per-request
+          timeouts and concurrency=20.
+
+        BUILD-EXCEPTION-VISIBILITY - log per-task exceptions from gather:
+          Non-CancelledError exceptions in individual tasks are now counted
+          and logged at WARNING so ops can distinguish timed-out tickers
+          from errored tickers in the build log.
         """
         from services.symbols_loader import SymbolQuote
 
@@ -519,12 +580,14 @@ class SymbolRegistry:
                     _build_with_sem(ticker)
                     for ticker in tickers_to_refresh
                 ]
-                # BUILD-HANG: hard 180s timeout on the chain-fetch gather.
-                # Covers ~765 tickers at concurrency=50 with normal Tradier
-                # latency. On timeout, proceed with whatever contracts were
-                # fetched before the deadline; _build_complete is still set.
+                # BUILD-HANG / BUILD-GATHER-TIMEOUT: hard 300s timeout on the
+                # chain-fetch gather. Raised from 180s to match the realistic
+                # worst-case bound with per-request 15s timeouts and
+                # concurrency=20. On timeout, proceed with whatever contracts
+                # were fetched before the deadline; _build_complete is still set.
+                gather_results = None
                 try:
-                    await asyncio.wait_for(
+                    gather_results = await asyncio.wait_for(
                         asyncio.gather(*tasks, return_exceptions=True),
                         timeout=_CHAIN_GATHER_TIMEOUT_S,
                     )
@@ -538,6 +601,25 @@ class SymbolRegistry:
                         len(tickers_to_refresh),
                         len(new_registry),
                     )
+
+                # BUILD-EXCEPTION-VISIBILITY: log per-task exceptions that are
+                # not CancelledError. These are swallowed by return_exceptions=True
+                # and would otherwise be invisible in the build log, making it
+                # impossible to distinguish timed-out tickers from errored tickers.
+                if gather_results is not None:
+                    task_errors = [
+                        r for r in gather_results
+                        if isinstance(r, BaseException)
+                        and not isinstance(r, asyncio.CancelledError)
+                    ]
+                    if task_errors:
+                        log.warning(
+                            "[symbol_registry] BUILD: %d/%d ticker tasks raised exceptions "
+                            "(non-CancelledError). First: %r",
+                            len(task_errors),
+                            len(tickers_to_refresh),
+                            task_errors[0],
+                        )
 
             synthetic_quotes = []
             for ticker in self._watchlist:
@@ -721,6 +803,14 @@ class SymbolRegistry:
           The former bootstrap_params collapse to T3 for all tiers has
           been removed in build(). _build_ticker() is unchanged here —
           it always read tier_params[tier]; the fix is in the caller.
+
+        BUILD-PER-REQUEST-TIMEOUT: each get_option_chain_bulk() call is
+          wrapped in asyncio.wait_for(timeout=_CHAIN_REQUEST_TIMEOUT_S).
+          On TimeoutError, log WARNING for the specific (ticker, expiry)
+          pair and continue to the next expiry. Partial contracts already
+          written to registry for this ticker are retained.
+          This frees the semaphore slot immediately on Tradier stall
+          instead of holding it for up to _CHAIN_GATHER_TIMEOUT_S.
         """
         if stock_price <= 0:
             if zero_price_fallback:
@@ -760,8 +850,23 @@ class SymbolRegistry:
             if dte < 0 or dte > params.max_dte:
                 continue
 
+            # BUILD-PER-REQUEST-TIMEOUT: 15s hard deadline per chain fetch.
+            # A stalled Tradier TCP connection previously held the semaphore
+            # slot for up to _CHAIN_GATHER_TIMEOUT_S, collapsing throughput
+            # when multiple tickers stalled simultaneously. Now each fetch
+            # times out independently, freeing the slot so the gather can
+            # cycle through the remaining tickers without interruption.
             try:
-                contracts = await get_option_chain_bulk(ticker, expiry_str)
+                contracts = await asyncio.wait_for(
+                    get_option_chain_bulk(ticker, expiry_str),
+                    timeout=_CHAIN_REQUEST_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[symbol_registry] %s %s: chain fetch timed out after %ds — skipping expiry",
+                    ticker, expiry_str, _CHAIN_REQUEST_TIMEOUT_S,
+                )
+                continue
             except Exception as e:
                 log.warning(
                     "[symbol_registry] %s %s: chain fetch failed: %s",
