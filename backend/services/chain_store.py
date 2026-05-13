@@ -117,6 +117,18 @@ HOTFIX-SSL-EOF (2026-05-13):
   SyncClient transport. HTTP/1.1 reconnects per-request so stale
   connection reuse is impossible. Supabase PostgREST upserts are not
   multiplexed — no HTTP/2 throughput benefit was being realised anyway.
+
+HOTFIX-SSL-EOF-2 (2026-05-13):
+  The previous approach patched client.postgrest._client.session after
+  create_client() returned. In supabase-py >=2.x the postgrest client
+  is constructed lazily and the .session attribute path changed, causing
+  the patch to always fail silently and log the "Could not patch" warning.
+
+  Fix: pass http_options={"http2": False} directly inside ClientOptions
+  so supabase-py/postgrest-py constructs the httpx.Client with HTTP/1.1
+  from the start. No internal attribute access needed — this is the
+  supported public API for disabling HTTP/2 in supabase-py >=2.3.
+  The post-construction patch block and its warning log are removed.
 """
 import asyncio
 import logging
@@ -195,7 +207,7 @@ def get_contract_vol_oi(occ_symbol: str) -> Tuple[Optional[int], Optional[int]]:
 def invalidate_vol_oi_cache() -> None:
     """
     ING-008: Clear the vol/OI cache at market open so yesterday's intraday
-    volume never bleeds into early-morning flow events.
+    volume never bleeds into pre-market / early-morning flow events.
     Call this from the market-open boundary handler in main.py or the stream.
     """
     _vol_oi_cache.clear()
@@ -298,17 +310,20 @@ async def start_chain_refresh_worker(
 
 def _client() -> Client:
     """
-    HOTFIX-SSL-EOF: force HTTP/1.1 on the sync Supabase client.
+    HOTFIX-SSL-EOF-2: force HTTP/1.1 via ClientOptions http_options.
 
-    The default client uses HTTP/2 via httpcore/_sync/http2.py. Supabase's
-    load balancer closes idle HTTP/2 connections after its keep-alive window
-    expires. The sync client caches the connection and tries to reuse it on
-    the next upsert, hitting a dead TLS session and raising:
-      httpx.WriteError: EOF occurred in violation of protocol (_ssl.c:2393)
+    The previous approach patched client.postgrest._client.session after
+    construction, but supabase-py >=2.x builds the postgrest httpx client
+    lazily and the internal attribute path changed — the patch always fell
+    into the except branch and the "Could not patch" warning was logged.
 
-    HTTP/1.1 does not multiplex, so each request opens a fresh connection.
-    Stale connection reuse is impossible. PostgREST upserts don't benefit
-    from HTTP/2 multiplexing anyway -- there's no concurrent stream per client.
+    Fix: pass http_options={"http2": False} through ClientOptions so
+    postgrest-py constructs its httpx.Client with HTTP/1.1 from the start.
+    This is the supported public API — no internal attribute access required.
+
+    HTTP/1.1 opens a fresh connection per request, making stale-connection
+    SSL EOF errors impossible. PostgREST upserts are not multiplexed so
+    there is no throughput regression from disabling HTTP/2.
     """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
@@ -316,27 +331,12 @@ def _client() -> Client:
             "[chain_store] SUPABASE_SERVICE_KEY not set -- "
             "cannot read/write options_chain_cache."
         )
-    # Force HTTP/1.1 to prevent stale HTTP/2 connection reuse after idle periods.
     options = ClientOptions(
         postgrest_client_timeout=30,
         storage_client_timeout=30,
+        http_options={"http2": False},
     )
-    client = create_client(settings.SUPABASE_URL, key, options=options)
-    # Patch the underlying httpx sync transport to disable HTTP/2.
-    # supabase-py exposes the postgrest client's httpx session via _client.session.
-    try:
-        client.postgrest._client.session = httpx.Client(
-            http2=False,
-            timeout=30.0,
-        )
-    except Exception:
-        # If the internal structure changes in a future supabase-py version,
-        # fall back gracefully -- the client still works, just with HTTP/2.
-        log.warning(
-            "[chain_store] Could not patch httpx session to HTTP/1.1 -- "
-            "SSL EOF may recur on stale connections"
-        )
-    return client
+    return create_client(settings.SUPABASE_URL, key, options=options)
 
 
 async def save_chain(
