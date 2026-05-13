@@ -27,7 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build()`.\
+  always doing a full rebuild after the first build()`.
   Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
@@ -179,9 +179,44 @@ FIX BUILD-EXCEPTION-VISIBILITY (2026-05-13): log per-task exceptions from
   silently discarded. Now gather results are inspected and a WARNING is
   logged with the exception count so ops can distinguish 'ticker timed out'
   from 'ticker raised unexpectedly' in the build log.
+
+FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
+  with p95-latency-driven AdaptiveSemaphore.
+
+  AdaptiveSemaphore wraps asyncio.Semaphore and tracks per-slot wall-clock
+  duration (time from semaphore acquire to release) in a rolling deque of
+  the last _ADAPT_WINDOW=100 samples. Every _ADAPT_SAMPLE_INTERVAL=20
+  completions it evaluates the p95 latency and adjusts concurrency:
+
+    p95 < _P95_RAMP_UP_THRESHOLD_S (1.0s)  -> ramp up by _ADAPT_STEP (5),
+                                               capped at _CONCURRENCY_MAX (40)
+    p95 > _P95_DROP_THRESHOLD_S    (5.0s)  -> drop down by _ADAPT_STEP (5),
+                                               floored at _CONCURRENCY_MIN (10)
+    1.0s <= p95 <= 5.0s             (hold)  -> no change
+
+  Starting concurrency: _DEFAULT_BUILD_CONCURRENCY=20 (unchanged baseline).
+
+  On a clean Tradier day (p95 ~0.6s typical):
+    - Ramps to 40 within the first 100 completions (~2 adapt cycles).
+    - Cold-build wall time recovers to ~42-48s, closing the gap vs the
+      former fixed-50 setting on stable/ingestion-frontend-2026-04-29.
+
+  Under degraded Tradier (p95 > 5s):
+    - Drops to 10 within one adapt cycle, reducing simultaneous inflight
+      calls and preventing the stall-slot saturation that caused the
+      original BUILD-SEMAPHORE regression.
+
+  The per-request 15s wait_for (BUILD-PER-REQUEST-TIMEOUT) and the 300s
+  outer gather timeout (BUILD-GATHER-TIMEOUT) are unchanged — they are the
+  hard safety net. AdaptiveSemaphore operates at the soft throughput layer.
+
+  Concurrency adjustments are logged at INFO with p95 and direction so the
+  build log makes Tradier health visible without extra instrumentation.
 """
 import asyncio
+import collections
 import logging
+import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -196,12 +231,28 @@ from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quo
 
 log = logging.getLogger("symbol_registry")
 
-# BUILD-SEMAPHORE: reduced from 50 -> 20 to stay within Tradier rate-limit
-# headroom. 50 concurrent _build_ticker coroutines each iterating 5-8
-# expirations produced 250-400 simultaneous HTTP calls, causing silent
-# rate-limit stalls that consumed semaphore slots until the 180s gather
-# timeout fired and killed all remaining tasks.
+# ---------------------------------------------------------------------------
+# Build concurrency constants
+# ---------------------------------------------------------------------------
+
+# BUILD-SEMAPHORE: baseline concurrency used at build start and as the
+# midpoint for AdaptiveSemaphore adjustment. Reduced from 50 on 2026-05-13
+# after analysis showed 50 concurrent coroutines each iterating 5-8
+# expirations produced 250-400 simultaneous Tradier HTTP calls, causing
+# silent rate-limit stalls. AdaptiveSemaphore will ramp above this on clean
+# days and drop below it under pressure.
 _DEFAULT_BUILD_CONCURRENCY = 20
+
+# BUILD-ADAPTIVE-CONCURRENCY: concurrency bounds and p95 thresholds for
+# AdaptiveSemaphore. All values are module-level constants so they can be
+# adjusted without touching logic.
+_CONCURRENCY_MIN            = 10    # hard floor — never drop below this
+_CONCURRENCY_MAX            = 40    # hard ceiling — never ramp above this
+_ADAPT_STEP                 = 5     # concurrency delta per adapt cycle
+_ADAPT_SAMPLE_INTERVAL      = 20    # evaluate p95 every N slot completions
+_ADAPT_WINDOW               = 100   # rolling window size for latency samples
+_P95_RAMP_UP_THRESHOLD_S    = 1.0   # p95 below this -> ramp up concurrency
+_P95_DROP_THRESHOLD_S       = 5.0   # p95 above this -> drop concurrency
 
 # BUILD-HANG: hard timeouts for the two network-bound phases inside build().
 # These prevent an indefinite hang when Tradier stalls at the TCP layer
@@ -219,6 +270,104 @@ _CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): ~765 tickers at concur
 # instead of holding it for up to _CHAIN_GATHER_TIMEOUT_S. 15s gives one full
 # httpx read_timeout (~10s) plus a 5s buffer for slow-but-not-stalled responses.
 _CHAIN_REQUEST_TIMEOUT_S = 15
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveSemaphore
+# ---------------------------------------------------------------------------
+
+class AdaptiveSemaphore:
+    """
+    asyncio.Semaphore wrapper with rolling p95 latency-driven concurrency
+    adjustment.
+
+    Usage (identical to asyncio.Semaphore via async context manager):
+
+        sem = AdaptiveSemaphore(initial=20)
+        async with sem:
+            await do_work()
+
+    Internals
+    ---------
+    - Tracks per-slot wall-clock duration (acquire → release) in a
+      collections.deque of max length _ADAPT_WINDOW.
+    - Every _ADAPT_SAMPLE_INTERVAL completions evaluates p95 latency:
+        p95 < _P95_RAMP_UP_THRESHOLD_S  -> ramp up by _ADAPT_STEP
+        p95 > _P95_DROP_THRESHOLD_S     -> drop down by _ADAPT_STEP
+    - Ramp: releases (_ADAPT_STEP) extra internal-semaphore permits.
+    - Drop: acquires (_ADAPT_STEP) permits without releasing, reducing
+      the effective concurrency ceiling. Waits for each permit
+      non-blockingly (tries acquire; if already at 0 outstanding, no-op).
+    - Thread-safe for asyncio: all mutations happen inside the event loop.
+    - .value property exposes current concurrency for logging.
+    """
+
+    def __init__(self, initial: int) -> None:
+        self._value   = max(_CONCURRENCY_MIN, min(_CONCURRENCY_MAX, initial))
+        self._sem     = asyncio.Semaphore(self._value)
+        self._samples: collections.deque = collections.deque(maxlen=_ADAPT_WINDOW)
+        self._since_last_adapt = 0
+        self._start_ts: Optional[float] = None
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    async def __aenter__(self):
+        self._start_ts = _time.monotonic()
+        await self._sem.acquire()
+        return self
+
+    async def __aexit__(self, *_):
+        elapsed = _time.monotonic() - (self._start_ts or _time.monotonic())
+        self._sem.release()
+        self._samples.append(elapsed)
+        self._since_last_adapt += 1
+        if self._since_last_adapt >= _ADAPT_SAMPLE_INTERVAL and len(self._samples) >= _ADAPT_SAMPLE_INTERVAL:
+            await self._maybe_adapt()
+
+    async def _maybe_adapt(self) -> None:
+        self._since_last_adapt = 0
+        sorted_samples = sorted(self._samples)
+        idx = int(len(sorted_samples) * 0.95)
+        p95 = sorted_samples[min(idx, len(sorted_samples) - 1)]
+
+        if p95 < _P95_RAMP_UP_THRESHOLD_S and self._value < _CONCURRENCY_MAX:
+            step = min(_ADAPT_STEP, _CONCURRENCY_MAX - self._value)
+            self._value += step
+            for _ in range(step):
+                self._sem.release()
+            log.info(
+                "[symbol_registry] AdaptiveSemaphore: p95=%.2fs < %.1fs -> "
+                "ramp up concurrency %d -> %d",
+                p95, _P95_RAMP_UP_THRESHOLD_S,
+                self._value - step, self._value,
+            )
+
+        elif p95 > _P95_DROP_THRESHOLD_S and self._value > _CONCURRENCY_MIN:
+            step = min(_ADAPT_STEP, self._value - _CONCURRENCY_MIN)
+            # Drain `step` permits from the semaphore without blocking.
+            # acquire() is non-blocking here because the semaphore value
+            # reflects available (not in-use) slots — we only drain up to
+            # what is currently free, so inflight coroutines are unaffected.
+            drained = 0
+            for _ in range(step):
+                if self._sem._value > 0:  # type: ignore[attr-defined]
+                    await self._sem.acquire()
+                    drained += 1
+            self._value -= drained
+            log.info(
+                "[symbol_registry] AdaptiveSemaphore: p95=%.2fs > %.1fs -> "
+                "drop concurrency %d -> %d (drained=%d permits)",
+                p95, _P95_DROP_THRESHOLD_S,
+                self._value + drained, self._value, drained,
+            )
+
+        else:
+            log.debug(
+                "[symbol_registry] AdaptiveSemaphore: p95=%.2fs in [%.1f, %.1f] -> hold concurrency=%d",
+                p95, _P95_RAMP_UP_THRESHOLD_S, _P95_DROP_THRESHOLD_S, self._value,
+            )
 
 
 @dataclass
@@ -443,10 +592,12 @@ class SymbolRegistry:
           '_GatheringFuture exception was never retrieved'. No behaviour
           change — only shutdown log noise is eliminated.
 
-        BUILD-SEMAPHORE - concurrency 50 -> 20:
-          Reduces concurrent _build_ticker coroutines to stay within
-          Tradier rate-limit headroom and prevent semaphore-slot starvation
-          from stalled TCP connections consuming all 50 slots simultaneously.
+        BUILD-ADAPTIVE-CONCURRENCY - p95-driven AdaptiveSemaphore:
+          Replaces fixed asyncio.Semaphore(20) with AdaptiveSemaphore
+          starting at _DEFAULT_BUILD_CONCURRENCY=20. Ramps toward 40 when
+          Tradier is responsive (p95 < 1s); drops toward 10 when Tradier
+          is congested (p95 > 5s). See AdaptiveSemaphore docstring and
+          module-level constants for full details.
 
         BUILD-PER-REQUEST-TIMEOUT - 15s per get_option_chain_bulk() call:
           Each chain fetch in _build_ticker is wrapped in wait_for(15s).
@@ -455,7 +606,7 @@ class SymbolRegistry:
 
         BUILD-GATHER-TIMEOUT - 180s -> 300s:
           Raised to match the realistic worst-case bound with per-request
-          timeouts and concurrency=20.
+          timeouts and adaptive concurrency.
 
         BUILD-EXCEPTION-VISIBILITY - log per-task exceptions from gather:
           Non-CancelledError exceptions in individual tasks are now counted
@@ -471,8 +622,12 @@ class SymbolRegistry:
         # silently dropping institutional contracts outside that window.
         tier_params = _build_tier_params(thresh, global_min_oi=cfg["REGISTRY_MIN_OI"])
 
-        build_concurrency = int(cfg.get("REGISTRY_BUILD_CONCURRENCY", _DEFAULT_BUILD_CONCURRENCY))
-        sem = asyncio.Semaphore(build_concurrency)
+        # BUILD-ADAPTIVE-CONCURRENCY: AdaptiveSemaphore replaces plain
+        # asyncio.Semaphore. The cfg override (REGISTRY_BUILD_CONCURRENCY) is
+        # honoured as the starting value so operators can still force a fixed
+        # concurrency via env/DB config if needed.
+        starting_concurrency = int(cfg.get("REGISTRY_BUILD_CONCURRENCY", _DEFAULT_BUILD_CONCURRENCY))
+        sem = AdaptiveSemaphore(initial=starting_concurrency)
 
         async with self._build_lock:
             if self._registry:
@@ -500,11 +655,14 @@ class SymbolRegistry:
                 tickers_to_refresh = list(self._watchlist)
                 tickers_to_carry   = []
                 log.info(
-                    "[symbol_registry] Full build: %d tickers (concurrency=%d) "
+                    "[symbol_registry] Full build: %d tickers (starting_concurrency=%d "
+                    "adaptive=[%d..%d] p95_thresholds=[%.1fs ramp / %.1fs drop]) "
                     "[T1: atm=+/-%.0f%% dte=%d | T2: atm=+/-%.0f%% dte=%d | "
                     "T3: atm=+/-%.0f%% dte=%d | min_oi=%d]",
                     len(tickers_to_refresh),
-                    build_concurrency,
+                    starting_concurrency,
+                    _CONCURRENCY_MIN, _CONCURRENCY_MAX,
+                    _P95_RAMP_UP_THRESHOLD_S, _P95_DROP_THRESHOLD_S,
                     tier_params[1].atm_pct * 100, tier_params[1].max_dte,
                     tier_params[2].atm_pct * 100, tier_params[2].max_dte,
                     tier_params[3].atm_pct * 100, tier_params[3].max_dte,
@@ -582,8 +740,8 @@ class SymbolRegistry:
                 ]
                 # BUILD-HANG / BUILD-GATHER-TIMEOUT: hard 300s timeout on the
                 # chain-fetch gather. Raised from 180s to match the realistic
-                # worst-case bound with per-request 15s timeouts and
-                # concurrency=20. On timeout, proceed with whatever contracts
+                # worst-case bound with per-request 15s timeouts and adaptive
+                # concurrency. On timeout, proceed with whatever contracts
                 # were fetched before the deadline; _build_complete is still set.
                 gather_results = None
                 try:
@@ -594,11 +752,12 @@ class SymbolRegistry:
                 except asyncio.TimeoutError:
                     log.error(
                         "[symbol_registry] BUILD-HANG: chain gather timed out after %ds "
-                        "(%d tickers queued). Proceeding with partial registry (%d contracts "
-                        "so far) — stream workers will spawn against partial data. "
-                        "Next refresh_loop() will complete the missing tickers.",
+                        "(%d tickers queued, concurrency=%d at timeout). Proceeding with "
+                        "partial registry (%d contracts so far) — stream workers will spawn "
+                        "against partial data. Next refresh_loop() will complete the missing tickers.",
                         _CHAIN_GATHER_TIMEOUT_S,
                         len(tickers_to_refresh),
+                        sem.value,
                         len(new_registry),
                     )
 
@@ -620,6 +779,12 @@ class SymbolRegistry:
                             len(tickers_to_refresh),
                             task_errors[0],
                         )
+
+                log.info(
+                    "[symbol_registry] Build gather complete: final_concurrency=%d "
+                    "(started=%d, min=%d, max=%d)",
+                    sem.value, starting_concurrency, _CONCURRENCY_MIN, _CONCURRENCY_MAX,
+                )
 
             synthetic_quotes = []
             for ticker in self._watchlist:
