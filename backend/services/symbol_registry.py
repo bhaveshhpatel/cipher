@@ -268,6 +268,14 @@ FIX COLD-BUILD-TIMEOUT (2026-05-13): _CHAIN_GATHER_TIMEOUT_S 300 -> 1800.
   load_from_db() now logs an explicit WARNING when it returns 0 contracts
   so ops can immediately see that a full 3,848-ticker cold build is running
   and expect ~155 workers on successful completion.
+
+FIX SINGLETON (2026-05-13): add init_registry() / get_registry() module-level
+  singleton functions.
+  main.py line 151 imports both names but symbol_registry.py never defined
+  them, causing an ImportError crash on every deploy. init_registry()
+  constructs the single SymbolRegistry instance; get_registry() returns it
+  and raises RuntimeError if called before init_registry(). Pattern mirrors
+  gate_config_store.init_store() / get_store() already used in this codebase.
 """
 import asyncio
 import collections
@@ -1037,3 +1045,69 @@ async def _build_ticker(
     log.debug("[symbol_registry] _build_ticker(%s): %d contracts added", ticker, sum(
         1 for m in new_registry.values() if m.ticker == ticker
     ))
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — mirrors gate_config_store pattern
+# ---------------------------------------------------------------------------
+# FIX SINGLETON (2026-05-13): main.py line 151 imports init_registry and
+# get_registry but neither was defined here, causing an ImportError on every
+# deploy. init_registry() constructs and stores the single SymbolRegistry
+# instance; get_registry() returns it, raising RuntimeError if called before
+# initialisation.
+
+_registry_instance: Optional[SymbolRegistry] = None
+
+
+def init_registry(
+    watchlist: Optional[list[str]] = None,
+    tier_map: Optional[dict[str, int]] = None,
+) -> SymbolRegistry:
+    """
+    Construct and store the process-wide SymbolRegistry singleton.
+
+    Call once during application startup (main.py lifespan) before any
+    consumer calls get_registry(). Calling a second time replaces the
+    existing instance — intentional for test isolation only.
+
+    Parameters
+    ----------
+    watchlist : list[str] | None
+        Ticker symbols to include in the registry build.
+    tier_map : dict[str, int] | None
+        Optional pre-seeded tier classification (ticker -> 1/2/3).
+        If omitted, tier map is populated by the first build() call.
+
+    Returns
+    -------
+    SymbolRegistry
+        The newly created singleton instance.
+    """
+    global _registry_instance
+    _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
+    log.info(
+        "[symbol_registry] init_registry: singleton created "
+        "(watchlist=%d tickers, tier_map=%d entries)",
+        len(watchlist or []),
+        len(tier_map or {}),
+    )
+    return _registry_instance
+
+
+def get_registry() -> SymbolRegistry:
+    """
+    Return the process-wide SymbolRegistry singleton.
+
+    Raises
+    ------
+    RuntimeError
+        If called before init_registry() has been called (programming error —
+        startup order violation).
+    """
+    if _registry_instance is None:
+        raise RuntimeError(
+            "get_registry() called before init_registry(). "
+            "Ensure init_registry() is invoked during application startup "
+            "before any consumer accesses the registry."
+        )
+    return _registry_instance
