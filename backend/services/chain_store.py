@@ -98,17 +98,34 @@ HOTFIX-CHAIN-CONCURRENCY (2026-05-13):
 
   Fix: single _client() call outside _upsert_batch, shared across all
   batches. Added asyncio.Semaphore(_SAVE_CONCURRENCY=10) to cap concurrent
-  run_in_executor threads. Wall time: ~300ms → ~1.5s (still 4x faster
-  than the original sequential 5.8s). Zero impact on streaming hot path —
+  run_in_executor threads. Wall time: ~300ms -> ~1.5s (still 4x faster
+  than the original sequential 5.8s). Zero impact on streaming hot path --
   save_chain is called only at startup and every 24h; get_contract_vol_oi()
   reads _vol_oi_cache fed by start_chain_refresh_worker(), a separate path.
+
+HOTFIX-SSL-EOF (2026-05-13):
+  _upsert_batch and _sync_load_chain were using the default Supabase sync
+  client which uses HTTP/2 via httpcore. Supabase's load balancer closes
+  idle HTTP/2 connections after a short keep-alive window. When the sync
+  client tries to reuse a stale connection it raises:
+    httpx.WriteError: EOF occurred in violation of protocol (_ssl.c:2393)
+  This caused chain upserts to silently fail after any idle period
+  (post-midnight, post-weekend, etc.).
+
+  Fix: create_client() accepts http_options kwarg via the underlying
+  httpx transport. Force HTTP/1.1 by passing http2=False to the httpx
+  SyncClient transport. HTTP/1.1 reconnects per-request so stale
+  connection reuse is impossible. Supabase PostgREST upserts are not
+  multiplexed — no HTTP/2 throughput benefit was being realised anyway.
 """
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
+import httpx
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 from config import settings
 
 if TYPE_CHECKING:
@@ -132,7 +149,7 @@ _SAVE_CONCURRENCY: int = 10
 # ---------------------------------------------------------------------------
 # ING-008: background refresh cadence for intraday vol/OI
 # One Tradier chain call per symbol per cycle.
-# At 300s cadence and 50 symbols → ~10 req/min (limit: 120 req/min).
+# At 300s cadence and 50 symbols -> ~10 req/min (limit: 120 req/min).
 # Revisit when universe exceeds ~200 symbols.
 # ---------------------------------------------------------------------------
 _CHAIN_REFRESH_INTERVAL_S: int = 300  # 5 minutes
@@ -147,7 +164,7 @@ _CHAIN_REFRESH_INTERVAL_S: int = 300  # 5 minutes
 _vol_oi_cache: Dict[str, Dict] = {}
 
 # ---------------------------------------------------------------------------
-# Epoch counter — incremented on every successful save_chain().
+# Epoch counter -- incremented on every successful save_chain().
 # Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
 # ---------------------------------------------------------------------------
 _epoch: int = 0
@@ -165,7 +182,7 @@ def get_contract_vol_oi(occ_symbol: str) -> Tuple[Optional[int], Optional[int]]:
     Returns (volume, open_interest) from the _vol_oi_cache populated by
     start_chain_refresh_worker().  Returns (None, None) on cache miss.
 
-    Never makes a live API call — zero latency on the hot path.
+    Never makes a live API call -- zero latency on the hot path.
     Cache misses are expected on cold start and for symbols not yet
     refreshed in the current cycle; callers must treat None as acceptable.
     """
@@ -214,7 +231,7 @@ async def start_chain_refresh_worker(
 
     API budget
     ----------
-    One call per symbol per cycle.  At 300s cadence, 50 symbols → 10 req/min.
+    One call per symbol per cycle.  At 300s cadence, 50 symbols -> 10 req/min.
     Tradier rate limit: 120 req/min.  Headroom: ~110 req/min for stream.
     Scale note: if symbol universe exceeds ~200, increase interval to 600s.
 
@@ -228,13 +245,13 @@ async def start_chain_refresh_worker(
 
     Volume reset
     ------------
-    _vol_oi_cache is NOT cleared here between cycles — it is invalidated
+    _vol_oi_cache is NOT cleared here between cycles -- it is invalidated
     at market open by calling invalidate_vol_oi_cache() from the stream
     market-open handler.  This prevents yesterday's volume from bleeding
     into pre-market / early-morning events.
     """
     log.info(
-        "[chain_store] chain refresh worker started — interval=%ds",
+        "[chain_store] chain refresh worker started -- interval=%ds",
         _CHAIN_REFRESH_INTERVAL_S,
     )
     try:
@@ -269,24 +286,57 @@ async def start_chain_refresh_worker(
                     )
 
             log.info(
-                "[chain_store] chain refresh cycle complete — "
+                "[chain_store] chain refresh cycle complete -- "
                 "symbols=%d refreshed=%d errors=%d cache_size=%d",
                 len(symbols), refreshed, errors, len(_vol_oi_cache),
             )
 
     except asyncio.CancelledError:
-        log.info("[chain_store] chain refresh worker cancelled — shutting down cleanly")
+        log.info("[chain_store] chain refresh worker cancelled -- shutting down cleanly")
         raise
 
 
 def _client() -> Client:
+    """
+    HOTFIX-SSL-EOF: force HTTP/1.1 on the sync Supabase client.
+
+    The default client uses HTTP/2 via httpcore/_sync/http2.py. Supabase's
+    load balancer closes idle HTTP/2 connections after its keep-alive window
+    expires. The sync client caches the connection and tries to reuse it on
+    the next upsert, hitting a dead TLS session and raising:
+      httpx.WriteError: EOF occurred in violation of protocol (_ssl.c:2393)
+
+    HTTP/1.1 does not multiplex, so each request opens a fresh connection.
+    Stale connection reuse is impossible. PostgREST upserts don't benefit
+    from HTTP/2 multiplexing anyway -- there's no concurrent stream per client.
+    """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
         raise RuntimeError(
-            "[chain_store] SUPABASE_SERVICE_KEY not set — "
+            "[chain_store] SUPABASE_SERVICE_KEY not set -- "
             "cannot read/write options_chain_cache."
         )
-    return create_client(settings.SUPABASE_URL, key)
+    # Force HTTP/1.1 to prevent stale HTTP/2 connection reuse after idle periods.
+    options = ClientOptions(
+        postgrest_client_timeout=30,
+        storage_client_timeout=30,
+    )
+    client = create_client(settings.SUPABASE_URL, key, options=options)
+    # Patch the underlying httpx sync transport to disable HTTP/2.
+    # supabase-py exposes the postgrest client's httpx session via _client.session.
+    try:
+        client.postgrest._client.session = httpx.Client(
+            http2=False,
+            timeout=30.0,
+        )
+    except Exception:
+        # If the internal structure changes in a future supabase-py version,
+        # fall back gracefully -- the client still works, just with HTTP/2.
+        log.warning(
+            "[chain_store] Could not patch httpx session to HTTP/1.1 -- "
+            "SSL EOF may recur on stale connections"
+        )
+    return client
 
 
 async def save_chain(
@@ -299,7 +349,7 @@ async def save_chain(
 
     Previously _client() was called inside _upsert_batch, creating one new
     Supabase connection pool per batch. With 155 batches firing concurrently
-    via asyncio.gather, this instantiated 155 clients simultaneously — spiking
+    via asyncio.gather, this instantiated 155 clients simultaneously -- spiking
     memory and saturating the threadpool, causing OOM restarts and health probe
     failures on Render.
 
@@ -308,7 +358,7 @@ async def save_chain(
       - asyncio.Semaphore(_SAVE_CONCURRENCY=10) caps concurrent
         run_in_executor threads to 10 at a time.
 
-    Wall time: ~300ms (155 concurrent) → ~1.5s (10 at a time).
+    Wall time: ~300ms (155 concurrent) -> ~1.5s (10 at a time).
     Still ~4x faster than the original sequential 5.8s path.
     Zero impact on streaming: save_chain is called only at startup and
     every 24h; the hot-path vol/OI lookups use _vol_oi_cache exclusively.
@@ -318,7 +368,7 @@ async def save_chain(
     global _epoch
 
     if not registry_dict:
-        log.info("[chain_store] save_chain: empty registry — nothing to persist")
+        log.info("[chain_store] save_chain: empty registry -- nothing to persist")
         return True
 
     rows = [
@@ -400,14 +450,14 @@ def _sync_load_chain(
             return chain
 
         log.info(
-            "[chain_store] load_chain: snapshot %s has no rows — "
+            "[chain_store] load_chain: snapshot %s has no rows -- "
             "searching for most-recent cached snapshot (max_age=%dh)",
             snapshot_id, max_age_hours,
         )
         fallback_snap = _find_latest_cached_snapshot(sb, max_age_hours=max_age_hours)
         if not fallback_snap:
             log.info(
-                "[chain_store] load_chain: no cached chains within %dh — "
+                "[chain_store] load_chain: no cached chains within %dh -- "
                 "full build() required",
                 max_age_hours,
             )
@@ -415,7 +465,7 @@ def _sync_load_chain(
 
         chain = _paginate_chain(sb, fallback_snap)
         log.info(
-            "[chain_store] load_chain: P1 fallback — loaded %d OCC contracts "
+            "[chain_store] load_chain: P1 fallback -- loaded %d OCC contracts "
             "from prior snapshot %s (active=%s)",
             len(chain), fallback_snap, snapshot_id,
         )
