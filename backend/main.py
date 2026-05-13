@@ -17,6 +17,8 @@ Startup sequence:
      f. start_signal_writer()        — signal DB writer
      g. _universe_refresh_loop()     — 24h universe refresh
      h. start_chain_refresh_worker() — ING-008: 5-min chain cache refresh loop
+     i. _self_ping_worker()          — RENDER-KEEPALIVE: pings /health every 10 min
+                                       to prevent free-tier spin-down; no-op locally
 
 Key architectural fixes:
   P1 (chain_store)    — snapshot-agnostic fallback load
@@ -68,10 +70,26 @@ Key architectural fixes:
                         its own accumulator internally via get_accumulator() — it
                         takes 0 positional args. Removed stale registry.accumulator
                         argument from the create_task() call site.
+  RENDER-KEEPALIVE    — _self_ping_worker() pings GET /health every 10 minutes.
+                        Reads RENDER_EXTERNAL_URL env var (injected automatically by
+                        Render). No-ops locally when the var is absent. Prevents
+                        free-tier spin-down (15-min idle threshold).
+                        Hardened vs the bare version that existed only on main:
+                          * Initial jitter (0-30s) so parallel restarts don't
+                            thunderherd /health simultaneously.
+                          * Exponential backoff on consecutive failures:
+                            10s → 20s → 40s … capped at 300s (5 min). Resets to
+                            normal 600s interval on first success after a streak.
+                          * Single shared httpx.AsyncClient (one connection pool
+                            for the worker's lifetime, not one client per ping).
+                          * asyncio.CancelledError propagates cleanly so the task
+                            exits without swallowing the shutdown signal.
 """
 import asyncio
 import json
 import logging
+import os
+import random
 import re
 import sys
 from contextlib import asynccontextmanager
@@ -146,6 +164,116 @@ async def get_config() -> dict:
         "app_env":   settings.APP_ENV,
         "log_level": settings.LOG_LEVEL,
     }
+
+
+# ---------------------------------------------------------------------------
+# RENDER-KEEPALIVE: Hardened self-ping worker to prevent free-tier spin-down.
+#
+# Render's free tier spins down a service after 15 minutes of no inbound
+# traffic.  This worker pings GET /health every 10 minutes to keep the
+# instance alive.
+#
+# Design decisions vs the bare version that existed only on main:
+#
+#   Jitter on startup (0–30 s)
+#     Render restarts all containers simultaneously on a deploy.  Without
+#     jitter, every new container hits /health at exactly the same second,
+#     creating a brief thunderherd.  A random 0–30 s initial delay spreads
+#     them out with zero coordination overhead.
+#
+#   Exponential backoff on consecutive failures
+#     If /health is returning errors (OOM restart in progress, network blip)
+#     hammering it every 10 s makes things worse.  Backoff sequence:
+#       streak=1 → 10 s, streak=2 → 20 s, streak=3 → 40 s, … cap at 300 s.
+#     On the first successful ping after a failure streak the interval resets
+#     to the normal 600 s so normal cadence resumes immediately.
+#
+#   Single shared httpx.AsyncClient
+#     Creating a new client for every ping spawns a new connection pool each
+#     time and leaves TCP sockets in TIME_WAIT.  One client for the worker's
+#     entire lifetime reuses the keep-alive connection to localhost.
+#
+#   CancelledError propagation
+#     asyncio.CancelledError is NOT caught in the inner loop.  It propagates
+#     up, exits the worker cleanly, and lets the lifespan shutdown sequence
+#     proceed without hanging on this task.
+#
+# Environment:
+#   RENDER_EXTERNAL_URL — injected automatically by Render (e.g.
+#     https://cipher-backend.onrender.com).  When absent (local dev, Railway,
+#     Fly.io, etc.) the worker exits immediately — no-op.
+#
+# This only prevents idle spin-down.  It does NOT prevent restarts caused by
+# deploys, crashes, or OOM — tradier_stream reconnect logic handles those.
+# ---------------------------------------------------------------------------
+
+_KEEPALIVE_INTERVAL    = 600   # normal ping cadence (seconds)
+_KEEPALIVE_FAIL_BASE   = 10    # backoff base on failure (seconds)
+_KEEPALIVE_FAIL_CAP    = 300   # maximum backoff (seconds)
+_KEEPALIVE_JITTER_MAX  = 30    # max initial jitter (seconds)
+_KEEPALIVE_TIMEOUT     = 10    # per-request timeout (seconds)
+
+
+async def _self_ping_worker() -> None:
+    """
+    RENDER-KEEPALIVE: Hardened in-process keepalive worker.
+
+    Pings GET /health every 10 minutes to prevent Render free-tier spin-down.
+    No-op when RENDER_EXTERNAL_URL is not set (local / non-Render deployments).
+    """
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        log.info(
+            "[keepalive] RENDER_EXTERNAL_URL not set — self-ping disabled (non-Render env)"
+        )
+        return
+
+    ping_url = f"{url.rstrip('/')}/health"
+    log.info("[keepalive] Self-ping worker started — target: %s (every %ds)", ping_url, _KEEPALIVE_INTERVAL)
+
+    # Spread restarts across the jitter window so parallel container starts
+    # don't all hit /health at the same instant.
+    jitter = random.uniform(0, _KEEPALIVE_JITTER_MAX)
+    log.debug("[keepalive] Initial jitter: %.1f s", jitter)
+    await asyncio.sleep(jitter)
+
+    consecutive_failures = 0
+
+    async with httpx.AsyncClient(timeout=_KEEPALIVE_TIMEOUT) as client:
+        while True:
+            try:
+                resp = await client.get(ping_url)
+                if resp.status_code < 500:
+                    if consecutive_failures > 0:
+                        log.info(
+                            "[keepalive] Ping recovered after %d failure(s) — HTTP %d",
+                            consecutive_failures, resp.status_code,
+                        )
+                    else:
+                        log.debug("[keepalive] Ping OK — HTTP %d", resp.status_code)
+                    consecutive_failures = 0
+                    await asyncio.sleep(_KEEPALIVE_INTERVAL)
+                else:
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code}", request=resp.request, response=resp
+                    )
+
+            except asyncio.CancelledError:
+                # Propagate cleanly — do not swallow the shutdown signal.
+                log.info("[keepalive] Worker cancelled — shutting down")
+                raise
+
+            except Exception as exc:
+                consecutive_failures += 1
+                backoff = min(
+                    _KEEPALIVE_FAIL_BASE * (2 ** (consecutive_failures - 1)),
+                    _KEEPALIVE_FAIL_CAP,
+                )
+                log.warning(
+                    "[keepalive] Ping failed (streak=%d, backoff=%ds): %s",
+                    consecutive_failures, backoff, exc,
+                )
+                await asyncio.sleep(backoff)
 
 
 # ---------------------------------------------------------------------------
@@ -634,31 +762,10 @@ async def lifespan(app: FastAPI):
     lookback_task         = asyncio.create_task(start_lookback_worker())
 
     # ING-008: background 5-min chain cache refresh loop.
-    #
-    # Wired with the two-callable signature required by start_chain_refresh_worker:
-    #
-    #   get_tracked_symbols — zero-arg callable returning the live list of OCC
-    #     symbols currently in the registry.  Called fresh each cycle so newly
-    #     added symbols are automatically picked up without a restart.
-    #     Falls back to stream_symbols (ticker list) if the registry dict is not
-    #     accessible, which is safe because chain_store only uses the symbol as a
-    #     key for the Tradier chain API call (it accepts either OCC or ticker).
-    #
-    #   fetch_chain_fn — async callable accepting a ticker string and returning a
-    #     list of contract dicts from Tradier GET /v1/markets/options/chains.
-    #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
-    #     aborts the refresh cycle.
-    #
-    # Zero live API calls on the flow hot path: persist_flow_event and
-    # persist_flow_episode read from the in-process _vol_oi_cache via
-    # get_contract_vol_oi(occ_symbol) — O(1) dict lookup.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
-            # Return the unique set of underlying tickers (not OCC symbols) so
-            # one Tradier chain call per ticker covers all its strikes/expiries.
             return list({v.ticker for v in reg._registry.values()})
-        # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
     chain_refresh_task    = asyncio.create_task(
@@ -667,6 +774,9 @@ async def lifespan(app: FastAPI):
             fetch_chain_fn=_fetch_tradier_chain,
         )
     )
+
+    # RENDER-KEEPALIVE: hardened in-process self-ping (jitter + exp backoff).
+    keepalive_task        = asyncio.create_task(_self_ping_worker())
 
     yield
 
@@ -686,6 +796,7 @@ async def lifespan(app: FastAPI):
     db_write_task.cancel()
     signal_write_task.cancel()
     chain_refresh_task.cancel()  # ING-008
+    keepalive_task.cancel()      # RENDER-KEEPALIVE
     for task in (
         build_task,
         db_write_task,
@@ -695,6 +806,7 @@ async def lifespan(app: FastAPI):
         prewarm_task,
         lookback_task,
         chain_refresh_task,  # ING-008
+        keepalive_task,      # RENDER-KEEPALIVE
     ):
         try:
             await task
