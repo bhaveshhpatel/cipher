@@ -243,6 +243,11 @@ Fix (SEM-STREAM 2026-05-12): wire _SESSION_SEM into _get_session_token().
   finally block. timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6s).
   If acquire times out, proceeds without semaphore — isolation preserved.
   Hot path (_process_trade) is completely untouched.
+
+Fix (SEM-STREAM-RESTORE 2026-05-12): restore stream_options_flow + downstream fns.
+  The SEM-STREAM commit truncated the file at _resolve_exclude_indices() —
+  everything from _is_market_hours() through _process_trade() was lost.
+  Cherry-picked verbatim from cipher-rearch. No logic changes.
 """
 import asyncio
 import logging
@@ -702,13 +707,407 @@ def _resolve_signal_min_premium() -> float:
 
 
 # ---------------------------------------------------------------------------
-# ING-011: live exclude_indices gate resolver
+# ING-011: live exclude_indices resolver
 # ---------------------------------------------------------------------------
 def _resolve_exclude_indices() -> bool:
+    """
+    Return True if the exclude_indices gate is active (1.0), False if disabled (0.0).
+
+    Reads gate_config_store.get("exclude_indices", 1) — tier=1 is the
+    canonical row for this tier-independent gate.  Safe fallback is True
+    (filter ON) so index noise is suppressed even before the store loads.
+    Never raises.
+    """
     try:
         val = gate_config_store.get("exclude_indices", 1)
-        if val is not None:
-            return bool(val)
+        return bool(val >= 0.5)
     except Exception:
-        pass
-    return True  # safe default: filter indices ON
+        return True  # safe fallback: filter ON
+
+
+# ---------------------------------------------------------------------------
+# Market hours helper
+# ---------------------------------------------------------------------------
+def _is_market_hours() -> bool:
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    return _MARKET_OPEN <= now_et.time() < _MARKET_CLOSE
+
+
+# ---------------------------------------------------------------------------
+# Backoff helper
+# ---------------------------------------------------------------------------
+def _backoff(attempt: int) -> float:
+    delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
+    return random.uniform(0, delay)
+
+
+# ---------------------------------------------------------------------------
+# Main streaming entry point
+# ---------------------------------------------------------------------------
+async def stream_options_flow(
+    symbols: list[str],
+    registry=None,
+):
+    global _order_side_startup_logged
+
+    _stats["active_symbols"] = len(symbols)
+    _stats["mode"] = "starting"
+
+    # ING-010-DUP: gate_config_store.load() is called at lifespan step 0 in
+    # main.py before any service starts. The duplicate asyncio.create_task()
+    # that previously appeared here has been removed — it fired on every
+    # stream invocation including reconnects, making it dead/redundant code.
+
+    if not settings.TRADIER_API_KEY:
+        log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
+        _stats["mode"] = "idle"
+        return
+
+    if not _order_side_startup_logged:
+        log.info(
+            "[stream] order_side not available on Tradier timesale stream — "
+            "using bid/ask spread as aggression proxy via is_directionally_aggressive() (ING-001/ING-006)"
+        )
+        _order_side_startup_logged = True
+
+    from services.stream_manager import StreamManager
+
+    if registry is not None:
+        log.info(
+            "[stream] Registry provided by lifespan (is_ready=%s, %d OCC symbols). "
+            "Waiting for background build to complete before spawning workers...",
+            registry.is_ready(), registry.size(),
+        )
+        waited = 0.0
+        while not registry.is_ready() and waited < _REGISTRY_READY_TIMEOUT_S:
+            await asyncio.sleep(_REGISTRY_READY_POLL_S)
+            waited += _REGISTRY_READY_POLL_S
+
+        if not registry.is_ready():
+            log.error(
+                "[stream] Registry still not ready after %.0fs — "
+                "stream idle. Use admin panel to start demo engine.",
+                _REGISTRY_READY_TIMEOUT_S,
+            )
+            _stats["mode"] = "idle"
+            return
+
+        log.info(
+            "[stream] Registry ready: %d OCC contracts (waited=%.1fs) — "
+            "starting stream manager",
+            registry.size(), waited,
+        )
+    else:
+        from services.symbol_registry import init_registry as _init_registry
+        log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
+        registry = _init_registry(watchlist=symbols)
+        try:
+            occ_count, _ = await registry.build()
+        except Exception as e:
+            log.error(
+                f"[stream] OCC registry build failed: {e} — "
+                "stream idle. Use admin panel to start demo engine."
+            )
+            _stats["mode"] = "idle"
+            return
+
+        if occ_count == 0:
+            log.warning("[stream] OCC registry is empty — stream idle. Use admin panel to start demo engine.")
+            _stats["mode"] = "idle"
+            return
+
+        log.info(f"[stream] OCC registry ready: {occ_count:,} contracts — starting stream manager")
+        asyncio.create_task(registry.refresh_loop())
+
+    _stats["active_symbols"] = registry.size()
+    _stats["mode"] = "live"
+
+    log.info(
+        "[stream] LIVE mode — subscribing to %d OCC contracts across %d tickers",
+        registry.size(),
+        len({v.ticker for v in registry._registry.values()}) if hasattr(registry, '_registry') else 0,
+    )
+
+    manager = StreamManager(registry=registry, process_fn=_process_trade)
+    await manager.run()
+
+
+start_stream = stream_options_flow
+
+
+# ---------------------------------------------------------------------------
+# Idle watchdog
+# ---------------------------------------------------------------------------
+async def _guarded_lines(resp: httpx.Response):
+    aiter = resp.aiter_lines().__aiter__()
+    while True:
+        try:
+            line = await asyncio.wait_for(aiter.__anext__(), timeout=_IDLE_TIMEOUT)
+            yield line
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise
+
+
+# ---------------------------------------------------------------------------
+# SIG-DEBOUNCE helpers
+# ---------------------------------------------------------------------------
+def _evict_signal_emit_cache(now: float) -> None:
+    stale = [
+        k for k, v in _signal_last_emit.items()
+        if now - v["ts"] > _SIGNAL_EMIT_TTL_S
+    ]
+    for k in stale:
+        del _signal_last_emit[k]
+
+
+def _evict_lookback_result_cache(now: float) -> None:
+    stale = [
+        k for k, (_, stamped_at) in _lookback_result_cache.items()
+        if now - stamped_at > _LBC_TTL_S
+    ]
+    for k in stale:
+        del _lookback_result_cache[k]
+
+
+def _should_emit_signal(
+    emit_key: str,
+    alert_level: str,
+    total_premium: float,
+    now: float,
+) -> tuple[bool, str]:
+    last = _signal_last_emit.get(emit_key)
+
+    if last is None:
+        return True, "initial_emit"
+
+    debounce_s = _resolve_signal_debounce_s()
+    elapsed = now - last["ts"]
+    if elapsed < debounce_s:
+        return False, f"debounced({elapsed:.0f}s<{debounce_s:.0f}s)"
+
+    if alert_level != last["alert_level"]:
+        return True, f"level_change({last['alert_level']}->{alert_level})"
+
+    delta_prem = abs(total_premium - last["premium"])
+    if delta_prem >= _SIGNAL_DELTA_PREM:
+        return True, f"premium_delta(${delta_prem:,.0f})"
+
+    if last["premium"] > 0:
+        pct = delta_prem / last["premium"]
+        if pct >= _SIGNAL_DELTA_PCT:
+            return True, f"premium_pct({pct:.0%})"
+
+    return False, f"suppressed(no_material_change,elapsed={elapsed:.0f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Core trade processor — called by StreamManager for every timesale tick.
+# ---------------------------------------------------------------------------
+async def _process_trade(raw: dict, registry=None) -> None:
+    global _last_gate_epoch
+
+    now = _time.time()
+    _stats["ticks"] += 1
+
+    # --- Epoch-change detection (ING-010) ---
+    current_epoch = gate_config_store.epoch
+    if current_epoch != _last_gate_epoch:
+        log.info(
+            "[stream] gate_config_store epoch changed %d -> %d — hot-reload confirmed",
+            _last_gate_epoch, current_epoch,
+        )
+        _last_gate_epoch = current_epoch
+        _stats["gate_epoch"] = current_epoch
+
+    # --- Periodic cache eviction ---
+    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
+        _evict_signal_emit_cache(now)
+        _evict_lookback_result_cache(now)
+        # H4: evict stale sweep-upgrade dispatch keys
+        stale_sweep = [k for k, ts in _sweep_upgrade_dispatched.items() if now - ts > _SWEEP_DISPATCH_TTL_S]
+        for k in stale_sweep:
+            del _sweep_upgrade_dispatched[k]
+
+    # --- Event type filter ---
+    etype = raw.get("type", "")
+    if etype not in _PROCESSABLE_TYPES:
+        if etype and etype not in _non_timesale_etypes_seen:
+            if len(_non_timesale_etypes_seen) < _FIRST_ETYPE_LOG_COUNT:
+                log.info("[stream] non-timesale event type seen: %r (suppressing future logs for this type)", etype)
+            _non_timesale_etypes_seen.add(etype)
+        return
+
+    # --- Raw ticker extraction (pre-parse, for tier resolution) ---
+    _raw_symbol = raw.get("symbol", "")
+    _raw_ticker = _raw_symbol.split(" ")[0] if _raw_symbol else ""
+
+    # --- ING-011: index/ETF filter (Gate 6) ---
+    if _raw_ticker and _resolve_exclude_indices() and _raw_ticker in _INDEX_SYMBOLS:
+        _stats["index_filtered"] += 1
+        return
+
+    # --- Pre-parse tier resolution (ING-010 / REARCH-010) ---
+    _ev_tier_int = _resolve_tier_int(_raw_ticker)
+
+    # --- First-tick INFO log ---
+    if _stats["ticks"] <= _FIRST_TICK_LOG_COUNT:
+        log.info(
+            "[stream] first-tick #%d: symbol=%r tier=%d",
+            _stats["ticks"], _raw_symbol, _ev_tier_int,
+        )
+
+    # --- Parse ---
+    min_premium = _resolve_min_premium(_raw_ticker)
+    result = parse_tradier_trade(raw, registry=registry, min_premium=min_premium)
+
+    if result == "below_premium":
+        return
+    if result is None:
+        _stats["parse_failed"] += 1
+        return
+
+    ev = result
+    _stats["parsed"] += 1
+
+    # --- REARCH-002: IngestionProcessor 4-gate filter ---
+    processed = _ingestion_processor.process(ev, tier=_ev_tier_int)
+    if processed is None:
+        log.info(
+            "[stream] tick dropped by IngestionProcessor: symbol=%r tier=%d",
+            ev.occ_symbol, _ev_tier_int,
+        )
+        return
+    ev = processed
+
+    # --- Dedup ---
+    if flow_dedup.is_duplicate(ev, tier_int=_ev_tier_int):
+        _stats["deduped"] += 1
+        return
+
+    _stats["classified"] += 1
+
+    # --- Accumulate ---
+    sig_ep = accumulator.get_signal(ev)
+
+    # --- Persist flow event (fire-and-forget) ---
+    t = asyncio.create_task(persist_flow_event(ev))
+    t.add_done_callback(_persist_done_cb)
+    _stats["persisted"] += 1
+    log.info(
+        "[stream] persisted flow event: symbol=%r premium=$%.0f tier=%d",
+        ev.occ_symbol, ev.premium, _ev_tier_int,
+    )
+
+    # --- Sweep upgrade check ---
+    if ev.is_sweep and ev.occ_symbol:
+        dispatch_key = f"{ev.occ_symbol}|{ev.size}|{ev.fill_price}"
+        if dispatch_key not in _sweep_upgrade_dispatched:
+            _sweep_upgrade_dispatched[dispatch_key] = now
+            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol))
+
+    if sig_ep is None:
+        _stats["accumulator_gated"] += 1
+        return
+
+    # --- Persist episode (fire-and-forget) ---
+    persist_ep = accumulator.to_episode(sig_ep)
+    if persist_ep is not None:
+        asyncio.create_task(persist_flow_episode(persist_ep))
+        enqueue_lookback(persist_ep)
+
+    # --- Signal gate ---
+    signal_min_premium = _resolve_signal_min_premium()
+    if sig_ep.total_premium < signal_min_premium:
+        return
+
+    if sig_ep.trade_count < _SIGNAL_MIN_TRADES:
+        return
+
+    # --- Alert level resolution ---
+    alert_level = accumulator.get_alert_level(sig_ep)
+
+    # --- SIG-DEBOUNCE ---
+    emit_key = f"{ev.occ_symbol}"
+    should_emit, reason = _should_emit_signal(
+        emit_key=emit_key,
+        alert_level=alert_level,
+        total_premium=sig_ep.total_premium,
+        now=now,
+    )
+
+    if not should_emit:
+        _stats["sig_debounced"] += 1
+        log.info("[stream] signal suppressed for %r: %s", ev.occ_symbol, reason)
+        return
+
+    _signal_last_emit[emit_key] = {
+        "ts":          now,
+        "alert_level": alert_level,
+        "premium":     sig_ep.total_premium,
+    }
+
+    # --- Composite score ---
+    composite = None
+    try:
+        composite = build_composite(sig_ep, registry=registry)
+    except Exception as exc:
+        _stats["composite_errors"] += 1
+        log.warning("[stream] build_composite error for %r: %s", ev.occ_symbol, exc)
+
+    if composite is None:
+        return
+
+    direction = sig_ep.dominant_direction
+
+    _stats["signals"] += 1
+    log.info(
+        "[stream] SIGNAL %s | %s | alert=%s | premium=$%.0f | score=%.3f | reason=%s",
+        ev.ticker, ev.occ_symbol, alert_level,
+        sig_ep.total_premium, composite.score, reason,
+    )
+
+    # --- Multiday lookback result (cached) ---
+    is_repeat: bool = False
+    lbc_key = ev.occ_symbol
+    if lbc_key in _lookback_result_cache:
+        is_repeat, _ = _lookback_result_cache[lbc_key]
+    elif _lbc_fresh(lbc_key):
+        cached_val = _lbc.get(_ContractKey(lbc_key))
+        if cached_val is not None:
+            is_repeat = cached_val
+            _lookback_result_cache[lbc_key] = (is_repeat, now)
+
+    # --- Publish composite signal ---
+    payload = {
+        "ticker":              ev.ticker,
+        "occ_symbol":          ev.occ_symbol,
+        "contract_type":       ev.contract_type,
+        "strike":              ev.strike,
+        "expiry":              ev.expiry.isoformat() if ev.expiry else None,
+        "alert_level":         alert_level,
+        "direction":           direction,
+        "total_premium":       sig_ep.total_premium,
+        "trade_count":         sig_ep.trade_count,
+        "composite_score":     composite.score,
+        "score_ceiling":       COMPOSITE_SCORE_CEILING,
+        "influence_tier":      episode_influence_tier(sig_ep),
+        "is_multiday_repeat":  is_repeat,
+        "emit_reason":         reason,
+    }
+    await bus.publish_all("composite_signal", payload)
+
+    # --- Stats log (every N ticks) ---
+    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
+        log.info(
+            "[stream] funnel | ticks=%d parsed=%d classified=%d "
+            "deduped=%d index_filtered=%d accumulator_gated=%d "
+            "persisted=%d signals=%d sig_debounced=%d errors=%d",
+            _stats["ticks"], _stats["parsed"], _stats["classified"],
+            _stats["deduped"], _stats["index_filtered"], _stats["accumulator_gated"],
+            _stats["persisted"], _stats["signals"], _stats["sig_debounced"],
+            _stats["errors"],
+        )
