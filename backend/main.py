@@ -113,6 +113,11 @@ Key architectural fixes:
                         get_stats() from tradier_stream and returns the full raw
                         stats dict — identical to GET /stats — for ops debugging.
                         include_in_schema=False retained (internal ops only).
+  STEP2A-LOG-FIX      — Step 2a registry-seed log moved outside `if snapshot_id:`
+                        so it fires on both warm (snapshot present) and cold
+                        (no snapshot in DB) startup paths. registry.epoch removed
+                        from this log — epoch is a build() artifact not set here,
+                        logging it pre-build always showed 0 (misleading).
 """
 import asyncio
 import json
@@ -838,6 +843,15 @@ async def lifespan(app: FastAPI):
     )
 
     # Step 4: Seed OCC chains from DB (P1 fallback — no Tradier call).
+    #
+    # STEP2A-LOG-FIX: The Step 2a registry-seed log now fires unconditionally
+    # after load_from_db() returns, covering both the warm path (snapshot_id
+    # present) and the cold path (no snapshot in DB).
+    #
+    # registry.epoch is intentionally omitted here — it is a build() artifact
+    # set only after _background_build_and_upsert() completes. Reading it
+    # pre-build always returned 0 which was misleading in logs.
+    _db_count = 0
     if snapshot_id:
         _db_count = await registry.load_from_db(snapshot_id)
         log.info(
@@ -845,14 +859,16 @@ async def lifespan(app: FastAPI):
             "(is_ready=%s — waiting for build() to complete)",
             _db_count, registry.is_ready(),
         )
-        log.info(
-            "[universe] Step 2a HIT — registry ready: %d OCC symbols "
-            "(db_seed=%d, epoch=%d) path=%s",
-            registry.size(),
-            _db_count,
-            registry.epoch,
-            "warm" if _db_count > 0 else "cold",
-        )
+
+    # Step 2a summary log — fires on BOTH warm and cold startup paths.
+    log.info(
+        "[universe] Step 2a — registry seed complete: "
+        "occ_symbols=%d db_seeded=%d is_ready=%s path=%s",
+        registry.size(),
+        _db_count,
+        registry.is_ready(),
+        "warm" if _db_count > 0 else ("cold (no snapshot)" if not snapshot_id else "cold (empty seed)"),
+    )
 
     log.info(
         "[registry] Server starting (is_ready=%s, %d OCC contracts seeded). "
