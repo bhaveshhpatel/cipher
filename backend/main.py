@@ -108,6 +108,11 @@ Key architectural fixes:
                         - fail_streak counter replaces silent except-swallow;
                           log.warning on every failure, log.error after streak >= 3
                           with actionable guidance to check RENDER_EXTERNAL_URL
+  STATS-STREAM-ALIAS  — /stream/stats stub replaced: was returning {"status": "ok"}
+                        (dead stub that discarded all funnel stats). Now calls
+                        get_stats() from tradier_stream and returns the full raw
+                        stats dict — identical to GET /stats — for ops debugging.
+                        include_in_schema=False retained (internal ops only).
 """
 import asyncio
 import json
@@ -140,7 +145,7 @@ from services.signal_store import start_signal_writer
 from services.tier_engine import assign_tiers
 from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
-from services.tradier_stream import stream_options_flow
+from services.tradier_stream import stream_options_flow, get_stats as get_stream_stats
 from services.gate_config_store import store as gate_config_store  # HOTFIX-IMPORT-001
 
 import httpx
@@ -1007,7 +1012,16 @@ app.include_router(signal_config_router.router)     # REARCH-005: /admin/signal-
 
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
-    return JSONResponse({"status": "ok"})
+    """
+    STATS-STREAM-ALIAS: returns the full raw stats dict from get_stats().
+
+    Previously this was a dead stub returning {"status": "ok"} that discarded
+    all funnel counters. Now wired to get_stats() so both /stats (health.py)
+    and /stream/stats return identical full funnel data for ops debugging.
+
+    include_in_schema=False — internal ops use only, not in public OpenAPI docs.
+    """
+    return get_stream_stats()
 
 @app.get("/api/stream/stats", tags=["signals"])
 async def _stream_stats_alias(current_user=Depends(get_current_user)):
