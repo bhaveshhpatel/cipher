@@ -248,6 +248,18 @@ Fix (SEM-STREAM-RESTORE 2026-05-12): restore stream_options_flow + downstream fn
   The SEM-STREAM commit truncated the file at _resolve_exclude_indices() —
   everything from _is_market_hours() through _process_trade() was lost.
   Cherry-picked verbatim from cipher-rearch. No logic changes.
+
+Fix (BUG-REGISTRY-KWARG 2026-05-13): remove stale registry= kwarg from
+  parse_tradier_trade() call in _process_trade().
+  parse_tradier_trade() signature is (raw, min_premium=None) — it has never
+  accepted a registry= kwarg. The call site in _process_trade() was passing
+  registry=registry (always None since StreamManager only passes raw to
+  process_fn) causing TypeError: parse_tradier_trade() got an unexpected
+  keyword argument 'registry' on every single timesale tick. This silently
+  dropped 100% of trades — ticks incremented but parsed stayed 0.
+  Fix: remove registry=registry from the call. min_premium= is unchanged.
+  The registry enrichment inside parse_tradier_trade() uses get_registry()
+  internally and never needed the caller to pass it.
 """
 import asyncio
 import logging
@@ -289,7 +301,7 @@ from services.gate_config_store import store as gate_config_store
 # acquire_session_token_slot() tries to claim a _SESSION_SEM slot with a
 # bounded timeout so tradier_stream workers participate in B-022 burst
 # protection without merging their token-fetch implementation into
-# get_session_token() (which would break per-worker isolation).
+# get_session_token() (which would break per-worker isolation)
 from utils.tradier_client import (
     acquire_session_token_slot,
     _SESSION_SEM as _tradier_session_sem,
@@ -961,8 +973,12 @@ async def _process_trade(raw: dict, registry=None) -> None:
         )
 
     # --- Parse ---
+    # BUG-REGISTRY-KWARG: parse_tradier_trade signature is (raw, min_premium=None).
+    # The registry= kwarg was stale — parse_tradier_trade uses get_registry()
+    # internally and never accepted registry as a parameter. Passing it caused
+    # TypeError on every tick, silently dropping 100% of trades (parsed stayed 0).
     min_premium = _resolve_min_premium(_raw_ticker)
-    result = parse_tradier_trade(raw, registry=registry, min_premium=min_premium)
+    result = parse_tradier_trade(raw, min_premium=min_premium)
 
     if result == "below_premium":
         return
