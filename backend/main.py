@@ -136,6 +136,20 @@ Key architectural fixes:
                         The event fires exactly once, guaranteed, even on build failure or
                         CancelledError — chain_refresh is never permanently blocked.
                         Zero polling, zero race conditions, zero timing ambiguity.
+  SEQ-002-FIX (main)  — Correct the event-set placement in _background_build_and_upsert.
+                        The previous implementation set build_done_event inside the
+                        finally block of the try/except around registry.build() only —
+                        meaning the event fired BEFORE _post_build_upsert() ran. This
+                        re-introduced Tradier quota contention: chain_refresh could
+                        unblock and start fetching chains while _post_build_upsert()
+                        was still making its own Tradier calls (assign_tiers,
+                        upsert_symbol_quotes).
+                        Fix: single outer try/finally wraps BOTH build() and
+                        _post_build_upsert(). The event is set only in the outer
+                        finally — guaranteed to fire whether either phase succeeds,
+                        fails, or the task is cancelled. An inner try/except still
+                        catches build() failures and returns early (skipping upsert)
+                        while preserving the outer finally guarantee.
 """
 import asyncio
 import json
@@ -355,20 +369,24 @@ async def _fetch_tradier_chain(symbol: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# SEQ-002: Sequenced chain refresh — waits for registry build via asyncio.Event.
+# SEQ-002 / SEQ-002-FIX: Sequenced chain refresh — waits for registry build
+# AND post_build_upsert via asyncio.Event.
 #
 # SEQ-001 polled registry.is_ready() every 5 s, but is_ready() fires as soon
 # as _build_complete is set inside build() — before _post_build_upsert() runs.
-# On warm restarts with a pre-seeded DB registry, this meant chain_refresh
-# could start while the incremental build was still running, still contending
-# for Tradier API quota with the registry build.
 #
-# SEQ-002 fix: use an asyncio.Event (_registry_build_done) that is set by
-# _background_build_and_upsert() in a finally block — after both build() and
-# _post_build_upsert() have completed (or failed/cancelled). The event fires
-# exactly once, guaranteed. _chain_refresh_after_build() awaits the event
-# with a 30-min timeout safety valve, then delegates to
-# start_chain_refresh_worker(). Zero polling, zero timing races.
+# SEQ-002 introduced asyncio.Event but the original implementation set the
+# event inside the finally block of the try/except around registry.build()
+# only — meaning the event fired BEFORE _post_build_upsert() ran. This
+# re-introduced Tradier quota contention: chain_refresh could unblock while
+# _post_build_upsert() was still making its own Tradier/DB calls.
+#
+# SEQ-002-FIX: _background_build_and_upsert() now wraps BOTH build() and
+# _post_build_upsert() in a single outer try/finally. The event is set only
+# in the outer finally — guaranteed to fire whether either phase succeeds,
+# fails, or the task is cancelled. An inner try/except still catches build()
+# failures and returns early (skipping upsert) while the outer finally
+# guarantee is preserved.
 # ---------------------------------------------------------------------------
 async def _chain_refresh_after_build(
     get_tracked_symbols,
@@ -377,24 +395,24 @@ async def _chain_refresh_after_build(
     timeout: float = 1800.0,
 ) -> None:
     """
-    SEQ-002: Gate chain_refresh strictly behind registry build completion.
+    SEQ-002: Gate chain_refresh strictly behind registry build + upsert completion.
 
     Awaits `build_done_event` which is set by _background_build_and_upsert()
-    in its finally block — guaranteed to fire whether build() succeeds, fails,
-    or is cancelled. Once the event fires, delegates to
-    start_chain_refresh_worker() which runs its internal loop forever.
+    in its outer finally block — guaranteed to fire after BOTH registry.build()
+    AND _post_build_upsert() have completed (or failed/cancelled). Once the
+    event fires, delegates to start_chain_refresh_worker() which runs its
+    internal loop forever.
 
     `timeout` (default 30 min) is a last-resort safety valve: if
-    build_done_event is never set (e.g. the build task is cancelled before
-    its finally block runs in a catastrophic shutdown scenario), chain_refresh
-    starts anyway so the vol/OI cache is not permanently empty. A warning
-    is logged in that case.
+    build_done_event is never set (e.g. catastrophic shutdown before the
+    finally block runs), chain_refresh starts anyway so the vol/OI cache
+    is not permanently empty. A warning is logged in that case.
     """
     try:
         await asyncio.wait_for(build_done_event.wait(), timeout=timeout)
         log.info(
             "[chain_refresh] SEQ-002: build_done_event received — "
-            "starting chain refresh worker (symbol_registry build fully complete)"
+            "starting chain refresh worker (symbol_registry build + upsert fully complete)"
         )
     except asyncio.TimeoutError:
         log.warning(
@@ -754,39 +772,60 @@ async def _background_build_and_upsert(
     build_done_event: asyncio.Event,
 ) -> None:
     """
-    SEQ-002: Run the OCC registry build then signal completion via event.
+    SEQ-002-FIX: Run the full OCC build pipeline then signal completion.
 
-    build_done_event is set in a finally block so it fires whether build()
-    succeeds, fails, or the task is cancelled — _chain_refresh_after_build()
-    is never permanently blocked waiting for the event.
+    The build_done_event is set in the OUTER finally block that wraps BOTH
+    registry.build() and _post_build_upsert(). This guarantees the event
+    fires only after both phases have fully completed (or failed/cancelled)
+    — not just after build() returns.
+
+    Previous behaviour (bug): the event was set inside the finally block of
+    the inner try/except around build() only, which fired it before
+    _post_build_upsert() started, re-introducing Tradier quota contention
+    with chain_refresh.
+
+    Structure:
+        outer try/finally  — sets build_done_event unconditionally
+          inner try/except — catches build() failure; returns early on error
+                             (skips upsert), but outer finally still fires
     """
     log.info("[registry] Background build starting (server already live)")
     try:
-        count, raw_quotes = await registry.build()
-        log.info("[registry] Background build complete: %d OCC symbols", count)
-    except Exception as exc:
-        log.error("[registry] Background build failed: %s", exc, exc_info=True)
-        return
+        # --- Inner block: build() failure short-circuits to outer finally ---
+        build_failed = False
+        count = 0
+        raw_quotes: Optional[dict] = None
+        try:
+            count, raw_quotes = await registry.build()
+            log.info("[registry] Background build complete: %d OCC symbols", count)
+        except Exception as exc:
+            log.error("[registry] Background build failed: %s", exc, exc_info=True)
+            build_failed = True
+
+        if build_failed:
+            # build() failed — skip upsert, let outer finally signal the event.
+            return
+
+        # --- Post-build upsert (runs only if build() succeeded) ---
+        try:
+            await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
+        except Exception as exc:
+            log.error(
+                "[registry] _post_build_upsert raised (tier assignment failed) — "
+                "DB tier columns NOT updated this cycle: %s",
+                exc, exc_info=True,
+            )
     finally:
-        # SEQ-002: signal chain_refresh that the build phase is done.
-        # Set here (in finally) so the event fires even on build failure or
-        # CancelledError. chain_refresh seeing an incomplete registry is better
-        # than chain_refresh being permanently blocked.
+        # SEQ-002-FIX: set the event AFTER both build() and _post_build_upsert()
+        # have completed (or failed). This is the strict serialization barrier —
+        # chain_refresh will not start until this point.
         if not build_done_event.is_set():
             build_done_event.set()
             log.info(
                 "[registry] SEQ-002: build_done_event set — "
-                "chain refresh worker may now start"
+                "chain refresh worker may now start "
+                "(both registry.build() and _post_build_upsert() complete)"
             )
-
-    try:
-        await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
-    except Exception as exc:
-        log.error(
-            "[registry] _post_build_upsert raised (tier assignment failed) — "
-            "DB tier columns NOT updated this cycle: %s",
-            exc, exc_info=True,
-        )
 
 
 async def _universe_refresh_loop():
@@ -993,12 +1032,14 @@ async def lifespan(app: FastAPI):
             "[universe] Cache miss at startup — background universe resolve task spawned"
         )
 
-    # SEQ-002: chain_refresh_after_build — strictly serialized behind build_task.
+    # SEQ-002-FIX: chain_refresh_after_build — strictly serialized behind
+    # BOTH build_task and _post_build_upsert.
     #
     # _chain_refresh_after_build() awaits _registry_build_done (asyncio.Event)
-    # which is set by _background_build_and_upsert() in its finally block —
-    # after build() AND _post_build_upsert() have both completed (or failed).
-    # This guarantees zero Tradier chain-fetch contention with the registry build.
+    # which is now set by _background_build_and_upsert() in its OUTER finally
+    # block — after BOTH registry.build() AND _post_build_upsert() have
+    # completed (or failed). This guarantees zero Tradier chain-fetch
+    # contention with either the registry build or the post-build upsert.
     #
     # get_tracked_symbols returns the unique set of underlying tickers from the
     # live registry (not OCC symbols — one chain call per ticker covers all
