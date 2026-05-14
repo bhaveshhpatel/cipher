@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     REGISTRY_MIN_OI:                  int   = 0
     REGISTRY_EXPIRY_DAY_REFRESH_MINS: int   = 15
 
+    # ── Excluded symbols (env-var override path) ──────────────────────────────
+    # Primary source is ingestion_config DB key 'EXCLUDED_SYMBOLS' (read live
+    # via get_config() in symbols_loader._load_excluded_symbols).
+    # This env-var field is a secondary fallback: if EXCLUDED_SYMBOLS is set in
+    # .env or the process environment it is used when the DB key is absent/empty.
+    # Format: comma-separated uppercase tickers, e.g. "SPY,QQQ,IWM".
+    # Leave blank (default) to rely entirely on ingestion_config DB or the
+    # built-in _DEFAULT_EXCLUDED list in symbols_loader.py.
+    EXCLUDED_SYMBOLS: Optional[str] = None
+
     # ── Computed aliases (plain properties, visible to hasattr) ───────────────
 
     @property

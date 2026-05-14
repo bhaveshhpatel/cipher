@@ -35,12 +35,18 @@ Note on priority_symbols:
   to the eligible_set regardless of their price/volume thresholds.
 
 Note on excluded_symbols:
-  EXCLUDED_SYMBOLS is read from ingestion_config (key='EXCLUDED_SYMBOLS',
-  value_type='json_list', comma-separated string).  It is applied immediately
-  after the CBOE CSV parse (Step 1), before any Tradier API calls.  This
-  means excluded symbols cost zero API quota.  The list is configurable from
-  the admin page and takes effect on the next universe reload — no code
-  deploy required.
+  EXCLUDED_SYMBOLS is read live from ingestion_config (key='EXCLUDED_SYMBOLS',
+  value_type='json_list', comma-separated string) via get_config() each time
+  _fetch_and_validate() runs.  The 60-second TTL cache in ingestion_config
+  means an admin PATCH takes effect within 60 s — no code deploy required.
+
+  Fallback chain:
+    1. ingestion_config DB key EXCLUDED_SYMBOLS (non-empty comma-separated string)
+    2. settings.EXCLUDED_SYMBOLS env-var (EXCLUDED_SYMBOLS=SPY,QQQ in .env)
+    3. _DEFAULT_EXCLUDED built-in frozenset (hardcoded ~40 ETF tickers)
+
+  The filter is applied immediately after the CBOE CSV parse (Step 1),
+  before any Tradier API calls — excluded symbols cost zero API quota.
 """
 import asyncio
 import csv
@@ -61,7 +67,8 @@ SEED_SYMBOLS: list[str] = [
 ]
 
 # Default excluded symbols used when EXCLUDED_SYMBOLS is not set in
-# ingestion_config.  Covers: broad-market index ETFs (SPY/QQQ/IWM/DIA),
+# ingestion_config (DB key empty) and not set via env-var.
+# Covers: broad-market index ETFs (SPY/QQQ/IWM/DIA),
 # commodity ETFs (GLD/SLV/USO), bond ETFs (TLT/HYG/LQD), international
 # ETFs (EEM/EFA), sector ETFs (XL*), gold miner ETFs (GDX/GDXJ),
 # leveraged/inverse ETFs (TQQQ/SQQQ/SOXL/SOXS/SPXL/SPXS), volatility
@@ -92,7 +99,7 @@ _DEFAULT_EXCLUDED: frozenset[str] = frozenset([
     # Crypto ETFs
     "BITO", "IBIT", "ETHA", "FBTC", "BITB",
     # Fixed-income / dividend ETFs with low signal value
-    "SCHD", "BKLN", "LQD",
+    "SCHD", "BKLN",
     # Other broad ETFs
     "SCHX", "IGV",
 ])
@@ -127,39 +134,62 @@ class SymbolQuote:
 # Excluded symbols helper
 # ---------------------------------------------------------------------------
 
-def _load_excluded_symbols() -> frozenset[str]:
+async def _load_excluded_symbols() -> frozenset[str]:
     """
-    Load the EXCLUDED_SYMBOLS set from settings (populated from ingestion_config).
+    Load the EXCLUDED_SYMBOLS set, checking sources in priority order:
 
-    Settings loader is expected to read ingestion_config key 'EXCLUDED_SYMBOLS'
-    (value_type='json_list', comma-separated string) and expose it as
-    settings.EXCLUDED_SYMBOLS (a str or list[str]).
+      1. ingestion_config DB key 'EXCLUDED_SYMBOLS' (json_list, comma-separated).
+         Read via get_config() which has a 60-second TTL cache — an admin PATCH
+         takes effect within one cache cycle without a restart.
+      2. settings.EXCLUDED_SYMBOLS env-var (e.g. EXCLUDED_SYMBOLS=SPY,QQQ in .env).
+         Useful for local dev overrides or infra-level pinning.
+      3. _DEFAULT_EXCLUDED built-in frozenset (hardcoded ~40 ETF/index tickers).
+         Used when both DB and env-var are absent or empty.
 
-    Falls back to _DEFAULT_EXCLUDED if the key is absent or empty.
     Returns a frozenset of uppercase ticker strings.
     """
-    raw = getattr(settings, "EXCLUDED_SYMBOLS", None)
-    if not raw:
-        log.debug(
-            "EXCLUDED_SYMBOLS not set in settings — using built-in default list "
-            "(%d symbols)", len(_DEFAULT_EXCLUDED),
+    # Source 1: live ingestion_config DB value (60s TTL cache)
+    try:
+        from services.ingestion_config import get_config
+        cfg = await get_config()
+        db_raw = cfg.get("EXCLUDED_SYMBOLS", "")
+        if db_raw and str(db_raw).strip():
+            parsed = frozenset(
+                s.strip().upper() for s in str(db_raw).split(",") if s.strip()
+            )
+            if parsed:
+                log.debug(
+                    "EXCLUDED_SYMBOLS loaded from ingestion_config DB (%d symbols)",
+                    len(parsed),
+                )
+                return parsed
+    except Exception as exc:
+        log.warning(
+            "EXCLUDED_SYMBOLS: ingestion_config get_config() failed (%s) — "
+            "falling back to env-var / built-in list",
+            exc,
         )
-        return _DEFAULT_EXCLUDED
 
-    # settings may expose it as a pre-parsed list or a raw comma-separated string
-    if isinstance(raw, (list, tuple, set, frozenset)):
-        parsed = frozenset(str(s).strip().upper() for s in raw if str(s).strip())
-    else:
-        parsed = frozenset(s.strip().upper() for s in str(raw).split(",") if s.strip())
+    # Source 2: env-var / settings override
+    env_raw = getattr(settings, "EXCLUDED_SYMBOLS", None)
+    if env_raw and str(env_raw).strip():
+        if isinstance(env_raw, (list, tuple, set, frozenset)):
+            parsed = frozenset(str(s).strip().upper() for s in env_raw if str(s).strip())
+        else:
+            parsed = frozenset(s.strip().upper() for s in str(env_raw).split(",") if s.strip())
+        if parsed:
+            log.debug(
+                "EXCLUDED_SYMBOLS loaded from settings/env-var (%d symbols)",
+                len(parsed),
+            )
+            return parsed
 
-    if not parsed:
-        log.debug(
-            "EXCLUDED_SYMBOLS parsed to empty set — using built-in default list "
-            "(%d symbols)", len(_DEFAULT_EXCLUDED),
-        )
-        return _DEFAULT_EXCLUDED
-
-    return parsed
+    # Source 3: built-in default list
+    log.debug(
+        "EXCLUDED_SYMBOLS: using built-in default list (%d symbols)",
+        len(_DEFAULT_EXCLUDED),
+    )
+    return _DEFAULT_EXCLUDED
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +278,8 @@ async def _fetch_and_validate() -> list[str]:
         return []
 
     # Apply EXCLUDED_SYMBOLS filter before any Tradier API calls.
-    # Reads from ingestion_config via settings; falls back to _DEFAULT_EXCLUDED.
-    excluded = _load_excluded_symbols()
+    # Priority: ingestion_config DB → settings env-var → _DEFAULT_EXCLUDED.
+    excluded = await _load_excluded_symbols()
     if excluded:
         before = len(raw_symbols)
         raw_symbols = [s for s in raw_symbols if s not in excluded]
