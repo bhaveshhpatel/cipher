@@ -109,6 +109,18 @@ _SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 # ---------------------------------------------------------------------------
 _shared_client: Optional[httpx.AsyncClient] = None
 
+# Canonical Timeout used by the shared pool, the _client() fallback, and
+# any ephemeral retry clients. httpx requires either a scalar default= or
+# all four parameters (connect, read, write, pool) set explicitly — partial
+# kwargs without default= raise ValueError at request time, not at
+# construction time, which caused every get_expirations() call to fail.
+_TIMEOUT = httpx.Timeout(
+    connect=_CONNECT_TIMEOUT,
+    read=_READ_TIMEOUT,
+    write=10.0,
+    pool=5.0,
+)
+
 
 def init_http_client() -> None:
     """Create the shared httpx client. Call once on app startup."""
@@ -118,8 +130,7 @@ def init_http_client() -> None:
         max_keepalive_connections=20,
         keepalive_expiry=30.0,
     )
-    timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=_READ_TIMEOUT, write=10.0, pool=5.0)
-    _shared_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+    _shared_client = httpx.AsyncClient(limits=limits, timeout=_TIMEOUT)
     log.info("[tradier_client] shared HTTP client initialised (pool max=30)")
 
 
@@ -141,9 +152,11 @@ def _client() -> httpx.AsyncClient:
     if _shared_client is not None:
         return _shared_client
     log.debug("[tradier_client] _shared_client not initialised — using ephemeral client")
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=_CONNECT_TIMEOUT, read=_READ_TIMEOUT)
-    )
+    # Always use the module-level _TIMEOUT here. Passing partial kwargs to
+    # httpx.Timeout (e.g. connect= + read= without default=) is rejected by
+    # httpx at request time — not at construction time — so the error would
+    # surface as a warning on every API call rather than at startup.
+    return httpx.AsyncClient(timeout=_TIMEOUT)
 
 
 def _headers() -> dict:
@@ -309,7 +322,7 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
                     symbol, expiration, retry_after,
                 )
                 await asyncio.sleep(retry_after)
-                async with httpx.AsyncClient(timeout=_READ_TIMEOUT) as retry_client:
+                async with httpx.AsyncClient(timeout=_TIMEOUT) as retry_client:
                     resp = await retry_client.get(
                         url, headers=_headers(),
                         params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
