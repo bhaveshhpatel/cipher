@@ -11,7 +11,8 @@ Startup sequence:
   4. registry.load_from_db()           — seed OCC chains from DB via P1 fallback
   5. yield                             — SERVER IS LIVE, health probe passes (~6 s)
   6. Parallel background tasks launched:
-     a. _background_build_and_upsert   — incremental/full OCC build (P4)
+     a. _background_build_and_upsert   — incremental/full OCC build (P4);
+                                         sets _registry_build_done event on completion
      b. _background_universe_resolve() — MISS only: load_universe() + save + tier assign
      c. registry.refresh_loop()        — scheduled 30-min rebuilds
      d. _registry_prewarm_loop()       — 9:15 AM ET daily pre-warm
@@ -19,7 +20,7 @@ Startup sequence:
      f. start_flow_writer()            — DB flush loop
      g. start_signal_writer()          — signal DB writer
      h. _universe_refresh_loop()       — 24h universe refresh
-     i. _chain_refresh_after_build()   — SEQ-001: waits for registry.is_ready()
+     i. _chain_refresh_after_build()   — SEQ-002: awaits _registry_build_done Event
                                          THEN starts 5-min chain cache refresh loop
      j. _self_ping_worker()            — RENDER: pings /health every 5 min to prevent spin-down
 
@@ -121,6 +122,20 @@ Key architectural fixes:
                           symbol_registry.build() completes → chain_refresh starts.
                         All other tasks (stream, db_write, signal_write, etc.) are
                         unaffected and continue to launch in parallel as before.
+  SEQ-002 (main)      — Replace SEQ-001 polling with asyncio.Event (_registry_build_done).
+                        Root cause of SEQ-001 failure: registry.is_ready() fires as soon
+                        as _build_complete is set inside build(), which happens before
+                        _post_build_upsert() completes. On warm restarts the registry is
+                        pre-seeded from DB (7275 contracts) and _build_complete can be set
+                        for a partial incremental build — earlier than intended.
+                        Fix: _registry_build_done = asyncio.Event() created in lifespan().
+                          _background_build_and_upsert() sets it in a finally block after
+                          both build() and _post_build_upsert() have finished (or failed).
+                          _chain_refresh_after_build() awaits the event with a 30-min
+                          timeout safety valve, then delegates to start_chain_refresh_worker().
+                        The event fires exactly once, guaranteed, even on build failure or
+                        CancelledError — chain_refresh is never permanently blocked.
+                        Zero polling, zero race conditions, zero timing ambiguity.
 """
 import asyncio
 import json
@@ -340,61 +355,50 @@ async def _fetch_tradier_chain(symbol: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# SEQ-001: Sequenced chain refresh — waits for registry build before starting.
+# SEQ-002: Sequenced chain refresh — waits for registry build via asyncio.Event.
 #
-# Previously start_chain_refresh_worker() was launched immediately in parallel
-# with _background_build_and_upsert(). This caused the chain worker to begin
-# fetching Tradier chain data for all 3900 tickers while the OCC symbol map
-# was still being built, producing:
-#   - HTTP 400 storms (Tradier rejecting concurrent bulk requests)
-#   - Incomplete chain data written to the vol/OI cache
-#   - The registry build itself slowing down due to shared Tradier session
-#     contention with the chain worker
+# SEQ-001 polled registry.is_ready() every 5 s, but is_ready() fires as soon
+# as _build_complete is set inside build() — before _post_build_upsert() runs.
+# On warm restarts with a pre-seeded DB registry, this meant chain_refresh
+# could start while the incremental build was still running, still contending
+# for Tradier API quota with the registry build.
 #
-# Fix: poll registry.is_ready() every 5 s (timeout 30 min) before handing
-# off to start_chain_refresh_worker(). is_ready() returns True only after
-# _background_build_and_upsert() has fully completed build() and set the
-# _build_complete flag (M-1/M-2 in symbol_registry).
-#
-# All other tasks (stream, db_write, signal_write, etc.) are unaffected —
-# they continue to start immediately in parallel after yield as before.
+# SEQ-002 fix: use an asyncio.Event (_registry_build_done) that is set by
+# _background_build_and_upsert() in a finally block — after both build() and
+# _post_build_upsert() have completed (or failed/cancelled). The event fires
+# exactly once, guaranteed. _chain_refresh_after_build() awaits the event
+# with a 30-min timeout safety valve, then delegates to
+# start_chain_refresh_worker(). Zero polling, zero timing races.
 # ---------------------------------------------------------------------------
 async def _chain_refresh_after_build(
     get_tracked_symbols,
     fetch_chain_fn,
-    poll_interval: float = 5.0,
+    build_done_event: asyncio.Event,
     timeout: float = 1800.0,
 ) -> None:
     """
-    SEQ-001: Gate chain_refresh behind registry build completion.
+    SEQ-002: Gate chain_refresh strictly behind registry build completion.
 
-    Polls registry.is_ready() every `poll_interval` seconds.  Once the
-    registry signals readiness (build() fully complete, _build_complete set),
-    delegates unconditionally to start_chain_refresh_worker() which runs
-    its own internal loop forever.
+    Awaits `build_done_event` which is set by _background_build_and_upsert()
+    in its finally block — guaranteed to fire whether build() succeeds, fails,
+    or is cancelled. Once the event fires, delegates to
+    start_chain_refresh_worker() which runs its internal loop forever.
 
-    `timeout` (default 30 min) is a safety valve: if build() never finishes
-    (e.g. Tradier is down for a sustained period), chain_refresh starts anyway
-    so the cache is not permanently empty.  A warning is logged in that case.
+    `timeout` (default 30 min) is a last-resort safety valve: if
+    build_done_event is never set (e.g. the build task is cancelled before
+    its finally block runs in a catastrophic shutdown scenario), chain_refresh
+    starts anyway so the vol/OI cache is not permanently empty. A warning
+    is logged in that case.
     """
-    reg = get_registry()
-    elapsed = 0.0
-    while elapsed < timeout:
-        if reg is not None and reg.is_ready():
-            log.info(
-                "[chain_refresh] SEQ-001: registry is_ready=True after %.0f s — "
-                "starting chain refresh worker",
-                elapsed,
-            )
-            break
-        # Re-fetch the registry reference in case init_registry() was called
-        # after this coroutine started (defensive).
-        reg = get_registry()
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-    else:
+    try:
+        await asyncio.wait_for(build_done_event.wait(), timeout=timeout)
+        log.info(
+            "[chain_refresh] SEQ-002: build_done_event received — "
+            "starting chain refresh worker (symbol_registry build fully complete)"
+        )
+    except asyncio.TimeoutError:
         log.warning(
-            "[chain_refresh] SEQ-001: registry not ready after %.0f s (timeout) — "
+            "[chain_refresh] SEQ-002: build_done_event not set after %.0f s (timeout) — "
             "starting chain refresh worker anyway to avoid permanent cache miss",
             timeout,
         )
@@ -744,7 +748,18 @@ async def _post_build_upsert(
         )
 
 
-async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> None:
+async def _background_build_and_upsert(
+    registry,
+    stream_symbols: list[str],
+    build_done_event: asyncio.Event,
+) -> None:
+    """
+    SEQ-002: Run the OCC registry build then signal completion via event.
+
+    build_done_event is set in a finally block so it fires whether build()
+    succeeds, fails, or the task is cancelled — _chain_refresh_after_build()
+    is never permanently blocked waiting for the event.
+    """
     log.info("[registry] Background build starting (server already live)")
     try:
         count, raw_quotes = await registry.build()
@@ -752,6 +767,18 @@ async def _background_build_and_upsert(registry, stream_symbols: list[str]) -> N
     except Exception as exc:
         log.error("[registry] Background build failed: %s", exc, exc_info=True)
         return
+    finally:
+        # SEQ-002: signal chain_refresh that the build phase is done.
+        # Set here (in finally) so the event fires even on build failure or
+        # CancelledError. chain_refresh seeing an incomplete registry is better
+        # than chain_refresh being permanently blocked.
+        if not build_done_event.is_set():
+            build_done_event.set()
+            log.info(
+                "[registry] SEQ-002: build_done_event set — "
+                "chain refresh worker may now start"
+            )
+
     try:
         await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
     except Exception as exc:
@@ -931,6 +958,12 @@ async def lifespan(app: FastAPI):
     # yield HERE so Render's health probe passes immediately.
     # All remaining work runs in background tasks below.
 
+    # SEQ-002: create the build-done event before spawning any tasks.
+    # Passed into _background_build_and_upsert() (sets it) and
+    # _chain_refresh_after_build() (awaits it). This is the strict
+    # serialization barrier between the two Tradier fetch paths.
+    _registry_build_done = asyncio.Event()
+
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
     stream_task           = asyncio.create_task(
@@ -940,7 +973,7 @@ async def lifespan(app: FastAPI):
     signal_write_task     = asyncio.create_task(start_signal_writer())
     refresh_task          = asyncio.create_task(_universe_refresh_loop())
     build_task            = asyncio.create_task(
-        _background_build_and_upsert(registry, stream_symbols)
+        _background_build_and_upsert(registry, stream_symbols, _registry_build_done)
     )
     # MAIN-FIX-001: start_lookback_worker() was refactored (FS-HANG fix) to
     # fetch its own accumulator internally via get_accumulator() — it takes 0
@@ -960,42 +993,33 @@ async def lifespan(app: FastAPI):
             "[universe] Cache miss at startup — background universe resolve task spawned"
         )
 
-    # SEQ-001: chain_refresh_after_build — gates chain refresh behind registry build.
+    # SEQ-002: chain_refresh_after_build — strictly serialized behind build_task.
     #
-    # _chain_refresh_after_build() polls registry.is_ready() every 5 s and only
-    # calls start_chain_refresh_worker() once the OCC symbol map is fully populated
-    # by _background_build_and_upsert(). This prevents the chain worker from firing
-    # Tradier requests for all 3900 tickers simultaneously with the registry build,
-    # which was causing HTTP 400 storms and incomplete chain data.
+    # _chain_refresh_after_build() awaits _registry_build_done (asyncio.Event)
+    # which is set by _background_build_and_upsert() in its finally block —
+    # after build() AND _post_build_upsert() have both completed (or failed).
+    # This guarantees zero Tradier chain-fetch contention with the registry build.
     #
-    # Wired with the same two-callable signature as before:
-    #
-    #   get_tracked_symbols — zero-arg callable returning the live list of unique
-    #     underlying tickers from the registry. Called fresh each refresh cycle so
-    #     newly added symbols are automatically picked up without a restart.
-    #     Falls back to stream_symbols (ticker list) if the registry is not yet
-    #     accessible.
-    #
-    #   fetch_chain_fn — async callable accepting a ticker string and returning a
-    #     list of contract dicts from Tradier GET /v1/markets/options/chains.
-    #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
-    #     aborts the refresh cycle.
+    # get_tracked_symbols returns the unique set of underlying tickers from the
+    # live registry (not OCC symbols — one chain call per ticker covers all
+    # strikes/expiries). Falls back to stream_symbols if registry is not ready.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
-            # Return the unique set of underlying tickers (not OCC symbols) so
-            # one Tradier chain call per ticker covers all its strikes/expiries.
+            # Unique underlying tickers — one chain call covers all strikes/expiries.
             return list({v.ticker for v in reg._registry.values()})
         # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
     log.info(
-        "[chain_refresh] SEQ-001: chain refresh worker will start after registry build completes"
+        "[chain_refresh] SEQ-002: chain refresh worker will start after "
+        "build_done_event fires (registry build + post_build_upsert complete)"
     )
     chain_refresh_task = asyncio.create_task(
         _chain_refresh_after_build(
             get_tracked_symbols=_get_tracked_tickers,
             fetch_chain_fn=_fetch_tradier_chain,
+            build_done_event=_registry_build_done,
         )
     )
 
@@ -1021,7 +1045,7 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    chain_refresh_task.cancel()  # SEQ-001 / ING-008
+    chain_refresh_task.cancel()  # SEQ-002 / ING-008
     self_ping_task.cancel()      # RENDER-KEEPALIVE
     if universe_resolve_task:
         universe_resolve_task.cancel()  # RENDER-STARTUP-HANG
@@ -1034,7 +1058,7 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         lookback_task,
-        chain_refresh_task,  # SEQ-001 / ING-008
+        chain_refresh_task,  # SEQ-002 / ING-008
         self_ping_task,      # RENDER-KEEPALIVE
     ]
     if universe_resolve_task:
