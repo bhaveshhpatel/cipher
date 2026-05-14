@@ -20,7 +20,7 @@ FIX C-3 (2026-04-27): assign_tiers() is now called with require_oi=True
 
 FIX H1 (2026-04-27): build() now returns a tuple[int, dict[str, dict]]
   (count, raw_quotes). Callers that only need the count ignore the second
-  element; _background_build_and_upsert passes raw_quotes to
+  element; _post_build_upsert passes raw_quotes to
   _post_build_upsert so it can skip the duplicate _fetch_batch_quotes call.
 
 FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
@@ -153,6 +153,21 @@ FIX BUILD-HANG-PER-REQUEST (2026-05-14): Each individual get_option_chain_bulk()
   TCP slots made the 180s gather fire after only ~130 alphabetically-first
   tickers completed.
 
+FIX POOL-MISMATCH (2026-05-14): Companion to tradier_client.py POOL-MISMATCH.
+  _CHAIN_REQUEST_TIMEOUT_S raised from 15s to 30s now that pool contention
+  is eliminated (max_connections=75, 1.5× _BULK_CHAIN_SEM=50).
+
+  Root cause: when PERF-SEM-50 raised _BULK_CHAIN_SEM from 10→50 without
+  updating max_connections (still 30), 50 coroutines competed for 30 TCP
+  slots. The 20 blocked on pool-wait burned the 15s asyncio.wait_for budget
+  before the HTTP request even started — timeouts fired on pool contention,
+  not Tradier TCP stalls. Cascading timeouts yielded only ~5,560 OCC contracts
+  vs the expected ~50K.
+
+  With pool now at 75 (headroom fully restored), 30s reflects genuine P99
+  Tradier stall time (~8-12s on degraded days) with comfortable margin,
+  while still freeing truly-stalled slots well before the 300s gather ceiling.
+
 FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
   and re-raises immediately instead of letting it propagate through
   `async with sem:` as an unhandled future exception.
@@ -208,7 +223,7 @@ _DEFAULT_BUILD_CONCURRENCY = 50
 _PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3949 tickers × 200/batch = 20 batches
 
 # BUILD-HANG-PER-REQUEST: raised from 180s to 300s.
-# Per-request 15s timeouts on each get_option_chain_bulk() call (see
+# Per-request 30s timeouts on each get_option_chain_bulk() call (see
 # _build_ticker) keep all 50 semaphore slots productive. At concurrency=50
 # with typical Tradier latency (500ms-1.5s/ticker), 3949 tickers completes
 # in 40-120s. 300s is the true last-resort ceiling that should never fire
@@ -216,9 +231,13 @@ _PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3949 tickers × 200/bat
 _CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): full 3949-ticker universe
 
 # Per-request timeout for each individual get_option_chain_bulk() call.
-# Frees the semaphore slot immediately on TCP stall — keeps concurrency=50
-# slots productive throughout the entire build window.
-_CHAIN_REQUEST_TIMEOUT_S = 15
+# POOL-MISMATCH fix (2026-05-14): raised from 15s → 30s now that
+# max_connections=75 eliminates pool contention (was 0.6× sem=50, now 1.5×).
+# 30s reflects genuine P99 Tradier stall time (~8-12s on degraded days)
+# with headroom, while still freeing truly-stalled slots well before the
+# 300s gather ceiling. Previously, 20 of 50 coroutines burned the 15s budget
+# waiting for a TCP pool slot rather than for actual Tradier I/O.
+_CHAIN_REQUEST_TIMEOUT_S = 30   # was 15 — safe now that pool contention is eliminated
 
 # LOG-CHAIN: log chain-pull progress every N tickers so cold-start is visible.
 _CHAIN_PROGRESS_INTERVAL = 250
@@ -440,10 +459,11 @@ class SymbolRegistry:
           on timeout (zero-price fallback / partial registry) and always
           set _build_complete=True so stream workers can spawn.
 
-        BUILD-HANG-PER-REQUEST - per-request chain timeout:
+        BUILD-HANG-PER-REQUEST / POOL-MISMATCH:
           Each get_option_chain_bulk() call in _build_ticker() is wrapped
-          in asyncio.wait_for(timeout=15s). Stalled TCP connections no
-          longer hold semaphore slots — all 50 slots stay productive.
+          in asyncio.wait_for(timeout=30s). Timeout raised from 15s after
+          POOL-MISMATCH fix (max_connections=75) eliminated pool contention.
+          30s reflects genuine P99 Tradier stall time with headroom.
 
         SHUTDOWN-CANCEL - clean CancelledError propagation:
           _build_with_sem catches CancelledError and re-raises immediately
@@ -598,7 +618,7 @@ class SymbolRegistry:
                     for ticker in tickers_to_refresh
                 ]
                 # BUILD-HANG: hard 300s timeout on the chain-fetch gather.
-                # Per-request 15s timeouts in _build_ticker keep all semaphore
+                # Per-request 30s timeouts in _build_ticker keep all semaphore
                 # slots productive — this outer timeout is the last-resort
                 # safety net that should not fire under normal conditions.
                 # On timeout, proceed with whatever contracts were fetched
@@ -813,9 +833,11 @@ class SymbolRegistry:
           been removed in build(). _build_ticker() is unchanged here —
           it always read tier_params[tier]; the fix is in the caller.
 
-        BUILD-HANG-PER-REQUEST: each get_option_chain_bulk() call is wrapped
-          in asyncio.wait_for(timeout=_CHAIN_REQUEST_TIMEOUT_S=15s).
-          A stalled TCP connection frees its semaphore slot within 15s
+        BUILD-HANG-PER-REQUEST / POOL-MISMATCH:
+          Each get_option_chain_bulk() call is wrapped in
+          asyncio.wait_for(timeout=_CHAIN_REQUEST_TIMEOUT_S=30s).
+          Raised from 15s after POOL-MISMATCH fix eliminated pool contention.
+          A stalled TCP connection frees its semaphore slot within 30s
           instead of holding it for the full gather window. This keeps
           all concurrency=50 slots productive throughout the build.
           Timeout is logged at WARNING with ticker + expiry string.
@@ -862,11 +884,10 @@ class SymbolRegistry:
             if dte < 0 or dte > params.max_dte:
                 continue
 
-            # BUILD-HANG-PER-REQUEST: wrap each chain fetch in a 15s deadline.
-            # Without this, a stalled TCP connection holds the semaphore slot
-            # for the entire outer gather window (300s), starving other tickers.
-            # LOG-CHAIN: TimeoutError now logged with ticker + expiry string so
-            # stalling tickers are identifiable (was silently continuing).
+            # POOL-MISMATCH / BUILD-HANG-PER-REQUEST: wrap each chain fetch
+            # in a 30s deadline (raised from 15s after pool contention was
+            # eliminated by max_connections=75 in tradier_client.py).
+            # LOG-CHAIN: TimeoutError now logged with ticker + expiry string.
             try:
                 contracts = await asyncio.wait_for(
                     get_option_chain_bulk(ticker, expiry_str),
