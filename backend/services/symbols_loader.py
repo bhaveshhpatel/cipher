@@ -6,6 +6,7 @@ stream eligibility via Tradier batch quotes (Step 3).
 
 Universe pipeline:
   Step 1 — CBOE CSV → ~5,500 raw symbols
+             → EXCLUDED_SYMBOLS filter applied (configurable via ingestion_config)
   Step 2 — [DISABLED] Tradier /expirations validation — commented out;
              fired 5,267 serial API calls on cold start, hitting Tradier
              rate/timeout limits → 0 valid symbols → seed fallback every
@@ -32,6 +33,14 @@ Returns (symbols, source, stream_eligible_set) from load_universe().
 Note on priority_symbols:
   After the pipeline completes, settings.priority_symbols are force-added
   to the eligible_set regardless of their price/volume thresholds.
+
+Note on excluded_symbols:
+  EXCLUDED_SYMBOLS is read from ingestion_config (key='EXCLUDED_SYMBOLS',
+  value_type='json_list', comma-separated string).  It is applied immediately
+  after the CBOE CSV parse (Step 1), before any Tradier API calls.  This
+  means excluded symbols cost zero API quota.  The list is configurable from
+  the admin page and takes effect on the next universe reload — no code
+  deploy required.
 """
 import asyncio
 import csv
@@ -50,6 +59,43 @@ SEED_SYMBOLS: list[str] = [
     "AAPL", "TSLA", "NVDA", "SPY", "QQQ", "MSFT", "AMZN", "META",
     "GOOGL", "AMD", "PLTR", "SOFI", "HOOD", "RIVN", "CRWD", "NET",
 ]
+
+# Default excluded symbols used when EXCLUDED_SYMBOLS is not set in
+# ingestion_config.  Covers: broad-market index ETFs (SPY/QQQ/IWM/DIA),
+# commodity ETFs (GLD/SLV/USO), bond ETFs (TLT/HYG/LQD), international
+# ETFs (EEM/EFA), sector ETFs (XL*), gold miner ETFs (GDX/GDXJ),
+# leveraged/inverse ETFs (TQQQ/SQQQ/SOXL/SOXS/SPXL/SPXS), volatility
+# ETPs (UVXY/SVXY/VIXY), and crypto ETFs (BITO/IBIT/ETHA).
+# These instruments either lack meaningful options sweep signals or produce
+# predominantly macro/hedging flow rather than the single-stock sweep
+# patterns the Steamroom strategy targets.
+_DEFAULT_EXCLUDED: frozenset[str] = frozenset([
+    # Broad-market index ETFs
+    "SPY", "QQQ", "IWM", "DIA",
+    # Commodity ETFs
+    "GLD", "SLV", "USO",
+    # Bond ETFs
+    "TLT", "HYG", "LQD", "BND", "AGG",
+    # International ETFs
+    "EEM", "EFA", "EWZ", "FXI", "EWY",
+    # Sector ETFs
+    "XLF", "XLE", "XLU", "XLK", "XLV", "XLI", "XLB", "XLP", "XLRE",
+    # Gold miner ETFs
+    "GDX", "GDXJ",
+    # Leveraged / inverse ETFs
+    "TQQQ", "SQQQ", "SOXL", "SOXS", "SPXL", "SPXS",
+    "UPRO", "SPXU", "UDOW", "SDOW", "LABU", "LABD",
+    "QID", "QLD", "PSQ", "SSO", "SDS", "SH",
+    "RWM", "TNA", "TZA", "TSLL", "TSLQ",
+    # Volatility ETPs
+    "UVXY", "SVXY", "VIXY", "VXX",
+    # Crypto ETFs
+    "BITO", "IBIT", "ETHA", "FBTC", "BITB",
+    # Fixed-income / dividend ETFs with low signal value
+    "SCHD", "BKLN", "LQD",
+    # Other broad ETFs
+    "SCHX", "IGV",
+])
 
 _CBOE_URL             = (
     "https://www.cboe.com/us/options/symboldir/"
@@ -78,6 +124,45 @@ class SymbolQuote:
 
 
 # ---------------------------------------------------------------------------
+# Excluded symbols helper
+# ---------------------------------------------------------------------------
+
+def _load_excluded_symbols() -> frozenset[str]:
+    """
+    Load the EXCLUDED_SYMBOLS set from settings (populated from ingestion_config).
+
+    Settings loader is expected to read ingestion_config key 'EXCLUDED_SYMBOLS'
+    (value_type='json_list', comma-separated string) and expose it as
+    settings.EXCLUDED_SYMBOLS (a str or list[str]).
+
+    Falls back to _DEFAULT_EXCLUDED if the key is absent or empty.
+    Returns a frozenset of uppercase ticker strings.
+    """
+    raw = getattr(settings, "EXCLUDED_SYMBOLS", None)
+    if not raw:
+        log.debug(
+            "EXCLUDED_SYMBOLS not set in settings — using built-in default list "
+            "(%d symbols)", len(_DEFAULT_EXCLUDED),
+        )
+        return _DEFAULT_EXCLUDED
+
+    # settings may expose it as a pre-parsed list or a raw comma-separated string
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        parsed = frozenset(str(s).strip().upper() for s in raw if str(s).strip())
+    else:
+        parsed = frozenset(s.strip().upper() for s in str(raw).split(",") if s.strip())
+
+    if not parsed:
+        log.debug(
+            "EXCLUDED_SYMBOLS parsed to empty set — using built-in default list "
+            "(%d symbols)", len(_DEFAULT_EXCLUDED),
+        )
+        return _DEFAULT_EXCLUDED
+
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -99,6 +184,9 @@ async def load_universe(
 
     priority_symbols from settings are force-added to stream_eligible_set
     after the pipeline completes (they bypass price/volume thresholds).
+
+    EXCLUDED_SYMBOLS from ingestion_config are removed from the CBOE universe
+    before any Tradier API calls fire (zero API cost for excluded symbols).
     """
     if not getattr(settings, "TRADIER_API_KEY", None):
         log.warning("TRADIER_API_KEY not set — skipping full pipeline, using fallback")
@@ -151,7 +239,7 @@ def _fallback(db_snapshot: Optional[list[str]]) -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: CBOE fetch
+# Step 1: CBOE fetch + excluded symbols filter
 # ---------------------------------------------------------------------------
 
 async def _fetch_and_validate() -> list[str]:
@@ -159,7 +247,25 @@ async def _fetch_and_validate() -> list[str]:
     if not raw_symbols:
         return []
 
-    log.info("Fetched %d raw symbols from CBOE — Step 2 validation DISABLED, proceeding to Step 3", len(raw_symbols))
+    # Apply EXCLUDED_SYMBOLS filter before any Tradier API calls.
+    # Reads from ingestion_config via settings; falls back to _DEFAULT_EXCLUDED.
+    excluded = _load_excluded_symbols()
+    if excluded:
+        before = len(raw_symbols)
+        raw_symbols = [s for s in raw_symbols if s not in excluded]
+        removed = before - len(raw_symbols)
+        if removed:
+            log.info(
+                "EXCLUDED_SYMBOLS filter: removed %d symbols from CBOE universe "
+                "(%d remaining). Active exclusion list has %d entries.",
+                removed, len(raw_symbols), len(excluded),
+            )
+
+    log.info(
+        "Fetched %d symbols from CBOE after exclusion filter — "
+        "Step 2 validation DISABLED, proceeding to Step 3",
+        len(raw_symbols),
+    )
 
     # TODO(parallel-schema): reinstate _validate_symbols() call here once a
     # cached/parallel validation layer exists that won't block startup with
@@ -220,7 +326,7 @@ async def _fetch_cboe_symbols() -> list[str]:
                 seen.add(s)
                 unique.append(s)
 
-        log.info("CBOE CSV parsed: %d unique symbols", len(unique))
+        log.info("CBOE CSV parsed: %d unique symbols (before exclusion filter)", len(unique))
         return unique
 
     except (httpx.TimeoutException, httpx.ConnectError) as e:
