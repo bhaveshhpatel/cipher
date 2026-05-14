@@ -127,6 +127,17 @@ Key architectural fixes:
                         main.py updated to use the shared pool instead of creating
                         a new AsyncClient per call. Eliminates ~22 min of TCP
                         handshake overhead during cold-start registry build.
+  FIX-CHAIN-400       — _fetch_tradier_chain() was sending GET /v1/markets/options/chains
+                        with only {symbol, greeks=false}. Tradier requires
+                        ?expiration=YYYY-MM-DD and returns HTTP 400 without it.
+                        Because _refresh_one() in chain_store treated [] as a
+                        non-error return, every cycle logged refreshed=N errors=0
+                        cache_size=0 — the vol/OI cache was permanently empty.
+                        Fix: call get_expirations(symbol) first to resolve all active
+                        expiry dates, then call get_option_chain(symbol, expiry) per
+                        date and flatten results. Matches the registry build() path
+                        exactly. The inline httpx block is removed — all Tradier I/O
+                        now routes through tradier_client functions consistently.
 """
 import asyncio
 import json
@@ -161,7 +172,12 @@ from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow, get_stats as get_stream_stats
 from services.gate_config_store import store as gate_config_store  # HOTFIX-IMPORT-001
-from utils.tradier_client import init_http_client, close_http_client, _client as _tradier_client  # FLAW3-POOL
+from utils.tradier_client import (  # FLAW3-POOL + FIX-CHAIN-400
+    init_http_client,
+    close_http_client,
+    get_expirations,
+    get_option_chain,
+)
 
 import httpx
 
@@ -283,34 +299,47 @@ def _is_market_hours() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ING-008: Tradier chain fetch helper for the background refresh worker.
+# FIX-CHAIN-400: Tradier chain fetch helper for the background refresh worker.
 #
-# FLAW3-POOL: Updated to use the shared httpx client (_tradier_client()) from
-# utils.tradier_client instead of creating a new AsyncClient per call.
-# During the 5-min chain refresh cycle (hundreds of symbols) this eliminates
-# the per-call TCP handshake overhead from this path as well.
+# Root cause: the previous implementation sent only {symbol, greeks=false}
+# to GET /v1/markets/options/chains. Tradier requires ?expiration=YYYY-MM-DD
+# and returns HTTP 400 without it. Because _refresh_one() in chain_store.py
+# treats an empty [] return as a non-error success, every cycle logged:
+#   refreshed=N errors=0 cache_size=0
+# meaning the vol/OI cache was permanently empty.
+#
+# Fix: call get_expirations(symbol) first to resolve all active expiry dates
+# for the ticker, then call get_option_chain(symbol, expiry) per date and
+# flatten all returned contract dicts. This matches exactly what the registry
+# build() path does via get_option_chain_bulk(). The previous inline httpx
+# block (url/headers/params constructed inside main.py) is removed — all
+# Tradier I/O now routes through tradier_client functions consistently.
+#
+# HOTFIX-CHAIN-HOURS: Returns [] immediately outside market hours
+# (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
+# are closed, so there is nothing useful to fetch.
+#
+# Used exclusively by start_chain_refresh_worker() as the fetch_chain_fn
+# callable. Returns a flat list of option contract dicts. On any network or
+# API error returns [] so the worker continues to the next symbol without
+# aborting the refresh cycle.
 # ---------------------------------------------------------------------------
 async def _fetch_tradier_chain(symbol: str) -> list:
     """
-    ING-008: Fetch the current options chain for `symbol` from Tradier.
+    FIX-CHAIN-400: Fetch the full options chain for `symbol` across all
+    active expiration dates.
 
-    Used exclusively by start_chain_refresh_worker() as the fetch_chain_fn
-    callable.  Returns a flat list of option contract dicts.  On any
-    network or API error returns [] so the worker continues to the next
-    symbol without aborting the refresh cycle.
+    Calls get_expirations(symbol) to resolve all active expiry dates, then
+    calls get_option_chain(symbol, expiry) for each date and returns the
+    flattened list of contract dicts.
 
-    HOTFIX-CHAIN-HOURS: Returns [] immediately outside market hours
-    (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
-    are closed, so there is nothing useful to fetch.
-
-    FLAW3-POOL: Uses shared httpx pool via _tradier_client() instead of a
-    per-call AsyncClient.
-
-    API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
     Each returned dict includes at minimum:
       - "symbol"        : str  (21-char OCC symbol)
       - "volume"        : int  (today's volume for this contract)
       - "open_interest" : int
+
+    Returns [] immediately outside market hours (HOTFIX-CHAIN-HOURS) or on
+    any error. Never raises — callers must handle [] as a valid no-data signal.
     """
     if not _is_market_hours():
         log.debug("[chain_refresh] %s — skipped (market closed)", symbol)
@@ -318,26 +347,24 @@ async def _fetch_tradier_chain(symbol: str) -> list:
 
     if not settings.TRADIER_API_KEY:
         return []
-    url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
-    headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept": "application/json",
-    }
-    params = {"symbol": symbol, "greeks": "false"}
+
     try:
-        resp = await _tradier_client().get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            log.warning(
-                "[chain_refresh] Tradier chain fetch %s -> HTTP %d",
-                symbol, resp.status_code,
-            )
+        expirations = await get_expirations(symbol)
+        if not expirations:
+            log.debug("[chain_refresh] %s — no expirations returned", symbol)
             return []
-        data = resp.json()
-        options = data.get("options") or {}
-        option_list = options.get("option") or []
-        if isinstance(option_list, dict):
-            option_list = [option_list]
-        return option_list
+
+        all_contracts: list = []
+        for expiry in expirations:
+            contracts = await get_option_chain(symbol, expiry)
+            all_contracts.extend(contracts)
+
+        log.debug(
+            "[chain_refresh] %s — fetched %d contracts across %d expirations",
+            symbol, len(all_contracts), len(expirations),
+        )
+        return all_contracts
+
     except Exception as exc:
         log.warning(
             "[chain_refresh] _fetch_tradier_chain(%s) error: %s",
@@ -981,22 +1008,17 @@ app.include_router(signal_config_router.router)
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
     """
-    STATS-STREAM-ALIAS: returns the full raw stats dict from get_stats().
+    STATS-STREAM-ALIAS: Returns full stream funnel stats for ops debugging.
+    Identical payload to GET /stats. include_in_schema=False (internal only).
     """
-    return get_stream_stats()
+    return JSONResponse(content=get_stream_stats())
 
-@app.get("/api/stream/stats", tags=["signals"])
-async def _stream_stats_alias(current_user=Depends(get_current_user)):
-    return await stream_stats(current_user)
 
-@app.get("/api/health", tags=["health"])
-async def api_health():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
+@app.get("/stats", tags=["health"])
+async def get_stats_endpoint(user=Depends(get_current_user)):
+    return JSONResponse(content=get_stream_stats())
 
-@app.get("/health", tags=["health"])
-async def health_root():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
 
-@app.get("/", tags=["health"])
-async def root():
-    return JSONResponse({"message": "Cipher API v1.0 — Decode the Market"})
+@app.get("/config", tags=["health"])
+async def config_endpoint(cfg=Depends(get_config)):
+    return JSONResponse(content=cfg)
