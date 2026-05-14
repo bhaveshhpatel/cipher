@@ -26,6 +26,20 @@ PERF-SEM-50 (2026-05-14):
   sem. Cold-start now completes in ~2.5 min (clean) / ~12 min (degraded)
   instead of 9-12 min (clean) / never (degraded with 15s per-request timeouts).
 
+POOL-MISMATCH fix (2026-05-14):
+  When PERF-SEM-50 raised _BULK_CHAIN_SEM from 10 → 50, max_connections was
+  not updated (still 30). 50 coroutines competed for 30 TCP slots; the 20
+  blocked on pool-wait burned the 15s asyncio.wait_for budget in _build_ticker
+  before the HTTP request even started — timeouts fired on pool contention,
+  not Tradier TCP stalls. Cascading timeouts yielded only ~5,560 OCC contracts
+  vs the expected ~50K.
+  Fix:
+    max_connections: 30 → 75  (1.5× sem=50; restores the 3× ratio from sem=10 era)
+    max_keepalive_connections: 20 → 60
+    _CONNECT_TIMEOUT: 15.0 → 10.0  (fail fast on connect, free pool slot sooner)
+    _READ_TIMEOUT:    20.0 → 25.0  (must exceed _CHAIN_REQUEST_TIMEOUT_S=30s budget)
+  Companion fix in symbol_registry.py: _CHAIN_REQUEST_TIMEOUT_S 15 → 30s.
+
 B-022 — Global Session Token Semaphore:
   _SESSION_SEM = asyncio.Semaphore(3) wraps get_session_token() / get_token().
 
@@ -47,10 +61,10 @@ Fix (SEM-STREAM 2026-05-12): expose acquire_session_token_slot() for
 Flaw 3 Fix (TCP Connection Pooling):
   Replaced per-call httpx.AsyncClient instantiation with a single shared
   client (_shared_client) that maintains a persistent connection pool.
-  max_connections=30 / max_keepalive_connections=20 / keepalive_expiry=30s.
+  max_connections=75 / max_keepalive_connections=60 / keepalive_expiry=30s.
   Call init_http_client() on app startup and close_http_client() on shutdown
   (both wired into main.py lifespan). Eliminates ~22 min of TCP handshake
-  overhead during cold-start registry build at _BULK_CHAIN_SEM(10).
+  overhead during cold-start registry build.
 
 Public API:
   init_http_client()                         -> None  (call on startup)
@@ -77,16 +91,16 @@ from config import settings
 
 log = logging.getLogger("tradier_client")
 
-_CONNECT_TIMEOUT = 15.0
-_READ_TIMEOUT    = 20.0
+_CONNECT_TIMEOUT = 10.0   # was 15.0 — fail fast on connect, free pool slot sooner
+_READ_TIMEOUT    = 25.0   # was 20.0 — must exceed _CHAIN_REQUEST_TIMEOUT_S=30s budget
 
 # Live streaming flow path — conservative, never races with Tradier rate limit
 _CHAIN_SEM       = asyncio.Semaphore(2)
 
 # Registry build() bulk path — raised from 10 → 50 (PERF-SEM-50 2026-05-14)
-# to match outer build sem(50) in symbol_registry.py. Previously min(50,10)=10
-# was the real concurrency ceiling. Sustained rate stays below 120 req/min
-# because each ticker coroutine also blocks on get_expirations() first.
+# to match outer build sem(50) in symbol_registry.py. Previously the inner
+# sem(10) was the real throughput ceiling (min(50,10)=10 effective
+# concurrency). Now true 50-concurrent chain fetches are possible.
 _BULK_CHAIN_SEM  = asyncio.Semaphore(50)
 
 # B-022: max 3 concurrent session token fetches across ALL callers
@@ -109,11 +123,15 @@ _SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 # ---------------------------------------------------------------------------
 # One persistent client is shared across all callers. Connections are reused
 # after initial TCP handshake, eliminating ~100ms overhead per call.
-# Pool sizing rationale:
-#   max_connections=30      — covers _BULK_CHAIN_SEM(10) + _CHAIN_SEM(2) +
-#                             _SESSION_SEM(3) + quotes/expirations bursts
-#   max_keepalive_connections=20 — keep warm connections for the build path
-#   keepalive_expiry=30s    — Tradier keeps-alives are typically <60s
+# Pool sizing rationale (POOL-MISMATCH fix 2026-05-14):
+#   max_connections=75      — 1.5× _BULK_CHAIN_SEM(50). Restores the 3× ratio
+#                             from the sem=10 era (pool=30 was 3× sem=10).
+#                             Previously pool=30 was 0.6× sem=50, causing 20
+#                             coroutines to block on pool-wait and burn the
+#                             per-request asyncio.wait_for budget before the
+#                             HTTP request even started.
+#   max_keepalive_connections=60 — keep warm connections for the build path
+#   keepalive_expiry=30s    — Tradier keep-alives are typically <60s
 # init_http_client() / close_http_client() are called from main.py lifespan.
 # ---------------------------------------------------------------------------
 _shared_client: Optional[httpx.AsyncClient] = None
@@ -135,12 +153,12 @@ def init_http_client() -> None:
     """Create the shared httpx client. Call once on app startup."""
     global _shared_client
     limits = httpx.Limits(
-        max_connections=30,
-        max_keepalive_connections=20,
+        max_connections=75,            # POOL-MISMATCH fix: was 30 (0.6× sem=50)
+        max_keepalive_connections=60,  # was 20
         keepalive_expiry=30.0,
     )
     _shared_client = httpx.AsyncClient(limits=limits, timeout=_TIMEOUT)
-    log.info("[tradier_client] shared HTTP client initialised (pool max=30)")
+    log.info("[tradier_client] shared HTTP client initialised (pool max=75)")
 
 
 async def close_http_client() -> None:
@@ -309,7 +327,7 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
 
     Still safe under 120 req/min because:
       - each ticker coroutine also blocks on get_expirations() first
-      - per-request 15s timeouts in _build_ticker free stalled slots fast
+      - per-request 30s timeouts in _build_ticker free stalled slots fast
       - 429 responses are handled gracefully with back-off retry
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
