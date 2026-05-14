@@ -71,6 +71,12 @@ REARCH-003 (2026-05-10): enrich_tags() static method.
   compute both tags inline. enrich_tags() itself is NOT called from
   persist_flow_event() — production writes use the inline path.
   REARCH-004 may wire enrich_tags() into a different call site.
+
+FIX (2026-05-14): _fetch_from_db() previously imported
+  services.supabase_client.get_supabase_client which does not exist in
+  the deployed codebase, causing ModuleNotFoundError at every cache
+  refresh cycle.  Replaced with direct supabase.create_client using
+  config.settings, matching the pattern used in chain_store.py and auth.py.
 """
 from __future__ import annotations
 
@@ -168,10 +174,22 @@ async def _fetch_from_db() -> IngestionConfig:
     """
     Pull ingestion_config rows from Supabase and build a new IngestionConfig.
     Falls back to current cache if the query fails.
+
+    FIX (2026-05-14): replaced broken `from services.supabase_client import
+    get_supabase_client` with direct supabase.create_client using
+    config.settings — the only Supabase client pattern that exists in
+    this codebase (see chain_store.py, auth.py).
     """
     try:
-        from services.supabase_client import get_supabase_client  # local import — avoids circular
-        sb = get_supabase_client()
+        from supabase import create_client
+        from config import settings
+
+        key = settings.SUPABASE_SERVICE_KEY
+        if not key:
+            log.warning("ingestion_config DB fetch skipped — SUPABASE_SERVICE_KEY not set")
+            return _cache
+
+        sb = create_client(settings.SUPABASE_URL, key)
         resp = sb.table("ingestion_config").select("key,value,value_type").execute()
         rows = resp.data or []
         kv: dict = {}

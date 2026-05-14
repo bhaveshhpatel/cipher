@@ -28,6 +28,10 @@ Validation ranges (enforced here, not in DB):
 
 REARCH-002 (2026-05-09)
 M3 auth fix (2026-05-10): added verify_service_role() dependency.
+FIX (2026-05-14): replaced broken `from services.supabase_client import
+  get_supabase_client` local imports in both route handlers with direct
+  supabase.create_client using config.settings — the only Supabase client
+  pattern that exists in this codebase.
 """
 from __future__ import annotations
 
@@ -38,7 +42,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, model_validator
+from supabase import create_client
 
+from config import settings
 from ingestion.processor import invalidate_ingestion_config_cache
 
 log = logging.getLogger(__name__)
@@ -77,6 +83,26 @@ def verify_service_role(
     if token != service_role_key:
         log.warning("ingestion_config: unauthorized access attempt")
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# ---------------------------------------------------------------------------
+# Supabase client factory (service role)
+# ---------------------------------------------------------------------------
+
+def _get_sb_client():
+    """
+    Return a Supabase client using the service-role key from settings.
+    Raises HTTPException 500 if the key is not configured.
+
+    FIX (2026-05-14): previously used non-existent
+    services.supabase_client.get_supabase_client(). Now uses
+    supabase.create_client directly, consistent with chain_store.py.
+    """
+    key = settings.SUPABASE_SERVICE_KEY
+    if not key:
+        log.error("SUPABASE_SERVICE_KEY not set — ingestion-config DB access unavailable")
+        raise HTTPException(status_code=500, detail="DB client not configured")
+    return create_client(settings.SUPABASE_URL, key)
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +150,7 @@ async def get_ingestion_config_endpoint(
     Return all ingestion_config rows as a flat dict { key: typed_value }.
     Requires Authorization: Bearer <SERVICE_ROLE_KEY>.
     """
-    from services.supabase_client import get_supabase_client
-    sb = get_supabase_client()
+    sb = _get_sb_client()
     resp = sb.table("ingestion_config").select("key,value,value_type,description,updated_at").execute()
     rows = resp.data or []
     result = {}
@@ -185,8 +210,7 @@ async def patch_ingestion_config(
     Raises 403 if Authorization header is missing or incorrect.
     Requires Authorization: Bearer <SERVICE_ROLE_KEY>.
     """
-    from services.supabase_client import get_supabase_client
-    sb = get_supabase_client()
+    sb = _get_sb_client()
 
     updated_keys: list[str] = []
     for key, raw_value in request.updates.items():

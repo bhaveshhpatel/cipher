@@ -102,6 +102,17 @@ HOTFIX-CHAIN-CONCURRENCY (2026-05-13):
   than the original sequential 5.8s). Zero impact on streaming hot path —
   save_chain is called only at startup and every 24h; get_contract_vol_oi()
   reads _vol_oi_cache fed by start_chain_refresh_worker(), a separate path.
+
+FIX (2026-05-14): HTTP 400 handling in start_chain_refresh_worker().
+  Tradier returns HTTP 400 for tickers that have no listed options
+  (e.g. AWI, ARES, ARI). The worker previously relied entirely on
+  fetch_chain_fn() to return [] on all errors, but aiohttp/httpx raises
+  ClientResponseError (or similar) for 4xx responses rather than returning
+  gracefully. Fix: catch exceptions whose string representation contains
+  '400' or whose status attribute == 400, log the ticker as non-optionable
+  at INFO level (not WARNING — this is expected for some tickers), and
+  skip without incrementing the error counter. All other exceptions
+  continue to increment the error counter and log at WARNING.
 """
 import asyncio
 import logging
@@ -185,6 +196,38 @@ def invalidate_vol_oi_cache() -> None:
     log.info("[chain_store] vol/OI cache invalidated (market-open reset)")
 
 
+def _is_http_400(exc: Exception) -> bool:
+    """
+    FIX (2026-05-14): Detect HTTP 400 responses from any HTTP client library
+    (aiohttp, httpx, requests) without hard-coding a specific exception type.
+
+    Checks:
+      1. exc.status == 400         (aiohttp ClientResponseError)
+      2. exc.status_code == 400    (httpx HTTPStatusError)
+      3. exc.response.status_code == 400  (requests HTTPError / httpx variant)
+      4. '400' in str(exc)         (last resort string match)
+
+    Returns True only when we are confident this is a 400 Bad Request,
+    so legitimate network errors still route to the WARNING path.
+    """
+    # aiohttp: ClientResponseError.status
+    if getattr(exc, "status", None) == 400:
+        return True
+    # httpx: HTTPStatusError.response.status_code
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 400:
+        return True
+    # httpx direct attribute
+    if getattr(exc, "status_code", None) == 400:
+        return True
+    # Last-resort string match — only when string is short and contains '400'
+    # to avoid false positives on messages mentioning port 4000 etc.
+    exc_str = str(exc)
+    if "400" in exc_str and ("Bad Request" in exc_str or "status" in exc_str.lower()):
+        return True
+    return False
+
+
 async def start_chain_refresh_worker(
     get_tracked_symbols: Callable[[], list],
     fetch_chain_fn: Callable[[str], Awaitable[list]],
@@ -211,6 +254,15 @@ async def start_chain_refresh_worker(
           - "open_interest" : int
         On error it should return [] (never raise) so one bad symbol does
         not abort the entire refresh cycle.
+
+    HTTP 400 handling (FIX 2026-05-14)
+    ------------------------------------
+    Tradier returns HTTP 400 for tickers with no listed options contracts
+    (e.g. AWI, ARES, ARI). These 400s are expected and non-actionable —
+    the ticker just isn't optionable. They are caught by _is_http_400(),
+    logged at INFO (not WARNING — no action required), and skipped without
+    incrementing the error counter. All other exceptions are logged at
+    WARNING and DO increment the error counter.
 
     API budget
     ----------
@@ -247,6 +299,7 @@ async def start_chain_refresh_worker(
 
             refreshed = 0
             errors = 0
+            skipped_400 = 0
             for symbol in symbols:
                 try:
                     contracts = await fetch_chain_fn(symbol)
@@ -262,16 +315,27 @@ async def start_chain_refresh_worker(
                         }
                     refreshed += 1
                 except Exception as exc:
-                    errors += 1
-                    log.warning(
-                        "[chain_store] chain refresh: error fetching %s: %s",
-                        symbol, exc,
-                    )
+                    # FIX (2026-05-14): Tradier returns HTTP 400 for non-optionable
+                    # tickers (AWI, ARES, ARI, etc.). Detect these specifically so
+                    # they do not pollute the error counter or log at WARNING level.
+                    if _is_http_400(exc):
+                        skipped_400 += 1
+                        log.info(
+                            "[chain_store] chain refresh: %s has no listed options "
+                            "(Tradier HTTP 400) — skipping",
+                            symbol,
+                        )
+                    else:
+                        errors += 1
+                        log.warning(
+                            "[chain_store] chain refresh: error fetching %s: %s",
+                            symbol, exc,
+                        )
 
             log.info(
                 "[chain_store] chain refresh cycle complete — "
-                "symbols=%d refreshed=%d errors=%d cache_size=%d",
-                len(symbols), refreshed, errors, len(_vol_oi_cache),
+                "symbols=%d refreshed=%d skipped_400=%d errors=%d cache_size=%d",
+                len(symbols), refreshed, skipped_400, errors, len(_vol_oi_cache),
             )
 
     except asyncio.CancelledError:
