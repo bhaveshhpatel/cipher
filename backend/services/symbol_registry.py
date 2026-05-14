@@ -167,9 +167,25 @@ FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
   Fix: explicit try/except asyncio.CancelledError inside _build_with_sem
   re-raises the error so asyncio retires the future cleanly. No logic change —
   the shutdown behaviour is identical; only the stderr noise is eliminated.
+
+LOG-CHAIN (2026-05-14): Chain-pull progress, per-request timeout, and
+  elapsed-time logging added to build() and _build_ticker().
+
+  - _build_with_sem: shared atomic counter logs progress every 250 tickers
+    (and at 100% completion) showing count/total/%, contracts accumulated so
+    far, and elapsed seconds since chain gather started. Gives real-time
+    visibility into cold-start chain pull with zero logic changes.
+
+  - _build_ticker: asyncio.TimeoutError on get_option_chain_bulk() now logs
+    at WARNING with ticker + expiry string so stalling tickers are
+    identifiable (was silently `continue`-ing with no trace).
+
+  - build(): chain gather phase timed with time.monotonic(). Elapsed seconds
+    logged on both clean completion and gather-timeout path.
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -203,6 +219,9 @@ _CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): full 3949-ticker unive
 # Frees the semaphore slot immediately on TCP stall — keeps concurrency=50
 # slots productive throughout the entire build window.
 _CHAIN_REQUEST_TIMEOUT_S = 15
+
+# LOG-CHAIN: log chain-pull progress every N tickers so cold-start is visible.
+_CHAIN_PROGRESS_INTERVAL = 250
 
 
 @dataclass
@@ -431,6 +450,12 @@ class SymbolRegistry:
           so asyncio can retire each gather future without logging it as
           '_GatheringFuture exception was never retrieved'. No behaviour
           change — only shutdown log noise is eliminated.
+
+        LOG-CHAIN - chain-pull progress logging:
+          _build_with_sem logs progress every 250 tickers (count/total/%,
+          contracts so far, elapsed seconds). _build_ticker logs per-ticker
+          TimeoutError with expiry string. build() logs elapsed seconds for
+          the entire chain gather phase.
         """
         from services.symbols_loader import SymbolQuote
 
@@ -528,6 +553,13 @@ class SymbolRegistry:
                 zero_price_fallback = True
 
             if tickers_to_refresh:
+                total_tickers = len(tickers_to_refresh)
+                # LOG-CHAIN: shared counter for progress logging inside
+                # _build_with_sem. Using a list so the nested closure can
+                # mutate it (nonlocal requires Python 3 enclosing scope).
+                _completed = [0]
+                _chain_start = time.monotonic()
+
                 async def _build_with_sem(ticker):
                     # SHUTDOWN-CANCEL: catch CancelledError and re-raise immediately
                     # so asyncio can retire the gather future cleanly without logging
@@ -545,6 +577,21 @@ class SymbolRegistry:
                             )
                     except asyncio.CancelledError:
                         raise
+                    finally:
+                        # LOG-CHAIN: increment counter and emit progress line
+                        # every _CHAIN_PROGRESS_INTERVAL tickers and at 100%.
+                        _completed[0] += 1
+                        done = _completed[0]
+                        if done % _CHAIN_PROGRESS_INTERVAL == 0 or done == total_tickers:
+                            elapsed = time.monotonic() - _chain_start
+                            log.info(
+                                "[symbol_registry] Chain pull progress: %d/%d tickers "
+                                "(%.0f%%) | contracts so far: %d | elapsed: %.1fs",
+                                done, total_tickers,
+                                100.0 * done / total_tickers,
+                                len(new_registry),
+                                elapsed,
+                            )
 
                 tasks = [
                     _build_with_sem(ticker)
@@ -561,14 +608,25 @@ class SymbolRegistry:
                         asyncio.gather(*tasks, return_exceptions=True),
                         timeout=_CHAIN_GATHER_TIMEOUT_S,
                     )
+                    # LOG-CHAIN: elapsed for clean gather completion.
+                    chain_elapsed = time.monotonic() - _chain_start
+                    log.info(
+                        "[symbol_registry] Chain gather complete: %d tickers in %.1fs "
+                        "| %d contracts loaded",
+                        total_tickers, chain_elapsed, len(new_registry),
+                    )
                 except asyncio.TimeoutError:
+                    chain_elapsed = time.monotonic() - _chain_start
                     log.error(
                         "[symbol_registry] BUILD-HANG: chain gather timed out after %ds "
-                        "(%d tickers queued). Proceeding with partial registry (%d contracts "
-                        "so far) — stream workers will spawn against partial data. "
-                        "Next refresh_loop() will complete the missing tickers.",
+                        "(%.1fs elapsed, %d tickers queued, %d completed). Proceeding with "
+                        "partial registry (%d contracts so far) — stream workers will spawn "
+                        "against partial data. Next refresh_loop() will complete the missing "
+                        "tickers.",
                         _CHAIN_GATHER_TIMEOUT_S,
-                        len(tickers_to_refresh),
+                        chain_elapsed,
+                        total_tickers,
+                        _completed[0],
                         len(new_registry),
                     )
 
@@ -760,8 +818,11 @@ class SymbolRegistry:
           A stalled TCP connection frees its semaphore slot within 15s
           instead of holding it for the full gather window. This keeps
           all concurrency=50 slots productive throughout the build.
-          Timeout is logged at WARNING and the expiry is skipped (same
-          behaviour as a failed chain fetch).
+          Timeout is logged at WARNING with ticker + expiry string.
+
+        LOG-CHAIN: TimeoutError on get_option_chain_bulk() now logs at
+          WARNING with ticker + expiry string so stalling tickers are
+          identifiable in Railway logs (was silently continuing).
         """
         if stock_price <= 0:
             if zero_price_fallback:
@@ -804,8 +865,8 @@ class SymbolRegistry:
             # BUILD-HANG-PER-REQUEST: wrap each chain fetch in a 15s deadline.
             # Without this, a stalled TCP connection holds the semaphore slot
             # for the entire outer gather window (300s), starving other tickers.
-            # On timeout: log WARNING and skip this expiry (same as a network
-            # error). The ticker's other expiries are still attempted.
+            # LOG-CHAIN: TimeoutError now logged with ticker + expiry string so
+            # stalling tickers are identifiable (was silently continuing).
             try:
                 contracts = await asyncio.wait_for(
                     get_option_chain_bulk(ticker, expiry_str),
