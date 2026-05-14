@@ -19,7 +19,8 @@ Startup sequence:
      f. start_flow_writer()            — DB flush loop
      g. start_signal_writer()          — signal DB writer
      h. _universe_refresh_loop()       — 24h universe refresh
-     i. start_chain_refresh_worker()   — ING-008: 5-min chain cache refresh loop
+     i. _chain_refresh_after_build()   — SEQ-001: waits for registry.is_ready()
+                                         THEN starts 5-min chain cache refresh loop
      j. _self_ping_worker()            — RENDER: pings /health every 5 min to prevent spin-down
 
 Key architectural fixes:
@@ -108,6 +109,18 @@ Key architectural fixes:
                         - fail_streak counter replaces silent except-swallow;
                           log.warning on every failure, log.error after streak >= 3
                           with actionable guidance to check RENDER_EXTERNAL_URL
+  SEQ-001 (main)      — _chain_refresh_after_build() wrapper introduced.
+                        chain_refresh_worker was previously launched in parallel with
+                        _background_build_and_upsert(), causing it to fire Tradier
+                        chain API requests for all 3900 tickers while the OCC symbol
+                        map was still being populated. This produced HTTP 400 storms
+                        and incomplete chain data.
+                        Fix: poll registry.is_ready() every 5 s (max 30 min) before
+                        delegating to start_chain_refresh_worker(). The two fetch
+                        paths are now strictly serialized:
+                          symbol_registry.build() completes → chain_refresh starts.
+                        All other tasks (stream, db_write, signal_write, etc.) are
+                        unaffected and continue to launch in parallel as before.
 """
 import asyncio
 import json
@@ -324,6 +337,73 @@ async def _fetch_tradier_chain(symbol: str) -> list:
             symbol, exc,
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# SEQ-001: Sequenced chain refresh — waits for registry build before starting.
+#
+# Previously start_chain_refresh_worker() was launched immediately in parallel
+# with _background_build_and_upsert(). This caused the chain worker to begin
+# fetching Tradier chain data for all 3900 tickers while the OCC symbol map
+# was still being built, producing:
+#   - HTTP 400 storms (Tradier rejecting concurrent bulk requests)
+#   - Incomplete chain data written to the vol/OI cache
+#   - The registry build itself slowing down due to shared Tradier session
+#     contention with the chain worker
+#
+# Fix: poll registry.is_ready() every 5 s (timeout 30 min) before handing
+# off to start_chain_refresh_worker(). is_ready() returns True only after
+# _background_build_and_upsert() has fully completed build() and set the
+# _build_complete flag (M-1/M-2 in symbol_registry).
+#
+# All other tasks (stream, db_write, signal_write, etc.) are unaffected —
+# they continue to start immediately in parallel after yield as before.
+# ---------------------------------------------------------------------------
+async def _chain_refresh_after_build(
+    get_tracked_symbols,
+    fetch_chain_fn,
+    poll_interval: float = 5.0,
+    timeout: float = 1800.0,
+) -> None:
+    """
+    SEQ-001: Gate chain_refresh behind registry build completion.
+
+    Polls registry.is_ready() every `poll_interval` seconds.  Once the
+    registry signals readiness (build() fully complete, _build_complete set),
+    delegates unconditionally to start_chain_refresh_worker() which runs
+    its own internal loop forever.
+
+    `timeout` (default 30 min) is a safety valve: if build() never finishes
+    (e.g. Tradier is down for a sustained period), chain_refresh starts anyway
+    so the cache is not permanently empty.  A warning is logged in that case.
+    """
+    reg = get_registry()
+    elapsed = 0.0
+    while elapsed < timeout:
+        if reg is not None and reg.is_ready():
+            log.info(
+                "[chain_refresh] SEQ-001: registry is_ready=True after %.0f s — "
+                "starting chain refresh worker",
+                elapsed,
+            )
+            break
+        # Re-fetch the registry reference in case init_registry() was called
+        # after this coroutine started (defensive).
+        reg = get_registry()
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+    else:
+        log.warning(
+            "[chain_refresh] SEQ-001: registry not ready after %.0f s (timeout) — "
+            "starting chain refresh worker anyway to avoid permanent cache miss",
+            timeout,
+        )
+
+    # Delegate to the real worker — runs its loop forever.
+    await start_chain_refresh_worker(
+        get_tracked_symbols=get_tracked_symbols,
+        fetch_chain_fn=fetch_chain_fn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -880,25 +960,26 @@ async def lifespan(app: FastAPI):
             "[universe] Cache miss at startup — background universe resolve task spawned"
         )
 
-    # ING-008: background 5-min chain cache refresh loop.
+    # SEQ-001: chain_refresh_after_build — gates chain refresh behind registry build.
     #
-    # Wired with the two-callable signature required by start_chain_refresh_worker:
+    # _chain_refresh_after_build() polls registry.is_ready() every 5 s and only
+    # calls start_chain_refresh_worker() once the OCC symbol map is fully populated
+    # by _background_build_and_upsert(). This prevents the chain worker from firing
+    # Tradier requests for all 3900 tickers simultaneously with the registry build,
+    # which was causing HTTP 400 storms and incomplete chain data.
     #
-    #   get_tracked_symbols — zero-arg callable returning the live list of OCC
-    #     symbols currently in the registry.  Called fresh each cycle so newly
-    #     added symbols are automatically picked up without a restart.
-    #     Falls back to stream_symbols (ticker list) if the registry dict is not
-    #     accessible, which is safe because chain_store only uses the symbol as a
-    #     key for the Tradier chain API call (it accepts either OCC or ticker).
+    # Wired with the same two-callable signature as before:
+    #
+    #   get_tracked_symbols — zero-arg callable returning the live list of unique
+    #     underlying tickers from the registry. Called fresh each refresh cycle so
+    #     newly added symbols are automatically picked up without a restart.
+    #     Falls back to stream_symbols (ticker list) if the registry is not yet
+    #     accessible.
     #
     #   fetch_chain_fn — async callable accepting a ticker string and returning a
     #     list of contract dicts from Tradier GET /v1/markets/options/chains.
     #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
     #     aborts the refresh cycle.
-    #
-    # Zero live API calls on the flow hot path: persist_flow_event and
-    # persist_flow_episode read from the in-process _vol_oi_cache via
-    # get_contract_vol_oi(occ_symbol) — O(1) dict lookup.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
@@ -908,8 +989,11 @@ async def lifespan(app: FastAPI):
         # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
-    chain_refresh_task    = asyncio.create_task(
-        start_chain_refresh_worker(
+    log.info(
+        "[chain_refresh] SEQ-001: chain refresh worker will start after registry build completes"
+    )
+    chain_refresh_task = asyncio.create_task(
+        _chain_refresh_after_build(
             get_tracked_symbols=_get_tracked_tickers,
             fetch_chain_fn=_fetch_tradier_chain,
         )
@@ -937,7 +1021,7 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    chain_refresh_task.cancel()  # ING-008
+    chain_refresh_task.cancel()  # SEQ-001 / ING-008
     self_ping_task.cancel()      # RENDER-KEEPALIVE
     if universe_resolve_task:
         universe_resolve_task.cancel()  # RENDER-STARTUP-HANG
@@ -950,7 +1034,7 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         lookback_task,
-        chain_refresh_task,  # ING-008
+        chain_refresh_task,  # SEQ-001 / ING-008
         self_ping_task,      # RENDER-KEEPALIVE
     ]
     if universe_resolve_task:
