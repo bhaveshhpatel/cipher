@@ -228,7 +228,7 @@ _PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3949 tickers × 200/bat
 # with typical Tradier latency (500ms-1.5s/ticker), 3949 tickers completes
 # in 40-120s. 300s is the true last-resort ceiling that should never fire
 # under normal operating conditions.
-_CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): full 3949-ticker universe
+_CHAIN_GATHER_TIMEOUT_S = 600   # asyncio.gather(*tasks): full 3949-ticker universe
 
 # Per-request timeout for each individual get_option_chain_bulk() call.
 # POOL-MISMATCH fix (2026-05-14): raised from 15s → 30s now that
@@ -237,7 +237,7 @@ _CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): full 3949-ticker unive
 # with headroom, while still freeing truly-stalled slots well before the
 # 300s gather ceiling. Previously, 20 of 50 coroutines burned the 15s budget
 # waiting for a TCP pool slot rather than for actual Tradier I/O.
-_CHAIN_REQUEST_TIMEOUT_S = 30   # was 15 — safe now that pool contention is eliminated
+_CHAIN_REQUEST_TIMEOUT_S = 45   # was 15 — safe now that pool contention is eliminated
 
 # LOG-CHAIN: log chain-pull progress every N tickers so cold-start is visible.
 _CHAIN_PROGRESS_INTERVAL = 250
