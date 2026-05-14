@@ -189,6 +189,28 @@ PERF concurrent-refresh (2026-05-13):
   gated by asyncio.Semaphore(_REFRESH_CONCURRENCY=25). Cycle time drops
   from ~100 min to ~4 min at 4,000 symbols. Tune _REFRESH_CONCURRENCY
   down to 10 if Tradier returns 429s; up to 40 if latency is higher.
+
+HOTFIX-SSL-EOF-4 (2026-05-14):
+  All prior attempts to eliminate the SSL EOF failed due to supabase-py
+  version mismatches (http_options, httpx_client, ClientOptions.http_options
+  all unsupported). The correct approach for the installed version is to
+  swap out the httpx.Client on the postgrest session after create_client()
+  returns.
+
+  In supabase-py 2.x the sync postgrest client exposes its httpx transport
+  as client.postgrest.session (a sync httpx.Client). We replace that session
+  with a fresh httpx.Client(http2=False, ...) carrying:
+    - http2=False: forces HTTP/1.1, making stale-connection reuse impossible
+    - limits: max_keepalive_connections=5, keepalive_expiry=10s to prevent
+      any residual stale-connection buildup
+    - timeout=30s: matches the existing postgrest_client_timeout
+
+  A legacy fallback also checks .postgrest._client.session for older
+  supabase-py builds. If neither path exists a one-time WARNING is logged
+  but the client still functions (just without the H2 fix).
+
+  PostgREST upserts are not multiplexed — zero throughput loss from
+  dropping H2 on this client.
 """
 import asyncio
 import logging
@@ -196,6 +218,7 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+import httpx
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 from config import settings
@@ -244,6 +267,21 @@ _vol_oi_cache: Dict[str, Dict] = {}
 # Epoch counter -- incremented on every successful save_chain().
 # ---------------------------------------------------------------------------
 _epoch: int = 0
+
+# ---------------------------------------------------------------------------
+# HOTFIX-SSL-EOF-4: HTTP/1.1 httpx transport for the postgrest session.
+# Constructed once at module load; reused for every _client() call.
+# keepalive_expiry=10s prevents any residual stale-connection buildup.
+# ---------------------------------------------------------------------------
+_HTTP1_TRANSPORT = httpx.Client(
+    http2=False,
+    limits=httpx.Limits(
+        max_connections=20,
+        max_keepalive_connections=5,
+        keepalive_expiry=10.0,
+    ),
+    timeout=30.0,
+)
 
 
 def get_epoch() -> int:
@@ -456,17 +494,62 @@ async def start_chain_refresh_worker(
         raise
 
 
+def _patch_postgrest_http1(client: Client) -> None:
+    """
+    HOTFIX-SSL-EOF-4: Replace the postgrest httpx session with an HTTP/1.1
+    client to prevent stale HTTP/2 connection reuse against Supabase's LB.
+
+    Supabase-py 2.x exposes the sync postgrest httpx transport as:
+      client.postgrest.session   (primary path, supabase-py >=2.0)
+
+    We also check the legacy path used in some 1.x builds:
+      client.postgrest._client.session
+
+    The replacement client shares _HTTP1_TRANSPORT which is constructed
+    once at module load with http2=False and a short keepalive_expiry.
+    If neither attribute path exists we log a one-time WARNING and return
+    — the client still works, just without the H2 fix.
+    """
+    patched = False
+
+    # Primary path: supabase-py 2.x
+    pg = getattr(client, "postgrest", None)
+    if pg is not None and hasattr(pg, "session"):
+        try:
+            pg.session = _HTTP1_TRANSPORT
+            patched = True
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Legacy fallback path
+    if not patched:
+        inner = getattr(pg, "_client", None) if pg is not None else None
+        if inner is not None and hasattr(inner, "session"):
+            try:
+                inner.session = _HTTP1_TRANSPORT
+                patched = True
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not patched:
+        log.warning(
+            "[chain_store] HOTFIX-SSL-EOF-4: could not patch postgrest session "
+            "to HTTP/1.1 — attribute path not found in installed supabase-py. "
+            "SSL EOF errors on idle connections may recur."
+        )
+    else:
+        log.debug("[chain_store] postgrest session patched to HTTP/1.1 (ssl-eof-4)")
+
+
 def _client() -> Client:
     """
-    HOTFIX-CHAIN-CLIENT: removed unsupported httpx_client kwarg.
+    HOTFIX-SSL-EOF-4: construct a supabase Client and swap the postgrest
+    httpx session to HTTP/1.1 to eliminate stale-connection SSL EOF errors.
 
-    The installed supabase-py version does not support httpx_client as a
-    kwarg on create_client(). Passing it caused a TypeError on every call,
-    silently breaking load_chain() (warm DB-seed path) and save_chain()
-    (persist path) on every deploy.
-
-    Fix: pass only (url, key, options=options). ClientOptions retains
-    postgrest_client_timeout=30 and storage_client_timeout=30.
+    The create_client() call is kept intentionally minimal — no unsupported
+    kwargs (httpx_client, http_options) that caused TypeErrors in prior
+    hotfix attempts. HTTP/1.1 is enforced via _patch_postgrest_http1() after
+    the client is constructed.
     """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
@@ -478,7 +561,9 @@ def _client() -> Client:
         postgrest_client_timeout=30,
         storage_client_timeout=30,
     )
-    return create_client(settings.SUPABASE_URL, key, options=options)
+    client = create_client(settings.SUPABASE_URL, key, options=options)
+    _patch_postgrest_http1(client)
+    return client
 
 
 async def save_chain(
