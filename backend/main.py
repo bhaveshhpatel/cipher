@@ -2,6 +2,7 @@
 Cipher Backend — FastAPI entry point
 
 Startup sequence:
+  0. init_http_client()                — warm shared httpx connection pool
   0. gate_config_store.load()          — load tier gate config from DB into memory  [ING-010]
   1. validate_ingestion_config()       — warn on missing ingestion config rows  [RC-3]
   2. _resolve_startup_universe_fast()  — DB-only path: fresh snapshot HIT → done;
@@ -118,6 +119,14 @@ Key architectural fixes:
                         (no snapshot in DB) startup paths. registry.epoch removed
                         from this log — epoch is a build() artifact not set here,
                         logging it pre-build always showed 0 (misleading).
+  FLAW3-POOL          — Shared httpx connection pool via tradier_client._shared_client.
+                        init_http_client() called at lifespan step 0 (before any
+                        Tradier I/O). close_http_client() called during graceful
+                        shutdown after stream_task is cancelled so the pool remains
+                        live for any in-flight retries. _fetch_tradier_chain() in
+                        main.py updated to use the shared pool instead of creating
+                        a new AsyncClient per call. Eliminates ~22 min of TCP
+                        handshake overhead during cold-start registry build.
 """
 import asyncio
 import json
@@ -152,6 +161,7 @@ from services.symbol_registry import init_registry, get_registry
 from services.ingestion_config import validate_ingestion_config
 from services.tradier_stream import stream_options_flow, get_stats as get_stream_stats
 from services.gate_config_store import store as gate_config_store  # HOTFIX-IMPORT-001
+from utils.tradier_client import init_http_client, close_http_client, _client as _tradier_client  # FLAW3-POOL
 
 import httpx
 
@@ -275,10 +285,10 @@ def _is_market_hours() -> bool:
 # ---------------------------------------------------------------------------
 # ING-008: Tradier chain fetch helper for the background refresh worker.
 #
-# Calls GET /v1/markets/options/chains?symbol=X&greeks=false.
-# Returns a list of contract dicts, each containing at minimum:
-#   {"symbol": <occ_str>, "volume": int, "open_interest": int}
-# Returns [] on any error — one bad symbol must never abort the refresh cycle.
+# FLAW3-POOL: Updated to use the shared httpx client (_tradier_client()) from
+# utils.tradier_client instead of creating a new AsyncClient per call.
+# During the 5-min chain refresh cycle (hundreds of symbols) this eliminates
+# the per-call TCP handshake overhead from this path as well.
 # ---------------------------------------------------------------------------
 async def _fetch_tradier_chain(symbol: str) -> list:
     """
@@ -293,13 +303,15 @@ async def _fetch_tradier_chain(symbol: str) -> list:
     (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
     are closed, so there is nothing useful to fetch.
 
+    FLAW3-POOL: Uses shared httpx pool via _tradier_client() instead of a
+    per-call AsyncClient.
+
     API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
     Each returned dict includes at minimum:
       - "symbol"        : str  (21-char OCC symbol)
       - "volume"        : int  (today's volume for this contract)
       - "open_interest" : int
     """
-    # HOTFIX-CHAIN-HOURS: skip entirely outside market hours.
     if not _is_market_hours():
         log.debug("[chain_refresh] %s — skipped (market closed)", symbol)
         return []
@@ -313,8 +325,7 @@ async def _fetch_tradier_chain(symbol: str) -> list:
     }
     params = {"symbol": symbol, "greeks": "false"}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, params=params)
+        resp = await _tradier_client().get(url, headers=headers, params=params)
         if resp.status_code != 200:
             log.warning(
                 "[chain_refresh] Tradier chain fetch %s -> HTTP %d",
@@ -325,7 +336,6 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         options = data.get("options") or {}
         option_list = options.get("option") or []
         if isinstance(option_list, dict):
-            # Single-contract response (rare edge case)
             option_list = [option_list]
         return option_list
     except Exception as exc:
@@ -412,7 +422,6 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             "[universe] Step 2a stale seed: %d symbols available for stream seed",
             len(stale),
         )
-        # Load the stale tier map as best-effort; background refresh will overwrite.
         tier_map = await universe_store.load_tier_map()
         active_snap = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -508,7 +517,6 @@ async def _background_universe_resolve(registry) -> None:
             source,
         )
 
-    # Live-patch the running registry and accumulator if we got fresh tiers.
     if tier_map:
         try:
             registry.set_tier_map(tier_map)
@@ -550,17 +558,6 @@ def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
     """
     ING-010-ACC: propagate the freshly-assigned tier_map to the module-level
     accumulator in tradier_stream.py.
-
-    The registry.set_tier_map() call in _post_build_upsert() updates the
-    SymbolRegistry instance used for OCC lookups, but the hot-path accumulator
-    (services.tradier_stream.accumulator) is a separate RepetitionAccumulator
-    instance instantiated at module import time.  Without this call its
-    _tier_map stays empty, causing _get_episode_min_premium() to resolve every
-    ticker to tier 1 (strict cold-start default) for the entire trading session.
-
-    Import is deferred to avoid a circular import at module load time.
-    Logs a warning and returns cleanly if the import or attribute access fails
-    — the stream continues, just without tier-aware Gate 2 floors.
     """
     try:
         import services.tradier_stream as _ts
@@ -647,7 +644,6 @@ async def _post_build_upsert(
     try:
         tier_map = await assign_tiers(quotes)
         registry.set_tier_map(tier_map)
-        # ING-010-ACC: also update the module-level accumulator on the hot path.
         _sync_accumulator_tier_map(tier_map)
         log.info(
             "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
@@ -722,7 +718,6 @@ async def _universe_refresh_loop():
                 registry = get_registry()
                 if registry and tier_map:
                     registry.set_tier_map(tier_map)
-                    # ING-010-ACC: keep the hot-path accumulator in sync.
                     _sync_accumulator_tier_map(tier_map)
                     log.info(
                         "[universe] Background refresh: registry tier_map updated "
@@ -776,8 +771,6 @@ async def _registry_prewarm_loop() -> None:
         )
         await asyncio.sleep(sleep_secs)
 
-        # ING-008: invalidate vol/OI cache at market-open boundary so yesterday's
-        # intraday volume never bleeds into early-morning flow events.
         invalidate_vol_oi_cache()
         log.info("[prewarm] vol/OI cache invalidated ahead of market open")
 
@@ -800,10 +793,13 @@ async def _registry_prewarm_loop() -> None:
 async def lifespan(app: FastAPI):
     log.info("Starting Cipher backend...")
 
+    # FLAW3-POOL: Initialise the shared httpx connection pool FIRST, before any
+    # code path that calls Tradier. All downstream callers (_client()) will reuse
+    # the 30-connection pool rather than opening a fresh TCP socket per call.
+    init_http_client()
+
     # Step 0 [ING-010]: Load tier gate config into memory before any service
-    # reads gate values (stream, accumulator, parser all call store.get() on
-    # the first tick).  load() is safe to call even if Supabase is unreachable
-    # — it falls back to hardcoded defaults and logs a warning.
+    # reads gate values.
     log.info("[gate_config] Loading tier gate configuration from DB...")
     await gate_config_store.load()
     log.info(
@@ -816,17 +812,6 @@ async def lifespan(app: FastAPI):
     await validate_ingestion_config()
 
     # Step 2 [RENDER-STARTUP-HANG]: Fast DB-only universe resolution.
-    #
-    # _resolve_startup_universe_fast() only does Supabase reads — no Tradier,
-    # no CBOE.  Expected wall-clock time: <2 s.
-    #
-    # On cache HIT (normal daily operation): returns fresh snapshot + tiers.
-    #   needs_refresh=False — no background refresh spawned.
-    #
-    # On cache MISS (first deploy / snapshot >24 h old): returns stale snapshot
-    # as seed (or empty list if no snapshot exists at all).
-    #   needs_refresh=True — _background_universe_resolve() is launched post-yield
-    #   to run the full load_universe() pipeline without blocking the health probe.
     stream_symbols, tier_map, snapshot_id, needs_universe_refresh = (
         await _resolve_startup_universe_fast()
     )
@@ -843,14 +828,6 @@ async def lifespan(app: FastAPI):
     )
 
     # Step 4: Seed OCC chains from DB (P1 fallback — no Tradier call).
-    #
-    # STEP2A-LOG-FIX: The Step 2a registry-seed log now fires unconditionally
-    # after load_from_db() returns, covering both the warm path (snapshot_id
-    # present) and the cold path (no snapshot in DB).
-    #
-    # registry.epoch is intentionally omitted here — it is a build() artifact
-    # set only after _background_build_and_upsert() completes. Reading it
-    # pre-build always returned 0 which was misleading in logs.
     _db_count = 0
     if snapshot_id:
         _db_count = await registry.load_from_db(snapshot_id)
@@ -860,7 +837,6 @@ async def lifespan(app: FastAPI):
             _db_count, registry.is_ready(),
         )
 
-    # Step 2a summary log — fires on BOTH warm and cold startup paths.
     log.info(
         "[universe] Step 2a — registry seed complete: "
         "occ_symbols=%d db_seeded=%d is_ready=%s path=%s",
@@ -876,10 +852,6 @@ async def lifespan(app: FastAPI):
         registry.is_ready(), registry.size(),
     )
 
-    # Steps 0-4 above complete in ~6 s (all DB reads, no external HTTP).
-    # yield HERE so Render's health probe passes immediately.
-    # All remaining work runs in background tasks below.
-
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
     stream_task           = asyncio.create_task(
@@ -891,14 +863,8 @@ async def lifespan(app: FastAPI):
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols)
     )
-    # MAIN-FIX-001: start_lookback_worker() was refactored (FS-HANG fix) to
-    # fetch its own accumulator internally via get_accumulator() — it takes 0
-    # positional arguments. The previous call site passed registry.accumulator,
-    # causing TypeError at every TestClient startup.
     lookback_task         = asyncio.create_task(start_lookback_worker())
 
-    # RENDER-STARTUP-HANG: spawn background universe refresh only on cache MISS.
-    # On HIT this is None and is excluded from the shutdown cancel list.
     universe_resolve_task = (
         asyncio.create_task(_background_universe_resolve(registry))
         if needs_universe_refresh
@@ -909,32 +875,10 @@ async def lifespan(app: FastAPI):
             "[universe] Cache miss at startup — background universe resolve task spawned"
         )
 
-    # ING-008: background 5-min chain cache refresh loop.
-    #
-    # Wired with the two-callable signature required by start_chain_refresh_worker:
-    #
-    #   get_tracked_symbols — zero-arg callable returning the live list of OCC
-    #     symbols currently in the registry.  Called fresh each cycle so newly
-    #     added symbols are automatically picked up without a restart.
-    #     Falls back to stream_symbols (ticker list) if the registry dict is not
-    #     accessible, which is safe because chain_store only uses the symbol as a
-    #     key for the Tradier chain API call (it accepts either OCC or ticker).
-    #
-    #   fetch_chain_fn — async callable accepting a ticker string and returning a
-    #     list of contract dicts from Tradier GET /v1/markets/options/chains.
-    #     _fetch_tradier_chain() returns [] on any error so one bad symbol never
-    #     aborts the refresh cycle.
-    #
-    # Zero live API calls on the flow hot path: persist_flow_event and
-    # persist_flow_episode read from the in-process _vol_oi_cache via
-    # get_contract_vol_oi(occ_symbol) — O(1) dict lookup.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
-            # Return the unique set of underlying tickers (not OCC symbols) so
-            # one Tradier chain call per ticker covers all its strikes/expiries.
             return list({v.ticker for v in reg._registry.values()})
-        # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
     chain_refresh_task    = asyncio.create_task(
@@ -944,13 +888,11 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    # RENDER-KEEPALIVE: prevent free-tier idle spin-down (15-min threshold).
-    # Pings GET /health every 5 minutes. No-ops when RENDER_EXTERNAL_URL is unset.
-    # HOTFIX-KEEPALIVE-001: hardened — fresh client per cycle, fail-streak logging.
     self_ping_task        = asyncio.create_task(_self_ping_worker())
 
     yield
 
+    # STREAM-5: cancel stream first so Tradier HTTP connections close cleanly.
     log.info("[shutdown] Closing Tradier stream connections first...")
     stream_task.cancel()
     lookback_task.cancel()
@@ -966,10 +908,10 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    chain_refresh_task.cancel()  # ING-008
-    self_ping_task.cancel()      # RENDER-KEEPALIVE
+    chain_refresh_task.cancel()
+    self_ping_task.cancel()
     if universe_resolve_task:
-        universe_resolve_task.cancel()  # RENDER-STARTUP-HANG
+        universe_resolve_task.cancel()
 
     shutdown_tasks = [
         build_task,
@@ -979,17 +921,20 @@ async def lifespan(app: FastAPI):
         registry_refresh_task,
         prewarm_task,
         lookback_task,
-        chain_refresh_task,  # ING-008
-        self_ping_task,      # RENDER-KEEPALIVE
+        chain_refresh_task,
+        self_ping_task,
     ]
     if universe_resolve_task:
-        shutdown_tasks.append(universe_resolve_task)  # RENDER-STARTUP-HANG
+        shutdown_tasks.append(universe_resolve_task)
 
     for task in shutdown_tasks:
         try:
             await task
         except asyncio.CancelledError:
             pass
+
+    # FLAW3-POOL: close the shared httpx pool after all tasks are done.
+    await close_http_client()
     log.info("Cipher backend stopped.")
 
 
@@ -1000,7 +945,6 @@ app = FastAPI(
     lifespan    = lifespan,
 )
 
-# SA-2 fix: single-escape raw strings are correct for regex in Python.
 _explicit_origins = settings.origins
 _explicit_patterns = [
     re.escape(o) for o in _explicit_origins if o != "*"
@@ -1030,20 +974,14 @@ app.include_router(smart_signals.router)
 app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
-app.include_router(ingestion_config_router.router)  # REARCH-002: /admin/ingestion-config GET+PATCH
-app.include_router(signal_config_router.router)     # REARCH-005: /admin/signal-config GET+PATCH
+app.include_router(ingestion_config_router.router)
+app.include_router(signal_config_router.router)
 
 
 @app.get("/stream/stats", tags=["health"], include_in_schema=False)
 async def stream_stats_health_alias():
     """
     STATS-STREAM-ALIAS: returns the full raw stats dict from get_stats().
-
-    Previously this was a dead stub returning {"status": "ok"} that discarded
-    all funnel counters. Now wired to get_stats() so both /stats (health.py)
-    and /stream/stats return identical full funnel data for ops debugging.
-
-    include_in_schema=False — internal ops use only, not in public OpenAPI docs.
     """
     return get_stream_stats()
 
