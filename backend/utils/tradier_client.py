@@ -8,9 +8,10 @@ Rate limits:
   Tradier sandbox: 120 req/min
   Tradier production: 120 req/min (same limit)
   → _CHAIN_SEM(2): conservative for live streaming flow path (~3 req/s)
-  → _BULK_CHAIN_SEM(10): used by registry build() only (~16 req/s)
-     Still within 120 req/min since build tasks are bounded by outer sem(50)
-     and each ticker makes sequential expiry+chain calls.
+  → _BULK_CHAIN_SEM(50): used by registry build() only — raised from 10
+     to match outer build sem(50) in symbol_registry.py. True 50-concurrent
+     chain fetches; sustained rate stays below 120 req/min because each
+     ticker also blocks on get_expirations() before the chain loop.
   → _SESSION_SEM(3): for session token fetches (B-022)
 
 P3 FIX (2026-04-27):
@@ -18,6 +19,12 @@ P3 FIX (2026-04-27):
   during registry build(). The live-streaming _CHAIN_SEM(2) is unchanged so
   flow ingestion throughput is unaffected. This raises build throughput from
   ~3.3 req/s to ~16 req/s, cutting cold-start chain fetch time by ~5×.
+
+PERF-SEM-50 (2026-05-14):
+  Raised _BULK_CHAIN_SEM from 10 → 50 to match outer build sem(50).
+  Previously min(50,10)=10 was the real concurrency ceiling, not the outer
+  sem. Cold-start now completes in ~2.5 min (clean) / ~12 min (degraded)
+  instead of 9-12 min (clean) / never (degraded with 15s per-request timeouts).
 
 B-022 — Global Session Token Semaphore:
   _SESSION_SEM = asyncio.Semaphore(3) wraps get_session_token() / get_token().
@@ -52,7 +59,7 @@ Public API:
   get_quotes_batch(symbols)                  -> dict[str, dict]
   get_expirations(symbol)                    -> list[str]
   get_option_chain(symbol, expiration)       -> list[dict]   (streaming, sem=2)
-  get_option_chain_bulk(symbol, expiration)  -> list[dict]   (build path, sem=10)
+  get_option_chain_bulk(symbol, expiration)  -> list[dict]   (build path, sem=50)
   get_options_chain(symbol, expiration)      -> list[dict]   (alias for get_option_chain)
   get_session_token()                        -> Optional[str]
   get_token()                                -> Optional[str]  (alias)
@@ -76,9 +83,11 @@ _READ_TIMEOUT    = 20.0
 # Live streaming flow path — conservative, never races with Tradier rate limit
 _CHAIN_SEM       = asyncio.Semaphore(2)
 
-# Registry build() bulk path — higher concurrency, still within 120 req/min
-# 10 concurrent × ~0.6s/req = ~16 req/s; outer build sem(50) bounds ticker tasks
-_BULK_CHAIN_SEM  = asyncio.Semaphore(10)
+# Registry build() bulk path — raised from 10 → 50 (PERF-SEM-50 2026-05-14)
+# to match outer build sem(50) in symbol_registry.py. Previously min(50,10)=10
+# was the real concurrency ceiling. Sustained rate stays below 120 req/min
+# because each ticker coroutine also blocks on get_expirations() first.
+_BULK_CHAIN_SEM  = asyncio.Semaphore(50)
 
 # B-022: max 3 concurrent session token fetches across ALL callers
 # (stream_worker.py via get_session_token() + tradier_stream.py via
@@ -104,7 +113,7 @@ _SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 #   max_connections=30      — covers _BULK_CHAIN_SEM(10) + _CHAIN_SEM(2) +
 #                             _SESSION_SEM(3) + quotes/expirations bursts
 #   max_keepalive_connections=20 — keep warm connections for the build path
-#   keepalive_expiry=30s    — Tradier keeps-alive are typically <60s
+#   keepalive_expiry=30s    — Tradier keeps-alives are typically <60s
 # init_http_client() / close_http_client() are called from main.py lifespan.
 # ---------------------------------------------------------------------------
 _shared_client: Optional[httpx.AsyncClient] = None
@@ -291,16 +300,17 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
     """
     Fetch full option chain for ticker + expiry — BULK BUILD PATH ONLY.
 
-    Uses _BULK_CHAIN_SEM(10) instead of _CHAIN_SEM(2) so registry build()
-    can fetch chains at ~16 req/s without blocking the live flow ingestion
-    path. MUST NOT be used from the streaming flow path — use get_option_chain().
+    Uses _BULK_CHAIN_SEM(50) — raised from 10 to match outer build sem(50)
+    in symbol_registry.py (PERF-SEM-50 2026-05-14). Previously the inner
+    sem(10) was the real throughput ceiling (min(50,10)=10 effective
+    concurrency). Now true 50-concurrent chain fetches are possible.
+
+    MUST NOT be used from the streaming flow path — use get_option_chain().
 
     Still safe under 120 req/min because:
-      - outer build() sem(50) limits concurrent ticker coroutines
-      - each ticker makes sequential expiry+chain calls (not parallel)
-      - 10 concurrent chains × ~0.6s each = ~16 req/s = ~960 req/min
-        BUT each ticker also blocks on get_expirations() first, so real
-        sustained rate is lower; 429 responses are handled gracefully.
+      - each ticker coroutine also blocks on get_expirations() first
+      - per-request 15s timeouts in _build_ticker free stalled slots fast
+      - 429 responses are handled gracefully with back-off retry
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
     async with _BULK_CHAIN_SEM:
