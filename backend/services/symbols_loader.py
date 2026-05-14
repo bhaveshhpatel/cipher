@@ -58,6 +58,7 @@ from typing import Optional
 import httpx
 
 from config import settings
+from utils.tradier_client import _client as _get_http_client  # FLAW3-POOL
 
 log = logging.getLogger("symbols_loader")
 
@@ -317,13 +318,13 @@ async def _fetch_and_validate() -> list[str]:
 
 
 async def _fetch_cboe_symbols() -> list[str]:
+    # FLAW3-POOL: reuse shared httpx connection pool instead of a per-call client.
     try:
-        async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
-            resp = await client.get(
-                _CBOE_URL,
-                headers={"User-Agent": "cipher-backend/1.0"},
-                follow_redirects=True,
-            )
+        resp = await _get_http_client().get(
+            _CBOE_URL,
+            headers={"User-Agent": "cipher-backend/1.0"},
+            follow_redirects=True,
+        )
 
         if resp.status_code != 200:
             log.error(
@@ -435,6 +436,9 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
 
     Any symbol that errors or returns no quote data gets:
       last_price=None, volume=None, average_volume=None, stream_eligible=False
+
+    FLAW3-POOL: inner _fetch_batch() reuses the shared httpx pool via
+    _get_http_client() instead of opening a new AsyncClient per batch call.
     """
     if not symbols:
         return []
@@ -462,15 +466,15 @@ async def _fetch_batch_quotes(symbols: list[str]) -> list[SymbolQuote]:
     async def _fetch_batch(batch: list[str]) -> list[SymbolQuote]:
         async with sem:
             try:
-                async with httpx.AsyncClient(timeout=_QUOTES_TIMEOUT) as client:
-                    resp = await client.get(
-                        _QUOTES_URL,
-                        headers=headers,
-                        params={
-                            "symbols": ",".join(batch),
-                            "greeks": "false",
-                        },
-                    )
+                # FLAW3-POOL: reuse shared pool — no new TCP handshake per batch.
+                resp = await _get_http_client().get(
+                    _QUOTES_URL,
+                    headers=headers,
+                    params={
+                        "symbols": ",".join(batch),
+                        "greeks": "false",
+                    },
+                )
 
                 if resp.status_code != 200:
                     log.warning(
