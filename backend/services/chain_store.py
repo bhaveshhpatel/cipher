@@ -147,6 +147,21 @@ HOTFIX-SSL-EOF-3 (2026-05-13):
   http_options. The SSL-EOF root cause is still fully addressed —
   HTTP/1.1 reconnects per-request so stale connection reuse is impossible.
 
+HOTFIX-CHAIN-CLIENT (2026-05-13):
+  create_client() does not accept httpx_client as a kwarg in the installed
+  supabase-py version, causing a TypeError on every _client() call:
+    create_client() got an unexpected keyword argument 'httpx_client'
+  This silently broke BOTH load_chain() (warm DB-seed path) AND
+  save_chain() (persist path) on every deploy:
+    - load_from_db() returned None -> cold build of all 3,848 tickers
+    - save_chain() silently failed -> DB cache never replenished
+
+  Fix: remove httpx_client=httpx_client from the create_client() call.
+  The httpx.Client(http2=False) import and construction are also removed
+  since there is no longer a consumer for it. The SSL-EOF (HTTP/2 stale
+  connection) concern is lower priority than a fully broken DB path and
+  can be revisited once the correct supabase-py kwarg surface is confirmed.
+
 FIX #134 (2026-05-13): gate chain_refresh worker to market hours.
   start_chain_refresh_worker() previously ran 24/7 with no market-hours
   guard and no initial startup delay. On pre-market process restarts
@@ -181,7 +196,6 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-import httpx
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 from config import settings
@@ -444,18 +458,15 @@ async def start_chain_refresh_worker(
 
 def _client() -> Client:
     """
-    HOTFIX-SSL-EOF-3: force HTTP/1.1 via a pre-built httpx.Client passed
-    to create_client() as httpx_client.
+    HOTFIX-CHAIN-CLIENT: removed unsupported httpx_client kwarg.
 
-    ClientOptions does not expose http_options in all supabase-py 2.x
-    versions, so passing it there raises:
-      TypeError: ClientOptions.__init__() got an unexpected keyword argument 'http_options'
+    The installed supabase-py version does not support httpx_client as a
+    kwarg on create_client(). Passing it caused a TypeError on every call,
+    silently breaking load_chain() (warm DB-seed path) and save_chain()
+    (persist path) on every deploy.
 
-    Instead we build an httpx.Client with http2=False ourselves and hand it
-    directly to create_client(). supabase-py forwards this client to the
-    underlying postgrest-py SyncRequestsClient, bypassing HTTP/2 entirely.
-    HTTP/1.1 reconnects per-request so stale SSL connections (SSL-EOF) are
-    impossible regardless of idle time.
+    Fix: pass only (url, key, options=options). ClientOptions retains
+    postgrest_client_timeout=30 and storage_client_timeout=30.
     """
     key = settings.SUPABASE_SERVICE_KEY
     if not key:
@@ -467,8 +478,7 @@ def _client() -> Client:
         postgrest_client_timeout=30,
         storage_client_timeout=30,
     )
-    httpx_client = httpx.Client(http2=False)
-    return create_client(settings.SUPABASE_URL, key, options=options, httpx_client=httpx_client)
+    return create_client(settings.SUPABASE_URL, key, options=options)
 
 
 async def save_chain(
