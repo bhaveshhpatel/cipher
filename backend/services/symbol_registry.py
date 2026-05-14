@@ -206,9 +206,9 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
 
     p95 < _P95_RAMP_UP_THRESHOLD_S (1.0s)  -> ramp up by _ADAPT_STEP (5),
                                                capped at _CONCURRENCY_MAX (40)
-    p95 > _P95_DROP_THRESHOLD_S    (5.0s)  -> drop down by _ADAPT_STEP (5),
+    p95 > _P95_DROP_THRESHOLD_S    (10.0s) -> drop down by _ADAPT_STEP (5),
                                                floored at _CONCURRENCY_MIN (15)
-    1.0s <= p95 <= 5.0s             (hold)  -> no change
+    1.0s <= p95 <= 10.0s            (hold)  -> no change
 
   Starting concurrency: _DEFAULT_BUILD_CONCURRENCY=20 (unchanged baseline).
 
@@ -217,10 +217,12 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
     - Cold-build wall time recovers to ~42-48s, closing the gap vs the
       former fixed-50 setting on stable/ingestion-frontend-2026-04-29.
 
-  Under degraded Tradier (p95 > 5s):
+  Under degraded Tradier (p95 > 10s):
     - Drops to 15 within one adapt cycle, reducing simultaneous inflight
       calls and preventing the stall-slot saturation that caused the
       original BUILD-SEMAPHORE regression.
+    - _ADAPT_DROP_COOLDOWN_S (30s) prevents consecutive drops within the
+      same stabilisation window.
 
   The per-request 8s wait_for (FIX 2) and the 1800s outer gather timeout
   (BUILD-GATHER-TIMEOUT) are unchanged — they are the hard safety net.
@@ -345,6 +347,21 @@ FIX MARKET-HOURS-GATE (2026-05-13): build() now skips Tradier calls outside
 
   _is_market_hours() and _sleep_until_market_open() are imported from
   chain_store (FIX #134, 2026-05-13) — no duplication of ET constants.
+
+FIX ADAPT-001 (2026-05-14): AdaptiveSemaphore freefall fix.
+  Observed: 40->35->30->25->20->15 in 11s during 30-min market-hours refresh.
+  Root cause 1: _P95_DROP_THRESHOLD_S=5.0s too aggressive for peak-hours
+    Tradier; realistic p95 under load is 7-17s — threshold fired on normal
+    market conditions, not just degraded API.
+  Root cause 2: No cooldown between consecutive drops. Each drop raised p95
+    further (fewer slots = slower drain = higher per-slot latency), creating
+    a self-reinforcing cascade until _CONCURRENCY_MIN=15 was hit.
+  Fix 1: _P95_DROP_THRESHOLD_S 5.0 -> 10.0
+    Only fires on genuinely degraded Tradier (not peak-hours normal load).
+  Fix 2: _ADAPT_DROP_COOLDOWN_S = 30.0
+    Drop branch in _maybe_adapt() checks (now - _last_drop_ts) < cooldown
+    and skips with DEBUG log if within window. Ramp-up is NOT rate-limited.
+    _last_drop_ts tracked as float on AdaptiveSemaphore instance.
 """
 import asyncio
 import collections
@@ -376,7 +393,8 @@ _ADAPT_STEP                 = 5
 _ADAPT_SAMPLE_INTERVAL      = 20
 _ADAPT_WINDOW               = 100
 _P95_RAMP_UP_THRESHOLD_S    = 1.0
-_P95_DROP_THRESHOLD_S       = 5.0
+_P95_DROP_THRESHOLD_S       = 10.0   # ADAPT-001: raised from 5.0 — peak-hours Tradier p95 is 7-17s
+_ADAPT_DROP_COOLDOWN_S      = 30.0   # ADAPT-001: min seconds between consecutive drops
 
 _PRICES_FETCH_TIMEOUT_S  = 45
 _CHAIN_GATHER_TIMEOUT_S  = 1800
@@ -390,8 +408,8 @@ _CHAIN_REQUEST_TIMEOUT_S = 8   # FIX 2: 15s -> 8s
 class AdaptiveSemaphore:
     """
     asyncio.Semaphore wrapper with rolling p95 latency-driven concurrency
-    adjustment. See module docstring FIX BUILD-ADAPTIVE-CONCURRENCY for
-    full specification.
+    adjustment. See module docstring FIX BUILD-ADAPTIVE-CONCURRENCY and
+    FIX ADAPT-001 for full specification.
     """
 
     def __init__(self, initial: int) -> None:
@@ -401,6 +419,7 @@ class AdaptiveSemaphore:
         self._since_last_adapt = 0
         self._start_ts: Optional[float] = None
         self._pending_drain: int = 0
+        self._last_drop_ts: float = 0.0   # ADAPT-001: cooldown tracking
 
     @property
     def value(self) -> int:
@@ -442,6 +461,18 @@ class AdaptiveSemaphore:
             )
 
         elif p95 > _P95_DROP_THRESHOLD_S and self._value > _CONCURRENCY_MIN:
+            # ADAPT-001: enforce drop cooldown — skip if we dropped too recently
+            now = _time.monotonic()
+            since_last_drop = now - self._last_drop_ts
+            if since_last_drop < _ADAPT_DROP_COOLDOWN_S:
+                log.debug(
+                    "[symbol_registry] AdaptiveSemaphore: p95=%.2fs > %.1fs but "
+                    "drop cooldown active (%.1fs remaining) — holding concurrency=%d",
+                    p95, _P95_DROP_THRESHOLD_S,
+                    _ADAPT_DROP_COOLDOWN_S - since_last_drop, self._value,
+                )
+                return
+
             step = min(_ADAPT_STEP, self._value - _CONCURRENCY_MIN)
             self._value -= step
             drained = 0
@@ -451,6 +482,7 @@ class AdaptiveSemaphore:
                     drained += 1
             lazy = step - drained
             self._pending_drain += lazy
+            self._last_drop_ts = now   # ADAPT-001: record drop time
             log.info(
                 "[symbol_registry] AdaptiveSemaphore: p95=%.2fs > %.1fs -> "
                 "drop concurrency %d -> %d (drained=%d, pending_drain=%d)",
