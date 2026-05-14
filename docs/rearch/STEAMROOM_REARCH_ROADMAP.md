@@ -141,6 +141,7 @@ All direction values use `BULLISH / BEARISH / NEUTRAL` (replaces `BUY / SELL / H
 | 13 | **REARCH-013** — S7: Tiered Swarm Engine + Circuit Breaker | [#115](https://github.com/bhaveshhpatel/cipher/issues/115) | `feat/rearch-013-tiered-swarm-circuit-breaker` | 🔲 Not Started | SA · PBE · QA | REARCH-010, REARCH-006, REARCH-004 |
 | 14 | **REARCH-014** — S8: Backtest Engine from `flow_events` Replay | [#116](https://github.com/bhaveshhpatel/cipher/issues/116) | `feat/rearch-014-backtest-engine` | 🔲 Not Started | SA · PBF · QA | REARCH-006, REARCH-005, REARCH-004, REARCH-003 |
 | 15 | **REARCH-015** — ADV-Normalized Premium Gate | [#129](https://github.com/bhaveshhpatel/cipher/issues/129) | `feat/rearch-015-adv-normalized-premium` | 🔲 Not Started (post-launch) | SA · PBE · QA | REARCH-006 (must be live first) |
+| 16 | **REARCH-016** — Admin UI: AdaptiveSemaphore Concurrency Knobs | [#139](https://github.com/bhaveshhpatel/cipher/issues/139) | `feat/rearch-016-adaptive-semaphore-config` | 🔲 Not Started | SA · PBE · PBF · QA | REARCH-007 |
 
 ### Status Legend
 | Icon | Meaning |
@@ -170,7 +171,8 @@ REARCH-001 (Index Purge) ✅
             │                               ├── REARCH-014 (Backtest Engine) ─────────────┘
             │                               └── REARCH-015 (ADV-Normalized Gate) ← POST-LAUNCH
             └── REARCH-007 (Admin: Ingestion Panel)
-                        └── REARCH-012 (Admin Page Overhaul)
+                        ├── REARCH-012 (Admin Page Overhaul)
+                        └── REARCH-016 (AdaptiveSemaphore Concurrency Knobs)
 
 REARCH-010 (DB Schema Purge) ✅ Applied — unblocks REARCH-003, REARCH-004,
     ├── REARCH-011 (Dashboard Overhaul)      REARCH-006 column reads and all UI work
@@ -210,3 +212,5 @@ REARCH-013 (Tiered Swarm) ← blocks REARCH-014
 > Unblocks: REARCH-008 (Admin UI: Signal Config Panel), REARCH-011 (Signal History persistence), REARCH-013 (Alert emission pipeline), REARCH-014 (Frontend signal feed), REARCH-015 (ADV-Normalized Gate — post-launch).
 
 > **REARCH-015 note:** 🔲 Not Started (post-launch). Tracked in [#129](https://github.com/bhaveshhpatel/cipher/issues/129). Adds `adv_cache` table (20-day rolling options premium ADV per ticker, computed from `flow_events` history — no external data provider needed), nightly refresh job, `sig.normalized_premium_floor` config key (default 2.0×), and changes Signal Engine Dimension-1 from a dollar gate to an ADV-normalized gate. Dollar thresholds (GOLDEN/BLOCK/NOTEWORTHY) are demoted to soft label classifiers only. Staleness fallback policy (F1: fall back to tier-multiplier dollar gate on cache miss) requires SA · PBE · QA deliberation before branch is cut. **Blocked on REARCH-006 merged and live.**
+
+> **REARCH-016 note:** 🔲 Not Started. Tracked in [#139](https://github.com/bhaveshhpatel/cipher/issues/139). The `AdaptiveSemaphore` in `symbol_registry.py` governs options chain fetch parallelism during registry `build()` — scaling concurrency between a floor of 15 and ceiling of 40 based on observed p95 Tradier API latency. All adaptation constants (`_CONCURRENCY_MIN=15`, `_CONCURRENCY_MAX=40`, `_ADAPT_STEP=5`, `_ADAPT_SAMPLE_INTERVAL=20`, `_ADAPT_WINDOW=100`, `_P95_RAMP_UP_THRESHOLD_S=1.0s`, `_P95_DROP_THRESHOLD_S=5.0s`) are currently hardcoded with no live-tuning surface. This story adds all seven constants to the `ingestion_config` DB table and reads them from `get_config()` inside `build()` at construction time. The Admin UI surface is a **Registry Build Tuning** subsection added to the existing REARCH-007 Ingestion Config panel — not a standalone page. Cross-field validation rules enforced: `REGISTRY_CONCURRENCY_MIN < REGISTRY_CONCURRENCY_MAX`, `REGISTRY_CONCURRENCY_MAX ≤ 100`, `REGISTRY_P95_RAMP_UP_S < REGISTRY_P95_DROP_S`. A new read-only `GET /admin/registry-status` endpoint exposes current adaptive semaphore state (current concurrency, last p95, last adapt decision) for operator observability. Config is read once per `build()` call — not per adapt cycle — to prevent config churn mid-build. **Depends on REARCH-007 for the Admin UI panel surface.**
