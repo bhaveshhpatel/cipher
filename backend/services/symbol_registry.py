@@ -27,7 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build().
+  always doing a full rebuild after the first build()。
   Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
@@ -105,17 +105,13 @@ FIX QQ1-B (2026-05-09): Round OI average instead of integer floor division.
   min_premium gate floor to all their flow events.
   Fix: round(total_oi / count) in both sites.
 
-FIX MARKET-HOURS-GATE (2026-05-13): build() now skips Tradier calls outside
-  market hours (Mon-Fri 09:30-16:05 ET). refresh_loop() calls
-  _sleep_until_market_open() when outside hours and fires build() immediately
-  at 09:30 ET. _is_market_hours() and _sleep_until_market_open() imported
-  from chain_store.
-
 FIX SINGLETON (2026-05-13): init_registry() / get_registry() module-level
   singleton functions added. Pattern mirrors gate_config_store.
 
 FIX REFRESH-LOOP (2026-05-13): refresh_loop() method added — reads intervals
   from DB config, checks expiry-day flag, sleeps, calls build() H3 incremental.
+  refresh_loop() retains its market-hours check so the scheduled periodic
+  rebuild skips Tradier outside 09:30-16:05 ET.
 
 CONCURRENCY REVERT (2026-05-14): Remove AdaptiveSemaphore and all adaptive
   concurrency logic. Restore plain asyncio.Semaphore with
@@ -129,6 +125,26 @@ CONCURRENCY REVERT (2026-05-14): Remove AdaptiveSemaphore and all adaptive
   _fetch_stock_prices() and _build_ticker() restored as instance methods
   (self.*) matching stable structure. SHUTDOWN-CANCEL CancelledError re-raise
   retained. BUILD-EXCEPTION-VISIBILITY log retained.
+
+FIX MARKET-HOURS-GATE-REMOVAL (2026-05-14): Remove MARKET-HOURS-GATE from
+  build(). This gate was added on 2026-05-13 to prevent Tradier 400 errors
+  outside market hours, but it introduced a critical regression:
+
+  build() returned (0, {}) or (len_registry, {}) WITHOUT setting
+  _build_complete=True. Since stream_options_flow() polls is_ready() which
+  checks _build_complete, the stream workers never spawned, _persist_to_db()
+  never ran, and options_chain_cache stayed permanently empty on any server
+  start outside 09:30-16:05 ET.
+
+  The stable branch (stable/ingestion-frontend-2026-04-29) has NO market
+  hours gate in build(). Individual ticker failures inside _build_ticker()
+  are already caught per-ticker (WARNING + continue) — a 400 from Tradier
+  for one expiry does not abort the full build. The httpx-layer timeouts
+  (_READ_TIMEOUT=20s) handle hung connections. This is sufficient.
+
+  refresh_loop() retains its _sleep_until_market_open() call so the
+  SCHEDULED periodic refresh still waits for market open — only the
+  cold-start / one-shot build() path is affected by this removal.
 """
 import asyncio
 import logging
@@ -333,19 +349,22 @@ class SymbolRegistry:
         """
         Build (or incrementally refresh) the OCC registry.
 
-        MARKET-HOURS-GATE: if called outside NYSE market hours (Mon-Fri
-        09:30-16:05 ET), Tradier's chain and quote APIs return stale or
-        error responses.  Two early-exit cases:
+        MARKET-HOURS-GATE REMOVED (2026-05-14):
+          The gate that previously returned early when called outside NYSE
+          market hours has been removed. It prevented _build_complete from
+          being set and left options_chain_cache permanently empty on any
+          server restart outside 09:30-16:05 ET.
 
-          Warm (self._registry populated):
-            Return (len(registry), {}) immediately — the existing registry
-            is still valid.  refresh_loop() will retry on the next cycle;
-            the first in-hours cycle runs H3 incremental as designed.
+          Individual ticker/expiry failures inside _build_ticker() are
+          already caught and logged per-ticker (WARNING + continue) so a
+          Tradier 400 for a single expiry does not abort the full build.
+          The httpx-layer timeouts (_READ_TIMEOUT=20s, _CONNECT_TIMEOUT=15s)
+          in tradier_client.py handle stalled connections. This is the same
+          behaviour as stable/ingestion-frontend-2026-04-29.
 
-          Cold (self._registry empty, no DB seed loaded):
-            Return (0, {}) WITHOUT setting _build_complete.  Stream workers
-            stay blocked.  refresh_loop() calls _sleep_until_market_open()
-            and fires build() immediately at 09:30 ET.
+          refresh_loop() retains its _sleep_until_market_open() call so the
+          SCHEDULED periodic refresh still waits for market open — only the
+          cold-start / one-shot build() is affected.
 
         H3 - Incremental mode:
           If self._registry is already populated (seeded from DB or from a
@@ -387,28 +406,6 @@ class SymbolRegistry:
           exactly as in stable/ingestion-frontend-2026-04-29.
         """
         from services.symbols_loader import SymbolQuote
-
-        # -------------------------------------------------------------------
-        # MARKET-HOURS-GATE
-        # -------------------------------------------------------------------
-        if not _is_market_hours():
-            if self._registry:
-                log.info(
-                    "[symbol_registry] build() called outside market hours — "
-                    "registry already warm (%d contracts), skipping Tradier calls. "
-                    "Next refresh_loop() cycle will run H3 incremental at market open.",
-                    len(self._registry),
-                )
-                return len(self._registry), {}
-            else:
-                log.warning(
-                    "[symbol_registry] build() called outside market hours with "
-                    "EMPTY registry (no DB seed loaded). Tradier calls suppressed. "
-                    "_build_complete remains False — stream workers will not spawn "
-                    "until market open. refresh_loop() will call "
-                    "_sleep_until_market_open() and fire build() at 09:30 ET.",
-                )
-                return 0, {}
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
         # QQ1-A: real tier_params from the first build — bootstrap_params removed
@@ -665,6 +662,12 @@ class SymbolRegistry:
             H3 incremental: only tickers with min_dte=0 are re-fetched.
           - build() exceptions are caught and logged as non-fatal so the loop
             continues on the next cycle.
+
+        NOTE: The market-hours gate here only affects the SCHEDULED periodic
+        refresh (every 30 min). The cold-start build() called directly by
+        _background_build_and_upsert() in main.py has NO market hours gate —
+        it always proceeds so _build_complete is set and options_chain_cache
+        is populated regardless of what time the server starts.
         """
         while True:
             cfg = await get_config()
