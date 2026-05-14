@@ -145,7 +145,7 @@ _TIMEOUT = httpx.Timeout(
     connect=_CONNECT_TIMEOUT,
     read=_READ_TIMEOUT,
     write=10.0,
-    pool=5.0,
+    pool=15.0,
 )
 
 
