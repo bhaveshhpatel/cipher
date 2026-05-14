@@ -248,6 +248,14 @@ Fix (SEM-STREAM-RESTORE 2026-05-12): restore stream_options_flow + downstream fn
   The SEM-STREAM commit truncated the file at _resolve_exclude_indices() —
   everything from _is_market_hours() through _process_trade() was lost.
   Cherry-picked verbatim from cipher-rearch. No logic changes.
+
+Fix (PARSE-REGISTRY-KWARG 2026-05-14): remove stale registry= kwarg from
+  parse_tradier_trade() call in _process_trade().
+  parse_tradier_trade() signature is (raw, min_premium=None). The registry
+  kwarg was a remnant of an older calling convention removed when the parser
+  switched to a module-level get_registry() import. Passing registry= caused
+  TypeError on every single timesale tick — zero trades parsed, zero flow
+  events persisted, zero signals emitted during market hours.
 """
 import asyncio
 import logging
@@ -961,8 +969,11 @@ async def _process_trade(raw: dict, registry=None) -> None:
         )
 
     # --- Parse ---
+    # PARSE-REGISTRY-KWARG: parse_tradier_trade(raw, min_premium=...) only.
+    # The parser resolves the registry internally via get_registry() —
+    # do NOT pass registry= here (that kwarg does not exist on the function).
     min_premium = _resolve_min_premium(_raw_ticker)
-    result = parse_tradier_trade(raw, registry=registry, min_premium=min_premium)
+    result = parse_tradier_trade(raw, min_premium=min_premium)
 
     if result == "below_premium":
         return
