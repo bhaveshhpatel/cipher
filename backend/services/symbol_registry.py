@@ -312,6 +312,30 @@ FIX FREE-FUNCTIONS (2026-05-13): add module-level _fetch_stock_prices(tickers)
     one ticker, filters by ATM/DTE/OI, writes ContractMeta to new_registry,
     accumulates OI into oi_by_ticker. Includes B-ZERO-PRICE bypass and
     BUILD-PER-REQUEST-TIMEOUT (15s per chain fetch). QQ1-B: round() for OI.
+
+FIX MARKET-HOURS-GATE (2026-05-13): build() now skips Tradier calls outside
+  market hours (Mon-Fri 09:30-16:05 ET).
+
+  Two cases:
+
+  1. Warm registry (self._registry populated via load_from_db or prior build):
+     Return (len(self._registry), {}) immediately with INFO log. No lock
+     contention, no Tradier calls. refresh_loop() retries on the next normal
+     interval cycle; the first in-hours cycle runs H3 incremental as designed.
+
+  2. Cold registry (empty — no DB cache loaded, first ever startup):
+     Return (0, {}) WITHOUT setting _build_complete. Logs WARNING so ops
+     knows stream workers will not spawn until market open. refresh_loop()
+     will call _sleep_until_market_open() and then fire build() immediately
+     at 09:30 ET, completing the cold build and setting _build_complete.
+
+  refresh_loop() parallel guard: if _is_market_hours() is False at the top
+  of a refresh cycle, call _sleep_until_market_open() then invoke build()
+  immediately (rather than sleeping the full interval again post-open).
+  This guarantees the first in-market build fires at exactly 09:30 ET.
+
+  _is_market_hours() and _sleep_until_market_open() are imported from
+  chain_store (FIX #134, 2026-05-13) — no duplication of ET constants.
 """
 import asyncio
 import collections
@@ -326,7 +350,7 @@ from typing import Optional
 # the module namespace).
 from services.ingestion_config import get_config
 from services.tier_engine import _fetch_thresholds, assign_tiers
-from services.chain_store import load_chain
+from services.chain_store import load_chain, _is_market_hours, _sleep_until_market_open
 from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quotes_batch
 
 log = logging.getLogger("symbol_registry")
@@ -772,9 +796,46 @@ class SymbolRegistry:
     async def build(self) -> tuple[int, dict[str, dict]]:
         """
         Build (or incrementally refresh) the OCC registry.
+
+        MARKET-HOURS-GATE: if called outside NYSE market hours (Mon-Fri
+        09:30-16:05 ET), Tradier's chain and quote APIs return stale or
+        error responses.  Two early-exit cases:
+
+          Warm (self._registry populated):
+            Return (len(registry), {}) immediately — the existing registry
+            is still valid.  refresh_loop() will retry on the next cycle;
+            the first in-hours cycle runs H3 incremental as designed.
+
+          Cold (self._registry empty, no DB seed loaded):
+            Return (0, {}) WITHOUT setting _build_complete.  Stream workers
+            stay blocked.  refresh_loop() calls _sleep_until_market_open()
+            and fires build() immediately at 09:30 ET.
+
         See module docstring for full fix history.
         """
         from services.symbols_loader import SymbolQuote
+
+        # ---------------------------------------------------------------
+        # MARKET-HOURS-GATE (FIX MARKET-HOURS-GATE 2026-05-13)
+        # ---------------------------------------------------------------
+        if not _is_market_hours():
+            if self._registry:
+                log.info(
+                    "[symbol_registry] build() called outside market hours — "
+                    "registry already warm (%d contracts), skipping Tradier calls. "
+                    "Next refresh_loop() cycle will run H3 incremental at market open.",
+                    len(self._registry),
+                )
+                return len(self._registry), {}
+            else:
+                log.warning(
+                    "[symbol_registry] build() called outside market hours with "
+                    "EMPTY registry (no DB seed loaded). Tradier calls suppressed. "
+                    "_build_complete remains False — stream workers will not spawn "
+                    "until market open. refresh_loop() will call "
+                    "_sleep_until_market_open() and fire build() at 09:30 ET.",
+                )
+                return 0, {}
 
         cfg, thresh = await asyncio.gather(get_config(), _fetch_thresholds())
         # QQ1-A: real tier_params from the first build — bootstrap_params removed
@@ -1043,7 +1104,7 @@ class SymbolRegistry:
             )
 
     # -----------------------------------------------------------------------
-    # refresh_loop  (FIX REFRESH-LOOP 2026-05-13)
+    # refresh_loop  (FIX REFRESH-LOOP 2026-05-13 + FIX MARKET-HOURS-GATE 2026-05-13)
     # -----------------------------------------------------------------------
 
     async def refresh_loop(self) -> None:
@@ -1056,6 +1117,10 @@ class SymbolRegistry:
             from DB config via get_config().
           - Uses the shorter EXPIRY_DAY interval when any contract expires
             today; uses the normal interval otherwise.
+          - MARKET-HOURS-GATE: if outside market hours at the top of a cycle,
+            calls _sleep_until_market_open() then fires build() immediately
+            rather than sleeping the full interval first. This ensures the
+            first in-market build happens at 09:30 ET, not 09:30 + interval.
           - Sleeps the chosen interval, then calls self.build().
             H3 incremental: only tickers with min_dte=0 are re-fetched.
           - build() exceptions are caught and logged as non-fatal so the loop
@@ -1074,6 +1139,25 @@ class SymbolRegistry:
                 if has_expiry_today
                 else cfg["REGISTRY_REFRESH_MINS"]
             )
+
+            # MARKET-HOURS-GATE: if currently outside market hours, sleep
+            # until open and fire build() immediately at 09:30 ET rather
+            # than waiting the full interval after open.
+            if not _is_market_hours():
+                log.info(
+                    "[symbol_registry] refresh_loop: outside market hours — "
+                    "sleeping until market open before next build()"
+                )
+                await _sleep_until_market_open()
+                log.info(
+                    "[symbol_registry] refresh_loop: market open — firing build() now"
+                )
+                try:
+                    await self.build()
+                except Exception as e:
+                    log.error("[symbol_registry] Refresh (post-open) failed (non-fatal): %s", e)
+                continue
+
             await asyncio.sleep(interval_mins * 60)
 
             log.info(
