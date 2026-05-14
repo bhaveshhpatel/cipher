@@ -124,9 +124,9 @@ FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
     bypassed (existing B-ZERO-PRICE path). _build_complete is guaranteed to
     be set.
 
-  - asyncio.gather(*tasks) for chain fetches: 180s timeout (covers ~765
-    tickers at build_concurrency=50 with reasonable Tradier latency). On
-    expiry, logs ERROR and proceeds with whatever contracts were fetched
+  - asyncio.gather(*tasks) for chain fetches: 300s timeout (covers full
+    3949-ticker universe at concurrency=50 even on degraded Tradier days).
+    On expiry, logs ERROR and proceeds with whatever contracts were fetched
     before the deadline; _build_complete is still set so stream workers
     can spawn against the partial registry.
 
@@ -134,10 +134,24 @@ FIX BUILD-HANG (2026-05-12): build() could hang indefinitely when Tradier's
   outer non-fatal wrapper in main.py/_background_build_and_upsert is not
   triggered — the build completes (possibly partial) rather than raising.
 
-  Root cause of 2026-05-12 incident: server deployed at 14:43 UTC, H3
-  incremental build logged '765 tickers to refresh' then went silent.
-  _build_complete never set → stream workers never spawned → no flow data
-  processed during market hours.
+FIX BUILD-HANG-PER-REQUEST (2026-05-14): Each individual get_option_chain_bulk()
+  call inside _build_ticker() is now wrapped in asyncio.wait_for(timeout=15s).
+  Without this, a single stalled TCP connection held a semaphore slot for the
+  entire gather window. With concurrency=50, a handful of stalled connections
+  reduced effective throughput to ~5 real requests, completing only ~130
+  tickers before the gather timeout fired.
+
+  With per-request timeouts:
+  - Each slot is freed within 15s max regardless of Tradier TCP behaviour.
+  - Semaphore stays productive at full concurrency=50 throughout.
+  - Expected build time: 40-65s on a clean day, ~120s on degraded days.
+  - BUILD-HANG gather timeout (300s) becomes a true last-resort safety net
+    that should never fire under normal operating conditions.
+
+  Root cause of 2026-05-14 incident: stream spawned with 1570/3949 OCC
+  contracts (~40% of tickers, ~2% of full OCC universe) because stalled
+  TCP slots made the 180s gather fire after only ~130 alphabetically-first
+  tickers completed.
 
 FIX SHUTDOWN-CANCEL (2026-05-12): _build_with_sem now catches CancelledError
   and re-raises immediately instead of letting it propagate through
@@ -175,8 +189,20 @@ _DEFAULT_BUILD_CONCURRENCY = 50
 # BUILD-HANG: hard timeouts for the two network-bound phases inside build().
 # These prevent an indefinite hang when Tradier stalls at the TCP layer
 # before the httpx read timeout fires.
-_PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3834 tickers × 200/batch = 20 batches
-_CHAIN_GATHER_TIMEOUT_S = 180   # asyncio.gather(*tasks): up to ~765 chain fetches at concurrency=50
+_PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3949 tickers × 200/batch = 20 batches
+
+# BUILD-HANG-PER-REQUEST: raised from 180s to 300s.
+# Per-request 15s timeouts on each get_option_chain_bulk() call (see
+# _build_ticker) keep all 50 semaphore slots productive. At concurrency=50
+# with typical Tradier latency (500ms-1.5s/ticker), 3949 tickers completes
+# in 40-120s. 300s is the true last-resort ceiling that should never fire
+# under normal operating conditions.
+_CHAIN_GATHER_TIMEOUT_S = 300   # asyncio.gather(*tasks): full 3949-ticker universe
+
+# Per-request timeout for each individual get_option_chain_bulk() call.
+# Frees the semaphore slot immediately on TCP stall — keeps concurrency=50
+# slots productive throughout the entire build window.
+_CHAIN_REQUEST_TIMEOUT_S = 15
 
 
 @dataclass
@@ -391,9 +417,14 @@ class SymbolRegistry:
         BUILD-HANG - hard timeouts on network phases:
           _fetch_stock_prices() is wrapped in asyncio.wait_for(timeout=45s).
           asyncio.gather(*tasks) for chain fetches is wrapped in
-          asyncio.wait_for(timeout=180s). Both phases degrade gracefully
+          asyncio.wait_for(timeout=300s). Both phases degrade gracefully
           on timeout (zero-price fallback / partial registry) and always
           set _build_complete=True so stream workers can spawn.
+
+        BUILD-HANG-PER-REQUEST - per-request chain timeout:
+          Each get_option_chain_bulk() call in _build_ticker() is wrapped
+          in asyncio.wait_for(timeout=15s). Stalled TCP connections no
+          longer hold semaphore slots — all 50 slots stay productive.
 
         SHUTDOWN-CANCEL - clean CancelledError propagation:
           _build_with_sem catches CancelledError and re-raises immediately
@@ -519,10 +550,12 @@ class SymbolRegistry:
                     _build_with_sem(ticker)
                     for ticker in tickers_to_refresh
                 ]
-                # BUILD-HANG: hard 180s timeout on the chain-fetch gather.
-                # Covers ~765 tickers at concurrency=50 with normal Tradier
-                # latency. On timeout, proceed with whatever contracts were
-                # fetched before the deadline; _build_complete is still set.
+                # BUILD-HANG: hard 300s timeout on the chain-fetch gather.
+                # Per-request 15s timeouts in _build_ticker keep all semaphore
+                # slots productive — this outer timeout is the last-resort
+                # safety net that should not fire under normal conditions.
+                # On timeout, proceed with whatever contracts were fetched
+                # before the deadline; _build_complete is still set.
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*tasks, return_exceptions=True),
@@ -721,6 +754,14 @@ class SymbolRegistry:
           The former bootstrap_params collapse to T3 for all tiers has
           been removed in build(). _build_ticker() is unchanged here —
           it always read tier_params[tier]; the fix is in the caller.
+
+        BUILD-HANG-PER-REQUEST: each get_option_chain_bulk() call is wrapped
+          in asyncio.wait_for(timeout=_CHAIN_REQUEST_TIMEOUT_S=15s).
+          A stalled TCP connection frees its semaphore slot within 15s
+          instead of holding it for the full gather window. This keeps
+          all concurrency=50 slots productive throughout the build.
+          Timeout is logged at WARNING and the expiry is skipped (same
+          behaviour as a failed chain fetch).
         """
         if stock_price <= 0:
             if zero_price_fallback:
@@ -760,8 +801,22 @@ class SymbolRegistry:
             if dte < 0 or dte > params.max_dte:
                 continue
 
+            # BUILD-HANG-PER-REQUEST: wrap each chain fetch in a 15s deadline.
+            # Without this, a stalled TCP connection holds the semaphore slot
+            # for the entire outer gather window (300s), starving other tickers.
+            # On timeout: log WARNING and skip this expiry (same as a network
+            # error). The ticker's other expiries are still attempted.
             try:
-                contracts = await get_option_chain_bulk(ticker, expiry_str)
+                contracts = await asyncio.wait_for(
+                    get_option_chain_bulk(ticker, expiry_str),
+                    timeout=_CHAIN_REQUEST_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[symbol_registry] %s %s: chain fetch timed out after %ds — skipping expiry",
+                    ticker, expiry_str, _CHAIN_REQUEST_TIMEOUT_S,
+                )
+                continue
             except Exception as e:
                 log.warning(
                     "[symbol_registry] %s %s: chain fetch failed: %s",
