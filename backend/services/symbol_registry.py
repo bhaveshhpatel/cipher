@@ -27,8 +27,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build().
-  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
+  always doing a full rebuild after the first build().\n  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
 
@@ -66,7 +65,7 @@ FIX B-ZERO-PRICE (2026-04-29): When _fetch_stock_prices() returns 0 prices,
 FIX ING-010 (2026-05-07): Add influence_tier_int() as the sole tier accessor.
   _resolve_min_premium() in tradier_stream.py calls influence_tier_int(ticker)
   directly to get the integer tier (1/2/3) and passes it straight to
-  gate_config_store.get("min_premium", tier_int). No string intermediary.
+  gate_config_store.get(\"min_premium\", tier_int). No string intermediary.
   Fallback: 3 (most conservative / T3 defaults) for unknown tickers.
 
   NOTE: The former influence_tier_string() method and _INT_TIER_TO_STRING dict
@@ -86,7 +85,7 @@ ING-010-EPOCH (2026-05-07): Add epoch versioning to SymbolRegistry.
   Consumers (stream_worker, tradier_stream) can watch registry.epoch to
   detect tier-map refreshes without polling individual symbol keys.
   load_from_db() does NOT increment epoch — only build() does, so callers
-  can rely on epoch > 0 as a "fully built from Tradier" signal (same
+  can rely on epoch > 0 as a \"fully built from Tradier\" signal (same
   semantics as _build_complete).
 
 FIX QQ1-A (2026-05-09): Use real tier_params on cold-start build — remove
@@ -157,20 +156,30 @@ FIX BUILD-SEMAPHORE (2026-05-13): _DEFAULT_BUILD_CONCURRENCY 50 -> 20.
   fired, killing all remaining tasks. 20 concurrency stays within Tradier's
   safe rate-limit headroom. Realistic wall time is unchanged (~57s).
 
-FIX BUILD-PER-REQUEST-TIMEOUT (2026-05-13): add 15s per-request timeout
-  on every get_option_chain_bulk() call inside _build_ticker().
+FIX BUILD-PER-REQUEST-TIMEOUT (2026-05-13): add per-request timeout on every
+  get_option_chain_bulk() call inside _build_ticker().
   Previously a single stalled TCP connection held a semaphore slot for up
   to 300s (the outer gather timeout). Now each chain fetch times out
-  independently at 15s, frees the slot immediately, and the gather keeps
-  cycling. 15s gives one full httpx read_timeout (~10s) + 5s buffer.
+  independently, frees the slot immediately, and the gather keeps cycling.
   On timeout: log WARNING for the specific (ticker, expiry) pair and
   continue to the next expiry — partial contracts already written to
   new_registry are retained.
 
+FIX 2 (2026-05-13): _CHAIN_REQUEST_TIMEOUT_S 15s -> 8s.
+  Tradier's chain API responds in <1s on healthy days and <4s under moderate
+  load. The original 15s was sized as '1x httpx read_timeout (10s) + 5s
+  buffer' but the httpx read_timeout is already enforced at the HTTP client
+  layer — the asyncio.wait_for wrapper is a second, outer deadline. 8s
+  gives full coverage for the realistic degraded-Tradier case (p95 ~4-5s
+  under heavy load) while freeing stalled semaphore slots 2x faster. At
+  AdaptiveSemaphore concurrency=20 and 8s timeout, worst-case cold-build
+  wall time is unchanged (~57s realistic) because AdaptiveSemaphore already
+  drops concurrency before per-slot stalls accumulate to 15s.
+
 FIX BUILD-GATHER-TIMEOUT (2026-05-13, corrected 2026-05-13): _CHAIN_GATHER_TIMEOUT_S
   180 -> 300 -> 1800 (Option B cold-start safety net).
   The 300s value was sized for the wrong scale: commit 515cb2f7 commented
-  "~765 tickers at concurrency=20" but the actual watchlist is 3,848 tickers.
+  \"~765 tickers at concurrency=20\" but the actual watchlist is 3,848 tickers.
   Cold-build math: ceil(3848 / 20) = 193 serial batches x 15s per-request
   timeout = 2,895s worst case; at 5% stall rate ~480s realistic — 300s fired
   too early and killed mid-batch tasks that would have succeeded.
@@ -213,9 +222,9 @@ FIX BUILD-ADAPTIVE-CONCURRENCY (2026-05-13): replace fixed concurrency=20
       calls and preventing the stall-slot saturation that caused the
       original BUILD-SEMAPHORE regression.
 
-  The per-request 15s wait_for (BUILD-PER-REQUEST-TIMEOUT) and the 1800s
-  outer gather timeout (BUILD-GATHER-TIMEOUT) are unchanged — they are the
-  hard safety net. AdaptiveSemaphore operates at the soft throughput layer.
+  The per-request 8s wait_for (FIX 2) and the 1800s outer gather timeout
+  (BUILD-GATHER-TIMEOUT) are unchanged — they are the hard safety net.
+  AdaptiveSemaphore operates at the soft throughput layer.
 
   Concurrency adjustments are logged at INFO with p95 and direction so the
   build log makes Tradier health visible without extra instrumentation.
@@ -311,7 +320,7 @@ FIX FREE-FUNCTIONS (2026-05-13): add module-level _fetch_stock_prices(tickers)
     zero_price_fallback, tier_map): fetches expirations + option chains for
     one ticker, filters by ATM/DTE/OI, writes ContractMeta to new_registry,
     accumulates OI into oi_by_ticker. Includes B-ZERO-PRICE bypass and
-    BUILD-PER-REQUEST-TIMEOUT (15s per chain fetch). QQ1-B: round() for OI.
+    BUILD-PER-REQUEST-TIMEOUT (8s per chain fetch per FIX 2). QQ1-B: round() for OI.
 
 FIX MARKET-HOURS-GATE (2026-05-13): build() now skips Tradier calls outside
   market hours (Mon-Fri 09:30-16:05 ET).
@@ -369,9 +378,9 @@ _ADAPT_WINDOW               = 100
 _P95_RAMP_UP_THRESHOLD_S    = 1.0
 _P95_DROP_THRESHOLD_S       = 5.0
 
-_PRICES_FETCH_TIMEOUT_S = 45
-_CHAIN_GATHER_TIMEOUT_S = 1800
-_CHAIN_REQUEST_TIMEOUT_S = 15
+_PRICES_FETCH_TIMEOUT_S  = 45
+_CHAIN_GATHER_TIMEOUT_S  = 1800
+_CHAIN_REQUEST_TIMEOUT_S = 8   # FIX 2: 15s -> 8s
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +566,8 @@ async def _build_ticker(
         DTE gating still applies. Logs WARNING and continues.
       - zero_price_fallback=False -> skip ticker (regression guard).
 
-    BUILD-PER-REQUEST-TIMEOUT: each get_option_chain_bulk() call is wrapped
-      in asyncio.wait_for(_CHAIN_REQUEST_TIMEOUT_S). Frees semaphore slot
+    FIX 2: each get_option_chain_bulk() call is wrapped in
+      asyncio.wait_for(_CHAIN_REQUEST_TIMEOUT_S=8s). Frees semaphore slot
       immediately on stall rather than holding until outer gather timeout.
 
     QQ1-B: OI average uses round() not floor division.
