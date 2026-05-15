@@ -254,6 +254,29 @@ FIX-QUOTES-ITER (2026-05-15): Fix _fetch_stock_prices iterating dict keys
   cold-start build (ATM filter bypassed, chain stall warnings flood logs).
 
   Fix: "for q in quotes.values()" so q is the quote dict as intended.
+
+FIX-INCREMENTAL-REGISTRY (2026-05-15): Populate new_registry in-place inside
+  _build_with_sem so FLUSH-PERIODIC and progress logs see live data.
+
+  Root cause: new_registry was only updated in the post-gather loop (after
+  asyncio.gather() completed). During the entire 5-10 min gather window,
+  new_registry stayed empty/stale, causing two silent failures:
+
+  1. contracts=0 in every chain progress log — total_so_far read
+     len(new_registry) which was always 0 during the gather.
+
+  2. FLUSH-PERIODIC never flushed — _periodic_flush() woke every 30s,
+     called dict(snap_ref[0]) on the still-empty new_registry, hit the
+     `if not snapshot: continue` guard, and logged nothing.
+
+  Fix: move new_registry.update(result) + OI sum accumulation into
+  _build_with_sem immediately after _build_ticker returns. new_registry
+  is now populated incrementally as each of the 10 concurrent slots finishes.
+
+  Post-gather loop is retained for the OI average recomputation step
+  (dividing accumulated sums by contract counts); the redundant
+  new_registry.update() call is removed from that loop since the dict
+  is already fully populated by the time gather() returns.
 """
 import asyncio
 import logging
@@ -723,6 +746,9 @@ class SymbolRegistry:
                     """
                     Acquire the semaphore, delegate to _build_ticker, release.
                     LOG-CHAIN-V2: logs per-ticker start/done with timing.
+                    FIX-INCREMENTAL-REGISTRY: updates new_registry and
+                    new_oi_by_ticker in-place immediately after _build_ticker
+                    returns so FLUSH-PERIODIC and progress logs see live data.
                     """
                     try:
                         async with sem:
@@ -736,6 +762,16 @@ class SymbolRegistry:
                                 zero_price_fallback=zero_price_fallback,
                             )
                             elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+                            # FIX-INCREMENTAL-REGISTRY: populate new_registry
+                            # immediately so _periodic_flush and progress counter
+                            # reflect real accumulated contracts, not post-gather.
+                            if result:
+                                new_registry.update(result)
+                                for occ, meta in result.items():
+                                    new_oi_by_ticker.setdefault(meta.ticker, 0)
+                                    new_oi_by_ticker[meta.ticker] += meta.open_interest
+
                             _completed[0] += 1
                             done = _completed[0]
                             log.debug(
@@ -747,7 +783,7 @@ class SymbolRegistry:
                                 elapsed_s = time.monotonic() - _chain_start
                                 rate = done / elapsed_s if elapsed_s > 0 else 0
                                 eta_s = (total_tickers - done) / rate if rate > 0 else 0
-                                total_so_far = sum(len(v) for v in new_registry.values())
+                                total_so_far = len(new_registry)
                                 log.info(
                                     "[symbol_registry] chain progress: %d/%d (%.1f%%) "
                                     "contracts=%d elapsed=%.0fs eta=%.0fs",
@@ -767,6 +803,9 @@ class SymbolRegistry:
                     _CHAIN_FLUSH_INTERVAL_S seconds during the gather phase.
                     snap_ref[0] is the live new_registry dict (mutated in-place
                     by _build_with_sem tasks as contracts accumulate).
+                    FIX-INCREMENTAL-REGISTRY: new_registry is now populated
+                    incrementally by _build_with_sem so this flush sees real
+                    data on every wake instead of always finding an empty dict.
                     """
                     from services.chain_store import save_chain
                     while True:
@@ -827,17 +866,10 @@ class SymbolRegistry:
                     except asyncio.CancelledError:
                         pass
 
-                for ticker_contracts in results:
-                    if ticker_contracts:
-                        new_registry.update(ticker_contracts)
-                        for occ, meta in ticker_contracts.items():
-                            new_oi_by_ticker.setdefault(meta.ticker, 0)
-                            new_oi_by_ticker[meta.ticker] = (
-                                new_oi_by_ticker[meta.ticker] + meta.open_interest
-                            )
-
-                # Recompute OI averages: accumulated values above are sums.
-                # Divide by contract count per ticker to get a per-ticker avg.
+                # FIX-INCREMENTAL-REGISTRY: new_registry is already fully populated
+                # by _build_with_sem. This loop only recomputes OI averages
+                # (accumulated values in new_oi_by_ticker are sums; divide by
+                # contract count per ticker to get the per-ticker average).
                 oi_counts: dict[str, int] = {}
                 for occ, meta in new_registry.items():
                     if meta.ticker in set(tickers_to_refresh):
