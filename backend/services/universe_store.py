@@ -46,6 +46,7 @@ ROOT CAUSE FIX (2026-05-05) ING-010:
 """
 
 import asyncio
+import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -53,7 +54,8 @@ from uuid import uuid4
 
 from supabase import Client
 
-from core.config import settings
+SUPABASE_URL         = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 log = logging.getLogger(__name__)
 
@@ -124,21 +126,14 @@ def _sync_get_latest_snapshot_id() -> str:
 
 
 def _client() -> Client:
-    """
-    Always use the service role key — it bypasses RLS, which is required
-    for all server-side INSERT/UPDATE/DELETE operations.
-
-    NEVER fall back to the anon key (settings.SUPABASE_KEY). The anon key
-    respects RLS and will cause 401/42501 errors on every write.
-    """
-    service_key = settings.SUPABASE_SERVICE_KEY
+    service_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     if not service_key:
         raise RuntimeError(
             "SUPABASE_SERVICE_KEY is not set. universe_store requires the service role key "
             "to bypass RLS on options_universe_snapshots and options_universe_symbols."
         )
     from supabase import create_client
-    return create_client(settings.SUPABASE_URL, service_key)
+    return create_client(os.environ["SUPABASE_URL"], service_key)
 
 
 # ── Public async API ────────────────────────────────────────────────────────
