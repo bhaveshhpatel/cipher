@@ -102,3 +102,7 @@ async def get_full_stats():
       gate_epoch        — current gate_config_store epoch (0 = not loaded)
     """
     return get_stats()
+
+@router.get("/health", include_in_schema=False)
+async def health_probe() -> dict:
+    return {"status": "ok"}
