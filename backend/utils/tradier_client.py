@@ -103,6 +103,28 @@ FIX-QUOTES-RESP (2026-05-14):
   Fix: assert isinstance(data, dict); log ERROR with raw body on failure.
   Also guard quotes_container in get_quotes_batch() for the "No Content" case.
 
+FIX-CHAIN-400 (2026-05-15): Distinguish HTTP 400 from other error codes in
+  get_option_chain_bulk() and get_expirations().
+
+  get_option_chain_bulk() previously fell through `if resp.status_code != 200:
+  return []` for ALL non-200 codes — a 400 (ticker has no listed options),
+  a 401 (auth failure), and a 500 (server error) were all silently swallowed
+  as empty-list returns with no log entry. Under rate-limit pressure many of
+  the ~21,450 per-expiry calls returned 400, making it impossible to
+  distinguish "ticker has no options" from "Tradier is rejecting us".
+
+  Fix:
+    - HTTP 400: log at DEBUG (expected for tickers with no listed options),
+      return [].
+    - HTTP 429: existing back-off retry logic unchanged.
+    - Any other non-200 (401, 403, 500, etc.): log at WARNING with the
+      first 300 chars of the response body so auth failures and server
+      errors are immediately visible in Railway logs.
+
+  get_expirations() bare-except now logs repr(e) instead of str(e) so
+  TimeoutError, CancelledError, and httpx internal errors surface their
+  full type name rather than an empty string.
+
 Public API:
   init_http_client()                         -> None  (call on startup)
   close_http_client()                        -> None  (call on shutdown)
@@ -320,7 +342,7 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
         return {}
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
     try:
-        resp = await _client().get(
+<br>        resp = await _client().get(
             url, headers=_headers(),
             params={"symbols": ",".join(symbols), "greeks": "false"}
         )
@@ -359,11 +381,18 @@ async def get_expirations(symbol: str) -> list[str]:
     """
     Fetch all active expiration dates for a ticker.
     Returns list of YYYY-MM-DD strings, empty list on error.
+
+    FIX-CHAIN-400: bare-except now logs repr(e) so TimeoutError and
+    CancelledError surface their full type name instead of empty string.
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/expirations"
     try:
         resp = await _client().get(url, headers=_headers(), params={"symbol": symbol})
         if resp.status_code != 200:
+            log.debug(
+                "[tradier_client] get_expirations(%s) HTTP %d — no listed options or error",
+                symbol, resp.status_code,
+            )
             return []
         data = resp.json()
         dates = (data.get("expirations") or {}).get("date") or []
@@ -371,7 +400,7 @@ async def get_expirations(symbol: str) -> list[str]:
             dates = [dates]
         return dates
     except Exception as e:
-        log.warning(f"[tradier_client] get_expirations({symbol}) error: {e}")
+        log.warning("[tradier_client] get_expirations(%s) error: %r", symbol, e)
         return []
 
 
@@ -409,6 +438,12 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
     (3× sem=10), restoring the original ratio from the sem=10 era.
 
     MUST NOT be used from the streaming flow path — use get_option_chain().
+
+    FIX-CHAIN-400: HTTP status handling is now explicit:
+      - 429: existing back-off retry (unchanged).
+      - 400: ticker has no listed options — log at DEBUG, return [].
+      - Any other non-200 (401, 403, 500, …): log at WARNING with body
+            so auth failures and server errors are visible in logs.
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
     async with _BULK_CHAIN_SEM:
@@ -435,7 +470,23 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
                     url, headers=_headers(),
                     params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
                 )
+            if resp.status_code == 400:
+                # FIX-CHAIN-400: 400 = ticker has no listed options (expected).
+                # Log at DEBUG only — this is normal for many watchlist symbols.
+                log.debug(
+                    "[tradier_client] get_option_chain_bulk(%s, %s) HTTP 400 — "
+                    "no listed options, skipping",
+                    symbol, expiration,
+                )
+                return []
             if resp.status_code != 200:
+                # FIX-CHAIN-400: any non-200/non-429/non-400 (e.g. 401, 403, 500)
+                # is unexpected — log at WARNING with response body so auth failures
+                # and server errors are immediately visible in Railway logs.
+                log.warning(
+                    "[tradier_client] get_option_chain_bulk(%s, %s) HTTP %d — body: %s",
+                    symbol, expiration, resp.status_code, resp.text[:300],
+                )
                 return []
             data = resp.json()
             options = (data.get("options") or {}).get("option") or []
@@ -444,7 +495,8 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
             return options
         except Exception as e:
             log.warning(
-                f"[tradier_client] get_option_chain_bulk({symbol}, {expiration}) error: {e}"
+                "[tradier_client] get_option_chain_bulk(%s, %s) error: %r",
+                symbol, expiration, e,
             )
             return []
 
@@ -507,8 +559,8 @@ async def get_option_chain_bulk_all(symbol: str) -> list[dict]:
                 return []
             if resp.status_code != 200:
                 log.warning(
-                    "[tradier_client] get_option_chain_bulk_all(%s) HTTP %d — skipping",
-                    symbol, resp.status_code,
+                    "[tradier_client] get_option_chain_bulk_all(%s) HTTP %d — body: %s",
+                    symbol, resp.status_code, resp.text[:300],
                 )
                 return []
             data = resp.json()
@@ -518,7 +570,7 @@ async def get_option_chain_bulk_all(symbol: str) -> list[dict]:
             return options
         except Exception as e:
             log.warning(
-                "[tradier_client] get_option_chain_bulk_all(%s) error: %s",
+                "[tradier_client] get_option_chain_bulk_all(%s) error: %r",
                 symbol, e,
             )
             return []
