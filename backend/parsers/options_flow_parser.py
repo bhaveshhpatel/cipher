@@ -161,7 +161,21 @@ class OptionsFlowEvent:
     underlying_price:  float = 0.0
 
     # Data quality flag
+        # Data quality flag
     is_synthetic_quote: bool = False
+
+    @property
+    def occ_symbol(self) -> str:
+        try:
+            if not self.ticker or not self.expiry or not self.contract_type:
+                return ""
+            ymd = self.expiry.replace("-", "")
+            yy_mm_dd = ymd[2:]
+            cp = "C" if self.contract_type.upper() == "CALL" else "P"
+            strike_int = int(round(self.strike * 1000))
+            return f"{self.ticker.upper()}{yy_mm_dd}{cp}{strike_int:08d}"
+        except Exception:
+            return ""
 
 
 _OCC_RE = re.compile(
