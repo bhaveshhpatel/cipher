@@ -1,1 +1,1 @@
-# File content will be injected below
+CONTENT_PLACEHOLDER
