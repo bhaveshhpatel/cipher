@@ -287,6 +287,24 @@ FIX-INCREMENTAL-REGISTRY (2026-05-15): Populate new_registry in-place inside
   (dividing accumulated sums by contract counts); the redundant
   new_registry.update() call is removed from that loop since the dict
   is already fully populated by the time gather() returns.
+
+FIX-SAVE-CHAIN-ARGS (2026-05-15): Fix swapped arguments in _periodic_flush
+  and _persist_to_db.
+
+  save_chain(snapshot_id, registry_dict) — both call sites had the arguments
+  reversed: passing the registry dict as the first positional arg (snapshot_id)
+  and the snapshot_id string as the second (registry_dict). Inside save_chain,
+  `for occ, m in registry_dict.items()` was therefore called on a string,
+  raising:
+    'str' object has no attribute 'items'
+  Caught and logged every 30s as:
+    FLUSH-PERIODIC: flush failed — 'str' object has no attribute 'items'
+  and silently swallowed every _persist_to_db write, meaning the registry was
+  never actually persisted to DB after any build.
+
+  Fix: correct argument order in both call sites:
+    _periodic_flush:  save_chain(snapshot_id_str, snapshot_dict)
+    _persist_to_db:   save_chain(snapshot_id,    self._registry)
 """
 import asyncio
 import logging
@@ -843,6 +861,10 @@ class SymbolRegistry:
                     FIX-INCREMENTAL-REGISTRY: new_registry is now populated
                     incrementally by _build_with_sem so this flush sees real
                     data on every wake instead of always finding an empty dict.
+                    FIX-SAVE-CHAIN-ARGS: save_chain(snapshot_id, registry_dict)
+                    — args were previously reversed, passing the dict as
+                    snapshot_id and the string as registry_dict, causing
+                    'str' object has no attribute 'items' on every flush.
                     """
                     from services.chain_store import save_chain
                     while True:
@@ -850,8 +872,9 @@ class SymbolRegistry:
                         snapshot = dict(snap_ref[0])
                         if not snapshot:
                             continue
+                        snapshot_id = self._persisted_snapshot_id or "partial"
                         try:
-                            await save_chain(snapshot, self._persisted_snapshot_id or "partial")
+                            await save_chain(snapshot_id, snapshot)
                             log.info(
                                 "[symbol_registry] FLUSH-PERIODIC: flushed %d contracts to DB",
                                 len(snapshot),
@@ -977,13 +1000,19 @@ class SymbolRegistry:
         return prices, raw
 
     async def _persist_to_db(self) -> None:
-        """Write the current registry snapshot to chain_store."""
+        """Write the current registry snapshot to chain_store.
+
+        FIX-SAVE-CHAIN-ARGS: save_chain(snapshot_id, registry_dict).
+        Previously the args were reversed — self._registry was passed as
+        snapshot_id and snapshot_id as registry_dict — causing save_chain
+        to call .items() on a string and silently swallowing every write.
+        """
         from services.chain_store import save_chain
         if not self._registry:
             return
         try:
             snapshot_id = self._persisted_snapshot_id or "latest"
-            await save_chain(self._registry, snapshot_id)
+            await save_chain(snapshot_id, self._registry)
             log.info(
                 "[symbol_registry] _persist_to_db: saved %d contracts "
                 "(snapshot_id=%s)",
