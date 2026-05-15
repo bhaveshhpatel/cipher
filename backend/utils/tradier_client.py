@@ -87,6 +87,22 @@ CHAIN-ALL (2026-05-14):
   - Build time: ~117s clean / ~312s degraded (vs 343s / 1287s before).
   - get_expirations() is preserved for non-build callers.
 
+FIX-QUOTES-RESP (2026-05-14):
+  get_quote() and get_quotes_batch() now validate that resp.json() returns
+  a dict before chaining .get() on it.
+
+  Tradier returns HTTP 200 with a non-dict body in two known cases:
+    1. {"quotes": "No Content"} — valid token but no matching symbols.
+       data.get("quotes", {}) returns the string "No Content"; calling
+       .get("quote") on a string raises AttributeError, swallowed by the
+       bare except block, silently returning {} / None with no log trace.
+    2. {"fault": {"faultstring": "...", ...}} — API key invalid / sandbox
+       vs production mismatch. Same silent AttributeError path.
+  Both cases previously triggered the B-ZERO-PRICE zero_price_fallback path
+  with no indication of the root cause in logs.
+  Fix: assert isinstance(data, dict); log ERROR with raw body on failure.
+  Also guard quotes_container in get_quotes_batch() for the "No Content" case.
+
 Public API:
   init_http_client()                         -> None  (call on startup)
   close_http_client()                        -> None  (call on shutdown)
@@ -246,14 +262,39 @@ async def acquire_session_token_slot(
 
 
 async def get_quote(symbol: str) -> Optional[dict]:
-    """Fetch single stock quote. Returns raw quote dict or None."""
+    """Fetch single stock quote. Returns raw quote dict or None.
+
+    FIX-QUOTES-RESP: validates resp.json() is a dict and that the quotes
+    container is a dict before chaining .get() — Tradier can return HTTP 200
+    with {"quotes": "No Content"} or {"fault": {...}} which previously caused
+    a silent AttributeError swallowed by the bare except, masking auth/rate
+    issues as missing prices.
+    """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
     try:
         resp = await _client().get(url, headers=_headers(), params={"symbols": symbol, "greeks": "false"})
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quote(%s) HTTP %d — body: %s",
+                symbol, resp.status_code, resp.text[:300],
+            )
             return None
         data = resp.json()
-        quote = data.get("quotes", {}).get("quote")
+        if not isinstance(data, dict):
+            log.error(
+                "[tradier_client] get_quote(%s) unexpected response type %s — body: %s",
+                symbol, type(data).__name__, str(data)[:300],
+            )
+            return None
+        quotes_container = data.get("quotes", {})
+        if not isinstance(quotes_container, dict):
+            log.error(
+                "[tradier_client] get_quote(%s) quotes field is %s (expected dict) — "
+                "possible auth error or rate limit. Body: %s",
+                symbol, type(quotes_container).__name__, str(data)[:300],
+            )
+            return None
+        quote = quotes_container.get("quote")
         if isinstance(quote, list):
             quote = quote[0] if quote else None
         return quote
@@ -266,6 +307,14 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
     """
     Fetch quotes for up to 200 symbols in one call.
     Returns {symbol: quote_dict} mapping.
+
+    FIX-QUOTES-RESP: validates resp.json() is a dict and that the quotes
+    container is a dict before chaining .get() — Tradier can return HTTP 200
+    with {"quotes": "No Content"} (no matching symbols) or {"fault": {...}}
+    (auth error / sandbox-vs-production mismatch). Previously both cases
+    raised AttributeError on the string/dict .get("quote") call, which was
+    silently swallowed by the bare except and returned {}, triggering the
+    B-ZERO-PRICE fallback with no root-cause log entry.
     """
     if not symbols:
         return {}
@@ -276,9 +325,28 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
             params={"symbols": ",".join(symbols), "greeks": "false"}
         )
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quotes_batch HTTP %d for %d symbols — body: %s",
+                resp.status_code, len(symbols), resp.text[:300],
+            )
             return {}
         data = resp.json()
-        quotes_raw = data.get("quotes", {}).get("quote") or []
+        if not isinstance(data, dict):
+            log.error(
+                "[tradier_client] get_quotes_batch unexpected response type %s "
+                "for %d symbols — body: %s",
+                type(data).__name__, len(symbols), str(data)[:300],
+            )
+            return {}
+        quotes_container = data.get("quotes", {})
+        if not isinstance(quotes_container, dict):
+            log.error(
+                "[tradier_client] get_quotes_batch quotes field is %s (expected dict) "
+                "for %d symbols — possible auth error or empty result. Body: %s",
+                type(quotes_container).__name__, len(symbols), str(data)[:300],
+            )
+            return {}
+        quotes_raw = quotes_container.get("quote") or []
         if isinstance(quotes_raw, dict):
             quotes_raw = [quotes_raw]
         return {q["symbol"]: q for q in quotes_raw if "symbol" in q}
