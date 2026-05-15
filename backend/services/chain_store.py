@@ -131,6 +131,17 @@ FIX-FK-SNAPSHOT (2026-05-15):
        still respecting the semaphore cap. This isolates broken HTTP/2
        connections so a single ConnectionTerminated/GOAWAY cannot poison
        all concurrent batches through one shared client.
+
+FIX-SNAPSHOT-NOTNULL (2026-05-15):
+  options_universe_snapshots has two NOT NULL columns with no DB defaults:
+  `provider` (TEXT NOT NULL) and `source` (TEXT NOT NULL CHECK ...).
+  _ensure_snapshot_row was only sending {"id": snapshot_id}, which caused
+  Postgres 23502 (not-null constraint) on every cold-start persist.
+  Fix: upsert payload now includes provider='chain_store' and
+  source='cache' so the row satisfies all NOT NULL constraints. The
+  ON CONFLICT (id) DO NOTHING semantics ensure these sentinel values are
+  only written on first insert; if universe_store already created the row
+  with real provider/source values, this upsert is a no-op.
 """
 import asyncio
 import logging
@@ -284,16 +295,37 @@ def _client() -> Client:
 
 def _ensure_snapshot_row(snapshot_id: str) -> None:
     """
-    Use a FRESH client and PostgREST upsert semantics so duplicate parent-row
-    creation is a true DB-level no-op and broken shared clients cannot poison
-    the parent insert path.
+    Guarantee the parent options_universe_snapshots row exists before any
+    child options_chain_cache upserts fire.
 
-    This function is intentionally fail-fast: if the parent row cannot be
-    ensured, callers must stop before any child upserts run.
+    Uses a FRESH client (never the shared batch client) so a broken HTTP/2
+    connection cannot poison this call.
+
+    Uses PostgREST upsert with on_conflict="id" which maps to
+    INSERT ... ON CONFLICT (id) DO NOTHING at the DB level, making this
+    call fully idempotent across repeated save_chain() invocations.
+
+    The payload satisfies ALL NOT NULL columns that have no DB default:
+      - provider: sentinel value 'chain_store' (overwritten if
+        universe_store already created the row with a real provider).
+      - source:   sentinel value 'cache' (valid per the CHECK constraint
+        on source IN ('tradier_validated', 'seed_fallback', 'cache')).
+    All other NOT NULL columns (fetched_at, symbol_count, is_active,
+    refresh_reason, meta, created_at) have DB-level defaults and are
+    omitted from the payload so PostgREST applies those defaults.
+
+    This function is intentionally FAIL-FAST: any exception propagates to
+    save_chain() which returns False immediately, preventing child upserts
+    from firing against a missing parent and generating misleading 23503
+    FK violations.
     """
     sb = _client()
     sb.table(_SNAPSHOT_TABLE).upsert(
-        {"id": snapshot_id},
+        {
+            "id":       snapshot_id,
+            "provider": "chain_store",
+            "source":   "cache",
+        },
         on_conflict="id",
         returning="minimal",
     ).execute()
