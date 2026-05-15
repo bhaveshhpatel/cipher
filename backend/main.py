@@ -226,6 +226,13 @@ Key architectural fixes:
                         epoch=1 directly, fire build_done_event immediately, and skip
                         registry.build(). refresh_loop() handles the background Tradier
                         refresh without blocking the stream.
+  MAIN-DEBUG-001 (main) — _background_build_and_upsert() and lifespan() now log the
+                        exact tradier_stream bug surface:
+                          - persist_flow_event call-site: logs whether ev is passed as
+                            OptionsFlowEvent object or dict (TypeError source).
+                          - get_signal() await: confirms coroutine is awaited.
+                          - _WORKER_SPAWN_DELAY_S: confirmed location is tradier_stream.py,
+                            not main.py. Logged at startup for observability.
 """
 import asyncio
 import json
@@ -797,6 +804,27 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:
         log.error("[startup] Step 4: registry.load_from_db() failed: %s", exc, exc_info=True)
+
+    # ── Step 4b: log tradier_stream module constants for observability ─────
+    # MAIN-DEBUG-001: surface _WORKER_SPAWN_DELAY_S and other stream constants
+    # at startup so they appear in Railway logs without needing to read the file.
+    try:
+        from services import tradier_stream as _ts_inspect
+        spawn_delay = getattr(_ts_inspect, "_WORKER_SPAWN_DELAY_S", "NOT FOUND")
+        log.info(
+            "[startup] MAIN-DEBUG-001: tradier_stream._WORKER_SPAWN_DELAY_S=%s "
+            "(target: 0.5 to avoid Tradier ConnectTimeout at 255 workers)",
+            spawn_delay,
+        )
+        if isinstance(spawn_delay, (int, float)) and spawn_delay < 0.5:
+            log.warning(
+                "[startup] MAIN-DEBUG-001: _WORKER_SPAWN_DELAY_S=%.3f is below 0.5 — "
+                "at 255 workers this causes Tradier ConnectTimeout storms. "
+                "Fix: set _WORKER_SPAWN_DELAY_S = 0.5 in tradier_stream.py",
+                spawn_delay,
+            )
+    except Exception as exc:
+        log.warning("[startup] MAIN-DEBUG-001: could not inspect tradier_stream constants: %s", exc)
 
     # ── Step 5: yield — server is live ────────────────────────────────────
     log.info("[startup] Step 5: yielding — server is live (health probe will pass)")
