@@ -125,6 +125,9 @@ FIX-CHAIN-400 (2026-05-15): Distinguish HTTP 400 from other error codes in
   TimeoutError, CancelledError, and httpx internal errors surface their
   full type name rather than an empty string.
 
+FIX-BR-TAG (2026-05-15): Remove stray HTML <br> tag that was injected into
+  get_quotes_batch() causing IndentationError on startup.
+
 Public API:
   init_http_client()                         -> None  (call on startup)
   close_http_client()                        -> None  (call on shutdown)
@@ -342,7 +345,7 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
         return {}
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
     try:
-<br>        resp = await _client().get(
+        resp = await _client().get(
             url, headers=_headers(),
             params={"symbols": ",".join(symbols), "greeks": "false"}
         )
