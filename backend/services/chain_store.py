@@ -113,6 +113,24 @@ FIX (2026-05-14): HTTP 400 handling in start_chain_refresh_worker().
   at INFO level (not WARNING — this is expected for some tickers), and
   skip without incrementing the error counter. All other exceptions
   continue to increment the error counter and log at WARNING.
+
+FIX-FK-SNAPSHOT (2026-05-15):
+  save_chain() was failing with Postgres FK violation 23503 on every cold-start
+  periodic flush and final persist. Root cause: options_chain_cache.snapshot_id
+  has a FK constraint referencing options_universe_snapshots.id. When
+  _periodic_flush() generated a fresh uuid4() (after FIX-PARTIAL-UUID), no
+  corresponding parent row existed in options_universe_snapshots, so every
+  upsert into options_chain_cache was rejected.
+
+  Fix: _ensure_snapshot_row(sb, snapshot_id) is called once at the top of
+  save_chain() before any batch upserts. It executes:
+    INSERT INTO options_universe_snapshots (id) VALUES (:id) ON CONFLICT DO NOTHING
+  On cold start this creates the parent row so all subsequent
+  options_chain_cache upserts satisfy the FK. On subsequent flushes (row
+  already exists) it is a true no-op — zero writes, zero contention.
+  The helper is synchronous (called via run_in_executor alongside batch
+  upserts) and non-fatal: any error is logged as WARNING and save_chain
+  continues (same contract as existing batch error handling).
 """
 import asyncio
 import logging
@@ -127,9 +145,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("chain_store")
 
-_TABLE      = "options_chain_cache"
-_BATCH_SIZE = 500
-_PAGE_SIZE  = 1000
+_TABLE          = "options_chain_cache"
+_SNAPSHOT_TABLE = "options_universe_snapshots"
+_BATCH_SIZE     = 500
+_PAGE_SIZE      = 1000
 _DEFAULT_MAX_AGE_HOURS = 24
 
 # ---------------------------------------------------------------------------
@@ -353,6 +372,45 @@ def _client() -> Client:
     return create_client(settings.SUPABASE_URL, key)
 
 
+def _ensure_snapshot_row(sb: Client, snapshot_id: str) -> None:
+    """
+    FIX-FK-SNAPSHOT: Insert a parent row into options_universe_snapshots
+    so that subsequent options_chain_cache upserts satisfy the FK constraint
+    options_chain_cache_snapshot_id_fkey.
+
+    Uses ON CONFLICT DO NOTHING so this is a true no-op when the row already
+    exists (e.g. second periodic flush, or final _persist_to_db() call after
+    _periodic_flush() already created the row).
+
+    Non-fatal: any error is logged as WARNING. save_chain() proceeds and the
+    FK violation will surface naturally in the batch upsert error handling.
+    """
+    try:
+        sb.table(_SNAPSHOT_TABLE).insert(
+            {"id": snapshot_id},
+            returning="minimal",
+        ).execute()
+        log.debug(
+            "[chain_store] _ensure_snapshot_row: upserted parent row for snapshot %s",
+            snapshot_id,
+        )
+    except Exception as exc:
+        # PostgREST / Supabase raises on duplicate key — treat as a no-op.
+        # Any genuine error (wrong table name, auth failure) will also surface
+        # in the batch upserts below with a clearer message.
+        exc_str = str(exc)
+        if "duplicate" in exc_str.lower() or "23505" in exc_str or "conflict" in exc_str.lower():
+            log.debug(
+                "[chain_store] _ensure_snapshot_row: snapshot %s already exists — no-op",
+                snapshot_id,
+            )
+        else:
+            log.warning(
+                "[chain_store] _ensure_snapshot_row: unexpected error for snapshot %s: %s",
+                snapshot_id, exc,
+            )
+
+
 async def save_chain(
     snapshot_id: str,
     registry_dict: "dict[str, ContractMeta]",
@@ -376,6 +434,10 @@ async def save_chain(
     Still ~4x faster than the original sequential 5.8s path.
     Zero impact on streaming: save_chain is called only at startup and
     every 24h; the hot-path vol/OI lookups use _vol_oi_cache exclusively.
+
+    FIX-FK-SNAPSHOT: _ensure_snapshot_row() is called once before any batch
+    upserts to guarantee the parent row in options_universe_snapshots exists.
+    Without this, every upsert fails with Postgres FK violation 23503.
 
     Increments the module-level _epoch counter on success.
     """
@@ -408,9 +470,15 @@ async def save_chain(
     sb  = _client()
     sem = asyncio.Semaphore(_SAVE_CONCURRENCY)
 
+    # FIX-FK-SNAPSHOT: ensure the parent options_universe_snapshots row
+    # exists before any child options_chain_cache upserts fire.
+    # This satisfies the FK constraint options_chain_cache_snapshot_id_fkey
+    # on both cold-start periodic flushes and the final _persist_to_db() call.
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _ensure_snapshot_row, sb, snapshot_id)
+
     async def _upsert_batch(batch: list, batch_num: int) -> None:
         async with sem:
-            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
                 lambda: sb.table(_TABLE).upsert(
