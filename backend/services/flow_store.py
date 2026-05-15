@@ -620,7 +620,7 @@ async def _flush_flow_events():
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
 
 
-async def persist_flow_event(ev_dict: dict):
+async def persist_flow_event(ev_dict):
     global _flow_event_buffer
 
     if not _is_configured():
@@ -629,6 +629,10 @@ async def persist_flow_event(ev_dict: dict):
             "not set — event dropped. Set env vars to enable DB persistence."
         )
         return
+    # EV-OBJ-001: normalize OptionsFlowEvent → dict so .get() calls work
+    # regardless of whether caller passes a dataclass/object or a plain dict.
+    if not isinstance(ev_dict, dict):
+        ev_dict = vars(ev_dict)
 
     expiry = ev_dict.get("expiry") or None
     strike = ev_dict.get("strike")
