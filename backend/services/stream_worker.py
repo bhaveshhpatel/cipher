@@ -16,7 +16,8 @@ STREAM-3 (2026-04-28):
     API_ERROR    — any {"error":...} payload from Tradier with full context
     RECONNECT    — backoff duration, attempt count, session_ticks on last conn
     STALL        — logged when no tick received for >30s on an active stream
-    401          — token expired, _token_expired flag set, clean exit
+
+  Logging: 401 — token expired, _token_expired flag set, clean exit
 
 B-021: startup_delay_s for staggered startup (50ms × worker_id).
 B-008: global stats rollup via _global_stats().
@@ -31,6 +32,26 @@ STREAM-8 (2026-05-15):
   Fix: workers NEVER call get_session_token() independently. If
   _shared_token is missing, set _token_expired=True and return cleanly
   so the manager fetches a fresh token and respawns via STREAM-7.
+
+STREAM-9 (2026-05-15):
+  Connect-then-sleep probe pattern for market-closed periods.
+
+  Previously workers hit the market-closed gate and slept 300s immediately,
+  never attempting a Tradier connection. This meant connectivity failures
+  (Render/Railway egress blocks, stale session tokens, TLS issues) were only
+  discovered at market open — too late.
+
+  Fix: when market is closed, each worker now attempts a real probe
+  connection to Tradier (5s timeout) before sleeping. This surfaces
+  connectivity problems at deploy time.
+
+    PROBE_OK   — connection succeeded; market is closed; sleeping Xs
+    PROBE_FAIL — connection failed; logs repr(e); sleeps 60s then retries
+    401 probe  — stale token detected immediately; sets _token_expired so
+                 manager refreshes before market open
+
+  The market-closed gate is moved to AFTER the session-token check so token
+  validity is validated on every wake cycle regardless of market hours.
 """
 import asyncio
 import json
@@ -53,6 +74,7 @@ _MARKET_CLOSE = time(16, 0)
 
 _IDLE_TIMEOUT          = 30.0    # seconds before declaring stream stalled
 _CONNECT_TIMEOUT       = 15.0
+_PROBE_TIMEOUT_S       = 5.0    # STREAM-9: short timeout for market-closed probe
 _BACKOFF_BASE          = 1.0
 _BACKOFF_CAP           = 10.0
 _MARKET_CLOSED_SLEEP_S = 300.0
@@ -185,6 +207,58 @@ class StreamWorker:
         self._last_stats_at        = now_mono
 
     # ------------------------------------------------------------------
+    # STREAM-9: Probe connection (market-closed path)
+    # ------------------------------------------------------------------
+
+    async def _probe_connection(self, url: str, headers: dict, session_token: str) -> Optional[int]:
+        """
+        Attempt a real Tradier SSE connection with a short timeout.
+        Returns the HTTP status code on connect, or None on network error.
+
+        Used when market is closed so connectivity failures surface at
+        deploy time rather than silently at market open.
+        """
+        payload = {
+            "sessionid": session_token,
+            "symbols":   ",".join(self.symbols[:1]),  # 1 symbol is enough to test auth+routing
+            "filter":    "timesale",
+            "linebreak": "true",
+        }
+        try:
+            timeout = httpx.Timeout(
+                connect=_PROBE_TIMEOUT_S, read=_PROBE_TIMEOUT_S, write=5.0, pool=5.0
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", url, headers=headers, data=payload) as resp:
+                    status = resp.status_code
+                    if status == 200:
+                        # Attempt to read one line to confirm the stream opens
+                        try:
+                            async for _ in resp.aiter_lines():
+                                break  # got at least one line (may be empty keepalive)
+                        except Exception:
+                            pass  # EOF or timeout on read is fine — connect succeeded
+                    return status
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, asyncio.TimeoutError):
+            log.warning(
+                "[worker-%d] PROBE_FAIL | ConnectTimeout after %.0fs — Tradier unreachable?",
+                self.worker_id, _PROBE_TIMEOUT_S,
+            )
+            return None
+        except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
+            log.warning(
+                "[worker-%d] PROBE_FAIL | %s: %r",
+                self.worker_id, type(e).__name__, e,
+            )
+            return None
+        except Exception as e:
+            log.warning(
+                "[worker-%d] PROBE_FAIL | Unexpected: %r",
+                self.worker_id, e,
+            )
+            return None
+
+    # ------------------------------------------------------------------
     # Main run loop
     # ------------------------------------------------------------------
 
@@ -206,20 +280,9 @@ class StreamWorker:
 
         while self._running:
 
-            # ---- Market hours gate ----
-            if not _is_market_hours():
-                log.info(
-                    "[worker-%d] Market closed — sleeping %ds",
-                    self.worker_id, int(_MARKET_CLOSED_SLEEP_S),
-                )
-                await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
-                continue
-
-            # ---- Session token ----
-            # STREAM-8: Workers NEVER call get_session_token() independently.
-            # Doing so would POST /v1/markets/session and immediately invalidate
-            # the shared token held by all other workers, causing a 401 storm.
-            # If _shared_token is missing, signal the manager and exit cleanly.
+            # ---- Session token (STREAM-8) ----
+            # Check token BEFORE the market-hours gate so a stale token is
+            # detected even when market is closed (STREAM-9).
             session_token = self._shared_token
             if not session_token:
                 log.error(
@@ -232,6 +295,48 @@ class StreamWorker:
                 self._inc_global_error()
                 return  # manager detects _token_expired and respawns all workers
 
+            # ---- STREAM-9: Market-closed probe ----
+            # When market is closed, attempt a real probe connection before
+            # sleeping so connectivity failures surface at deploy time.
+            if not _is_market_hours():
+                status = await self._probe_connection(url, stream_headers, session_token)
+
+                if status == 200:
+                    log.info(
+                        "[worker-%d] PROBE_OK | Connected to Tradier SSE — market closed, sleeping %ds",
+                        self.worker_id, int(_MARKET_CLOSED_SLEEP_S),
+                    )
+                elif status == 401:
+                    log.warning(
+                        "[worker-%d] PROBE_FAIL | 401 Unauthorized — session token is stale. "
+                        "Signalling manager for token refresh.",
+                        self.worker_id,
+                    )
+                    self._token_expired = True
+                    self._errors += 1
+                    self._inc_global_error()
+                    return  # manager will refresh token and respawn
+                elif status is not None:
+                    # Other HTTP error (429, 400, 503 etc.)
+                    log.warning(
+                        "[worker-%d] PROBE_FAIL | HTTP %d — sleeping 60s before retry",
+                        self.worker_id, status,
+                    )
+                    self._errors += 1
+                    self._inc_global_error()
+                    await asyncio.sleep(60)
+                    continue
+                else:
+                    # None = network/connect error, already logged in _probe_connection
+                    self._errors += 1
+                    self._inc_global_error()
+                    await asyncio.sleep(60)
+                    continue
+
+                await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
+                continue
+
+            # ---- Live market path ----
             payload = {
                 "sessionid": session_token,
                 "symbols":   ",".join(self.symbols),
