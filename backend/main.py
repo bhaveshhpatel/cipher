@@ -150,6 +150,27 @@ Key architectural fixes:
                         fails, or the task is cancelled. An inner try/except still
                         catches build() failures and returns early (skipping upsert)
                         while preserving the outer finally guarantee.
+  PREWARM-RACE (main) — _registry_prewarm_loop() and _universe_refresh_loop() both
+                        called registry.build() directly with no guard on the initial
+                        build completing first.
+                        _registry_prewarm_loop(): if the process restarts between
+                        ~9:00-9:15 AM ET, sleep_secs is near-zero and prewarm fires
+                        immediately. It acquires _build_lock behind the still-running
+                        _background_build_and_upsert, then starts a second full build
+                        when the lock releases — now chain_refresh AND a second build
+                        are both hammering Tradier simultaneously.
+                        Fix: skip prewarm's registry.build() if registry.epoch == 0
+                        (initial build not yet complete). Prewarm is a daily warm-up
+                        for the *next* trading day's open, not a substitute for the
+                        startup build.
+                        _universe_refresh_loop(): called registry.build() directly
+                        inside its 24h refresh cycle with no guard. If the 24h timer
+                        fired near a restart, two build() calls queued on _build_lock
+                        producing identical contention. registry.refresh_loop() already
+                        handles periodic OCC rebuilds every 30 min; _universe_refresh_loop
+                        should not duplicate that path. Removed the direct build() call;
+                        OI data is read from the live registry (get_oi_map()) which
+                        is kept fresh by refresh_loop().
 """
 import asyncio
 import json
@@ -828,8 +849,29 @@ async def _background_build_and_upsert(
             )
 
 
-async def _universe_refresh_loop():
+async def _universe_refresh_loop(build_done_event: asyncio.Event) -> None:
+    """
+    24h universe refresh loop.
+
+    PREWARM-RACE fix: removed the direct registry.build() call from this loop.
+
+    Previously this loop called registry.build() directly to get fresh OI data.
+    If the 24h timer fired near a process restart, two build() calls would queue
+    on _build_lock — one from _background_build_and_upsert (startup) and one from
+    here — producing Tradier quota contention identical to the prewarm race.
+
+    registry.refresh_loop() already handles periodic OCC rebuilds (every 30 min
+    by default). This loop's responsibility is universe snapshot refresh only
+    (CBOE + Tradier symbol list + tier assignment). OI data is read from the
+    live registry via get_oi_map() which is kept current by refresh_loop().
+
+    The build_done_event ensures we never attempt to read OI from a registry
+    that hasn't completed its initial build.
+    """
     REFRESH_INTERVAL = 24 * 60 * 60
+    # Wait for the initial build to complete before the first OI read.
+    # This is a no-op on the first iteration since the 24h sleep runs first,
+    # but guards the extremely unlikely case of a very fast 24h clock wrap.
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         log.info("[universe] Background refresh starting")
@@ -843,15 +885,22 @@ async def _universe_refresh_loop():
                 if saved and quotes:
                     registry = get_registry()
                     if registry:
-                        log.info("[universe] Background refresh: rebuilding registry for OI roll-up")
-                        await registry.build()
-                        oi_map = registry.get_oi_map()
-                        _stamp_oi(quotes, oi_map)
-                        log.info(
-                            "[universe] Background refresh: OI stamped on %d quotes "
-                            "(%d tickers with oi>0)",
-                            len(quotes), sum(1 for v in oi_map.values() if v > 0),
-                        )
+                        # PREWARM-RACE fix: read OI from the live registry without
+                        # calling build() — refresh_loop() keeps it current.
+                        # Only read OI if the initial build has completed (epoch > 0).
+                        if build_done_event.is_set():
+                            oi_map = registry.get_oi_map()
+                            _stamp_oi(quotes, oi_map)
+                            log.info(
+                                "[universe] Background refresh: OI stamped on %d quotes "
+                                "(%d tickers with oi>0)",
+                                len(quotes), sum(1 for v in oi_map.values() if v > 0),
+                            )
+                        else:
+                            log.info(
+                                "[universe] Background refresh: initial build not yet complete "
+                                "— skipping OI stamp (quotes will have oi=0 this cycle)"
+                            )
                     tier_map = await assign_tiers(quotes)
                     await universe_store.upsert_symbol_quotes(quotes, tier_map)
 
@@ -883,7 +932,25 @@ async def _universe_refresh_loop():
 _PREWARM_TIME = time(9, 15)
 
 
-async def _registry_prewarm_loop() -> None:
+async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
+    """
+    Daily 9:15 AM ET registry pre-warm.
+
+    PREWARM-RACE fix: skip registry.build() if the initial startup build has
+    not yet completed (registry.epoch == 0 / build_done_event not set).
+
+    Root cause: if the process restarts between ~9:00-9:15 AM ET, sleep_secs
+    is near-zero and prewarm fires almost immediately after startup. It then
+    calls registry.build() concurrently with the still-running
+    _background_build_and_upsert. The _build_lock serializes them, but once
+    _background_build_and_upsert finishes and fires build_done_event, prewarm
+    acquires the lock and starts a SECOND full build — now chain_refresh AND
+    a second post-build upsert are both hammering Tradier simultaneously.
+
+    Fix: prewarm's build() is skipped if build_done_event is not yet set.
+    The initial _background_build_and_upsert already serves as the market-open
+    warm-up in this scenario. Prewarm resumes its normal role on subsequent days.
+    """
     while True:
         now = datetime.now(_ET)
 
@@ -916,6 +983,19 @@ async def _registry_prewarm_loop() -> None:
         # intraday volume never bleeds into early-morning flow events.
         invalidate_vol_oi_cache()
         log.info("[prewarm] vol/OI cache invalidated ahead of market open")
+
+        # PREWARM-RACE fix: skip build() if the startup build hasn't finished.
+        # This scenario occurs when the process restarts between ~9:00-9:15 AM ET
+        # and prewarm fires within seconds of startup. _background_build_and_upsert
+        # is already running (or just finished); a second build() here races it.
+        if not build_done_event.is_set():
+            log.info(
+                "[prewarm] PREWARM-RACE guard: initial build not yet complete "
+                "(build_done_event not set) — skipping redundant registry.build(). "
+                "_background_build_and_upsert serves as the market-open warm-up "
+                "for this boot cycle."
+            )
+            continue
 
         log.info("[prewarm] Building OCC registry ahead of market open...")
         try:
@@ -1001,16 +1081,21 @@ async def lifespan(app: FastAPI):
     # Passed into _background_build_and_upsert() (sets it) and
     # _chain_refresh_after_build() (awaits it). This is the strict
     # serialization barrier between the two Tradier fetch paths.
+    #
+    # PREWARM-RACE: also passed into _registry_prewarm_loop() and
+    # _universe_refresh_loop() so they can guard their own registry.build()
+    # calls (prewarm) or OI reads (universe refresh) behind initial build
+    # completion.
     _registry_build_done = asyncio.Event()
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
+    prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
     stream_task           = asyncio.create_task(
         stream_options_flow(stream_symbols, registry=registry)
     )
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
-    refresh_task          = asyncio.create_task(_universe_refresh_loop())
+    refresh_task          = asyncio.create_task(_universe_refresh_loop(_registry_build_done))
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols, _registry_build_done)
     )
