@@ -119,6 +119,18 @@ FIX EPOCH (2026-05-07):
   Added module-level _epoch counter incremented on every successful
   save_snapshot() call (both new-snapshot and reuse paths). Exposed via
   get_epoch() for parity assertions with gate_config_store.assert_epoch_parity().
+
+FIX VIX-CONSTRAINT (2026-05-15):
+  _sync_upsert_symbol_quotes now skips rows where both volume and
+  last_price are None. Index symbols like VIX are included in the raw
+  CBOE universe and pass through _fetch_batch_quotes() with null
+  price/volume because Tradier returns no quote data for pure indices.
+  The DB constraint chk_options_universe_symbols_no_index rejects such
+  rows, causing the entire 500-row batch to fail with APIError and abort
+  all subsequent batches silently (non-fatal catch swallows the error).
+  These symbols are never stream_eligible and are never inserted by
+  save_snapshot(), so skipping them in upsert is correct and safe.
+  A debug-level log line reports the skip count per call.
 """
 import asyncio
 import logging
@@ -235,6 +247,10 @@ async def upsert_symbol_quotes(
     before or after save_snapshot() — whichever order, the data will be consistent.
 
     Non-fatal: logs a warning and returns if no active snapshot exists yet.
+
+    VIX-CONSTRAINT: rows with both volume=None and last_price=None are
+    silently skipped — they are index symbols (VIX, etc.) that have no row
+    in options_universe_symbols and would violate the DB check constraint.
     """
     if not quotes:
         return
@@ -594,6 +610,14 @@ def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
     TL;DR: build() raw_quotes never set stream_eligible (defaults False),
     so including it here would silently wipe True → False on every warm restart.
     stream_eligible is owned exclusively by _sync_save_snapshot().
+
+    VIX-CONSTRAINT (2026-05-15):
+    Rows where both volume and last_price are None are skipped entirely.
+    These are index symbols (VIX, VVIX, etc.) that Tradier returns no
+    quote data for. They are never stream_eligible and are never inserted
+    by save_snapshot(), so the ON CONFLICT target row does not exist —
+    the upsert would attempt an INSERT which violates
+    chk_options_universe_symbols_no_index, aborting the entire batch.
     """
     try:
         sb = _client()
@@ -615,9 +639,30 @@ def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
             return
 
         snapshot_id = rows[0]["id"]
+
+        # VIX-CONSTRAINT: skip symbols with no price AND no volume data.
+        # These are pure indices (VIX, VVIX, etc.) — they have no row in
+        # options_universe_symbols (save_snapshot never inserted them) so
+        # the upsert would become an INSERT which violates the DB constraint.
+        filtered_quotes = [
+            q for q in quotes
+            if not (q.last_price is None and q.volume is None)
+        ]
+        skipped = len(quotes) - len(filtered_quotes)
+        if skipped:
+            log.debug(
+                "upsert_symbol_quotes: skipped %d symbols with null price+volume "
+                "(index symbols — VIX etc.) out of %d total",
+                skipped, len(quotes),
+            )
+
+        if not filtered_quotes:
+            log.warning("upsert_symbol_quotes: no valid quotes to upsert after filtering")
+            return
+
         log.info(
             "upsert_symbol_quotes: upserting %d symbol quotes into snapshot %s",
-            len(quotes), snapshot_id,
+            len(filtered_quotes), snapshot_id,
         )
 
         upsert_rows = [
@@ -631,7 +676,7 @@ def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
                 "tier":           tier_map.get(q.symbol, 3),
                 # stream_eligible intentionally omitted — owned by _sync_save_snapshot
             }
-            for q in quotes
+            for q in filtered_quotes
         ]
 
         total_batches = (len(upsert_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
