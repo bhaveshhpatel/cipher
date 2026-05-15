@@ -24,6 +24,9 @@ GET /stats  (unauthenticated)
 
 Auth: Bearer token required for /api/health/stream.
       /stats is intentionally unauthenticated — internal ops use only.
+
+HEALTH-ROOT: GET / added as an alias for /health so Render's default
+  health-check probe (which hits the root path) returns 200 instead of 404.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -111,5 +114,18 @@ def health_probe() -> dict:
     loop. As a plain `def` endpoint FastAPI runs it in a threadpool executor,
     so it is never queued behind connection-storm coroutines during startup or
     reconnect bursts. No awaits, no I/O, no dependencies.
+    """
+    return {"status": "ok"}
+
+
+@router.get("/", include_in_schema=False)
+def root_probe() -> dict:
+    """
+    HEALTH-ROOT: Render's default health-check probe hits GET / (root path).
+    Without this route the probe gets a 404, marking the deploy as unhealthy
+    even when the server is fully operational.
+
+    Identical behaviour to /health — sync def, threadpool-safe, zero I/O.
+    Both routes stay out of the OpenAPI docs (include_in_schema=False).
     """
     return {"status": "ok"}
