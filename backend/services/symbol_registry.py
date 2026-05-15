@@ -479,6 +479,35 @@ class SymbolRegistry:
                 if t in set(tickers_to_carry)
             }
 
+            # FIX-STALE-DTE: carried contracts have DTE values from the previous
+            # build. DTE decrements by 1 per day; a contract with DTE=45 yesterday
+            # has DTE=44 today. Without this fix, tier routing and the DTE gate
+            # use a value that is always ≥1 day stale, which silently mis-slots
+            # contracts approaching DTE thresholds (e.g. DTE=1 → carried as DTE=1
+            # instead of being evicted as DTE=0). Recompute from date.today() and
+            # evict contracts that have now expired (DTE < 0).
+            if tickers_to_carry:
+                today_date = date.today()
+                stale_occ = []
+                for occ, meta in new_registry.items():
+                    try:
+                        exp_date = date.fromisoformat(meta.expiry)
+                        fresh_dte = (exp_date - today_date).days
+                        if fresh_dte < 0:
+                            stale_occ.append(occ)
+                        else:
+                            meta.dte = fresh_dte
+                    except (ValueError, AttributeError):
+                        stale_occ.append(occ)
+                for occ in stale_occ:
+                    del new_registry[occ]
+                if stale_occ:
+                    log.info(
+                        "[symbol_registry] FIX-STALE-DTE: evicted %d now-expired "
+                        "carried contracts; %d remain",
+                        len(stale_occ), len(new_registry),
+                    )
+
             # BUILD-HANG: hard 45s timeout on _fetch_stock_prices().
             zero_price_fallback = False
             raw_quotes: dict[str, dict] = {}
@@ -513,16 +542,30 @@ class SymbolRegistry:
                 total_tickers = len(tickers_to_refresh)
                 # Shared mutable state for progress tracking across concurrent tasks.
                 # Lists used so nested closures can mutate via index (nonlocal alternative).
-                _completed = [0]
+                _completed   = [0]
                 _chain_start = time.monotonic()
+                # BUILD-METRICS: structured counters for post-build summary log.
+                # These replace invisible per-ticker warnings with a single summary
+                # that makes degraded builds immediately diagnosable.
+                _metric_429s        = [0]   # 429 responses received
+                _metric_timeouts    = [0]   # per-ticker hard timeout hits
+                _metric_zero_chain  = [0]   # tickers returning 0 contracts
+                _metric_errors      = [0]   # other fetch errors
 
                 # ------------------------------------------------------------------
                 # FLUSH-PERIODIC: background task that snapshots new_registry every
                 # _CHAIN_FLUSH_INTERVAL_S seconds and calls save_chain() so contracts
                 # start appearing in DB well before the full build completes.
+                #
+                # FIX-FLUSH-DELTA: previously did dict(new_registry) — a full
+                # shallow copy of up to 50K items every 30s while 50 concurrent
+                # coroutines were writing to it. Now tracks the last-flushed
+                # registry size and only triggers a flush when new contracts have
+                # been added, avoiding redundant full-registry copies.
                 # Errors are best-effort — never propagated to the gather.
                 # ------------------------------------------------------------------
                 _flush_stop = asyncio.Event()
+                _last_flush_size = [0]
 
                 async def _periodic_flush(snapshot_id: str) -> None:
                     from services.chain_store import save_chain as _save_chain
@@ -539,12 +582,22 @@ class SymbolRegistry:
                             pass  # interval elapsed — do a flush
                         if _flush_stop.is_set():
                             break
+                        current_size = len(new_registry)
+                        if current_size <= _last_flush_size[0]:
+                            # No new contracts since last flush — skip the copy.
+                            log.debug(
+                                "[symbol_registry] FLUSH-PERIODIC: no new contracts "
+                                "since last flush (%d), skipping",
+                                current_size,
+                            )
+                            continue
                         flush_num += 1
                         snapshot = dict(new_registry)
                         if not snapshot:
                             continue
                         try:
                             ok = await _save_chain(snapshot_id, snapshot)
+                            _last_flush_size[0] = len(snapshot)
                             log.info(
                                 "[symbol_registry] FLUSH-PERIODIC #%d: flushed %d contracts "
                                 "to DB mid-build (%d/%d tickers done, ok=%s)",
@@ -613,6 +666,7 @@ class SymbolRegistry:
                             )
 
                             ticker_price = prices.get(ticker, 0.0)
+                            contracts_before = len(new_registry)
                             await self._build_ticker(
                                 ticker,
                                 ticker_price,
@@ -620,13 +674,16 @@ class SymbolRegistry:
                                 new_oi_by_ticker,
                                 tier_params,
                                 zero_price_fallback=zero_price_fallback,
+                                metric_429s=_metric_429s,
+                                metric_timeouts=_metric_timeouts,
+                                metric_zero_chain=_metric_zero_chain,
+                                metric_errors=_metric_errors,
                             )
 
                             t_elapsed_ms = (time.monotonic() - t_start) * 1000
-                            # Count contracts written for this ticker
-                            ticker_contracts = sum(
-                                1 for m in new_registry.values() if m.ticker == ticker
-                            )
+                            # FIX-QUADRATIC: count contracts added by THIS ticker
+                            # using the size delta — O(1) instead of O(registry).
+                            ticker_contracts = len(new_registry) - contracts_before
 
                             # LOG-CHAIN-V2 DONE: elapsed + contracts for this ticker.
                             log.debug(
@@ -697,6 +754,23 @@ class SymbolRegistry:
                             await asyncio.wait_for(flush_task, timeout=5.0)
                         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                             flush_task.cancel()
+
+                # BUILD-METRICS: emit structured summary so degraded builds are
+                # immediately diagnosable without reading per-ticker warning logs.
+                build_elapsed = time.monotonic() - _chain_start
+                log.info(
+                    "[symbol_registry] BUILD-METRICS: tickers=%d contracts=%d "
+                    "elapsed=%.1fs rate=%.1f/s | 429s=%d timeouts=%d "
+                    "zero_chain=%d errors=%d",
+                    total_tickers,
+                    len(new_registry),
+                    build_elapsed,
+                    total_tickers / build_elapsed if build_elapsed > 0 else 0,
+                    _metric_429s[0],
+                    _metric_timeouts[0],
+                    _metric_zero_chain[0],
+                    _metric_errors[0],
+                )
 
             synthetic_quotes = []
             for ticker in self._watchlist:
@@ -860,6 +934,10 @@ class SymbolRegistry:
         oi_by_ticker:        dict[str, int],
         tier_params:         dict[int, _TierParams],
         zero_price_fallback: bool = False,
+        metric_429s:         Optional[list] = None,
+        metric_timeouts:     Optional[list] = None,
+        metric_zero_chain:   Optional[list] = None,
+        metric_errors:       Optional[list] = None,
     ):
         """
         CHAIN-ALL: Build OCC contracts for a single ticker using ONE Tradier
@@ -907,30 +985,41 @@ class SymbolRegistry:
             atm_high = float("inf")
 
         # CHAIN-ALL: single call fetching all expiries in one response.
-        # Two-stage wait_for: warn at _CHAIN_STALL_WARN_S, hard deadline at
-        # _CHAIN_REQUEST_TIMEOUT_S.
+        #
+        # FIX-DOUBLE-CALL: The previous two-stage wait_for pattern was buggy.
+        # When Stage 1 timed out, asyncio cancelled that coroutine and Stage 2
+        # called get_option_chain_bulk_all() again — a brand new HTTP request.
+        # On degraded Tradier days (many tickers > 10s) this doubled API call
+        # count (~3,900 → ~7,800), explaining the clean/degraded timing cliff.
+        #
+        # Fix: wrap in ensure_future so we hold a Task handle. Stage 1 wraps
+        # with asyncio.shield so a timeout cancels only the shield wrapper,
+        # leaving the underlying Task (and its HTTP connection) alive. Stage 2
+        # awaits the same Task — no new HTTP request is created.
         contracts_all = None
+        fetch_task = asyncio.ensure_future(get_option_chain_bulk_all(ticker))
         try:
             contracts_all = await asyncio.wait_for(
-                get_option_chain_bulk_all(ticker),
+                asyncio.shield(fetch_task),
                 timeout=_CHAIN_STALL_WARN_S,
             )
         except asyncio.TimeoutError:
-            # Stage 1 fired — log stall warning, then give remaining budget.
+            # Stage 1 fired — the HTTP request is STILL IN-FLIGHT on fetch_task.
             log.warning(
                 "[symbol_registry] %s: all-expiry chain fetch stalled >%.0fs "
-                "— still waiting (hard timeout=%.0fs)",
+                "— still waiting on same request (hard timeout=%.0fs)",
                 ticker,
                 _CHAIN_STALL_WARN_S,
                 _CHAIN_REQUEST_TIMEOUT_S,
             )
             remaining = _CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S
             try:
-                contracts_all = await asyncio.wait_for(
-                    get_option_chain_bulk_all(ticker),
-                    timeout=remaining,
-                )
+                # Await the SAME task — zero new API calls.
+                contracts_all = await asyncio.wait_for(fetch_task, timeout=remaining)
             except asyncio.TimeoutError:
+                fetch_task.cancel()
+                if metric_timeouts is not None:
+                    metric_timeouts[0] += 1
                 log.warning(
                     "[symbol_registry] %s: all-expiry chain fetch timed out after "
                     "%.0fs total — skipping ticker",
@@ -938,12 +1027,18 @@ class SymbolRegistry:
                 )
                 return
             except Exception as e:
+                fetch_task.cancel()
+                if metric_errors is not None:
+                    metric_errors[0] += 1
                 log.warning(
                     "[symbol_registry] %s: all-expiry chain fetch failed (stage 2): %s",
                     ticker, e,
                 )
                 return
         except Exception as e:
+            fetch_task.cancel()
+            if metric_errors is not None:
+                metric_errors[0] += 1
             log.warning(
                 "[symbol_registry] %s: all-expiry chain fetch failed: %s",
                 ticker, e,
@@ -952,6 +1047,8 @@ class SymbolRegistry:
 
         if not contracts_all:
             # HTTP 400 (no listed options) or genuinely empty — skip silently.
+            if metric_zero_chain is not None:
+                metric_zero_chain[0] += 1
             log.debug("[symbol_registry] %s: no contracts returned — skipping", ticker)
             return
 
@@ -967,7 +1064,15 @@ class SymbolRegistry:
             if exp:
                 expiry_groups.setdefault(exp, []).append(c)
 
+        # FIX-QUADRATIC: accumulate OI and contract count inline as we write
+        # contracts, rather than scanning the entire registry afterward.
+        # Old: O(total_contracts) registry scan per ticker = O(n*m) overall.
+        # With 3,900 tickers and ~50K contracts the later tickers each triggered
+        # a 50K-item scan while holding a semaphore slot.
         total_added = 0
+        running_oi_sum: int = 0
+        running_oi_count: int = 0
+
         for expiry_str, contracts in expiry_groups.items():
             try:
                 exp_date = date.fromisoformat(expiry_str)
@@ -1005,6 +1110,9 @@ class SymbolRegistry:
                         tier          = self._tier_map.get(ticker, 3),
                     )
                     contracts_added += 1
+                    # Accumulate OI inline — no registry scan needed later.
+                    running_oi_sum += oi
+                    running_oi_count += 1
                 except Exception as inner_exc:
                     log.debug(
                         "[symbol_registry] %s: contract parse error: %s",
@@ -1029,14 +1137,9 @@ class SymbolRegistry:
             len(contracts_all), params.max_dte,
         )
 
-        total_oi = sum(
-            meta.open_interest
-            for meta in registry.values()
-            if meta.ticker == ticker
-        )
-        count = sum(1 for m in registry.values() if m.ticker == ticker)
-        if count > 0:
-            oi_by_ticker[ticker] = round(total_oi / count)
+        # Write OI average using inline accumulators — O(1), not O(registry).
+        if running_oi_count > 0:
+            oi_by_ticker[ticker] = round(running_oi_sum / running_oi_count)
 
 
 # ---------------------------------------------------------------------------

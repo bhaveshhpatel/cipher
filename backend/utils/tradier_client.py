@@ -40,7 +40,12 @@ POOL-MISMATCH fix (2026-05-14):
     _READ_TIMEOUT:    20.0 → 25.0  (must exceed _CHAIN_REQUEST_TIMEOUT_S=30s budget)
   Companion fix in symbol_registry.py: _CHAIN_REQUEST_TIMEOUT_S 15 → 30s.
 
-B-022 — Global Session Token Semaphore:
+FIX-RETRY-POOL (fix/build-perf-bugs):
+  429 retry in get_option_chain_bulk() and get_option_chain_bulk_all() previously
+  spawned a fresh httpx.AsyncClient per retry, bypassing max_connections=75.
+  Under load (40+ simultaneous 429s) this created uncapped ephemeral connections.
+  Both retry paths now reuse _client() (the shared pool).
+
   _SESSION_SEM = asyncio.Semaphore(3) wraps get_session_token() / get_token().
 
 B-023 — Explicit 429 Handling:
@@ -349,9 +354,10 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
                 params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
             )
             if resp.status_code == 429:
-                # Back off and retry once — don't crash the whole build.
-                # Use an ephemeral client for the retry to avoid polluting the
-                # shared pool with a connection that may be in a bad state.
+                # Back off and retry once using the SHARED pool (not an ephemeral
+                # client). FIX-RETRY-POOL: the previous pattern spun up a fresh
+                # httpx.AsyncClient for each 429 retry, bypassing max_connections=75
+                # and creating uncapped connections under load.
                 retry_after = float(
                     resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER_S)
                 )
@@ -361,11 +367,10 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
                     symbol, expiration, retry_after,
                 )
                 await asyncio.sleep(retry_after)
-                async with httpx.AsyncClient(timeout=_TIMEOUT) as retry_client:
-                    resp = await retry_client.get(
-                        url, headers=_headers(),
-                        params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
-                    )
+                resp = await _client().get(
+                    url, headers=_headers(),
+                    params={"symbol": symbol, "expiration": expiration, "greeks": "false"}
+                )
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -422,11 +427,11 @@ async def get_option_chain_bulk_all(symbol: str) -> list[dict]:
                     symbol, retry_after,
                 )
                 await asyncio.sleep(retry_after)
-                async with httpx.AsyncClient(timeout=_TIMEOUT) as retry_client:
-                    resp = await retry_client.get(
-                        url, headers=_headers(),
-                        params={"symbol": symbol, "greeks": "false"}
-                    )
+                # FIX-RETRY-POOL: retry through shared pool, not an ephemeral client.
+                resp = await _client().get(
+                    url, headers=_headers(),
+                    params={"symbol": symbol, "greeks": "false"}
+                )
             if resp.status_code == 400:
                 # Ticker has no listed options — expected for many watchlist
                 # symbols. Return [] silently; caller skips gracefully.
