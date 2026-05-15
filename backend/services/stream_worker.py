@@ -64,13 +64,26 @@ STREAM-10 (2026-05-15):
   Fix: guard probe behind `if self.worker_id == 0`. Workers 1-172 fall
   through to sleep(300s) immediately. Worker-0 probes once on behalf of
   all workers. Startup probe load: 173 connections → 1 connection.
+
+STREAM-11 (2026-05-15):
+  Smart market-open sleep — wake exactly at 9:30 ET, not flat 300s.
+
+  Flat sleep(300s) could leave workers asleep through market open. Worst
+  case: a worker spawned at 9:27 ET sleeps until 9:32 ET, missing the
+  first 5 minutes of flow data.
+
+  Fix: replace flat _MARKET_CLOSED_SLEEP_S with _seconds_until_market_open()
+  which calculates exact seconds to the next 9:30 ET open, capped at 300s
+  so overnight deploys don't sleep for hours in a single shot.
+
+  Worker-0 probe-fail path (60s retry sleep) is unaffected.
 """
 import asyncio
 import json
 import logging
 import random
 import time as _time
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -86,10 +99,10 @@ _MARKET_CLOSE = time(16, 0)
 
 _IDLE_TIMEOUT          = 30.0    # seconds before declaring stream stalled
 _CONNECT_TIMEOUT       = 15.0
-_PROBE_TIMEOUT_S       = 5.0    # STREAM-9: short timeout for market-closed probe
+_PROBE_TIMEOUT_S       = 5.0     # STREAM-9: short timeout for market-closed probe
 _BACKOFF_BASE          = 1.0
 _BACKOFF_CAP           = 10.0
-_MARKET_CLOSED_SLEEP_S = 300.0
+_MARKET_CLOSED_SLEEP_S = 300.0   # cap for _seconds_until_market_open()
 _STATS_INTERVAL_S      = 30.0    # per-worker STREAM_STATS log frequency
 _STALL_LOG_INTERVAL_S  = 30.0    # how often to log a STALL warning mid-stream
 
@@ -99,6 +112,38 @@ def _is_market_hours() -> bool:
     if now.weekday() >= 5:
         return False
     return _MARKET_OPEN <= now.time() < _MARKET_CLOSE
+
+
+def _seconds_until_market_open() -> float:
+    """
+    STREAM-11: Return seconds until the next 9:30 ET market open, capped at
+    _MARKET_CLOSED_SLEEP_S (300s).
+
+    Replaces the flat sleep(300s) in the market-closed gate so workers
+    wake up exactly at open rather than potentially sleeping through it.
+
+    Examples:
+      9:29:45 ET  →  15s   (wakes at open)
+      9:31:00 ET  →  300s  (already past open; next open is tomorrow)
+      3:00 AM ET  →  300s  (cap; converges on 9:30 after several cycles)
+      Saturday    →  300s  (cap; rolls to Monday 9:30)
+    """
+    now = datetime.now(_ET)
+
+    # Build today's open candidate
+    candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # If we're already at or past today's open (or it's a weekend), roll forward
+    if now.time() >= _MARKET_OPEN or now.weekday() >= 5:
+        days_ahead = 1
+        while (now + timedelta(days=days_ahead)).weekday() >= 5:  # skip Sat/Sun
+            days_ahead += 1
+        candidate = (now + timedelta(days=days_ahead)).replace(
+            hour=9, minute=30, second=0, microsecond=0
+        )
+
+    secs = (candidate - now).total_seconds()
+    return min(max(secs, 1.0), _MARKET_CLOSED_SLEEP_S)  # floor 1s, cap 300s
 
 
 def _backoff(attempt: int) -> float:
@@ -308,19 +353,18 @@ class StreamWorker:
                 self._inc_global_error()
                 return  # manager detects _token_expired and respawns all workers
 
-            # ---- Market-closed gate (STREAM-9 / STREAM-10) ----
+            # ---- Market-closed gate (STREAM-9 / STREAM-10 / STREAM-11) ----
             if not _is_market_hours():
                 # STREAM-10: Only worker-0 probes. Workers 1-N sleep immediately.
-                # Probing on all workers simultaneously (STREAM-9) caused 173
-                # concurrent outbound connections at startup, flooding the event
-                # loop and timing out Render's HTTP health check.
                 if self.worker_id == 0:
                     status = await self._probe_connection(url, stream_headers, session_token)
 
                     if status == 200:
+                        sleep_secs = _seconds_until_market_open()
                         log.info(
-                            "[worker-0] PROBE_OK | Connected to Tradier SSE — market closed, sleeping %ds",
-                            int(_MARKET_CLOSED_SLEEP_S),
+                            "[worker-0] PROBE_OK | Connected to Tradier SSE — "
+                            "market closed, sleeping %.0fs (until ~9:30 ET)",
+                            sleep_secs,
                         )
                     elif status == 401:
                         log.warning(
@@ -332,7 +376,7 @@ class StreamWorker:
                         self._inc_global_error()
                         return  # manager will refresh token and respawn
                     elif status is not None:
-                        # Other HTTP error (429, 400, 503 etc.)
+                        # Other HTTP error (429, 400, 503 etc.) — short retry, not smart sleep
                         log.warning(
                             "[worker-0] PROBE_FAIL | HTTP %d — sleeping 60s before retry",
                             status,
@@ -348,7 +392,14 @@ class StreamWorker:
                         await asyncio.sleep(60)
                         continue
 
-                await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
+                # STREAM-11: All workers (including worker-0 on PROBE_OK path) sleep
+                # until just before market open rather than a flat 300s.
+                sleep_secs = _seconds_until_market_open()
+                log.debug(
+                    "[worker-%d] Market closed — sleeping %.0fs (until ~9:30 ET)",
+                    self.worker_id, sleep_secs,
+                )
+                await asyncio.sleep(sleep_secs)
                 continue
 
             # ---- Live market path ----
