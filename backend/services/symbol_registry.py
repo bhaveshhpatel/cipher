@@ -225,6 +225,16 @@ CHAIN-ALL (2026-05-14): Switch _build_ticker to single all-expiry call.
     tradier_stream path — not symbol_registry).
   - Two-stage stall warning (10s/45s) carried over unchanged.
 
+REVERT-CHAIN-ALL (2026-05-15): Reverted _build_ticker from CHAIN-ALL back to
+  get_expirations() + per-expiry get_option_chain_bulk() loop.
+  Root cause: Tradier does NOT stamp expiration_date on individual contracts
+  when the expiration param is omitted from /v1/markets/options/chains.
+  The CHAIN-ALL response returns contracts without that field, so by_expiry
+  grouped everything under "" → date.fromisoformat("") raised ValueError →
+  every contract skipped → contracts={} for all tickers → zero DB flushes.
+  Imports reverted: get_option_chain_bulk_all removed; get_expirations and
+  get_option_chain_bulk restored.
+
 CONCURRENCY-10 (2026-05-14): Lower _DEFAULT_BUILD_CONCURRENCY from 50 → 10.
   Companion to tradier_client.py CONCURRENCY-10. Reduces Tradier API pressure
   and eliminates rate-limit-induced HTTP 400/429s that were preventing all
@@ -291,7 +301,7 @@ from typing import Optional
 from services.ingestion_config import get_config
 from services.tier_engine import _fetch_thresholds, assign_tiers
 from services.chain_store import load_chain
-from utils.tradier_client import get_option_chain_bulk_all, get_quotes_batch
+from utils.tradier_client import get_expirations, get_option_chain_bulk, get_quotes_batch
 
 log = logging.getLogger("symbol_registry")
 
@@ -309,9 +319,9 @@ _PRICES_FETCH_TIMEOUT_S = 45    # _fetch_stock_prices(): 3949 tickers x 200/batc
 # 3949 tickers completes in ~200-600s. 600s is the true last-resort ceiling.
 _CHAIN_GATHER_TIMEOUT_S = 600   # asyncio.gather(*tasks): full 3949-ticker universe
 
-# Per-request timeout for each individual get_option_chain_bulk_all() call.
+# Per-request timeout for each individual get_option_chain_bulk() call (per-expiry).
 # 45s gives genuine stall headroom on Render cold-start.
-# CHAIN-ALL: this now covers the single all-expiry call (previously per-expiry).
+# REVERT-CHAIN-ALL: applied per-expiry inside the get_expirations() loop.
 _CHAIN_REQUEST_TIMEOUT_S: float = 45.0   # was 30s
 
 # LOG-CHAIN-V2: stall warning threshold — log WARNING if a single ticker
@@ -536,8 +546,8 @@ class SymbolRegistry:
             # FIX-STALE-DTE: carried contracts have DTE values from the previous
             # build. DTE decrements by 1 per day; a contract with DTE=45 yesterday
             # has DTE=44 today. Without this fix, tier routing and the DTE gate
-            # use a value that is always ≥1 day stale, which silently mis-slots
-            # contracts approaching DTE thresholds (e.g. DTE=1 → carried as DTE=1
+            # use a value that is always >=1 day stale, which silently mis-slots
+            # contracts approaching DTE thresholds (e.g. DTE=1 -> carried as DTE=1
             # instead of being evicted as DTE=0). Recompute from date.today() and
             # evict contracts that have now expired (DTE < 0).
             if tickers_to_carry:
@@ -615,12 +625,15 @@ class SymbolRegistry:
                     Fetch all options contracts for one ticker and return the
                     subset that passes DTE / ATM / OI / type filters.
 
-                    CHAIN-ALL: single get_option_chain_bulk_all() call replaces
-                    the former get_expirations() + per-expiry chain fetch loop.
-                    Client-side grouping by expiration_date, then identical
-                    DTE / ATM / OI / type filters.
+                    REVERT-CHAIN-ALL (2026-05-15): Tradier does not stamp
+                    expiration_date on individual contracts when the expiration
+                    param is omitted.  The CHAIN-ALL optimisation silently
+                    returned 0 contracts for every ticker.  Reverted to the
+                    proven get_expirations() + per-expiry
+                    get_option_chain_bulk() loop.
 
-                    LOG-CHAIN-V2: two-stage stall warning (10s/45s).
+                    LOG-CHAIN-V2: two-stage stall warning (10s/45s) retained
+                    on each per-expiry fetch.
                     """
                     if stock_price <= 0 and not zero_price_fallback:
                         log.warning(
@@ -638,69 +651,93 @@ class SymbolRegistry:
                         atm_high = stock_price * (1 + params.atm_pct)
 
                     contracts: dict[str, ContractMeta] = {}
+                    today_date = date.today()
 
-                    # Two-stage stall warning: fire WARNING at _CHAIN_STALL_WARN_S,
-                    # then hard-cancel at _CHAIN_REQUEST_TIMEOUT_S.
-                    async def _fetch_with_stall_warning() -> list:
-                        try:
-                            return await asyncio.wait_for(
-                                get_option_chain_bulk_all(ticker),
-                                timeout=_CHAIN_STALL_WARN_S,
-                            )
-                        except asyncio.TimeoutError:
-                            log.warning(
-                                "[symbol_registry] _build_ticker: %s chain fetch "
-                                "exceeded %.0fs stall threshold — waiting up to %.0fs total",
-                                ticker, _CHAIN_STALL_WARN_S, _CHAIN_REQUEST_TIMEOUT_S,
-                            )
-                            # Give the remaining budget (hard timeout - stall warning)
-                            remaining = _CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S
-                            return await asyncio.wait_for(
-                                get_option_chain_bulk_all(ticker),
-                                timeout=max(remaining, 1.0),
-                            )
-
+                    # Step 1: fetch expiration dates for this ticker.
                     try:
-                        all_contracts = await asyncio.wait_for(
-                            _fetch_with_stall_warning(),
-                            timeout=_CHAIN_REQUEST_TIMEOUT_S,
+                        expirations = await asyncio.wait_for(
+                            get_expirations(ticker),
+                            timeout=_CHAIN_STALL_WARN_S,
                         )
                     except asyncio.TimeoutError:
                         log.warning(
-                            "[symbol_registry] _build_ticker: %s chain fetch timed out "
-                            "after %.0fs — skipping ticker",
-                            ticker, _CHAIN_REQUEST_TIMEOUT_S,
+                            "[symbol_registry] _build_ticker: %s get_expirations "
+                            "timed out after %.0fs — skipping",
+                            ticker, _CHAIN_STALL_WARN_S,
                         )
                         return {}
                     except Exception as exc:
-                        if "400" in str(exc) or "HTTP 400" in str(exc):
-                            # Tradier: 400 = ticker has no listed options.
-                            return {}
                         log.warning(
-                            "[symbol_registry] _build_ticker: %s chain fetch error: %s",
+                            "[symbol_registry] _build_ticker: %s get_expirations "
+                            "error: %s — skipping",
                             ticker, exc,
                         )
                         return {}
 
-                    if not all_contracts:
+                    if not expirations:
                         return {}
 
-                    today_date = date.today()
-
-                    # Group by expiration_date (CHAIN-ALL)
-                    by_expiry: dict[str, list] = {}
-                    for c in all_contracts:
-                        exp = c.get("expiration_date") or c.get("expiry", "")
-                        if exp:
-                            by_expiry.setdefault(exp, []).append(c)
-
-                    for exp_str, exp_contracts in by_expiry.items():
+                    # Step 2: filter expirations by DTE before fetching chains.
+                    valid_expiries: list[tuple[str, int]] = []
+                    for exp_str in expirations:
                         try:
                             exp_date = date.fromisoformat(exp_str)
                         except (ValueError, TypeError):
                             continue
                         dte = (exp_date - today_date).days
-                        if dte < 0 or dte > params.max_dte:
+                        if 0 <= dte <= params.max_dte:
+                            valid_expiries.append((exp_str, dte))
+
+                    if not valid_expiries:
+                        return {}
+
+                    # Step 3: per-expiry chain fetch with two-stage stall warning.
+                    for exp_str, dte in valid_expiries:
+
+                        async def _fetch_expiry_with_stall(exp: str = exp_str) -> list:
+                            try:
+                                return await asyncio.wait_for(
+                                    get_option_chain_bulk(ticker, exp),
+                                    timeout=_CHAIN_STALL_WARN_S,
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning(
+                                    "[symbol_registry] _build_ticker: %s/%s chain "
+                                    "fetch exceeded %.0fs stall threshold — retrying "
+                                    "with remaining %.0fs budget",
+                                    ticker, exp, _CHAIN_STALL_WARN_S,
+                                    _CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S,
+                                )
+                                remaining = _CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S
+                                return await asyncio.wait_for(
+                                    get_option_chain_bulk(ticker, exp),
+                                    timeout=max(remaining, 1.0),
+                                )
+
+                        try:
+                            exp_contracts = await asyncio.wait_for(
+                                _fetch_expiry_with_stall(),
+                                timeout=_CHAIN_REQUEST_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                "[symbol_registry] _build_ticker: %s/%s chain fetch "
+                                "timed out after %.0fs — skipping expiry",
+                                ticker, exp_str, _CHAIN_REQUEST_TIMEOUT_S,
+                            )
+                            continue
+                        except Exception as exc:
+                            if "400" in str(exc) or "HTTP 400" in str(exc):
+                                # 400 means no listed options at all — bail entire ticker
+                                return {}
+                            log.warning(
+                                "[symbol_registry] _build_ticker: %s/%s chain fetch "
+                                "error: %s — skipping expiry",
+                                ticker, exp_str, exc,
+                            )
+                            continue
+
+                        if not exp_contracts:
                             continue
 
                         count_this_expiry = 0
