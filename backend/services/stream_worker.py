@@ -41,9 +41,9 @@ STREAM-9 (2026-05-15):
   (Render/Railway egress blocks, stale session tokens, TLS issues) were only
   discovered at market open — too late.
 
-  Fix: when market is closed, each worker now attempts a real probe
-  connection to Tradier (5s timeout) before sleeping. This surfaces
-  connectivity problems at deploy time.
+  Fix: when market is closed, worker-0 attempts a real probe connection
+  to Tradier (5s timeout) before sleeping. Workers 1-N sleep immediately.
+  One probe is sufficient — same egress IP, same token, same network path.
 
     PROBE_OK   — connection succeeded; market is closed; sleeping Xs
     PROBE_FAIL — connection failed; logs repr(e); sleeps 60s then retries
@@ -52,6 +52,18 @@ STREAM-9 (2026-05-15):
 
   The market-closed gate is moved to AFTER the session-token check so token
   validity is validated on every wake cycle regardless of market hours.
+
+STREAM-10 (2026-05-15):
+  Fix health check timeout caused by STREAM-9.
+
+  STREAM-9 probed on ALL workers simultaneously at startup. 173 concurrent
+  outbound httpx streams flooded the event loop before the HTTP health
+  endpoint could respond, causing Render to time out the 5s health check
+  and mark the instance as failed (ddkv9).
+
+  Fix: guard probe behind `if self.worker_id == 0`. Workers 1-172 fall
+  through to sleep(300s) immediately. Worker-0 probes once on behalf of
+  all workers. Startup probe load: 173 connections → 1 connection.
 """
 import asyncio
 import json
@@ -207,7 +219,7 @@ class StreamWorker:
         self._last_stats_at        = now_mono
 
     # ------------------------------------------------------------------
-    # STREAM-9: Probe connection (market-closed path)
+    # STREAM-9: Probe connection (worker-0 only, market-closed path)
     # ------------------------------------------------------------------
 
     async def _probe_connection(self, url: str, headers: dict, session_token: str) -> Optional[int]:
@@ -215,8 +227,9 @@ class StreamWorker:
         Attempt a real Tradier SSE connection with a short timeout.
         Returns the HTTP status code on connect, or None on network error.
 
-        Used when market is closed so connectivity failures surface at
-        deploy time rather than silently at market open.
+        Only called by worker-0 (STREAM-10). One probe is sufficient to
+        confirm Tradier reachability for all workers — same egress IP,
+        same token, same network path.
         """
         payload = {
             "sessionid": session_token,
@@ -295,43 +308,45 @@ class StreamWorker:
                 self._inc_global_error()
                 return  # manager detects _token_expired and respawns all workers
 
-            # ---- STREAM-9: Market-closed probe ----
-            # When market is closed, attempt a real probe connection before
-            # sleeping so connectivity failures surface at deploy time.
+            # ---- Market-closed gate (STREAM-9 / STREAM-10) ----
             if not _is_market_hours():
-                status = await self._probe_connection(url, stream_headers, session_token)
+                # STREAM-10: Only worker-0 probes. Workers 1-N sleep immediately.
+                # Probing on all workers simultaneously (STREAM-9) caused 173
+                # concurrent outbound connections at startup, flooding the event
+                # loop and timing out Render's HTTP health check.
+                if self.worker_id == 0:
+                    status = await self._probe_connection(url, stream_headers, session_token)
 
-                if status == 200:
-                    log.info(
-                        "[worker-%d] PROBE_OK | Connected to Tradier SSE — market closed, sleeping %ds",
-                        self.worker_id, int(_MARKET_CLOSED_SLEEP_S),
-                    )
-                elif status == 401:
-                    log.warning(
-                        "[worker-%d] PROBE_FAIL | 401 Unauthorized — session token is stale. "
-                        "Signalling manager for token refresh.",
-                        self.worker_id,
-                    )
-                    self._token_expired = True
-                    self._errors += 1
-                    self._inc_global_error()
-                    return  # manager will refresh token and respawn
-                elif status is not None:
-                    # Other HTTP error (429, 400, 503 etc.)
-                    log.warning(
-                        "[worker-%d] PROBE_FAIL | HTTP %d — sleeping 60s before retry",
-                        self.worker_id, status,
-                    )
-                    self._errors += 1
-                    self._inc_global_error()
-                    await asyncio.sleep(60)
-                    continue
-                else:
-                    # None = network/connect error, already logged in _probe_connection
-                    self._errors += 1
-                    self._inc_global_error()
-                    await asyncio.sleep(60)
-                    continue
+                    if status == 200:
+                        log.info(
+                            "[worker-0] PROBE_OK | Connected to Tradier SSE — market closed, sleeping %ds",
+                            int(_MARKET_CLOSED_SLEEP_S),
+                        )
+                    elif status == 401:
+                        log.warning(
+                            "[worker-0] PROBE_FAIL | 401 Unauthorized — session token is stale. "
+                            "Signalling manager for token refresh.",
+                        )
+                        self._token_expired = True
+                        self._errors += 1
+                        self._inc_global_error()
+                        return  # manager will refresh token and respawn
+                    elif status is not None:
+                        # Other HTTP error (429, 400, 503 etc.)
+                        log.warning(
+                            "[worker-0] PROBE_FAIL | HTTP %d — sleeping 60s before retry",
+                            status,
+                        )
+                        self._errors += 1
+                        self._inc_global_error()
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        # None = network/connect error, already logged in _probe_connection
+                        self._errors += 1
+                        self._inc_global_error()
+                        await asyncio.sleep(60)
+                        continue
 
                 await asyncio.sleep(_MARKET_CLOSED_SLEEP_S)
                 continue
