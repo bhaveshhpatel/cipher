@@ -502,8 +502,8 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        stream_symbols = [s["symbol"] for s in fresh if s.get("stream_eligible", True)]
-        snapshot_id    = fresh[0].get("snapshot_id", "") if fresh else ""
+        stream_symbols = list(fresh)
+        snapshot_id    = ""
         return stream_symbols, tier_map, snapshot_id, False  # needs_refresh=False
 
     # Cache MISS — fall back to the most-recent stale snapshot as a seed.
@@ -515,8 +515,8 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             "background refresh will produce the authoritative list",
             len(stale),
         )
-        stale_symbols = [s["symbol"] for s in stale if s.get("stream_eligible", True)]
-        snapshot_id   = stale[0].get("snapshot_id", "") if stale else ""
+        stale_symbols = list(stale)
+        snapshot_id   = ""
         return stale_symbols, {}, snapshot_id, True  # needs_refresh=True
 
     log.warning(
