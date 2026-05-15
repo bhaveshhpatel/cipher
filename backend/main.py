@@ -355,24 +355,6 @@ def _is_market_hours() -> bool:
 # Returns [] on any error — one bad symbol must never abort the refresh cycle.
 # ---------------------------------------------------------------------------
 async def _fetch_tradier_chain(symbol: str) -> list:
-    """
-    ING-008: Fetch the current options chain for `symbol` from Tradier.
-
-    Used exclusively by start_chain_refresh_worker() as the fetch_chain_fn
-    callable.  Returns a flat list of option contract dicts.  On any
-    network or API error returns [] so the worker continues to the next
-    symbol without aborting the refresh cycle.
-
-    HOTFIX-CHAIN-HOURS: Returns [] immediately outside market hours
-    (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
-    are closed, so there is nothing useful to fetch.
-
-    API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
-    Each returned dict includes at minimum:
-      - "symbol"        : str  (21-char OCC symbol)
-      - "volume"        : int  (today's volume for this contract)
-      - "open_interest" : int
-    """
     # HOTFIX-CHAIN-HOURS: skip entirely outside market hours.
     if not _is_market_hours():
         log.debug("[chain_refresh] %s — skipped (market closed)", symbol)
