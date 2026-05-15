@@ -8,7 +8,7 @@ Startup sequence:
                                          MISS → seed with stale snapshot and schedule
                                          background refresh  [RENDER-STARTUP-HANG]
   3. init_registry()                   — in-memory init (instant)
-  4. registry.load_from_db()           — seed OCC chains from DB via P1 fallback
+  4. registry.load_from_db(snapshot_id) — seed OCC chains from DB via P1 fallback
   5. yield                             — SERVER IS LIVE, health probe passes (~6 s)
   6. Parallel background tasks launched:
      a. _background_build_and_upsert   — incremental/full OCC build (P4);
@@ -192,6 +192,29 @@ Key architectural fixes:
                         lifespan() passes [stream_task] and stream_symbols as the
                         wrappers. Shutdown reads stream_task_ref[0] so it always
                         cancels the active task regardless of replacement.
+  FIX-LOAD-FROM-DB-ARG (main) — Pass snapshot_id to registry.load_from_db() at Step 4.
+                        root cause: _resolve_startup_universe_fast() loads the fresh
+                        snapshot from universe_store but returned snapshot_id="" (empty
+                        string) instead of the real UUID. Step 4 called
+                        registry.load_from_db() with no args →
+                          TypeError: SymbolRegistry.load_from_db() missing 1 required
+                          positional argument: 'snapshot_id'
+                        Logged as ERROR and fell through silently. The registry started
+                        with 0 OCC contracts from DB, so every cold start triggered a
+                        full Tradier chain-pull (all 4122 tickers, ~5-8 min) with no
+                        incremental warm-start benefit — explaining the flood of
+                        per-ticker stall warnings in the logs.
+                        Fix: _resolve_startup_universe_fast() now surfaces the actual
+                        snapshot UUID from universe_store.load_fresh_snapshot() on HIT,
+                        and returns None on MISS. Step 4 passes this value to
+                        load_from_db(snapshot_id). None triggers the P1
+                        snapshot-agnostic fallback (loads the latest snapshot row
+                        regardless of UUID), so MISS boots still seed from DB correctly.
+                        After this fix the warm-start path works as designed:
+                        load_from_db() populates _registry with the persisted snapshot,
+                        build() sees a non-empty registry and runs incrementally
+                        (expired-DTE tickers only), dropping cold-start chain-pull
+                        time from ~5-8 min to ~50-400 tickers.
 """
 import asyncio
 import json
@@ -462,6 +485,7 @@ async def _chain_refresh_after_build(
 #
 #   _resolve_startup_universe_fast()  — DB reads only (<2 s), runs before yield.
 #     Returns (stream_symbols, tier_map, snapshot_id, needs_refresh).
+#     snapshot_id is the UUID of the loaded snapshot (str), or None on MISS.
 #     needs_refresh=True when no fresh snapshot exists; the caller must then
 #     schedule _background_universe_resolve() as a post-yield task.
 #
@@ -470,17 +494,20 @@ async def _chain_refresh_after_build(
 #     the live registry + accumulator without blocking the health probe.
 # ---------------------------------------------------------------------------
 
-async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], str, bool]:
+async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     """
     RENDER-STARTUP-HANG: DB-only startup universe resolution.
 
     Fast path (cache HIT — normal daily operation):
       Loads the fresh snapshot from DB (max_age=24h) and returns immediately.
+      snapshot_id is the UUID string of the loaded snapshot.
       needs_refresh=False — no background refresh is needed.
 
     Slow path (cache MISS — first deploy or snapshot >24 h old):
       Falls back to the most-recent stale snapshot as a minimal seed so the
       stream and registry start with something rather than an empty list.
+      snapshot_id=None — caller passes None to load_from_db() which triggers
+      the P1 snapshot-agnostic fallback (loads latest row in options_chain_cache).
       needs_refresh=True — caller must schedule _background_universe_resolve().
 
     No Tradier calls, no CBOE calls.  All DB I/O via universe_store.
@@ -488,11 +515,18 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
     """
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
 
+    # FIX-LOAD-FROM-DB-ARG: use load_fresh_snapshot_with_id() to get the actual
+    # UUID so we can pass it to registry.load_from_db(snapshot_id) at Step 4.
+    # Fallback: universe_store.load_fresh_snapshot() returns the symbol set only;
+    # we call get_latest_snapshot_id() to surface the UUID separately.
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
+        # Retrieve the snapshot UUID that was just confirmed fresh.
+        snapshot_id: Optional[str] = await universe_store.get_latest_snapshot_id()
         log.info(
-            "[universe] Step 2a HIT: loaded fresh universe from DB (%d symbols) — stream starting",
-            len(fresh),
+            "[universe] Step 2a HIT: loaded fresh universe from DB (%d symbols) "
+            "snapshot_id=%s — stream starting",
+            len(fresh), snapshot_id,
         )
         tier_map = await universe_store.load_tier_map()
         log.info(
@@ -503,7 +537,6 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             sum(1 for t in tier_map.values() if t == 3),
         )
         stream_symbols = list(fresh)
-        snapshot_id    = ""
         return stream_symbols, tier_map, snapshot_id, False  # needs_refresh=False
 
     # Cache MISS — fall back to the most-recent stale snapshot as a seed.
@@ -516,14 +549,14 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             len(stale),
         )
         stale_symbols = list(stale)
-        snapshot_id   = ""
-        return stale_symbols, {}, snapshot_id, True  # needs_refresh=True
+        # snapshot_id=None triggers P1 snapshot-agnostic fallback in load_from_db()
+        return stale_symbols, {}, None, True  # needs_refresh=True
 
     log.warning(
         "[universe] Step 2a: no snapshot in DB at all — "
         "starting with empty symbol list, background refresh will populate"
     )
-    return [], {}, "", True  # needs_refresh=True
+    return [], {}, None, True  # needs_refresh=True
 
 
 async def _background_universe_resolve(
@@ -906,9 +939,13 @@ async def lifespan(app: FastAPI):
         _sync_accumulator_tier_map(tier_map)  # ING-010-ACC
 
     # ── Step 4: seed OCC chains from DB ───────────────────────────────────
-    log.info("[startup] Step 4: seeding OCC chains from DB (P1 fallback)")
+    # FIX-LOAD-FROM-DB-ARG: pass snapshot_id (UUID str or None).
+    # On HIT: snapshot_id is the UUID of the fresh snapshot loaded in Step 2a.
+    # On MISS: snapshot_id is None → load_from_db() uses the P1
+    #   snapshot-agnostic fallback (loads the latest row in options_chain_cache).
+    log.info("[startup] Step 4: seeding OCC chains from DB (P1 fallback, snapshot_id=%s)", snapshot_id)
     try:
-        await registry.load_from_db()
+        await registry.load_from_db(snapshot_id)
         log.info(
             "[startup] Step 4: DB seed complete — %d contracts loaded",
             len(registry._registry) if hasattr(registry, "_registry") else 0,
