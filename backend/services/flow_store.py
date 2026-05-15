@@ -620,7 +620,53 @@ async def _flush_flow_events():
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
 
 
-async def persist_flow_event(ev_dict: dict):
+def _compute_episode_steamroom_score(
+    ask_side_pct: Optional[float],
+    vol_oi_signal: Optional[bool],
+    total_premium: float,
+    dte_bucket: Optional[str],
+    trade_count: int,
+    min_trade_count: int = 3,
+) -> int:
+    """
+    REARCH-004: Compute the 5-dimension Steamroom conviction score for an episode.
+    Range: 0–5.  1 point each for:
+      Dim 1 — ask-side majority  : ask_side_pct is not None and >= 0.5
+      Dim 2 — vol > OI           : vol_oi_signal is True
+      Dim 3 — premium >= NOTEWORTHY ($50k): total_premium >= 50_000
+      Dim 4 — near-term expiry   : dte_bucket in ('0DTE', '1-4', '5-60')
+      Dim 5 — confirmed activity : trade_count >= min_trade_count
+    None-safe — any missing input simply contributes 0.
+    """
+    score = 0
+    if ask_side_pct is not None and ask_side_pct >= 0.5:
+        score += 1
+    if vol_oi_signal is True:
+        score += 1
+    if (total_premium or 0) >= 50_000:
+        score += 1
+    if (dte_bucket or "") in ("0DTE", "1-4", "5-60"):
+        score += 1
+    if trade_count >= min_trade_count:
+        score += 1
+    return score
+
+
+async def persist_flow_event(ev) -> None:
+    """
+    Persist a single OptionsFlowEvent (or legacy dict) to flow_events via the
+    in-process buffer → batch flush loop.
+
+    FIX-PERSIST-TYPE (fix/ingestion-persist-correctness):
+      Previously accepted only `ev_dict: dict` but was called from
+      _process_trade() with an OptionsFlowEvent dataclass.  Every .get() call
+      on the dataclass raised AttributeError, which _persist_done_cb caught and
+      counted silently — zero rows ever reached flow_events from the hot path.
+
+      Fix: normalise the input via a local _g() accessor that works for both
+      dict (uses .get) and dataclass (uses getattr).  The row dict built from
+      _g() is pure Python scalars — safe to JSON-serialise downstream.
+    """
     global _flow_event_buffer
 
     if not _is_configured():
@@ -630,13 +676,18 @@ async def persist_flow_event(ev_dict: dict):
         )
         return
 
-    expiry = ev_dict.get("expiry") or None
-    strike = ev_dict.get("strike")
-    if strike is None:
-        strike = None
+    # FIX-PERSIST-TYPE: normalise dict vs OptionsFlowEvent dataclass.
+    if isinstance(ev, dict):
+        _g = ev.get
+    else:
+        def _g(key, default=None):
+            return getattr(ev, key, default)
 
-    ticker     = ev_dict.get("ticker", "UNKNOWN")
-    occ_symbol = ev_dict.get("occ_symbol")
+    expiry = _g("expiry") or None
+    strike = _g("strike")
+
+    ticker     = _g("ticker", "UNKNOWN")
+    occ_symbol = _g("occ_symbol") or _g("id")  # occ_symbol preferred; id fallback for legacy dicts
 
     if not expiry:
         log.warning(f"[flow_store] {ticker}: expiry is empty -- OCC parse may have failed")
@@ -653,14 +704,14 @@ async def persist_flow_event(ev_dict: dict):
             pass
 
     # REARCH-003: compute quality dimension tags.
-    fill_price       = ev_dict.get("fill_price", 0.0) or 0.0
-    bid              = ev_dict.get("bid", 0.0) or 0.0
-    ask              = ev_dict.get("ask", 0.0) or 0.0
-    underlying_price = ev_dict.get("underlying_price", 0.0) or 0.0
-    premium          = ev_dict.get("premium", 0.0) or 0.0
-    dte              = ev_dict.get("dte")
+    fill_price       = _g("fill_price", 0.0) or 0.0
+    bid              = _g("bid", 0.0) or 0.0
+    ask              = _g("ask", 0.0) or 0.0
+    underlying_price = _g("underlying_price", 0.0) or 0.0
+    premium          = _g("premium", 0.0) or 0.0
+    dte              = _g("dte")
 
-    open_interest = ev_dict.get("open_interest") or None
+    open_interest = _g("open_interest") or None
 
     # PBE-1: classify_bid_ask() returns Tuple[str, bool] — unpack directly.
     bid_ask_cls, is_ask_side = classify_bid_ask(fill_price, bid, ask)
@@ -676,29 +727,57 @@ async def persist_flow_event(ev_dict: dict):
     dte_bucket    = _compute_dte_bucket(dte)
     notional_tier = _compute_notional_tier(premium)
 
+    # Execution mechanic: derive from bid_ask_class and is_aggressive for
+    # columns added in migration 012 that have NOT NULL defaults.
+    # We write the correct derived value rather than relying solely on the DB default.
+    trade_type = _g("trade_type", "UNKNOWN") or "UNKNOWN"
+    is_agg     = bool(_g("is_aggressive", False))
+    _bac       = bid_ask_cls  # already resolved above
+    if _bac == "ASK" and is_agg:
+        execution_mechanic = "AGGRESSIVE_BUY"
+    elif _bac == "BID" and is_agg:
+        execution_mechanic = "AGGRESSIVE_SELL"
+    elif _bac == "ASK":
+        execution_mechanic = "PASSIVE_BUY"
+    elif _bac == "BID":
+        execution_mechanic = "PASSIVE_SELL"
+    else:
+        execution_mechanic = "AMBIGUOUS_LONG"
+
+    sentiment = _g("sentiment", "NEUTRAL") or "NEUTRAL"
+    # strong_sentiment: True when ask-side aggressive on a non-synthetic quote
+    strong_sentiment = bool(
+        is_ask_side and is_agg and not bool(_g("is_synthetic_quote", False))
+    )
+
+    global _flow_event_buffer
     row = {
         "ticker":                   ticker,
-        "contract_type":            ev_dict.get("contract_type"),
+        "contract_type":            _g("contract_type"),
         "strike":                   strike,
         "expiry":                   expiry,
-        "dte":                      ev_dict.get("dte", 0),
+        "dte":                      _g("dte", 0),
         "fill_price":               fill_price,
         "bid":                      bid,
         "ask":                      ask,
-        "size":                     ev_dict.get("size", 0),
+        "size":                     _g("size", 0),
         "premium":                  premium,
-        "trade_type":               ev_dict.get("trade_type", "UNKNOWN"),
+        "trade_type":               trade_type,
         "bid_ask_class":            bid_ask_cls,
         "is_ask_side":              is_ask_side,
-        "is_aggressive":            ev_dict.get("is_aggressive", False),
-        "sentiment":                ev_dict.get("sentiment", "NEUTRAL"),
-        "exchange_count":           ev_dict.get("exchange_count", 1),
-        "fill_count":               ev_dict.get("fill_count", 1),
-        "open_interest":            ev_dict.get("open_interest", 0),
-        "iv":                       ev_dict.get("iv", 0.0),
+        "is_aggressive":            is_agg,
+        "sentiment":                sentiment,
+        "order_side":               _g("order_side", "UNKNOWN") or "UNKNOWN",
+        "strong_sentiment":         strong_sentiment,
+        "execution_mechanic":       execution_mechanic,
+        "exchange_count":           _g("exchange_count", 1),
+        "fill_count":               _g("fill_count", 1),
+        "open_interest":            _g("open_interest", 0),
+        "iv":                       _g("iv", 0.0),
         "underlying_price":         underlying_price,
         "occ_symbol":               occ_symbol,
-        "is_synthetic_quote":       ev_dict.get("is_synthetic_quote", False),
+        "is_synthetic_quote":       bool(_g("is_synthetic_quote", False)),
+        "quote_source":             "live",
         "contract_volume_snapshot": contract_volume_snapshot,
         "contract_oi":              contract_oi,
         "vol_oi_signal":            vol_oi_signal,
@@ -893,40 +972,84 @@ async def _insert_rows_with_episode_id(
         return False
 
 
-async def persist_flow_episode(signal_data: dict) -> None:
+async def persist_flow_episode(signal_data) -> None:
     """
     ING-009: Upsert a flow_episodes row for the given contract.
 
-    Accepts a single signal_data dict. Empty-string expiry is coerced to None.
-    The early-return guard only fires when strike is None.
+    FIX-PERSIST-TYPE (fix/ingestion-persist-correctness):
+      Previously accepted only `signal_data: dict` but was called from
+      _process_trade() with a RepetitionEpisode dataclass after the
+      (non-existent) accumulator.to_episode() call was removed.
+      Fix: normalise dict vs RepetitionEpisode via a local _g() accessor.
+      RepetitionEpisode fields are accessed via getattr; dict fields via .get().
+      dominant_direction is a property on RepetitionEpisode — it is computed
+      inline and stored in `direction` before any DB I/O.
 
-    ING-009-RACE: serialised per-contract via _get_episode_lock().
+    FIX-OCC-SYMBOL (fix/ingestion-persist-correctness):
+      The vol/OI lookup used an ad-hoc OCC symbol construction:
+        f"{ticker}{expiry}{contract_type[0].upper()}{int(strike*1000):08d}"
+      This produced invalid symbols (e.g. "AAPL2026-01-17C00200000") because:
+        1. expiry is in YYYY-MM-DD format, not YYMMDD
+        2. The ticker is not padded to 6 chars
+      chain_store.get_contract_vol_oi expects the raw OCC format from the stream
+      (e.g. "AAPL  260117C00200000").  We use the occ_symbol field if available
+      or construct the proper format otherwise.
 
-    ING-009-GUARD: No _is_configured() guard here. The in-process lock/counter
-    logic must always run. _lookup_open_episode() and _insert_rows_with_episode_id()
-    each check _is_configured() internally and return None / False when the DB is
-    not reachable — so INSERT/PATCH dispatch and counter increments work correctly
-    in test environments where SUPABASE_URL is unset.
+    FIX-VOL-OI-SIGNAL (fix/ingestion-persist-correctness):
+      flow_episodes.vol_oi_signal (BOOLEAN NOT NULL DEFAULT FALSE) was never
+      written — INSERT and PATCH payloads both omitted it. Now computed from
+      compute_vol_oi_signal(contract_volume_at_close, contract_oi_at_open) and
+      written on every INSERT and PATCH.
 
-    REARCH-004: episode quality aggregate columns (ask_side_count, ask_side_pct,
-    dte_bucket, notional_tier) are populated on INSERT and incrementally updated
-    on PATCH. dte_bucket and notional_tier are locked at episode open — they are
-    NEVER included in PATCH payloads (SA-3 seed-event-only semantics).
+    FIX-STEAMROOM-SCORE (fix/ingestion-persist-correctness):
+      flow_episodes.episode_steamroom_score (INTEGER NOT NULL DEFAULT 0) was
+      never computed or written. Now computed by _compute_episode_steamroom_score()
+      on every INSERT and recomputed on every PATCH.
     """
-    ticker        = signal_data.get("ticker", "UNKNOWN")
-    direction     = signal_data.get("direction", "UNKNOWN")
-    contract_type = signal_data.get("contract_type", "CALL")
-    strike        = signal_data.get("strike")
+    # Normalise RepetitionEpisode vs dict input.
+    if isinstance(signal_data, dict):
+        _g = signal_data.get
+        # dict path: dominant_direction comes from the "direction" key
+        direction = _g("direction", "UNKNOWN")
+    else:
+        # RepetitionEpisode dataclass path
+        def _g(key, default=None):
+            return getattr(signal_data, key, default)
+        # dominant_direction is a computed property — read it once here
+        try:
+            direction = signal_data.dominant_direction
+        except Exception:
+            direction = "UNKNOWN"
+
+    ticker        = _g("ticker", "UNKNOWN")
+    contract_type = _g("contract_type", "CALL")
+    strike        = _g("strike")
     # Coerce empty-string expiry to None (FS-TEST-FIX)
-    expiry        = signal_data.get("expiry") or None
-    premium       = signal_data.get("total_premium") or signal_data.get("premium") or 0.0
-    signal_ts     = signal_data.get("signal_ts") or signal_data.get("timestamp") or None
-    is_multi_day_repeat = signal_data.get("is_multi_day_repeat")
+    expiry        = _g("expiry") or None
+    premium       = _g("total_premium") or _g("premium") or 0.0
+    signal_ts     = _g("signal_ts") or _g("last_seen") or _g("timestamp") or None
+    is_multi_day_repeat = _g("is_multi_day_repeat")
 
     # REARCH-004: seed event quality tags
-    is_ask_side   = bool(signal_data.get("is_ask_side", False))
-    dte           = signal_data.get("dte")
-    event_premium = signal_data.get("premium") or premium
+    # For RepetitionEpisode: derive is_ask_side and dte from constituent events.
+    # For dict: read directly with fallback defaults.
+    if isinstance(signal_data, dict):
+        is_ask_side   = bool(_g("is_ask_side", False))
+        dte           = _g("dte")
+        event_premium = _g("premium") or premium
+    else:
+        # Compute ask-side majority from constituent events (bid_ask_class field)
+        events        = getattr(signal_data, "events", []) or []
+        ask_side_events = sum(
+            1 for e in events
+            if str(getattr(e, "bid_ask_class", "")).upper() in (
+                "AT_ASK", "ABOVE_ASK", "ASK"
+            )
+        )
+        is_ask_side   = (ask_side_events / len(events) >= 0.5) if events else False
+        # DTE from the most recent constituent event
+        dte           = getattr(events[-1], "dte", None) if events else None
+        event_premium = premium  # total episode premium as seed value
 
     if strike is None:
         log.debug(
@@ -934,26 +1057,56 @@ async def persist_flow_episode(signal_data: dict) -> None:
         )
         return
 
+    # FIX-OCC-SYMBOL: build a valid OCC symbol for the chain_store lookup.
+    # For RepetitionEpisode, try to get it from the most recent event first
+    # (avoids re-constructing when it was already parsed from the stream).
+    # Fallback: construct from components in the standard OCC format.
+    contract_occ_symbol: Optional[str] = None
+    if not isinstance(signal_data, dict):
+        events = getattr(signal_data, "events", []) or []
+        if events:
+            contract_occ_symbol = getattr(events[-1], "occ_symbol", None) or None
+    if not contract_occ_symbol:
+        contract_occ_symbol = _g("occ_symbol") or None
+    if not contract_occ_symbol and expiry and strike is not None:
+        # Last-resort construction using proper OCC YYMMDD format.
+        try:
+            from datetime import date as _date
+            exp = _date.fromisoformat(expiry)
+            yy, mm, dd = f"{exp.year % 100:02d}", f"{exp.month:02d}", f"{exp.day:02d}"
+            ticker_padded = ticker.ljust(6)
+            cp = contract_type[0].upper()
+            contract_occ_symbol = f"{ticker_padded}{yy}{mm}{dd}{cp}{int(strike * 1000):08d}"
+        except Exception:
+            pass
+
     # ING-008: vol/OI snapshot at episode persist time.
     contract_oi_at_open: Optional[int] = None
     contract_volume_at_close: Optional[int] = None
     vol_snapshot: Optional[int] = None
-    try:
-        occ_symbol = f"{ticker}{expiry}{contract_type[0].upper()}{int(strike * 1000):08d}"
-        vol_snapshot, contract_oi_at_open = get_contract_vol_oi(occ_symbol)
-        contract_volume_at_close = vol_snapshot
-    except Exception:
-        pass
+    if contract_occ_symbol:
+        try:
+            vol_snapshot, contract_oi_at_open = get_contract_vol_oi(contract_occ_symbol)
+            contract_volume_at_close = vol_snapshot
+        except Exception:
+            pass
 
     volume_oi_ratio: Optional[float] = _compute_vol_oi_ratio(
         contract_volume_at_close, contract_oi_at_open
+    )
+
+    # FIX-VOL-OI-SIGNAL: compute boolean signal for episode column.
+    ep_vol_oi_signal: bool = bool(
+        compute_vol_oi_signal(contract_volume_at_close, contract_oi_at_open)
     )
 
     # REARCH-004: compute seed-event quality dimensions (used on INSERT only).
     seed_dte_bucket    = _compute_dte_bucket(dte)
     seed_notional_tier = _compute_notional_tier(event_premium)
 
-    ts = signal_ts or datetime.now(timezone.utc).isoformat()
+    ts = (signal_ts.isoformat() if hasattr(signal_ts, "isoformat") else signal_ts) \
+        or datetime.now(timezone.utc).isoformat()
+
     key = _episode_key(ticker, direction, contract_type, strike or 0, expiry or "")
     lock = _get_episode_lock(key)
 
@@ -966,6 +1119,14 @@ async def persist_flow_episode(signal_data: dict) -> None:
             # REARCH-004: increment ask_side_count from in-flight cache and recompute pct.
             new_ask_side_count = (in_flight.get("ask_side_count") or 0) + (1 if is_ask_side else 0)
             new_ask_side_pct   = round(new_ask_side_count / new_trade_count, 4)
+            # FIX-STEAMROOM-SCORE: recompute on every PATCH.
+            new_steamroom_score = _compute_episode_steamroom_score(
+                ask_side_pct   = new_ask_side_pct,
+                vol_oi_signal  = ep_vol_oi_signal,
+                total_premium  = new_total_premium,
+                dte_bucket     = seed_dte_bucket,
+                trade_count    = new_trade_count,
+            )
             patch_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"?id=eq.{in_flight['id']}"
@@ -978,7 +1139,11 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "volume_oi_ratio":          volume_oi_ratio,
                 "ask_side_count":           new_ask_side_count,
                 "ask_side_pct":             new_ask_side_pct,
-                # REARCH-004 SA-3: dte_bucket and notional_tier are intentionally
+                # FIX-VOL-OI-SIGNAL: write on every PATCH.
+                "vol_oi_signal":            ep_vol_oi_signal,
+                # FIX-STEAMROOM-SCORE: write on every PATCH.
+                "episode_steamroom_score":  new_steamroom_score,
+                # REARCH-004 SA-3: dte_bucket and notional_tier intentionally
                 # excluded — they are locked at episode open (seed-event-only).
             }
             if is_multi_day_repeat is not None:
@@ -1018,6 +1183,13 @@ async def persist_flow_episode(signal_data: dict) -> None:
             # REARCH-004: COALESCE(NULL, 0) handles pre-REARCH rows (PBE-1 NULL contract).
             new_ask_side_count = (existing.get("ask_side_count") or 0) + (1 if is_ask_side else 0)
             new_ask_side_pct   = round(new_ask_side_count / new_trade_count, 4)
+            new_steamroom_score = _compute_episode_steamroom_score(
+                ask_side_pct   = new_ask_side_pct,
+                vol_oi_signal  = ep_vol_oi_signal,
+                total_premium  = new_total_premium,
+                dte_bucket     = seed_dte_bucket,
+                trade_count    = new_trade_count,
+            )
             patch_url = (
                 f"{_SUPABASE_URL}/rest/v1/flow_episodes"
                 f"?id=eq.{existing['id']}"
@@ -1030,6 +1202,8 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "volume_oi_ratio":          volume_oi_ratio,
                 "ask_side_count":           new_ask_side_count,
                 "ask_side_pct":             new_ask_side_pct,
+                "vol_oi_signal":            ep_vol_oi_signal,
+                "episode_steamroom_score":  new_steamroom_score,
                 # REARCH-004 SA-3: dte_bucket and notional_tier intentionally excluded.
             }
             if is_multi_day_repeat is not None:
@@ -1058,12 +1232,15 @@ async def persist_flow_episode(signal_data: dict) -> None:
             except Exception as e:
                 log.error(f"[flow_store] persist_flow_episode DB PATCH exception: {e}")
         else:
-            # ING-009-EXTRACT: INSERT path delegated to _insert_rows_with_episode_id.
-            # That function handles the HTTP POST, id-caching, and in-flight population.
-            # created_episodes counter stays here so patching the helper in tests
-            # still triggers the counter (E-1: mock returns True → counter == 1).
             seed_ask_side_count = 1 if is_ask_side else 0
             seed_ask_side_pct   = round(seed_ask_side_count / 1, 4)  # trade_count=1 at seed
+            seed_steamroom_score = _compute_episode_steamroom_score(
+                ask_side_pct   = seed_ask_side_pct,
+                vol_oi_signal  = ep_vol_oi_signal,
+                total_premium  = premium,
+                dte_bucket     = seed_dte_bucket,
+                trade_count    = 1,
+            )
             insert_payload = {
                 "ticker":                   ticker,
                 "direction":                direction,
@@ -1076,11 +1253,15 @@ async def persist_flow_episode(signal_data: dict) -> None:
                 "contract_oi_at_open":      contract_oi_at_open,
                 "contract_volume_at_close": contract_volume_at_close,
                 "volume_oi_ratio":          volume_oi_ratio,
+                # FIX-VOL-OI-SIGNAL: write on INSERT.
+                "vol_oi_signal":            ep_vol_oi_signal,
                 # REARCH-004: seed-event quality aggregate columns.
                 "ask_side_count":           seed_ask_side_count,
                 "ask_side_pct":             seed_ask_side_pct,
                 "dte_bucket":               seed_dte_bucket,
                 "notional_tier":            seed_notional_tier,
+                # FIX-STEAMROOM-SCORE: write on INSERT.
+                "episode_steamroom_score":  seed_steamroom_score,
             }
             if is_multi_day_repeat is not None:
                 insert_payload["is_multi_day_repeat"] = is_multi_day_repeat

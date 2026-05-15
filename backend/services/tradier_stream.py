@@ -1002,9 +1002,18 @@ async def _process_trade(raw: dict, registry=None) -> None:
     _stats["classified"] += 1
 
     # --- Accumulate ---
-    sig_ep = accumulator.get_signal(ev)
+    # FIX-AWAIT (fix/ingestion-persist-correctness):
+    # accumulator.get_signal() is async — MUST be awaited. Previously called
+    # without await, returning a coroutine object (always truthy → never None).
+    # Every gate check below ("if sig_ep is None") was therefore dead code —
+    # nothing was ever gated by the accumulator from the hot path.
+    sig_ep = await accumulator.get_signal(ev)
 
     # --- Persist flow event (fire-and-forget) ---
+    # FIX-PERSIST-TYPE (fix/ingestion-persist-correctness):
+    # persist_flow_event now accepts OptionsFlowEvent directly (see flow_store.py).
+    # Previously only accepted dict; the dataclass was passed silently failing
+    # on every .get() call, so zero rows reached flow_events from the hot path.
     t = asyncio.create_task(persist_flow_event(ev))
     t.add_done_callback(_persist_done_cb)
     _stats["persisted"] += 1
@@ -1014,21 +1023,31 @@ async def _process_trade(raw: dict, registry=None) -> None:
     )
 
     # --- Sweep upgrade check ---
+    # FIX-OCC-SYMBOL + FIX-UPGRADE-ARITY (fix/ingestion-persist-correctness):
+    # ev.occ_symbol now exists on OptionsFlowEvent (added to dataclass).
+    # upgrade_to_sweep_in_db requires (occ_symbol, fill_price, size) — previously
+    # called with only occ_symbol (TypeError on every sweep event).
     if ev.is_sweep and ev.occ_symbol:
         dispatch_key = f"{ev.occ_symbol}|{ev.size}|{ev.fill_price}"
         if dispatch_key not in _sweep_upgrade_dispatched:
             _sweep_upgrade_dispatched[dispatch_key] = now
-            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol))
+            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol, ev.fill_price, ev.size))
 
     if sig_ep is None:
         _stats["accumulator_gated"] += 1
         return
 
     # --- Persist episode (fire-and-forget) ---
-    persist_ep = accumulator.to_episode(sig_ep)
-    if persist_ep is not None:
-        asyncio.create_task(persist_flow_episode(persist_ep))
-        enqueue_lookback(persist_ep)
+    # FIX-TO-EPISODE (fix/ingestion-persist-correctness):
+    # accumulator.to_episode() does not exist — it was never defined on
+    # RepetitionAccumulator.  The call raised AttributeError on every qualifying
+    # episode, meaning zero episodes were ever persisted from the hot path.
+    # Fix: persist_flow_episode now accepts RepetitionEpisode directly (it
+    # normalises the type internally). Pass sig_ep (RepetitionEpisode) directly.
+    # enqueue_lookback also accepts RepetitionEpisode — the worker only needs
+    # .ticker, .contract_type, .strike, .expiry which are all present.
+    asyncio.create_task(persist_flow_episode(sig_ep))
+    enqueue_lookback(sig_ep)
 
     # --- Signal gate ---
     signal_min_premium = _resolve_signal_min_premium()

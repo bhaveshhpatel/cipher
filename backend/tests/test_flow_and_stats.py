@@ -21,7 +21,47 @@ for _mod in (
     "ingestion.processor",
 ):
     if _mod not in sys.modules:
-        sys.modules[_mod] = types.ModuleType(_mod)
+        _stub = types.ModuleType(_mod)
+        # Package stubs (no dot, or top-level) need __path__ so that
+        # sub-module imports (e.g. `import services.flow_store`) don't fail
+        # with "not a package".  Setting __path__ = [] marks the module as a
+        # namespace package without pointing at any real directory.
+        if "." not in _mod:
+            _stub.__path__ = []  # type: ignore[attr-defined]
+            _stub.__package__ = _mod
+        sys.modules[_mod] = _stub
+
+# IMPORT-HOIST fix: flow_store imports _compute_dte_bucket and _compute_notional_tier
+# from ingestion.processor at MODULE LEVEL.  The blanket stub above installs an empty
+# module which causes ImportError when flow_store is imported after this file.
+# Populate the stub with minimal implementations that match the real functions.
+_proc_stub = sys.modules["ingestion.processor"]
+if not hasattr(_proc_stub, "_compute_dte_bucket"):
+    def _compute_dte_bucket(dte) -> str:  # type: ignore[misc]
+        if dte is None:
+            return "UNKNOWN"
+        if dte == 0:
+            return "0DTE"
+        if dte <= 4:
+            return "1-4"
+        if dte <= 60:
+            return "5-60"
+        if dte <= 90:
+            return "61-90"
+        return "90+"
+    _proc_stub._compute_dte_bucket = _compute_dte_bucket  # type: ignore[attr-defined]
+
+if not hasattr(_proc_stub, "_compute_notional_tier"):
+    def _compute_notional_tier(premium) -> str:  # type: ignore[misc]
+        p = premium or 0.0
+        if p >= 1_000_000:
+            return "GOLDEN"
+        if p >= 500_000:
+            return "BLOCK"
+        if p >= 50_000:
+            return "NOTEWORTHY"
+        return "WATCH"
+    _proc_stub._compute_notional_tier = _compute_notional_tier  # type: ignore[attr-defined]
 
 # Provide a minimal bus stub with a subscribe no-op
 _bus_stub = sys.modules["core.async_bus"]

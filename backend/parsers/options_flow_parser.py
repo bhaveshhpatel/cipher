@@ -130,6 +130,7 @@ class OptionsFlowEvent:
     timestamp:      datetime
 
     # Contract
+    occ_symbol:     str   # canonical OCC symbol (e.g. "AAPL  260117C00200000"), "" if not parseable
     contract_type:  str   # CALL | PUT
     strike:         float
     expiry:         str   # YYYY-MM-DD or "" if unparseable
@@ -147,9 +148,11 @@ class OptionsFlowEvent:
     bid_ask_class:  str = ""         # ABOVE_ASK | AT_ASK | MID | AT_BID | BELOW_BID
     is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive(); re-computed post-registry
     is_golden_sweep: bool = False
+    is_sweep:       bool = False     # True when trade_type == "SWEEP"
 
     # Classification (set later)
     sentiment:       str = "NEUTRAL" # BULLISH | BEARISH | NEUTRAL
+    order_side:      str = "UNKNOWN" # BUY | SELL | UNKNOWN (Tradier stream never sets this)
     influence_tier:  str = "RETAIL"  # WHALE | INSTITUTIONAL | LARGE | RETAIL
     conviction_score: float = 0.0
 
@@ -339,10 +342,15 @@ def parse_tradier_trade(
         ttype  = detect_trade_type(size, premium, exc_cnt, fill_cnt)
         golden = is_golden_sweep(ttype, premium, aggressive)
 
+        # Normalise OCC symbol: strip whitespace so both "AAPL  260117C00200000"
+        # and "AAPL260117C00200000" collapse to the same canonical form.
+        occ_sym = symbol.strip()
+
         ev = OptionsFlowEvent(
             id              = raw.get("id", f"{ticker}_{expiry}_{strike}_{ctype}"),
             ticker          = ticker,
             timestamp       = _parse_timestamp(raw.get("timestamp")),
+            occ_symbol      = occ_sym,
             contract_type   = ctype,
             strike          = strike,
             expiry          = expiry,
@@ -356,6 +364,7 @@ def parse_tradier_trade(
             bid_ask_class   = ba_class,
             is_aggressive   = aggressive,
             is_golden_sweep = golden,
+            is_sweep        = (ttype == "SWEEP"),
             exchange_count  = exc_cnt,
             fill_count      = fill_cnt,
             open_interest   = int(raw.get("open_interest", 0) or 0),
