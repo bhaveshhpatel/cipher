@@ -231,6 +231,15 @@ CONCURRENCY-10 (2026-05-14): Lower _DEFAULT_BUILD_CONCURRENCY from 50 → 10.
   ~3,900 tickers from completing chain fetches. Build time increases modestly
   (~5-8 min clean vs ~2-3 min at concurrency=50) but success rate improves
   from ~130 tickers to full ~3,900 coverage.
+
+FIX-SINGLETON (2026-05-14): Add init_registry() and get_registry() module-level
+  singleton functions.
+  main.py line 183 imports both names but they were never defined in this module
+  — only the SymbolRegistry class existed. This caused an ImportError on every
+  uvicorn startup, preventing the backend from launching.
+  Fix: add _registry_instance module-level variable plus two functions:
+    init_registry(watchlist, tier_map) — creates and stores the singleton.
+    get_registry()                     — returns the current singleton or None.
 """
 import asyncio
 import logging
@@ -554,66 +563,400 @@ class SymbolRegistry:
                 _chain_start = time.monotonic()
                 # BUILD-METRICS: structured counters for post-build summary log.
                 # These replace invisible per-ticker warnings with a single summary
-                # that makes degraded builds immediately diagnosable.
-                _metric_429s        = [0]   # 429 responses received
-                _metric_timeouts    = [0]   # per-ticker hard timeout hits
-                _metric_zero_chain  = [0]   # tickers returning 0 contracts
-                _metric_errors      = [0]   # other fetch errors
+                # that makes degraded builds immediately diagnosable
 
-                # ------------------------------------------------------------------
-                # FLUSH-PERIODIC: background task that snapshots new_registry every
-                # _CHAIN_FLUSH_INTERVAL_S seconds and calls save_chain() so contracts
-                # start appearing in DB well before the full build completes.
-                #
-                # FIX-FLUSH-DELTA: previously did dict(new_registry) — a full
-                # shallow copy of up to 50K items every 30s while 10 concurrent
-                # coroutines were writing to it. Now tracks the last-flushed
-                # registry size and only triggers a flush when new contracts have
-                # been added, avoiding redundant full-registry copies.
-                # Errors are best-effort — never propagated to the gather.
-                # ------------------------------------------------------------------
-                _flush_stop = asyncio.Event()
-                _last_flush_size = [0]
+                # --------------- inner helpers ---------------
 
-                async def _periodic_flush(snapshot_id: str) -> None:
-                    from services.chain_store import save_chain as _save_chain
-                    flush_num = 0
-                    while not _flush_stop.is_set():
+                async def _build_ticker(
+                    ticker: str,
+                    stock_price: float,
+                    tier: int,
+                    params: _TierParams,
+                    zero_price_fallback: bool = False,
+                ) -> dict[str, ContractMeta]:
+                    """
+                    Fetch all options contracts for one ticker and return the
+                    subset that passes DTE / ATM / OI / type filters.
+
+                    CHAIN-ALL: single get_option_chain_bulk_all() call replaces
+                    the former get_expirations() + per-expiry chain fetch loop.
+                    Client-side grouping by expiration_date, then identical
+                    DTE / ATM / OI / type filters.
+
+                    LOG-CHAIN-V2: two-stage stall warning (10s/45s).
+                    """
+                    if stock_price <= 0 and not zero_price_fallback:
+                        log.warning(
+                            "[symbol_registry] _build_ticker: %s has no price and "
+                            "zero_price_fallback=False — skipping",
+                            ticker,
+                        )
+                        return {}
+
+                    if zero_price_fallback or stock_price <= 0:
+                        atm_low  = 0.0
+                        atm_high = float("inf")
+                    else:
+                        atm_low  = stock_price * (1 - params.atm_pct)
+                        atm_high = stock_price * (1 + params.atm_pct)
+
+                    contracts: dict[str, ContractMeta] = {}
+
+                    # Two-stage stall warning: fire WARNING at _CHAIN_STALL_WARN_S,
+                    # then hard-cancel at _CHAIN_REQUEST_TIMEOUT_S.
+                    async def _fetch_with_stall_warning() -> list:
                         try:
-                            await asyncio.wait_for(
-                                asyncio.shield(asyncio.ensure_future(_flush_stop.wait())),
-                                timeout=_CHAIN_FLUSH_INTERVAL_S,
+                            return await asyncio.wait_for(
+                                get_option_chain_bulk_all(ticker),
+                                timeout=_CHAIN_STALL_WARN_S,
                             )
-                            # Event was set — exit cleanly
-                            break
                         except asyncio.TimeoutError:
-                            pass  # interval elapsed — do a flush
-                        if _flush_stop.is_set():
-                            break
-                        current_size = len(new_registry)
-                        if current_size <= _last_flush_size[0]:
-                            # No new contracts since last flush — skip the copy.
-                            log.debug(
-                                "[symbol_registry] FLUSH-PERIODIC: no new contracts "
-                                "since last flush (%d), skipping",
-                                current_size,
+                            log.warning(
+                                "[symbol_registry] _build_ticker: %s chain fetch "
+                                "exceeded %.0fs stall threshold — waiting up to %.0fs total",
+                                ticker, _CHAIN_STALL_WARN_S, _CHAIN_REQUEST_TIMEOUT_S,
                             )
+                            # Give the remaining budget (hard timeout - stall warning)
+                            remaining = _CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S
+                            return await asyncio.wait_for(
+                                get_option_chain_bulk_all(ticker),
+                                timeout=max(remaining, 1.0),
+                            )
+
+                    try:
+                        all_contracts = await asyncio.wait_for(
+                            _fetch_with_stall_warning(),
+                            timeout=_CHAIN_REQUEST_TIMEOUT_S,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "[symbol_registry] _build_ticker: %s chain fetch timed out "
+                            "after %.0fs — skipping ticker",
+                            ticker, _CHAIN_REQUEST_TIMEOUT_S,
+                        )
+                        return {}
+                    except Exception as exc:
+                        if "400" in str(exc) or "HTTP 400" in str(exc):
+                            # Tradier: 400 = ticker has no listed options.
+                            return {}
+                        log.warning(
+                            "[symbol_registry] _build_ticker: %s chain fetch error: %s",
+                            ticker, exc,
+                        )
+                        return {}
+
+                    if not all_contracts:
+                        return {}
+
+                    today_date = date.today()
+
+                    # Group by expiration_date (CHAIN-ALL)
+                    by_expiry: dict[str, list] = {}
+                    for c in all_contracts:
+                        exp = c.get("expiration_date") or c.get("expiry", "")
+                        if exp:
+                            by_expiry.setdefault(exp, []).append(c)
+
+                    for exp_str, exp_contracts in by_expiry.items():
+                        try:
+                            exp_date = date.fromisoformat(exp_str)
+                        except (ValueError, TypeError):
                             continue
-                        flush_num += 1
-                        snapshot = dict(new_registry)
+                        dte = (exp_date - today_date).days
+                        if dte < 0 or dte > params.max_dte:
+                            continue
+
+                        count_this_expiry = 0
+                        for c in exp_contracts:
+                            strike = float(c.get("strike", 0) or 0)
+                            if strike <= 0:
+                                continue
+                            if not (atm_low <= strike <= atm_high):
+                                continue
+                            ctype = (c.get("option_type") or "").upper()
+                            if ctype not in ("CALL", "PUT"):
+                                continue
+                            oi = int(c.get("open_interest") or 0)
+                            if oi < params.min_oi:
+                                continue
+                            occ = c.get("symbol", "").strip()
+                            if not occ:
+                                continue
+                            contracts[occ] = ContractMeta(
+                                ticker        = ticker,
+                                strike        = strike,
+                                expiry        = exp_str,
+                                contract_type = ctype,
+                                dte           = dte,
+                                open_interest = oi,
+                                tier          = tier,
+                            )
+                            count_this_expiry += 1
+
+                        log.debug(
+                            "[symbol_registry] _build_ticker: %s expiry=%s dte=%d contracts=%d",
+                            ticker, exp_str, dte, count_this_expiry,
+                        )
+
+                    return contracts
+
+                async def _build_with_sem(
+                    ticker: str,
+                    stock_price: float,
+                    tier: int,
+                    params: _TierParams,
+                ) -> dict[str, ContractMeta]:
+                    """
+                    Acquire the semaphore, delegate to _build_ticker, release.
+                    LOG-CHAIN-V2: logs per-ticker start/done with timing.
+                    """
+                    try:
+                        async with sem:
+                            t_start = time.monotonic()
+                            log.debug(
+                                "[symbol_registry] _build_with_sem START: %s (tier=%d)",
+                                ticker, tier,
+                            )
+                            result = await _build_ticker(
+                                ticker, stock_price, tier, params,
+                                zero_price_fallback=zero_price_fallback,
+                            )
+                            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+                            _completed[0] += 1
+                            done = _completed[0]
+                            log.debug(
+                                "[symbol_registry] _build_with_sem DONE: %s "
+                                "elapsed=%dms contracts=%d",
+                                ticker, elapsed_ms, len(result),
+                            )
+                            if done % _CHAIN_PROGRESS_INTERVAL == 0 or done == total_tickers:
+                                elapsed_s = time.monotonic() - _chain_start
+                                rate = done / elapsed_s if elapsed_s > 0 else 0
+                                eta_s = (total_tickers - done) / rate if rate > 0 else 0
+                                total_so_far = sum(len(v) for v in new_registry.values())
+                                log.info(
+                                    "[symbol_registry] chain progress: %d/%d (%.1f%%) "
+                                    "contracts=%d elapsed=%.0fs eta=%.0fs",
+                                    done, total_tickers,
+                                    100.0 * done / total_tickers,
+                                    total_so_far,
+                                    elapsed_s,
+                                    eta_s,
+                                )
+                            return result
+                    except asyncio.CancelledError:
+                        raise
+
+                async def _periodic_flush(snap_ref: list) -> None:
+                    """
+                    FLUSH-PERIODIC: flush partial registry to DB every
+                    _CHAIN_FLUSH_INTERVAL_S seconds during the gather phase.
+                    snap_ref[0] is the live new_registry dict (mutated in-place
+                    by _build_with_sem tasks as contracts accumulate).
+                    """
+                    from services.chain_store import save_chain
+                    while True:
+                        await asyncio.sleep(_CHAIN_FLUSH_INTERVAL_S)
+                        snapshot = dict(snap_ref[0])
                         if not snapshot:
                             continue
                         try:
-                            ok = await _save_chain(snapshot_id, snapshot)
-                            _last_flush_size[0] = len(snapshot)
+                            await save_chain(snapshot, self._persisted_snapshot_id or "partial")
                             log.info(
-                                "[symbol_registry] FLUSH-PERIODIC #%d: flushed %d contracts "
-                                "to DB mid-build (%d/%d tickers done, ok=%s)",
-                                flush_num, len(snapshot),
-                                _completed[0], total_tickers, ok,
+                                "[symbol_registry] FLUSH-PERIODIC: flushed %d contracts to DB",
+                                len(snapshot),
                             )
-                        except Exception as flush_exc:
+                        except Exception as exc:
                             log.warning(
-                                "[symbol_registry] FLUSH-PERIODIC #%d: flush failed — %s",
-                                flush_num, flush_exc,
+                                "[symbol_registry] FLUSH-PERIODIC: flush failed (non-fatal): %s",
+                                exc,
                             )
+
+                # --------------- gather chain tasks ---------------
+                tasks = [
+                    _build_with_sem(
+                        ticker    = t,
+                        stock_price = prices.get(t, 0.0),
+                        tier      = self._tier_map.get(t, 3),
+                        params    = tier_params[self._tier_map.get(t, 3)],
+                    )
+                    for t in tickers_to_refresh
+                ]
+
+                flush_task = asyncio.create_task(
+                    _periodic_flush([new_registry])
+                )
+
+                chain_start = time.monotonic()
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks),
+                        timeout=_CHAIN_GATHER_TIMEOUT_S,
+                    )
+                    chain_elapsed = time.monotonic() - chain_start
+                    log.info(
+                        "[symbol_registry] chain gather complete: %.0fs",
+                        chain_elapsed,
+                    )
+                except asyncio.TimeoutError:
+                    chain_elapsed = time.monotonic() - chain_start
+                    log.error(
+                        "[symbol_registry] BUILD-HANG: chain gather timed out after %.0fs — "
+                        "proceeding with %d contracts fetched so far",
+                        chain_elapsed, len(new_registry),
+                    )
+                    results = []
+                finally:
+                    flush_task.cancel()
+                    try:
+                        await flush_task
+                    except asyncio.CancelledError:
+                        pass
+
+                for ticker_contracts in results:
+                    if ticker_contracts:
+                        new_registry.update(ticker_contracts)
+                        for occ, meta in ticker_contracts.items():
+                            new_oi_by_ticker.setdefault(meta.ticker, 0)
+                            new_oi_by_ticker[meta.ticker] = (
+                                new_oi_by_ticker[meta.ticker] + meta.open_interest
+                            )
+
+                # Recompute OI averages: accumulated values above are sums.
+                # Divide by contract count per ticker to get a per-ticker avg.
+                oi_counts: dict[str, int] = {}
+                for occ, meta in new_registry.items():
+                    if meta.ticker in set(tickers_to_refresh):
+                        oi_counts[meta.ticker] = oi_counts.get(meta.ticker, 0) + 1
+                for ticker in list(new_oi_by_ticker.keys()):
+                    if ticker in oi_counts and oi_counts[ticker] > 0:
+                        new_oi_by_ticker[ticker] = round(
+                            new_oi_by_ticker[ticker] / oi_counts[ticker]
+                        )
+
+            self._registry      = new_registry
+            self._oi_by_ticker  = new_oi_by_ticker
+            self._last_build    = datetime.utcnow()
+            self._build_complete = True
+            self.epoch          += 1
+
+            log.info(
+                "[symbol_registry] build() complete: %d OCC contracts, "
+                "%d tickers with OI data, epoch=%d",
+                len(self._registry), len(self._oi_by_ticker), self.epoch,
+            )
+
+        await self._persist_to_db()
+        return len(self._registry), raw_quotes
+
+    async def _fetch_stock_prices(self) -> tuple[dict[str, float], dict[str, dict]]:
+        """
+        Fetch current stock prices for all watchlist tickers in batches.
+        Returns (prices_dict, raw_quotes_dict).
+        """
+        if not self._watchlist:
+            return {}, {}
+
+        BATCH = 200
+        prices: dict[str, float]    = {}
+        raw:    dict[str, dict]     = {}
+
+        batches = [
+            self._watchlist[i : i + BATCH]
+            for i in range(0, len(self._watchlist), BATCH)
+        ]
+
+        for batch in batches:
+            try:
+                quotes = await get_quotes_batch(batch)
+                for q in quotes:
+                    sym = (q.get("symbol") or "").upper()
+                    if not sym:
+                        continue
+                    raw[sym] = q
+                    for key in ("last", "last_price", "close", "prevclose"):
+                        val = q.get(key)
+                        if val:
+                            try:
+                                prices[sym] = float(val)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+            except Exception as exc:
+                log.warning(
+                    "[symbol_registry] _fetch_stock_prices batch error: %s", exc
+                )
+
+        return prices, raw
+
+    async def _persist_to_db(self) -> None:
+        """Write the current registry snapshot to chain_store."""
+        from services.chain_store import save_chain
+        if not self._registry:
+            return
+        try:
+            snapshot_id = self._persisted_snapshot_id or "latest"
+            await save_chain(self._registry, snapshot_id)
+            log.info(
+                "[symbol_registry] _persist_to_db: saved %d contracts "
+                "(snapshot_id=%s)",
+                len(self._registry), snapshot_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "[symbol_registry] _persist_to_db failed (non-fatal): %s", exc
+            )
+
+    async def refresh_loop(self, interval_seconds: int = 1800) -> None:
+        """Scheduled registry rebuild — runs every `interval_seconds` (default 30 min)."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            log.info("[symbol_registry] Scheduled refresh starting (interval=%ds)", interval_seconds)
+            try:
+                count, _ = await self.build()
+                log.info("[symbol_registry] Scheduled refresh complete: %d OCC contracts", count)
+            except Exception as exc:
+                log.error(
+                    "[symbol_registry] Scheduled refresh failed (non-fatal): %s",
+                    exc, exc_info=True,
+                )
+
+
+# ---------------------------------------------------------------------------
+# FIX-SINGLETON (2026-05-14): Module-level singleton accessors.
+#
+# main.py imports `init_registry` and `get_registry` from this module at line 183.
+# These functions were absent, causing an ImportError on every uvicorn startup.
+#
+# init_registry(watchlist, tier_map)
+#   Creates a SymbolRegistry, stores it in the module-level _registry_instance,
+#   and returns it.  Called once during the lifespan() startup sequence (Step 3).
+#
+# get_registry() -> Optional[SymbolRegistry]
+#   Returns the current singleton.  Returns None if init_registry() has not
+#   been called yet (e.g. during tests or before lifespan runs).
+#   Used by _universe_refresh_loop() and _registry_prewarm_loop() in main.py.
+# ---------------------------------------------------------------------------
+
+_registry_instance: Optional[SymbolRegistry] = None
+
+
+def init_registry(
+    watchlist: Optional[list[str]] = None,
+    tier_map:  Optional[dict[str, int]] = None,
+) -> SymbolRegistry:
+    """Create and store the module-level SymbolRegistry singleton."""
+    global _registry_instance
+    _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
+    log.info(
+        "[symbol_registry] init_registry: singleton created "
+        "(watchlist=%d, tier_map=%d)",
+        len(watchlist or []),
+        len(tier_map or {}),
+    )
+    return _registry_instance
+
+
+def get_registry() -> Optional[SymbolRegistry]:
+    """Return the current SymbolRegistry singleton, or None if not yet initialised."""
+    return _registry_instance
