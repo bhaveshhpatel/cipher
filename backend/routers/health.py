@@ -103,6 +103,13 @@ async def get_full_stats():
     """
     return get_stats()
 
+
 @router.get("/health", include_in_schema=False)
-async def health_probe() -> dict:
+def health_probe() -> dict:
+    """
+    H2: Sync route — returns 200 immediately, independent of the async event
+    loop. As a plain `def` endpoint FastAPI runs it in a threadpool executor,
+    so it is never queued behind connection-storm coroutines during startup or
+    reconnect bursts. No awaits, no I/O, no dependencies.
+    """
     return {"status": "ok"}
