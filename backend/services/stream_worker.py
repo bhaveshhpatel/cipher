@@ -20,6 +20,17 @@ STREAM-3 (2026-04-28):
 
 B-021: startup_delay_s for staggered startup (50ms × worker_id).
 B-008: global stats rollup via _global_stats().
+
+STREAM-8 (2026-05-15):
+  Remove independent get_session_token() fallback. Previously, if
+  _shared_token was None, the worker would call get_session_token()
+  directly. Tradier's model is one sessionid per API key — a second
+  POST /v1/markets/session call immediately invalidates the existing
+  shared token, causing a 401 storm across all other workers.
+
+  Fix: workers NEVER call get_session_token() independently. If
+  _shared_token is missing, set _token_expired=True and return cleanly
+  so the manager fetches a fresh token and respawns via STREAM-7.
 """
 import asyncio
 import json
@@ -33,7 +44,6 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from config import settings
-from utils.tradier_client import get_session_token
 
 log = logging.getLogger("stream_worker")
 
@@ -206,22 +216,21 @@ class StreamWorker:
                 continue
 
             # ---- Session token ----
-            session_token = (
-                self._shared_token
-                if self._shared_token
-                else await get_session_token()
-            )
+            # STREAM-8: Workers NEVER call get_session_token() independently.
+            # Doing so would POST /v1/markets/session and immediately invalidate
+            # the shared token held by all other workers, causing a 401 storm.
+            # If _shared_token is missing, signal the manager and exit cleanly.
+            session_token = self._shared_token
             if not session_token:
+                log.error(
+                    "[worker-%d] No shared_session_token — refusing to fetch independently "
+                    "(would invalidate shared token). Signalling manager for respawn.",
+                    self.worker_id,
+                )
+                self._token_expired = True
                 self._errors += 1
                 self._inc_global_error()
-                backoff = _backoff(min(reconnect_attempt, 7))
-                log.warning(
-                    "[worker-%d] No session token — backing off %.1fs (attempt=%d)",
-                    self.worker_id, backoff, reconnect_attempt,
-                )
-                await asyncio.sleep(backoff)
-                reconnect_attempt += 1
-                continue
+                return  # manager detects _token_expired and respawns all workers
 
             payload = {
                 "sessionid": session_token,
