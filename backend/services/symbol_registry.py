@@ -240,6 +240,20 @@ FIX-SINGLETON (2026-05-14): Add init_registry() and get_registry() module-level
   Fix: add _registry_instance module-level variable plus two functions:
     init_registry(watchlist, tier_map) — creates and stores the singleton.
     get_registry()                     — returns the current singleton or None.
+
+FIX-QUOTES-ITER (2026-05-15): Fix _fetch_stock_prices iterating dict keys
+  instead of values after FIX-QUOTES-RESP changed get_quotes_batch() return
+  type from list[dict] to dict[str, dict].
+
+  get_quotes_batch() now returns {symbol: quote_dict}. The old loop
+  "for q in quotes:" iterates over string keys ("AAPL", "MSFT", …).
+  q.get("symbol") on a string raises:
+    'str' object has no attribute 'get'
+  Caught by bare except → logged as WARNING per batch → all 20 batches fail
+  silently → 0 prices returned → B-ZERO-PRICE fallback fires on every
+  cold-start build (ATM filter bypassed, chain stall warnings flood logs).
+
+  Fix: "for q in quotes.values()" so q is the quote dict as intended.
 """
 import asyncio
 import logging
@@ -869,7 +883,11 @@ class SymbolRegistry:
         for batch in batches:
             try:
                 quotes = await get_quotes_batch(batch)
-                for q in quotes:
+                # FIX-QUOTES-ITER (2026-05-15): get_quotes_batch() returns
+                # dict[str, dict] (symbol -> quote_dict). Iterating the dict
+                # directly yields string keys, not quote dicts, causing
+                # 'str object has no attribute get' on every batch.
+                for q in quotes.values():
                     sym = (q.get("symbol") or "").upper()
                     if not sym:
                         continue
