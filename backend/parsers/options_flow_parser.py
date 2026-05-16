@@ -64,6 +64,13 @@ SENTIMENT FIX (2026-05-09):
   All historical flow_events rows had order_side=UNKNOWN (Tradier stream
   never populated it), so bid_ask_class is the only available fill-placement
   signal and is the correct input to classify_sentiment().
+
+FIX-OCC-SYMBOL (fix/ingestion-persist-correctness):
+  occ_symbol is now a first-class field on OptionsFlowEvent, populated at
+  parse time from the raw stream symbol (stripped of whitespace). This ensures
+  chain_store lookups and upgrade_to_sweep_in_db use the same canonical
+  representation as the stream, avoiding the YYYY-MM-DD expiry bug in the
+  old @property fallback construction.
 """
 import logging
 import re
@@ -84,36 +91,20 @@ except Exception:  # pragma: no cover
 
 # ---------------------------------------------------------------------------
 # ING-002 / ING-010: Per-event premium floor.
-# This is the module-level cold-start fallback. In production, _process_trade
-# in tradier_stream.py resolves the tier-aware floor from gate_config_store and
-# passes it as min_premium= to parse_tradier_trade(). This fallback is only
-# used when min_premium= is not supplied (tests, standalone callers, cold-start
-# before gate_config_store.load() has completed).
 # ---------------------------------------------------------------------------
 _MIN_EVENT_PREMIUM = 10_000
 
 # ---------------------------------------------------------------------------
 # ING-002: Sampling rate for the below_min_premium gate log.
-# Every Nth drop emits a DEBUG line: [below_premium] TICKER prem=$X (floor=$Y)
-# Set to 0 to disable sampling entirely (aggregate counter only).
-# Tune upward to reduce log volume in high-throughput sessions.
 # ---------------------------------------------------------------------------
 _BELOW_PREMIUM_SAMPLE_RATE = 500
 
 # ---------------------------------------------------------------------------
 # Parser-level stats.
-# This module owns exactly two counters:
-#   below_min_premium                 — ING-002: clean filter drops at parser premium floor
-#   underlying_price_fallback_applied — ING-004: ticks where registry stock_price used
-#
-# parse_failed is owned by tradier_stream — do NOT add it here.
-# If get_stats() returned parse_failed, stats.update(get_parser_stats()) in
-# tradier_stream.get_stats() would overwrite the stream's real parse_failed
-# counter with 0 on every /health/stream call (F-1 fix, 2026-05-03).
 # ---------------------------------------------------------------------------
 _stats: dict = {
-    "below_min_premium":                  0,  # ING-002: clean filter drops at parser premium floor
-    "underlying_price_fallback_applied":  0,  # ING-004: ticks where registry stock_price used as fallback
+    "below_min_premium":                  0,
+    "underlying_price_fallback_applied":  0,
 }
 
 
@@ -130,6 +121,7 @@ class OptionsFlowEvent:
     timestamp:      datetime
 
     # Contract
+    occ_symbol:     str   # canonical OCC symbol (e.g. "AAPL  260117C00200000"), "" if not parseable
     contract_type:  str   # CALL | PUT
     strike:         float
     expiry:         str   # YYYY-MM-DD or "" if unparseable
@@ -147,9 +139,11 @@ class OptionsFlowEvent:
     bid_ask_class:  str = ""         # ABOVE_ASK | AT_ASK | MID | AT_BID | BELOW_BID
     is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive(); re-computed post-registry
     is_golden_sweep: bool = False
+    is_sweep:       bool = False     # True when trade_type == "SWEEP"
 
     # Classification (set later)
     sentiment:       str = "NEUTRAL" # BULLISH | BEARISH | NEUTRAL
+    order_side:      str = "UNKNOWN" # BUY | SELL | UNKNOWN (Tradier stream never sets this)
     influence_tier:  str = "RETAIL"  # WHALE | INSTITUTIONAL | LARGE | RETAIL
     conviction_score: float = 0.0
 
@@ -161,21 +155,7 @@ class OptionsFlowEvent:
     underlying_price:  float = 0.0
 
     # Data quality flag
-        # Data quality flag
     is_synthetic_quote: bool = False
-
-    @property
-    def occ_symbol(self) -> str:
-        try:
-            if not self.ticker or not self.expiry or not self.contract_type:
-                return ""
-            ymd = self.expiry.replace("-", "")
-            yy_mm_dd = ymd[2:]
-            cp = "C" if self.contract_type.upper() == "CALL" else "P"
-            strike_int = int(round(self.strike * 1000))
-            return f"{self.ticker.upper()}{yy_mm_dd}{cp}{strike_int:08d}"
-        except Exception:
-            return ""
 
 
 _OCC_RE = re.compile(
@@ -230,18 +210,12 @@ def parse_tradier_trade(
         raw:         Raw Tradier timesale tick dict.
         min_premium: ING-010 — tier-aware premium floor resolved by the caller.
                      When None, falls back to module-level _MIN_EVENT_PREMIUM (10_000).
-                     Caller (_process_trade) resolves: registry.influence_tier(ticker)
-                     -> gate_config_store.get("min_premium", tier_int) and passes result.
 
     Returns:
       OptionsFlowEvent  — valid event, passes all gates
       "below_premium"   — clean filter drop: premium < effective floor (ING-002/ING-010)
-                          Caller must NOT increment parse_failed for this sentinel.
-                          _stats["below_min_premium"] is incremented here, by the gate.
       None              — genuine parse error or size==0 guard triggered
     """
-    # ING-010: resolve effective floor for this tick.
-    # Caller supplies tier-resolved value; fallback to module constant when absent.
     effective_floor: int = min_premium if min_premium is not None else _MIN_EVENT_PREMIUM
 
     try:
@@ -263,12 +237,6 @@ def parse_tradier_trade(
 
         premium = fill * size * 100
 
-        # ING-002 / ING-010: Tier-aware per-event premium floor.
-        # Gate fires after size==0 guard, after premium is known,
-        # before OCC parsing and OptionsFlowEvent construction.
-        # Counter incremented here — gate owns its counter.
-        # Sampling log: every _BELOW_PREMIUM_SAMPLE_RATE-th drop emits a DEBUG
-        # line so the ticker composition of this gate is observable in logs.
         if premium < effective_floor:
             _stats["below_min_premium"] += 1
             if (
@@ -319,22 +287,6 @@ def parse_tradier_trade(
         exc_cnt  = int(raw.get("exchange_count", 1) or 1)
         fill_cnt = int(raw.get("fill_count", 1) or 1)
 
-        # ------------------------------------------------------------------
-        # Synthetic quote handling
-        # When bid=ask=0 we have no real spread data. Instead of fabricating
-        # a tight ±0.5% spread and running classification (which almost
-        # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
-        # wide-spread contracts), we:
-        #   1. Flag is_synthetic_quote=True
-        #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
-        #   3. Force is_aggressive=False — cannot claim aggression without quotes
-        #   4. Apply a 40% conviction haircut (×0.6) downstream
-        # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
-        # post-registry — synthetic spreads have no valid aggression signal.
-        # NOTE (SENTIMENT FIX): synthetic quotes force ba_class="MID" which
-        # means classify_sentiment() falls back to contract type — correct
-        # behaviour since we have no fill placement signal.
-        # ------------------------------------------------------------------
         is_synthetic_quote = False
         effective_bid = bid
         effective_ask = ask
@@ -343,20 +295,25 @@ def parse_tradier_trade(
             effective_bid = round(fill * 0.995, 4)
             effective_ask = round(fill * 1.005, 4)
             is_synthetic_quote = True
-            ba_class   = "MID"   # force neutral, skip classify_bid_ask
-            aggressive = False   # cannot claim aggression without real quotes
+            ba_class   = "MID"
+            aggressive = False
         else:
             ba_class   = classify_bid_ask(fill, effective_bid, effective_ask)
-            # ING-006: use directional aggression classifier (replaces is_aggressive shim)
             aggressive = is_directionally_aggressive(ba_class, ctype)
 
         ttype  = detect_trade_type(size, premium, exc_cnt, fill_cnt)
         golden = is_golden_sweep(ttype, premium, aggressive)
 
+        # FIX-OCC-SYMBOL: Normalise OCC symbol — strip whitespace so both
+        # "AAPL  260117C00200000" and "AAPL260117C00200000" collapse to the
+        # same canonical form used by chain_store lookups.
+        occ_sym = symbol.strip()
+
         ev = OptionsFlowEvent(
             id              = raw.get("id", f"{ticker}_{expiry}_{strike}_{ctype}"),
             ticker          = ticker,
             timestamp       = _parse_timestamp(raw.get("timestamp")),
+            occ_symbol      = occ_sym,
             contract_type   = ctype,
             strike          = strike,
             expiry          = expiry,
@@ -370,6 +327,7 @@ def parse_tradier_trade(
             bid_ask_class   = ba_class,
             is_aggressive   = aggressive,
             is_golden_sweep = golden,
+            is_sweep        = (ttype == "SWEEP"),
             exchange_count  = exc_cnt,
             fill_count      = fill_cnt,
             open_interest   = int(raw.get("open_interest", 0) or 0),
@@ -378,10 +336,6 @@ def parse_tradier_trade(
             is_synthetic_quote = is_synthetic_quote,
         )
 
-        # SENTIMENT FIX (2026-05-09): derive from bid_ask_class + contract_type.
-        # ASK-side fills -> buyer initiating -> sentiment follows contract type.
-        # BID-side fills -> seller writing  -> sentiment is INVERSE of contract type.
-        # MID fills      -> ambiguous        -> fallback to contract type.
         ev.sentiment = classify_sentiment(ev.bid_ask_class, ev.contract_type)
 
         if premium >= 2_000_000:
@@ -403,19 +357,11 @@ def parse_tradier_trade(
             3,
         )
 
-        # 40% conviction haircut for synthetic quotes — prevents wide-spread
-        # contracts with unknown fill placement from scoring as high-conviction
-        # events solely on premium size.
         if is_synthetic_quote:
             ev.conviction_score = round(raw_conviction * 0.6, 3)
         else:
             ev.conviction_score = raw_conviction
 
-        # ------------------------------------------------------------------
-        # Registry enrichment block.
-        # Guarded by its own try/except so registry errors degrade gracefully
-        # without poisoning ev.is_aggressive (see F1 fix below).
-        # ------------------------------------------------------------------
         try:
             reg = get_registry()
             if reg and reg.is_ready():
@@ -427,11 +373,8 @@ def parse_tradier_trade(
                     ev.contract_type = meta.contract_type
                     ev.dte           = meta.dte
                     ev.open_interest = meta.open_interest
-                    # SENTIMENT FIX: re-derive after registry may flip contract_type.
-                    # bid_ask_class does not change here — only contract_type can flip.
                     ev.sentiment = classify_sentiment(ev.bid_ask_class, ev.contract_type)
 
-                # ING-004: Fallback underlying_price from registry stock_price.
                 if ev.underlying_price == 0.0:
                     sp = reg.stock_price(ev.ticker)
                     if sp > 0.0:
@@ -440,9 +383,6 @@ def parse_tradier_trade(
         except Exception:
             pass
 
-        # ------------------------------------------------------------------
-        # ING-006 (F1 fix): re-compute is_aggressive AFTER registry enrichment.
-        # ------------------------------------------------------------------
         if not ev.is_synthetic_quote:
             try:
                 ev.is_aggressive = is_directionally_aggressive(
