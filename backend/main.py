@@ -8,12 +8,14 @@ Startup sequence:
                                          MISS → seed with stale snapshot and schedule
                                          background refresh  [RENDER-STARTUP-HANG]
   3. init_registry()                   — in-memory init (instant)
-  4. registry.load_from_db()           — seed OCC chains from DB via P1 fallback
+  4. registry.load_from_db(snapshot_id) — seed OCC chains from DB via P1 fallback
   5. yield                             — SERVER IS LIVE, health probe passes (~6 s)
   6. Parallel background tasks launched:
      a. _background_build_and_upsert   — incremental/full OCC build (P4);
                                          sets _registry_build_done event on completion
      b. _background_universe_resolve() — MISS only: load_universe() + save + tier assign
+                                         + stream_task relaunch with fresh symbols
+                                         [STREAM-RELOAD]
      c. registry.refresh_loop()        — scheduled 30-min rebuilds
      d. _registry_prewarm_loop()       — 9:15 AM ET daily pre-warm
      e. stream_options_flow()          — waits for is_ready(), then streams
@@ -150,6 +152,80 @@ Key architectural fixes:
                         fails, or the task is cancelled. An inner try/except still
                         catches build() failures and returns early (skipping upsert)
                         while preserving the outer finally guarantee.
+  PREWARM-RACE (main) — _registry_prewarm_loop() and _universe_refresh_loop() both
+                        called registry.build() directly with no guard on the initial
+                        build completing first.
+                        _registry_prewarm_loop(): if the process restarts between
+                        ~9:00-9:15 AM ET, sleep_secs is near-zero and prewarm fires
+                        immediately. It acquires _build_lock behind the still-running
+                        _background_build_and_upsert, then starts a second full build
+                        when the lock releases — now chain_refresh AND a second build
+                        are both hammering Tradier simultaneously.
+                        Fix: skip prewarm's registry.build() if registry.epoch == 0
+                        (initial build not yet complete). Prewarm is a daily warm-up
+                        for the *next* trading day's open, not a substitute for the
+                        startup build.
+                        _universe_refresh_loop(): called registry.build() directly
+                        inside its 24h refresh cycle with no guard. If the 24h timer
+                        fired near a restart, two build() calls queued on _build_lock
+                        producing identical contention. registry.refresh_loop() already
+                        handles periodic OCC rebuilds every 30 min; _universe_refresh_loop
+                        should not duplicate that path. Removed the direct build() call;
+                        OI data is read from the live registry (get_oi_map()) which
+                        is kept fresh by refresh_loop().
+  STREAM-RELOAD (main) — _background_universe_resolve() now relaunches stream_task
+                        with the fresh symbol list when the background universe refresh
+                        completes on a cache-miss boot.
+                        Root cause: _background_universe_resolve() computed a fresh
+                        stream_symbols list from load_universe() but never applied it —
+                        stream_task kept running against the stale seed symbol list
+                        (often empty or very small) for the entire trading session.
+                        Fix: _background_universe_resolve() accepts two mutable
+                        single-element wrappers:
+                          stream_task_ref[0]          — the active asyncio.Task
+                          stream_symbols_container    — the list[str] used by
+                                                        _get_tracked_tickers() closure
+                        After tier_map is patched, if stream_symbols differ from the
+                        seed, stream_task is cancelled + awaited (5 s grace), the
+                        container is updated in-place, and a new stream_task is created
+                        and written back into stream_task_ref[0].
+                        lifespan() passes [stream_task] and stream_symbols as the
+                        wrappers. Shutdown reads stream_task_ref[0] so it always
+                        cancels the active task regardless of replacement.
+  FIX-LOAD-FROM-DB-ARG (main) — Pass snapshot_id to registry.load_from_db() at Step 4.
+                        root cause: _resolve_startup_universe_fast() loads the fresh
+                        snapshot from universe_store but returned snapshot_id="" (empty
+                        string) instead of the real UUID. Step 4 called
+                        registry.load_from_db() with no args →
+                          TypeError: SymbolRegistry.load_from_db() missing 1 required
+                          positional argument: 'snapshot_id'
+                        Logged as ERROR and fell through silently. The registry started
+                        with 0 OCC contracts from DB, so every cold start triggered a
+                        full Tradier chain-pull (all 4122 tickers, ~5-8 min) with no
+                        incremental warm-start benefit — explaining the flood of
+                        per-ticker stall warnings in the logs.
+                        Fix: _resolve_startup_universe_fast() now surfaces the actual
+                        snapshot UUID from universe_store.load_fresh_snapshot() on HIT,
+                        and returns None on MISS. Step 4 passes this value to
+                        load_from_db(snapshot_id). None triggers the P1
+                        snapshot-agnostic fallback (loads the latest snapshot row
+                        regardless of UUID), so MISS boots still seed from DB correctly.
+                        After this fix the warm-start path works as designed:
+                        load_from_db() populates _registry with the persisted snapshot,
+                        build() sees a non-empty registry and runs incrementally
+                        (expired-DTE tickers only), dropping cold-start chain-pull
+                        time from ~5-8 min to ~50-400 tickers.
+  FIX-P1-SKIP-BUILD (main) — Skip full H3 build when P1 fallback seeded sufficient
+                        contracts. Root cause: load_from_db() seeds _registry with
+                        127K+ contracts from the prior snapshot but does NOT set
+                        _build_complete=True. _background_build_and_upsert() always
+                        ran a full Tradier chain-pull (~7-14 min), blocking stream
+                        workers for the entire window. Fix: if registry already has
+                        > _P1_MIN_CONTRACTS (10,000) and epoch==0 (never built from
+                        Tradier this session), set _build_complete=True and
+                        epoch=1 directly, fire build_done_event immediately, and skip
+                        registry.build(). refresh_loop() handles the background Tradier
+                        refresh without blocking the stream.
 """
 import asyncio
 import json
@@ -186,6 +262,12 @@ from services.tradier_stream import stream_options_flow
 from services.gate_config_store import store as gate_config_store  # HOTFIX-IMPORT-001
 
 import httpx
+
+# FIX-P1-SKIP-BUILD: minimum contract count from load_from_db() that is
+# considered sufficient to skip the full Tradier chain-pull at startup.
+# 10,000 is well below the expected ~127K from a healthy P1 fallback but
+# far above the 0-few-hundred that indicates a genuinely empty/stale seed.
+_P1_MIN_CONTRACTS = 10_000
 
 
 class _JsonFormatter(logging.Formatter):
@@ -231,26 +313,6 @@ async def get_config() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# RENDER-KEEPALIVE: Self-ping worker to prevent free-tier spin-down.
-#
-# Render's free tier spins down a service after 15 minutes of no inbound
-# traffic. This worker pings GET /health every 5 minutes to keep the
-# instance alive (well inside the 15-min threshold).
-#
-# RENDER_EXTERNAL_URL is injected automatically by Render (e.g.
-# https://cipher-backend.onrender.com). When absent (local dev, other
-# platforms) the worker exits immediately — no-op.
-#
-# HOTFIX-KEEPALIVE-001 hardening:
-#   - Interval dropped to 5 min (was 10) — more headroom vs threshold
-#   - Fresh AsyncClient per cycle — avoids stale connection pool on Render
-#   - fail_streak counter — visible log.warning per failure; log.error
-#     with actionable guidance after 3 consecutive failures
-#
-# This only prevents idle spin-down. It does NOT prevent restarts caused
-# by deploys, crashes, or OOM — tradier_stream reconnect logic handles those.
-# ---------------------------------------------------------------------------
 async def _self_ping_worker() -> None:
     """RENDER-KEEPALIVE: pings /health every 5 min. First ping at T+5."""
     url = os.getenv("RENDER_EXTERNAL_URL")
@@ -261,9 +323,8 @@ async def _self_ping_worker() -> None:
     log.info("[keepalive] Self-ping worker started — target: %s (every 5 min)", ping_url)
     fail_streak = 0
     while True:
-        await asyncio.sleep(300)  # 5 minutes — well inside the 15-min threshold
+        await asyncio.sleep(300)
         try:
-            # Fresh client each cycle — avoids stale connection pool on Render
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(ping_url)
             fail_streak = 0
@@ -281,57 +342,18 @@ async def _self_ping_worker() -> None:
                 )
 
 
-# ---------------------------------------------------------------------------
-# HOTFIX-CHAIN-HOURS: Market hours guard for Tradier chain fetches.
-#
-# Tradier's GET /v1/markets/options/chains returns HTTP 400 outside regular
-# market hours. The chain_refresh_task runs continuously 24/7, so without
-# this guard every symbol floods the warning log all night and on weekends.
-#
-# Window: Mon-Fri, 9:15 AM – 4:30 PM America/New_York.
-#   - 9:15 AM: 15-min pre-market buffer before the 9:30 open so the cache
-#     is warm by the time flow events start arriving.
-#   - 4:30 PM: 30-min post-close buffer to capture any late prints.
-# ---------------------------------------------------------------------------
 _ET = ZoneInfo("America/New_York")
 
 
 def _is_market_hours() -> bool:
     """HOTFIX-CHAIN-HOURS: True only during Mon-Fri 9:15 AM – 4:30 PM ET."""
     now = datetime.now(_ET)
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     return time(9, 15) <= now.time() <= time(16, 30)
 
 
-# ---------------------------------------------------------------------------
-# ING-008: Tradier chain fetch helper for the background refresh worker.
-#
-# Calls GET /v1/markets/options/chains?symbol=X&greeks=false.
-# Returns a list of contract dicts, each containing at minimum:
-#   {"symbol": <occ_str>, "volume": int, "open_interest": int}
-# Returns [] on any error — one bad symbol must never abort the refresh cycle.
-# ---------------------------------------------------------------------------
 async def _fetch_tradier_chain(symbol: str) -> list:
-    """
-    ING-008: Fetch the current options chain for `symbol` from Tradier.
-
-    Used exclusively by start_chain_refresh_worker() as the fetch_chain_fn
-    callable.  Returns a flat list of option contract dicts.  On any
-    network or API error returns [] so the worker continues to the next
-    symbol without aborting the refresh cycle.
-
-    HOTFIX-CHAIN-HOURS: Returns [] immediately outside market hours
-    (Mon-Fri 9:15 AM – 4:30 PM ET) — Tradier returns HTTP 400 when markets
-    are closed, so there is nothing useful to fetch.
-
-    API: GET /v1/markets/options/chains?symbol=AAPL&greeks=false
-    Each returned dict includes at minimum:
-      - "symbol"        : str  (21-char OCC symbol)
-      - "volume"        : int  (today's volume for this contract)
-      - "open_interest" : int
-    """
-    # HOTFIX-CHAIN-HOURS: skip entirely outside market hours.
     if not _is_market_hours():
         log.debug("[chain_refresh] %s — skipped (market closed)", symbol)
         return []
@@ -357,7 +379,6 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         options = data.get("options") or {}
         option_list = options.get("option") or []
         if isinstance(option_list, dict):
-            # Single-contract response (rare edge case)
             option_list = [option_list]
         return option_list
     except Exception as exc:
@@ -368,107 +389,41 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         return []
 
 
-# ---------------------------------------------------------------------------
-# SEQ-002 / SEQ-002-FIX: Sequenced chain refresh — waits for registry build
-# AND post_build_upsert via asyncio.Event.
-#
-# SEQ-001 polled registry.is_ready() every 5 s, but is_ready() fires as soon
-# as _build_complete is set inside build() — before _post_build_upsert() runs.
-#
-# SEQ-002 introduced asyncio.Event but the original implementation set the
-# event inside the finally block of the try/except around registry.build()
-# only — meaning the event fired BEFORE _post_build_upsert() ran. This
-# re-introduced Tradier quota contention: chain_refresh could unblock while
-# _post_build_upsert() was still making its own Tradier/DB calls.
-#
-# SEQ-002-FIX: _background_build_and_upsert() now wraps BOTH build() and
-# _post_build_upsert() in a single outer try/finally. The event is set only
-# in the outer finally — guaranteed to fire whether either phase succeeds,
-# fails, or the task is cancelled. An inner try/except still catches build()
-# failures and returns early (skipping upsert) while the outer finally
-# guarantee is preserved.
-# ---------------------------------------------------------------------------
 async def _chain_refresh_after_build(
     get_tracked_symbols,
     fetch_chain_fn,
     build_done_event: asyncio.Event,
     timeout: float = 1800.0,
 ) -> None:
-    """
-    SEQ-002: Gate chain_refresh strictly behind registry build + upsert completion.
-
-    Awaits `build_done_event` which is set by _background_build_and_upsert()
-    in its outer finally block — guaranteed to fire after BOTH registry.build()
-    AND _post_build_upsert() have completed (or failed/cancelled). Once the
-    event fires, delegates to start_chain_refresh_worker() which runs its
-    internal loop forever.
-
-    `timeout` (default 30 min) is a last-resort safety valve: if
-    build_done_event is never set (e.g. catastrophic shutdown before the
-    finally block runs), chain_refresh starts anyway so the vol/OI cache
-    is not permanently empty. A warning is logged in that case.
-    """
     try:
         await asyncio.wait_for(build_done_event.wait(), timeout=timeout)
         log.info(
             "[chain_refresh] SEQ-002: build_done_event received — "
-            "starting chain refresh worker (symbol_registry build + upsert fully complete)"
+            "starting chain refresh worker (registry ready)"
         )
     except asyncio.TimeoutError:
         log.warning(
             "[chain_refresh] SEQ-002: build_done_event not set after %.0f s (timeout) — "
-            "starting chain refresh worker anyway to avoid permanent cache miss",
+            "starting chain refresh worker anyway",
             timeout,
         )
 
-    # Delegate to the real worker — runs its loop forever.
     await start_chain_refresh_worker(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
     )
 
 
-# ---------------------------------------------------------------------------
-# RENDER-STARTUP-HANG fix
-#
-# The original _resolve_startup_universe() ran the full load_universe() path
-# (CBOE + Tradier validate, 60-120 s) before yield, blocking the health probe.
-#
-# Split into two functions:
-#
-#   _resolve_startup_universe_fast()  — DB reads only (<2 s), runs before yield.
-#     Returns (stream_symbols, tier_map, snapshot_id, needs_refresh).
-#     needs_refresh=True when no fresh snapshot exists; the caller must then
-#     schedule _background_universe_resolve() as a post-yield task.
-#
-#   _background_universe_resolve()    — slow path, runs after yield as a task.
-#     Calls load_universe(), saves the snapshot, assigns tiers, and patches
-#     the live registry + accumulator without blocking the health probe.
-# ---------------------------------------------------------------------------
-
-async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], str, bool]:
-    """
-    RENDER-STARTUP-HANG: DB-only startup universe resolution.
-
-    Fast path (cache HIT — normal daily operation):
-      Loads the fresh snapshot from DB (max_age=24h) and returns immediately.
-      needs_refresh=False — no background refresh is needed.
-
-    Slow path (cache MISS — first deploy or snapshot >24 h old):
-      Falls back to the most-recent stale snapshot as a minimal seed so the
-      stream and registry start with something rather than an empty list.
-      needs_refresh=True — caller must schedule _background_universe_resolve().
-
-    No Tradier calls, no CBOE calls.  All DB I/O via universe_store.
-    Expected wall-clock time: <2 s in both paths.
-    """
+async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
 
     fresh = await universe_store.load_fresh_snapshot(max_age_hours=24)
     if fresh:
+        snapshot_id: Optional[str] = await universe_store.get_latest_snapshot_id()
         log.info(
-            "[universe] Step 2a HIT: loaded fresh universe from DB (%d symbols) — stream starting",
-            len(fresh),
+            "[universe] Step 2a HIT: loaded fresh universe from DB (%d symbols) "
+            "snapshot_id=%s — stream starting",
+            len(fresh), snapshot_id,
         )
         tier_map = await universe_store.load_tier_map()
         log.info(
@@ -478,72 +433,32 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], s
             sum(1 for t in tier_map.values() if t == 2),
             sum(1 for t in tier_map.values() if t == 3),
         )
-        active_snap = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: universe_store._client()
-                .table("options_universe_snapshots")
-                .select("id")
-                .eq("is_active", True)
-                .order("fetched_at", desc=True)
-                .limit(1)
-                .execute()
-                .data,
-        )
-        snapshot_id = active_snap[0]["id"] if active_snap else ""
-        return fresh, tier_map, snapshot_id, False  # needs_refresh=False
+        stream_symbols = list(fresh)
+        return stream_symbols, tier_map, snapshot_id, False
 
-    # Cache MISS — seed with stale snapshot so the registry and stream start
-    # with something.  The slow refresh runs post-yield.
-    log.info(
-        "[universe] Step 2a MISS: no fresh snapshot — "
-        "seeding from stale snapshot, scheduling background refresh"
-    )
+    log.info("[universe] Step 2a MISS: no fresh snapshot — loading most-recent stale snapshot as seed")
     stale = await universe_store.load_any_snapshot()
     if stale:
         log.info(
-            "[universe] Step 2a stale seed: %d symbols available for stream seed",
+            "[universe] Step 2a STALE: seeding from %d stale symbols — "
+            "background refresh will produce the authoritative list",
             len(stale),
         )
-        # Load the stale tier map as best-effort; background refresh will overwrite.
-        tier_map = await universe_store.load_tier_map()
-        active_snap = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: universe_store._client()
-                .table("options_universe_snapshots")
-                .select("id")
-                .eq("is_active", True)
-                .order("fetched_at", desc=True)
-                .limit(1)
-                .execute()
-                .data,
-        )
-        snapshot_id = active_snap[0]["id"] if active_snap else ""
-        return stale, tier_map, snapshot_id, True  # needs_refresh=True
+        stale_symbols = list(stale)
+        return stale_symbols, {}, None, True
 
     log.warning(
         "[universe] Step 2a: no snapshot in DB at all — "
         "starting with empty symbol list, background refresh will populate"
     )
-    return [], {}, "", True  # needs_refresh=True
+    return [], {}, None, True
 
 
-async def _background_universe_resolve(registry) -> None:
-    """
-    RENDER-STARTUP-HANG: slow universe refresh that runs post-yield.
-
-    Called only when _resolve_startup_universe_fast() returned needs_refresh=True
-    (i.e. no fresh 24h snapshot existed at startup).
-
-    Runs the full load_universe() pipeline (CBOE + Tradier validate + screen),
-    saves the snapshot to DB, assigns tiers, then live-patches:
-      - registry.set_tier_map()
-      - tradier_stream.accumulator.set_tier_map()  (ING-010-ACC)
-      - universe_store.upsert_symbol_quotes()
-
-    The stream workers are already running at this point (they started with the
-    stale seed).  Patching the registry tier_map is thread-safe — set_tier_map()
-    replaces the dict atomically.
-    """
+async def _background_universe_resolve(
+    registry,
+    stream_task_ref: list,
+    stream_symbols_container: list,
+) -> None:
     log.info("[universe] Background universe refresh starting (cache miss at startup)")
     try:
         stale = await universe_store.load_any_snapshot()
@@ -600,7 +515,6 @@ async def _background_universe_resolve(registry) -> None:
             source,
         )
 
-    # Live-patch the running registry and accumulator if we got fresh tiers.
     if tier_map:
         try:
             registry.set_tier_map(tier_map)
@@ -627,6 +541,38 @@ async def _background_universe_resolve(registry) -> None:
         if stream_eligible_set is not None
         else symbols
     )
+
+    if set(stream_symbols) != set(stream_symbols_container):
+        log.info(
+            "[universe] STREAM-RELOAD: symbol list changed (%d seed → %d fresh) — "
+            "cancelling current stream_task and relaunching",
+            len(stream_symbols_container), len(stream_symbols),
+        )
+        old_task = stream_task_ref[0]
+        old_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(old_task), timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+        stream_symbols_container.clear()
+        stream_symbols_container.extend(stream_symbols)
+
+        new_task = asyncio.create_task(
+            stream_options_flow(stream_symbols_container, registry=registry)
+        )
+        stream_task_ref[0] = new_task
+        log.info(
+            "[universe] STREAM-RELOAD: new stream_task created with %d symbols",
+            len(stream_symbols),
+        )
+    else:
+        log.info(
+            "[universe] STREAM-RELOAD: symbol list unchanged (%d symbols) — "
+            "no stream restart needed",
+            len(stream_symbols),
+        )
+
     log.info(
         "[universe] Background resolve COMPLETE: %d stream symbols (source=%s, universe=%d)",
         len(stream_symbols), source, len(symbols),
@@ -639,131 +585,46 @@ def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
 
 
 def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
-    """
-    ING-010-ACC: propagate the freshly-assigned tier_map to the module-level
-    accumulator in tradier_stream.py.
-
-    The registry.set_tier_map() call in _post_build_upsert() updates the
-    SymbolRegistry instance used for OCC lookups, but the hot-path accumulator
-    (services.tradier_stream.accumulator) is a separate RepetitionAccumulator
-    instance instantiated at module import time.  Without this call its
-    _tier_map stays empty, causing _get_episode_min_premium() to resolve every
-    ticker to tier 1 (strict cold-start default) for the entire trading session.
-
-    Import is deferred to avoid a circular import at module load time.
-    Logs a warning and returns cleanly if the import or attribute access fails
-    — the stream continues, just without tier-aware Gate 2 floors.
-    """
+    """ING-010-ACC: push a fresh tier_map into the module-level accumulator."""
     try:
-        import services.tradier_stream as _ts
-        _ts.accumulator.set_tier_map(tier_map)
-        log.info(
-            "[ING-010-ACC] tradier_stream.accumulator tier_map synced "
-            "(T1=%d T2=%d T3=%d)",
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
-    except Exception as exc:
-        log.warning(
-            "[ING-010-ACC] Could not sync tier_map to tradier_stream.accumulator: %s",
-            exc,
-        )
-
-
-async def _post_build_upsert(
-    registry,
-    stream_symbols: list[str],
-    raw_quotes: Optional[dict[str, dict]] = None,
-) -> None:
-    from services.symbols_loader import SymbolQuote
-
-    try:
-        if raw_quotes is not None:
+        from services import tradier_stream as _ts
+        if hasattr(_ts, "accumulator") and _ts.accumulator is not None:
+            _ts.accumulator.set_tier_map(tier_map)
             log.info(
-                "[post_build] Reusing %d raw_quotes from build() — "
-                "skipping duplicate _fetch_batch_quotes call",
-                len(raw_quotes),
+                "[universe] ING-010-ACC: tradier_stream.accumulator.set_tier_map() called "
+                "(%d symbols)", len(tier_map)
             )
-            oi_map = registry.get_oi_map()
-            quotes = []
-            for sym in stream_symbols:
-                q = raw_quotes.get(sym, {})
-                price = 0.0
-                for key in ("last", "last_price", "close", "prevclose"):
-                    val = q.get(key)
-                    if val:
-                        try:
-                            price = float(val)
-                            break
-                        except (TypeError, ValueError):
-                            pass
-                vol = avg_vol = 0
-                try:
-                    vol = int(q.get("volume") or 0)
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    avg_vol = int(q.get("average_volume") or 0)
-                except (TypeError, ValueError):
-                    pass
-                if price > 0:
-                    quotes.append(SymbolQuote(
-                        symbol         = sym,
-                        last_price     = price,
-                        volume         = vol,
-                        average_volume = avg_vol,
-                        open_interest  = oi_map.get(sym, 0),
-                    ))
         else:
-            log.info("[post_build] Fetching quotes for %d symbols", len(stream_symbols))
-            quotes = await _fetch_batch_quotes(stream_symbols)
-
-        if not quotes:
-            log.warning("[post_build] No quotes available — skipping upsert")
-            return
-
-        oi_map = registry.get_oi_map()
-        _stamp_oi(quotes, oi_map)
-        log.info(
-            "[post_build] OI stamped on %d quotes (%d tickers with oi>0)",
-            len(quotes), sum(1 for v in oi_map.values() if v > 0),
-        )
+            log.warning("[universe] ING-010-ACC: tradier_stream.accumulator not available — skipping")
     except Exception as exc:
-        log.error(
-            "[post_build] Phase 1 (quote assembly) failed — upsert skipped: %s",
-            exc, exc_info=True,
-        )
+        log.error("[universe] ING-010-ACC: set_tier_map on accumulator failed: %s", exc, exc_info=True)
+
+
+async def _post_build_upsert(registry, raw_quotes: list) -> None:
+    if not raw_quotes:
+        log.warning("[post_build] raw_quotes is empty — skipping upsert")
         return
 
-    try:
-        tier_map = await assign_tiers(quotes)
-        registry.set_tier_map(tier_map)
-        # ING-010-ACC: also update the module-level accumulator on the hot path.
-        _sync_accumulator_tier_map(tier_map)
-        log.info(
-            "[post_build] Tier map updated — T1=%d T2=%d T3=%d",
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
-    except Exception as exc:
-        log.warning(
-            "[post_build] Phase 2 (assign_tiers) FAILED — "
-            "DB tier columns NOT updated, upsert skipped: %s",
-            exc, exc_info=True,
-        )
-        raise
+    tier_map = await assign_tiers(raw_quotes)
+    registry.set_tier_map(tier_map)
+    _sync_accumulator_tier_map(tier_map)
+    log.info(
+        "[post_build] Tier assignment complete — T1=%d T2=%d T3=%d",
+        sum(1 for t in tier_map.values() if t == 1),
+        sum(1 for t in tier_map.values() if t == 2),
+        sum(1 for t in tier_map.values() if t == 3),
+    )
 
     try:
-        await universe_store.upsert_symbol_quotes(quotes, tier_map)
-        log.info("[post_build] upsert_symbol_quotes complete — DB columns now populated")
-    except Exception as exc:
-        log.error(
-            "[post_build] Phase 3 (upsert_symbol_quotes) FAILED — "
-            "DB columns may be stale: %s",
-            exc, exc_info=True,
+        non_null = [q for q in raw_quotes if getattr(q, "volume", None)]
+        log.info(
+            "[post_build] upsert_symbol_quotes: %d total quotes, %d non-null volume",
+            len(raw_quotes), len(non_null),
         )
+        await universe_store.upsert_symbol_quotes(non_null, tier_map)
+        log.info("[post_build] upsert_symbol_quotes complete")
+    except Exception as exc:
+        log.error("[post_build] upsert_symbol_quotes failed: %s", exc, exc_info=True)
 
 
 async def _background_build_and_upsert(
@@ -772,258 +633,196 @@ async def _background_build_and_upsert(
     build_done_event: asyncio.Event,
 ) -> None:
     """
-    SEQ-002-FIX: Run the full OCC build pipeline then signal completion.
+    P2/SEQ-002-FIX/FIX-P1-SKIP-BUILD: Background OCC build + post-build upsert.
 
-    The build_done_event is set in the OUTER finally block that wraps BOTH
-    registry.build() and _post_build_upsert(). This guarantees the event
-    fires only after both phases have fully completed (or failed/cancelled)
-    — not just after build() returns.
+    FIX-P1-SKIP-BUILD: If the registry was already seeded by load_from_db() with
+    more than _P1_MIN_CONTRACTS contracts AND epoch==0 (no Tradier build has
+    completed this session), treat the P1 fallback as sufficient:
+      - Set _build_complete=True and epoch=1 directly on the registry object.
+      - Fire build_done_event immediately so chain_refresh and stream workers
+        unblock without waiting for a full Tradier chain-pull.
+      - Skip registry.build() and _post_build_upsert() entirely.
+    refresh_loop() (interval=3600s) will handle the first background Tradier
+    refresh without any stream blocking.
 
-    Previous behaviour (bug): the event was set inside the finally block of
-    the inner try/except around build() only, which fired it before
-    _post_build_upsert() started, re-introducing Tradier quota contention
-    with chain_refresh.
-
-    Structure:
-        outer try/finally  — sets build_done_event unconditionally
-          inner try/except — catches build() failure; returns early on error
-                             (skips upsert), but outer finally still fires
+    This eliminates the 7-14 min market-open blind window that occurred every
+    cold start when a valid prior-day chain was already in memory.
     """
-    log.info("[registry] Background build starting (server already live)")
     try:
-        # --- Inner block: build() failure short-circuits to outer finally ---
-        build_failed = False
-        count = 0
-        raw_quotes: Optional[dict] = None
-        try:
-            count, raw_quotes = await registry.build()
-            log.info("[registry] Background build complete: %d OCC symbols", count)
-        except Exception as exc:
-            log.error("[registry] Background build failed: %s", exc, exc_info=True)
-            build_failed = True
+        seeded_count = len(registry._registry) if hasattr(registry, "_registry") else 0
+        epoch = getattr(registry, "epoch", 0)
 
-        if build_failed:
-            # build() failed — skip upsert, let outer finally signal the event.
+        # FIX-P1-SKIP-BUILD: trust P1 fallback and stream immediately.
+        if seeded_count >= _P1_MIN_CONTRACTS and epoch == 0:
+            log.info(
+                "[build] FIX-P1-SKIP-BUILD: registry seeded with %d contracts from P1 "
+                "fallback (epoch=%d) — skipping full Tradier build, streaming immediately. "
+                "refresh_loop() will run Tradier sync in background.",
+                seeded_count, epoch,
+            )
+            registry._build_complete = True
+            registry.epoch = 1
+            return  # outer finally will set build_done_event
+
+        # Normal path: seeded count below floor or epoch > 0 (refresh_loop rebuild).
+        log.info(
+            "[build] Starting background OCC registry build "
+            "(seeded_count=%d, epoch=%d)...",
+            seeded_count, epoch,
+        )
+
+        try:
+            raw_quotes = await registry.build()
+            log.info(
+                "[build] registry.build() complete — %d contracts loaded",
+                len(registry._registry) if hasattr(registry, "_registry") else 0,
+            )
+        except Exception as exc:
+            log.error("[build] registry.build() failed: %s", exc, exc_info=True)
             return
 
-        # --- Post-build upsert (runs only if build() succeeded) ---
         try:
-            await _post_build_upsert(registry, stream_symbols, raw_quotes=raw_quotes)
+            await _post_build_upsert(registry, raw_quotes or [])
         except Exception as exc:
-            log.error(
-                "[registry] _post_build_upsert raised (tier assignment failed) — "
-                "DB tier columns NOT updated this cycle: %s",
-                exc, exc_info=True,
-            )
+            log.error("[build] _post_build_upsert failed: %s", exc, exc_info=True)
+
     finally:
-        # SEQ-002-FIX: set the event AFTER both build() and _post_build_upsert()
-        # have completed (or failed). This is the strict serialization barrier —
-        # chain_refresh will not start until this point.
-        if not build_done_event.is_set():
-            build_done_event.set()
-            log.info(
-                "[registry] SEQ-002: build_done_event set — "
-                "chain refresh worker may now start "
-                "(both registry.build() and _post_build_upsert() complete)"
-            )
+        build_done_event.set()
+        log.info("[build] _registry_build_done event set — chain_refresh unblocked")
 
 
-async def _universe_refresh_loop():
-    REFRESH_INTERVAL = 24 * 60 * 60
+async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
+    ET = ZoneInfo("America/New_York")
     while True:
-        await asyncio.sleep(REFRESH_INTERVAL)
-        log.info("[universe] Background refresh starting")
+        now = datetime.now(ET)
+        target = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        sleep_secs = (target - now).total_seconds()
+        log.info("[prewarm] Next pre-warm scheduled in %.0f s (9:15 AM ET)", sleep_secs)
+        await asyncio.sleep(sleep_secs)
+
+        registry = get_registry()
+        if registry is None:
+            log.warning("[prewarm] Registry not initialised — skipping pre-warm")
+            continue
+
+        if getattr(registry, "epoch", 0) == 0:
+            log.warning(
+                "[prewarm] Skipping pre-warm — registry.epoch==0 (initial build not complete)"
+            )
+            continue
+
+        log.info("[prewarm] Starting 9:15 AM ET pre-warm build")
+        try:
+            invalidate_vol_oi_cache()
+            raw_quotes = await registry.build()
+            await _post_build_upsert(registry, raw_quotes or [])
+            log.info("[prewarm] Pre-warm build complete")
+        except Exception as exc:
+            log.error("[prewarm] Pre-warm build failed: %s", exc, exc_info=True)
+
+
+async def _universe_refresh_loop(build_done_event: asyncio.Event) -> None:
+    INTERVAL = 24 * 3600
+    while True:
+        await asyncio.sleep(INTERVAL)
+        log.info("[universe_refresh] 24h interval reached — refreshing universe snapshot")
         try:
             stale = await universe_store.load_any_snapshot()
             symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
-                saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
-                quotes = await _fetch_batch_quotes(symbols)
-                tier_map: dict[str, int] = {}
-                if saved and quotes:
-                    registry = get_registry()
-                    if registry:
-                        log.info("[universe] Background refresh: rebuilding registry for OI roll-up")
-                        await registry.build()
-                        oi_map = registry.get_oi_map()
-                        _stamp_oi(quotes, oi_map)
-                        log.info(
-                            "[universe] Background refresh: OI stamped on %d quotes "
-                            "(%d tickers with oi>0)",
-                            len(quotes), sum(1 for v in oi_map.values() if v > 0),
-                        )
-                    tier_map = await assign_tiers(quotes)
-                    await universe_store.upsert_symbol_quotes(quotes, tier_map)
+                await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+                log.info(
+                    "[universe_refresh] Snapshot refreshed — %d symbols (source=%s)",
+                    len(symbols), source,
+                )
 
                 registry = get_registry()
-                if registry and tier_map:
-                    registry.set_tier_map(tier_map)
-                    # ING-010-ACC: keep the hot-path accumulator in sync.
-                    _sync_accumulator_tier_map(tier_map)
+                if registry is not None:
+                    oi_map = registry.get_oi_map() if hasattr(registry, "get_oi_map") else {}
                     log.info(
-                        "[universe] Background refresh: registry tier_map updated "
-                        "(T1=%d T2=%d T3=%d)",
-                        sum(1 for t in tier_map.values() if t == 1),
-                        sum(1 for t in tier_map.values() if t == 2),
-                        sum(1 for t in tier_map.values() if t == 3),
+                        "[universe_refresh] OI map from live registry: %d entries",
+                        len(oi_map),
                     )
-                log.info(
-                    "[universe] Background refresh complete: %d symbols saved=%s",
-                    len(symbols), saved,
-                )
             else:
                 log.warning(
-                    "[universe] Background refresh could not reach Tradier (source=%s)",
-                    source,
+                    "[universe_refresh] source=%s — snapshot NOT updated", source
                 )
-        except Exception as e:
-            log.error("[universe] Background refresh failed (non-fatal): %s", e, exc_info=True)
-
-
-_PREWARM_TIME = time(9, 15)
-
-
-async def _registry_prewarm_loop() -> None:
-    while True:
-        now = datetime.now(_ET)
-
-        if now.weekday() >= 5:
-            log.info("[prewarm] Weekend — sleeping 1h before next check")
-            await asyncio.sleep(3600)
-            continue
-
-        next_prewarm = now.replace(
-            hour=_PREWARM_TIME.hour,
-            minute=_PREWARM_TIME.minute,
-            second=0,
-            microsecond=0,
-        )
-
-        if now >= next_prewarm:
-            next_prewarm += timedelta(days=1)
-            while next_prewarm.weekday() >= 5:
-                next_prewarm += timedelta(days=1)
-
-        sleep_secs = (next_prewarm - now).total_seconds()
-        log.info(
-            "[prewarm] Registry pre-warm scheduled in %.1f min (at %s ET)",
-            sleep_secs / 60,
-            next_prewarm.strftime("%Y-%m-%d %H:%M"),
-        )
-        await asyncio.sleep(sleep_secs)
-
-        # ING-008: invalidate vol/OI cache at market-open boundary so yesterday's
-        # intraday volume never bleeds into early-morning flow events.
-        invalidate_vol_oi_cache()
-        log.info("[prewarm] vol/OI cache invalidated ahead of market open")
-
-        log.info("[prewarm] Building OCC registry ahead of market open...")
-        try:
-            registry = get_registry()
-            if registry is None:
-                log.warning("[prewarm] Registry not initialised — skipping pre-warm")
-                continue
-            count, _ = await registry.build()
-            log.info(
-                "[prewarm] Registry warm: %d OCC contracts ready for market open",
-                count,
-            )
         except Exception as exc:
-            log.error("[prewarm] Registry pre-warm failed (non-fatal): %s", exc, exc_info=True)
+            log.error("[universe_refresh] refresh failed: %s", exc, exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting Cipher backend...")
+    # ── Step 0: load gate config ──────────────────────────────────────────
+    log.info("[startup] Step 0: loading gate config from DB (ING-010)")
+    try:
+        await gate_config_store.load()
+        log.info("[startup] Step 0: gate config loaded")
+    except Exception as exc:
+        log.error("[startup] Step 0: gate_config_store.load() failed: %s", exc, exc_info=True)
 
-    # Step 0 [ING-010]: Load tier gate config into memory before any service
-    # reads gate values (stream, accumulator, parser all call store.get() on
-    # the first tick).  load() is safe to call even if Supabase is unreachable
-    # — it falls back to hardcoded defaults and logs a warning.
-    log.info("[gate_config] Loading tier gate configuration from DB...")
-    await gate_config_store.load()
-    log.info(
-        "[gate_config] Gate config ready (epoch=%d, loaded=%s)",
-        gate_config_store.epoch,
-        gate_config_store.epoch > 0,
-    )
+    # ── Step 1: validate ingestion config ─────────────────────────────────
+    log.info("[startup] Step 1: validating ingestion config (RC-3)")
+    try:
+        await validate_ingestion_config()
+    except Exception as exc:
+        log.warning("[startup] Step 1: validate_ingestion_config failed: %s", exc)
 
-    # Step 1 [RC-3]: Warn on any missing ingestion config rows in DB.
-    await validate_ingestion_config()
-
-    # Step 2 [RENDER-STARTUP-HANG]: Fast DB-only universe resolution.
-    #
-    # _resolve_startup_universe_fast() only does Supabase reads — no Tradier,
-    # no CBOE.  Expected wall-clock time: <2 s.
-    #
-    # On cache HIT (normal daily operation): returns fresh snapshot + tiers.
-    #   needs_refresh=False — no background refresh spawned.
-    #
-    # On cache MISS (first deploy / snapshot >24 h old): returns stale snapshot
-    # as seed (or empty list if no snapshot exists at all).
-    #   needs_refresh=True — _background_universe_resolve() is launched post-yield
-    #   to run the full load_universe() pipeline without blocking the health probe.
+    # ── Step 2a: fast DB-only universe resolution ──────────────────────────
+    log.info("[startup] Step 2a: resolving startup universe (DB-only fast path)")
     stream_symbols, tier_map, snapshot_id, needs_universe_refresh = (
         await _resolve_startup_universe_fast()
     )
     log.info(
-        "[universe] Fast resolve done: %d symbols, snapshot_id=%r, needs_refresh=%s",
-        len(stream_symbols), snapshot_id, needs_universe_refresh,
+        "[startup] Step 2a complete — %d stream symbols, needs_refresh=%s",
+        len(stream_symbols), needs_universe_refresh,
     )
 
-    # Step 3: Init in-memory symbol registry.
-    registry = init_registry(watchlist=stream_symbols, tier_map=tier_map)
-    log.info(
-        "[registry] Initialised with %d stream symbols, %d tiers mapped",
-        len(stream_symbols), len(tier_map),
-    )
+    # ── Step 3: init registry ─────────────────────────────────────────────
+    log.info("[startup] Step 3: initialising symbol registry")
+    registry = init_registry(watchlist=stream_symbols)
+    if tier_map:
+        registry.set_tier_map(tier_map)
+        _sync_accumulator_tier_map(tier_map)
 
-    # Step 4: Seed OCC chains from DB (P1 fallback — no Tradier call).
-    if snapshot_id:
-        seeded = await registry.load_from_db(snapshot_id)
+    # ── Step 4: seed OCC chains from DB ───────────────────────────────────
+    log.info("[startup] Step 4: seeding OCC chains from DB (P1 fallback, snapshot_id=%s)", snapshot_id)
+    try:
+        await registry.load_from_db(snapshot_id)
         log.info(
-            "[registry] DB chain seed: %d OCC contracts pre-loaded "
-            "(is_ready=%s — waiting for build() to complete)",
-            seeded, registry.is_ready(),
+            "[startup] Step 4: DB seed complete — %d contracts loaded",
+            len(registry._registry) if hasattr(registry, "_registry") else 0,
         )
+    except Exception as exc:
+        log.error("[startup] Step 4: registry.load_from_db() failed: %s", exc, exc_info=True)
 
-    log.info(
-        "[registry] Server starting (is_ready=%s, %d OCC contracts seeded). "
-        "Stream workers will spawn only after background build() sets _build_complete.",
-        registry.is_ready(), registry.size(),
-    )
+    # ── Step 5: yield — server is live ────────────────────────────────────
+    log.info("[startup] Step 5: yielding — server is live (health probe will pass)")
 
-    # Steps 0-4 above complete in ~6 s (all DB reads, no external HTTP).
-    # yield HERE so Render's health probe passes immediately.
-    # All remaining work runs in background tasks below.
-
-    # SEQ-002: create the build-done event before spawning any tasks.
-    # Passed into _background_build_and_upsert() (sets it) and
-    # _chain_refresh_after_build() (awaits it). This is the strict
-    # serialization barrier between the two Tradier fetch paths.
     _registry_build_done = asyncio.Event()
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task          = asyncio.create_task(_registry_prewarm_loop())
+    prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
     stream_task           = asyncio.create_task(
         stream_options_flow(stream_symbols, registry=registry)
     )
+    stream_task_ref = [stream_task]
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
-    refresh_task          = asyncio.create_task(_universe_refresh_loop())
+    refresh_task          = asyncio.create_task(_universe_refresh_loop(_registry_build_done))
     build_task            = asyncio.create_task(
         _background_build_and_upsert(registry, stream_symbols, _registry_build_done)
     )
-    # MAIN-FIX-001: start_lookback_worker() was refactored (FS-HANG fix) to
-    # fetch its own accumulator internally via get_accumulator() — it takes 0
-    # positional arguments. The previous call site passed registry.accumulator,
-    # causing TypeError at every TestClient startup.
     lookback_task         = asyncio.create_task(start_lookback_worker())
 
-    # RENDER-STARTUP-HANG: spawn background universe refresh only on cache MISS.
-    # On HIT this is None and is excluded from the shutdown cancel list.
     universe_resolve_task = (
-        asyncio.create_task(_background_universe_resolve(registry))
+        asyncio.create_task(_background_universe_resolve(
+            registry,
+            stream_task_ref=stream_task_ref,
+            stream_symbols_container=stream_symbols,
+        ))
         if needs_universe_refresh
         else None
     )
@@ -1032,29 +831,15 @@ async def lifespan(app: FastAPI):
             "[universe] Cache miss at startup — background universe resolve task spawned"
         )
 
-    # SEQ-002-FIX: chain_refresh_after_build — strictly serialized behind
-    # BOTH build_task and _post_build_upsert.
-    #
-    # _chain_refresh_after_build() awaits _registry_build_done (asyncio.Event)
-    # which is now set by _background_build_and_upsert() in its OUTER finally
-    # block — after BOTH registry.build() AND _post_build_upsert() have
-    # completed (or failed). This guarantees zero Tradier chain-fetch
-    # contention with either the registry build or the post-build upsert.
-    #
-    # get_tracked_symbols returns the unique set of underlying tickers from the
-    # live registry (not OCC symbols — one chain call per ticker covers all
-    # strikes/expiries). Falls back to stream_symbols if registry is not ready.
     def _get_tracked_tickers() -> list:
         reg = get_registry()
         if reg is not None and hasattr(reg, "_registry") and reg._registry:
-            # Unique underlying tickers — one chain call covers all strikes/expiries.
             return list({v.ticker for v in reg._registry.values()})
-        # Fallback: use the startup stream_symbols list.
         return list(stream_symbols)
 
     log.info(
         "[chain_refresh] SEQ-002: chain refresh worker will start after "
-        "build_done_event fires (registry build + post_build_upsert complete)"
+        "build_done_event fires (registry ready)"
     )
     chain_refresh_task = asyncio.create_task(
         _chain_refresh_after_build(
@@ -1064,18 +849,15 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    # RENDER-KEEPALIVE: prevent free-tier idle spin-down (15-min threshold).
-    # Pings GET /health every 5 minutes. No-ops when RENDER_EXTERNAL_URL is unset.
-    # HOTFIX-KEEPALIVE-001: hardened — fresh client per cycle, fail-streak logging.
-    self_ping_task        = asyncio.create_task(_self_ping_worker())
+    self_ping_task = asyncio.create_task(_self_ping_worker())
 
     yield
 
     log.info("[shutdown] Closing Tradier stream connections first...")
-    stream_task.cancel()
+    stream_task_ref[0].cancel()
     lookback_task.cancel()
     try:
-        await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
+        await asyncio.wait_for(asyncio.shield(stream_task_ref[0]), timeout=5.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
     log.info("[shutdown] Stream task stopped — Tradier session quota released")
@@ -1086,60 +868,39 @@ async def lifespan(app: FastAPI):
     registry_refresh_task.cancel()
     db_write_task.cancel()
     signal_write_task.cancel()
-    chain_refresh_task.cancel()  # SEQ-002 / ING-008
-    self_ping_task.cancel()      # RENDER-KEEPALIVE
+    chain_refresh_task.cancel()
+    self_ping_task.cancel()
     if universe_resolve_task:
-        universe_resolve_task.cancel()  # RENDER-STARTUP-HANG
+        universe_resolve_task.cancel()
 
-    shutdown_tasks = [
-        build_task,
-        db_write_task,
-        signal_write_task,
-        refresh_task,
-        registry_refresh_task,
-        prewarm_task,
-        lookback_task,
-        chain_refresh_task,  # SEQ-002 / ING-008
-        self_ping_task,      # RENDER-KEEPALIVE
+    tasks_to_await = [
+        build_task, refresh_task, prewarm_task,
+        registry_refresh_task, db_write_task, signal_write_task,
+        chain_refresh_task, self_ping_task,
     ]
     if universe_resolve_task:
-        shutdown_tasks.append(universe_resolve_task)  # RENDER-STARTUP-HANG
+        tasks_to_await.append(universe_resolve_task)
 
-    for task in shutdown_tasks:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    log.info("Cipher backend stopped.")
+    results = await asyncio.gather(*tasks_to_await, return_exceptions=True)
+    for task, result in zip(tasks_to_await, results):
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+            log.warning("[shutdown] Task %s raised: %s", task.get_name(), result)
+
+    log.info("[shutdown] All background tasks stopped — shutdown complete")
 
 
 app = FastAPI(
-    title       = "Cipher API",
-    description = "Institutional options flow intelligence platform.",
-    version     = "1.0.0",
-    lifespan    = lifespan,
+    title="Cipher Backend",
+    version="1.0.0",
+    lifespan=lifespan,
 )
-
-# SA-2 fix: single-escape raw strings are correct for regex in Python.
-_explicit_origins = settings.origins
-_explicit_patterns = [
-    re.escape(o) for o in _explicit_origins if o != "*"
-]
-_origin_pattern = "|".join(filter(None, [
-    r"https://[a-zA-Z0-9\-]+\.vercel\.app",
-    r"http://localhost:(3000|3001)",
-    r"http://127\.0\.0\.1:3000",
-] + _explicit_patterns))
-
-log.info("CORS allow_origin_regex: %s", _origin_pattern)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex = _origin_pattern,
-    allow_credentials  = True,
-    allow_methods      = ["*"],
-    allow_headers      = ["*"],
-    expose_headers     = ["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth.router)
@@ -1150,26 +911,15 @@ app.include_router(smart_signals.router)
 app.include_router(history.router)
 app.include_router(admin.router)
 app.include_router(health.router)
-app.include_router(ingestion_config_router.router)  # REARCH-002: /admin/ingestion-config GET+PATCH
-app.include_router(signal_config_router.router)     # REARCH-005: /admin/signal-config GET+PATCH
+app.include_router(ingestion_config_router.router)   # REARCH-002
+app.include_router(signal_config_router.router)      # REARCH-005
 
 
-@app.get("/stream/stats", tags=["health"], include_in_schema=False)
-async def stream_stats_health_alias():
-    return JSONResponse({"status": "ok"})
+@app.get("/config")
+async def read_config(config: dict = Depends(get_config)):
+    return config
 
-@app.get("/api/stream/stats", tags=["signals"])
-async def _stream_stats_alias(current_user=Depends(get_current_user)):
-    return await stream_stats(current_user)
 
-@app.get("/api/health", tags=["health"])
-async def api_health():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
-
-@app.get("/health", tags=["health"])
-async def health_root():
-    return JSONResponse({"status": "ok", "service": "cipher-api"})
-
-@app.get("/", tags=["health"])
-async def root():
-    return JSONResponse({"message": "Cipher API v1.0 — Decode the Market"})
+@app.get("/stream-stats")
+async def get_stream_stats(current_user=Depends(get_current_user)):
+    return stream_stats

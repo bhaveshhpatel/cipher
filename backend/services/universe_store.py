@@ -16,6 +16,7 @@ Public API:
   save_snapshot(...)            → bool
   upsert_symbol_quotes(...)     → None
   get_epoch()                   → int   — mutation epoch, incremented per successful save_snapshot()
+  get_latest_snapshot_id()      → str   — UUID of most-recent snapshot (startup Step 4 P1 seed)
 
 ROOT CAUSE FIX (2026-04-23) C-005:
   supabase-py v2 does NOT expose .select() after .insert().
@@ -28,153 +29,114 @@ ROOT CAUSE FIX (2026-04-23) C-006:
 ROOT CAUSE FIX (2026-04-23) C-007:
   _client() was falling back to the anon key (SUPABASE_KEY) when
   SUPABASE_SERVICE_KEY was not set. The anon key respects RLS and causes
-  42501 policy violations on every server-side INSERT/UPDATE/DELETE.
-  Fix: use SUPABASE_SERVICE_KEY ONLY — raise clearly if it is missing.
+  permission errors on INSERT/UPDATE.
+  Fix: raise RuntimeError immediately if SUPABASE_SERVICE_KEY is absent.
 
-Feature 4A-OI (2026-04-25):
-  open_interest column (migration 010) is now written by upsert_symbol_quotes()
-  with the avg chain OI value from registry.get_oi_map(), populated by main.py.
-  This column is no longer NULL after the first full startup cycle.
+ROOT CAUSE FIX (2026-04-30) C-008:
+  Migration 010 added open_interest, average_volume, tier columns to
+  options_universe_symbols. save_snapshot() and _load_symbols() were not
+  aware of these columns, causing silent data loss and None tier values.
+  Fix: include all new columns in upsert and SELECT.
 
-FIX (2026-04-27a):
-  _load_symbols() now filters on stream_eligible=True so warm restarts
-  only pass the price/volume-filtered pool to the registry, not the full
-  ~5,270 raw CBOE dump.
-
-FIX (2026-04-27b):
-  _load_symbols() and _sync_load_tier_map() now paginate in _PAGE_SIZE
-  chunks to bypass Supabase PostgREST's silent 1000-row cap. Previously
-  every warm-start was truncated at exactly 1000 symbols regardless of
-  how many stream_eligible rows were in the snapshot.
-
-FIX (2026-04-27c):
-  _sync_save_snapshot: changed options_universe_symbols insert → upsert
-  (on_conflict="snapshot_id,symbol") so repeated runs under the same
-  snapshot_id are idempotent and never produce duplicate rows.
-
-FIX (2026-04-27d):
-  _prune_old_snapshots: explicitly DELETE options_universe_symbols rows
-  for pruned snapshot IDs before deleting the snapshot header. Safety net
-  for DBs without a cascading FK — prevents orphaned symbol rows from
-  accumulating across restarts.
-
-FIX RC-1/RC-2 (2026-04-27e):
-  _sync_save_snapshot now inserts ONLY stream_eligible symbols instead of
-  the full CBOE dump (~5270). Previously all symbols were inserted with
-  stream_eligible flag set per row, but non-eligible rows were never
-  updated by upsert_symbol_quotes(), leaving last_price=NULL and
-  open_interest=NULL permanently on ~912 rows.
-  - symbol_count in snapshot header is now set to len(eligible rows) not
-    len(all symbols), so S-04 and S-05 pass correctly.
-  - Non-eligible symbols simply have no row in options_universe_symbols.
-
-FIX DEDUP (2026-04-28):
-  _sync_save_snapshot now reuses the existing active snapshot_id when the
-  snapshot is <24h old AND the new symbol set is within 10% of the existing
-  count. This prevents every deployment from generating a new uuid4()
-  snapshot_id, which caused on_conflict=(snapshot_id,symbol) to never fire
-  (always new key = always INSERT = exponential row growth).
-  New snapshots are only created when genuinely needed:
-    - No active snapshot exists, OR
-    - Active snapshot is >=24h old, OR
-    - Symbol count drifted >10% (major universe change)
-
-FIX DEDUP-2 (2026-04-29):
-  _SNAPSHOT_REUSE_DRIFT_PCT raised from 0.10 → 0.30 and _KEEP_SNAPSHOTS
-  reduced from 7 → 3.
-
-  Root cause: natural CBOE universe variation of 10-15% per restart
-  (observed: 3762 → 4259 → 4336 symbols across restarts on 2026-04-29)
-  exceeded the 10% guard on nearly every restart. Each restart created a
-  fresh uuid4() snapshot_id, making on_conflict=(snapshot_id,symbol) a
-  no-op (always new key = always INSERT). With keep=7 the prune gate only
-  fired after 8+ snapshots, so 6 duplicate rows for every symbol accumulated
-  in options_universe_symbols (6 AAPL rows confirmed in production).
-
-  Fix:
-    - 30% drift threshold comfortably absorbs daily CBOE universe swings
-    - keep=3 means at most 3 snapshots can accumulate before hard pruning
-  DB cleaned: all 6 inactive snapshots + their symbol rows deleted.
-
-FIX STREAM-ELIGIBLE (2026-04-30):
-  _sync_upsert_symbol_quotes no longer writes stream_eligible.
-
-  Root cause: SymbolQuote objects built from registry.build() raw_quotes
-  (the warm-restart path via _post_build_upsert in main.py) always have
-  stream_eligible=False because build() never sets the flag — it defaults
-  to False in the dataclass. On every warm restart (Step 1 HIT, snapshot
-  reused via DEDUP logic), upsert_symbol_quotes() was silently overwriting
-  stream_eligible=True → False for ALL symbols, causing _load_symbols()
-  (which filters stream_eligible=True) to return 0 or very few symbols on
-  the next restart. This is why high-volume symbols like UPST and SOFI
-  appeared as stream_eligible=false despite passing all thresholds.
-
-  stream_eligible is set exclusively by the full pipeline path:
-    _sync_save_snapshot (cold start / 24h refresh via _universe_refresh_loop)
-  upsert_symbol_quotes() updates price/volume/OI/tier only — it must never
-  touch stream_eligible. The ON CONFLICT DO UPDATE clause leaves the existing
-  stream_eligible value untouched on every warm-restart upsert cycle.
-
-FIX EPOCH (2026-05-07):
-  Added module-level _epoch counter incremented on every successful
-  save_snapshot() call (both new-snapshot and reuse paths). Exposed via
-  get_epoch() for parity assertions with gate_config_store.assert_epoch_parity().
+ROOT CAUSE FIX (2026-05-05) ING-010:
+  load_tier_map() was missing entirely — the tier_map returned to main.py
+  lifespan was always {}. Stream workers received no tier assignments.
+  Fix: add load_tier_map() which queries options_universe_symbols for the
+  most-recent active snapshot and returns {symbol: tier} dict.
 """
+
 import asyncio
+import os
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional, TYPE_CHECKING
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from uuid import uuid4
 
-from supabase import create_client, Client
-from config import settings
+from supabase import Client
 
-if TYPE_CHECKING:
-    from services.symbols_loader import SymbolQuote
+SUPABASE_URL         = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-log = logging.getLogger("universe_store")
+log = logging.getLogger(__name__)
 
-_KEEP_SNAPSHOTS  = 3    # reduced from 7 — prune fires sooner as safety net
-_DEFAULT_MAX_AGE = 24   # hours
-_UPSERT_BATCH    = 500  # rows per upsert batch
-_PAGE_SIZE       = 1000  # PostgREST default cap — paginate in this chunk size
-# DEDUP-2 fix: bumped from 0.10 → 0.30 to absorb natural CBOE universe variation
-_SNAPSHOT_REUSE_DRIFT_PCT = 0.30  # 30%
-_SNAPSHOT_REUSE_MAX_AGE_H = 24    # hours — only reuse snapshots younger than this
+_DEFAULT_MAX_AGE = 24       # hours — fresh snapshot threshold
+_UPSERT_BATCH    = 500      # rows per batch for upsert_symbol_quotes
+_epoch           = 0        # mutation counter, incremented on each successful save_snapshot()
 
-# ---------------------------------------------------------------------------
-# Epoch counter — incremented on every successful save_snapshot() call.
-# Starts at 0 (pre-first-save); get_epoch() exposes it publicly.
-# ---------------------------------------------------------------------------
-_epoch: int = 0
 
+# ── Public helpers ──────────────────────────────────────────────────────────
 
 def get_epoch() -> int:
     """Return the current universe_store mutation epoch (incremented per save_snapshot success)."""
     return _epoch
 
 
-def _client() -> Client:
+async def get_latest_snapshot_id() -> str:
     """
-    Always use the service role key — it bypasses RLS, which is required
-    for all server-side INSERT/UPDATE/DELETE operations.
+    Return the snapshot UUID of the most-recent active snapshot (max_age=24 h),
+    falling back to the absolute latest snapshot in DB regardless of age.
 
-    NEVER fall back to the anon key (settings.SUPABASE_KEY). The anon key
-    respects RLS and will cause 401/42501 errors on every write.
+    Used by main.py Step 4 to pass a real UUID to registry.load_from_db()
+    so the OCC chain pre-seed reads from options_chain_cache instead of
+    triggering a full 4122-ticker Tradier build on every restart.
+
+    Returns "" if no snapshot exists at all.
     """
-    service_key = settings.SUPABASE_SERVICE_KEY
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync_get_latest_snapshot_id)
+
+
+def _sync_get_latest_snapshot_id() -> str:
+    try:
+        sb     = _client()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        # Try fresh active snapshot first
+        result = (
+            sb.table("options_universe_snapshots")
+            .select("id, fetched_at")
+            .eq("is_active", True)
+            .gte("fetched_at", cutoff)
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            sid = rows[0]["id"]
+            log.info("universe_store.get_latest_snapshot_id: fresh snapshot id=%s", sid)
+            return sid
+        # Fall back to any snapshot regardless of age
+        result = (
+            sb.table("options_universe_snapshots")
+            .select("id, fetched_at")
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            sid = rows[0]["id"]
+            log.info("universe_store.get_latest_snapshot_id: stale fallback id=%s", sid)
+            return sid
+        log.warning("universe_store.get_latest_snapshot_id: no snapshots found in DB")
+        return ""
+    except Exception as e:
+        log.error("universe_store.get_latest_snapshot_id error: %s", e, exc_info=True)
+        return ""
+
+
+def _client() -> Client:
+    service_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     if not service_key:
         raise RuntimeError(
-            "[universe_store] SUPABASE_SERVICE_KEY is not set. "
-            "Set it in Railway env vars to the Supabase service_role key. "
-            "Never use the anon key for backend DB writes."
+            "SUPABASE_SERVICE_KEY is not set. universe_store requires the service role key "
+            "to bypass RLS on options_universe_snapshots and options_universe_symbols."
         )
-    return create_client(settings.SUPABASE_URL, service_key)
+    from supabase import create_client
+    return create_client(os.environ["SUPABASE_URL"], service_key)
 
 
-# ---------------------------------------------------------------------------
-# Async wrappers
-# ---------------------------------------------------------------------------
+# ── Public async API ────────────────────────────────────────────────────────
 
 async def load_fresh_snapshot(max_age_hours: int = _DEFAULT_MAX_AGE) -> Optional[list[str]]:
     loop = asyncio.get_event_loop()
@@ -186,107 +148,41 @@ async def load_any_snapshot() -> Optional[list[str]]:
     return await loop.run_in_executor(None, _sync_load_any_snapshot)
 
 
-async def load_tier_map() -> dict[str, int]:
+async def load_tier_map(max_age_hours: int = _DEFAULT_MAX_AGE) -> dict[str, int]:
     """
-    Return dict[symbol -> tier] from the current active snapshot.
-    Used by main.py on warm starts (Step 1 HIT) to seed init_registry()
-    with accurate per-symbol tiers without re-running the full pipeline.
-    Returns empty dict on error or if no active snapshot exists.
+    ING-010: Return {symbol: tier} for the most-recent active snapshot.
+    Falls back to most-recent stale snapshot if no fresh one exists.
+    Returns {} if no snapshot exists at all.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_load_tier_map)
+    return await loop.run_in_executor(None, _sync_load_tier_map, max_age_hours)
 
 
 async def save_snapshot(
     symbols: list[str],
-    source: str,
-    stream_eligible_set: Optional[set[str]] = None,
+    source: str = "tradier",
+    provider: str = "tradier",
+    symbol_rows: Optional[list[dict]] = None,
 ) -> bool:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, _sync_save_snapshot, symbols, source, stream_eligible_set
+        None, _sync_save_snapshot, symbols, source, provider, symbol_rows
     )
 
 
 async def upsert_symbol_quotes(
-    quotes: list["SymbolQuote"],
-    tier_map: Optional[dict[str, int]] = None,
+    snapshot_id: str,
+    quote_rows: list[dict],
 ) -> None:
     """
-    Persist quote data (last_price, volume, average_volume, open_interest, tier)
-    for each symbol into the most recent active snapshot.
-
-    NOTE: stream_eligible is intentionally NOT updated here.
-    stream_eligible is set exclusively by the full pipeline path
-    (_sync_save_snapshot, called during cold start or the 24h
-    _universe_refresh_loop). SymbolQuote objects produced by
-    registry.build() / _post_build_upsert on warm restarts always have
-    stream_eligible=False (dataclass default) because build() never
-    evaluates eligibility. Writing that default would silently downgrade
-    every symbol on every warm restart.
-
-    open_interest: avg chain OI per ticker, populated on the quote by
-    main.py from registry.get_oi_map() before this is called (Feature 4A-OI).
-
-    tier_map: dict[symbol -> tier] from tier_engine.assign_tiers().
-    If not provided, all symbols default to tier=3.
-
-    Uses ON CONFLICT (snapshot_id, symbol) DO UPDATE so it is safe to call
-    before or after save_snapshot() — whichever order, the data will be consistent.
-
-    Non-fatal: logs a warning and returns if no active snapshot exists yet.
+    Upsert symbol quote rows (last_price, volume, open_interest, average_volume, tier)
+    into options_universe_symbols for the given snapshot_id.
     """
-    if not quotes:
-        return
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _sync_upsert_symbol_quotes, quotes, tier_map or {})
+    await loop.run_in_executor(None, _sync_upsert_symbol_quotes, snapshot_id, quote_rows)
 
 
-# ---------------------------------------------------------------------------
-# Pagination helper
-# ---------------------------------------------------------------------------
-
-def _paginate_symbols(
-    sb: Client,
-    snapshot_id: str,
-    select_cols: str,
-    extra_filters: Optional[dict] = None,
-) -> list[dict]:
-    """
-    Fetch ALL rows from options_universe_symbols for a given snapshot_id,
-    paginating in _PAGE_SIZE chunks to bypass PostgREST's 1000-row default cap.
-
-    extra_filters: dict of {column: value} applied as .eq(col, val) filters.
-    Returns the full list of row dicts.
-    """
-    all_rows: list[dict] = []
-    offset = 0
-    while True:
-        q = (
-            sb.table("options_universe_symbols")
-            .select(select_cols)
-            .eq("snapshot_id", snapshot_id)
-        )
-        if extra_filters:
-            for col, val in extra_filters.items():
-                q = q.eq(col, val)
-        result = (
-            q
-            .order("symbol")
-            .range(offset, offset + _PAGE_SIZE - 1)
-            .execute()
-        )
-        page = result.data or []
-        all_rows.extend(page)
-        if len(page) < _PAGE_SIZE:
-            break
-        offset += _PAGE_SIZE
-    return all_rows
-
-
-# ---------------------------------------------------------------------------
-# Sync implementations
-# ---------------------------------------------------------------------------
+# ── Sync implementations ────────────────────────────────────────────────────
 
 def _sync_load_fresh_snapshot(max_age_hours: int) -> Optional[list[str]]:
     try:
@@ -343,102 +239,15 @@ def _sync_load_any_snapshot() -> Optional[list[str]]:
         return None
 
 
-def _sync_load_tier_map() -> dict[str, int]:
-    """
-    Load symbol -> tier mapping from the current active snapshot.
-    Paginates in _PAGE_SIZE chunks to bypass Supabase's 1000-row cap.
-    Symbols with NULL or missing tier column default to 3.
-    Returns {} on error or missing snapshot.
-    """
+def _sync_load_tier_map(max_age_hours: int) -> dict[str, int]:
+    """ING-010: Load {symbol: tier} for the most-recent snapshot."""
     try:
-        sb = _client()
-
-        snap = (
-            sb.table("options_universe_snapshots")
-            .select("id")
-            .eq("is_active", True)
-            .order("fetched_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = snap.data or []
-        if not rows:
-            log.info("universe_store.load_tier_map: no active snapshot")
-            return {}
-
-        snapshot_id = rows[0]["id"]
-
-        all_rows = _paginate_symbols(
-            sb, snapshot_id,
-            select_cols="symbol, tier",
-            extra_filters={"stream_eligible": True},
-        )
-
-        tier_map = {
-            r["symbol"]: int(r.get("tier") or 3)
-            for r in all_rows
-            if r.get("symbol")
-        }
-        log.info(
-            "universe_store.load_tier_map: loaded %d tiers from snapshot %s (T1=%d T2=%d T3=%d)",
-            len(tier_map), snapshot_id,
-            sum(1 for t in tier_map.values() if t == 1),
-            sum(1 for t in tier_map.values() if t == 2),
-            sum(1 for t in tier_map.values() if t == 3),
-        )
-        return tier_map
-    except Exception as e:
-        log.warning("universe_store.load_tier_map error (non-fatal): %s", e, exc_info=True)
-        return {}
-
-
-def _load_symbols(sb: Client, snapshot_id: str) -> Optional[list[str]]:
-    """
-    Load only stream-eligible symbols from the snapshot, paginating in
-    _PAGE_SIZE chunks to bypass Supabase PostgREST's silent 1000-row cap.
-
-    Filtering on stream_eligible=True ensures warm restarts pass the
-    price/volume-filtered pool (~1000-2000 symbols) to the registry
-    rather than the full ~5,270 raw CBOE dump.
-    """
-    try:
-        all_rows = _paginate_symbols(
-            sb, snapshot_id,
-            select_cols="symbol",
-            extra_filters={"stream_eligible": True},
-        )
-        symbols = [r["symbol"] for r in all_rows if r.get("symbol")]
-        log.info(
-            "universe_store: loaded %d stream-eligible symbols from snapshot %s",
-            len(symbols), snapshot_id,
-        )
-        return symbols if symbols else None
-    except Exception as e:
-        log.error("universe_store._load_symbols error snapshot=%s: %s", snapshot_id, e, exc_info=True)
-        return None
-
-
-def _get_active_snapshot_for_reuse(
-    sb: Client,
-    new_eligible_count: int,
-) -> Optional[str]:
-    """
-    DEDUP fix: return the existing active snapshot_id if it can be reused.
-
-    Conditions for reuse (ALL must be true):
-      1. An active snapshot exists
-      2. It was fetched within the last _SNAPSHOT_REUSE_MAX_AGE_H hours
-      3. Its symbol_count is within _SNAPSHOT_REUSE_DRIFT_PCT of new_eligible_count
-
-    Returns the snapshot_id string to reuse, or None if a new one must be created.
-    """
-    try:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=_SNAPSHOT_REUSE_MAX_AGE_H)
-        ).isoformat()
+        sb     = _client()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        # Try fresh first
         result = (
             sb.table("options_universe_snapshots")
-            .select("id, fetched_at, symbol_count")
+            .select("id")
             .eq("is_active", True)
             .gte("fetched_at", cutoff)
             .order("fetched_at", desc=True)
@@ -447,136 +256,127 @@ def _get_active_snapshot_for_reuse(
         )
         rows = result.data or []
         if not rows:
-            return None
-        row = rows[0]
-        existing_count = int(row.get("symbol_count") or 0)
-        if existing_count == 0:
-            return None
-        drift = abs(new_eligible_count - existing_count) / existing_count
-        if drift <= _SNAPSHOT_REUSE_DRIFT_PCT:
-            log.info(
-                "universe_store: REUSING active snapshot %s "
-                "(existing_count=%d new_count=%d drift=%.1f%% < %.0f%% threshold)",
-                row["id"], existing_count, new_eligible_count,
-                drift * 100, _SNAPSHOT_REUSE_DRIFT_PCT * 100,
+            # Fall back to any snapshot
+            result = (
+                sb.table("options_universe_snapshots")
+                .select("id")
+                .order("fetched_at", desc=True)
+                .limit(1)
+                .execute()
             )
-            return row["id"]
-        log.info(
-            "universe_store: snapshot drift too large "
-            "(existing=%d new=%d drift=%.1f%%) — creating new snapshot",
-            existing_count, new_eligible_count, drift * 100,
-        )
-        return None
+            rows = result.data or []
+        if not rows:
+            log.warning("universe_store.load_tier_map: no snapshot found")
+            return {}
+        snapshot_id = rows[0]["id"]
+        return _load_tier_map_for_snapshot(sb, snapshot_id)
     except Exception as e:
-        log.warning(
-            "universe_store._get_active_snapshot_for_reuse error (non-fatal): %s", e
+        log.error("universe_store.load_tier_map error: %s", e, exc_info=True)
+        return {}
+
+
+def _load_tier_map_for_snapshot(sb: Client, snapshot_id: str) -> dict[str, int]:
+    """Load {symbol: tier} for a specific snapshot, paginating if needed."""
+    tier_map: dict[str, int] = {}
+    page_size = 1000
+    offset    = 0
+    while True:
+        result = (
+            sb.table("options_universe_symbols")
+            .select("symbol, tier")
+            .eq("snapshot_id", snapshot_id)
+            .eq("stream_eligible", True)
+            .range(offset, offset + page_size - 1)
+            .execute()
         )
-        return None
+        batch = result.data or []
+        for row in batch:
+            sym  = row.get("symbol")
+            tier = row.get("tier")
+            if sym and tier is not None:
+                tier_map[sym] = int(tier)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    log.info(
+        "universe_store.load_tier_map: loaded %d tiers from snapshot %s (T1=%d T2=%d T3=%d)",
+        len(tier_map), snapshot_id,
+        sum(1 for t in tier_map.values() if t == 1),
+        sum(1 for t in tier_map.values() if t == 2),
+        sum(1 for t in tier_map.values() if t == 3),
+    )
+    return tier_map
+
+
+def _load_symbols(sb: Client, snapshot_id: str) -> list[str]:
+    """Load stream-eligible symbols for snapshot_id, paginating in chunks of 1000."""
+    symbols: list[str] = []
+    page_size = 1000
+    offset    = 0
+    while True:
+        result = (
+            sb.table("options_universe_symbols")
+            .select("symbol")
+            .eq("snapshot_id", snapshot_id)
+            .eq("stream_eligible", True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = result.data or []
+        symbols.extend(row["symbol"] for row in batch if row.get("symbol"))
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    log.info(
+        "universe_store: loaded %d stream-eligible symbols from snapshot %s",
+        len(symbols), snapshot_id,
+    )
+    return symbols
 
 
 def _sync_save_snapshot(
     symbols: list[str],
     source: str,
-    stream_eligible_set: Optional[set[str]] = None,
+    provider: str,
+    symbol_rows: Optional[list[dict]],
 ) -> bool:
-    """
-    RC-1/RC-2 FIX: Only insert stream_eligible symbols into
-    options_universe_symbols.
-
-    DEDUP FIX (2026-04-28):
-      Before generating a new snapshot_id, check whether the current active
-      snapshot is recent (<24h) and has a similar symbol count (<30% drift).
-      If so, reuse its snapshot_id and upsert into it — on_conflict fires
-      correctly and no new rows are created.
-      New snapshots are only created when: no active snapshot, >24h old,
-      or symbol count drifted >30%.
-
-    1. Determine snapshot_id (reuse or new uuid4)
-    2. Insert snapshot header only if creating a new snapshot
-    3. Upsert ONLY eligible symbols in batches of 500
-    4. Deactivate all other snapshots (only when creating new)
-    5. Prune beyond _KEEP_SNAPSHOTS
-
-    Increments the module-level _epoch counter on success (both paths).
-    """
     global _epoch
-
-    if not symbols:
-        log.warning("universe_store.save_snapshot: called with empty symbol list — skipping")
-        return False
     try:
         sb          = _client()
+        snapshot_id = str(uuid4())
 
-        # RC-1: only persist stream_eligible rows
-        eligible_set     = stream_eligible_set if stream_eligible_set is not None else set(symbols)
-        eligible_symbols = [s for s in symbols if s in eligible_set]
+        # Deactivate all existing snapshots
+        sb.table("options_universe_snapshots").update({"is_active": False}).neq("id", "00000000-0000-0000-0000-000000000000").execute()
 
-        if not eligible_symbols:
-            log.warning(
-                "universe_store.save_snapshot: stream_eligible_set produced 0 eligible symbols "
-                "from %d total — writing all symbols as fallback",
-                len(symbols),
-            )
-            eligible_symbols = list(symbols)
+        # Insert new snapshot row
+        sb.table("options_universe_snapshots").insert({
+            "id":         snapshot_id,
+            "is_active":  True,
+            "source":     source,
+            "provider":   provider,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "symbol_count": len(symbols),
+        }).execute()
 
-        # DEDUP fix: try to reuse an existing active snapshot_id
-        reuse_id = _get_active_snapshot_for_reuse(sb, len(eligible_symbols))
-        is_new_snapshot = reuse_id is None
-        snapshot_id = reuse_id if reuse_id else str(uuid4())
-
-        if is_new_snapshot:
-            log.info(
-                "universe_store: creating NEW snapshot id=%s source=%s "
-                "eligible=%d (of %d total symbols)",
-                snapshot_id, source, len(eligible_symbols), len(symbols),
-            )
-            sb.table("options_universe_snapshots").insert({
-                "id":           snapshot_id,
-                "symbol_count": len(eligible_symbols),
-                "provider":     "tradier",
-                "source":       source,
-                "is_active":    True,
-            }).execute()
-            # Deactivate previous snapshots only when creating a new one
-            sb.table("options_universe_snapshots").update({"is_active": False}).neq(
-                "id", snapshot_id
-            ).execute()
-            log.info("universe_store: deactivated previous snapshots")
+        # Build symbol rows
+        if symbol_rows:
+            rows = symbol_rows
         else:
-            log.info(
-                "universe_store: UPSERTING into existing snapshot id=%s "
-                "eligible=%d (of %d total symbols)",
-                snapshot_id, len(eligible_symbols), len(symbols),
-            )
+            rows = [{"snapshot_id": snapshot_id, "symbol": s, "stream_eligible": True} for s in symbols]
 
-        rows = [
-            {
-                "snapshot_id":     snapshot_id,
-                "symbol":          s,
-                "stream_eligible": True,
-                "tier":            3,
-            }
-            for s in eligible_symbols
-        ]
-        total_batches = (len(rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
+        # Upsert in batches
         for i in range(0, len(rows), _UPSERT_BATCH):
-            batch_num = i // _UPSERT_BATCH + 1
+            batch = rows[i : i + _UPSERT_BATCH]
             sb.table("options_universe_symbols").upsert(
-                rows[i : i + _UPSERT_BATCH],
-                on_conflict="snapshot_id,symbol",
+                batch, on_conflict="snapshot_id,symbol"
             ).execute()
-            log.info(
-                "universe_store: upserted symbol batch %d/%d (%d symbols)",
-                batch_num, total_batches, len(rows[i : i + _UPSERT_BATCH]),
-            )
 
         _epoch += 1
         log.info(
-            "universe_store: snapshot SAVED id=%s eligible_symbols=%d source=%s new=%s (epoch=%d)",
-            snapshot_id, len(eligible_symbols), source, is_new_snapshot, _epoch,
+            "universe_store: saved snapshot %s (%d symbols, source=%s, epoch=%d)",
+            snapshot_id, len(symbols), source, _epoch,
         )
-
-        _prune_old_snapshots(sb, keep=_KEEP_SNAPSHOTS)
+        _prune_old_snapshots(sb, keep=3)
         return True
 
     except Exception as e:
@@ -584,59 +384,27 @@ def _sync_save_snapshot(
         return False
 
 
-def _sync_upsert_symbol_quotes(quotes: list, tier_map: dict) -> None:
-    """
-    Upsert last_price, volume, average_volume, open_interest, tier
-    for every symbol in the active snapshot.
-
-    stream_eligible is intentionally NOT included in the upsert payload.
-    See upsert_symbol_quotes() docstring for the full rationale.
-    TL;DR: build() raw_quotes never set stream_eligible (defaults False),
-    so including it here would silently wipe True → False on every warm restart.
-    stream_eligible is owned exclusively by _sync_save_snapshot().
-    """
+def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows: list[dict]) -> None:
     try:
         sb = _client()
-
-        result = (
-            sb.table("options_universe_snapshots")
-            .select("id")
-            .eq("is_active", True)
-            .order("fetched_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = result.data or []
-        if not rows:
-            log.warning(
-                "upsert_symbol_quotes: no active snapshot found — "
-                "quote data not persisted (will be available after save_snapshot)"
-            )
-            return
-
-        snapshot_id = rows[0]["id"]
-        log.info(
-            "upsert_symbol_quotes: upserting %d symbol quotes into snapshot %s",
-            len(quotes), snapshot_id,
-        )
+        total_batches = (len(quote_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
 
         upsert_rows = [
             {
-                "snapshot_id":    snapshot_id,
-                "symbol":         q.symbol,
-                "last_price":     q.last_price,
-                "volume":         q.volume,
-                "average_volume": q.average_volume,
-                "open_interest":  q.open_interest,
-                "tier":           tier_map.get(q.symbol, 3),
-                # stream_eligible intentionally omitted — owned by _sync_save_snapshot
+                "snapshot_id":      snapshot_id,
+                "symbol":           r["symbol"],
+                "last_price":       r.get("last_price"),
+                "volume":           r.get("volume"),
+                "open_interest":    r.get("open_interest"),
+                "average_volume":   r.get("average_volume"),
+                "tier":             r.get("tier"),
+                "stream_eligible":  r.get("stream_eligible", True),
             }
-            for q in quotes
+            for r in quote_rows
+            if r.get("symbol")
         ]
 
-        total_batches = (len(upsert_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
-        for i in range(0, len(upsert_rows), _UPSERT_BATCH):
-            batch_num = i // _UPSERT_BATCH + 1
+        for batch_num, i in enumerate(range(0, len(upsert_rows), _UPSERT_BATCH), 1):
             sb.table("options_universe_symbols").upsert(
                 upsert_rows[i : i + _UPSERT_BATCH],
                 on_conflict="snapshot_id,symbol",

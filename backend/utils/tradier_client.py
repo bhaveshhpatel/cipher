@@ -8,10 +8,9 @@ Rate limits:
   Tradier sandbox: 120 req/min
   Tradier production: 120 req/min (same limit)
   → _CHAIN_SEM(2): conservative for live streaming flow path (~3 req/s)
-  → _BULK_CHAIN_SEM(50): used by registry build() only — raised from 10
-     to match outer build sem(50) in symbol_registry.py. True 50-concurrent
-     chain fetches; sustained rate stays below 120 req/min because each
-     ticker also blocks on get_expirations() before the chain loop.
+  → _BULK_CHAIN_SEM(10): used by registry build() only — lowered from 50
+     back to 10 to stay well under Tradier's 120 req/min rate limit.
+     True 10-concurrent chain fetches; pool sized at 30 (3× sem=10).
   → _SESSION_SEM(3): for session token fetches (B-022)
 
 P3 FIX (2026-04-27):
@@ -33,12 +32,19 @@ POOL-MISMATCH fix (2026-05-14):
   before the HTTP request even started — timeouts fired on pool contention,
   not Tradier TCP stalls. Cascading timeouts yielded only ~5,560 OCC contracts
   vs the expected ~50K.
-  Fix:
+  Fix (original):
     max_connections: 30 → 75  (1.5× sem=50; restores the 3× ratio from sem=10 era)
     max_keepalive_connections: 20 → 60
     _CONNECT_TIMEOUT: 15.0 → 10.0  (fail fast on connect, free pool slot sooner)
     _READ_TIMEOUT:    20.0 → 25.0  (must exceed _CHAIN_REQUEST_TIMEOUT_S=30s budget)
   Companion fix in symbol_registry.py: _CHAIN_REQUEST_TIMEOUT_S 15 → 30s.
+
+CONCURRENCY-10 (2026-05-14):
+  Reverted _BULK_CHAIN_SEM from 50 → 10 to avoid sustained rate-limit
+  hammering under Tradier's 120 req/min ceiling. Pool resized to match:
+    max_connections: 75 → 30  (3× sem=10; same ratio as original sem=10 era)
+    max_keepalive_connections: 60 → 25
+  Companion fix in symbol_registry.py: _DEFAULT_BUILD_CONCURRENCY 50 → 10.
 
 FIX-RETRY-POOL (fix/build-perf-bugs):
   429 retry in get_option_chain_bulk() and get_option_chain_bulk_all() previously
@@ -66,7 +72,7 @@ Fix (SEM-STREAM 2026-05-12): expose acquire_session_token_slot() for
 Flaw 3 Fix (TCP Connection Pooling):
   Replaced per-call httpx.AsyncClient instantiation with a single shared
   client (_shared_client) that maintains a persistent connection pool.
-  max_connections=75 / max_keepalive_connections=60 / keepalive_expiry=30s.
+  max_connections=30 / max_keepalive_connections=25 / keepalive_expiry=30s.
   Call init_http_client() on app startup and close_http_client() on shutdown
   (both wired into main.py lifespan). Eliminates ~22 min of TCP handshake
   overhead during cold-start registry build.
@@ -75,11 +81,27 @@ CHAIN-ALL (2026-05-14):
   New get_option_chain_bulk_all(symbol) omits the expiration param entirely.
   Tradier returns all expiries in one response (options.option[] with each
   contract carrying an expiration_date field).
-  - Uses _BULK_CHAIN_SEM(50) — same semaphore as get_option_chain_bulk().
+  - Uses _BULK_CHAIN_SEM(10) — same semaphore as get_option_chain_bulk().
   - 429 back-off retry logic carried over from get_option_chain_bulk().
   - Reduces total API calls from ~21,450 to ~3,900 (82% fewer).
   - Build time: ~117s clean / ~312s degraded (vs 343s / 1287s before).
   - get_expirations() is preserved for non-build callers.
+
+FIX-QUOTES-RESP (2026-05-14):
+  get_quote() and get_quotes_batch() now validate that resp.json() returns
+  a dict before chaining .get() on it.
+
+  Tradier returns HTTP 200 with a non-dict body in two known cases:
+    1. {"quotes": "No Content"} — valid token but no matching symbols.
+       data.get("quotes", {}) returns the string "No Content"; calling
+       .get("quote") on a string raises AttributeError, swallowed by the
+       bare except block, silently returning {} / None with no log trace.
+    2. {"fault": {"faultstring": "...", ...}} — API key invalid / sandbox
+       vs production mismatch. Same silent AttributeError path.
+  Both cases previously triggered the B-ZERO-PRICE zero_price_fallback path
+  with no indication of the root cause in logs.
+  Fix: assert isinstance(data, dict); log ERROR with raw body on failure.
+  Also guard quotes_container in get_quotes_batch() for the "No Content" case.
 
 Public API:
   init_http_client()                         -> None  (call on startup)
@@ -88,8 +110,8 @@ Public API:
   get_quotes_batch(symbols)                  -> dict[str, dict]
   get_expirations(symbol)                    -> list[str]
   get_option_chain(symbol, expiration)       -> list[dict]   (streaming, sem=2)
-  get_option_chain_bulk(symbol, expiration)  -> list[dict]   (build path, sem=50, per-expiry)
-  get_option_chain_bulk_all(symbol)          -> list[dict]   (build path, sem=50, ALL expiries)
+  get_option_chain_bulk(symbol, expiration)  -> list[dict]   (build path, sem=10, per-expiry)
+  get_option_chain_bulk_all(symbol)          -> list[dict]   (build path, sem=10, ALL expiries)
   get_options_chain(symbol, expiration)      -> list[dict]   (alias for get_option_chain)
   get_session_token()                        -> Optional[str]
   get_token()                                -> Optional[str]  (alias)
@@ -113,11 +135,10 @@ _READ_TIMEOUT    = 25.0   # was 20.0 — must exceed _CHAIN_REQUEST_TIMEOUT_S=30
 # Live streaming flow path — conservative, never races with Tradier rate limit
 _CHAIN_SEM       = asyncio.Semaphore(2)
 
-# Registry build() bulk path — raised from 10 → 50 (PERF-SEM-50 2026-05-14)
-# to match outer build sem(50) in symbol_registry.py. Previously the inner
-# sem(10) was the real throughput ceiling (min(50,10)=10 effective
-# concurrency). Now true 50-concurrent chain fetches are possible.
-_BULK_CHAIN_SEM  = asyncio.Semaphore(50)
+# Registry build() bulk path — lowered from 50 → 10 (CONCURRENCY-10 2026-05-14)
+# to stay well under Tradier's 120 req/min rate limit. Pool resized to match
+# (max_connections=30, 3× sem=10). Companion: _DEFAULT_BUILD_CONCURRENCY=10.
+_BULK_CHAIN_SEM  = asyncio.Semaphore(10)
 
 # B-022: max 3 concurrent session token fetches across ALL callers
 # (stream_worker.py via get_session_token() + tradier_stream.py via
@@ -139,14 +160,11 @@ _SESSION_RETRY_MAX:   int   = 3     # max retry attempts per token fetch
 # ---------------------------------------------------------------------------
 # One persistent client is shared across all callers. Connections are reused
 # after initial TCP handshake, eliminating ~100ms overhead per call.
-# Pool sizing rationale (POOL-MISMATCH fix 2026-05-14):
-#   max_connections=75      — 1.5× _BULK_CHAIN_SEM(50). Restores the 3× ratio
-#                             from the sem=10 era (pool=30 was 3× sem=10).
-#                             Previously pool=30 was 0.6× sem=50, causing 20
-#                             coroutines to block on pool-wait and burn the
-#                             per-request asyncio.wait_for budget before the
-#                             HTTP request even started.
-#   max_keepalive_connections=60 — keep warm connections for the build path
+# Pool sizing rationale (CONCURRENCY-10 2026-05-14):
+#   max_connections=30      — 3× _BULK_CHAIN_SEM(10). Restores the original
+#                             3× ratio from the sem=10 era. Previously raised
+#                             to 75 for sem=50; reverted to match new sem=10.
+#   max_keepalive_connections=25 — proportional to pool=30
 #   keepalive_expiry=30s    — Tradier keep-alives are typically <60s
 # init_http_client() / close_http_client() are called from main.py lifespan.
 # ---------------------------------------------------------------------------
@@ -169,12 +187,12 @@ def init_http_client() -> None:
     """Create the shared httpx client. Call once on app startup."""
     global _shared_client
     limits = httpx.Limits(
-        max_connections=75,            # POOL-MISMATCH fix: was 30 (0.6× sem=50)
-        max_keepalive_connections=60,  # was 20
+        max_connections=30,            # CONCURRENCY-10: was 75 (for sem=50); now 3× sem=10
+        max_keepalive_connections=25,  # was 60
         keepalive_expiry=30.0,
     )
     _shared_client = httpx.AsyncClient(limits=limits, timeout=_TIMEOUT)
-    log.info("[tradier_client] shared HTTP client initialised (pool max=75)")
+    log.info("[tradier_client] shared HTTP client initialised (pool max=30)")
 
 
 async def close_http_client() -> None:
@@ -244,14 +262,39 @@ async def acquire_session_token_slot(
 
 
 async def get_quote(symbol: str) -> Optional[dict]:
-    """Fetch single stock quote. Returns raw quote dict or None."""
+    """Fetch single stock quote. Returns raw quote dict or None.
+
+    FIX-QUOTES-RESP: validates resp.json() is a dict and that the quotes
+    container is a dict before chaining .get() — Tradier can return HTTP 200
+    with {"quotes": "No Content"} or {"fault": {...}} which previously caused
+    a silent AttributeError swallowed by the bare except, masking auth/rate
+    issues as missing prices.
+    """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/quotes"
     try:
         resp = await _client().get(url, headers=_headers(), params={"symbols": symbol, "greeks": "false"})
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quote(%s) HTTP %d — body: %s",
+                symbol, resp.status_code, resp.text[:300],
+            )
             return None
         data = resp.json()
-        quote = data.get("quotes", {}).get("quote")
+        if not isinstance(data, dict):
+            log.error(
+                "[tradier_client] get_quote(%s) unexpected response type %s — body: %s",
+                symbol, type(data).__name__, str(data)[:300],
+            )
+            return None
+        quotes_container = data.get("quotes", {})
+        if not isinstance(quotes_container, dict):
+            log.error(
+                "[tradier_client] get_quote(%s) quotes field is %s (expected dict) — "
+                "possible auth error or rate limit. Body: %s",
+                symbol, type(quotes_container).__name__, str(data)[:300],
+            )
+            return None
+        quote = quotes_container.get("quote")
         if isinstance(quote, list):
             quote = quote[0] if quote else None
         return quote
@@ -264,6 +307,14 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
     """
     Fetch quotes for up to 200 symbols in one call.
     Returns {symbol: quote_dict} mapping.
+
+    FIX-QUOTES-RESP: validates resp.json() is a dict and that the quotes
+    container is a dict before chaining .get() — Tradier can return HTTP 200
+    with {"quotes": "No Content"} (no matching symbols) or {"fault": {...}}
+    (auth error / sandbox-vs-production mismatch). Previously both cases
+    raised AttributeError on the string/dict .get("quote") call, which was
+    silently swallowed by the bare except and returned {}, triggering the
+    B-ZERO-PRICE fallback with no root-cause log entry.
     """
     if not symbols:
         return {}
@@ -274,9 +325,28 @@ async def get_quotes_batch(symbols: list[str]) -> dict[str, dict]:
             params={"symbols": ",".join(symbols), "greeks": "false"}
         )
         if resp.status_code != 200:
+            log.warning(
+                "[tradier_client] get_quotes_batch HTTP %d for %d symbols — body: %s",
+                resp.status_code, len(symbols), resp.text[:300],
+            )
             return {}
         data = resp.json()
-        quotes_raw = data.get("quotes", {}).get("quote") or []
+        if not isinstance(data, dict):
+            log.error(
+                "[tradier_client] get_quotes_batch unexpected response type %s "
+                "for %d symbols — body: %s",
+                type(data).__name__, len(symbols), str(data)[:300],
+            )
+            return {}
+        quotes_container = data.get("quotes", {})
+        if not isinstance(quotes_container, dict):
+            log.error(
+                "[tradier_client] get_quotes_batch quotes field is %s (expected dict) "
+                "for %d symbols — possible auth error or empty result. Body: %s",
+                type(quotes_container).__name__, len(symbols), str(data)[:300],
+            )
+            return {}
+        quotes_raw = quotes_container.get("quote") or []
         if isinstance(quotes_raw, dict):
             quotes_raw = [quotes_raw]
         return {q["symbol"]: q for q in quotes_raw if "symbol" in q}
@@ -334,17 +404,11 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
     """
     Fetch full option chain for ticker + expiry — BULK BUILD PATH ONLY.
 
-    Uses _BULK_CHAIN_SEM(50) — raised from 10 to match outer build sem(50)
-    in symbol_registry.py (PERF-SEM-50 2026-05-14). Previously the inner
-    sem(10) was the real throughput ceiling (min(50,10)=10 effective
-    concurrency). Now true 50-concurrent chain fetches are possible.
+    Uses _BULK_CHAIN_SEM(10) — lowered from 50 (CONCURRENCY-10 2026-05-14)
+    to stay well under Tradier's 120 req/min ceiling. Pool sized at 30
+    (3× sem=10), restoring the original ratio from the sem=10 era.
 
     MUST NOT be used from the streaming flow path — use get_option_chain().
-
-    Still safe under 120 req/min because:
-      - each ticker coroutine also blocks on get_expirations() first
-      - per-request 30s timeouts in _build_ticker free stalled slots fast
-      - 429 responses are handled gracefully with back-off retry
     """
     url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
     async with _BULK_CHAIN_SEM:
@@ -356,7 +420,7 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
             if resp.status_code == 429:
                 # Back off and retry once using the SHARED pool (not an ephemeral
                 # client). FIX-RETRY-POOL: the previous pattern spun up a fresh
-                # httpx.AsyncClient for each 429 retry, bypassing max_connections=75
+                # httpx.AsyncClient for each 429 retry, bypassing max_connections=30
                 # and creating uncapped connections under load.
                 retry_after = float(
                     resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER_S)
@@ -402,7 +466,7 @@ async def get_option_chain_bulk_all(symbol: str) -> list[dict]:
       - Larger TCP transfer per call provides natural spacing between
         completions, making Tradier's rolling-window enforcement friendlier.
 
-    Uses _BULK_CHAIN_SEM(50) — same semaphore as get_option_chain_bulk().
+    Uses _BULK_CHAIN_SEM(10) — lowered from 50 (CONCURRENCY-10 2026-05-14).
     MUST NOT be used from the streaming flow path — use get_option_chain().
 
     429 handling: identical back-off retry as get_option_chain_bulk().
