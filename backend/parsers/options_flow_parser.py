@@ -64,10 +64,18 @@ SENTIMENT FIX (2026-05-09):
   All historical flow_events rows had order_side=UNKNOWN (Tradier stream
   never populated it), so bid_ask_class is the only available fill-placement
   signal and is the correct input to classify_sentiment().
+
+FIX-PERSIST-TYPE (fix/ingestion-persist-correctness cherry-pick):
+  occ_symbol promoted from @property to stored field — set at parse time
+  from the raw stream symbol (stripped of whitespace). This ensures
+  ev.occ_symbol is always available on the dataclass without recomputing,
+  and allows flow_store / tradier_stream to read it via getattr().
+  is_sweep and order_side fields added to support sweep upgrade path and
+  future order-side tracking.
 """
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Optional, Union, Literal
 from parsers.bid_ask_classifier import classify_bid_ask, classify_sentiment, is_directionally_aggressive
@@ -130,6 +138,7 @@ class OptionsFlowEvent:
     timestamp:      datetime
 
     # Contract
+    occ_symbol:     str   # canonical OCC symbol (e.g. "AAPL  260117C00200000"), "" if not parseable
     contract_type:  str   # CALL | PUT
     strike:         float
     expiry:         str   # YYYY-MM-DD or "" if unparseable
@@ -147,9 +156,11 @@ class OptionsFlowEvent:
     bid_ask_class:  str = ""         # ABOVE_ASK | AT_ASK | MID | AT_BID | BELOW_BID
     is_aggressive:  bool = False     # ING-006: set via is_directionally_aggressive(); re-computed post-registry
     is_golden_sweep: bool = False
+    is_sweep:       bool = False     # True when trade_type == "SWEEP"
 
     # Classification (set later)
     sentiment:       str = "NEUTRAL" # BULLISH | BEARISH | NEUTRAL
+    order_side:      str = "UNKNOWN" # BUY | SELL | UNKNOWN (Tradier stream never sets this)
     influence_tier:  str = "RETAIL"  # WHALE | INSTITUTIONAL | LARGE | RETAIL
     conviction_score: float = 0.0
 
@@ -161,21 +172,7 @@ class OptionsFlowEvent:
     underlying_price:  float = 0.0
 
     # Data quality flag
-        # Data quality flag
     is_synthetic_quote: bool = False
-
-    @property
-    def occ_symbol(self) -> str:
-        try:
-            if not self.ticker or not self.expiry or not self.contract_type:
-                return ""
-            ymd = self.expiry.replace("-", "")
-            yy_mm_dd = ymd[2:]
-            cp = "C" if self.contract_type.upper() == "CALL" else "P"
-            strike_int = int(round(self.strike * 1000))
-            return f"{self.ticker.upper()}{yy_mm_dd}{cp}{strike_int:08d}"
-        except Exception:
-            return ""
 
 
 _OCC_RE = re.compile(
@@ -322,13 +319,13 @@ def parse_tradier_trade(
         # ------------------------------------------------------------------
         # Synthetic quote handling
         # When bid=ask=0 we have no real spread data. Instead of fabricating
-        # a tight ±0.5% spread and running classification (which almost
+        # a tight +-0.5% spread and running classification (which almost
         # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
         # wide-spread contracts), we:
         #   1. Flag is_synthetic_quote=True
         #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
         #   3. Force is_aggressive=False — cannot claim aggression without quotes
-        #   4. Apply a 40% conviction haircut (×0.6) downstream
+        #   4. Apply a 40% conviction haircut (x0.6) downstream
         # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
         # post-registry — synthetic spreads have no valid aggression signal.
         # NOTE (SENTIMENT FIX): synthetic quotes force ba_class="MID" which
@@ -353,10 +350,15 @@ def parse_tradier_trade(
         ttype  = detect_trade_type(size, premium, exc_cnt, fill_cnt)
         golden = is_golden_sweep(ttype, premium, aggressive)
 
+        # Normalise OCC symbol: strip whitespace so both "AAPL  260117C00200000"
+        # and "AAPL260117C00200000" collapse to the same canonical form.
+        occ_sym = symbol.strip()
+
         ev = OptionsFlowEvent(
             id              = raw.get("id", f"{ticker}_{expiry}_{strike}_{ctype}"),
             ticker          = ticker,
             timestamp       = _parse_timestamp(raw.get("timestamp")),
+            occ_symbol      = occ_sym,
             contract_type   = ctype,
             strike          = strike,
             expiry          = expiry,
@@ -370,6 +372,7 @@ def parse_tradier_trade(
             bid_ask_class   = ba_class,
             is_aggressive   = aggressive,
             is_golden_sweep = golden,
+            is_sweep        = (ttype == "SWEEP"),
             exchange_count  = exc_cnt,
             fill_count      = fill_cnt,
             open_interest   = int(raw.get("open_interest", 0) or 0),
