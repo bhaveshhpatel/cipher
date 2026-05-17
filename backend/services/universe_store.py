@@ -61,6 +61,28 @@ FIX-QUOTE-ROWS-STR (2026-05-17):
   Fix: if any element of quote_rows is a str, normalise the entire list to
   [{"symbol": s, "stream_eligible": True}] before building upsert_rows so
   both call shapes (str list or dict list) are accepted.
+
+FIX-UNIVERSE-CHK-INDEX (2026-05-17):
+  CBOE CSV contains VIX, SPX, NDX, RUT, etc. — all of which violate the DB
+  check constraint chk_options_universe_symbols_no_index (code 23514) when
+  inserted into options_universe_symbols. This caused save_snapshot() to
+  return False on EVERY cold-start restart, so no snapshot was ever written
+  to DB and the OCC chain cache could never be seeded from DB on the next boot.
+  Fix: strip _INDEX_BLACKLIST ∪ _ETF_NOISE_BLOCKLIST from both `symbols` and
+  `symbol_rows` in _sync_save_snapshot() before building the upsert rows.
+  The canonical exclusion logic in ingestion.filters is reused directly.
+
+FIX-UPSERT-QUOTE-DICT (2026-05-17):
+  _sync_upsert_symbol_quotes() received quote_rows as a dict in some code paths
+  (e.g. when main.py passes the raw SymbolQuote mapping). dict[0] raises
+  KeyError: 0, not AttributeError, so the existing str-element guard did not
+  fire and the exception was swallowed as a non-fatal warning. Result: zero
+  rows upserted, options_universe_symbols never updated with price/tier data.
+  Fix: normalise dict input to list(dict.values()) at entry before any
+  element-type checks so all three call shapes work:
+    - list[SymbolQuote / dict]
+    - list[str]
+    - dict[str, SymbolQuote]
 """
 
 import asyncio
@@ -190,11 +212,16 @@ async def save_snapshot(
 
 async def upsert_symbol_quotes(
     snapshot_id: str,
-    quote_rows: list[dict],
+    quote_rows,
 ) -> None:
     """
     Upsert symbol quote rows (last_price, volume, open_interest, average_volume, tier)
     into options_universe_symbols for the given snapshot_id.
+
+    Accepts three call shapes:
+      - list[dict]         — standard shape from main.py Step 2f
+      - list[str]          — plain symbol list (normalised internally)
+      - dict[str, ...]     — mapping of symbol -> quote object (normalised internally)
     """
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _sync_upsert_symbol_quotes, snapshot_id, quote_rows)
@@ -360,31 +387,53 @@ def _sync_save_snapshot(
 ) -> bool:
     global _epoch
     try:
+        # FIX-UNIVERSE-CHK-INDEX: strip index/ETF-noise symbols before any upsert
+        # so we never hit the DB check constraint chk_options_universe_symbols_no_index
+        # (code 23514). Import lazily to avoid circular-import risk at module load.
+        from ingestion.filters import is_index_symbol, is_etf_noise_symbol
+
+        def _is_blocked(sym: str) -> bool:
+            return is_index_symbol(sym) or is_etf_noise_symbol(sym)
+
+        clean_symbols = [s for s in symbols if not _is_blocked(s)]
+        dropped = len(symbols) - len(clean_symbols)
+        if dropped:
+            log.info(
+                "universe_store.save_snapshot: stripped %d index/ETF-noise symbols "
+                "before DB upsert (e.g. VIX, SPX, SPY)",
+                dropped,
+            )
+
         sb          = _client()
         snapshot_id = str(uuid4())
 
         # Deactivate all existing snapshots
         sb.table("options_universe_snapshots").update({"is_active": False}).neq("id", "00000000-0000-0000-0000-000000000000").execute()
 
-        # Insert new snapshot row
+        # Insert new snapshot row (use original symbol count for auditing)
         sb.table("options_universe_snapshots").insert({
-            "id":         snapshot_id,
-            "is_active":  True,
-            "source":     source,
-            "provider":   provider,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "symbol_count": len(symbols),
+            "id":           snapshot_id,
+            "is_active":    True,
+            "source":       source,
+            "provider":     provider,
+            "fetched_at":   datetime.now(timezone.utc).isoformat(),
+            "symbol_count": len(clean_symbols),
         }).execute()
 
-        # Build symbol rows — always stamp snapshot_id regardless of source
-        # FIX-SNAPSHOT-ID-INJECT: callers may pass symbol_rows without snapshot_id
-        # (e.g. main.py Step 2e builds rows before the UUID is known). Stamping
-        # here is the single authoritative injection point; it is idempotent if
-        # the caller already set it to the correct value.
+        # Build symbol rows — strip index/ETF-noise, always stamp snapshot_id.
+        # FIX-SNAPSHOT-ID-INJECT: callers may pass symbol_rows without snapshot_id;
+        # stamping here is the single authoritative injection point.
         if symbol_rows:
-            rows = [{**r, "snapshot_id": snapshot_id} for r in symbol_rows]
+            rows = [
+                {**r, "snapshot_id": snapshot_id}
+                for r in symbol_rows
+                if not _is_blocked(r.get("symbol", ""))
+            ]
         else:
-            rows = [{"snapshot_id": snapshot_id, "symbol": s, "stream_eligible": True} for s in symbols]
+            rows = [
+                {"snapshot_id": snapshot_id, "symbol": s, "stream_eligible": True}
+                for s in clean_symbols
+            ]
 
         # Upsert in batches
         for i in range(0, len(rows), _UPSERT_BATCH):
@@ -395,8 +444,8 @@ def _sync_save_snapshot(
 
         _epoch += 1
         log.info(
-            "universe_store: saved snapshot %s (%d symbols, source=%s, epoch=%d)",
-            snapshot_id, len(symbols), source, _epoch,
+            "universe_store: saved snapshot %s (%d symbols, %d after index-strip, source=%s, epoch=%d)",
+            snapshot_id, len(symbols), len(clean_symbols), source, _epoch,
         )
         _prune_old_snapshots(sb, keep=3)
         return True
@@ -406,31 +455,41 @@ def _sync_save_snapshot(
         return False
 
 
-def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows: list) -> None:
+def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows) -> None:
     try:
         sb = _client()
-        total_batches = (len(quote_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
 
-        # FIX-QUOTE-ROWS-STR: accept list[str] (plain symbol names) in addition to
-        # list[dict]. main.py Step 2f passes symbols as a list of strings after the
-        # preliminary tier assignment; normalise to dict form before the comprehension
-        # so r.get("symbol") does not raise AttributeError: 'str' object has no attr 'get'.
-        if quote_rows and isinstance(quote_rows[0], str):
+        # FIX-UPSERT-QUOTE-DICT: normalise all three call shapes before any
+        # element-level type checks:
+        #   1. dict (e.g. {symbol: SymbolQuote}) → list of values
+        #   2. list[str]  (plain symbol names)    → list of minimal dicts
+        #   3. list[dict] (standard shape)         → used as-is
+        if isinstance(quote_rows, dict):
+            quote_rows = list(quote_rows.values())
+
+        # Guard: nothing to do
+        if not quote_rows:
+            return
+
+        # FIX-QUOTE-ROWS-STR: plain string list from main.py Step 2f
+        if isinstance(quote_rows[0], str):
             quote_rows = [{"symbol": s, "stream_eligible": True} for s in quote_rows]
+
+        total_batches = (len(quote_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
 
         upsert_rows = [
             {
                 "snapshot_id":      snapshot_id,
-                "symbol":           r["symbol"],
-                "last_price":       r.get("last_price"),
-                "volume":           r.get("volume"),
-                "open_interest":    r.get("open_interest"),
-                "average_volume":   r.get("average_volume"),
-                "tier":             r.get("tier"),
-                "stream_eligible":  r.get("stream_eligible", True),
+                "symbol":           _get_symbol(r),
+                "last_price":       _rget(r, "last_price"),
+                "volume":           _rget(r, "volume"),
+                "open_interest":    _rget(r, "open_interest"),
+                "average_volume":   _rget(r, "average_volume"),
+                "tier":             _rget(r, "tier"),
+                "stream_eligible":  _rget(r, "stream_eligible", True),
             }
             for r in quote_rows
-            if r.get("symbol")
+            if _get_symbol(r)
         ]
 
         for batch_num, i in enumerate(range(0, len(upsert_rows), _UPSERT_BATCH), 1):
@@ -443,10 +502,24 @@ def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows: list) -> None:
                 batch_num, total_batches, len(upsert_rows[i : i + _UPSERT_BATCH]),
             )
 
-        log.info("upsert_symbol_quotes: complete")
+        log.info("upsert_symbol_quotes: complete (%d rows)", len(upsert_rows))
 
     except Exception as e:
         log.warning("upsert_symbol_quotes error (non-fatal): %s", e, exc_info=True)
+
+
+def _get_symbol(r) -> str:
+    """Extract symbol string from a dict, NamedTuple, or dataclass row."""
+    if isinstance(r, dict):
+        return r.get("symbol", "") or ""
+    return getattr(r, "symbol", "") or ""
+
+
+def _rget(r, key: str, default=None):
+    """Get attribute from a dict or object row, returning default on miss."""
+    if isinstance(r, dict):
+        return r.get(key, default)
+    return getattr(r, key, default)
 
 
 def _prune_old_snapshots(sb: Client, keep: int) -> None:
