@@ -245,6 +245,19 @@ Key architectural fixes:
                           - get_signal() await: confirms coroutine is awaited.
                           - _WORKER_SPAWN_DELAY_S: confirmed location is tradier_stream.py,
                             not main.py. Logged at startup for observability.
+  BUILD-QUOTE-TYPE (main) — _post_build_upsert() now filters raw_quotes to only
+                        objects that have the `average_volume` attribute before
+                        passing to assign_tiers() and upsert_symbol_quotes().
+                        Root cause: registry.build() returns a list that can contain
+                        plain int objects (OI counts / internal accumulation artefacts
+                        leaking from the build pipeline) mixed with SymbolQuote
+                        instances. _classify() accessed quote.average_volume on an int
+                        and raised AttributeError, causing _post_build_upsert to fail
+                        entirely on every boot -- tier_map was never set from a fresh
+                        Tradier build and upsert_symbol_quotes() was never called.
+                        Fix: filter at the top of _post_build_upsert; log the count
+                        of dropped non-SymbolQuote items so the underlying build()
+                        contamination remains visible in logs.
 """
 import asyncio
 import json
@@ -619,12 +632,38 @@ def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
         log.error("[universe] ING-010-ACC: set_tier_map on accumulator failed: %s", exc, exc_info=True)
 
 
+def _filter_symbol_quotes(raw: list, caller: str) -> list:
+    """BUILD-QUOTE-TYPE: filter raw_quotes to only SymbolQuote-like objects.
+
+    registry.build() can return a heterogeneous list that includes plain int
+    objects (OI counts / internal accumulation artefacts). _classify() in
+    tier_engine.py accesses quote.average_volume, which raises AttributeError
+    on plain ints. Filter here so both assign_tiers() and upsert_symbol_quotes()
+    always receive a clean list.
+    """
+    clean = [q for q in raw if hasattr(q, "average_volume")]
+    dropped = len(raw) - len(clean)
+    if dropped:
+        log.warning(
+            "[%s] BUILD-QUOTE-TYPE: dropped %d non-SymbolQuote item(s) from raw_quotes "
+            "(total=%d kept=%d) - check symbol_registry.build() return value",
+            caller, dropped, len(raw), len(clean),
+        )
+    return clean
+
+
 async def _post_build_upsert(registry, raw_quotes: list) -> None:
     if not raw_quotes:
         log.warning("[post_build] raw_quotes is empty - skipping upsert")
         return
 
-    tier_map = await assign_tiers(raw_quotes)
+    # BUILD-QUOTE-TYPE: strip any non-SymbolQuote items before tier assignment.
+    quotes = _filter_symbol_quotes(raw_quotes, "post_build")
+    if not quotes:
+        log.warning("[post_build] no valid SymbolQuote objects after filtering - skipping upsert")
+        return
+
+    tier_map = await assign_tiers(quotes)
     registry.set_tier_map(tier_map)
     _sync_accumulator_tier_map(tier_map)
     log.info(
@@ -635,10 +674,10 @@ async def _post_build_upsert(registry, raw_quotes: list) -> None:
     )
 
     try:
-        non_null = [q for q in raw_quotes if getattr(q, "volume", None)]
+        non_null = [q for q in quotes if getattr(q, "volume", None)]
         log.info(
             "[post_build] upsert_symbol_quotes: %d total quotes, %d non-null volume",
-            len(raw_quotes), len(non_null),
+            len(quotes), len(non_null),
         )
         await universe_store.upsert_symbol_quotes(non_null, tier_map)
         log.info("[post_build] upsert_symbol_quotes complete")
@@ -736,6 +775,7 @@ async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
         try:
             invalidate_vol_oi_cache()
             raw_quotes = await registry.build()
+            # BUILD-QUOTE-TYPE: filter before passing to _post_build_upsert.
             await _post_build_upsert(registry, raw_quotes or [])
             log.info("[prewarm] Pre-warm build complete")
         except Exception as exc:
