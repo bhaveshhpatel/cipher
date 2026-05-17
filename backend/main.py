@@ -309,6 +309,30 @@ Key architectural fixes:
                         Fixed in:
                           1. _background_universe_resolve()
                           2. _universe_refresh_loop()
+  FIX-UPSERT-ARG-ORDER (main) — Correct upsert_symbol_quotes() argument order at both
+                        call sites. Root cause: both _post_build_upsert() and
+                        _background_universe_resolve() called:
+                          upsert_symbol_quotes(quote_rows, tier_map)
+                        but the signature is:
+                          upsert_symbol_quotes(snapshot_id: str, quote_rows) -> None
+                        quote_rows landed in snapshot_id; tier_map (a dict) landed in
+                        quote_rows; _sync_upsert_symbol_quotes normalised dict ->
+                        list(values()) producing list[int] (tier values); _get_symbol()
+                        returned "" for every int; upsert_rows was always empty ->
+                        (0 rows) logged on every boot. Additionally, no real snapshot
+                        UUID was ever passed.
+                        Fix:
+                          1. Add _enrich_quotes_with_tier(quotes, tier_map) helper
+                             that stamps q.tier on each SymbolQuote in-place so
+                             _rget(r, "tier") returns a real value in the upsert.
+                          2. _post_build_upsert(): after assign_tiers(), call
+                             universe_store.get_latest_snapshot_id() to get the real
+                             UUID, enrich quotes, then call
+                             upsert_symbol_quotes(snapshot_id, enriched_quotes).
+                          3. _background_universe_resolve(): after save_snapshot()
+                             succeeds, call get_latest_snapshot_id() for the
+                             freshly-written UUID, enrich quotes, then call
+                             upsert_symbol_quotes(snapshot_id, enriched_quotes).
 """
 import asyncio
 import json
@@ -572,6 +596,28 @@ def _build_symbol_rows(symbols: list[str], stream_eligible_set) -> list[dict]:
     ]
 
 
+def _enrich_quotes_with_tier(quotes: list, tier_map: dict[str, int]) -> list:
+    """FIX-UPSERT-ARG-ORDER: stamp .tier on each SymbolQuote from tier_map.
+
+    universe_store.upsert_symbol_quotes() uses _rget(r, "tier") to read the
+    tier column value. Without this stamp, _rget() returns None for every
+    quote and the tier column is never written to options_universe_symbols.
+
+    Returns the same list (mutated in-place) for convenience.
+    """
+    for q in quotes:
+        sym = getattr(q, "symbol", None) or (q.get("symbol") if isinstance(q, dict) else None)
+        if sym and sym in tier_map:
+            if isinstance(q, dict):
+                q["tier"] = tier_map[sym]
+            else:
+                try:
+                    q.tier = tier_map[sym]
+                except AttributeError:
+                    pass  # frozen dataclass or NamedTuple — tier stays None
+    return quotes
+
+
 async def _background_universe_resolve(
     registry,
     stream_task_ref: list,
@@ -597,6 +643,7 @@ async def _background_universe_resolve(
 
     tier_map: dict[str, int] = {}
     quotes: list = []
+    saved_snapshot_id: Optional[str] = None
 
     if source == "tradier_validated":
         log.info(
@@ -615,6 +662,13 @@ async def _background_universe_resolve(
             )
             if saved:
                 log.info("[universe] Step 2e SUCCESS: snapshot persisted to DB")
+                # FIX-UPSERT-ARG-ORDER: fetch the UUID of the snapshot we just wrote
+                # so upsert_symbol_quotes() targets the correct rows.
+                saved_snapshot_id = await universe_store.get_latest_snapshot_id()
+                log.info(
+                    "[universe] Step 2e: saved_snapshot_id=%s",
+                    saved_snapshot_id,
+                )
             else:
                 log.error("[universe] Step 2e FAILED: save_snapshot returned False")
         except Exception as exc:
@@ -654,12 +708,21 @@ async def _background_universe_resolve(
         except Exception as exc:
             log.error("[universe] Background resolve: tier_map patch failed: %s", exc, exc_info=True)
 
-    if quotes and tier_map:
+    # FIX-UPSERT-ARG-ORDER: pass (snapshot_id, enriched_quotes) — correct arg order.
+    # Previously called upsert_symbol_quotes(quotes, tier_map) which put quote_rows
+    # in snapshot_id and tier_map in quote_rows -> always (0 rows).
+    if quotes and tier_map and saved_snapshot_id:
         try:
-            await universe_store.upsert_symbol_quotes(quotes, tier_map)
-            log.info("[universe] Background resolve: upsert_symbol_quotes complete")
+            enriched = _enrich_quotes_with_tier(quotes, tier_map)
+            await universe_store.upsert_symbol_quotes(saved_snapshot_id, enriched)
+            log.info("[universe] Background resolve: upsert_symbol_quotes complete (snapshot_id=%s)", saved_snapshot_id)
         except Exception as exc:
             log.error("[universe] Background resolve: upsert_symbol_quotes failed: %s", exc, exc_info=True)
+    elif quotes and tier_map and not saved_snapshot_id:
+        log.warning(
+            "[universe] Background resolve: skipping upsert_symbol_quotes - "
+            "saved_snapshot_id is None (save_snapshot may have failed)"
+        )
 
     stream_symbols = (
         [s for s in symbols if s in stream_eligible_set]
@@ -759,13 +822,25 @@ async def _post_build_upsert(registry, raw_quotes: list) -> None:
         sum(1 for t in tier_map.values() if t == 3),
     )
 
+    # FIX-UPSERT-ARG-ORDER: fetch the real snapshot UUID first, then call
+    # upsert_symbol_quotes(snapshot_id, quote_rows) in the correct order.
+    # Previously called upsert_symbol_quotes(non_null, tier_map) which put
+    # the quote list in snapshot_id and tier_map in quote_rows -> (0 rows).
     try:
-        non_null = [q for q in quotes if getattr(q, "volume", None)]
+        snapshot_id = await universe_store.get_latest_snapshot_id()
+        if not snapshot_id:
+            log.warning(
+                "[post_build] upsert_symbol_quotes: no snapshot_id found in DB - "
+                "skipping upsert (options_universe_symbols will not be updated)"
+            )
+            return
+
         log.info(
-            "[post_build] upsert_symbol_quotes: %d total quotes, %d non-null volume",
-            len(quotes), len(non_null),
+            "[post_build] upsert_symbol_quotes: snapshot_id=%s, %d quotes",
+            snapshot_id, len(quotes),
         )
-        await universe_store.upsert_symbol_quotes(non_null, tier_map)
+        enriched = _enrich_quotes_with_tier(quotes, tier_map)
+        await universe_store.upsert_symbol_quotes(snapshot_id, enriched)
         log.info("[post_build] upsert_symbol_quotes complete")
     except Exception as exc:
         log.error("[post_build] upsert_symbol_quotes failed: %s", exc, exc_info=True)
