@@ -43,6 +43,24 @@ ROOT CAUSE FIX (2026-05-05) ING-010:
   lifespan was always {}. Stream workers received no tier assignments.
   Fix: add load_tier_map() which queries options_universe_symbols for the
   most-recent active snapshot and returns {symbol: tier} dict.
+
+FIX-SNAPSHOT-ID-INJECT (2026-05-17):
+  _sync_save_snapshot() only injected snapshot_id in the fallback `else` branch
+  (when symbol_rows was None/empty). Callers that pass pre-built symbol_rows
+  (e.g. main.py Step 2e) received rows without snapshot_id -> Supabase NOT NULL
+  violation: null value in column "snapshot_id" violates not-null constraint.
+  Fix: always stamp r["snapshot_id"] = snapshot_id on every row before the
+  batch upsert loop, regardless of which branch built the rows.
+
+FIX-QUOTE-ROWS-STR (2026-05-17):
+  upsert_symbol_quotes() was called from main.py Step 2f with a list of plain
+  symbol strings. The comprehension `r.get("symbol")` raised:
+    AttributeError: 'str' object has no attribute 'get'
+  Caught as non-fatal WARNING -> zero rows upserted -> options_universe_symbols
+  never received price/volume/tier data for the new snapshot.
+  Fix: if any element of quote_rows is a str, normalise the entire list to
+  [{"symbol": s, "stream_eligible": True}] before building upsert_rows so
+  both call shapes (str list or dict list) are accepted.
 """
 
 import asyncio
@@ -358,9 +376,13 @@ def _sync_save_snapshot(
             "symbol_count": len(symbols),
         }).execute()
 
-        # Build symbol rows
+        # Build symbol rows — always stamp snapshot_id regardless of source
+        # FIX-SNAPSHOT-ID-INJECT: callers may pass symbol_rows without snapshot_id
+        # (e.g. main.py Step 2e builds rows before the UUID is known). Stamping
+        # here is the single authoritative injection point; it is idempotent if
+        # the caller already set it to the correct value.
         if symbol_rows:
-            rows = symbol_rows
+            rows = [{**r, "snapshot_id": snapshot_id} for r in symbol_rows]
         else:
             rows = [{"snapshot_id": snapshot_id, "symbol": s, "stream_eligible": True} for s in symbols]
 
@@ -384,10 +406,17 @@ def _sync_save_snapshot(
         return False
 
 
-def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows: list[dict]) -> None:
+def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows: list) -> None:
     try:
         sb = _client()
         total_batches = (len(quote_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
+
+        # FIX-QUOTE-ROWS-STR: accept list[str] (plain symbol names) in addition to
+        # list[dict]. main.py Step 2f passes symbols as a list of strings after the
+        # preliminary tier assignment; normalise to dict form before the comprehension
+        # so r.get("symbol") does not raise AttributeError: 'str' object has no attr 'get'.
+        if quote_rows and isinstance(quote_rows[0], str):
+            quote_rows = [{"symbol": s, "stream_eligible": True} for s in quote_rows]
 
         upsert_rows = [
             {
