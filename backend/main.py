@@ -255,6 +255,24 @@ Key architectural fixes:
                         epoch=1 directly, fire build_done_event immediately, and skip
                         registry.build(). refresh_loop() handles the background Tradier
                         refresh without blocking the stream.
+  FIX-P1-SKIP-TIERS (main) — Fix stale T3 tier_map infinite-loop regression caused by
+                        FIX-P1-SKIP-BUILD. Root cause: the early-return guard in
+                        _background_build_and_upsert() returned before calling
+                        _post_build_upsert(), so assign_tiers() was never invoked.
+                        The tier_map loaded at startup (all T3 from a stale DB snapshot)
+                        was never refreshed. Every subsequent boot read the same stale
+                        T3=all data, creating an infinite stale-tier loop.
+                        Confirmed by logs:
+                          [build] FIX-P1-SKIP-BUILD: registry seeded with 55393 contracts
+                          (epoch=0) - skipping full Tradier build, streaming immediately.
+                        and startup tier_map showing T1=0 T2=0 T3=4357 on every boot.
+                        Fix: after the skip guard fires, call _fetch_batch_quotes() on
+                        stream_symbols (shallow volume/OI fetch, not a chain-pull --
+                        completes in seconds) and pass the result to _post_build_upsert().
+                        If the fetch returns nothing, log a warning and continue -- tiers
+                        remain as-loaded from DB rather than crashing the stream.
+                        The full Tradier chain-pull (registry.build()) is still skipped;
+                        only tier assignment is added to the skip path.
   MAIN-DEBUG-001 (main) — _background_build_and_upsert() and lifespan() now log the
                         exact tradier_stream bug surface:
                           - persist_flow_event call-site: logs whether ev is passed as
@@ -765,12 +783,46 @@ async def _background_build_and_upsert(
         if seeded_count >= _P1_MIN_CONTRACTS and epoch == 0:
             log.info(
                 "[build] FIX-P1-SKIP-BUILD: registry seeded with %d contracts from P1 "
-                "fallback (epoch=%d) - skipping full Tradier build, streaming immediately. "
-                "refresh_loop() will run Tradier sync in background.",
+                "fallback (epoch=%d) - skipping full Tradier build. "
+                "Running tier assignment from batch quotes (FIX-P1-SKIP-TIERS).",
                 seeded_count, epoch,
             )
             registry._build_complete = True
             registry.epoch = 1
+
+            # FIX-P1-SKIP-TIERS: tier assignment must still run even when the
+            # full chain-pull is skipped. _fetch_batch_quotes() is a shallow
+            # volume/OI fetch (not a per-ticker chain-pull) -- it completes in
+            # seconds and returns SymbolQuote objects suitable for assign_tiers().
+            # Without this, the tier_map loaded at startup (all T3 from a stale
+            # DB snapshot) is never refreshed, producing an infinite stale-tier
+            # loop across every subsequent boot.
+            try:
+                symbols_for_tiers = stream_symbols if stream_symbols else []
+                if symbols_for_tiers:
+                    log.info(
+                        "[build] FIX-P1-SKIP-TIERS: fetching batch quotes for %d symbols",
+                        len(symbols_for_tiers),
+                    )
+                    skip_quotes = await _fetch_batch_quotes(symbols_for_tiers)
+                    if skip_quotes:
+                        await _post_build_upsert(registry, skip_quotes)
+                    else:
+                        log.warning(
+                            "[build] FIX-P1-SKIP-TIERS: _fetch_batch_quotes returned no quotes "
+                            "for %d symbols - tiers remain as loaded from DB snapshot",
+                            len(symbols_for_tiers),
+                        )
+                else:
+                    log.warning(
+                        "[build] FIX-P1-SKIP-TIERS: stream_symbols is empty - "
+                        "skipping tier assignment, tiers remain as loaded from DB snapshot"
+                    )
+            except Exception as exc:
+                log.error(
+                    "[build] FIX-P1-SKIP-TIERS: tier assignment failed: %s",
+                    exc, exc_info=True,
+                )
             return
 
         log.info(
