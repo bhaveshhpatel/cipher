@@ -258,6 +258,22 @@ Key architectural fixes:
                         Fix: filter at the top of _post_build_upsert; log the count
                         of dropped non-SymbolQuote items so the underlying build()
                         contamination remains visible in logs.
+  SAVE-SNAPSHOT-SET (main) — Fix save_snapshot() call sites passing stream_eligible_set
+                        as the third positional arg (provider parameter).
+                        Root cause: both call sites used the positional signature:
+                          save_snapshot(symbols, source, stream_eligible_set)
+                        but universe_store.save_snapshot() is defined as:
+                          save_snapshot(symbols, source="tradier", provider="tradier", symbol_rows=None)
+                        stream_eligible_set (a Python set) landed in `provider` and
+                        was embedded in the INSERT payload, causing:
+                          TypeError: Object of type set is not JSON serializable
+                        in _sync_save_snapshot() on every boot.
+                        Fix: both call sites now build an explicit symbol_rows list
+                        that encodes stream_eligible per-symbol correctly, and pass it
+                        as the keyword argument. provider defaults to "tradier".
+                        Fixed in:
+                          1. _background_universe_resolve()
+                          2. _universe_refresh_loop()
 """
 import asyncio
 import json
@@ -297,8 +313,6 @@ import httpx
 
 # FIX-P1-SKIP-BUILD: minimum contract count from load_from_db() that is
 # considered sufficient to skip the full Tradier chain-pull at startup.
-# 10,000 is well below the expected ~127K from a healthy P1 fallback but
-# far above the 0-few-hundred that indicates a genuinely empty/stale seed.
 _P1_MIN_CONTRACTS = 10_000
 
 
@@ -486,6 +500,27 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], O
     return [], {}, None, True
 
 
+def _build_symbol_rows(symbols: list[str], stream_eligible_set) -> list[dict]:
+    """SAVE-SNAPSHOT-SET: build explicit symbol_rows for save_snapshot().
+
+    Encodes stream_eligible per-symbol so that the correct value is persisted
+    to options_universe_symbols. Avoids passing stream_eligible_set (a Python
+    set) as the `provider` positional arg, which caused JSON serialisation
+    failure.
+
+    snapshot_id is intentionally omitted here; _sync_save_snapshot() injects
+    the freshly-generated UUID into each row before upserting.
+    """
+    eligible: set = set(stream_eligible_set) if stream_eligible_set is not None else set(symbols)
+    return [
+        {
+            "symbol":          s,
+            "stream_eligible": s in eligible,
+        }
+        for s in symbols
+    ]
+
+
 async def _background_universe_resolve(
     registry,
     stream_task_ref: list,
@@ -519,7 +554,14 @@ async def _background_universe_resolve(
             len(stream_eligible_set) if stream_eligible_set is not None else len(symbols),
         )
         try:
-            saved = await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+            # SAVE-SNAPSHOT-SET: build explicit symbol_rows so stream_eligible is
+            # persisted correctly and stream_eligible_set never lands in `provider`.
+            symbol_rows = _build_symbol_rows(symbols, stream_eligible_set)
+            saved = await universe_store.save_snapshot(
+                symbols,
+                source,
+                symbol_rows=symbol_rows,
+            )
             if saved:
                 log.info("[universe] Step 2e SUCCESS: snapshot persisted to DB")
             else:
@@ -633,14 +675,7 @@ def _sync_accumulator_tier_map(tier_map: dict[str, int]) -> None:
 
 
 def _filter_symbol_quotes(raw: list, caller: str) -> list:
-    """BUILD-QUOTE-TYPE: filter raw_quotes to only SymbolQuote-like objects.
-
-    registry.build() can return a heterogeneous list that includes plain int
-    objects (OI counts / internal accumulation artefacts). _classify() in
-    tier_engine.py accesses quote.average_volume, which raises AttributeError
-    on plain ints. Filter here so both assign_tiers() and upsert_symbol_quotes()
-    always receive a clean list.
-    """
+    """BUILD-QUOTE-TYPE: filter raw_quotes to only SymbolQuote-like objects."""
     clean = [q for q in raw if hasattr(q, "average_volume")]
     dropped = len(raw) - len(clean)
     if dropped:
@@ -690,27 +725,10 @@ async def _background_build_and_upsert(
     stream_symbols: list[str],
     build_done_event: asyncio.Event,
 ) -> None:
-    """
-    P2/SEQ-002-FIX/FIX-P1-SKIP-BUILD: Background OCC build + post-build upsert.
-
-    FIX-P1-SKIP-BUILD: If the registry was already seeded by load_from_db() with
-    more than _P1_MIN_CONTRACTS contracts AND epoch==0 (no Tradier build has
-    completed this session), treat the P1 fallback as sufficient:
-      - Set _build_complete=True and epoch=1 directly on the registry object.
-      - Fire build_done_event immediately so chain_refresh and stream workers
-        unblock without waiting for a full Tradier chain-pull.
-      - Skip registry.build() and _post_build_upsert() entirely.
-    refresh_loop() (interval=3600s) will handle the first background Tradier
-    refresh without any stream blocking.
-
-    This eliminates the 7-14 min market-open blind window that occurred every
-    cold start when a valid prior-day chain was already in memory.
-    """
     try:
         seeded_count = len(registry._registry) if hasattr(registry, "_registry") else 0
         epoch = getattr(registry, "epoch", 0)
 
-        # FIX-P1-SKIP-BUILD: trust P1 fallback and stream immediately.
         if seeded_count >= _P1_MIN_CONTRACTS and epoch == 0:
             log.info(
                 "[build] FIX-P1-SKIP-BUILD: registry seeded with %d contracts from P1 "
@@ -720,9 +738,8 @@ async def _background_build_and_upsert(
             )
             registry._build_complete = True
             registry.epoch = 1
-            return  # outer finally will set build_done_event
+            return
 
-        # Normal path: seeded count below floor or epoch > 0 (refresh_loop rebuild).
         log.info(
             "[build] Starting background OCC registry build "
             "(seeded_count=%d, epoch=%d)...",
@@ -775,7 +792,6 @@ async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
         try:
             invalidate_vol_oi_cache()
             raw_quotes = await registry.build()
-            # BUILD-QUOTE-TYPE: filter before passing to _post_build_upsert.
             await _post_build_upsert(registry, raw_quotes or [])
             log.info("[prewarm] Pre-warm build complete")
         except Exception as exc:
@@ -791,7 +807,14 @@ async def _universe_refresh_loop(build_done_event: asyncio.Event) -> None:
             stale = await universe_store.load_any_snapshot()
             symbols, source, stream_eligible_set = await load_universe(db_snapshot=stale)
             if source == "tradier_validated":
-                await universe_store.save_snapshot(symbols, source, stream_eligible_set)
+                # SAVE-SNAPSHOT-SET: build explicit symbol_rows; never pass
+                # stream_eligible_set as the positional `provider` argument.
+                symbol_rows = _build_symbol_rows(symbols, stream_eligible_set)
+                await universe_store.save_snapshot(
+                    symbols,
+                    source,
+                    symbol_rows=symbol_rows,
+                )
                 log.info(
                     "[universe_refresh] Snapshot refreshed - %d symbols (source=%s)",
                     len(symbols), source,
@@ -858,21 +881,17 @@ async def lifespan(app: FastAPI):
         log.error("[startup] Step 4: registry.load_from_db() failed: %s", exc, exc_info=True)
 
     # -- Step 4b: log tradier_stream module constants for observability ----
-    # MAIN-DEBUG-001: surface _WORKER_SPAWN_DELAY_S and other stream constants
-    # at startup so they appear in Railway logs without needing to read the file.
     try:
         from services import tradier_stream as _ts_inspect
         spawn_delay = getattr(_ts_inspect, "_WORKER_SPAWN_DELAY_S", "NOT FOUND")
         log.info(
-            "[startup] MAIN-DEBUG-001: tradier_stream._WORKER_SPAWN_DELAY_S=%s "
-            "(target: 0.5 to avoid Tradier ConnectTimeout at 255 workers)",
+            "[startup] MAIN-DEBUG-001: tradier_stream._WORKER_SPAWN_DELAY_S=%s",
             spawn_delay,
         )
         if isinstance(spawn_delay, (int, float)) and spawn_delay < 0.5:
             log.warning(
                 "[startup] MAIN-DEBUG-001: _WORKER_SPAWN_DELAY_S=%.3f is below 0.5 - "
-                "at 255 workers this causes Tradier ConnectTimeout storms. "
-                "Fix: set _WORKER_SPAWN_DELAY_S = 0.5 in tradier_stream.py",
+                "Tradier ConnectTimeout risk at high worker counts.",
                 spawn_delay,
             )
     except Exception as exc:
@@ -931,9 +950,6 @@ async def lifespan(app: FastAPI):
 
     self_ping_task = asyncio.create_task(_self_ping_worker())
 
-    # -- Step 6-k: ING-010-RELOAD: gate config refresh loop ---------------
-    # Re-polls gate_configs table every 300 s so external DB writes
-    # (Supabase dashboard, SQL, separate deploy) propagate without restart.
     gate_config_refresh_task = asyncio.create_task(
         gate_config_store.start_refresh_loop(300)
     )
