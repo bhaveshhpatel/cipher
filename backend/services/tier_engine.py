@@ -49,22 +49,26 @@ _SUPABASE_KEY: Optional[str] = (
 
 CACHE_TTL = 300  # seconds
 
+# ---------------------------------------------------------------------------
+# Defaults — must exactly mirror the active tier_thresholds row in Supabase.
+# Last synced from DB id=1 (updated_by=bhaveshhpatel@yahoo.com, 2026-05-04).
+# ---------------------------------------------------------------------------
 _DEFAULT_THRESHOLDS: dict = {
     "t1_min_volume":     20_000_000,
     "t1_min_last_price": 10.0,
     "t1_min_oi":         1_000,
-    "t1_atm_pct":        0.20,
-    "t1_max_dte":        90,
-    "t2_min_volume":     2_000_000,
+    "t1_atm_pct":        0.15,   # ±15% strike range for T1
+    "t1_max_dte":        60,
+    "t2_min_volume":     1_000_000,
     "t2_min_last_price": 10.0,
     "t2_min_oi":         500,
-    "t2_atm_pct":        0.15,
-    "t2_max_dte":        60,
+    "t2_atm_pct":        0.20,   # ±20% strike range for T2
+    "t2_max_dte":        90,
     "t3_min_volume":     500_000,
     "t3_min_last_price": 1.0,
     "t3_min_oi":         100,
-    "t3_atm_pct":        0.10,
-    "t3_max_dte":        30,
+    "t3_atm_pct":        0.20,   # ±20% strike range for T3
+    "t3_max_dte":        90,
 }
 
 # Used by assign_tiers() when _fetch_thresholds() itself raises despite the
@@ -73,18 +77,18 @@ _SAFE_FALLBACK_THRESHOLDS: dict = {
     "t1_min_volume":     float("inf"),
     "t1_min_last_price": float("inf"),
     "t1_min_oi":         float("inf"),
-    "t1_atm_pct":        0.20,
-    "t1_max_dte":        90,
+    "t1_atm_pct":        0.15,
+    "t1_max_dte":        60,
     "t2_min_volume":     float("inf"),
     "t2_min_last_price": float("inf"),
     "t2_min_oi":         float("inf"),
-    "t2_atm_pct":        0.15,
-    "t2_max_dte":        60,
+    "t2_atm_pct":        0.20,
+    "t2_max_dte":        90,
     "t3_min_volume":     0,
     "t3_min_last_price": 0.0,
     "t3_min_oi":         0,
-    "t3_atm_pct":        0.10,
-    "t3_max_dte":        30,
+    "t3_atm_pct":        0.20,
+    "t3_max_dte":        90,
 }
 
 # Required keys that must be present in any thresholds dict passed to _classify.
