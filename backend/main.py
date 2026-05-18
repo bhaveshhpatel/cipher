@@ -906,20 +906,63 @@ async def _background_build_and_upsert(
             seeded_count, epoch,
         )
 
+        # FIX-QQ1-BUILD-SEQUENCING: tier_map must be refreshed BEFORE build() so
+        # _build_with_sem reads the correct tier via self._tier_map.get(ticker, 3)
+        # when selecting tier_params for the chain pull.
+        pre_quotes: list = []
+        if stream_symbols:
+            try:
+                log.info(
+                    "[build] FIX-QQ1-BUILD-SEQUENCING: pre-fetching batch quotes for %d symbols before build()",
+                    len(stream_symbols),
+                )
+                pre_quotes = await _fetch_batch_quotes(stream_symbols)
+                if pre_quotes:
+                    pre_tier_map = await assign_tiers(pre_quotes)
+                    registry.set_tier_map(pre_tier_map)
+                    _sync_accumulator_tier_map(pre_tier_map)
+                    log.info(
+                        "[build] FIX-QQ1-BUILD-SEQUENCING: pre-build tier_map applied "
+                        "from %d SymbolQuotes (T1=%d T2=%d T3=%d)",
+                        len(pre_quotes),
+                        sum(1 for t in pre_tier_map.values() if t == 1),
+                        sum(1 for t in pre_tier_map.values() if t == 2),
+                        sum(1 for t in pre_tier_map.values() if t == 3),
+                    )
+                else:
+                    log.warning(
+                        "[build] FIX-QQ1-BUILD-SEQUENCING: pre-fetch returned no quotes - "
+                        "proceeding with DB-loaded tiers"
+                    )
+            except Exception as exc:
+                log.warning(
+                    "[build] FIX-QQ1-BUILD-SEQUENCING: pre-fetch/tier assignment failed: %s - "
+                    "proceeding with DB-loaded tiers",
+                    exc,
+                    exc_info=True,
+                )
+
         try:
-            raw_quotes = await registry.build()
+            build_count, _ = await registry.build()
             log.info(
-                "[build] registry.build() complete - %d contracts loaded",
+                "[build] registry.build() complete - build_count=%d contracts_loaded=%d",
+                build_count,
                 len(registry._registry) if hasattr(registry, "_registry") else 0,
             )
         except Exception as exc:
             log.error("[build] registry.build() failed: %s", exc, exc_info=True)
             return
 
-        try:
-            await _post_build_upsert(registry, raw_quotes or [])
-        except Exception as exc:
-            log.error("[build] _post_build_upsert failed: %s", exc, exc_info=True)
+        if pre_quotes:
+            try:
+                await _post_build_upsert(registry, pre_quotes)
+            except Exception as exc:
+                log.error("[build] _post_build_upsert failed: %s", exc, exc_info=True)
+        else:
+            log.warning(
+                "[build] FIX-QQ1-BUILD-SEQUENCING: skipping _post_build_upsert - "
+                "no pre-fetched SymbolQuotes available"
+            )
 
     finally:
         build_done_event.set()
@@ -951,8 +994,28 @@ async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
         log.info("[prewarm] Starting 9:15 AM ET pre-warm build")
         try:
             invalidate_vol_oi_cache()
-            raw_quotes = await registry.build()
-            await _post_build_upsert(registry, raw_quotes or [])
+            pre_quotes: list = []
+            tracked_symbols = []
+            if hasattr(registry, "_tier_map") and registry._tier_map:
+                tracked_symbols = list(registry._tier_map.keys())
+            elif hasattr(registry, "watchlist") and registry.watchlist:
+                tracked_symbols = list(registry.watchlist)
+
+            if tracked_symbols:
+                try:
+                    pre_quotes = await _fetch_batch_quotes(tracked_symbols)
+                    if pre_quotes:
+                        pre_tier_map = await assign_tiers(pre_quotes)
+                        registry.set_tier_map(pre_tier_map)
+                        _sync_accumulator_tier_map(pre_tier_map)
+                except Exception as exc:
+                    log.warning("[prewarm] pre-fetch tier refresh failed: %s", exc, exc_info=True)
+
+            _build_count, _ = await registry.build()
+            if pre_quotes:
+                await _post_build_upsert(registry, pre_quotes)
+            else:
+                log.warning("[prewarm] no SymbolQuotes available for _post_build_upsert after build()")
             log.info("[prewarm] Pre-warm build complete")
         except Exception as exc:
             log.error("[prewarm] Pre-warm build failed: %s", exc, exc_info=True)
