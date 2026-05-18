@@ -994,6 +994,7 @@ async def _background_build_and_upsert(
             )
 
     finally:
+        registry._build_complete = True
         build_done_event.set()
         log.info("[build] _registry_build_done event set - chain_refresh unblocked")
 
