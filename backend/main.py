@@ -333,6 +333,35 @@ Key architectural fixes:
                              succeeds, call get_latest_snapshot_id() for the
                              freshly-written UUID, enrich quotes, then call
                              upsert_symbol_quotes(snapshot_id, enriched_quotes).
+  FIX-QQ1-BUILD-SEQUENCING (main) — Pre-fetch SymbolQuote objects BEFORE registry.build()
+                        so tier_map is correct during the chain-pull AND _post_build_upsert
+                        receives real SymbolQuote objects (not raw dicts from build()).
+                        Root causes fixed:
+                          1. registry.build() returns (int, dict) tuple -- code was
+                             treating the whole tuple as raw_quotes, so _post_build_upsert
+                             received a 2-tuple instead of a list, _filter_symbol_quotes
+                             saw 0 SymbolQuote objects, and tier assignment was silently
+                             skipped on every full build.
+                          2. raw_quotes_dict from build() contains raw dicts from
+                             _fetch_stock_prices, NOT SymbolQuote objects -- assign_tiers()
+                             needs SymbolQuote objects with .average_volume / .open_interest.
+                        Fix:
+                          - Pre-build: call _fetch_batch_quotes(stream_symbols) BEFORE
+                            registry.build() to obtain real SymbolQuote objects, then
+                            assign_tiers() -> registry.set_tier_map() ->
+                            _sync_accumulator_tier_map() so _build_with_sem reads the
+                            correct tier via self._tier_map.get(ticker, 3) during the
+                            chain-pull.
+                          - Tuple unpack: count, _ = await registry.build() -- discard
+                            the raw dict return (internal _fetch_stock_prices dicts,
+                            not SymbolQuotes).
+                          - Post-build: pass the pre-fetched SymbolQuote list (pre_quotes)
+                            to _post_build_upsert() -- these are guaranteed SymbolQuote
+                            objects that assign_tiers() and upsert_symbol_quotes() can
+                            consume correctly.
+                          - Guard: if pre-fetch returns nothing (Tradier down), fall through
+                            to registry.build() anyway but log a warning; tiers stay as
+                            DB-loaded rather than crashing the stream.
 """
 import asyncio
 import json
