@@ -286,6 +286,14 @@ Fix (FIX-2 2026-05-16): use symbol_tier from OCC registry for tier resolution.
     - T2/T3 symbols receive correct $15k/$10k floors respectively.
     - Dedup window dispatch correctly uses symbol_tier.
     - No hot-path performance change — O(1) dict lookup in the registry.
+
+Fix (DIRECTION-KWARG 2026-05-18): remove stale price/bid/ask kwargs from
+  order_side_to_direction() call in Gate 4 of _process_trade().
+  order_side_to_direction(order_side, contract_type) takes exactly two positional
+  args. The call was incorrectly passing price=ev.fill_price, bid=ev.bid,
+  ask=ev.ask — kwargs that belong to is_directionally_aggressive(), not this
+  function. This caused TypeError on every single timesale tick, blocking all
+  flow from reaching flow_events. Fix: pass ev.order_side and ev.contract_type.
 """
 import asyncio
 import logging
@@ -855,10 +863,11 @@ async def _process_trade(raw: dict) -> None:
         return
 
     # --- Gate 4: direction classification ---
+    # DIRECTION-KWARG fix: order_side_to_direction(order_side, contract_type) only.
+    # price/bid/ask are is_directionally_aggressive() params, not this function's.
     ev.direction = order_side_to_direction(
-        price=ev.fill_price,
-        bid=ev.bid,
-        ask=ev.ask,
+        order_side=ev.order_side,
+        contract_type=ev.contract_type,
     )
     if not is_directionally_aggressive(ev):
         return
