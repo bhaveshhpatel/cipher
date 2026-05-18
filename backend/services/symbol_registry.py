@@ -1050,24 +1050,30 @@ async def _build_ticker(
 
         # Two-stage stall warning: warn at _CHAIN_STALL_WARN_S, hard-kill at
         # _CHAIN_REQUEST_TIMEOUT_S.
+        # FIX-DOUBLE-CALL: wrap in ensure_future so stage 2 awaits the SAME
+        # in-flight HTTP request instead of starting a brand new one.
+        # asyncio.shield() lets the outer wait_for cancel without touching the Task.
         chain_data = None
+        _chain_task = asyncio.ensure_future(get_option_chain_bulk(ticker, expiry_str))
         try:
             chain_data = await asyncio.wait_for(
-                get_option_chain_bulk(ticker, expiry_str),
+                asyncio.shield(_chain_task),
                 timeout=_CHAIN_STALL_WARN_S,
             )
         except asyncio.TimeoutError:
             log.warning(
                 "[symbol_registry] _build_ticker: %s expiry=%s stalled >%.0fs "
-                "— extending to %.0fs hard timeout",
+                "— waiting on same request (hard timeout=%.0fs)",
                 ticker, expiry_str, _CHAIN_STALL_WARN_S, _CHAIN_REQUEST_TIMEOUT_S,
             )
             try:
+                # Stage 2: await the SAME task — zero new API calls.
                 chain_data = await asyncio.wait_for(
-                    get_option_chain_bulk(ticker, expiry_str),
+                    _chain_task,
                     timeout=_CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S,
                 )
             except asyncio.TimeoutError:
+                _chain_task.cancel()
                 log.warning(
                     "[symbol_registry] _build_ticker: %s expiry=%s hard timeout "
                     "after %.0fs — skipping expiry",
@@ -1075,6 +1081,7 @@ async def _build_ticker(
                 )
                 continue
             except Exception as exc:
+                _chain_task.cancel()
                 log.warning(
                     "[symbol_registry] _build_ticker: %s expiry=%s error after "
                     "stall warning: %s",
