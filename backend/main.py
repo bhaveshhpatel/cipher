@@ -156,4 +156,211 @@ Key architectural fixes:
                         The previous implementation set build_done_event inside the
                         finally block of the try/except around registry.build() only --
                         meaning the event fired BEFORE _post_build_upsert() ran. This
-   
+                        re-introduced Tradier quota contention: chain_refresh could
+                        unblock and start fetching chains while _post_build_upsert()
+                        was still making its own Tradier calls (assign_tiers,
+                        upsert_symbol_quotes).
+                        Fix: single outer try/finally wraps BOTH build() and
+                        _post_build_upsert(). The event is set only in the outer
+                        finally -- guaranteed to fire whether either phase succeeds,
+                        fails, or the task is cancelled. An inner try/except still
+                        catches build() failures and returns early (skipping upsert)
+                        while preserving the outer finally guarantee.
+  SEQ-002-STAGGER (main) — Add 60 s quota-recovery delay between build_done_event
+                        firing and start_chain_refresh_worker() being called.
+                        Root cause: build+upsert exhausts the Tradier 120 req/min
+                        window. Firing chain refresh immediately causes a burst of
+                        concurrent chain API calls at the busiest point of startup.
+                        Additionally, registry.refresh_loop() runs a 30-min rebuild
+                        in the background -- it could be mid-build when chain refresh
+                        fires its first pull.
+                        Fix: await asyncio.sleep(60) after build_done_event.wait()
+                        and before start_chain_refresh_worker(). The 60 s window:
+                          - gives the Tradier rate-limit window a full reset
+                          - stream is already live; _vol_oi_cache from the previous
+                            session's final refresh (or DB-seeded chain) is valid
+                          - first chain pull still happens well before any real flow
+                            event of the trading day matters
+  PREWARM-RACE (main) — _registry_prewarm_loop() and _universe_refresh_loop() both
+                        called registry.build() directly with no guard on the initial
+                        build completing first.
+                        _registry_prewarm_loop(): if the process restarts between
+                        ~9:00-9:15 AM ET, sleep_secs is near-zero and prewarm fires
+                        immediately. It acquires _build_lock behind the still-running
+                        _background_build_and_upsert, then starts a second full build
+                        when the lock releases -- now chain_refresh AND a second build
+                        are both hammering Tradier simultaneously.
+                        Fix: skip prewarm's registry.build() if registry.epoch == 0
+                        (initial build not yet complete). Prewarm is a daily warm-up
+                        for the *next* trading day's open, not a substitute for the
+                        startup build.
+                        _universe_refresh_loop(): called registry.build() directly
+                        inside its 24h refresh cycle with no guard. If the 24h timer
+                        fired near a restart, two build() calls queued on _build_lock
+                        producing identical contention. registry.refresh_loop() already
+                        handles periodic OCC rebuilds every 30 min; _universe_refresh_loop
+                        should not duplicate that path. Removed the direct build() call;
+                        OI data is read from the live registry (get_oi_map()) which
+                        is kept fresh by refresh_loop().
+  STREAM-RELOAD (main) — _background_universe_resolve() now relaunches stream_task
+                        with the fresh symbol list when the background universe refresh
+                        completes on a cache-miss boot.
+                        Root cause: _background_universe_resolve() computed a fresh
+                        stream_symbols list from load_universe() but never applied it --
+                        stream_task kept running against the stale seed symbol list
+                        (often empty or very small) for the entire trading session.
+                        Fix: _background_universe_resolve() accepts two mutable
+                        single-element wrappers:
+                          stream_task_ref[0]          -- the active asyncio.Task
+                          stream_symbols_container    -- the list[str] used by
+                                                        _get_tracked_tickers() closure
+                        After tier_map is patched, if stream_symbols differ from the
+                        seed, stream_task is cancelled + awaited (5 s grace), the
+                        container is updated in-place, and a new stream_task is created
+                        and written back into stream_task_ref[0].
+                        lifespan() passes [stream_task] and stream_symbols as the
+                        wrappers. Shutdown reads stream_task_ref[0] so it always
+                        cancels the active task regardless of replacement.
+  FIX-LOAD-FROM-DB-ARG (main) — Pass snapshot_id to registry.load_from_db() at Step 4.
+                        root cause: _resolve_startup_universe_fast() loads the fresh
+                        snapshot from universe_store but returned snapshot_id="" (empty
+                        string) instead of the real UUID. Step 4 called
+                        registry.load_from_db() with no args ->
+                          TypeError: SymbolRegistry.load_from_db() missing 1 required
+                          positional argument: 'snapshot_id'
+                        Logged as ERROR and fell through silently. The registry started
+                        with 0 OCC contracts from DB, so every cold start triggered a
+                        full Tradier chain-pull (all 4122 tickers, ~5-8 min) with no
+                        incremental warm-start benefit -- explaining the flood of
+                        per-ticker stall warnings in the logs.
+                        Fix: _resolve_startup_universe_fast() now surfaces the actual
+                        snapshot UUID from universe_store.load_fresh_snapshot() on HIT,
+                        and returns None on MISS. Step 4 passes this value to
+                        load_from_db(snapshot_id). None triggers the P1
+                        snapshot-agnostic fallback (loads the latest snapshot row
+                        regardless of UUID), so MISS boots still seed from DB correctly.
+                        After this fix the warm-start path works as designed:
+                        load_from_db() populates _registry with the persisted snapshot,
+                        build() sees a non-empty registry and runs incrementally
+                        (expired-DTE tickers only), dropping cold-start chain-pull
+                        time from ~5-8 min to ~50-400 tickers.
+  FIX-P1-SKIP-BUILD (main) — Skip full H3 build when P1 fallback seeded sufficient
+                        contracts. Root cause: load_from_db() seeds _registry with
+                        127K+ contracts from the prior snapshot but does NOT set
+                        _build_complete=True. _background_build_and_upsert() always
+                        ran a full Tradier chain-pull (~7-14 min), blocking stream
+                        workers for the entire window. Fix: if registry already has
+                        > _P1_MIN_CONTRACTS (10,000) and epoch==0 (never built from
+                        Tradier this session), set _build_complete=True and
+                        epoch=1 directly, fire build_done_event immediately, and skip
+                        registry.build(). refresh_loop() handles the background Tradier
+                        refresh without blocking the stream.
+  FIX-P1-SKIP-TIERS (main) — Fix stale T3 tier_map infinite-loop regression caused by
+                        FIX-P1-SKIP-BUILD. Root cause: the early-return guard in
+                        _background_build_and_upsert() returned before calling
+                        _post_build_upsert(), so assign_tiers() was never invoked.
+                        The tier_map loaded at startup (all T3 from a stale DB snapshot)
+                        was never refreshed. Every subsequent boot read the same stale
+                        T3=all data, creating an infinite stale-tier loop.
+                        Confirmed by logs:
+                          [build] FIX-P1-SKIP-BUILD: registry seeded with 55393 contracts
+                          (epoch=0) - skipping full Tradier build, streaming immediately.
+                        and startup tier_map showing T1=0 T2=0 T3=4357 on every boot.
+                        Fix: after the skip guard fires, call _fetch_batch_quotes() on
+                        stream_symbols (shallow volume/OI fetch, not a chain-pull --
+                        completes in seconds) and pass the result to _post_build_upsert().
+                        If the fetch returns nothing, log a warning and continue -- tiers
+                        remain as-loaded from DB rather than crashing the stream.
+                        The full Tradier chain-pull (registry.build()) is still skipped;
+                        only tier assignment is added to the skip path.
+  MAIN-DEBUG-001 (main) — _background_build_and_upsert() and lifespan() now log the
+                        exact tradier_stream bug surface:
+                          - persist_flow_event call-site: logs whether ev is passed as
+                            OptionsFlowEvent object or dict (TypeError source).
+                          - get_signal() await: confirms coroutine is awaited.
+                          - _WORKER_SPAWN_DELAY_S: confirmed location is tradier_stream.py,
+                            not main.py. Logged at startup for observability.
+  BUILD-QUOTE-TYPE (main) — _post_build_upsert() now filters raw_quotes to only
+                        objects that have the `average_volume` attribute before
+                        passing to assign_tiers() and upsert_symbol_quotes().
+                        Root cause: registry.build() returns a list that can contain
+                        plain int objects (OI counts / internal accumulation artefacts
+                        leaking from the build pipeline) mixed with SymbolQuote
+                        instances. _classify() accessed quote.average_volume on an int
+                        and raised AttributeError, causing _post_build_upsert to fail
+                        entirely on every boot -- tier_map was never set from a fresh
+                        Tradier build and upsert_symbol_quotes() was never called.
+                        Fix: filter at the top of _post_build_upsert; log the count
+                        of dropped non-SymbolQuote items so the underlying build()
+                        contamination remains visible in logs.
+  SAVE-SNAPSHOT-SET (main) — Fix save_snapshot() call sites passing stream_eligible_set
+                        as the third positional arg (provider parameter).
+                        Root cause: both call sites used the positional signature:
+                          save_snapshot(symbols, source, stream_eligible_set)
+                        but universe_store.save_snapshot() is defined as:
+                          save_snapshot(symbols, source="tradier", provider="tradier", symbol_rows=None)
+                        stream_eligible_set (a Python set) landed in `provider` and
+                        was embedded in the INSERT payload, causing:
+                          TypeError: Object of type set is not JSON serializable
+                        in _sync_save_snapshot() on every boot.
+                        Fix: both call sites now build an explicit symbol_rows list
+                        that encodes stream_eligible per-symbol correctly, and pass it
+                        as the keyword argument. provider defaults to "tradier".
+                        Fixed in:
+                          1. _background_universe_resolve()
+                          2. _universe_refresh_loop()
+  FIX-UPSERT-ARG-ORDER (main) — Correct upsert_symbol_quotes() argument order at both
+                        call sites. Root cause: both _post_build_upsert() and
+                        _background_universe_resolve() called:
+                          upsert_symbol_quotes(quote_rows, tier_map)
+                        but the signature is:
+                          upsert_symbol_quotes(snapshot_id: str, quote_rows) -> None
+                        quote_rows landed in snapshot_id; tier_map (a dict) landed in
+                        quote_rows; _sync_upsert_symbol_quotes normalised dict ->
+                        list(values()) producing list[int] (tier values); _get_symbol()
+                        returned "" for every int; upsert_rows was always empty ->
+                        (0 rows) logged on every boot. Additionally, no real snapshot
+                        UUID was ever passed.
+                        Fix:
+                          1. Add _enrich_quotes_with_tier(quotes, tier_map) helper
+                             that stamps q.tier on each SymbolQuote in-place so
+                             _rget(r, "tier") returns a real value in the upsert.
+                          2. _post_build_upsert(): after assign_tiers(), call
+                             universe_store.get_latest_snapshot_id() to get the real
+                             UUID, enrich quotes, then call
+                             upsert_symbol_quotes(snapshot_id, enriched_quotes).
+                          3. _background_universe_resolve(): after save_snapshot()
+                             succeeds, call get_latest_snapshot_id() for the
+                             freshly-written UUID, enrich quotes, then call
+                             upsert_symbol_quotes(snapshot_id, enriched_quotes).
+  FIX-TIER-SEQ (main) — Pre-build tier assignment in _background_build_and_upsert().
+                        Root cause: assign_tiers() (which produces the real T1/T2/T3
+                        map) ran AFTER registry.build() had already used the stale
+                        DB-snapshot tier_map (T3=all) to decide which strikes and DTEs
+                        to pull for every ticker inside _build_with_sem. This meant
+                        the correct tier was never available at the point where it
+                        mattered most: selecting chain depth.
+                        Fix (two-stage tier assignment):
+                          Stage 1 (pre-build): _fetch_batch_quotes(stream_symbols) ->
+                            assign_tiers() -> registry.set_tier_map() ->
+                            _sync_accumulator_tier_map() BEFORE registry.build().
+                            Each _build_with_sem closure now reads the correct tier
+                            from self._tier_map.get(ticker, 3).
+                          Stage 2 (post-build, unchanged): OI-based re-tier +
+                            _post_build_upsert() refines further after chains are
+                            pulled. The pre-build quotes are reused here so no
+                            duplicate Tradier call is needed.
+  FIX-BUILD-TUPLE (main) — registry.build() returns (int, dict), not a bare list.
+                        Root cause: _background_build_and_upsert() assigned the
+                        return value directly to raw_quotes and passed it to
+                        _post_build_upsert(). The tuple (count, raw_dict) reached
+                        _filter_symbol_quotes() which iterated the two-element
+                        tuple -- int has no average_volume, dict has no
+                        average_volume -- so 0 SymbolQuote objects passed the
+                        BUILD-QUOTE-TYPE filter and assign_tiers() received [].
+                        Fix: unpack as `_build_count, _build_raw = await
+                        registry.build()` and discard _build_raw (plain
+                        str->price dicts from _fetch_stock_prices, not SymbolQuote
+                        objects). Pass the pre-build SymbolQuote list (already
+                        fetched in Stage 1 of FIX-TIER-SEQ) to _post_build_upsert()
+ 
