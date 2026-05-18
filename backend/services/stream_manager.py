@@ -58,15 +58,34 @@ FIX-A (2026-05-18):
   Applied to both _spawn_workers() and _respawn_workers() so every
   401-triggered respawn also gets the gradual ramp.
 
-FIX-C (2026-05-18):
-  After the spawn loop, if spawn duration exceeded 10s, fetch a fresh
-  session token and push it to every worker via w._shared_token.
-  Root cause: token is fetched once before the loop; with FIX-A the last
-  worker sleeps ~10s before its first POST — by which time the original
-  token may have exceeded Tradier's ~10-15s TTL window, causing the worker
-  to POST with a stale token and receive 400/401 immediately.
+FIX-C (2026-05-18) — revised in STREAM-13:
+  See STREAM-13 below.
+
+STREAM-13 (2026-05-18):
+  Fix FIX-C dead code — post-spawn token refresh now actually fires.
+
+  FIX-C checked `spawn_duration > _SPAWN_WINDOW_S` after the spawn loop.
+  The spawn loop is a plain Python for-loop creating asyncio.Tasks — it
+  contains no awaits — so it completes in microseconds. `spawn_duration`
+  was always ~0.001s, never > 10s, so the token refresh never executed.
+
+  The actual race: each worker sleeps `startup_delay_s` (up to 10s) inside
+  its asyncio.Task before its first POST. The session token was fetched
+  before the spawn loop. If the last worker's startup_delay_s ≈ 10s, it
+  POSTs at T+10s — right at Tradier's ~10-15s session TTL boundary,
+  risking an immediate 400/401.
+
+  Fix: schedule a one-shot _post_spawn_token_refresh() coroutine as an
+  asyncio.Task immediately after the spawn loop. It sleeps
+  _SPAWN_WINDOW_S + _TOKEN_REFRESH_GRACE_S (10s + 2s = 12s total), then
+  fetches a fresh token and pushes it to all workers via w._shared_token.
+  Workers that have already connected read self._shared_token at the top
+  of their run() loop on next reconnect. Workers still in their startup
+  sleep pick up the fresh token on their very first loop iteration.
+
   Only applied in _spawn_workers(); _respawn_workers() always fetches a
-  fresh token before its own loop so the TTL race does not apply there.
+  fresh token immediately before its own loop so the TTL race does not
+  apply there.
 
 Architecture
 ------------
@@ -74,6 +93,8 @@ Architecture
   - 64 workers x 500 symbols = 31,920 OCC symbols, all streaming in parallel
   - Workers staggered proportionally over ~10s (FIX-A) to avoid
     thundering-herd on Tradier endpoint
+  - STREAM-13: token refreshed 12s post-spawn, pushed to all workers so the
+    last worker connects with a fresh token regardless of TTL boundary
   - asyncio.Queue(maxsize=50_000) feeds a single _consume_queue() task
   - _consume_queue drains at wire speed; _process_trade runs concurrently
     under a Semaphore(32) cap to protect shared accumulator/dedup state
@@ -102,7 +123,8 @@ _SESSION_RETRY_DELAY_S   = 15.0       # delay between retry attempts (STREAM-5)
 _SESSION_QUOTA_BACKOFF_S = 20.0       # extra backoff on 400 Quota Violation (STREAM-5)
 _PROCESS_CONCURRENCY     = 32         # STREAM-7: max concurrent _process_trade coroutines
 _TOKEN_POLL_INTERVAL_S   = 10.0       # STREAM-7: poll interval for 401 detection (was 60s)
-_SPAWN_WINDOW_S          = 10.0       # FIX-A/FIX-C: target window to spread worker startups
+_SPAWN_WINDOW_S          = 10.0       # FIX-A: target window to spread worker startups
+_TOKEN_REFRESH_GRACE_S   = 2.0        # STREAM-13: extra grace after last worker wakes before token refresh
 
 
 class StreamManager:
@@ -333,6 +355,57 @@ class StreamManager:
         log.error("[stream_manager] Could not acquire session token after 3 attempts")
         return None
 
+    async def _post_spawn_token_refresh(self, workers_snapshot: list) -> None:
+        """
+        STREAM-13: Scheduled immediately after _spawn_workers() as a fire-and-
+        forget Task. Sleeps until after the last worker has woken from its
+        startup_delay, then fetches a fresh session token and pushes it to
+        every worker via w._shared_token.
+
+        Why: the spawn loop is a plain Python for-loop with no awaits — it
+        completes in microseconds. The original FIX-C measured spawn_duration
+        after the loop and found ~0.001s, so its `if spawn_duration > 10s`
+        guard never fired. Meanwhile the last worker's startup_delay_s ≈ 10s
+        means it POSTs to Tradier at T+10s — right at the ~10-15s session TTL
+        boundary. Refreshing the token at T+12s ensures a fresh token is in
+        place before any worker's first reconnect attempt.
+
+        workers_snapshot: the list of StreamWorker objects at spawn time,
+        captured before the task is created so it's stable even if
+        self._workers is later replaced by a respawn.
+        """
+        sleep_s = _SPAWN_WINDOW_S + _TOKEN_REFRESH_GRACE_S  # 12s
+        log.debug(
+            "[stream_manager] STREAM-13: post-spawn token refresh scheduled in %.0fs",
+            sleep_s,
+        )
+        await asyncio.sleep(sleep_s)
+
+        # Check that this spawn generation is still the active one.
+        # If _respawn_workers() fired in the meantime, self._workers will be
+        # a different list and workers_snapshot is stale — skip the push.
+        if workers_snapshot is not self._workers:
+            log.debug(
+                "[stream_manager] STREAM-13: workers respawned before refresh fired — skipping"
+            )
+            return
+
+        fresh_token = await self._fetch_session_token()
+        if fresh_token:
+            self._session_token = fresh_token
+            for w in workers_snapshot:
+                w._shared_token = fresh_token
+            log.info(
+                "[stream_manager] STREAM-13: Post-spawn token refreshed — "
+                "session=%s... pushed to %d workers",
+                fresh_token[:8], len(workers_snapshot),
+            )
+        else:
+            log.error(
+                "[stream_manager] STREAM-13: Post-spawn token refresh failed — "
+                "workers will reconnect with original token (may hit 400/401)"
+            )
+
     async def _spawn_workers(self):
         if self._registry is None:
             return
@@ -394,36 +467,14 @@ class StreamManager:
             len(self._workers),
         )
 
-        # FIX-C: if the spawn loop itself took > _SPAWN_WINDOW_S (10s), the
-        # original token may have aged past Tradier's ~10-15s TTL window by the
-        # time the last worker wakes from its startup_delay sleep and POSTs.
-        # Refresh the token now and push it to all workers so every pending
-        # startup uses a fresh token.
-        # NOTE: w._shared_token is the correct attribute name on StreamWorker
-        # (stored as self._shared_token in __init__; shared_session_token is
-        # only the constructor parameter name).
-        spawn_duration = _time.time() - self._spawn_at
-        if spawn_duration > _SPAWN_WINDOW_S:
-            log.warning(
-                "[stream_manager] FIX-C: Spawn loop took %.1fs > %.0fs — "
-                "refreshing token post-spawn and pushing to %d workers",
-                spawn_duration, _SPAWN_WINDOW_S, len(self._workers),
-            )
-            fresh_token = await self._fetch_session_token()
-            if fresh_token:
-                self._session_token = fresh_token
-                for w in self._workers:
-                    w._shared_token = fresh_token
-                log.info(
-                    "[stream_manager] FIX-C: Token refreshed post-spawn — "
-                    "session=%s... pushed to %d workers",
-                    fresh_token[:8], len(self._workers),
-                )
-            else:
-                log.error(
-                    "[stream_manager] FIX-C: Post-spawn token refresh failed — "
-                    "workers will use original token (may get 400/401 on connect)"
-                )
+        # STREAM-13: schedule the post-spawn token refresh as a fire-and-forget
+        # task. It sleeps _SPAWN_WINDOW_S + _TOKEN_REFRESH_GRACE_S (12s) then
+        # pushes a fresh token to all workers so the last worker's first POST
+        # (at T+10s) uses a token that hasn't aged past Tradier's ~10-15s TTL.
+        asyncio.create_task(
+            self._post_spawn_token_refresh(self._workers),
+            name="post-spawn-token-refresh",
+        )
 
     async def _respawn_workers(self, force_token_refresh: bool = False):
         """Cancel all current workers and start fresh ones."""
@@ -504,6 +555,8 @@ class StreamManager:
             len(self._workers), len(new_symbols), self._session_token[:8],
             stagger_step * 1000, _SPAWN_WINDOW_S,
         )
+        # Note: _respawn_workers() fetches a fresh token immediately before the
+        # spawn loop so the TTL race does not apply — no post-spawn refresh needed.
 
     async def _consume_queue(self):
         """

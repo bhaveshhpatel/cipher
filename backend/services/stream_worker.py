@@ -15,7 +15,7 @@ STREAM-3 (2026-04-28):
                    uptime, last_tick_ago, queue_depth
     API_ERROR    — any {"error":...} payload from Tradier with full context
     RECONNECT    — backoff duration, attempt count, session_ticks on last conn
-    STALL        — logged when no tick received for >30s on an active stream
+    STALL        — logged when no tick received for >60s on an active stream
 
   Logging: 401 — token expired, _token_expired flag set, clean exit
 
@@ -77,6 +77,33 @@ STREAM-11 (2026-05-15):
   so overnight deploys don't sleep for hours in a single shot.
 
   Worker-0 probe-fail path (60s retry sleep) is unaffected.
+
+STREAM-12 (2026-05-18):
+  Fix false-reconnect loop caused by _guarded_lines re-raising TimeoutError.
+
+  Two problems with the previous behaviour:
+    1. _IDLE_TIMEOUT=30s was too short. With 64 workers covering 500 OCC
+       contracts each, a single worker can legitimately receive no ticks for
+       >30s in a quiet market. Every timeout triggered a reconnect, which
+       issued a fresh POST to Tradier — risking 400 Quota Violations and
+       growing exponential backoff (up to 10s after 7 stalls).
+    2. _guarded_lines re-raised TimeoutError, which propagated out of the
+       async-for loop, through the inner try block, and was caught by the
+       outer `except asyncio.TimeoutError`. That outer handler called
+       `reconnect_attempt += 1`, meaning 7 normal quiet-market periods
+       were enough to pin backoff at 10s — turning normal idle time into
+       prolonged blackouts.
+
+  Fixes:
+    a. _IDLE_TIMEOUT raised 30s → 60s to better match OCC tick cadence.
+    b. _guarded_lines no longer re-raises on idle timeout. It logs the STALL
+       once per _STALL_LOG_INTERVAL_S (30s), then loops back to the next
+       asyncio.wait_for — keeping the worker alive and connected. Only
+       StopAsyncIteration (server closed the TCP stream) exits the iterator.
+    c. The outer `except asyncio.TimeoutError` block is retained but is now
+       only reachable from a genuine connection-phase timeout (the httpx POST
+       itself timing out at _CONNECT_TIMEOUT=15s). Its log message is updated
+       to CONNECT_TIMEOUT to distinguish it from idle stalls.
 """
 import asyncio
 import json
@@ -97,7 +124,9 @@ _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN  = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-_IDLE_TIMEOUT          = 30.0    # seconds before declaring stream stalled
+# STREAM-12: raised 30s → 60s — OCC tick cadence in quiet markets can exceed
+# 30s per worker; the previous value triggered spurious reconnects.
+_IDLE_TIMEOUT          = 60.0
 _CONNECT_TIMEOUT       = 15.0
 _PROBE_TIMEOUT_S       = 5.0     # STREAM-9: short timeout for market-closed probe
 _BACKOFF_BASE          = 1.0
@@ -538,11 +567,14 @@ class StreamWorker:
                             )
 
             except asyncio.TimeoutError:
+                # STREAM-12: This except now only fires on a genuine connection-phase
+                # timeout (httpx POST at _CONNECT_TIMEOUT=15s). Idle-stream timeouts
+                # are absorbed inside _guarded_lines and no longer propagate here.
                 self._errors += 1
                 self._inc_global_error()
                 log.warning(
-                    "[worker-%d] STALL | No tick for %.0fs — reconnecting",
-                    self.worker_id, _IDLE_TIMEOUT,
+                    "[worker-%d] CONNECT_TIMEOUT | Could not connect within %.0fs — reconnecting",
+                    self.worker_id, _CONNECT_TIMEOUT,
                 )
 
             except asyncio.CancelledError:
@@ -591,7 +623,18 @@ class StreamWorker:
     ):
         """
         Async line iterator with idle watchdog.
-        Logs a STALL warning if no line arrives within _IDLE_TIMEOUT seconds.
+
+        STREAM-12: No longer re-raises TimeoutError on idle timeout.
+        Previously, re-raising propagated out of the `async for` loop and
+        was caught by the outer `except asyncio.TimeoutError`, which triggered
+        a full reconnect and incremented reconnect_attempt. In quiet markets
+        a single worker can go >30s (now 60s) without a tick for its 500 OCC
+        contracts — this was causing spurious reconnect storms.
+
+        New behaviour: on idle timeout, log a STALL warning (rate-limited to
+        every _STALL_LOG_INTERVAL_S=30s) and loop back to wait_for — the
+        worker stays connected on the same POST stream. Only StopAsyncIteration
+        (server closed the TCP stream) exits the iterator cleanly.
         """
         aiter = resp.aiter_lines().__aiter__()
         stall_logged = False
@@ -618,4 +661,5 @@ class StreamWorker:
                     )
                     self._last_stall_log_at = now
                     stall_logged = True
-                raise  # propagate to reconnect loop
+                # STREAM-12: do NOT re-raise — stay on the open POST stream
+                # and keep waiting for the next tick.
