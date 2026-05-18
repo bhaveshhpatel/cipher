@@ -1,0 +1,5 @@
+# Force Railway redeploy - stale container fix
+# Pushed: 2026-05-18
+# Reason: Railway container was built from pre-patch image where bid_ask_classifier.py
+# had the old single-argument is_directionally_aggressive() signature.
+# Code on main is correct - this commit forces a fresh container build.
