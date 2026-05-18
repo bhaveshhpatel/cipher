@@ -1280,3 +1280,8 @@ async def read_config(config: dict = Depends(get_config)):
 @app.get("/stream-stats")
 async def get_stream_stats(current_user=Depends(get_current_user)):
     return stream_stats
+
+# Add this BEFORE any router includes or startup hooks — at app definition time:
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
