@@ -48,11 +48,32 @@ STREAM-7 (2026-05-01):
   401 token-expired events are detected and respawned within 10s instead
   of up to 60s (previous worst-case session gap).
 
+FIX-A (2026-05-18):
+  Replace flat 50ms stagger with proportional spread across ~10s.
+  Previous: idx * _WORKER_SPAWN_DELAY_S (50ms) spread 64 workers over ~3s,
+  causing thundering-herd on Tradier's stream endpoint (400 Quota Violation /
+  dropped connections on late workers). New formula:
+    startup_delay_s = idx * (10.0 / max(len(chunks), 1))
+  Spreads workers evenly over exactly 10s regardless of worker count.
+  Applied to both _spawn_workers() and _respawn_workers() so every
+  401-triggered respawn also gets the gradual ramp.
+
+FIX-C (2026-05-18):
+  After the spawn loop, if spawn duration exceeded 10s, fetch a fresh
+  session token and push it to every worker via w._shared_token.
+  Root cause: token is fetched once before the loop; with FIX-A the last
+  worker sleeps ~10s before its first POST — by which time the original
+  token may have exceeded Tradier's ~10-15s TTL window, causing the worker
+  to POST with a stale token and receive 400/401 immediately.
+  Only applied in _spawn_workers(); _respawn_workers() always fetches a
+  fresh token before its own loop so the TTL race does not apply there.
+
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
   - 64 workers x 500 symbols = 31,920 OCC symbols, all streaming in parallel
-  - 50ms staggered startup to avoid thundering-herd on Tradier endpoint
+  - Workers staggered proportionally over ~10s (FIX-A) to avoid
+    thundering-herd on Tradier endpoint
   - asyncio.Queue(maxsize=50_000) feeds a single _consume_queue() task
   - _consume_queue drains at wire speed; _process_trade runs concurrently
     under a Semaphore(32) cap to protect shared accumulator/dedup state
@@ -72,7 +93,7 @@ log = logging.getLogger("stream_manager")
 
 _CHUNK_SIZE              = 500        # Tradier hard limit: 500 symbols per POST
 _QUEUE_SIZE              = 50_000     # handle burst from 64 parallel workers
-_WORKER_SPAWN_DELAY_S    = 0.05       # 50ms stagger between worker starts
+_WORKER_SPAWN_DELAY_S    = 0.05       # kept for reference; spawn loop now uses proportional formula
 _HEALTH_LOG_INTERVAL_S   = 30.0       # manager-level aggregate log interval
 _DEFAULT_WORKER_REFRESH_S: float = 300.0
 _STALL_THRESHOLD_S       = 300.0      # STREAM-6: raised from 60s; matches 120s idle timeout with headroom
@@ -81,6 +102,7 @@ _SESSION_RETRY_DELAY_S   = 15.0       # delay between retry attempts (STREAM-5)
 _SESSION_QUOTA_BACKOFF_S = 20.0       # extra backoff on 400 Quota Violation (STREAM-5)
 _PROCESS_CONCURRENCY     = 32         # STREAM-7: max concurrent _process_trade coroutines
 _TOKEN_POLL_INTERVAL_S   = 10.0       # STREAM-7: poll interval for 401 detection (was 60s)
+_SPAWN_WINDOW_S          = 10.0       # FIX-A/FIX-C: target window to spread worker startups
 
 
 class StreamManager:
@@ -335,11 +357,18 @@ class StreamManager:
             for i in range(0, len(all_symbols), _CHUNK_SIZE)
         ]
 
+        # FIX-A: spread workers proportionally over _SPAWN_WINDOW_S (~10s)
+        # instead of a flat 50ms stagger. With 64 workers the old 50ms stagger
+        # compressed all connections into ~3s, causing thundering-herd 400s.
+        stagger_step = _SPAWN_WINDOW_S / max(len(chunks), 1)
+
         log.info(
             "[stream_manager] Spawning %d workers | symbols=%d chunk_size=%d "
-            "session=%s... stagger=%dms",
+            "session=%s... stagger=%.0fms (spread=%.1fs)",
             len(chunks), len(all_symbols), _CHUNK_SIZE,
-            self._session_token[:8], int(_WORKER_SPAWN_DELAY_S * 1000),
+            self._session_token[:8],
+            stagger_step * 1000,
+            _SPAWN_WINDOW_S,
         )
 
         self._workers = []
@@ -353,7 +382,7 @@ class StreamManager:
                 worker_id            = idx,
                 symbols              = chunk,
                 event_queue          = self._queue,
-                startup_delay_s      = idx * _WORKER_SPAWN_DELAY_S,  # 50ms stagger
+                startup_delay_s      = idx * stagger_step,   # FIX-A: proportional
                 shared_session_token = self._session_token,
             )
             self._workers.append(worker)
@@ -364,6 +393,37 @@ class StreamManager:
             "[stream_manager] %d workers spawned -- all streaming in parallel",
             len(self._workers),
         )
+
+        # FIX-C: if the spawn loop itself took > _SPAWN_WINDOW_S (10s), the
+        # original token may have aged past Tradier's ~10-15s TTL window by the
+        # time the last worker wakes from its startup_delay sleep and POSTs.
+        # Refresh the token now and push it to all workers so every pending
+        # startup uses a fresh token.
+        # NOTE: w._shared_token is the correct attribute name on StreamWorker
+        # (stored as self._shared_token in __init__; shared_session_token is
+        # only the constructor parameter name).
+        spawn_duration = _time.time() - self._spawn_at
+        if spawn_duration > _SPAWN_WINDOW_S:
+            log.warning(
+                "[stream_manager] FIX-C: Spawn loop took %.1fs > %.0fs — "
+                "refreshing token post-spawn and pushing to %d workers",
+                spawn_duration, _SPAWN_WINDOW_S, len(self._workers),
+            )
+            fresh_token = await self._fetch_session_token()
+            if fresh_token:
+                self._session_token = fresh_token
+                for w in self._workers:
+                    w._shared_token = fresh_token
+                log.info(
+                    "[stream_manager] FIX-C: Token refreshed post-spawn — "
+                    "session=%s... pushed to %d workers",
+                    fresh_token[:8], len(self._workers),
+                )
+            else:
+                log.error(
+                    "[stream_manager] FIX-C: Post-spawn token refresh failed — "
+                    "workers will use original token (may get 400/401 on connect)"
+                )
 
     async def _respawn_workers(self, force_token_refresh: bool = False):
         """Cancel all current workers and start fresh ones."""
@@ -416,6 +476,10 @@ class StreamManager:
             for i in range(0, len(new_symbols), _CHUNK_SIZE)
         ]
 
+        # FIX-A: same proportional stagger applied to respawn so 401-triggered
+        # respawns don't cause the same thundering-herd that _spawn_workers had.
+        stagger_step = _SPAWN_WINDOW_S / max(len(chunks), 1)
+
         self._workers = []
         self._tasks   = []
         self._spawn_at = _time.time()
@@ -427,7 +491,7 @@ class StreamManager:
                 worker_id            = idx,
                 symbols              = chunk,
                 event_queue          = self._queue,
-                startup_delay_s      = idx * _WORKER_SPAWN_DELAY_S,
+                startup_delay_s      = idx * stagger_step,   # FIX-A: proportional
                 shared_session_token = self._session_token,
             )
             self._workers.append(worker)
@@ -436,8 +500,9 @@ class StreamManager:
 
         log.info(
             "[stream_manager] _respawn_workers done: %d workers for %d symbols "
-            "session=%s...",
+            "session=%s... stagger=%.0fms (spread=%.1fs)",
             len(self._workers), len(new_symbols), self._session_token[:8],
+            stagger_step * 1000, _SPAWN_WINDOW_S,
         )
 
     async def _consume_queue(self):
