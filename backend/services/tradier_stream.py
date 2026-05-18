@@ -294,6 +294,15 @@ Fix (DIRECTION-KWARG 2026-05-18): remove stale price/bid/ask kwargs from
   ask=ev.ask — kwargs that belong to is_directionally_aggressive(), not this
   function. This caused TypeError on every single timesale tick, blocking all
   flow from reaching flow_events. Fix: pass ev.order_side and ev.contract_type.
+
+Fix (ING-006-CALL 2026-05-18): pass ev.bid_ask_class + ev.contract_type to
+  is_directionally_aggressive() in Gate 4 of _process_trade().
+  The call was is_directionally_aggressive(ev) — passing the entire
+  OptionsFlowEvent object as the first positional arg. The function signature
+  is is_directionally_aggressive(bid_ask_class: str, contract_type: str) and
+  requires two string arguments. This TypeError fired on every timesale tick,
+  blocking all flow from accumulator, persist, and signal gate.
+  Fix: is_directionally_aggressive(ev.bid_ask_class, ev.contract_type).
 """
 import asyncio
 import logging
@@ -869,7 +878,9 @@ async def _process_trade(raw: dict) -> None:
         order_side=ev.order_side,
         contract_type=ev.contract_type,
     )
-    if not is_directionally_aggressive(ev):
+    # ING-006-CALL fix: pass the two required string fields, not the event object.
+    # is_directionally_aggressive(bid_ask_class: str, contract_type: str) -> bool
+    if not is_directionally_aggressive(ev.bid_ask_class, ev.contract_type):
         return
     _stats["classified"] += 1
 
