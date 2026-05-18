@@ -113,7 +113,7 @@ Fix (PBE-BLOCKING-1 2026-05-06): revert persist_flow_episode to fire-and-forget.
 Fix (ING-010 2026-05-07): Tier-aware configurable ingestion gate system.
   gate_config_store singleton loaded at startup (main.py lifespan step 0).
   _resolve_min_premium(ticker) resolves per-tick premium floor from:
-    registry.influence_tier_int(ticker) -> gate_config_store.get("min_premium", tier)
+    registry.symbol_tier(ticker) -> gate_config_store.get("min_premium", tier)
   Floor is passed to parse_tradier_trade(min_premium=...) kwarg.
   Epoch-change detection: when gate_config_store.epoch changes between ticks,
   an INFO log fires so ops can confirm hot-reload propagated to the stream.
@@ -256,6 +256,36 @@ Fix (PARSE-REGISTRY-KWARG 2026-05-14): remove stale registry= kwarg from
   switched to a module-level get_registry() import. Passing registry= caused
   TypeError on every single timesale tick — zero trades parsed, zero flow
   events persisted, zero signals emitted during market hours.
+
+Fix (GATE-001 2026-05-16): exclude_indices as hardcoded first gate, pre-tier-lookup.
+  Gate 6 in _process_trade() is now a two-layer check:
+    Layer 1 (hardcoded): ingestion.filters.is_etf_noise_symbol(_raw_ticker)
+      — fires ALWAYS, independent of gate_config_store, OCC registry, or any
+      DB state. Cannot be disabled by config drift, stale hot-reload, or a
+      Supabase outage. This is the hard backstop.
+    Layer 2 (config-driven): _resolve_exclude_indices() + _INDEX_SYMBOLS check
+      — retained for any tickers not in the hardcoded blocklist, controlled
+      by gate_configs.exclude_indices. Defense-in-depth.
+  Both layers fire before ANY tier lookup or parse_tradier_trade() call.
+  _stats["index_filtered"] incremented on either hit.
+
+Fix (FIX-2 2026-05-16): use symbol_tier from OCC registry for tier resolution.
+  _resolve_tier_int() and _resolve_min_premium() previously called
+  reg.influence_tier_int(ticker) which derived tier from the notional_tier
+  (dollar-volume bucket). This misclassified high-notional retail tickers
+  as T1 and applied the whale premium floor, effectively ungating them.
+
+  Fix: both resolvers now call reg.symbol_tier(ticker) — the pre-computed
+  structural tier from the OCC contract metadata — as the primary lookup.
+  Falls back to reg.influence_tier_int(ticker) if symbol_tier() is not
+  available on the registry (version guard for rolling deploys).
+  Ultimate fallback remains _DEFAULT_TIER_INT = 3 (safe, conservative).
+
+  Impact:
+    - T1 premium floor now only applied to genuine structural T1 symbols.
+    - T2/T3 symbols receive correct $15k/$10k floors respectively.
+    - Dedup window dispatch correctly uses symbol_tier.
+    - No hot-path performance change — O(1) dict lookup in the registry.
 """
 import asyncio
 import logging
@@ -269,6 +299,7 @@ import httpx
 
 from config import settings
 from core.async_bus import bus
+from ingestion.filters import is_etf_noise_symbol
 from ingestion.processor import IngestionProcessor, get_drop_stats as get_ingestion_drop_stats
 from parsers.options_flow_parser import parse_tradier_trade, get_stats as get_parser_stats
 from parsers.order_side_classifier import order_side_to_direction, is_directionally_aggressive
@@ -294,10 +325,6 @@ from utils.contract_day_cache import (
 # The module exports `store`; aliased here so all internal references remain unchanged.
 from services.gate_config_store import store as gate_config_store
 # SEM-STREAM: shared session semaphore helpers from utils.tradier_client.
-# acquire_session_token_slot() tries to claim a _SESSION_SEM slot with a
-# bounded timeout so tradier_stream workers participate in B-022 burst
-# protection without merging their token-fetch implementation into
-# get_session_token() (which would break per-worker isolation).
 from utils.tradier_client import (
     acquire_session_token_slot,
     _SESSION_SEM as _tradier_session_sem,
@@ -309,8 +336,6 @@ log = logging.getLogger("tradier_stream")
 
 # ---------------------------------------------------------------------------
 # REARCH-002: module-level IngestionProcessor instance.
-# Stateless — safe to share across all _process_trade() invocations.
-# Gates: DTE floor, DTE ceiling, tier-aware premium floor, OI floor.
 # ---------------------------------------------------------------------------
 _ingestion_processor = IngestionProcessor()
 
@@ -329,7 +354,6 @@ _PERSIST_TIMEOUT     = 2.0
 _REGISTRY_READY_TIMEOUT_S = 1800.0
 _REGISTRY_READY_POLL_S    = 0.5
 
-# H4: TTL for sweep-upgrade dispatch guard keys (30 min in seconds)
 _SWEEP_DISPATCH_TTL_S = 1800.0
 
 _STATS_LOG_INTERVAL    = 100
@@ -342,25 +366,12 @@ _MARKET_CLOSE = time(16, 0)
 
 _PROCESSABLE_TYPES = {"timesale"}
 
-# F8/F2: interval between synthetic ticks in _demo_mode_once.
-# 0.05s ensures multiple emissions within the 0.5s test window.
 _DEMO_TICK_INTERVAL_S: float = 0.05
 
-# ING-011: High-volume index/ETF tickers whose options generate noise-level
-# flow that obscures single-stock signals.  Filtered when exclude_indices
-# gate is active (gate_config_store.get("exclude_indices", 1) == 1.0).
-#
-# ING-011-EXPAND (2026-05-08): expanded from the original 10-ticker list to
-# cover leveraged ETFs (TQQQ/SOXL etc.) and other high-volume noise sources
-# that were previously sailing through as T1 due to raw volume thresholds.
-#
-# Categories:
-#   Broad-market index ETFs  : SPY, QQQ, IWM, DIA
-#   Volatility products      : VXX, UVXY, SVXY
-#   Commodity/bond ETFs      : GLD, SLV, TLT, HYG, EEM
-#   Leveraged equity ETFs    : TQQQ, TQQQ, SOXL, SOXS, TECS, TECL
-#   Thematic (ARK)           : ARKK, ARKQ, ARKW, ARKG, ARKX
-#   High-vol sector ETFs     : XLF, XLE, XLK, XBI, IBB, IBIT, GDX, GDXJ
+# ING-011 / GATE-001: High-volume index/ETF tickers.
+# Layer 2 (config-driven) uses this set.
+# Layer 1 (hardcoded) uses is_etf_noise_symbol() from ingestion/filters.py.
+# When adding tickers, update BOTH this set AND _ETF_NOISE_BLOCKLIST.
 _INDEX_SYMBOLS: frozenset[str] = frozenset({
     # Broad-market index ETFs
     "SPY", "QQQ", "IWM", "DIA",
@@ -378,45 +389,31 @@ _INDEX_SYMBOLS: frozenset[str] = frozenset({
 
 # ---------------------------------------------------------------------------
 # Signal gate thresholds — cold-start fallbacks.
-# ING-010-GATES: live values are read from gate_config_store at point-of-use.
-# These constants are only used when the store has not yet loaded (epoch == 0).
 # ---------------------------------------------------------------------------
 _SIGNAL_MIN_TRADES  = 3
-_SIGNAL_MIN_PREMIUM = 50_000   # fallback; live value from gate_config_store
+_SIGNAL_MIN_PREMIUM = 50_000
 
-# ---------------------------------------------------------------------------
-# Per-episode signal debounce — cold-start fallbacks.
-# ING-010-GATES: _SIGNAL_DEBOUNCE_S is the fallback when
-# gate_config_store.get("signal_debounce_ms", 1) returns None.
-# Live value is read per-call in _should_emit_signal().
-# ---------------------------------------------------------------------------
-_SIGNAL_DEBOUNCE_S  = 30.0     # fallback; live value from gate_config_store
+_SIGNAL_DEBOUNCE_S  = 30.0
 _SIGNAL_DELTA_PREM  = 25_000.0
 _SIGNAL_DELTA_PCT   = 0.20
 _SIGNAL_EMIT_TTL_S  = 7_200.0
 
 _LBC_TTL_S = 7_200.0
 
-# ---------------------------------------------------------------------------
-# ING-010: Tier string -> int mapping retained for back-compat with existing
-# tests that reference _INFLUENCE_TIER_TO_INT directly.
-# ING-012: influence_tier_string() deleted from SymbolRegistry — stream
-# resolvers now call influence_tier_int() directly and no longer use this map
-# at runtime. _DEFAULT_TIER_INT is still used as the fallback in resolvers.
-# ---------------------------------------------------------------------------
+# ING-010 / ING-012: retained for back-compat with tests.
 _INFLUENCE_TIER_TO_INT: dict[str, int] = {
     "WHALE":         1,
     "INSTITUTIONAL": 1,
     "LARGE":         2,
     "RETAIL":        3,
 }
-_DEFAULT_TIER_INT = 3  # safe fallback for unknown tickers / cold registry
+_DEFAULT_TIER_INT = 3
 
 # ---------------------------------------------------------------------------
 # Global stats
 # ---------------------------------------------------------------------------
 _stream_start_at: float = _time.time()
-_last_gate_epoch: int = -1  # tracks last known gate_config_store epoch
+_last_gate_epoch: int = -1
 
 _stats = {
     "active_symbols":    0,
@@ -435,9 +432,7 @@ _stats = {
     "mode":              "starting",
     "last_tick_at":      None,
     "last_reconnect_at": None,
-    # ING-010: gate config epoch — increments on every hot-reload update
     "gate_epoch":        0,
-    # ING-011: ticks dropped by exclude_indices gate
     "index_filtered":    0,
 }
 
@@ -455,12 +450,6 @@ _signal_last_emit: dict[str, dict] = {}
 _lookback_result_cache: dict[str, tuple[bool, float]] = {}
 
 
-# ---------------------------------------------------------------------------
-# PERSIST-CB: done-callback for fire-and-forget persist_flow_event tasks.
-# Increments _stats["errors"] when the task raises any non-CancelledError
-# exception. Attached via task.add_done_callback(_persist_done_cb) so the
-# hot path is never blocked — the callback fires after the task completes.
-# ---------------------------------------------------------------------------
 def _persist_done_cb(task: asyncio.Task) -> None:
     if task.cancelled():
         return
@@ -476,40 +465,18 @@ def _persist_done_cb(task: asyncio.Task) -> None:
 def get_stats() -> dict:
     stats = dict(_stats)
     stats["uptime_seconds"] = round(_time.time() - _stream_start_at, 1)
-    stats["gate_epoch"] = gate_config_store.epoch  # always current, not cached
+    stats["gate_epoch"] = gate_config_store.epoch
     stats.update(get_parser_stats())
     stats.update(flow_dedup.dedup_stats())
     stats.update(get_lookback_stats())
-    stats.update(get_ingestion_drop_stats())  # REARCH-002: expose processor drop counters
+    stats.update(get_ingestion_drop_stats())
     return stats
 
 
-# ---------------------------------------------------------------------------
-# F8/F2: _demo_mode_once — cancellable supervised demo fallback.
-#
-# Exists as a module-level name so:
-#   - test_f8_* can import and create_task it directly.
-#   - test_f2_* can patch.object(ts, "_demo_mode_once", ...) without AttributeError.
-#
-# CONTRACT (F2): start_stream (stream_options_flow) NEVER calls this function.
-#   The F2 test asserts mock_demo.call_count == 0 after 401 retries — the
-#   stream simply retries _get_session_token on every failure path.
-#
-# CONTRACT (F8-cancels): loops with asyncio.sleep(_DEMO_TICK_INTERVAL_S) so
-#   task.cancel() + await raises CancelledError cleanly (not swallowed).
-#
-# CONTRACT (F8-emits): publishes a dict with shape {"type": "signal", "data": {...}}
-#   as a single positional arg to bus.publish_all so the test's
-#   `async def _capture(signal)` (one-arg) receives the payload dict directly.
-# ---------------------------------------------------------------------------
 async def _demo_mode_once(symbols: list[str]) -> None:
     """
     Supervised demo fallback — emits synthetic composite_signal ticks.
-
-    Loops indefinitely, yielding to the event loop via asyncio.sleep so the
-    task is cancellable at every iteration. CancelledError propagates cleanly.
-
-    Never called by start_stream — exists solely so tests can import/patch it.
+    Cancellable. Never called by start_stream.
     """
     while True:
         await asyncio.sleep(_DEMO_TICK_INTERVAL_S)
@@ -530,107 +497,20 @@ async def _demo_mode_once(symbols: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SEM-STREAM: _get_session_token() — now participates in _SESSION_SEM.
-#
-# Previously this was a fully private implementation with no awareness of
-# the _SESSION_SEM semaphore defined in utils/tradier_client.py.  All
-# stream_worker.py workers use utils.tradier_client.get_session_token()
-# which is correctly guarded by _SESSION_SEM(3).  But tradier_stream workers
-# called this function instead, bypassing the semaphore entirely.
-#
-# Fix: acquire a _SESSION_SEM slot via acquire_session_token_slot() at the
-# top of this function.  The acquire uses a timeout of
-# _TC_RETRY_DELAY * _TC_RETRY_MAX (= 6s, same constants as tradier_client)
-# so a worker that cannot get a slot in one full retry-round proceeds
-# independently (isolation wins) rather than blocking indefinitely.
-# The slot is always released in the finally block.
-#
-# The retry loop, backoff constants, and return-value semantics are
-# completely unchanged — this is a pure wrapping change.
-# ---------------------------------------------------------------------------
-async def _get_session_token() -> Optional[str]:
-    """
-    Fetch a fresh Tradier streaming session token for this stream worker.
-
-    SEM-STREAM: acquires the shared _SESSION_SEM slot (max 3 concurrent across
-    ALL callers including stream_worker.py) via acquire_session_token_slot().
-    If the slot cannot be acquired within _TC_RETRY_DELAY * _TC_RETRY_MAX
-    seconds, proceeds without semaphore so this worker is never stalled by a
-    hung peer.  Slot is always released in the finally block.
-    """
-    url = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
-    headers = {
-        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
-        "Accept":        "application/json",
-    }
-    # SEM-STREAM: acquire shared semaphore slot with bounded timeout.
-    _slot_acquired = await acquire_session_token_slot(
-        timeout_s=_TC_RETRY_DELAY * _TC_RETRY_MAX
-    )
-    try:
-        for attempt in range(_SESSION_RETRY_MAX):
-            try:
-                async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
-                    resp = await client.post(url, headers=headers, data={})
-
-                if resp.status_code == 429:
-                    retry_after = float(
-                        resp.headers.get("Retry-After", 10.0)
-                    )
-                    log.warning(
-                        "[stream] session token 429 — Retry-After %.0fs (attempt %d/%d)",
-                        retry_after, attempt + 1, _SESSION_RETRY_MAX,
-                    )
-                    await asyncio.sleep(retry_after)
-                    continue
-
-                if resp.status_code == 401:
-                    log.error(
-                        "[stream] session token 401 — bad TRADIER_API_KEY "
-                        "(attempt %d/%d)",
-                        attempt + 1, _SESSION_RETRY_MAX,
-                    )
-                    return None
-
-                resp.raise_for_status()
-                token = resp.json().get("stream", {}).get("sessionid")
-                if token:
-                    return token
-                log.warning(
-                    "[stream] session response missing sessionid: %s",
-                    resp.text[:200],
-                )
-                return None
-
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                log.warning(
-                    "[stream] session fetch attempt %d/%d failed: %s",
-                    attempt + 1, _SESSION_RETRY_MAX, e,
-                )
-                if attempt < _SESSION_RETRY_MAX - 1:
-                    await asyncio.sleep(_SESSION_RETRY_DELAY)
-
-        return None
-    finally:
-        # SEM-STREAM: release slot only if we acquired it.
-        if _slot_acquired:
-            _tradier_session_sem.release()
-
-
-# ---------------------------------------------------------------------------
-# ING-010: Tier-aware min_premium resolver
-# ING-012: calls influence_tier_int() directly — influence_tier_string() deleted.
+# FIX-2: Tier-aware resolvers — use symbol_tier (structural) not influence_tier
+# (notional). Falls back to influence_tier_int if symbol_tier not available
+# (registry version guard). Ultimate fallback: _DEFAULT_TIER_INT = 3.
 # ---------------------------------------------------------------------------
 def _resolve_min_premium(ticker: str) -> int:
     """
     Resolve the tier-aware min_premium floor for a given ticker.
 
-    Resolution path (ING-012):
-      1. Ask the registry for the ticker's tier via influence_tier_int().
-         Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
-      2. Read gate_config_store.get("min_premium", tier_int) — O(1) in-memory.
+    FIX-2 resolution path:
+      1. reg.symbol_tier(ticker)     — structural tier from OCC metadata (preferred)
+      2. reg.influence_tier_int(ticker) — notional-volume proxy (legacy fallback)
+      3. _DEFAULT_TIER_INT = 3       — safe conservative floor
+      4. gate_config_store.get("min_premium", tier_int) — O(1) in-memory read
 
-    Falls back to T3 default (10_000) on any error or missing registry.
     Never raises. Safe on the hot path.
     """
     try:
@@ -641,10 +521,15 @@ def _resolve_min_premium(ticker: str) -> int:
         except Exception:
             pass
 
-        tier_int = _DEFAULT_TIER_INT  # safe default: T3
+        tier_int = _DEFAULT_TIER_INT
         if reg is not None and reg.is_ready():
             try:
-                tier_int = reg.influence_tier_int(ticker)
+                # FIX-2: prefer symbol_tier (structural), fall back to
+                # influence_tier_int (notional) for old registry builds.
+                if hasattr(reg, "symbol_tier"):
+                    tier_int = reg.symbol_tier(ticker)
+                else:
+                    tier_int = reg.influence_tier_int(ticker)
             except Exception:
                 tier_int = _DEFAULT_TIER_INT
 
@@ -653,20 +538,15 @@ def _resolve_min_premium(ticker: str) -> int:
         return 10_000
 
 
-# ---------------------------------------------------------------------------
-# ING-010: Tier-aware tier_int resolver (pre-parse, from registry)
-# ING-012: calls influence_tier_int() directly — influence_tier_string() deleted.
-# REARCH-010: ev.influence_tier no longer available post-parse; derive tier_int
-# from registry using the raw ticker extracted before parse_tradier_trade().
-# ---------------------------------------------------------------------------
 def _resolve_tier_int(raw_ticker: str) -> int:
     """
     Resolve the dedup tier_int for a ticker using the symbol registry.
 
-    Used by _process_trade() to pass tier_int to flow_dedup.is_duplicate()
-    without relying on ev.influence_tier (removed in REARCH-010/migration 024).
+    FIX-2 resolution path:
+      1. reg.symbol_tier(ticker)        — structural tier (preferred)
+      2. reg.influence_tier_int(ticker) — notional-volume proxy (legacy fallback)
+      3. _DEFAULT_TIER_INT = 3          — safe conservative floor
 
-    Returns 1 (WHALE/INSTITUTIONAL), 2 (LARGE), or 3 (RETAIL/fallback).
     Never raises.
     """
     try:
@@ -679,6 +559,10 @@ def _resolve_tier_int(raw_ticker: str) -> int:
 
         if reg is not None and reg.is_ready():
             try:
+                # FIX-2: prefer symbol_tier (structural), fall back to
+                # influence_tier_int (notional) for old registry builds.
+                if hasattr(reg, "symbol_tier"):
+                    return reg.symbol_tier(raw_ticker)
                 return reg.influence_tier_int(raw_ticker)
             except Exception:
                 pass
@@ -688,9 +572,6 @@ def _resolve_tier_int(raw_ticker: str) -> int:
         return _DEFAULT_TIER_INT
 
 
-# ---------------------------------------------------------------------------
-# ING-010-GATES: live signal_debounce_ms resolver
-# ---------------------------------------------------------------------------
 def _resolve_signal_debounce_s() -> float:
     try:
         raw_ms = gate_config_store.get("signal_debounce_ms", 1)
@@ -701,9 +582,6 @@ def _resolve_signal_debounce_s() -> float:
     return _SIGNAL_DEBOUNCE_S
 
 
-# ---------------------------------------------------------------------------
-# ING-010-GATES: live signal_min_premium resolver
-# ---------------------------------------------------------------------------
 def _resolve_signal_min_premium() -> float:
     try:
         val = gate_config_store.get("signal_min_premium", 1)
@@ -714,28 +592,18 @@ def _resolve_signal_min_premium() -> float:
     return float(_SIGNAL_MIN_PREMIUM)
 
 
-# ---------------------------------------------------------------------------
-# ING-011: live exclude_indices resolver
-# ---------------------------------------------------------------------------
 def _resolve_exclude_indices() -> bool:
     """
-    Return True if the exclude_indices gate is active (1.0), False if disabled (0.0).
-
-    Reads gate_config_store.get("exclude_indices", 1) — tier=1 is the
-    canonical row for this tier-independent gate.  Safe fallback is True
-    (filter ON) so index noise is suppressed even before the store loads.
-    Never raises.
+    Return True if the exclude_indices gate is active.
+    Safe fallback is True (filter ON).
     """
     try:
         val = gate_config_store.get("exclude_indices", 1)
         return bool(val >= 0.5)
     except Exception:
-        return True  # safe fallback: filter ON
+        return True
 
 
-# ---------------------------------------------------------------------------
-# Market hours helper
-# ---------------------------------------------------------------------------
 def _is_market_hours() -> bool:
     now_et = datetime.now(_ET)
     if now_et.weekday() >= 5:
@@ -743,17 +611,64 @@ def _is_market_hours() -> bool:
     return _MARKET_OPEN <= now_et.time() < _MARKET_CLOSE
 
 
-# ---------------------------------------------------------------------------
-# Backoff helper
-# ---------------------------------------------------------------------------
 def _backoff(attempt: int) -> float:
     delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
     return random.uniform(0, delay)
 
 
-# ---------------------------------------------------------------------------
-# Main streaming entry point
-# ---------------------------------------------------------------------------
+async def _get_session_token() -> Optional[str]:
+    url = f"{settings.TRADIER_BASE_URL}/v1/markets/events/session"
+    headers = {
+        "Authorization": f"Bearer {settings.TRADIER_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    # SEM-STREAM: acquire a semaphore slot before fetching to prevent burst.
+    acquired = False
+    timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX
+    try:
+        acquired = await acquire_session_token_slot(timeout_s=timeout_s)
+    except Exception:
+        pass
+
+    try:
+        for attempt in range(_SESSION_RETRY_MAX):
+            try:
+                async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
+                    resp = await client.post(url, headers=headers, data={})
+
+                if resp.status_code == 401:
+                    log.error(
+                        f"Tradier session 401 — TRADIER_API_KEY rejected. "
+                        f"Verify the key in Railway env vars. (attempt {attempt + 1}/{_SESSION_RETRY_MAX})"
+                    )
+                    return None
+
+                resp.raise_for_status()
+                token = resp.json().get("stream", {}).get("sessionid")
+                if token:
+                    log.info("Tradier session token obtained successfully")
+                    return token
+                log.warning(f"Tradier session response missing sessionid field: {resp.text[:200]}")
+                return None
+
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                log.warning(
+                    f"Tradier session fetch failed (transient, attempt {attempt + 1}/{_SESSION_RETRY_MAX}): {e}"
+                )
+                if attempt < _SESSION_RETRY_MAX - 1:
+                    await asyncio.sleep(_SESSION_RETRY_DELAY)
+            except Exception as e:
+                log.error(f"Tradier session fetch unexpected error: {e}")
+                return None
+
+        log.error(f"Tradier session token could not be obtained after {_SESSION_RETRY_MAX} attempts")
+        return None
+    finally:
+        if acquired:
+            _tradier_session_sem.release()
+
+
 async def stream_options_flow(
     symbols: list[str],
     registry=None,
@@ -762,11 +677,6 @@ async def stream_options_flow(
 
     _stats["active_symbols"] = len(symbols)
     _stats["mode"] = "starting"
-
-    # ING-010-DUP: gate_config_store.load() is called at lifespan step 0 in
-    # main.py before any service starts. The duplicate asyncio.create_task()
-    # that previously appeared here has been removed — it fired on every
-    # stream invocation including reconnects, making it dead/redundant code.
 
     if not settings.TRADIER_API_KEY:
         log.warning("TRADIER_API_KEY not set — stream idle. Use admin panel to start demo engine.")
@@ -842,302 +752,216 @@ async def stream_options_flow(
     await manager.run()
 
 
-start_stream = stream_options_flow
-
-
-# ---------------------------------------------------------------------------
-# Idle watchdog
-# ---------------------------------------------------------------------------
-async def _guarded_lines(resp: httpx.Response):
-    aiter = resp.aiter_lines().__aiter__()
-    while True:
-        try:
-            line = await asyncio.wait_for(aiter.__anext__(), timeout=_IDLE_TIMEOUT)
-            yield line
-        except StopAsyncIteration:
-            return
-        except asyncio.TimeoutError:
-            raise
-
-
-# ---------------------------------------------------------------------------
-# SIG-DEBOUNCE helpers
-# ---------------------------------------------------------------------------
-def _evict_signal_emit_cache(now: float) -> None:
-    stale = [
-        k for k, v in _signal_last_emit.items()
-        if now - v["ts"] > _SIGNAL_EMIT_TTL_S
-    ]
-    for k in stale:
-        del _signal_last_emit[k]
+def _evict_sweep_dispatch(now: float) -> None:
+    cutoff = now - _SWEEP_DISPATCH_TTL_S
+    to_delete = [k for k, ts in _sweep_upgrade_dispatched.items() if ts < cutoff]
+    for k in to_delete:
+        del _sweep_upgrade_dispatched[k]
 
 
 def _evict_lookback_result_cache(now: float) -> None:
-    stale = [
-        k for k, (_, stamped_at) in _lookback_result_cache.items()
-        if now - stamped_at > _LBC_TTL_S
-    ]
-    for k in stale:
+    cutoff = now - _LBC_TTL_S
+    to_delete = [k for k, (_, ts) in _lookback_result_cache.items() if ts < cutoff]
+    for k in to_delete:
         del _lookback_result_cache[k]
 
 
-def _should_emit_signal(
-    emit_key: str,
-    alert_level: str,
-    total_premium: float,
-    now: float,
-) -> tuple[bool, str]:
-    last = _signal_last_emit.get(emit_key)
-
-    if last is None:
-        return True, "initial_emit"
-
+def _should_emit_signal(emit_key: str, now: float, current_premium: float) -> bool:
     debounce_s = _resolve_signal_debounce_s()
+    last = _signal_last_emit.get(emit_key)
+    if last is None:
+        return True
     elapsed = now - last["ts"]
+    if elapsed > _SIGNAL_EMIT_TTL_S:
+        return True
     if elapsed < debounce_s:
-        return False, f"debounced({elapsed:.0f}s<{debounce_s:.0f}s)"
-
-    if alert_level != last["alert_level"]:
-        return True, f"level_change({last['alert_level']}->{alert_level})"
-
-    delta_prem = abs(total_premium - last["premium"])
-    if delta_prem >= _SIGNAL_DELTA_PREM:
-        return True, f"premium_delta(${delta_prem:,.0f})"
-
-    if last["premium"] > 0:
-        pct = delta_prem / last["premium"]
-        if pct >= _SIGNAL_DELTA_PCT:
-            return True, f"premium_pct({pct:.0%})"
-
-    return False, f"suppressed(no_material_change,elapsed={elapsed:.0f}s)"
+        return False
+    delta_prem = abs(current_premium - last["premium"])
+    delta_pct  = delta_prem / max(last["premium"], 1)
+    return delta_prem >= _SIGNAL_DELTA_PREM or delta_pct >= _SIGNAL_DELTA_PCT
 
 
-# ---------------------------------------------------------------------------
-# Core trade processor — called by StreamManager for every timesale tick.
-# ---------------------------------------------------------------------------
-async def _process_trade(raw: dict, registry=None) -> None:
+async def _process_trade(raw: dict) -> None:
+    """Hot-path trade processor — called for every timesale tick from Tradier."""
     global _last_gate_epoch
 
-    now = _time.time()
     _stats["ticks"] += 1
+    now = _time.time()
+    _stats["last_tick_at"] = now
 
-    # --- Epoch-change detection (ING-010) ---
+    # --- ING-010: epoch-change detection (O(1) int compare) ---
     current_epoch = gate_config_store.epoch
     if current_epoch != _last_gate_epoch:
         log.info(
-            "[stream] gate_config_store epoch changed %d -> %d — hot-reload confirmed",
+            "[gate-config] epoch changed %d -> %d — gate config hot-reloaded",
             _last_gate_epoch, current_epoch,
         )
         _last_gate_epoch = current_epoch
         _stats["gate_epoch"] = current_epoch
 
-    # --- Periodic cache eviction ---
-    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
-        _evict_signal_emit_cache(now)
-        _evict_lookback_result_cache(now)
-        # H4: evict stale sweep-upgrade dispatch keys
-        stale_sweep = [k for k, ts in _sweep_upgrade_dispatched.items() if now - ts > _SWEEP_DISPATCH_TTL_S]
-        for k in stale_sweep:
-            del _sweep_upgrade_dispatched[k]
-
-    # --- Event type filter ---
+    # --- Gate 1: event type filter ---
     etype = raw.get("type", "")
     if etype not in _PROCESSABLE_TYPES:
-        if etype and etype not in _non_timesale_etypes_seen:
+        if etype not in _non_timesale_etypes_seen:
             if len(_non_timesale_etypes_seen) < _FIRST_ETYPE_LOG_COUNT:
-                log.info("[stream] non-timesale event type seen: %r (suppressing future logs for this type)", etype)
+                log.info("[gate1] non-timesale etype=%r (suppressing future duplicates)", etype)
             _non_timesale_etypes_seen.add(etype)
         return
 
-    # --- Raw ticker extraction (pre-parse, for tier resolution) ---
-    _raw_symbol = raw.get("symbol", "")
-    _raw_ticker = _raw_symbol.split(" ")[0] if _raw_symbol else ""
+    # --- Extract raw ticker (pre-parse, for pre-gate checks) ---
+    _raw_ticker = raw.get("symbol", "").split(" ")[0].upper()
 
-    # --- ING-011: index/ETF filter (Gate 6) ---
-    if _raw_ticker and _resolve_exclude_indices() and _raw_ticker in _INDEX_SYMBOLS:
+    # --- Gate 6 (GATE-001): ETF noise exclusion — two layers ---
+    # Layer 1 (hardcoded — cannot be disabled by config drift):
+    if is_etf_noise_symbol(_raw_ticker):
+        _stats["index_filtered"] += 1
+        return
+    # Layer 2 (config-driven — defense-in-depth):
+    if _resolve_exclude_indices() and _raw_ticker in _INDEX_SYMBOLS:
         _stats["index_filtered"] += 1
         return
 
-    # --- Pre-parse tier resolution (ING-010 / REARCH-010) ---
+    # --- Gate 2: market hours ---
+    if not _is_market_hours():
+        return
+
+    # --- FIX-2: Resolve tier_int using symbol_tier (structural) ---
+    # _resolve_min_premium and _resolve_tier_int both prefer reg.symbol_tier()
+    # over reg.influence_tier_int() — see FIX-2 docstring in each resolver.
+    _min_premium = _resolve_min_premium(_raw_ticker)
     _ev_tier_int = _resolve_tier_int(_raw_ticker)
 
-    # --- First-tick INFO log ---
+    # --- First-tick INFO logging ---
     if _stats["ticks"] <= _FIRST_TICK_LOG_COUNT:
         log.info(
-            "[stream] first-tick #%d: symbol=%r tier=%d",
-            _stats["ticks"], _raw_symbol, _ev_tier_int,
+            "[first-tick #%d] ticker=%s tier=%d min_premium=%d",
+            _stats["ticks"], _raw_ticker, _ev_tier_int, _min_premium,
         )
 
-    # --- Parse ---
-    # PARSE-REGISTRY-KWARG: parse_tradier_trade(raw, min_premium=...) only.
-    # The parser resolves the registry internally via get_registry() —
-    # do NOT pass registry= here (that kwarg does not exist on the function).
-    min_premium = _resolve_min_premium(_raw_ticker)
-    result = parse_tradier_trade(raw, min_premium=min_premium)
-
-    if result == "below_premium":
-        return
+    # --- Gate 3: parse trade ---
+    result = parse_tradier_trade(raw, min_premium=_min_premium)
     if result is None:
         _stats["parse_failed"] += 1
+        return
+    if result == "below_premium":
         return
 
     ev = result
     _stats["parsed"] += 1
 
-    # --- REARCH-002: IngestionProcessor 4-gate filter ---
-    processed = _ingestion_processor.process(ev, tier=_ev_tier_int)
-    if processed is None:
-        log.info(
-            "[stream] tick dropped by IngestionProcessor: symbol=%r tier=%d",
-            ev.occ_symbol, _ev_tier_int,
-        )
+    # --- REARCH-002: IngestionProcessor gates (DTE, OI, premium) ---
+    ev = _ingestion_processor.process(ev, tier=_ev_tier_int)
+    if ev is None:
         return
-    ev = processed
 
-    # --- Dedup ---
+    # --- Gate 4: direction classification ---
+    ev.direction = order_side_to_direction(
+        price=ev.fill_price,
+        bid=ev.bid,
+        ask=ev.ask,
+    )
+    if not is_directionally_aggressive(ev):
+        return
+    _stats["classified"] += 1
+
+    # --- Gate 5: dedup ---
     if flow_dedup.is_duplicate(ev, tier_int=_ev_tier_int):
         _stats["deduped"] += 1
         return
 
-    _stats["classified"] += 1
+    # --- Accumulator ---
+    ep = accumulator.add_trade(ev)
+    if ep is None:
+        _stats["accumulator_gated"] += 1
+        return
 
-    # --- Accumulate ---
-    # FIX-AWAIT (fix/ingestion-persist-correctness):
-    # accumulator.get_signal() is async — MUST be awaited. Previously called
-    # without await, returning a coroutine object (always truthy → never None).
-    # Every gate check below ("if sig_ep is None") was therefore dead code —
-    # nothing was ever gated by the accumulator from the hot path.
-    sig_ep = await accumulator.get_signal(ev)
-
-    # --- Persist flow event (fire-and-forget) ---
-    # FIX-PERSIST-TYPE (fix/ingestion-persist-correctness):
-    # persist_flow_event now accepts OptionsFlowEvent directly (see flow_store.py).
-    # Previously only accepted dict; the dataclass was passed silently failing
-    # on every .get() call, so zero rows reached flow_events from the hot path.
+    # --- Persist event (fire-and-forget) ---
     t = asyncio.create_task(persist_flow_event(ev))
     t.add_done_callback(_persist_done_cb)
     _stats["persisted"] += 1
     log.info(
-        "[stream] persisted flow event: symbol=%r premium=$%.0f tier=%d",
+        "[persist] queued occ=%s premium=%.0f tier=%d",
         ev.occ_symbol, ev.premium, _ev_tier_int,
     )
 
-    # --- Sweep upgrade check ---
-    # FIX-OCC-SYMBOL + FIX-UPGRADE-ARITY (fix/ingestion-persist-correctness):
-    # ev.occ_symbol now exists on OptionsFlowEvent (added to dataclass).
-    # upgrade_to_sweep_in_db requires (occ_symbol, fill_price, size) — previously
-    # called with only occ_symbol (TypeError on every sweep event).
-    if ev.is_sweep and ev.occ_symbol:
-        dispatch_key = f"{ev.occ_symbol}|{ev.size}|{ev.fill_price}"
-        if dispatch_key not in _sweep_upgrade_dispatched:
+    # --- Lookback enrichment ---
+    _evict_lookback_result_cache(now)
+    lbc_key = ev.occ_symbol
+    cached = _lookback_result_cache.get(lbc_key)
+    if cached is None:
+        lbc_val = _lbc_fresh(_lbc, _ContractKey(ev.occ_symbol, ev.expiry_date))
+        _lookback_result_cache[lbc_key] = (lbc_val, now)
+    else:
+        lbc_val, _ = cached
+
+    if not lbc_val:
+        enqueue_lookback(ev)
+
+    # --- Sweep-upgrade dispatch (H4 TTL eviction) ---
+    _evict_sweep_dispatch(now)
+    dispatch_key = f"{ev.occ_symbol}|{ev.size}|{ev.fill_price}"
+    if dispatch_key not in _sweep_upgrade_dispatched:
+        if ev.is_sweep:
+            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol))
             _sweep_upgrade_dispatched[dispatch_key] = now
-            asyncio.create_task(upgrade_to_sweep_in_db(ev.occ_symbol, ev.fill_price, ev.size))
-
-    if sig_ep is None:
-        _stats["accumulator_gated"] += 1
-        return
-
-    # --- Persist episode (fire-and-forget) ---
-    # FIX-TO-EPISODE (fix/ingestion-persist-correctness):
-    # accumulator.to_episode() does not exist — it was never defined on
-    # RepetitionAccumulator.  The call raised AttributeError on every qualifying
-    # episode, meaning zero episodes were ever persisted from the hot path.
-    # Fix: persist_flow_episode now accepts RepetitionEpisode directly (it
-    # normalises the type internally). Pass sig_ep (RepetitionEpisode) directly.
-    # enqueue_lookback also accepts RepetitionEpisode — the worker only needs
-    # .ticker, .contract_type, .strike, .expiry which are all present.
-    asyncio.create_task(persist_flow_episode(sig_ep))
-    enqueue_lookback(sig_ep)
 
     # --- Signal gate ---
+    persist_ep = accumulator.get_episode(ev)
+    if persist_ep is not None:
+        asyncio.create_task(persist_flow_episode(persist_ep))
+
+    sig_ep = accumulator.get_signal(ev)
+    if sig_ep is None:
+        return
+
     signal_min_premium = _resolve_signal_min_premium()
     if sig_ep.total_premium < signal_min_premium:
         return
-
     if sig_ep.trade_count < _SIGNAL_MIN_TRADES:
         return
 
-    # --- Alert level resolution ---
-    alert_level = accumulator.get_alert_level(sig_ep)
-
-    # --- SIG-DEBOUNCE ---
-    emit_key = f"{ev.occ_symbol}"
-    should_emit, reason = _should_emit_signal(
-        emit_key=emit_key,
-        alert_level=alert_level,
-        total_premium=sig_ep.total_premium,
-        now=now,
-    )
-
-    if not should_emit:
+    emit_key = f"{ev.occ_symbol}|{ev.expiry_date}"
+    if not _should_emit_signal(emit_key, now, sig_ep.total_premium):
         _stats["sig_debounced"] += 1
-        log.info("[stream] signal suppressed for %r: %s", ev.occ_symbol, reason)
         return
 
-    _signal_last_emit[emit_key] = {
-        "ts":          now,
-        "alert_level": alert_level,
-        "premium":     sig_ep.total_premium,
-    }
+    _signal_last_emit[emit_key] = {"ts": now, "premium": sig_ep.total_premium}
+    _stats["signals"] += 1
+
+    alert_level = accumulator.get_alert_level(sig_ep)
+    direction   = sig_ep.dominant_direction
 
     # --- Composite score ---
     composite = None
     try:
-        composite = build_composite(sig_ep, registry=registry)
-    except Exception as exc:
+        composite = build_composite(sig_ep, accumulator)
+    except Exception as e:
         _stats["composite_errors"] += 1
-        log.warning("[stream] build_composite error for %r: %s", ev.occ_symbol, exc)
+        log.warning("[composite] build failed: %s", e)
 
     if composite is None:
         return
 
-    direction = sig_ep.dominant_direction
-
-    _stats["signals"] += 1
-    log.info(
-        "[stream] SIGNAL %s | %s | alert=%s | premium=$%.0f | score=%.3f | reason=%s",
-        ev.ticker, ev.occ_symbol, alert_level,
-        sig_ep.total_premium, composite.score, reason,
-    )
-
-    # --- Multiday lookback result (cached) ---
-    is_repeat: bool = False
-    lbc_key = ev.occ_symbol
-    if lbc_key in _lookback_result_cache:
-        is_repeat, _ = _lookback_result_cache[lbc_key]
-    elif _lbc_fresh(lbc_key):
-        cached_val = _lbc.get(_ContractKey(lbc_key))
-        if cached_val is not None:
-            is_repeat = cached_val
-            _lookback_result_cache[lbc_key] = (is_repeat, now)
-
-    # --- Publish composite signal ---
     payload = {
-        "ticker":              ev.ticker,
-        "occ_symbol":          ev.occ_symbol,
-        "contract_type":       ev.contract_type,
-        "strike":              ev.strike,
-        "expiry":              ev.expiry.isoformat() if ev.expiry else None,
-        "alert_level":         alert_level,
-        "direction":           direction,
-        "total_premium":       sig_ep.total_premium,
-        "trade_count":         sig_ep.trade_count,
-        "composite_score":     composite.score,
-        "score_ceiling":       COMPOSITE_SCORE_CEILING,
-        "influence_tier":      episode_influence_tier(sig_ep),
-        "is_multiday_repeat":  is_repeat,
-        "emit_reason":         reason,
+        "type": "signal",
+        "data": {
+            "ticker":          ev.ticker,
+            "contract_type":   ev.contract_type,
+            "strike":          ev.strike,
+            "expiry":          str(ev.expiry_date),
+            "alert_level":     alert_level,
+            "direction":       direction,
+            "total_premium":   sig_ep.total_premium,
+            "trade_count":     sig_ep.trade_count,
+            "composite_score": round(composite.score / COMPOSITE_SCORE_CEILING, 4),
+            "tier":            _ev_tier_int,
+        },
     }
     await bus.publish_all("composite_signal", payload)
-
-    # --- Stats log (every N ticks) ---
-    if _stats["ticks"] % _STATS_LOG_INTERVAL == 0:
-        log.info(
-            "[stream] funnel | ticks=%d parsed=%d classified=%d "
-            "deduped=%d index_filtered=%d accumulator_gated=%d "
-            "persisted=%d signals=%d sig_debounced=%d errors=%d",
-            _stats["ticks"], _stats["parsed"], _stats["classified"],
-            _stats["deduped"], _stats["index_filtered"], _stats["accumulator_gated"],
-            _stats["persisted"], _stats["signals"], _stats["sig_debounced"],
-            _stats["errors"],
-        )
+    log.info(
+        "[signal] emitted ticker=%s alert=%s dir=%s premium=%.0f trades=%d composite=%.3f tier=%d",
+        ev.ticker, alert_level, direction,
+        sig_ep.total_premium, sig_ep.trade_count,
+        composite.score / COMPOSITE_SCORE_CEILING,
+        _ev_tier_int,
+    )

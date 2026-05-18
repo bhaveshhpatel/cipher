@@ -7,9 +7,10 @@ must pass before it reaches the signal engines.  Gates are evaluated in order:
   1. DTE hard floor  (min_dte  — default 1, 0DTE never persists)
   2. DTE ceiling     (max_dte  — default 90)
   3. Tier-aware premium floor
-     T1 (INSTITUTIONAL) : ing.min_premium.t1  (default $25 000)
-     T2 (LARGE)         : ing.min_premium.t2  (default $15 000)
-     T3 (RETAIL)        : ing.min_premium.t3  (default $5 000)
+     T1 (INSTITUTIONAL) : gate_config_store.get("min_premium", 1)  (default $25 000)
+     T2 (LARGE)         : gate_config_store.get("min_premium", 2)  (default $15 000)
+     T3 (RETAIL)        : gate_config_store.get("min_premium", 3)  (default $10 000)
+     Fallback           : IngestionConfig.min_premium_t{1,2,3} when store returns None
   4. Open-interest floor  (min_oi — default 0; new-chain events must reach
      signal engines — Vol>OI conviction gating is REARCH-006 signal logic)
 
@@ -77,6 +78,25 @@ FIX (2026-05-14): _fetch_from_db() previously imported
   the deployed codebase, causing ModuleNotFoundError at every cache
   refresh cycle.  Replaced with direct supabase.create_client using
   config.settings, matching the pattern used in chain_store.py and auth.py.
+
+Fix (FIX-3 2026-05-16): sync premium floors with gate_config_store.
+  IngestionProcessor._apply_gates() previously read premium floors exclusively
+  from IngestionConfig (ingestion_config DB table, TTL=30s). gate_config_store
+  (gate_configs DB table) is the authoritative hot-reloadable source for
+  min_premium per tier — but the processor never consulted it.
+
+  Split-brain scenario:
+    _resolve_min_premium() in tradier_stream passes a gate_config_store floor
+    to parse_tradier_trade, pruning below-floor events at parse time.
+    But IngestionProcessor gate 3 re-evaluated using IngestionConfig floors
+    (default $5k for T3), so $5k–$9k events could slip through if
+    gate_config_store hot-reload hadn't propagated to IngestionConfig yet.
+
+  Fix: _apply_gates() calls gate_config_store.get("min_premium", tier_int)
+  as the primary floor when a tier int is supplied. IngestionConfig fields
+  remain the fallback (cold start / unit tests / process_with_config()).
+  _premium_floor_from_store() helper encapsulates the two-source resolution.
+  IngestionConfig T3 default updated from $5k → $10k to match store canonical.
 """
 from __future__ import annotations
 
@@ -144,14 +164,18 @@ class IngestionConfig:
     DB is unreachable.  The hot path reads a module-level reference to one of
     these objects — refresh creates a NEW instance and swaps the reference.
     Never mutate a live instance.
+
+    FIX-3: min_premium_t3 updated from $5 000 to $10 000 to match the
+    canonical gate_config_store default.  gate_config_store is now the primary
+    source; IngestionConfig values are the fallback only.
     """
     min_dte:         int  = 1
     max_dte:         int  = 90
     min_premium_t1:  int  = 25_000
     min_premium_t2:  int  = 15_000
-    min_premium_t3:  int  = 5_000
-    min_oi:          int  = 0      # 0 = pass new-chain events; Vol>OI gating is REARCH-006
-    require_ask_tag: bool = True   # tagging only — does not gate events
+    min_premium_t3:  int  = 10_000   # FIX-3: was 5_000 — aligned with gate_config_store default
+    min_oi:          int  = 0        # 0 = pass new-chain events; Vol>OI gating is REARCH-006
+    require_ask_tag: bool = True     # tagging only — does not gate events
 
 
 # ---------------------------------------------------------------------------
@@ -289,12 +313,47 @@ def reset_drop_stats() -> None:
 # ---------------------------------------------------------------------------
 
 def _premium_floor(cfg: IngestionConfig, tier: str) -> int:
-    """Return the premium floor for the given tier string."""
+    """Return the IngestionConfig premium floor for the given tier string.
+
+    FIX-3: This is now the FALLBACK path only.  _apply_gates() calls
+    _premium_floor_from_store() first, which consults gate_config_store.
+    This function is retained for process_with_config() (unit tests) and
+    as the None-fallback inside _premium_floor_from_store().
+    """
     if tier == _TIER_T1:
         return cfg.min_premium_t1
     if tier == _TIER_T2:
         return cfg.min_premium_t2
     return cfg.min_premium_t3   # T3 / unknown — safest default
+
+
+def _premium_floor_from_store(
+    tier_int: int,
+    cfg_fallback: IngestionConfig,
+    tier_str: str,
+) -> int:
+    """
+    FIX-3: Resolve the premium floor using gate_config_store as the primary
+    source, falling back to IngestionConfig when the store returns None.
+
+    gate_config_store is the authoritative hot-reloadable source (gate_configs
+    DB table).  IngestionConfig (ingestion_config DB table) is the fallback for
+    cold start, store not yet loaded, or explicit process_with_config() calls.
+
+    Resolution order:
+      1. gate_config_store.get("min_premium", tier_int)  — O(1) in-memory read
+      2. _premium_floor(cfg_fallback, tier_str)          — IngestionConfig snapshot
+
+    Never raises.  Returns int.
+    """
+    try:
+        from services.gate_config_store import store as _gate_store
+        val = _gate_store.get("min_premium", tier_int)
+        if val is not None and val > 0:
+            return int(val)
+    except Exception:
+        pass
+    return _premium_floor(cfg_fallback, tier_str)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +463,10 @@ class IngestionProcessor:
     int (1/2/3) to replace the now-removed ev.influence_tier attribute.  When
     supplied, `tier` takes precedence over any residual ev.influence_tier.
 
+    FIX-3: process() now uses gate_config_store as the primary floor source
+    for Gate 3 (premium floor) when a tier int is supplied.  process_with_config()
+    retains the IngestionConfig-only path for deterministic unit tests.
+
     REARCH-003: enrich_tags() is a static method that computes dte_bucket,
     notional_tier, and event_cipher_score from an ev_dict. It is a standalone
     testable helper. Production writes use _compute_dte_bucket() and
@@ -416,20 +479,21 @@ class IngestionProcessor:
 
     def process(self, ev: object, tier: Optional[int] = None) -> Optional[object]:
         """
-        Apply all ingestion gates to *ev* using the live cached IngestionConfig.
-        Returns the event unchanged if it passes all gates, or None if dropped.
+        Apply all ingestion gates to *ev* using the live cached IngestionConfig
+        (fallback) and gate_config_store (primary for premium floor).
+
+        FIX-3: Gate 3 (premium floor) now consults gate_config_store first.
+        IngestionConfig is retained as the fallback for cold start / store
+        not yet loaded.  All other gates (DTE, OI) continue to use
+        IngestionConfig exclusively.
 
         tier: optional int (1=INSTITUTIONAL, 2=LARGE, 3/None=RETAIL).
           Pass _ev_tier_int from tradier_stream._process_trade() so the
           correct per-ticker premium floor is enforced after REARCH-010
           dropped ev.influence_tier from OptionsFlowEvent.
-
-        Type is `object` here to avoid a circular import with the event models;
-        callers hold the concrete OptionsFlowEvent type.  All attribute accesses
-        are duck-typed against the expected event shape.
         """
         cfg = get_ingestion_config()
-        return self._apply_gates(ev, cfg, tier=tier)
+        return self._apply_gates(ev, cfg, tier=tier, use_store=True)
 
     def process_with_config(
         self,
@@ -439,11 +503,15 @@ class IngestionProcessor:
     ) -> Optional[object]:
         """
         Apply gates using an explicitly supplied IngestionConfig.  Intended for
-        unit tests that need deterministic config without touching the cache.
+        unit tests that need deterministic config without touching the cache
+        or gate_config_store.
+
+        FIX-3: use_store=False here so tests remain fully isolated from the
+        gate_config_store singleton.
 
         tier: optional int — same semantics as process().
         """
-        return self._apply_gates(ev, cfg, tier=tier)
+        return self._apply_gates(ev, cfg, tier=tier, use_store=False)
 
     # ------------------------------------------------------------------
     # Public — REARCH-003 enrichment
@@ -502,6 +570,7 @@ class IngestionProcessor:
         ev: object,
         cfg: IngestionConfig,
         tier: Optional[int] = None,
+        use_store: bool = True,
     ) -> Optional[object]:
         dte           = getattr(ev, "dte",           0)
         premium       = getattr(ev, "premium",       0)
@@ -518,10 +587,14 @@ class IngestionProcessor:
         # constants.  Without conversion, int 1 != "INSTITUTIONAL" and the T3
         # floor silently wins for every T1/T2 event.
         if tier is not None:
+            tier_int_resolved = tier
             influence_tier = _tier_int_to_str(tier)
         else:
             raw = getattr(ev, "influence_tier", None)
             influence_tier = _tier_int_to_str(raw) if isinstance(raw, int) else (raw or _TIER_T3)
+            # Map string back to int for store lookup
+            _str_to_int = {_TIER_T1: 1, _TIER_T2: 2, _TIER_T3: 3}
+            tier_int_resolved = _str_to_int.get(influence_tier, 3)
 
         # Gate 1 — DTE hard floor
         if dte < cfg.min_dte:
@@ -534,7 +607,14 @@ class IngestionProcessor:
             return None
 
         # Gate 3 — Tier-aware premium floor
-        floor = _premium_floor(cfg, influence_tier)
+        # FIX-3: use gate_config_store as the primary source when use_store=True
+        # (production path).  Fall back to IngestionConfig when use_store=False
+        # (process_with_config / unit tests) or when the store returns None.
+        if use_store:
+            floor = _premium_floor_from_store(tier_int_resolved, cfg, influence_tier)
+        else:
+            floor = _premium_floor(cfg, influence_tier)
+
         if premium < floor:
             _stats["dropped_min_premium"] += 1
             return None

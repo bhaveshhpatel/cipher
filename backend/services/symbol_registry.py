@@ -11,12 +11,15 @@ FIX P4 (2026-04-27): build() now performs an incremental warm-restart when
   today) are re-fetched; all other tickers are carried forward unchanged.
   Warm-restart chain API calls drop from ~17,360 to ~50-400.
 
-FIX C-3 (2026-04-27): assign_tiers() is now called with require_oi=True
-  in the post-build reclassification step. This ensures OI is enforced in
-  the tier gate only after build() has populated OI data from chain fetches.
-  Pre-build tier assignments (main.py Step 3b) default to require_oi=False,
-  which skips the OI gate and produces stable T1/T2 counts based on
-  volume and price alone.
+FIX C-3 (2026-04-27): Post-build OI-based tier reclassification.
+  assign_tiers() requires list[SymbolQuote] objects (average_volume, last_price
+  etc.) which are not available at post-build time — only raw oi_by_ticker dict
+  exists. Fix: inline OI re-tier directly against thresh (already fetched at
+  the top of build()). Each ticker in new_oi_by_ticker is compared to
+  t1_min_oi / t2_min_oi thresholds; the resolved tier is stamped onto every
+  ContractMeta in new_registry and stored in _tier_map. This is equivalent
+  to what assign_tiers(require_oi=True) was intended to do but could not
+  because it received oi_map= (a dict) instead of quotes= (list[SymbolQuote]).
 
 FIX H1 (2026-04-27): build() now returns a tuple[int, dict[str, dict]]
   (count, raw_quotes). Callers that only need the count ignore the second
@@ -395,6 +398,18 @@ FIX-SYNTAX-LINE690 (2026-05-15): Close truncated log.error() call at line 690.
   at line 690, preventing uvicorn from importing main.py and crashing the
   backend on every deploy. Fix: restore the complete except asyncio.TimeoutError
   block and the remainder of the build() method body.
+
+FIX C-3 REWRITE (2026-05-17): Replace broken assign_tiers(oi_map=...) call
+  with inline OI re-tier inside build().
+  assign_tiers() signature: async def assign_tiers(quotes: list[SymbolQuote], ...)
+  The post-build call was: await assign_tiers(oi_map=new_oi_by_ticker, require_oi=True)
+  This raised TypeError: assign_tiers() got an unexpected keyword argument 'oi_map',
+  which suppressed all post-build OI tier upgrades (all contracts stayed at
+  volume-only T3 instead of being upgraded to OI-confirmed T1/T2).
+  Fix: inline OI re-tier — classify each ticker in new_oi_by_ticker as T1/T2/T3
+  by comparing average OI to thresh t1_min_oi / t2_min_oi thresholds, stamp
+  the result onto every ContractMeta in new_registry, and update _tier_map.
+  assign_tiers() import retained (still used by _post_build_upsert in main.py).
 """
 import asyncio
 import logging
@@ -845,27 +860,37 @@ class SymbolRegistry:
                 if oi_list:
                     new_oi_by_ticker[ticker] = round(sum(oi_list) / len(oi_list))
 
-            # Post-build tier reclassification with OI enforcement (FIX C-3).
-            try:
-                reclassified = await assign_tiers(
-                    oi_map=new_oi_by_ticker,
-                    require_oi=True,
-                )
-                for occ, meta in new_registry.items():
-                    if meta.ticker in reclassified:
-                        meta.tier = reclassified[meta.ticker]
-                self._tier_map.update(reclassified)
-                log.info(
-                    "[symbol_registry] post-build tier reclassification: "
-                    "%d tickers updated (require_oi=True)",
-                    len(reclassified),
-                )
-            except Exception as exc:
-                log.warning(
-                    "[symbol_registry] post-build tier reclassification failed: %s "
-                    "— existing tier_map retained",
-                    exc,
-                )
+            # -----------------------------------------------------------------------
+            # FIX C-3 REWRITE: Post-build OI-based tier reclassification.
+            # assign_tiers() cannot be used here — it requires list[SymbolQuote]
+            # objects (average_volume, last_price etc.) which are not available at
+            # post-build time. Only raw new_oi_by_ticker (dict[str, int]) exists.
+            # Fix: inline OI re-tier directly against thresh thresholds already
+            # fetched at the top of build().
+            # -----------------------------------------------------------------------
+            t1_min_oi = int(thresh.get("t1_min_oi", 1000))
+            t2_min_oi = int(thresh.get("t2_min_oi", 500))
+            reclassified: dict[str, int] = {}
+            for ticker, avg_oi in new_oi_by_ticker.items():
+                if avg_oi >= t1_min_oi:
+                    reclassified[ticker] = 1
+                elif avg_oi >= t2_min_oi:
+                    reclassified[ticker] = 2
+                else:
+                    reclassified[ticker] = 3
+
+            # Stamp the resolved tier onto every ContractMeta in new_registry.
+            for occ, meta in new_registry.items():
+                if meta.ticker in reclassified:
+                    meta.tier = reclassified[meta.ticker]
+
+            # Merge into _tier_map so influence_tier_int() returns OI-confirmed tiers.
+            self._tier_map.update(reclassified)
+            log.info(
+                "[symbol_registry] post-build OI tier reclassification: "
+                "%d tickers updated (t1_min_oi=%d, t2_min_oi=%d)",
+                len(reclassified), t1_min_oi, t2_min_oi,
+            )
 
             self._registry      = new_registry
             self._oi_by_ticker  = new_oi_by_ticker

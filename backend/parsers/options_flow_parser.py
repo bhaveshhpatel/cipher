@@ -64,10 +64,18 @@ SENTIMENT FIX (2026-05-09):
   All historical flow_events rows had order_side=UNKNOWN (Tradier stream
   never populated it), so bid_ask_class is the only available fill-placement
   signal and is the correct input to classify_sentiment().
+
+FIX-PERSIST-TYPE (fix/ingestion-persist-correctness cherry-pick):
+  occ_symbol promoted from @property to stored field — set at parse time
+  from the raw stream symbol (stripped of whitespace). This ensures
+  ev.occ_symbol is always available on the dataclass without recomputing,
+  and allows flow_store / tradier_stream to read it via getattr().
+  is_sweep and order_side fields added to support sweep upgrade path and
+  future order-side tracking.
 """
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Optional, Union, Literal
 from parsers.bid_ask_classifier import classify_bid_ask, classify_sentiment, is_directionally_aggressive
@@ -311,13 +319,13 @@ def parse_tradier_trade(
         # ------------------------------------------------------------------
         # Synthetic quote handling
         # When bid=ask=0 we have no real spread data. Instead of fabricating
-        # a tight ±0.5% spread and running classification (which almost
+        # a tight +-0.5% spread and running classification (which almost
         # always produces ABOVE_ASK/AT_ASK -> is_aggressive=True on
         # wide-spread contracts), we:
         #   1. Flag is_synthetic_quote=True
         #   2. Force bid_ask_class="MID" — neutral, unknown fill placement
         #   3. Force is_aggressive=False — cannot claim aggression without quotes
-        #   4. Apply a 40% conviction haircut (×0.6) downstream
+        #   4. Apply a 40% conviction haircut (x0.6) downstream
         # NOTE (ING-006): is_aggressive stays False for synthetic quotes even
         # post-registry — synthetic spreads have no valid aggression signal.
         # NOTE (SENTIMENT FIX): synthetic quotes force ba_class="MID" which

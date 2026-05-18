@@ -620,53 +620,7 @@ async def _flush_flow_events():
             log.info(f"[flow_store] flushed {len(batch)} flow_events to DB")
 
 
-def _compute_episode_steamroom_score(
-    ask_side_pct: Optional[float],
-    vol_oi_signal: Optional[bool],
-    total_premium: float,
-    dte_bucket: Optional[str],
-    trade_count: int,
-    min_trade_count: int = 3,
-) -> int:
-    """
-    REARCH-004: Compute the 5-dimension Steamroom conviction score for an episode.
-    Range: 0–5.  1 point each for:
-      Dim 1 — ask-side majority  : ask_side_pct is not None and >= 0.5
-      Dim 2 — vol > OI           : vol_oi_signal is True
-      Dim 3 — premium >= NOTEWORTHY ($50k): total_premium >= 50_000
-      Dim 4 — near-term expiry   : dte_bucket in ('0DTE', '1-4', '5-60')
-      Dim 5 — confirmed activity : trade_count >= min_trade_count
-    None-safe — any missing input simply contributes 0.
-    """
-    score = 0
-    if ask_side_pct is not None and ask_side_pct >= 0.5:
-        score += 1
-    if vol_oi_signal is True:
-        score += 1
-    if (total_premium or 0) >= 50_000:
-        score += 1
-    if (dte_bucket or "") in ("0DTE", "1-4", "5-60"):
-        score += 1
-    if trade_count >= min_trade_count:
-        score += 1
-    return score
-
-
-async def persist_flow_event(ev) -> None:
-    """
-    Persist a single OptionsFlowEvent (or legacy dict) to flow_events via the
-    in-process buffer → batch flush loop.
-
-    FIX-PERSIST-TYPE (fix/ingestion-persist-correctness):
-      Previously accepted only `ev_dict: dict` but was called from
-      _process_trade() with an OptionsFlowEvent dataclass.  Every .get() call
-      on the dataclass raised AttributeError, which _persist_done_cb caught and
-      counted silently — zero rows ever reached flow_events from the hot path.
-
-      Fix: normalise the input via a local _g() accessor that works for both
-      dict (uses .get) and dataclass (uses getattr).  The row dict built from
-      _g() is pure Python scalars — safe to JSON-serialise downstream.
-    """
+async def persist_flow_event(ev_dict):
     global _flow_event_buffer
 
     if not _is_configured():
@@ -675,6 +629,10 @@ async def persist_flow_event(ev) -> None:
             "not set — event dropped. Set env vars to enable DB persistence."
         )
         return
+    # EV-OBJ-001: normalize OptionsFlowEvent → dict so .get() calls work
+    # regardless of whether caller passes a dataclass/object or a plain dict.
+    if not isinstance(ev_dict, dict):
+        ev_dict = vars(ev_dict)
 
     # FIX-PERSIST-TYPE: normalise dict vs OptionsFlowEvent dataclass.
     if isinstance(ev, dict):

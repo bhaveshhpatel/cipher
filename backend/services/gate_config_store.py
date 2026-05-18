@@ -15,14 +15,22 @@ Return contract:
   Returns 0.0 for unknown gates or missing tiers (never None).
 
 Data structure contracts (must match what tests import):
-  _DEFAULTS  — nested {gate: {tier: value}}  (string keys; .items() → sub-dicts)
+  _DEFAULTS  — nested {gate: {tier: value}}  (string keys; .items() -> sub-dicts)
   _FALLBACK  — flat {(gate, tier): value}    (tuple keys; flat iteration)
   _BOUNDS    — {gate: (lo, hi, cast)}        (3-tuple)
+
+ING-010-RELOAD: start_refresh_loop(interval_s=300) periodically re-calls
+  load() so that gate values written externally (Supabase dashboard, SQL
+  migration, admin API on a different service instance) are picked up
+  without restarting the process.  The loop is launched as a background
+  asyncio.Task in main.py lifespan (Step 6-k).  On any load() error the
+  loop logs a warning and continues — it never crashes.
 """
 from __future__ import annotations
 
 # Import the stdlib datetime MODULE and expose it under the name `datetime`
 # so that tests can patch it as:  patch("services.gate_config_store.datetime")
+import asyncio
 import datetime  # noqa: PLC0414  (we need the module, not the class)
 import logging
 import threading
@@ -33,7 +41,7 @@ import httpx  # top-level so tests can mock services.gate_config_store.httpx
 log = logging.getLogger("gate_config_store")
 
 # ---------------------------------------------------------------------------
-# Gate name → alias resolution
+# Gate name -> alias resolution
 # ---------------------------------------------------------------------------
 _ALIAS_MAP: dict[str, str] = {
     "debounce_ms": "signal_debounce_ms",
@@ -57,7 +65,7 @@ _VALID_TIERS: frozenset[int] = frozenset({1, 2, 3})
 _SAFE_DEFAULT_TIER: int = 3
 
 # ---------------------------------------------------------------------------
-# Static bounds — gate_name → (lo, hi, cast)
+# Static bounds — gate_name -> (lo, hi, cast)
 # Tests unpack as:  lo, hi, cast = _BOUNDS["gate_name"]
 # update() uses raw[0]/raw[1] so the cast element is ignored there.
 # ---------------------------------------------------------------------------
@@ -75,13 +83,13 @@ _BOUNDS: dict[str, tuple[float, float, type]] = {
 # Hard-coded defaults
 #
 # _DEFAULTS — nested dict {gate: {tier: value}}  (the public import name)
-#   Access:    _DEFAULTS["min_premium"][1]  → 25000.0
+#   Access:    _DEFAULTS["min_premium"][1]  -> 25000.0
 #   Membership: "min_premium" in _DEFAULTS
 #   Iteration:  for gate, tiers in _DEFAULTS.items():
 #                   for tier, value in tiers.items(): ...
 #
 # _FALLBACK — flat dict {(gate, tier): value}  (backward-compat alias)
-#   Access:    _FALLBACK[("min_premium", 1)]  → 25000.0
+#   Access:    _FALLBACK[("min_premium", 1)]  -> 25000.0
 #   Iteration:  for (gate, tier), value in _FALLBACK.items(): ...
 #
 # IMPORTANT: These values MUST match the DB seed in migration 021.
@@ -138,7 +146,7 @@ _FALLBACK: dict[tuple[str, int], float] = {
 
 
 def _is_market_open() -> bool:
-    """Return True if the US equity market is currently open (9:30–16:00 ET, Mon–Fri)."""
+    """Return True if the US equity market is currently open (9:30-16:00 ET, Mon-Fri)."""
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
     now = datetime.datetime.now(ET)
@@ -160,6 +168,11 @@ class GateConfigStore:
        lock-free (reading a dict is GIL-safe for CPython).
     3. Writes go through ``await store.update(...)`` which commits to
        the DB first, then patches the in-memory cache under a lock.
+    4. ``await store.start_refresh_loop(interval_s=300)`` runs as a
+       background asyncio.Task (launched in main.py lifespan Step 6-k).
+       It re-calls load() every interval_s seconds so that gate values
+       written externally (Supabase dashboard, SQL, admin API on another
+       instance) are picked up without a process restart.  [ING-010-RELOAD]
 
     Thread safety
     -------------
@@ -185,6 +198,8 @@ class GateConfigStore:
         self._supabase_url: str = ""
         self._supabase_key: str = ""
         self.epoch: int = 0          # monotonic counter — incremented on every update
+        # ING-010-RELOAD: exposed for observability (/health, admin endpoint)
+        self.refresh_interval_s: int = 300
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -219,10 +234,10 @@ class GateConfigStore:
 
     def get(self, gate_name: str, tier: int) -> float:
         """
-        Return the current value for ``gate_name`` × ``tier``.
+        Return the current value for ``gate_name`` x ``tier``.
 
         Always returns float — 0.0 for unknown gates or missing tiers.
-        Resolves 'debounce_ms' → 'signal_debounce_ms' transparently.
+        Resolves 'debounce_ms' -> 'signal_debounce_ms' transparently.
         Unknown tiers (not in _VALID_TIERS) always fall back to T3
         (_SAFE_DEFAULT_TIER) — even if an out-of-range tier was stored
         in the cache by load().
@@ -300,6 +315,53 @@ class GateConfigStore:
         log.info(
             "[gate_config] Loaded %d rows from DB (epoch=%d)", len(rows), self.epoch
         )
+
+    # ------------------------------------------------------------------
+    # Periodic hot-reload loop  [ING-010-RELOAD]
+    # ------------------------------------------------------------------
+
+    async def start_refresh_loop(self, interval_s: int = 300) -> None:
+        """
+        Periodically re-load gate_configs from the DB.  [ING-010-RELOAD]
+
+        Launched as a background asyncio.Task in main.py lifespan (Step 6-k).
+        Sleeps ``interval_s`` seconds between each load() call so the first
+        reload fires at T+interval_s (startup load() at Step 0 is already
+        fresh).
+
+        Guarantees:
+        - Never crashes the loop on load() failure — logs a WARNING and
+          sleeps until the next interval.
+        - Respects asyncio.CancelledError (propagates immediately on shutdown).
+        - Updates self.refresh_interval_s for observability.
+
+        Parameters
+        ----------
+        interval_s : int
+            Seconds between DB re-polls.  Default 300 (5 min).  The
+            maximum stale-config window is therefore interval_s seconds
+            for externally-written gate changes.
+        """
+        self.refresh_interval_s = interval_s
+        log.info(
+            "[gate_config] start_refresh_loop: periodic hot-reload every %d s "
+            "(ING-010-RELOAD)",
+            interval_s,
+        )
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await self.load()
+                log.debug(
+                    "[gate_config] Periodic reload complete (epoch=%d)", self.epoch
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[gate_config] Periodic reload failed (will retry in %d s): %s",
+                    interval_s, exc,
+                )
 
     # ------------------------------------------------------------------
     # Write API (admin PATCH)
@@ -428,32 +490,27 @@ class GateConfigStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def assert_store_epoch_parity(
-        gate_epoch: int,
-        chain_epoch: int,
-        universe_epoch: int,
+    def assert_store_epoch_matches(
+        expected_epoch: int,
+        store: "GateConfigStore",
+        label: str = "",
     ) -> None:
         """
-        Assert that dependent stores (chain, universe) have not advanced
-        ahead of the gate store epoch.
+        Assert that the store's current epoch matches ``expected_epoch``.
 
-        Raises
-        ------
-        AssertionError — if chain_epoch > gate_epoch or universe_epoch > gate_epoch
-                         (and the offending epoch is non-zero).
+        Used in tests to verify that load() / update() incremented the
+        epoch the expected number of times.
+
+        Raises AssertionError with a descriptive message on mismatch.
         """
-        if chain_epoch != 0 and chain_epoch > gate_epoch:
+        actual = store.epoch
+        if actual != expected_epoch:
+            prefix = f"[{label}] " if label else ""
             raise AssertionError(
-                f"chain_store epoch {chain_epoch} is ahead of gate_store epoch "
-                f"{gate_epoch} — gate store must be loaded first"
-            )
-        if universe_epoch != 0 and universe_epoch > gate_epoch:
-            raise AssertionError(
-                f"universe_store epoch {universe_epoch} is ahead of gate_store epoch "
-                f"{gate_epoch} — gate store must be loaded first"
+                f"{prefix}epoch mismatch: expected {expected_epoch}, got {actual}"
             )
 
 
-# Module-level singleton — imported by all consumers.
+# Module-level singleton — imported everywhere as:
+#   from services.gate_config_store import store
 store = GateConfigStore()
-gate_config_store = store   # alias used by main.py lifespan

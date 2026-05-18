@@ -24,10 +24,15 @@ get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
     (None, None) on cache miss.  Zero API calls on the hot path.
     The cache is populated / refreshed by start_chain_refresh_worker().
 
-start_chain_refresh_worker(registry_fn, tradier_client, symbols_fn)
+start_chain_refresh_worker(get_tracked_symbols, fetch_chain_fn)
     ING-008: Background asyncio task that refreshes the intraday chain
     data (volume + OI) every _CHAIN_REFRESH_INTERVAL_S seconds for all
     stream-eligible symbols.
+
+    ING-008-COLD fix: performs one IMMEDIATE refresh cycle on worker
+    start before entering the sleep-first loop, so get_contract_vol_oi()
+    returns live data from tick-1 instead of (None, None) for the first
+    5 minutes.
 
     API budget: one Tradier GET /markets/options/chains call per tracked
     symbol per refresh cycle.  At 300-second cadence and a 50-symbol
@@ -142,6 +147,16 @@ FIX-SNAPSHOT-NOTNULL (2026-05-15):
   ON CONFLICT (id) DO NOTHING semantics ensure these sentinel values are
   only written on first insert; if universe_store already created the row
   with real provider/source values, this upsert is a no-op.
+
+ING-008-COLD (2026-05-17):
+  start_chain_refresh_worker() opened with await asyncio.sleep(interval),
+  so the first Tradier chain pull was always 300 s after worker start.
+  For the entire first 5 minutes of market hours get_contract_vol_oi()
+  returned (None, None) for every OCC symbol, and the OI-based ingestion
+  gate dropped every flow event that depended on it.
+  Fix: do one full refresh cycle IMMEDIATELY on entry, then loop with
+  the normal sleep-first cadence. Initial pull is clearly labelled in
+  logs as '[initial]' vs '[cycle N]'.
 """
 import asyncio
 import logging
@@ -164,21 +179,16 @@ _DEFAULT_MAX_AGE_HOURS = 24
 
 # ---------------------------------------------------------------------------
 # Save timeout ceiling (seconds) for long-running chain persist operations.
-# Raised per request from 1800s to 18000s.
 # ---------------------------------------------------------------------------
 _SAVE_TIMEOUT_S: int = 18000
 
 # ---------------------------------------------------------------------------
 # HOTFIX-CHAIN-CONCURRENCY: cap concurrent save_chain batch writes.
-# Fresh client per batch is now safe because concurrency remains bounded.
 # ---------------------------------------------------------------------------
 _SAVE_CONCURRENCY: int = 10
 
 # ---------------------------------------------------------------------------
 # ING-008: background refresh cadence for intraday vol/OI
-# One Tradier chain call per symbol per cycle.
-# At 300s cadence and 50 symbols → ~10 req/min (limit: 120 req/min).
-# Revisit when universe exceeds ~200 symbols.
 # ---------------------------------------------------------------------------
 _CHAIN_REFRESH_INTERVAL_S: int = 300  # 5 minutes
 
@@ -224,58 +234,87 @@ def _is_http_400(exc: Exception) -> bool:
     return False
 
 
+async def _run_refresh_cycle(
+    symbols: list,
+    fetch_chain_fn: Callable[[str], Awaitable[list]],
+    label: str = "cycle",
+) -> None:
+    """Execute one full vol/OI refresh pass over *symbols*.
+
+    Extracted so the identical logic is shared by the immediate initial pull
+    (ING-008-COLD) and every subsequent scheduled cycle inside the loop.
+    *label* is used purely for log disambiguation ('initial' vs 'cycle N').
+    """
+    if not symbols:
+        log.debug("[chain_store] chain refresh [%s]: no tracked symbols — skipping", label)
+        return
+
+    refreshed = 0
+    errors = 0
+    skipped_400 = 0
+    for symbol in symbols:
+        try:
+            contracts = await fetch_chain_fn(symbol)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            for c in contracts:
+                occ = c.get("symbol", "").strip()
+                if not occ:
+                    continue
+                _vol_oi_cache[occ] = {
+                    "volume":        int(c.get("volume") or 0),
+                    "open_interest": int(c.get("open_interest") or 0),
+                    "refreshed_at":  now_ts,
+                }
+            refreshed += 1
+        except Exception as exc:
+            if _is_http_400(exc):
+                skipped_400 += 1
+                log.info(
+                    "[chain_store] chain refresh [%s]: %s has no listed options "
+                    "(Tradier HTTP 400) — skipping",
+                    label, symbol,
+                )
+            else:
+                errors += 1
+                log.warning(
+                    "[chain_store] chain refresh [%s]: error fetching %s: %s",
+                    label, symbol, exc,
+                )
+
+    log.info(
+        "[chain_store] chain refresh [%s] complete — "
+        "symbols=%d refreshed=%d skipped_400=%d errors=%d cache_size=%d",
+        label, len(symbols), refreshed, skipped_400, errors, len(_vol_oi_cache),
+    )
+
+
 async def start_chain_refresh_worker(
     get_tracked_symbols: Callable[[], list],
     fetch_chain_fn: Callable[[str], Awaitable[list]],
 ) -> None:
+    """ING-008 / ING-008-COLD: background vol/OI refresh worker.
+
+    Performs one IMMEDIATE refresh cycle on entry so the cache is warm from
+    tick-1, then loops with the normal sleep-first cadence every
+    _CHAIN_REFRESH_INTERVAL_S seconds.
+    """
     log.info(
-        "[chain_store] chain refresh worker started — interval=%ds",
+        "[chain_store] chain refresh worker started — interval=%ds; "
+        "running initial pull immediately (ING-008-COLD)",
         _CHAIN_REFRESH_INTERVAL_S,
     )
     try:
+        # ING-008-COLD: immediate initial pull — no 5-min wait before first data.
+        await _run_refresh_cycle(get_tracked_symbols(), fetch_chain_fn, label="initial")
+
+        cycle = 0
         while True:
             await asyncio.sleep(_CHAIN_REFRESH_INTERVAL_S)
-            symbols = get_tracked_symbols()
-            if not symbols:
-                log.debug("[chain_store] chain refresh: no tracked symbols yet, skipping cycle")
-                continue
-
-            refreshed = 0
-            errors = 0
-            skipped_400 = 0
-            for symbol in symbols:
-                try:
-                    contracts = await fetch_chain_fn(symbol)
-                    now_ts = datetime.now(timezone.utc).timestamp()
-                    for c in contracts:
-                        occ = c.get("symbol", "").strip()
-                        if not occ:
-                            continue
-                        _vol_oi_cache[occ] = {
-                            "volume":        int(c.get("volume") or 0),
-                            "open_interest": int(c.get("open_interest") or 0),
-                            "refreshed_at":  now_ts,
-                        }
-                    refreshed += 1
-                except Exception as exc:
-                    if _is_http_400(exc):
-                        skipped_400 += 1
-                        log.info(
-                            "[chain_store] chain refresh: %s has no listed options "
-                            "(Tradier HTTP 400) — skipping",
-                            symbol,
-                        )
-                    else:
-                        errors += 1
-                        log.warning(
-                            "[chain_store] chain refresh: error fetching %s: %s",
-                            symbol, exc,
-                        )
-
-            log.info(
-                "[chain_store] chain refresh cycle complete — "
-                "symbols=%d refreshed=%d skipped_400=%d errors=%d cache_size=%d",
-                len(symbols), refreshed, skipped_400, errors, len(_vol_oi_cache),
+            cycle += 1
+            await _run_refresh_cycle(
+                get_tracked_symbols(),
+                fetch_chain_fn,
+                label=f"cycle {cycle}",
             )
 
     except asyncio.CancelledError:
