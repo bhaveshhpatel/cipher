@@ -594,4 +594,29 @@ async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], O
             stream_symbols = list(fresh)
             return stream_symbols, tier_map, snapshot_id, False
 
-        log.info("[universe] Step 2a MISS: no fresh snapshot - loading most-recent stale snapshot as
+        log.info(
+            "[universe] Step 2a MISS: no fresh snapshot - "
+            "loading most-recent stale snapshot as seed"
+        )
+        stale = await universe_store.load_any_snapshot()
+        snapshot_id = await universe_store.get_latest_snapshot_id() if stale else None
+        stream_symbols = list(stale) if stale else []
+        log.info(
+            "[universe] Step 2a MISS: seeded %d symbols from stale snapshot "
+            "(snapshot_id=%s) - background refresh scheduled",
+            len(stream_symbols), snapshot_id,
+        )
+        return stream_symbols, {}, snapshot_id, True
+
+    try:
+        return await asyncio.wait_for(_inner(), timeout=_STARTUP_UNIVERSE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log.warning(
+            "[universe] Step 2a TIMEOUT after %.1f s - "
+            "falling through to empty symbol list; background resolve will populate",
+            _STARTUP_UNIVERSE_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log.warning("[universe] Step 2a unexpected error: %s - falling through", exc)
+
+    return [], {}, None, True
