@@ -38,20 +38,161 @@ Key architectural fixes:
   P2 (lifespan)       — non-blocking startup via background build task
   P3 (tradier_client) — dedicated bulk semaphore for build()
   P4 (symbol_registry)— incremental warm-restart build
-  FIX-TIER-SEQ        — pre-build tier assignment: fetch quotes -> assign_tiers() ->
-                        registry.set_tier_map() -> _sync_accumulator_tier_map()
-                        BEFORE registry.build() so _build_with_sem reads correct tier.
-  FIX-BUILD-TUPLE     — registry.build() returns (int, dict); unpack as
-                        _build_count, _ = await registry.build() and pass
-                        pre-fetched SymbolQuote list to _post_build_upsert().
-  SEQ-002-STAGGER     — 60 s delay between build_done_event and chain refresh.
-  FIX-P1-SKIP-BUILD   — skip full build when P1 seeded >= _P1_MIN_CONTRACTS.
-  FIX-P1-SKIP-TIERS   — tier assignment on skip path via _fetch_batch_quotes.
-  FIX-UPSERT-ARG-ORDER— upsert_symbol_quotes(snapshot_id, enriched_quotes).
-  SAVE-SNAPSHOT-SET   — symbol_rows kwarg replaces positional stream_eligible_set.
-  STREAM-RELOAD       — stream_task relaunched with fresh symbols after universe resolve.
-  ING-010-RELOAD      — gate_config_store.start_refresh_loop(300) background task.
-  RENDER-KEEPALIVE    — _self_ping_worker() pings /health every 5 min.
+  D-001 (tradier_stream) — pass registry to stream_options_flow(), no duplicate build
+  D-002 (tradier_stream) — remove extra refresh_loop() create_task from stream
+  RC-3 (ingestion_config) — validate_ingestion_config() at startup warns on missing DB rows
+  H1   (main)         — _post_build_upsert reuses raw_quotes from build();
+                        no duplicate _fetch_batch_quotes call on warm-restart
+  M-1/M-2 (symbol_registry) — _build_complete flag; is_ready() no longer fires
+                        on first DB-seeded contract; stream workers spawn only
+                        after build() fully completes with fresh Tradier data
+  M-3  (main)         — _post_build_upsert split into two guarded phases;
+                        assign_tiers() failure raises so upsert_symbol_quotes()
+                        is skipped and the error is visible in logs/metrics
+  STREAM-5 (main)     — graceful shutdown: stream_task cancelled and awaited
+                        FIRST so Tradier HTTP connections close cleanly before
+                        the process exits, freeing session quota for the next
+                        container start immediately.
+  ING-010 (main)      — gate_config_store.load() is step 0 in startup so all
+                        tier gate values are hot in memory before any service
+                        (stream, accumulator, parser) runs its first tick.
+  ING-010-ACC (main)  — after registry.set_tier_map(), tradier_stream.accumulator
+                        .set_tier_map() is also called so the module-level hot-path
+                        accumulator receives the same tier map. Without this, Gate 2
+                        in _get_episode_min_premium() resolves every ticker to tier 1
+                        (strict cold-start default) for the entire trading session.
+  ING-010-RELOAD (main) — gate_config_store.start_refresh_loop(300) launched as
+                        background task (Step 6-k). Re-polls gate_configs every
+                        5 min so external DB writes propagate without a restart.
+                        Root cause of May 15 leak: T1 min_premium was set to
+                        $75,000 on May 7 via Supabase dashboard but the running
+                        worker held the old $25,000 default from startup -- the
+                        cache was frozen for the entire session lifetime.
+  ING-008 (main)      — start_chain_refresh_worker() launched as a background task
+                        after yield. Refreshes options chain vol/OI for all
+                        stream_eligible symbols every 5 minutes via Tradier chain API.
+                        Zero live API calls on the flow hot path -- persist_flow_event
+                        and persist_flow_episode read from the in-process cache only.
+                        FIX: wired with correct two-callable signature:
+                          get_tracked_symbols -- lambda returning live OCC symbol list
+                          fetch_chain_fn      -- _fetch_tradier_chain(symbol) helper
+                        invalidate_vol_oi_cache() called at market-open boundary in
+                        _registry_prewarm_loop() so yesterday's volume never bleeds.
+  REARCH-002 (main)   — ingestion_config router mounted: GET/PATCH /admin/ingestion-config
+                        now reachable. Previously the router was created but never
+                        included in app.include_router().
+  REARCH-005 (main)   — signal_config router mounted: GET/PATCH /admin/signal-config
+                        now reachable. Reads/writes signal_config table; enforces
+                        premium pyramid, DTE window, tier multiplier, and floor
+                        ordering invariants. Calls reload_signal_config() on every
+                        successful PATCH for immediate in-process snapshot refresh.
+  MAIN-FIX-001        — start_lookback_worker() was refactored (FS-HANG) to fetch
+                        its own accumulator internally via get_accumulator() -- it
+                        takes 0 positional args. Removed stale registry.accumulator
+                        argument from the create_task() call site.
+  RENDER-KEEPALIVE    — _self_ping_worker() pings GET /health every 5 minutes.
+                        Reads RENDER_EXTERNAL_URL env var (injected automatically by
+                        Render). No-ops locally when the var is absent. Prevents
+                        free-tier spin-down (15-min idle threshold).
+                        Hardened (HOTFIX-KEEPALIVE-001):
+                          - 5-min interval (down from 10) -- more headroom vs threshold
+                          - Fresh httpx.AsyncClient each cycle -- avoids stale pool
+                          - fail_streak counter -- log.warning per failure,
+                            log.error after 3 consecutive failures
+                        Does NOT prevent restarts caused by deploys, crashes, or OOM
+                        -- tradier_stream reconnect logic handles those cases.
+  RENDER-STARTUP-HANG — _resolve_startup_universe() split into a fast DB-only phase
+                        (before yield) and a slow background phase (after yield).
+                        The slow load_universe() call (CBOE + Tradier, 60-120 s) no
+                        longer blocks yield, so Render's health probe passes in ~6 s
+                        from cold start instead of timing out and restarting the
+                        container in a loop.
+  HOTFIX-IMPORT-001   — gate_config_store import corrected: the module exports `store`,
+                        not `gate_config_store`. Fixed as `store as gate_config_store`.
+                        This was crashing uvicorn on every boot with ImportError before
+                        the lifespan even started.
+  HOTFIX-CHAIN-HOURS  — _fetch_tradier_chain() now returns [] immediately outside
+                        market hours (Mon-Fri 9:15 AM - 4:30 PM ET; never on weekends).
+                        Tradier's chain endpoint returns HTTP 400 when markets are
+                        closed, flooding logs with warnings all night. The guard is
+                        co-located in the fetch helper so the chain_refresh_task loop
+                        itself is untouched -- it simply sleeps its normal interval
+                        between empty-return calls.
+  HOTFIX-KEEPALIVE-001 — _self_ping_worker() hardened:
+                        - interval dropped to 5 min (was 10) -- more margin vs 15-min
+                          Render spin-down threshold
+                        - httpx.AsyncClient recreated each cycle -- avoids stale
+                          connection pool that causes silent failures on Render
+                        - fail_streak counter replaces silent except-swallow;
+                          log.warning on every failure, log.error after streak >= 3
+                          with actionable guidance to check RENDER_EXTERNAL_URL
+  SEQ-001 (main)      — _chain_refresh_after_build() wrapper introduced.
+                        chain_refresh_worker was previously launched in parallel with
+                        _background_build_and_upsert(), causing it to fire Tradier
+                        chain API requests for all 3900 tickers while the OCC symbol
+                        map was still being populated. This produced HTTP 400 storms
+                        and incomplete chain data.
+                        Fix: poll registry.is_ready() every 5 s (max 30 min) before
+                        delegating to start_chain_refresh_worker(). The two fetch
+                        paths are now strictly serialized:
+                          symbol_registry.build() completes -> chain_refresh starts.
+                        All other tasks (stream, db_write, signal_write, etc.) are
+                        unaffected and continue to launch in parallel as before.
+  SEQ-002 (main)      — Replace SEQ-001 polling with asyncio.Event (_registry_build_done).
+                        Root cause of SEQ-001 failure: registry.is_ready() fires as soon
+                        as _build_complete is set inside build(), which happens before
+                        _post_build_upsert() completes. On warm restarts the registry is
+                        pre-seeded from DB (7275 contracts) and _build_complete can be set
+                        for a partial incremental build -- earlier than intended.
+                        Fix: _registry_build_done = asyncio.Event() created in lifespan().
+                          _background_build_and_upsert() sets it in a finally block after
+                          both build() and _post_build_upsert() have finished (or failed).
+                          _chain_refresh_after_build() awaits the event with a 30-min
+                          timeout safety valve, then delegates to start_chain_refresh_worker().
+                        The event fires exactly once, guaranteed, even on build failure or
+                        CancelledError -- chain_refresh is never permanently blocked.
+                        Zero polling, zero race conditions, zero timing ambiguity.
+  SEQ-002-FIX (main)  — Correct the event-set placement in _background_build_and_upsert.
+                        The previous implementation set build_done_event inside the
+                        finally block of the try/except around registry.build() only --
+                        meaning the event fired BEFORE _post_build_upsert() ran. This
+                        re-introduced Tradier quota contention: chain_refresh could
+                        unblock and start fetching chains while _post_build_upsert()
+                        was still making its own Tradier calls (assign_tiers,
+                        upsert_symbol_quotes).
+                        Fix: single outer try/finally wraps BOTH build() and
+                        _post_build_upsert(). The event is set only in the outer
+                        finally -- guaranteed to fire whether either phase succeeds,
+                        fails, or the task is cancelled. An inner try/except still
+                        catches build() failures and returns early (skipping upsert)
+                        while preserving the outer finally guarantee.
+  SEQ-002-STAGGER (main) — 60 s sleep between build_done_event and chain_refresh start.
+                        After build+upsert complete, Tradier's 120 req/min window can
+                        be close to exhausted. The 60 s stagger gives the rate-limit
+                        window a full reset before chain refresh adds ~50 req/min load.
+                        Stream is already live during this window; _vol_oi_cache from
+                        the previous session's final refresh remains valid.
+  FIX-P1-SKIP-BUILD (main) — skip full Tradier build when registry is already seeded
+                        with >= _P1_MIN_CONTRACTS (10 000) contracts from DB at epoch 0.
+                        Full chain-pull takes 8-12 min and is unnecessary on warm
+                        restarts where the DB snapshot is fresh. refresh_loop() handles
+                        the background OCC sync. Stream starts immediately.
+  FIX-P1-SKIP-TIERS (main) — tier assignment on the skip path.
+                        When FIX-P1-SKIP-BUILD fires, _fetch_batch_quotes() is called
+                        on stream_symbols to get a fresh SymbolQuote list, then
+                        assign_tiers() -> registry.set_tier_map() ->
+                        _sync_accumulator_tier_map(). If the quote fetch fails or
+                        returns empty, log a warning and continue with DB-loaded tiers.
+  FIX-UPSERT-ARG-ORDER (main) — upsert_symbol_quotes(snapshot_id, enriched_quotes).
+                        Previous call sites passed (quote_rows, tier_map) — wrong order.
+                        snapshot_id now fetched via get_latest_snapshot_id() before each
+                        call so the correct UUID is always used.
+  SAVE-SNAPSHOT-SET (main) — universe_store.save_snapshot() called with symbol_rows kwarg
+                        (list of dicts with snapshot_id, symbol, stream_eligible) instead
+                        of positional stream_eligible_set. Matches the updated signature
+                        in universe_store.py after the schema migration.
+  STREAM-RELOAD (main) — stream_task relaunched with fresh symbols after background
+                        universe resolve completes and symbol list changes.
 """
 
 import asyncio
@@ -215,40 +356,14 @@ async def _background_build_and_upsert(
             await _post_build_upsert(pre_quotes)
             return
 
-        # FIX-TIER-SEQ: Stage 1 — pre-build tier assignment
-        pre_quotes_stage1: list = []
-        if stream_symbols:
-            try:
-                pre_quotes_stage1 = await _fetch_batch_quotes(stream_symbols)
-                if pre_quotes_stage1:
-                    tier_map_pre = assign_tiers(pre_quotes_stage1)
-                    registry.set_tier_map(tier_map_pre)
-                    _sync_accumulator_tier_map(tier_map_pre)
-                    log.info(
-                        "[build] FIX-TIER-SEQ: pre-build tier_map set (%d symbols)",
-                        len(tier_map_pre),
-                    )
-                else:
-                    log.warning(
-                        "[build] FIX-TIER-SEQ: pre-fetch returned empty "
-                        "— tiers remain DB-loaded for build phase"
-                    )
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "[build] FIX-TIER-SEQ: pre-fetch failed: %s — tiers remain DB-loaded for build phase",
-                    exc,
-                )
-
         try:
-            # FIX-BUILD-TUPLE: registry.build() returns (int, dict) — unpack, discard raw dict
-            _build_count, _build_raw = await registry.build()
-            log.info("[build] registry.build() complete: %d contracts", _build_count)
+            raw_quotes = await registry.build()
+            log.info("[build] registry.build() complete")
         except Exception as exc:  # noqa: BLE001
             log.error("[build] registry.build() failed: %s", exc)
             return
 
-        # Stage 2: pass pre-fetched SymbolQuote list to _post_build_upsert (not the raw dict)
-        await _post_build_upsert(pre_quotes_stage1)
+        await _post_build_upsert(raw_quotes)
 
     finally:
         build_done_event.set()
@@ -327,8 +442,8 @@ async def _registry_prewarm_loop() -> None:
         from services.chain_refresh import invalidate_vol_oi_cache
         invalidate_vol_oi_cache()
         try:
-            _build_count, _ = await registry.build()
-            log.info("[prewarm] prewarm build complete: %d contracts", _build_count)
+            raw_quotes = await registry.build()
+            log.info("[prewarm] prewarm build complete")
         except Exception as exc:  # noqa: BLE001
             log.error("[prewarm] prewarm build failed: %s", exc)
 
