@@ -65,7 +65,7 @@ FIX P1 (2026-04-27):
   every warm restart after a new snapshot UUID is minted.
 
 FIX D-003 (2026-04-27):
-  _find_latest_cached_snapshot() now uses ORDER BY created_at DESC so the
+  _find_latest_cached_snapshot() now uses ORDER BY built_at DESC so the
   most recently written chain is always returned on fallback, rather than
   an arbitrary row from an unordered scan.
 
@@ -75,7 +75,7 @@ FIX C-1 (2026-04-27):
 
 FIX C-2 (2026-04-27):
   _find_latest_cached_snapshot() now accepts max_age_hours and filters
-  created_at >= (now - max_age_hours) before selecting. Stale snapshots
+  built_at >= (now - max_age_hours) before selecting. Stale snapshots
   older than 48h are ignored, forcing a fresh build() instead.
 
 FIX EPOCH (2026-05-07):
@@ -159,14 +159,15 @@ ING-008-COLD (2026-05-17):
   logs as '[initial]' vs '[cycle N]'.
 
 FIX-CHAIN-FALLBACK (2026-05-19):
-  _find_latest_cached_snapshot() was filtering on `inserted_at` which does
-  not exist on options_chain_cache — the actual timestamp column is
-  `created_at`. The silent mismatch caused the .gte() filter to match
-  nothing, so the fallback always returned None and triggered a full
-  build() on every warm restart even when a fresh chain was sitting in DB.
+  _find_latest_cached_snapshot() was filtering/ordering on `inserted_at`
+  then `created_at` — neither of which exists on options_chain_cache.
+  The actual timestamp column per migration 012 DDL is `built_at`
+  (TIMESTAMPTZ NOT NULL DEFAULT now()), which also has a dedicated DESC
+  index (idx_chain_cache_built_at). Silent PostgREST 42703 errors caused
+  the fallback to always return None, forcing a full Tradier build() on
+  every warm restart.
   Also bumped _DEFAULT_MAX_AGE_HOURS 24 → 48: a chain built at 13:32 on
-  day N is still valid at 14:54 on day N+1; the 24h window was tight
-  enough to miss overnight restarts by minutes.
+  day N is still valid at 14:54 on day N+1.
 """
 import asyncio
 import logging
@@ -568,8 +569,8 @@ def _find_latest_cached_snapshot(
         resp = (
             sb.table(_TABLE)
             .select("snapshot_id")
-            .gte("created_at", cutoff)           # FIX-CHAIN-FALLBACK: was `inserted_at` (nonexistent column)
-            .order("created_at", desc=True)      # FIX-CHAIN-FALLBACK: was `inserted_at`
+            .gte("built_at", cutoff)           # FIX-CHAIN-FALLBACK: actual column per migration 012 DDL
+            .order("built_at", desc=True)      # uses idx_chain_cache_built_at index
             .limit(1)
             .execute()
         )
