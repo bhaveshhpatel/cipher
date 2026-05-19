@@ -30,8 +30,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build()`.
-  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
+  always doing a full rebuild after the first build()`.\n  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
 
@@ -430,6 +429,28 @@ DTE-FILTER-LOG (2026-05-19): Log expiries dropped by dte > params.max_dte guard
   inside _build_ticker. At DEBUG level for T2/T3; at INFO level when a T1 ticker
   has expiries dropped (max_dte=90 for T1 — should be rare and flags a potential
   DTE ceiling misconfiguration in ingestion_config).
+
+FIX-REFRESH-TIER-PREBUILD (2026-05-19): Pre-classify _tier_map inside build()
+  before _build_with_sem tasks are dispatched.
+
+  refresh_loop() calls build() directly, bypassing the pre-fetch + assign_tiers()
+  sequence that main.py runs before calling build() on startup. This means every
+  hourly chain pull used whatever _tier_map was last set at startup — so any symbol
+  that shifted tiers intraday (e.g. a T3 spiked into T1 OI territory) was fetched
+  with the wrong atm_pct / max_dte window for the entire remainder of the session.
+
+  The post-build OI re-tier (FIX C-3) reclassifies after the gather, but that is
+  too late: the wrong fetch window was already used to pull the chain.
+
+  Fix: inside build(), immediately after self._stock_prices is set and before
+  _build_with_sem tasks are created, iterate self._oi_by_ticker and classify each
+  symbol as T1/T2/T3 using the t1_min_oi / t2_min_oi thresholds already read from
+  thresh at the top of build(). Update self._tier_map in-place. Zero extra API calls.
+
+  Coverage after this fix:
+    startup path    — covered by FIX-QQ1-BUILD-SEQUENCING in main.py (pre-fetch)
+    prewarm path    — covered by _registry_prewarm_loop's own pre-fetch
+    refresh_loop()  — NOW covered by this pre-classify inside build()
 """
 import asyncio
 import logging
@@ -743,6 +764,40 @@ class SymbolRegistry:
                     )
 
             self._stock_prices = prices
+
+            # FIX-REFRESH-TIER-PREBUILD (2026-05-19): Refresh self._tier_map from
+            # in-memory OI before dispatching _build_with_sem tasks.
+            #
+            # refresh_loop() calls build() directly, bypassing main.py's pre-fetch +
+            # assign_tiers() sequence. Without this guard, every hourly chain pull
+            # uses whatever _tier_map was stamped at startup, so symbols that shifted
+            # tiers intraday get fetched with the wrong atm_pct / max_dte window.
+            #
+            # Uses self._oi_by_ticker which is always in memory — zero extra API calls.
+            # t1_min_oi / t2_min_oi are already available from thresh (fetched above).
+            _t1_min_oi = int(thresh.get("t1_min_oi", 1000))
+            _t2_min_oi = int(thresh.get("t2_min_oi", 500))
+            prebuild_tier_map: dict[str, int] = {}
+            for ticker, avg_oi in self._oi_by_ticker.items():
+                if avg_oi >= _t1_min_oi:
+                    prebuild_tier_map[ticker] = 1
+                elif avg_oi >= _t2_min_oi:
+                    prebuild_tier_map[ticker] = 2
+                else:
+                    prebuild_tier_map[ticker] = 3
+            if prebuild_tier_map:
+                self._tier_map.update(prebuild_tier_map)
+                log.info(
+                    "[symbol_registry] FIX-REFRESH-TIER-PREBUILD: pre-build tier_map "
+                    "refreshed from in-memory OI (%d symbols — T1=%d T2=%d T3=%d; "
+                    "t1_min_oi=%d t2_min_oi=%d)",
+                    len(prebuild_tier_map),
+                    sum(1 for t in prebuild_tier_map.values() if t == 1),
+                    sum(1 for t in prebuild_tier_map.values() if t == 2),
+                    sum(1 for t in prebuild_tier_map.values() if t == 3),
+                    _t1_min_oi,
+                    _t2_min_oi,
+                )
 
             oi_acc_live: dict[str, list[int]] = {}
             counter = [0]
