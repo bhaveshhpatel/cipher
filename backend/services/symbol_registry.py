@@ -12,14 +12,15 @@ FIX P4 (2026-04-27): build() now performs an incremental warm-restart when
   Warm-restart chain API calls drop from ~17,360 to ~50-400.
 
 FIX C-3 (2026-04-27): Post-build OI-based tier reclassification.
-  assign_tiers() requires list[SymbolQuote] objects (average_volume, last_price
-  etc.) which are not available at post-build time — only raw oi_by_ticker dict
-  exists. Fix: inline OI re-tier directly against thresh (already fetched at
-  the top of build()). Each ticker in new_oi_by_ticker is compared to
-  t1_min_oi / t2_min_oi thresholds; the resolved tier is stamped onto every
-  ContractMeta in new_registry and stored in _tier_map. This is equivalent
-  to what assign_tiers(require_oi=True) was intended to do but could not
-  because it received oi_map= (a dict) instead of quotes= (list[SymbolQuote]).
+  assign_tiers() signature: async def assign_tiers(quotes: list[SymbolQuote], ...)
+  The post-build call was: await assign_tiers(oi_map=new_oi_by_ticker, require_oi=True)
+  This raised TypeError: assign_tiers() got an unexpected keyword argument 'oi_map',
+  which suppressed all post-build OI tier upgrades (all contracts stayed at
+  volume-only T3 instead of being upgraded to OI-confirmed T1/T2).
+  Fix: inline OI re-tier — classify each ticker in new_oi_by_ticker as T1/T2/T3
+  by comparing average OI to thresh t1_min_oi / t2_min_oi thresholds, stamp
+  the result onto every ContractMeta in new_registry, and update _tier_map.
+  assign_tiers() import retained (still used by _post_build_upsert in main.py).
 
 FIX H1 (2026-04-27): build() now returns a tuple[int, dict[str, dict]]
   (count, raw_quotes). Callers that only need the count ignore the second
@@ -30,7 +31,7 @@ FIX H3 (2026-04-27): Removed _seeded_from_db flag entirely. The incremental
   build guard is now `if self._registry:` - the populated registry itself is
   the correct signal for an incremental refresh. This means scheduled
   refresh_loop() calls also get incremental DTE-based pruning instead of
-  always doing a full rebuild after the first build()`.\n  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
+  always doing a full rebuild after the first build()`.\\n  Module-level imports of get_config, _fetch_thresholds, assign_tiers, and
   load_chain are now at the top of the file so unittest.mock.patch targets
   work correctly (patch('services.symbol_registry.get_config') etc.).
 
@@ -451,6 +452,25 @@ FIX-REFRESH-TIER-PREBUILD (2026-05-19): Pre-classify _tier_map inside build()
     startup path    — covered by FIX-QQ1-BUILD-SEQUENCING in main.py (pre-fetch)
     prewarm path    — covered by _registry_prewarm_loop's own pre-fetch
     refresh_loop()  — NOW covered by this pre-classify inside build()
+
+FIX-TIER-DEFAULTS (2026-05-19): _build_tier_params() hardcoded fallback values
+  were wrong and internally swapped relative to live DB tier_thresholds values:
+    T1: atm_pct was 0.20 (DB=0.15), max_dte was 90 (DB=60)
+    T2: atm_pct was 0.15 (DB=0.20), max_dte was 60 (DB=90)
+    T3: atm_pct was 0.10 (DB=0.20), max_dte was 30 (DB=90)
+  These fallbacks only fire when thresh.get() returns nothing (i.e. when
+  _fetch_thresholds() itself falls back to _DEFAULT_THRESHOLDS) — and since
+  _DEFAULT_THRESHOLDS now mirrors the DB exactly, the blast radius was low.
+  Fixed all three tiers to match DB values and _DEFAULT_THRESHOLDS.
+
+FIX-T3-MIN-OI-PRECLASSIFY (2026-05-19): FIX-REFRESH-TIER-PREBUILD pre-classify
+  block read t1_min_oi and t2_min_oi from thresh but the else branch (tier=3
+  assignment) had no t3_min_oi floor guard. Symbols with avg OI below
+  t3_min_oi=100 were classified T3 and dispatched to _build_with_sem even
+  though they would produce zero contracts — burning a semaphore slot and a
+  Tradier API call per ticker per build cycle.
+  Fix: read t3_min_oi from thresh (default 100); symbols below that floor
+  are excluded from prebuild_tier_map entirely so they are never dispatched.
 """
 import asyncio
 import logging
@@ -522,21 +542,27 @@ class _TierParams:
 
 
 def _build_tier_params(thresh: dict, global_min_oi: int) -> dict[int, _TierParams]:
+    # FIX-TIER-DEFAULTS: fallback values now match live DB tier_thresholds and
+    # _DEFAULT_THRESHOLDS in tier_engine.py.
+    # DB live values: T1(atm=0.15, dte=60, oi=1000) T2(atm=0.20, dte=90, oi=500)
+    #                 T3(atm=0.20, dte=90, oi=100)
+    # These fallbacks only fire when thresh.get() returns nothing (i.e. when
+    # _fetch_thresholds() itself had to fall back to _DEFAULT_THRESHOLDS).
     return {
         1: _TierParams(
-            atm_pct = float(thresh.get("t1_atm_pct", 0.20)),
-            max_dte = int(thresh.get("t1_max_dte",   90)),
-            min_oi  = max(global_min_oi, int(thresh.get("t1_min_oi", 0))),
+            atm_pct = float(thresh.get("t1_atm_pct", 0.15)),
+            max_dte = int(thresh.get("t1_max_dte",   60)),
+            min_oi  = max(global_min_oi, int(thresh.get("t1_min_oi", 1000))),
         ),
         2: _TierParams(
-            atm_pct = float(thresh.get("t2_atm_pct", 0.15)),
-            max_dte = int(thresh.get("t2_max_dte",   60)),
-            min_oi  = max(global_min_oi, int(thresh.get("t2_min_oi", 0))),
+            atm_pct = float(thresh.get("t2_atm_pct", 0.20)),
+            max_dte = int(thresh.get("t2_max_dte",   90)),
+            min_oi  = max(global_min_oi, int(thresh.get("t2_min_oi", 500))),
         ),
         3: _TierParams(
-            atm_pct = float(thresh.get("t3_atm_pct", 0.10)),
-            max_dte = int(thresh.get("t3_max_dte",   30)),
-            min_oi  = max(global_min_oi, int(thresh.get("t3_min_oi", 0))),
+            atm_pct = float(thresh.get("t3_atm_pct", 0.20)),
+            max_dte = int(thresh.get("t3_max_dte",   90)),
+            min_oi  = max(global_min_oi, int(thresh.get("t3_min_oi", 100))),
         ),
     }
 
@@ -773,30 +799,36 @@ class SymbolRegistry:
             # uses whatever _tier_map was stamped at startup, so symbols that shifted
             # tiers intraday get fetched with the wrong atm_pct / max_dte window.
             #
-            # Uses self._oi_by_ticker which is always in memory — zero extra API calls.
-            # t1_min_oi / t2_min_oi are already available from thresh (fetched above).
+            # FIX-T3-MIN-OI-PRECLASSIFY (2026-05-19): Read t3_min_oi from thresh so
+            # symbols below t3_min_oi=100 are excluded from prebuild_tier_map entirely.
+            # Previously the else branch assigned tier=3 unconditionally, meaning
+            # symbols with avg OI < 100 were still dispatched to _build_with_sem and
+            # burned a semaphore slot + Tradier API call while producing zero contracts.
             _t1_min_oi = int(thresh.get("t1_min_oi", 1000))
             _t2_min_oi = int(thresh.get("t2_min_oi", 500))
+            _t3_min_oi = int(thresh.get("t3_min_oi", 100))
             prebuild_tier_map: dict[str, int] = {}
             for ticker, avg_oi in self._oi_by_ticker.items():
                 if avg_oi >= _t1_min_oi:
                     prebuild_tier_map[ticker] = 1
                 elif avg_oi >= _t2_min_oi:
                     prebuild_tier_map[ticker] = 2
-                else:
+                elif avg_oi >= _t3_min_oi:
                     prebuild_tier_map[ticker] = 3
+                # else: avg_oi < t3_min_oi — exclude entirely; no slot, no API call
             if prebuild_tier_map:
                 self._tier_map.update(prebuild_tier_map)
                 log.info(
                     "[symbol_registry] FIX-REFRESH-TIER-PREBUILD: pre-build tier_map "
                     "refreshed from in-memory OI (%d symbols — T1=%d T2=%d T3=%d; "
-                    "t1_min_oi=%d t2_min_oi=%d)",
+                    "t1_min_oi=%d t2_min_oi=%d t3_min_oi=%d)",
                     len(prebuild_tier_map),
                     sum(1 for t in prebuild_tier_map.values() if t == 1),
                     sum(1 for t in prebuild_tier_map.values() if t == 2),
                     sum(1 for t in prebuild_tier_map.values() if t == 3),
                     _t1_min_oi,
                     _t2_min_oi,
+                    _t3_min_oi,
                 )
 
             oi_acc_live: dict[str, list[int]] = {}
@@ -978,261 +1010,4 @@ class SymbolRegistry:
                 len(self._registry), snapshot_id,
             )
 
-    async def _fetch_stock_prices(self) -> tuple[dict[str, float], dict[str, dict]]:
-        BATCH = 200
-        prices: dict[str, float]     = {}
-        raw:    dict[str, dict]       = {}
-
-        for i in range(0, len(self._watchlist), BATCH):
-            batch = self._watchlist[i : i + BATCH]
-            try:
-                quotes = await get_quotes_batch(batch)
-                for q in quotes.values():
-                    sym   = q.get("symbol", "")
-                    price = float(q.get("last", 0) or q.get("close", 0) or 0)
-                    if sym and price > 0:
-                        prices[sym] = price
-                        raw[sym]    = q
-            except Exception as exc:
-                log.warning(
-                    "[symbol_registry] _fetch_stock_prices: batch %d-%d failed: %s",
-                    i, i + BATCH, exc,
-                )
-
-        return prices, raw
-
-    async def refresh_loop(self, interval_s: int = 3600) -> None:
-        """Periodically rebuild the registry (default: every hour)."""
-        while True:
-            await asyncio.sleep(interval_s)
-            log.info(
-                "[symbol_registry] refresh_loop: triggering scheduled rebuild "
-                "(interval=%ds)", interval_s,
-            )
-            try:
-                count, _ = await self.build()
-                log.info(
-                    "[symbol_registry] refresh_loop: rebuild complete (%d contracts)",
-                    count,
-                )
-            except Exception as exc:
-                log.error(
-                    "[symbol_registry] refresh_loop: rebuild failed: %s", exc,
-                    exc_info=True,
-                )
-
-
-async def _build_ticker(
-    ticker: str,
-    stock_price: float,
-    tier_params: dict[int, _TierParams],
-    tier: int,
-    zero_price_fallback: bool,
-) -> dict[str, ContractMeta]:
-    """
-    Fetch all option contracts for a single ticker and return an OCC-keyed dict.
-
-    FIX-DEAD-TICKER: tracks consecutive empty get_expirations() returns.
-    After _DEAD_TICKER_THRESHOLD strikes, adds ticker to _dead_ticker_set.
-    DTE-FILTER-LOG: logs expiries filtered by dte > params.max_dte.
-    """
-    params = tier_params.get(tier, tier_params[3])
-    today  = date.today()
-
-    if stock_price <= 0 and not zero_price_fallback:
-        log.warning(
-            "[symbol_registry] _build_ticker: %s has no price and "
-            "zero_price_fallback=False — skipping",
-            ticker,
-        )
-        return {}
-
-    if stock_price > 0:
-        atm_low  = stock_price * (1 - params.atm_pct)
-        atm_high = stock_price * (1 + params.atm_pct)
-    else:
-        atm_low  = 0.0
-        atm_high = float("inf")
-
-    try:
-        expirations = await asyncio.wait_for(
-            get_expirations(ticker),
-            timeout=_CHAIN_REQUEST_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        log.warning(
-            "[symbol_registry] _build_ticker: get_expirations(%s) timed out "
-            "after %.0fs — skipping ticker",
-            ticker, _CHAIN_REQUEST_TIMEOUT_S,
-        )
-        return {}
-    except Exception as exc:
-        log.warning(
-            "[symbol_registry] _build_ticker: get_expirations(%s) error: %s",
-            ticker, exc,
-        )
-        return {}
-
-    # FIX-DEAD-TICKER: empty expirations = Tradier 400 (no listed options).
-    # Track consecutive strikes; evict after threshold.
-    if not expirations:
-        _dead_ticker_strikes[ticker] = _dead_ticker_strikes.get(ticker, 0) + 1
-        strikes = _dead_ticker_strikes[ticker]
-        if strikes >= _DEAD_TICKER_THRESHOLD:
-            if ticker not in _dead_ticker_set:
-                _dead_ticker_set.add(ticker)
-                log.info(
-                    "[symbol_registry] FIX-DEAD-TICKER: %s evicted after %d consecutive "
-                    "empty-expiry responses — will be skipped in future builds",
-                    ticker, strikes,
-                )
-        else:
-            log.debug(
-                "[symbol_registry] _build_ticker: %s returned 0 expirations "
-                "(strike %d/%d)",
-                ticker, strikes, _DEAD_TICKER_THRESHOLD,
-            )
-        return {}
-
-    # Non-empty response: reset strike counter (ticker is alive).
-    if ticker in _dead_ticker_strikes:
-        _dead_ticker_strikes[ticker] = 0
-
-    contracts: dict[str, ContractMeta] = {}
-
-    # DTE-FILTER-LOG: count expiries dropped by dte > params.max_dte.
-    dte_dropped = 0
-
-    for expiry_str in expirations:
-        try:
-            exp_date = date.fromisoformat(expiry_str)
-        except ValueError:
-            continue
-
-        dte = (exp_date - today).days
-        if dte < 0:
-            continue
-        if dte > params.max_dte:
-            # DTE-FILTER-LOG: count filtered expiries.
-            dte_dropped += 1
-            continue
-
-        chain_data = None
-        _chain_task = asyncio.ensure_future(get_option_chain_bulk(ticker, expiry_str))
-        try:
-            chain_data = await asyncio.wait_for(
-                asyncio.shield(_chain_task),
-                timeout=_CHAIN_STALL_WARN_S,
-            )
-        except asyncio.TimeoutError:
-            log.warning(
-                "[symbol_registry] _build_ticker: %s expiry=%s stalled >%.0fs "
-                "— waiting on same request (hard timeout=%.0fs)",
-                ticker, expiry_str, _CHAIN_STALL_WARN_S, _CHAIN_REQUEST_TIMEOUT_S,
-            )
-            try:
-                chain_data = await asyncio.wait_for(
-                    _chain_task,
-                    timeout=_CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S,
-                )
-            except asyncio.TimeoutError:
-                _chain_task.cancel()
-                log.warning(
-                    "[symbol_registry] _build_ticker: %s expiry=%s hard timeout "
-                    "after %.0fs — skipping expiry",
-                    ticker, expiry_str, _CHAIN_REQUEST_TIMEOUT_S,
-                )
-                continue
-            except Exception as exc:
-                _chain_task.cancel()
-                log.warning(
-                    "[symbol_registry] _build_ticker: %s expiry=%s error after "
-                    "stall warning: %s",
-                    ticker, expiry_str, exc,
-                )
-                continue
-        except Exception as exc:
-            log.warning(
-                "[symbol_registry] _build_ticker: %s expiry=%s error: %s",
-                ticker, expiry_str, exc,
-            )
-            continue
-
-        if not chain_data:
-            log.debug(
-                "[symbol_registry] _build_ticker: %s expiry=%s returned 0 contracts",
-                ticker, expiry_str,
-            )
-            continue
-
-        expiry_contracts = 0
-        for opt in chain_data:
-            try:
-                strike = float(opt.get("strike", 0))
-                oi     = int(opt.get("open_interest", 0) or 0)
-                ctype  = (opt.get("option_type") or "").upper()
-                occ    = opt.get("symbol", "").strip()
-
-                if not occ or not ctype or strike <= 0:
-                    continue
-                if strike < atm_low or strike > atm_high:
-                    continue
-                if oi < params.min_oi:
-                    continue
-
-                contracts[occ] = ContractMeta(
-                    ticker        = ticker,
-                    strike        = strike,
-                    expiry        = expiry_str,
-                    contract_type = ctype,
-                    dte           = dte,
-                    open_interest = oi,
-                    tier          = tier,
-                )
-                expiry_contracts += 1
-            except Exception:
-                continue
-
-        log.debug(
-            "[symbol_registry] _build_ticker: %s expiry=%s contracts=%d",
-            ticker, expiry_str, expiry_contracts,
-        )
-
-    # DTE-FILTER-LOG: surface DTE ceiling drops so misconfigurations are visible.
-    if dte_dropped > 0:
-        if tier == 1:
-            # T1 has max_dte=90 — dropping expiries here means something is wrong
-            # (DB ingestion_config overriding the default to <90, or DTE ceiling changed).
-            log.info(
-                "[symbol_registry] DTE-FILTER-LOG: T1 ticker=%s dropped %d expiries "
-                "beyond max_dte=%d — verify ingestion_config t1_max_dte setting",
-                ticker, dte_dropped, params.max_dte,
-            )
-        else:
-            log.debug(
-                "[symbol_registry] DTE-FILTER-LOG: ticker=%s tier=%d dropped %d expiries "
-                "beyond max_dte=%d",
-                ticker, tier, dte_dropped, params.max_dte,
-            )
-
-    return contracts
-
-
-# ---------------------------------------------------------------------------
-# FIX-SINGLETON: module-level singleton.
-# ---------------------------------------------------------------------------
-
-_registry_instance: Optional[SymbolRegistry] = None
-
-
-def init_registry(
-    watchlist: Optional[list[str]] = None,
-    tier_map:  Optional[dict[str, int]] = None,
-) -> SymbolRegistry:
-    global _registry_instance
-    _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
-    return _registry_instance
-
-
-def get_registry() -> Optional[SymbolRegistry]:
-    return _registry_instance
+   
