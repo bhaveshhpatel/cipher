@@ -15,7 +15,7 @@ save_chain(snapshot_id, registry_dict)  -> bool
 load_chain(snapshot_id, max_age_hours)  -> dict[str, ContractMeta] | None
     Load all rows for snapshot_id.
     Falls back to the most-recent snapshot in options_chain_cache that
-    has rows AND is within max_age_hours (default 24) (C-2 fix).
+    has rows AND is within max_age_hours (default 48) (C-2 fix).
     Returns None on DB error, empty dict if no fresh chains exist.
 
 get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
@@ -65,7 +65,7 @@ FIX P1 (2026-04-27):
   every warm restart after a new snapshot UUID is minted.
 
 FIX D-003 (2026-04-27):
-  _find_latest_cached_snapshot() now uses ORDER BY inserted_at DESC so the
+  _find_latest_cached_snapshot() now uses ORDER BY created_at DESC so the
   most recently written chain is always returned on fallback, rather than
   an arbitrary row from an unordered scan.
 
@@ -75,8 +75,8 @@ FIX C-1 (2026-04-27):
 
 FIX C-2 (2026-04-27):
   _find_latest_cached_snapshot() now accepts max_age_hours and filters
-  inserted_at >= (now - max_age_hours) before selecting. Stale snapshots
-  older than 24h are ignored, forcing a fresh build() instead.
+  created_at >= (now - max_age_hours) before selecting. Stale snapshots
+  older than 48h are ignored, forcing a fresh build() instead.
 
 FIX EPOCH (2026-05-07):
   Added module-level _epoch counter incremented on every successful
@@ -157,6 +157,16 @@ ING-008-COLD (2026-05-17):
   Fix: do one full refresh cycle IMMEDIATELY on entry, then loop with
   the normal sleep-first cadence. Initial pull is clearly labelled in
   logs as '[initial]' vs '[cycle N]'.
+
+FIX-CHAIN-FALLBACK (2026-05-19):
+  _find_latest_cached_snapshot() was filtering on `inserted_at` which does
+  not exist on options_chain_cache — the actual timestamp column is
+  `created_at`. The silent mismatch caused the .gte() filter to match
+  nothing, so the fallback always returned None and triggered a full
+  build() on every warm restart even when a fresh chain was sitting in DB.
+  Also bumped _DEFAULT_MAX_AGE_HOURS 24 → 48: a chain built at 13:32 on
+  day N is still valid at 14:54 on day N+1; the 24h window was tight
+  enough to miss overnight restarts by minutes.
 """
 import asyncio
 import logging
@@ -175,7 +185,7 @@ _TABLE          = "options_chain_cache"
 _SNAPSHOT_TABLE = "options_universe_snapshots"
 _BATCH_SIZE     = 500
 _PAGE_SIZE      = 1000
-_DEFAULT_MAX_AGE_HOURS = 24
+_DEFAULT_MAX_AGE_HOURS = 48  # FIX-CHAIN-FALLBACK: 24→48; overnight restarts need the extra window
 
 # ---------------------------------------------------------------------------
 # Save timeout ceiling (seconds) for long-running chain persist operations.
@@ -558,8 +568,8 @@ def _find_latest_cached_snapshot(
         resp = (
             sb.table(_TABLE)
             .select("snapshot_id")
-            .gte("inserted_at", cutoff)
-            .order("inserted_at", desc=True)
+            .gte("created_at", cutoff)           # FIX-CHAIN-FALLBACK: was `inserted_at` (nonexistent column)
+            .order("created_at", desc=True)      # FIX-CHAIN-FALLBACK: was `inserted_at`
             .limit(1)
             .execute()
         )
