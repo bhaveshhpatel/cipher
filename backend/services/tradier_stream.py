@@ -233,27 +233,14 @@ Fix (F8/F2 2026-05-10): add _demo_mode_once — cancellable supervised demo fall
   cancellable. On each tick it publishes a synthetic composite_signal payload so
   F8-emits test passes. CancelledError propagates cleanly.
 
-Fix (SEM-STREAM 2026-05-12): wire _SESSION_SEM into _get_session_token().
-  _get_session_token() was a private implementation that never called
-  utils.tradier_client.get_session_token() and therefore bypassed _SESSION_SEM
-  entirely. On a simultaneous Railway restart with many tradier_stream workers,
-  all workers burst-fetched tokens concurrently, negating B-022 protection.
-  Fix: _get_session_token() now calls acquire_session_token_slot() from
-  utils.tradier_client before its retry loop and releases _SESSION_SEM in a
-  finally block. timeout_s = _SESSION_RETRY_DELAY * _SESSION_RETRY_MAX (6s).
-  If acquire times out, proceed without semaphore (log warning, don't block).
-
-Fix (HOTFIX-REARCH-ACCUM 2026-05-19): replace accumulator.add_trade() with
-  accumulator.ingest_tick() on main branch.
-  Production was crashing with:
-    'RepetitionAccumulator' object has no attribute 'add_trade'
-  Root cause: main still had the legacy add_trade(ev) call. RepetitionAccumulator
-  only exposes ingest_tick() (async) and get_signal() (async).
-  Fix: forward-port the cipher-rearch accumulator call pattern:
-    Before: ep = accumulator.add_trade(ev)
-    After:  persist_ep = await accumulator.ingest_tick(ev)
-            sig_ep     = await accumulator.get_signal(ev)
-  Full cipher-rearch file carried forward to eliminate all remaining divergence.
+Fix (IS-SWEEP-ATTR 2026-05-19): replace sig_ep.is_sweep with ev.trade_type == "SWEEP".
+  RepetitionEpisode is a dataclass with no is_sweep field. The sweep state lives
+  on individual events: ev.trade_type is already upgraded to "SWEEP" in-place
+  before this point (dedup sweep path). Two call sites fixed:
+    1. persist_flow_episode dict — "is_sweep": sig_ep.is_sweep
+    2. bus.publish_all dict     — "is_sweep": sig_ep.is_sweep
+    3. signal log line          — sig_ep.is_sweep (same AttributeError risk)
+  All three replaced with ev.trade_type == "SWEEP".
 """
 import asyncio
 import logging
@@ -923,10 +910,9 @@ async def _process_trade(raw: dict):
     C008 fix (2026-05-05): decouple persist gate from signal gate.
     PBE-BLOCKING-1 fix (2026-05-06): persist_flow_episode is fire-and-forget.
 
-    HOTFIX-REARCH-ACCUM (2026-05-19): accumulator.add_trade() -> ingest_tick().
-      RepetitionAccumulator only exposes ingest_tick() (async) and get_signal()
-      (async). The legacy add_trade() call was causing AttributeError on every
-      tick in production. Fixed by using the correct async API.
+    IS-SWEEP-ATTR (2026-05-19): replace sig_ep.is_sweep with ev.trade_type == "SWEEP".
+      RepetitionEpisode has no is_sweep field. ev.trade_type is already upgraded
+      in-place to "SWEEP" by the dedup sweep path above.
     """
     global _last_gate_epoch
 
@@ -1122,9 +1108,6 @@ async def _process_trade(raw: dict):
         f"| synthetic_quote={ev.is_synthetic_quote}"
     )
 
-    # HOTFIX-REARCH-ACCUM: use ingest_tick() + get_signal() (async API).
-    # RepetitionAccumulator does NOT have add_trade() — that call was the
-    # root cause of the production AttributeError storm.
     persist_ep = await accumulator.ingest_tick(ev)
     sig_ep     = await accumulator.get_signal(ev)
 
@@ -1216,6 +1199,10 @@ async def _process_trade(raw: dict):
     alert_level = accumulator.get_alert_level(sig_ep)
     direction   = sig_ep.dominant_direction
 
+    # IS-SWEEP-ATTR: ev.trade_type is already upgraded to "SWEEP" in-place by
+    # the dedup sweep path above. RepetitionEpisode has no is_sweep field.
+    _is_sweep = ev.trade_type == "SWEEP"
+
     asyncio.create_task(
         persist_flow_episode({
             "occ_symbol":         occ_symbol,
@@ -1228,7 +1215,7 @@ async def _process_trade(raw: dict):
             "direction":          direction,
             "total_premium":      sig_ep.total_premium,
             "trade_count":        sig_ep.trade_count,
-            "is_sweep":           sig_ep.is_sweep,
+            "is_sweep":           _is_sweep,
             "is_multi_day_repeat": _is_multi_day_repeat,
             "strong_sentiment":   _strong_sentiment,
             "execution_mechanic": _execution_mechanic,
@@ -1285,7 +1272,7 @@ async def _process_trade(raw: dict):
         ev.ticker, ev.contract_type, ev.strike, ev.expiry,
         alert_level, direction,
         sig_ep.trade_count, sig_ep.total_premium,
-        sig_ep.is_sweep, _is_multi_day_repeat,
+        _is_sweep, _is_multi_day_repeat,
         ev.sentiment,
         composite.score, _composite_tier,
         reason,
@@ -1304,7 +1291,7 @@ async def _process_trade(raw: dict):
             "direction":          direction,
             "total_premium":      sig_ep.total_premium,
             "trade_count":        sig_ep.trade_count,
-            "is_sweep":           sig_ep.is_sweep,
+            "is_sweep":           _is_sweep,
             "is_multi_day_repeat": _is_multi_day_repeat,
             "strong_sentiment":   _strong_sentiment,
             "execution_mechanic": _execution_mechanic,
