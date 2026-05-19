@@ -1010,4 +1010,261 @@ class SymbolRegistry:
                 len(self._registry), snapshot_id,
             )
 
-   
+     async def _fetch_stock_prices(self) -> tuple[dict[str, float], dict[str, dict]]:
+        BATCH = 200
+        prices: dict[str, float]     = {}
+        raw:    dict[str, dict]       = {}
+
+        for i in range(0, len(self._watchlist), BATCH):
+            batch = self._watchlist[i : i + BATCH]
+            try:
+                quotes = await get_quotes_batch(batch)
+                for q in quotes.values():
+                    sym   = q.get("symbol", "")
+                    price = float(q.get("last", 0) or q.get("close", 0) or 0)
+                    if sym and price > 0:
+                        prices[sym] = price
+                        raw[sym]    = q
+            except Exception as exc:
+                log.warning(
+                    "[symbol_registry] _fetch_stock_prices: batch %d-%d failed: %s",
+                    i, i + BATCH, exc,
+                )
+
+        return prices, raw
+
+    async def refresh_loop(self, interval_s: int = 3600) -> None:
+        """Periodically rebuild the registry (default: every hour)."""
+        while True:
+            await asyncio.sleep(interval_s)
+            log.info(
+                "[symbol_registry] refresh_loop: triggering scheduled rebuild "
+                "(interval=%ds)", interval_s,
+            )
+            try:
+                count, _ = await self.build()
+                log.info(
+                    "[symbol_registry] refresh_loop: rebuild complete (%d contracts)",
+                    count,
+                )
+            except Exception as exc:
+                log.error(
+                    "[symbol_registry] refresh_loop: rebuild failed: %s", exc,
+                    exc_info=True,
+                )
+
+
+    async def _build_ticker(
+        ticker: str,
+        stock_price: float,
+        tier_params: dict[int, _TierParams],
+        tier: int,
+        zero_price_fallback: bool,
+    ) -> dict[str, ContractMeta]:
+        """
+        Fetch all option contracts for a single ticker and return an OCC-keyed dict.
+    
+        FIX-DEAD-TICKER: tracks consecutive empty get_expirations() returns.
+        After _DEAD_TICKER_THRESHOLD strikes, adds ticker to _dead_ticker_set.
+        DTE-FILTER-LOG: logs expiries filtered by dte > params.max_dte.
+        """
+        params = tier_params.get(tier, tier_params[3])
+        today  = date.today()
+    
+        if stock_price <= 0 and not zero_price_fallback:
+            log.warning(
+                "[symbol_registry] _build_ticker: %s has no price and "
+                "zero_price_fallback=False — skipping",
+                ticker,
+            )
+            return {}
+    
+        if stock_price > 0:
+            atm_low  = stock_price * (1 - params.atm_pct)
+            atm_high = stock_price * (1 + params.atm_pct)
+        else:
+            atm_low  = 0.0
+            atm_high = float("inf")
+    
+        try:
+            expirations = await asyncio.wait_for(
+                get_expirations(ticker),
+                timeout=_CHAIN_REQUEST_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "[symbol_registry] _build_ticker: get_expirations(%s) timed out "
+                "after %.0fs — skipping ticker",
+                ticker, _CHAIN_REQUEST_TIMEOUT_S,
+            )
+            return {}
+        except Exception as exc:
+            log.warning(
+                "[symbol_registry] _build_ticker: get_expirations(%s) error: %s",
+                ticker, exc,
+            )
+            return {}
+    
+        # FIX-DEAD-TICKER: empty expirations = Tradier 400 (no listed options).
+        # Track consecutive strikes; evict after threshold.
+        if not expirations:
+            _dead_ticker_strikes[ticker] = _dead_ticker_strikes.get(ticker, 0) + 1
+            strikes = _dead_ticker_strikes[ticker]
+            if strikes >= _DEAD_TICKER_THRESHOLD:
+                if ticker not in _dead_ticker_set:
+                    _dead_ticker_set.add(ticker)
+                    log.info(
+                        "[symbol_registry] FIX-DEAD-TICKER: %s evicted after %d consecutive "
+                        "empty-expiry responses — will be skipped in future builds",
+                        ticker, strikes,
+                    )
+            else:
+                log.debug(
+                    "[symbol_registry] _build_ticker: %s returned 0 expirations "
+                    "(strike %d/%d)",
+                    ticker, strikes, _DEAD_TICKER_THRESHOLD,
+                )
+            return {}
+    
+        # Non-empty response: reset strike counter (ticker is alive).
+        if ticker in _dead_ticker_strikes:
+            _dead_ticker_strikes[ticker] = 0
+    
+        contracts: dict[str, ContractMeta] = {}
+    
+        # DTE-FILTER-LOG: count expiries dropped by dte > params.max_dte.
+        dte_dropped = 0
+    
+        for expiry_str in expirations:
+            try:
+                exp_date = date.fromisoformat(expiry_str)
+            except ValueError:
+                continue
+    
+            dte = (exp_date - today).days
+            if dte < 0:
+                continue
+            if dte > params.max_dte:
+                # DTE-FILTER-LOG: count filtered expiries.
+                dte_dropped += 1
+                continue
+    
+            chain_data = None
+            _chain_task = asyncio.ensure_future(get_option_chain_bulk(ticker, expiry_str))
+            try:
+                chain_data = await asyncio.wait_for(
+                    asyncio.shield(_chain_task),
+                    timeout=_CHAIN_STALL_WARN_S,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[symbol_registry] _build_ticker: %s expiry=%s stalled >%.0fs "
+                    "— waiting on same request (hard timeout=%.0fs)",
+                    ticker, expiry_str, _CHAIN_STALL_WARN_S, _CHAIN_REQUEST_TIMEOUT_S,
+                )
+                try:
+                    chain_data = await asyncio.wait_for(
+                        _chain_task,
+                        timeout=_CHAIN_REQUEST_TIMEOUT_S - _CHAIN_STALL_WARN_S,
+                    )
+                except asyncio.TimeoutError:
+                    _chain_task.cancel()
+                    log.warning(
+                        "[symbol_registry] _build_ticker: %s expiry=%s hard timeout "
+                        "after %.0fs — skipping expiry",
+                        ticker, expiry_str, _CHAIN_REQUEST_TIMEOUT_S,
+                    )
+                    continue
+                except Exception as exc:
+                    _chain_task.cancel()
+                    log.warning(
+                        "[symbol_registry] _build_ticker: %s expiry=%s error after "
+                        "stall warning: %s",
+                        ticker, expiry_str, exc,
+                    )
+                    continue
+            except Exception as exc:
+                log.warning(
+                    "[symbol_registry] _build_ticker: %s expiry=%s error: %s",
+                    ticker, expiry_str, exc,
+                )
+                continue
+    
+            if not chain_data:
+                log.debug(
+                    "[symbol_registry] _build_ticker: %s expiry=%s returned 0 contracts",
+                    ticker, expiry_str,
+                )
+                continue
+    
+            expiry_contracts = 0
+            for opt in chain_data:
+                try:
+                    strike = float(opt.get("strike", 0))
+                    oi     = int(opt.get("open_interest", 0) or 0)
+                    ctype  = (opt.get("option_type") or "").upper()
+                    occ    = opt.get("symbol", "").strip()
+    
+                    if not occ or not ctype or strike <= 0:
+                        continue
+                    if strike < atm_low or strike > atm_high:
+                        continue
+                    if oi < params.min_oi:
+                        continue
+    
+                    contracts[occ] = ContractMeta(
+                        ticker        = ticker,
+                        strike        = strike,
+                        expiry        = expiry_str,
+                        contract_type = ctype,
+                        dte           = dte,
+                        open_interest = oi,
+                        tier          = tier,
+                    )
+                    expiry_contracts += 1
+                except Exception:
+                    continue
+    
+            log.debug(
+                "[symbol_registry] _build_ticker: %s expiry=%s contracts=%d",
+                ticker, expiry_str, expiry_contracts,
+            )
+    
+        # DTE-FILTER-LOG: surface DTE ceiling drops so misconfigurations are visible.
+        if dte_dropped > 0:
+            if tier == 1:
+                # T1 has max_dte=90 — dropping expiries here means something is wrong
+                # (DB ingestion_config overriding the default to <90, or DTE ceiling changed).
+                log.info(
+                    "[symbol_registry] DTE-FILTER-LOG: T1 ticker=%s dropped %d expiries "
+                    "beyond max_dte=%d — verify ingestion_config t1_max_dte setting",
+                    ticker, dte_dropped, params.max_dte,
+                )
+            else:
+                log.debug(
+                    "[symbol_registry] DTE-FILTER-LOG: ticker=%s tier=%d dropped %d expiries "
+                    "beyond max_dte=%d",
+                    ticker, tier, dte_dropped, params.max_dte,
+                )
+    
+        return contracts
+    
+    
+    # ---------------------------------------------------------------------------
+    # FIX-SINGLETON: module-level singleton.
+    # ---------------------------------------------------------------------------
+    
+    _registry_instance: Optional[SymbolRegistry] = None
+    
+    
+    def init_registry(
+        watchlist: Optional[list[str]] = None,
+        tier_map:  Optional[dict[str, int]] = None,
+    ) -> SymbolRegistry:
+        global _registry_instance
+        _registry_instance = SymbolRegistry(watchlist=watchlist, tier_map=tier_map)
+        return _registry_instance
+    
+    
+    def get_registry() -> Optional[SymbolRegistry]:
+        return _registry_instance
