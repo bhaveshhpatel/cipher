@@ -205,6 +205,19 @@ PRE-MERGE BLOCKER FIXES (2026-05-04):
 DELIBERATION INLINE FIXES (2026-05-04):
   SA-F3: elevated cold-miss log from DEBUG to INFO.
   PBE-F5: added log.debug for resolved min_premium in start_lookback_worker.
+
+HOTFIX (2026-05-19):
+  FIX-EV-NAME: persist_flow_event() parameter is ev_dict but dead code block
+    still referenced bare `ev` before _g() was ever defined — NameError on
+    every tick, blocking all flow_events inserts. Removed the dead isinstance
+    block; ev_dict is already normalised to a dict via vars() above.
+    Use ev_dict.get() directly throughout.
+
+  FIX-STEAMROOM-SCORE: _compute_episode_steamroom_score() was called in 3
+    places inside persist_flow_episode() but never defined — NameError on
+    every episode persist task. Added the function: sums 5 binary Steamroom
+    dimensions (ask_side_pct>=0.5, vol_oi_signal, BLOCK/GOLDEN notional,
+    near-term DTE bucket, trade_count>=3). Returns int 0-5.
 """
 import asyncio
 import logging
@@ -470,6 +483,46 @@ def _compute_normalized_premium(
 
 
 # ---------------------------------------------------------------------------
+# FIX-STEAMROOM-SCORE: episode-level Steamroom score (5 dimensions, 0-5)
+# ---------------------------------------------------------------------------
+
+def _compute_episode_steamroom_score(
+    ask_side_pct: float,
+    vol_oi_signal: bool,
+    total_premium: float,
+    dte_bucket: Optional[str],
+    trade_count: int,
+) -> int:
+    """
+    Compute an episode-level Steamroom conviction score as the sum of 5 binary
+    dimensions. Range: 0–5.
+
+    Dimensions (1 point each):
+      Dim 1 — ask-side majority  : ask_side_pct >= 0.5
+      Dim 2 — vol/OI conviction  : vol_oi_signal is True (HIGH)
+      Dim 3 — notional size      : total_premium >= $100k (BLOCK or GOLDEN tier)
+      Dim 4 — near-term expiry   : dte_bucket in ('1-4', '5-60')
+      Dim 5 — accumulation depth : trade_count >= 3 (repeated prints = conviction)
+
+    None-safety: all inputs are coerced to their zero-score default if
+    None/missing is passed. Score arithmetic never raises.
+    Returns int in [0, 5].
+    """
+    score = 0
+    if (ask_side_pct or 0.0) >= 0.5:
+        score += 1
+    if vol_oi_signal:
+        score += 1
+    if (total_premium or 0.0) >= 100_000:
+        score += 1
+    if (dte_bucket or "90+") in ("1-4", "5-60"):
+        score += 1
+    if (trade_count or 0) >= 3:
+        score += 1
+    return score
+
+
+# ---------------------------------------------------------------------------
 # Episode helpers
 # ---------------------------------------------------------------------------
 
@@ -629,17 +682,14 @@ async def persist_flow_event(ev_dict):
             "not set — event dropped. Set env vars to enable DB persistence."
         )
         return
-    # EV-OBJ-001: normalize OptionsFlowEvent → dict so .get() calls work
+
+    # FIX-EV-NAME: normalise OptionsFlowEvent dataclass → dict so .get() works
     # regardless of whether caller passes a dataclass/object or a plain dict.
+    # ev_dict is the canonical variable name throughout this function.
     if not isinstance(ev_dict, dict):
         ev_dict = vars(ev_dict)
 
-    # FIX-PERSIST-TYPE: normalise dict vs OptionsFlowEvent dataclass.
-    if isinstance(ev, dict):
-        _g = ev.get
-    else:
-        def _g(key, default=None):
-            return getattr(ev, key, default)
+    _g = ev_dict.get
 
     expiry = _g("expiry") or None
     strike = _g("strike")
