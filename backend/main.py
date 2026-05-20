@@ -1219,8 +1219,6 @@ async def lifespan(app: FastAPI):
     _chain_ready_event    = asyncio.Event()  # CHAIN-READY-001
     _p1_skip_event        = asyncio.Event()   # CHAIN-READY-P1-SKIP: set when P1 build is skipped
 
-    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
     # ADD — CHAIN-READY-001
     chain_ready_event = asyncio.Event()
     p1_skip_event = asyncio.Event()   # CHAIN-READY-P1-SKIP
@@ -1235,7 +1233,7 @@ async def lifespan(app: FastAPI):
             chain_ready_event=chain_ready_event,
         )
     )
-    streamtaskref = [streamtask]
+    stream_task_ref = [streamtask]
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
     refresh_task          = asyncio.create_task(_universe_refresh_loop(_registry_build_done))
