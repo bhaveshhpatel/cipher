@@ -531,6 +531,7 @@ async def _chain_refresh_after_build(
     get_tracked_symbols,
     fetch_chain_fn,
     build_done_event: asyncio.Event,
+    chain_ready_event: Optional[asyncio.Event] = None,  # CHAIN-READY-001
     timeout: float = 1800.0,
 ) -> None:
     log.info(
@@ -563,6 +564,13 @@ async def _chain_refresh_after_build(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
     )
+  # CHAIN-READY-001: signal that today's contracts are loaded
+    if chain_ready_event is not None and not chain_ready_event.is_set():
+        chain_ready_event.set()
+        log.info(
+            "[chain_refresh] CHAIN-READY-001: chain_ready_event set — "
+            "stream workers may now spawn with today's contracts"
+        )
 
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
@@ -1188,10 +1196,13 @@ async def lifespan(app: FastAPI):
 
     _registry_build_done  = asyncio.Event()
     _universe_ready_event = asyncio.Event() if needs_universe_refresh else None   # ← ADD
+    _chain_ready_event    = asyncio.Event()   # CHAIN-READY-001
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
-    stream_task = asyncio.create_task(stream_options_flow(stream_symbols, registry=registry))
+    stream_task = asyncio.create_task(
+        stream_options_flow(stream_symbols, registry=registry, chain_ready_event=_chain_ready_event)
+    )
     stream_task_ref = [stream_task]
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
@@ -1235,6 +1246,7 @@ async def lifespan(app: FastAPI):
             get_tracked_symbols=_get_tracked_tickers,
             fetch_chain_fn=_fetch_tradier_chain,
             build_done_event=_registry_build_done,
+            chain_ready_event=_chain_ready_event,  # CHAIN-READY-001
         )
     )
 
