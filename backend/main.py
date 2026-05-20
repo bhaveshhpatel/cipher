@@ -939,7 +939,9 @@ async def _background_build_and_upsert(
         if seeded_count >= _P1_MIN_CONTRACTS and epoch == 0:
             log.info(
                 "[build] FIX-P1-SKIP-BUILD: registry seeded with %d contracts from P1 "
-                ...
+                "fallback (epoch=%d) - skipping full Tradier build. "
+                "Running tier assignment from batch quotes (FIX-P1-SKIP-TIERS).",
+                seeded_count, epoch,
             )
             registry._build_complete = True
             registry.epoch = 1
