@@ -531,7 +531,8 @@ async def _chain_refresh_after_build(
     get_tracked_symbols,
     fetch_chain_fn,
     build_done_event: asyncio.Event,
-    chain_ready_event: Optional[asyncio.Event] = None,  # CHAIN-READY-001
+    chain_ready_event: Optional[asyncio.Event] = None,
+    p1_skip_event: Optional[asyncio.Event] = None,   # ← ADD: signals build was skipped
     timeout: float = 1800.0,
 ) -> None:
     log.info(
@@ -554,18 +555,21 @@ async def _chain_refresh_after_build(
             timeout,
         )
 
-    await asyncio.sleep(_CHAIN_REFRESH_STAGGER_S)
-    log.info(
-        "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
-        _CHAIN_REFRESH_STAGGER_S,
-    )
+    # CHAIN-READY-P1-SKIP: If the full Tradier build was skipped (P1 fallback),
+    # no rate-limit burst occurred — skip the stagger entirely so stream workers
+    # aren't blocked for 60s unnecessarily. Set chain_ready_event immediately.
+    if p1_skip_event is not None and p1_skip_event.is_set():
+        log.info(
+            "[chain_refresh] CHAIN-READY-P1-SKIP: P1 build was skipped — "
+            "no rate-limit stagger needed. Setting chain_ready_event immediately."
+        )
+    else:
+        await asyncio.sleep(_CHAIN_REFRESH_STAGGER_S)
+        log.info(
+            "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
+            _CHAIN_REFRESH_STAGGER_S,
+        )
 
-    # CHAIN-READY-001: set the event HERE — before the infinite loop.
-    # start_chain_refresh_worker() never returns, so any code after it
-    # is unreachable. The stream workers need fresh contracts from today's
-    # Tradier pull; build_done_event + stagger guarantees the OCC registry
-    # is fully built before this fires. Setting the event here unblocks
-    # stream_options_flow() which is waiting with a 180s timeout.
     if chain_ready_event is not None and not chain_ready_event.is_set():
         chain_ready_event.set()
         log.info(
@@ -901,7 +905,8 @@ async def _background_build_and_upsert(
     registry,
     stream_symbols: list[str],
     build_done_event: asyncio.Event,
-    universe_ready_event: Optional[asyncio.Event] = None,   # ← ADD
+    universe_ready_event: Optional[asyncio.Event] = None,
+    p1_skip_event: Optional[asyncio.Event] = None,   # ← ADD
 ) -> None:
     try:
         # ── ADD: wait for universe symbols on cold start ──────────────
@@ -934,12 +939,15 @@ async def _background_build_and_upsert(
         if seeded_count >= _P1_MIN_CONTRACTS and epoch == 0:
             log.info(
                 "[build] FIX-P1-SKIP-BUILD: registry seeded with %d contracts from P1 "
-                "fallback (epoch=%d) - skipping full Tradier build. "
-                "Running tier assignment from batch quotes (FIX-P1-SKIP-TIERS).",
-                seeded_count, epoch,
+                ...
             )
             registry._build_complete = True
             registry.epoch = 1
+            # CHAIN-READY-P1-SKIP: signal that no Tradier chain-pull occurred,
+            # so the 60s rate-limit stagger in _chain_refresh_after_build can be skipped.
+            if p1_skip_event is not None:
+                p1_skip_event.set()
+                log.info("[build] CHAIN-READY-P1-SKIP: p1_skip_event set — stagger will be bypassed")
 
             # FIX-P1-SKIP-TIERS: tier assignment must still run even when the
             # full chain-pull is skipped. _fetch_batch_quotes() is a shallow
@@ -1203,7 +1211,8 @@ async def lifespan(app: FastAPI):
 
     _registry_build_done  = asyncio.Event()
     _universe_ready_event = asyncio.Event() if needs_universe_refresh else None   # ← ADD
-    _chain_ready_event    = asyncio.Event()   # CHAIN-READY-001
+    _chain_ready_event    = asyncio.Event()  # CHAIN-READY-001
+    _p1_skip_event        = asyncio.Event()   # CHAIN-READY-P1-SKIP: set when P1 build is skipped
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
@@ -1217,7 +1226,8 @@ async def lifespan(app: FastAPI):
     build_task = asyncio.create_task(
         _background_build_and_upsert(
             registry, stream_symbols, _registry_build_done,
-            universe_ready_event=_universe_ready_event,           # ← ADD
+            universe_ready_event=_universe_ready_event,
+            p1_skip_event=_p1_skip_event,              # ← ADD
         )
     )
     lookback_task         = asyncio.create_task(start_lookback_worker())
@@ -1253,7 +1263,8 @@ async def lifespan(app: FastAPI):
             get_tracked_symbols=_get_tracked_tickers,
             fetch_chain_fn=_fetch_tradier_chain,
             build_done_event=_registry_build_done,
-            chain_ready_event=_chain_ready_event,  # CHAIN-READY-001
+            chain_ready_event=_chain_ready_event,
+            p1_skip_event=_p1_skip_event,              # ← ADD
         )
     )
 
