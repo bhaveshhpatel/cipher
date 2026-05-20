@@ -1033,7 +1033,7 @@ class SymbolRegistry:
 
         return prices, raw
 
-async def refresh_loop(self, interval_s: int = 3600) -> None:
+  async def refresh_loop(self, interval_s: int = 3600) -> None:
     """Periodically rebuild the registry (default: every hour)."""
     while True:
         await asyncio.sleep(interval_s)
