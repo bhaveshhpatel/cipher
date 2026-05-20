@@ -528,11 +528,11 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         return []
 
 
-async def _chain_refresh_after_build(
-    get_tracked_symbols,
-    fetch_chain_fn,
-    build_done_event: asyncio.Event,
-    timeout: float = 1800.0,
+async def _background_universe_resolve(
+    registry,
+    stream_task_ref: list,
+    stream_symbols_container: list,
+    universe_ready_event: Optional[asyncio.Event] = None,   # ← ADD
 ) -> None:
     try:
         await asyncio.wait_for(build_done_event.wait(), timeout=timeout)
@@ -794,6 +794,14 @@ async def _background_universe_resolve(
         "[universe] Background resolve COMPLETE: %d stream symbols (source=%s, universe=%d)",
         len(stream_symbols), source, len(symbols),
     )
+    # ← ADD vvv
+    if universe_ready_event is not None:
+        universe_ready_event.set()
+        log.info(
+            "[universe] UNIVERSE-READY-EVENT: set — _background_build_and_upsert "
+            "may now proceed with %d stream symbols",
+            len(stream_symbols_container),
+        )
 
 
 def _stamp_oi(quotes: list, oi_map: dict[str, int]) -> None:
@@ -879,8 +887,33 @@ async def _background_build_and_upsert(
     registry,
     stream_symbols: list[str],
     build_done_event: asyncio.Event,
+    universe_ready_event: Optional[asyncio.Event] = None,   # ← ADD
 ) -> None:
     try:
+        # ── ADD: wait for universe symbols on cold start ──────────────
+        if universe_ready_event is not None:
+            log.info(
+                "[build] UNIVERSE-SYNC: waiting for _background_universe_resolve "
+                "before pre-fetching quotes or calling build() "
+                "(stream_symbols currently %d)",
+                len(stream_symbols),
+            )
+            try:
+                await asyncio.wait_for(universe_ready_event.wait(), timeout=300.0)
+                log.info(
+                    "[build] UNIVERSE-SYNC: universe_ready_event received — "
+                    "proceeding with %d stream symbols",
+                    len(stream_symbols),
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[build] UNIVERSE-SYNC: universe_ready_event not set after 300 s "
+                    "(background universe resolve may have failed) — "
+                    "proceeding with %d stream symbols anyway",
+                    len(stream_symbols),
+                )
+        # ── END ADD ───────────────────────────────────────────────────
+
         seeded_count = len(registry._registry) if hasattr(registry, "_registry") else 0
         epoch = getattr(registry, "epoch", 0)
 
@@ -1153,7 +1186,8 @@ async def lifespan(app: FastAPI):
     # -- Step 5: yield - server is live ------------------------------------
     log.info("[startup] Step 5: yielding - server is live (health probe will pass)")
 
-    _registry_build_done = asyncio.Event()
+   _registry_build_done  = asyncio.Event()
+    _universe_ready_event = asyncio.Event() if needs_universe_refresh else None   # ← ADD
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
@@ -1162,8 +1196,11 @@ async def lifespan(app: FastAPI):
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
     refresh_task          = asyncio.create_task(_universe_refresh_loop(_registry_build_done))
-    build_task            = asyncio.create_task(
-        _background_build_and_upsert(registry, stream_symbols, _registry_build_done)
+    build_task = asyncio.create_task(
+        _background_build_and_upsert(
+            registry, stream_symbols, _registry_build_done,
+            universe_ready_event=_universe_ready_event,           # ← ADD
+        )
     )
     lookback_task         = asyncio.create_task(start_lookback_worker())
 
@@ -1172,6 +1209,7 @@ async def lifespan(app: FastAPI):
             registry,
             stream_task_ref=stream_task_ref,
             stream_symbols_container=stream_symbols,
+            universe_ready_event=_universe_ready_event,           # ← ADD
         ))
         if needs_universe_refresh
         else None
