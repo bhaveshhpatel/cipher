@@ -651,6 +651,7 @@ async def _background_universe_resolve(
     registry,
     stream_task_ref: list,
     stream_symbols_container: list,
+    universe_ready_event: Optional[asyncio.Event] = None,
 ) -> None:
     log.info("[universe] Background universe refresh starting (cache miss at startup)")
     try:
@@ -794,7 +795,6 @@ async def _background_universe_resolve(
         "[universe] Background resolve COMPLETE: %d stream symbols (source=%s, universe=%d)",
         len(stream_symbols), source, len(symbols),
     )
-    # ← ADD vvv
     if universe_ready_event is not None:
         universe_ready_event.set()
         log.info(
@@ -1209,7 +1209,7 @@ async def lifespan(app: FastAPI):
             registry,
             stream_task_ref=stream_task_ref,
             stream_symbols_container=stream_symbols,
-            universe_ready_event=_universe_ready_event,           # ← ADD
+            universe_ready_event=_universe_ready_event,
         ))
         if needs_universe_refresh
         else None
