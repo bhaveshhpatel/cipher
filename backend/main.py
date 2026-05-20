@@ -560,17 +560,23 @@ async def _chain_refresh_after_build(
         _CHAIN_REFRESH_STAGGER_S,
     )
 
-    await start_chain_refresh_worker(
-        get_tracked_symbols=get_tracked_symbols,
-        fetch_chain_fn=fetch_chain_fn,
-    )
-  # CHAIN-READY-001: signal that today's contracts are loaded
+    # CHAIN-READY-001: set the event HERE — before the infinite loop.
+    # start_chain_refresh_worker() never returns, so any code after it
+    # is unreachable. The stream workers need fresh contracts from today's
+    # Tradier pull; build_done_event + stagger guarantees the OCC registry
+    # is fully built before this fires. Setting the event here unblocks
+    # stream_options_flow() which is waiting with a 180s timeout.
     if chain_ready_event is not None and not chain_ready_event.is_set():
         chain_ready_event.set()
         log.info(
             "[chain_refresh] CHAIN-READY-001: chain_ready_event set — "
             "stream workers may now spawn with today's contracts"
         )
+
+    await start_chain_refresh_worker(
+        get_tracked_symbols=get_tracked_symbols,
+        fetch_chain_fn=fetch_chain_fn,
+    )
 
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
