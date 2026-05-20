@@ -1226,7 +1226,7 @@ async def lifespan(app: FastAPI):
     p1_skip_event = asyncio.Event()   # CHAIN-READY-P1-SKIP
     
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
-    prewarm_task = asyncio.create_task(registry_prewarm_loop(registry_build_done))
+    prewarm_task = asyncio.create_task(_registry_prewarm_loop(registry_build_done))
     
     streamtask = asyncio.create_task(                          # ← assign to streamtask
         stream_options_flow(
