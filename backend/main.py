@@ -581,6 +581,9 @@ async def _chain_refresh_after_build(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
     )
+    if chain_ready_event is not None and not chain_ready_event.is_set():
+      chain_ready_event.set()
+      log.info("[chain_refresh] CHAIN-READY-001 event set — workers may spawn with fresh contracts")
 
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
@@ -1218,8 +1221,10 @@ async def lifespan(app: FastAPI):
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
-    stream_task = asyncio.create_task(
-        stream_options_flow(stream_symbols, registry=registry, chain_ready_event=_chain_ready_event)
+    _chain_ready_event = asyncio.Event()
+
+    asyncio.create_task(
+        stream_options_flow(symbols, registry=registry, chain_ready_event=_chain_ready_event)
     )
     stream_task_ref = [stream_task]
     db_write_task         = asyncio.create_task(start_flow_writer())
