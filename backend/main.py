@@ -1186,7 +1186,7 @@ async def lifespan(app: FastAPI):
     # -- Step 5: yield - server is live ------------------------------------
     log.info("[startup] Step 5: yielding - server is live (health probe will pass)")
 
-   _registry_build_done  = asyncio.Event()
+    _registry_build_done  = asyncio.Event()
     _universe_ready_event = asyncio.Event() if needs_universe_refresh else None   # ← ADD
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
