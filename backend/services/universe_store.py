@@ -83,6 +83,14 @@ FIX-UPSERT-QUOTE-DICT (2026-05-17):
     - list[SymbolQuote / dict]
     - list[str]
     - dict[str, SymbolQuote]
+
+ FIX-UPSERT-INDEX-STRIP (2026-05-19):
+  _sync_upsert_symbol_quotes() did not strip index/ETF-noise symbols
+  before building upsert_rows. CBOE CSV contains VIX, SPX, NDX, RUT, etc.
+  which violate check constraint chk_options_universe_symbols_no_index (23514)
+  and produced a non-fatal WARNING on every cold-start boot.
+  Fix: apply is_index_symbol() | is_etf_noise_symbol() guard on quote_rows
+  before building upsert_rows, mirroring _sync_save_snapshot() exactly.
 """
 
 import asyncio
@@ -475,11 +483,30 @@ def _sync_upsert_symbol_quotes(snapshot_id: str, quote_rows) -> None:
         if isinstance(quote_rows[0], str):
             quote_rows = [{"symbol": s, "stream_eligible": True} for s in quote_rows]
 
+        # FIX-UPSERT-INDEX-STRIP: mirror _sync_save_snapshot()'s guard
+        try:
+            from ingestion.filters import is_index_symbol, is_etf_noise_symbol
+            def _is_blocked_quote(sym: str) -> bool:
+                return is_index_symbol(sym) or is_etf_noise_symbol(sym)
+        except Exception:
+            def _is_blocked_quote(sym: str) -> bool:  # type: ignore[misc]
+                return False
+
+        pre_filter_count = len(quote_rows)
+        quote_rows = [r for r in quote_rows if not _is_blocked_quote(_get_symbol(r))]
+        stripped = pre_filter_count - len(quote_rows)
+        if stripped:
+            log.info(
+                "upsert_symbol_quotes: stripped %d index/ETF-noise symbol(s) "
+                "before upsert (e.g. VIX, SPX)",
+                stripped,
+            )
+
         total_batches = (len(quote_rows) + _UPSERT_BATCH - 1) // _UPSERT_BATCH
 
         upsert_rows = [
             {
-                "snapshot_id":      snapshot_id,
+                "snapshot_id":     snapshot_id,
                 "symbol":           _get_symbol(r),
                 "last_price":       _rget(r, "last_price"),
                 "volume":           _rget(r, "volume"),
