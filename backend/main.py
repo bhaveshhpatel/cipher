@@ -987,6 +987,11 @@ async def _background_build_and_upsert(
                     "[build] FIX-P1-SKIP-TIERS: tier assignment failed: %s",
                     exc, exc_info=True,
                 )
+
+            # ← ADD THESE THREE LINES before return:
+            if not build_done_event.is_set():
+                build_done_event.set()
+                log.info("[build] _registry_build_done event set (P1-skip path) - chain_refresh and stream workers unblocked")
             return
 
         log.info(
@@ -1219,10 +1224,6 @@ async def lifespan(app: FastAPI):
     _chain_ready_event    = asyncio.Event()  # CHAIN-READY-001
     _p1_skip_event        = asyncio.Event()   # CHAIN-READY-P1-SKIP: set when P1 build is skipped
 
-    # ADD — CHAIN-READY-001
-    chain_ready_event = asyncio.Event()
-    p1_skip_event = asyncio.Event()   # CHAIN-READY-P1-SKIP
-    
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
     
@@ -1230,7 +1231,7 @@ async def lifespan(app: FastAPI):
         stream_options_flow(
             stream_symbols,                                    # ← was `symbols` (NameError)
             registry=registry,
-            chain_ready_event=chain_ready_event,
+            chain_ready_event=_chain_ready_event,
         )
     )
     stream_task_ref = [streamtask]
