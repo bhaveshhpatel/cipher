@@ -129,7 +129,7 @@ Fix (ING-010-GATES 2026-05-07): wire signal_debounce_ms + signal_min_premium.
   Both lookups are O(1) in-memory reads — zero async I/O on hot path.
 
 Fix (ING-010-DUP 2026-05-07): remove duplicate gate_config_store.load() call.
-  stream_options_flow() was scheduling asyncio.create_task(gate_config_store.load())
+  () was scheduling asyncio.create_task(gate_config_store.load())
   on every invocation (including reconnects). ING-010 already calls load() at
   lifespan step 0 in main.py before any service starts. The duplicate is dead
   code and has been removed.
@@ -227,7 +227,7 @@ Fix (F8/F2 2026-05-10): add _demo_mode_once — cancellable supervised demo fall
   Tests test_f8_demo_mode_cancels_cleanly, test_f8_demo_mode_emits_signals, and
   test_f2_stream_401_does_not_permanently_fall_to_demo all import or patch
   `_demo_mode_once` from services.tradier_stream. The function must exist as a
-  module-level name. start_stream (stream_options_flow) never calls it — the F2
+  module-level name. start_stream () never calls it — the F2
   contract asserts call_count == 0 after 401 retries and the stream simply
   retries _get_session_token. _demo_mode_once loops with asyncio.sleep so it is
   cancellable. On each tick it publishes a synthetic composite_signal payload so
@@ -465,7 +465,7 @@ def get_stats() -> dict:
 #   - test_f8_* can import and create_task it directly.
 #   - test_f2_* can patch.object(ts, "_demo_mode_once", ...) without AttributeError.
 #
-# CONTRACT (F2): start_stream (stream_options_flow) NEVER calls this function.
+# CONTRACT (F2): start_stream () NEVER calls this function.
 #   The F2 test asserts mock_demo.call_count == 0 after 401 retries — the
 #   stream simply retries _get_session_token on every failure path.
 #
@@ -687,6 +687,7 @@ async def _get_session_token() -> Optional[str]:
 async def stream_options_flow(
     symbols: list[str],
     registry=None,
+    chain_ready_event=None,
 ):
     global _order_side_startup_logged
 
@@ -718,6 +719,21 @@ async def stream_options_flow(
             "Waiting for background build to complete before spawning workers...",
             registry.is_ready(), registry.size(),
         )
+
+        # CHAIN-READY-001: wait for first chain refresh before spawning workers.
+        # Prevents HTTP 400 from Tradier due to stale/expired OCC contracts
+        # loaded from yesterday's DB snapshot.
+        if chain_ready_event is not None:
+            log.info("[stream] CHAIN-READY-001: waiting for chain refresh (timeout=180s)...")
+            try:
+                await asyncio.wait_for(chain_ready_event.wait(), timeout=180.0)
+                log.info("[stream] CHAIN-READY-001: fresh contracts confirmed — spawning workers")
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[stream] CHAIN-READY-001: chain_ready_event timed out (180s) — "
+                    "spawning with DB-seeded contracts"
+                )
+
         waited = 0.0
         while not registry.is_ready() and waited < _REGISTRY_READY_TIMEOUT_S:
             await asyncio.sleep(_REGISTRY_READY_POLL_S)
