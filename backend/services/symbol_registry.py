@@ -1033,54 +1033,54 @@ class SymbolRegistry:
 
         return prices, raw
 
-  async def refresh_loop(self, interval_s: int = 3600) -> None:
-    """Periodically rebuild the registry (default: every hour)."""
-    while True:
-        await asyncio.sleep(interval_s)
-        log.info(
-            "[symbol_registry] refresh_loop: triggering scheduled rebuild "
-            "(interval=%ds)", interval_s,
-        )
-        try:
-            count, _ = await self.build()
-            # FIX-QQ1-REFRESH-LOOP (2026-05-20): sync the post-build tier_map
-            # to the accumulator after every refresh_loop() rebuild.
-            #
-            # build() runs FIX-REFRESH-TIER-PREBUILD (pre-classify from OI) and
-            # FIX C-3 REWRITE (post-build OI reclassification), both of which
-            # update self._tier_map in-place. But refresh_loop() never calls
-            # _post_build_upsert(), so the accumulator's tier_map is never synced
-            # — it keeps running against the startup map for the entire session.
-            # main.py's _post_build_upsert() calls _sync_accumulator_tier_map()
-            # on the cold-start path; this mirrors that call for the refresh path.
-            try:
-                from services.tradier_stream import get_accumulator
-                acc = get_accumulator()
-                if acc is not None:
-                    acc.set_tier_map(dict(self._tier_map))
-                    log.info(
-                        "[symbol_registry] FIX-QQ1-REFRESH-LOOP: accumulator "
-                        "tier_map synced after refresh_loop rebuild "
-                        "(%d symbols — T1=%d T2=%d T3=%d)",
-                        len(self._tier_map),
-                        sum(1 for t in self._tier_map.values() if t == 1),
-                        sum(1 for t in self._tier_map.values() if t == 2),
-                        sum(1 for t in self._tier_map.values() if t == 3),
-                    )
-            except Exception as sync_exc:
-                log.warning(
-                    "[symbol_registry] FIX-QQ1-REFRESH-LOOP: accumulator sync "
-                    "failed (non-fatal, continuing): %s", sync_exc,
-                )
+    async def refresh_loop(self, interval_s: int = 3600) -> None:
+        """Periodically rebuild the registry (default: every hour)."""
+        while True:
+            await asyncio.sleep(interval_s)
             log.info(
-                "[symbol_registry] refresh_loop: rebuild complete (%d contracts)",
-                count,
+                "[symbol_registry] refresh_loop: triggering scheduled rebuild "
+                "(interval=%ds)", interval_s,
             )
-        except Exception as exc:
-            log.error(
-                "[symbol_registry] refresh_loop: rebuild failed: %s", exc,
-                exc_info=True,
-            )
+            try:
+                count, _ = await self.build()
+                # FIX-QQ1-REFRESH-LOOP (2026-05-20): sync the post-build tier_map
+                # to the accumulator after every refresh_loop() rebuild.
+                #
+                # build() runs FIX-REFRESH-TIER-PREBUILD (pre-classify from OI) and
+                # FIX C-3 REWRITE (post-build OI reclassification), both of which
+                # update self._tier_map in-place. But refresh_loop() never calls
+                # _post_build_upsert(), so the accumulator's tier_map is never synced
+                # — it keeps running against the startup map for the entire session.
+                # main.py's _post_build_upsert() calls _sync_accumulator_tier_map()
+                # on the cold-start path; this mirrors that call for the refresh path.
+                try:
+                    from services.tradier_stream import get_accumulator
+                    acc = get_accumulator()
+                    if acc is not None:
+                        acc.set_tier_map(dict(self._tier_map))
+                        log.info(
+                            "[symbol_registry] FIX-QQ1-REFRESH-LOOP: accumulator "
+                            "tier_map synced after refresh_loop rebuild "
+                            "(%d symbols — T1=%d T2=%d T3=%d)",
+                            len(self._tier_map),
+                            sum(1 for t in self._tier_map.values() if t == 1),
+                            sum(1 for t in self._tier_map.values() if t == 2),
+                            sum(1 for t in self._tier_map.values() if t == 3),
+                        )
+                except Exception as sync_exc:
+                    log.warning(
+                        "[symbol_registry] FIX-QQ1-REFRESH-LOOP: accumulator sync "
+                        "failed (non-fatal, continuing): %s", sync_exc,
+                    )
+                log.info(
+                    "[symbol_registry] refresh_loop: rebuild complete (%d contracts)",
+                    count,
+                )
+            except Exception as exc:
+                log.error(
+                    "[symbol_registry] refresh_loop: rebuild failed: %s", exc,
+                    exc_info=True,
+                )
 
 
 async def _build_ticker(
