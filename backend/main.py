@@ -1221,12 +1221,21 @@ async def lifespan(app: FastAPI):
 
     registry_refresh_task = asyncio.create_task(registry.refresh_loop())
     prewarm_task          = asyncio.create_task(_registry_prewarm_loop(_registry_build_done))
-    _chain_ready_event = asyncio.Event()
-
-    asyncio.create_task(
-        stream_options_flow(symbols, registry=registry, chain_ready_event=_chain_ready_event)
+    # ADD — CHAIN-READY-001
+    chain_ready_event = asyncio.Event()
+    p1_skip_event = asyncio.Event()   # CHAIN-READY-P1-SKIP
+    
+    registry_refresh_task = asyncio.create_task(registry.refresh_loop())
+    prewarm_task = asyncio.create_task(registry_prewarm_loop(registry_build_done))
+    
+    streamtask = asyncio.create_task(                          # ← assign to streamtask
+        stream_options_flow(
+            stream_symbols,                                    # ← was `symbols` (NameError)
+            registry=registry,
+            chain_ready_event=chain_ready_event,
+        )
     )
-    stream_task_ref = [stream_task]
+    streamtaskref = [streamtask]
     db_write_task         = asyncio.create_task(start_flow_writer())
     signal_write_task     = asyncio.create_task(start_signal_writer())
     refresh_task          = asyncio.create_task(_universe_refresh_loop(_registry_build_done))
