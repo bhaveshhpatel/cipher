@@ -581,9 +581,6 @@ async def _chain_refresh_after_build(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
     )
-    if chain_ready_event is not None and not chain_ready_event.is_set():
-      chain_ready_event.set()
-      log.info("[chain_refresh] CHAIN-READY-001 event set — workers may spawn with fresh contracts")
 
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
@@ -673,6 +670,7 @@ async def _background_universe_resolve(
     stream_task_ref: list,
     stream_symbols_container: list,
     universe_ready_event: Optional[asyncio.Event] = None,
+    chain_ready_event: Optional[asyncio.Event] = None,   # ← ADD
 ) -> None:
     log.info("[universe] Background universe refresh starting (cache miss at startup)")
     try:
@@ -798,7 +796,7 @@ async def _background_universe_resolve(
         stream_symbols_container.extend(stream_symbols)
 
         new_task = asyncio.create_task(
-            stream_options_flow(stream_symbols_container, registry=registry)
+            stream_options_flow(stream_symbols_container, registry=registry, chain_ready_event=chain_ready_event,)
         )
         stream_task_ref[0] = new_task
         log.info(
@@ -1253,6 +1251,7 @@ async def lifespan(app: FastAPI):
             stream_task_ref=stream_task_ref,
             stream_symbols_container=stream_symbols,
             universe_ready_event=_universe_ready_event,
+            chain_ready_event=_chain_ready_event,   # ← ADD
         ))
         if needs_universe_refresh
         else None
