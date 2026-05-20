@@ -527,13 +527,17 @@ async def _fetch_tradier_chain(symbol: str) -> list:
         )
         return []
 
-
-async def _background_universe_resolve(
-    registry,
-    stream_task_ref: list,
-    stream_symbols_container: list,
-    universe_ready_event: Optional[asyncio.Event] = None,   # ← ADD
+async def _chain_refresh_after_build(
+    get_tracked_symbols,
+    fetch_chain_fn,
+    build_done_event: asyncio.Event,
+    timeout: float = 1800.0,
 ) -> None:
+    log.info(
+        "[chain_refresh] SEQ-002: chain refresh worker will start after "
+        "build_done_event fires + %d s stagger (SEQ-002-STAGGER)",
+        _CHAIN_REFRESH_STAGGER_S,
+    )
     try:
         await asyncio.wait_for(build_done_event.wait(), timeout=timeout)
         log.info(
@@ -549,9 +553,6 @@ async def _background_universe_resolve(
             timeout,
         )
 
-    # SEQ-002-STAGGER: intentional delay to let Tradier quota recover.
-    # build+upsert can exhaust the 120 req/min window; 60 s gives a full
-    # reset before chain refresh adds its own ~50 req/min load.
     await asyncio.sleep(_CHAIN_REFRESH_STAGGER_S)
     log.info(
         "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
@@ -562,7 +563,6 @@ async def _background_universe_resolve(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
     )
-
 
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
