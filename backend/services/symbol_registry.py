@@ -621,6 +621,11 @@ class SymbolRegistry:
     def influence_tier_int(self, ticker: str) -> int:
         return self._tier_map.get(ticker, 3)
 
+    def mark_build_complete(self) -> None:
+        """Call when build is skipped (P1 path) to unblock stream workers."""
+        self._build_complete = True
+        log.info("[symbol_registry] mark_build_complete: _build_complete=True (P1-skip path)")
+
     async def load_from_db(self, snapshot_id: Optional[str] = None) -> int:
         if not snapshot_id:
             log.info("[symbol_registry] load_from_db: no snapshot_id — skipping pre-seed")
