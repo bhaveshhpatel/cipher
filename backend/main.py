@@ -994,6 +994,10 @@ async def _background_build_and_upsert(
                     exc, exc_info=True,
                 )
 
+            # Mark registry build complete so stream workers can spawn
+            registry.mark_build_complete()
+            log.info("[build] P1-SKIP-BUILD-COMPLETE: registry._build_complete set — stream workers unblocked")
+
             return
 
         log.info(
