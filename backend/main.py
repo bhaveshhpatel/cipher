@@ -1057,10 +1057,23 @@ async def _background_build_and_upsert(
             )
 
     finally:
+        # FIX-BUILD-COMPLETE-EVENT: registry._build_complete_event does not exist
+        # on SymbolRegistry — it was never defined in __init__. The stray
+        # .set() call raised AttributeError on every exit from this function,
+        # which silently prevented the two lines below it from running:
+        #   - build_done_event.set() never fired on the non-P1-skip path
+        #   - _chain_refresh_after_build() then waited its full 1800s timeout
+        #     before setting chain_ready_event
+        #   - stream_options_flow() timed out on chain_ready_event (180s),
+        #     fell through to the is_ready() poll, and workers spawned ~3 min
+        #     late — visible in logs as "no worker spawn message at startup"
+        # On the P1-skip path, build_done_event was set explicitly before
+        # return, so the stagger bypass still fired correctly; only the full
+        # Tradier-build path was affected.
+        # Fix: remove the non-existent attribute call entirely.
         registry._build_complete = True
-        registry._build_complete_event.set()
         build_done_event.set()
-        log.info("[build] _registry_build_done event set - chain_refresh unblocked")
+        log.info("[build] _registry_build_done event set - chain_refresh and stream workers unblocked")
 
 
 async def _registry_prewarm_loop(build_done_event: asyncio.Event) -> None:
