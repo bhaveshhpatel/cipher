@@ -570,18 +570,11 @@ async def _chain_refresh_after_build(
             _CHAIN_REFRESH_STAGGER_S,
         )
 
-    if chain_ready_event is not None and not chain_ready_event.is_set():
-        chain_ready_event.set()
-        log.info(
-            "[chain_refresh] CHAIN-READY-001: chain_ready_event set — "
-            "stream workers may now spawn with today's contracts"
-        )
-
     await start_chain_refresh_worker(
         get_tracked_symbols=get_tracked_symbols,
         fetch_chain_fn=fetch_chain_fn,
+        on_first_refresh_done=chain_ready_event,   # ← fires AFTER first pull completes
     )
-
 async def _resolve_startup_universe_fast() -> tuple[list[str], dict[str, int], Optional[str], bool]:
     log.info("[universe] Step 2a: checking for fresh DB snapshot (max_age=24h)")
 
