@@ -952,6 +952,21 @@ async def _background_build_and_upsert(
                 p1_skip_event.set()
                 log.info("[build] CHAIN-READY-P1-SKIP: p1_skip_event set — stagger will be bypassed")
 
+            # P1-SKIP-RACE-FIX: set build_done_event IMMEDIATELY here, before the
+            # slow _fetch_batch_quotes + _post_build_upsert calls (30-90s).
+            # _chain_refresh_after_build blocks on build_done_event before it can
+            # set chain_ready_event. stream_options_flow only waits 180s on
+            # chain_ready_event — if the tier fetch exceeds that window, workers
+            # spawn in degraded/timeout mode with no CHAIN-READY-001 log.
+            # Tier assignment still runs below; it just no longer gates worker spawn.
+            if not build_done_event.is_set():
+                build_done_event.set()
+                log.info(
+                    "[build] P1-SKIP-RACE-FIX: build_done_event set immediately "
+                    "(before tier fetch) — chain_ready_event will fire within seconds"
+                )
+
+            # FIX-P1-SKIP-TIERS: tier assignment must still run even when the
             # FIX-P1-SKIP-TIERS: tier assignment must still run even when the
             # full chain-pull is skipped. _fetch_batch_quotes() is a shallow
             # volume/OI fetch (not a per-ticker chain-pull) -- it completes in
@@ -986,10 +1001,6 @@ async def _background_build_and_upsert(
                     exc, exc_info=True,
                 )
 
-            # ← ADD THESE THREE LINES before return:
-            if not build_done_event.is_set():
-                build_done_event.set()
-                log.info("[build] _registry_build_done event set (P1-skip path) - chain_refresh and stream workers unblocked")
             return
 
         log.info(
