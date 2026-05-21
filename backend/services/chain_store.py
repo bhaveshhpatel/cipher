@@ -24,7 +24,7 @@ get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
     (None, None) on cache miss.  Zero API calls on the hot path.
     The cache is populated / refreshed by start_chain_refresh_worker().
 
-start_chain_refresh_worker(get_tracked_symbols, fetch_chain_fn)
+(get_tracked_symbols, fetch_chain_fn)
     ING-008: Background asyncio task that refreshes the intraday chain
     data (volume + OI) every _CHAIN_REFRESH_INTERVAL_S seconds for all
     stream-eligible symbols.
@@ -86,7 +86,7 @@ FIX EPOCH (2026-05-07):
 ING-008 (2026-05-08):
   Added `volume` column to save_chain / load_chain / _paginate_chain.
   Added get_contract_vol_oi() — O(1) dict lookup from _vol_oi_cache.
-  Added start_chain_refresh_worker() — 5-min background refresh of
+  Added () — 5-min background refresh of
   intraday volume+OI for all tracked symbols via Tradier chain API.
   Added invalidate_vol_oi_cache() for market-open reset.
 
@@ -106,9 +106,9 @@ HOTFIX-CHAIN-CONCURRENCY (2026-05-13):
   run_in_executor threads. Wall time: ~300ms → ~1.5s (still 4x faster
   than the original sequential 5.8s). Zero impact on streaming hot path —
   save_chain is called only at startup and every 24h; get_contract_vol_oi()
-  reads _vol_oi_cache fed by start_chain_refresh_worker(), a separate path.
+  reads _vol_oi_cache fed by (), a separate path.
 
-FIX (2026-05-14): HTTP 400 handling in start_chain_refresh_worker().
+FIX (2026-05-14): HTTP 400 handling in ().
   Tradier returns HTTP 400 for tickers that have no listed options
   (e.g. AWI, ARES, ARI). The worker previously relied entirely on
   fetch_chain_fn() to return [] on all errors, but aiohttp/httpx raises
@@ -149,7 +149,7 @@ FIX-SNAPSHOT-NOTNULL (2026-05-15):
   with real provider/source values, this upsert is a no-op.
 
 ING-008-COLD (2026-05-17):
-  start_chain_refresh_worker() opened with await asyncio.sleep(interval),
+  () opened with await asyncio.sleep(interval),
   so the first Tradier chain pull was always 300 s after worker start.
   For the entire first 5 minutes of market hours get_contract_vol_oi()
   returned (None, None) for every OCC symbol, and the OI-based ingestion
@@ -302,12 +302,20 @@ async def _run_refresh_cycle(
 async def start_chain_refresh_worker(
     get_tracked_symbols: Callable[[], list],
     fetch_chain_fn: Callable[[str], Awaitable[list]],
+    on_first_refresh_done: Optional[asyncio.Event] = None,
 ) -> None:
     """ING-008 / ING-008-COLD: background vol/OI refresh worker.
 
     Performs one IMMEDIATE refresh cycle on entry so the cache is warm from
     tick-1, then loops with the normal sleep-first cadence every
     _CHAIN_REFRESH_INTERVAL_S seconds.
+
+    CHAIN-READY-001: if on_first_refresh_done is provided, it is set AFTER
+    the initial pull completes — signalling stream workers that fresh
+    intraday OCC contracts are loaded and safe to subscribe against.
+    This replaces the prior pattern where chain_ready_event was set before
+    start_chain_refresh_worker() was called, which caused workers to spawn
+    against stale DB-seeded contracts and receive HTTP 400 from Tradier.
     """
     log.info(
         "[chain_store] chain refresh worker started — interval=%ds; "
@@ -317,6 +325,14 @@ async def start_chain_refresh_worker(
     try:
         # ING-008-COLD: immediate initial pull — no 5-min wait before first data.
         await _run_refresh_cycle(get_tracked_symbols(), fetch_chain_fn, label="initial")
+
+        # CHAIN-READY-001: signal stream workers NOW — after fresh contracts are loaded.
+        if on_first_refresh_done is not None and not on_first_refresh_done.is_set():
+            on_first_refresh_done.set()
+            log.info(
+                "[chain_store] CHAIN-READY-001: on_first_refresh_done set — "
+                "stream workers may now spawn with today's contracts"
+            )
 
         cycle = 0
         while True:
@@ -331,7 +347,6 @@ async def start_chain_refresh_worker(
     except asyncio.CancelledError:
         log.info("[chain_store] chain refresh worker cancelled — shutting down cleanly")
         raise
-
 
 def _client() -> Client:
     key = settings.SUPABASE_SERVICE_KEY
