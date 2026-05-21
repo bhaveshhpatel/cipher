@@ -714,45 +714,66 @@ async def stream_options_flow(
     from services.stream_manager import StreamManager
 
     if registry is not None:
-        log.info(
-            "[stream] Registry provided by lifespan (is_ready=%s, %d OCC symbols). "
-            "Waiting for background build to complete before spawning workers...",
-            registry.is_ready(), registry.size(),
+    log.info(
+        "[stream] STREAM-ENTRY-001: stream_options_flow entered. "
+        "registry=%s, chain_ready_event=%s, chain_ready_event.is_set()=%s",
+        registry,
+        chain_ready_event,
+        chain_ready_event.is_set() if chain_ready_event is not None else "N/A",
+    )
+
+    # Gate 1: wait for fresh chain refresh before spawning workers
+    if chain_ready_event is not None:
+        log.info("[stream] CHAIN-READY-001 waiting for chain refresh timeout=180s...")
+        try:
+            await asyncio.wait_for(chain_ready_event.wait(), timeout=180.0)
+            log.info("[stream] CHAIN-READY-001 fresh contracts confirmed, spawning workers")
+        except asyncio.TimeoutError:
+            log.warning("[stream] CHAIN-READY-001 chain_ready_event timed out (180s) spawning with DB-seeded contracts")
+
+    log.info(
+        "[stream] STREAM-GATE-002: past chain_ready_event. registry.isready=%s, registry.size=%d",
+        registry.isready,
+        registry.size,
+    )
+
+    # Gate 2: wait for registry build to complete
+    waited = 0.0
+    while not registry.isready and waited < REGISTRY_READY_TIMEOUT_S:
+        await asyncio.sleep(REGISTRY_READY_POLL_S)
+        waited += REGISTRY_READY_POLL_S
+
+    if not registry.isready:
+        log.error(
+            "[stream] Registry still not ready after %.0fs — stream idle. Use admin panel to start demo engine.",
+            REGISTRY_READY_TIMEOUT_S,
         )
+        stats["mode"] = "idle"
+        return
 
-        # CHAIN-READY-001: wait for first chain refresh before spawning workers.
-        # Prevents HTTP 400 from Tradier due to stale/expired OCC contracts
-        # loaded from yesterday's DB snapshot.
-        if chain_ready_event is not None:
-            log.info("[stream] CHAIN-READY-001: waiting for chain refresh (timeout=180s)...")
-            try:
-                await asyncio.wait_for(chain_ready_event.wait(), timeout=180.0)
-                log.info("[stream] CHAIN-READY-001: fresh contracts confirmed — spawning workers")
-            except asyncio.TimeoutError:
-                log.warning(
-                    "[stream] CHAIN-READY-001: chain_ready_event timed out (180s) — "
-                    "spawning with DB-seeded contracts"
-                )
+    log.info(
+        "[stream] STREAM-GATE-003: registry ready. size=%d, waited=%.1fs. About to call manager.run().",
+        registry.size,
+        waited,
+    )
+    log.info("[stream] Registry ready %d OCC contracts waited=%.1fs starting stream manager", registry.size, waited)
 
-        waited = 0.0
-        while not registry.is_ready() and waited < _REGISTRY_READY_TIMEOUT_S:
-            await asyncio.sleep(_REGISTRY_READY_POLL_S)
-            waited += _REGISTRY_READY_POLL_S
+    asyncio.create_task(registry.refresh_loop())
+    stats["active_symbols"] = registry.size
+    stats["mode"] = "live"
+    log.info(
+        "[stream] LIVE mode: subscribing to %d OCC contracts across %d tickers",
+        registry.size,
+        len({v.ticker for v in registry.registry.values()}) if hasattr(registry, "registry") else 0,
+    )
+    manager = StreamManager(registry=registry, process_fn=process_trade)
 
-        if not registry.is_ready():
-            log.error(
-                "[stream] Registry still not ready after %.0fs — "
-                "stream idle. Use admin panel to start demo engine.",
-                _REGISTRY_READY_TIMEOUT_S,
-            )
-            _stats["mode"] = "idle"
-            return
-
-        log.info(
-            "[stream] Registry ready: %d OCC contracts (waited=%.1fs) — "
-            "starting stream manager",
-            registry.size(), waited,
-        )
+    try:
+        await manager.run()
+    except Exception as exc:
+        log.exception("[stream] STREAM-FATAL: manager.run raised unexpectedly: %s", exc)
+        stats["mode"] = "idle"
+        raise
     else:
         from services.symbol_registry import init_registry as _init_registry
         log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
