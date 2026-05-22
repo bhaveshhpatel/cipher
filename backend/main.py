@@ -563,8 +563,19 @@ async def _chain_refresh_after_build(
             "[chain_refresh] CHAIN-READY-P1-SKIP: P1 build was skipped — "
             "no rate-limit stagger needed. Setting chain_ready_event immediately."
         )
+        # ← ADD THIS — the log said it, now actually do it
+        if chain_ready_event is not None and not chain_ready_event.is_set():
+            chain_ready_event.set()
+            log.info(
+                "[chain_refresh] CHAIN-READY-P1-SKIP: chain_ready_event.set() called — "
+                "stream workers unblocked immediately"
+            )
     else:
         await asyncio.sleep(_CHAIN_REFRESH_STAGGER_S)
+        log.info(
+            "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
+            _CHAIN_REFRESH_STAGGER_S,
+        )
         log.info(
             "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
             _CHAIN_REFRESH_STAGGER_S,
