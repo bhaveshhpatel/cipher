@@ -769,7 +769,7 @@ async def stream_options_flow(
         manager = StreamManager(registry=registry, process_fn=process_trade)
     
         try:
-            await manager.run
+            await manager.run()
         except Exception as exc:
             log.exception("[stream] STREAM-FATAL: manager.run raised unexpectedly: %s", exc)
             stats["mode"] = "idle"
