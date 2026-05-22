@@ -212,6 +212,7 @@ class StreamWorker:
         self._ticks_at_last_stats: int  = 0
         self._last_stats_at:      float = _time.monotonic()
         self._last_stall_log_at:  float = 0.0
+        self._stall_logged:       bool  = False   # STREAM-16: instance var so reconnects don't reset mid-session
 
     def update_symbols(self, new_symbols: list[str]):
         self.symbols = new_symbols
@@ -637,19 +638,19 @@ class StreamWorker:
         (server closed the TCP stream) exits the iterator cleanly.
         """
         aiter = resp.aiter_lines().__aiter__()
-        stall_logged = False
+        self._stall_logged = False  # reset at start of each new session
         while True:
             try:
                 line = await asyncio.wait_for(
                     aiter.__anext__(), timeout=_IDLE_TIMEOUT
                 )
-                stall_logged = False
+                self._stall_logged = False
                 yield line
             except StopAsyncIteration:
                 return
             except asyncio.TimeoutError:
                 now = _time.time()
-                if not stall_logged or (now - self._last_stall_log_at) > _STALL_LOG_INTERVAL_S:
+                if not self._stall_logged or (now - self._last_stall_log_at) > _STALL_LOG_INTERVAL_S:
                     log.warning(
                         "[worker-%d] STALL | No data for %.0fs | "
                         "symbols=%d session_ticks=%d session=%s...",
@@ -660,6 +661,6 @@ class StreamWorker:
                         session_token[:8],
                     )
                     self._last_stall_log_at = now
-                    stall_logged = True
+                    self._stall_logged = True
                 # STREAM-12: do NOT re-raise — stay on the open POST stream
                 # and keep waiting for the next tick.
