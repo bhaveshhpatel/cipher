@@ -1,8 +1,26 @@
 # Cipher — Claude Context File
 
-> Last updated: 2026-04-27 (Phase 5C — P2/P3 Coverage Expansion + Sandbox-Validated Test Push)
+> Last updated: 2026-05-21 (Added Development Quick Start)
 > This file is the authoritative AI-assistant context document for the Cipher codebase.
 > Keep it updated after every phase so future sessions have full project context.
+
+---
+
+## Development Quick Start
+
+### Backend
+- **Start**: `cd backend && uvicorn main:app --reload`
+- **Test (All)**: `cd backend && pytest` (Enforces $\ge 92\%$ coverage)
+- **Test (Fast)**: `cd backend && pytest --no-cov`
+- **Test (Single)**: `cd backend && pytest -k <test_name>`
+- **Lint**: `cd backend && python -m pyflakes .`
+
+### Frontend
+- **Start**: `cd frontend && npm run dev`
+- **Test (All)**: `cd frontend && npm test` (or `npx jest --coverage`)
+- **Test (Watch)**: `cd frontend && npm run test:watch`
+- **Lint**: `cd frontend && npm run lint`
+- **Typecheck**: `cd frontend && npm run typecheck`
 
 ---
 

@@ -506,77 +506,27 @@ async def get_option_chain_bulk(symbol: str, expiration: str) -> list[dict]:
 
 async def get_option_chain_bulk_all(symbol: str) -> list[dict]:
     """
-    Fetch ALL expiries for a ticker in a single Tradier API call — BULK BUILD PATH ONLY.
+    Fetch ALL expiries for a ticker.
 
-    CHAIN-ALL (2026-05-14):
-    Omits the ``expiration`` param from /v1/markets/options/chains so Tradier
-    returns every available expiry in one response. Each contract dict in the
-    returned list includes an ``expiration_date`` field (YYYY-MM-DD) that
-    _build_ticker uses to group and DTE-filter client-side.
+    Compliant with Tradier spec: Fetches all active expiration dates first,
+    then retrieves each chain individually.
 
-    Advantages vs the two-call-per-expiry approach:
-      - 82% fewer total API calls  (3,900 vs ~21,450 for 3,900 tickers)
-      - 66-76% faster build time   (~117s clean vs ~343s; ~312s degraded vs ~1287s)
-      - Lower burst-rate exposure  (~2,000 rpm vs ~3,750 rpm)
-      - Larger TCP transfer per call provides natural spacing between
-        completions, making Tradier's rolling-window enforcement friendlier.
-
-    Uses _BULK_CHAIN_SEM(10) — lowered from 50 (CONCURRENCY-10 2026-05-14).
-    MUST NOT be used from the streaming flow path — use get_option_chain().
-
-    429 handling: identical back-off retry as get_option_chain_bulk().
-    HTTP 400: returns [] (ticker has no listed options — correct behaviour;
-    the caller _build_ticker skips tickers that return []).
+    Slower than undocumented 'omit expiration' approach, but spec-compliant.
+    Uses _BULK_CHAIN_SEM to stay under 120 req/min.
     """
-    url = f"{settings.TRADIER_BASE_URL}/v1/markets/options/chains"
-    async with _BULK_CHAIN_SEM:
-        try:
-            resp = await _client().get(
-                url, headers=_headers(),
-                # No expiration param → all expiries returned in one response.
-                params={"symbol": symbol, "greeks": "false"}
-            )
-            if resp.status_code == 429:
-                retry_after = float(
-                    resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER_S)
-                )
-                log.warning(
-                    "[tradier_client] get_option_chain_bulk_all(%s) 429 — "
-                    "backing off %.0fs then retrying",
-                    symbol, retry_after,
-                )
-                await asyncio.sleep(retry_after)
-                # FIX-RETRY-POOL: retry through shared pool, not an ephemeral client.
-                resp = await _client().get(
-                    url, headers=_headers(),
-                    params={"symbol": symbol, "greeks": "false"}
-                )
-            if resp.status_code == 400:
-                # Ticker has no listed options — expected for many watchlist
-                # symbols. Return [] silently; caller skips gracefully.
-                log.debug(
-                    "[tradier_client] get_option_chain_bulk_all(%s) HTTP 400 — "
-                    "no listed options, skipping",
-                    symbol,
-                )
-                return []
-            if resp.status_code != 200:
-                log.warning(
-                    "[tradier_client] get_option_chain_bulk_all(%s) HTTP %d — body: %s",
-                    symbol, resp.status_code, resp.text[:300],
-                )
-                return []
-            data = resp.json()
-            options = (data.get("options") or {}).get("option") or []
-            if isinstance(options, dict):
-                options = [options]
-            return options
-        except Exception as e:
-            log.warning(
-                "[tradier_client] get_option_chain_bulk_all(%s) error: %r",
-                symbol, e,
-            )
+    try:
+        expirations = await get_expirations(symbol)
+        if not expirations:
             return []
+
+        all_options = []
+        for exp in expirations:
+            options = await get_option_chain_bulk(symbol, exp)
+            all_options.extend(options)
+        return all_options
+    except Exception as e:
+        log.warning(f"[tradier_client] get_option_chain_bulk_all la-loop error for {symbol}: {e}")
+        return []
 
 
 # Alias: tests import get_options_chain (plural)

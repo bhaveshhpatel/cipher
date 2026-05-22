@@ -309,7 +309,7 @@ class StreamWorker:
             "sessionid": session_token,
             "symbols":   ",".join(self.symbols[:1]),  # 1 symbol is enough to test auth+routing
             "filter":    "timesale",
-            "linebreak": "true",
+            "linebreak": True,
         }
         try:
             timeout = httpx.Timeout(
@@ -436,7 +436,7 @@ class StreamWorker:
                 "sessionid": session_token,
                 "symbols":   ",".join(self.symbols),
                 "filter":    "timesale",
-                "linebreak": "true",
+                "linebreak": True,
             }
 
             self._session_ticks   = 0
