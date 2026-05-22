@@ -732,23 +732,23 @@ async def stream_options_flow(
                 log.warning("[stream] CHAIN-READY-001 chain_ready_event timed out (180s) spawning with DB-seeded contracts")
     
         log.info(
-            "[stream] STREAM-GATE-002: past chain_ready_event. registry.isready=%s, registry.size=%d",
-            registry.isready,
+            "[stream] STREAM-GATE-002: past chain_ready_event. registry.is_ready()=%s, registry.size=%d",
+            registry.is_ready(),
             registry.size,
         )
-    
+
         # Gate 2: wait for registry build to complete
         waited = 0.0
-        while not registry.isready and waited < REGISTRY_READY_TIMEOUT_S:
+        while not registry.is_ready() and waited < REGISTRY_READY_TIMEOUT_S:
             await asyncio.sleep(REGISTRY_READY_POLL_S)
             waited += REGISTRY_READY_POLL_S
-    
-        if not registry.isready:
+
+        if not registry.is_ready():
             log.error(
                 "[stream] Registry still not ready after %.0fs — stream idle. Use admin panel to start demo engine.",
                 REGISTRY_READY_TIMEOUT_S,
             )
-            stats["mode"] = "idle"
+            _stats["mode"] = "idle"
             return
     
         log.info(
@@ -759,20 +759,20 @@ async def stream_options_flow(
         log.info("[stream] Registry ready %d OCC contracts waited=%.1fs starting stream manager", registry.size, waited)
     
         asyncio.create_task(registry.refresh_loop())
-        stats["active_symbols"] = registry.size
-        stats["mode"] = "live"
+        _stats["active_symbols"] = registry.size
+        _stats["mode"] = "live"
         log.info(
             "[stream] LIVE mode: subscribing to %d OCC contracts across %d tickers",
             registry.size,
             len({v.ticker for v in registry.registry.values()}) if hasattr(registry, "registry") else 0,
         )
-        manager = StreamManager(registry=registry, process_fn=process_trade)
-    
+        manager = StreamManager(registry=registry, process_fn=_process_trade)
+
         try:
             await manager.run()
         except Exception as exc:
             log.exception("[stream] STREAM-FATAL: manager.run raised unexpectedly: %s", exc)
-            stats["mode"] = "idle"
+            _stats["mode"] = "idle"
             raise
     else:
         from services.symbol_registry import init_registry as _init_registry
