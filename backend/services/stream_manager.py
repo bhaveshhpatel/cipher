@@ -87,34 +87,6 @@ STREAM-13 (2026-05-18):
   fresh token immediately before its own loop so the TTL race does not
   apply there.
 
-STREAM-14 (2026-05-20):
-  Fix health metric corruption when _respawn_workers() replaces self._workers
-  mid-iteration inside _log_health().
-
-  _log_health() iterated self._workers directly via sum() generators. If
-  _respawn_workers() swapped self._workers to a new list while those
-  generators were live (possible because both run on the same event loop
-  and asyncio.sleep yields between iterations), the aggregated totals
-  (ticks, errors, reconnects, stalled) could span a mix of old and new
-  worker objects, producing nonsensical STREAM_HEALTH log lines.
-
-  Fix: snapshot workers = list(self._workers) at the very top of
-  _log_health(). All subsequent iteration and sum() calls operate on the
-  stable snapshot, not the live attribute.
-
-STREAM-15 (2026-05-20):
-  Fix spurious ValueError from task_done() in _consume_queue._run_process().
-
-  task_done() was called unconditionally in the finally block, which fires
-  whether or not get() actually succeeded. If get() raised (e.g., the queue
-  was drained and cancelled mid-flight), task_done() would be called without
-  a matching get(), raising ValueError: task_done() called too many times.
-
-  Fix: remove task_done() from finally. Call it explicitly after the
-  process_fn invocation succeeds or raises — i.e., exactly once per
-  confirmed get(). Wrapped in try/except ValueError as a belt-and-suspenders
-  guard against any edge case where the count drifts.
-
 Architecture
 ------------
   - 1 session token fetched at spawn time, shared to all workers
@@ -244,4 +216,389 @@ class StreamManager:
                 elapsed += _TOKEN_POLL_INTERVAL_S
                 if self._any_token_expired():
                     log.warning("[stream_manager] Token expired detected -- refreshing session + respawning")
-       
+                    await self._respawn_workers(force_token_refresh=True)
+                    elapsed = 0.0
+                elif elapsed >= self._worker_refresh_s:
+                    elapsed = 0.0
+                    await self._respawn_workers()
+        except asyncio.CancelledError:
+            await self.stop()
+            raise
+
+    def status(self) -> dict:
+        now = _time.time()
+        stalled = sum(
+            1 for w in self._workers
+            if w._last_tick_at and (now - w._last_tick_at) > _STALL_THRESHOLD_S
+        )
+        return {
+            "running":         self._running,
+            "workers":         len(self._workers),
+            "active_symbols":  self._registry.size() if self._registry else 0,
+            "stalled_workers": stalled,
+            "queue_depth":     self._queue.qsize() if self._queue else 0,
+        }
+
+    @property
+    def stats(self) -> dict:
+        return self.status()
+
+    # ------------------------------------------------------------------
+    # Health log loop
+    # ------------------------------------------------------------------
+
+    async def _health_loop(self):
+        """Log aggregate STREAM_HEALTH every _HEALTH_LOG_INTERVAL_S seconds."""
+        await asyncio.sleep(_HEALTH_LOG_INTERVAL_S)  # first report after 30s
+        while True:
+            try:
+                await asyncio.sleep(_HEALTH_LOG_INTERVAL_S)
+                self._log_health()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error("[stream_manager] _health_loop error: %s", e)
+
+    def _log_health(self):
+        now_mono = _time.monotonic()
+        now_wall = _time.time()
+        elapsed  = now_mono - self._last_health_at
+
+        total_ticks  = sum(w._ticks       for w in self._workers)
+        total_errors = sum(w._errors      for w in self._workers)
+        total_recon  = sum(w._reconnects  for w in self._workers)
+
+        ticks_delta = total_ticks - self._total_ticks_at_last_health
+        rate        = ticks_delta / elapsed if elapsed > 0 else 0.0
+
+        active   = sum(1 for w in self._workers if not getattr(w, "_token_expired", False))
+        stalled  = sum(
+            1 for w in self._workers
+            if w._last_tick_at and (now_wall - w._last_tick_at) > _STALL_THRESHOLD_S
+        )
+        never_ticked = sum(1 for w in self._workers if w._last_tick_at is None)
+        queue_depth  = self._queue.qsize() if self._queue else 0
+        uptime_s     = round(now_wall - self._spawn_at, 0) if self._spawn_at else None
+
+        log.info(
+            "[stream_manager] STREAM_HEALTH | workers=%d active=%d stalled=%d "
+            "never_ticked=%d total_ticks=%d ticks_30s=%d rate=%.1f/s "
+            "errors=%d reconnects=%d queue_depth=%d uptime=%ss",
+            len(self._workers), active, stalled, never_ticked,
+            total_ticks, ticks_delta, rate,
+            total_errors, total_recon,
+            queue_depth, uptime_s,
+        )
+
+        self._total_ticks_at_last_health = total_ticks
+        self._last_health_at = now_mono
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _any_token_expired(self) -> bool:
+        return any(getattr(w, "_token_expired", False) for w in self._workers)
+
+    async def _fetch_session_token(self) -> Optional[str]:
+        """
+        Fetch a fresh session token with up to 3 retries.
+        STREAM-4: 10s hard timeout per attempt via asyncio.wait_for.
+        STREAM-5: 15s base retry delay; 20s extra backoff on 400 Quota Violation
+                  so rapid restarts self-heal after Tradier releases the old session.
+        """
+        for attempt in range(1, 4):
+            try:
+                token = await asyncio.wait_for(
+                    get_session_token(), timeout=_SESSION_TOKEN_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[stream_manager] Session token fetch timed out after %.0fs (attempt %d/3)",
+                    _SESSION_TOKEN_TIMEOUT_S, attempt,
+                )
+                token = None
+                is_quota = False
+            except Exception as e:
+                err_str = str(e)
+                is_quota = "400" in err_str and "Quota" in err_str
+                if is_quota:
+                    log.warning(
+                        "[stream_manager] Session token 400 Quota Violation (attempt %d/3) -- "
+                        "old session still registered on Tradier, backing off %.0fs",
+                        attempt, _SESSION_QUOTA_BACKOFF_S,
+                    )
+                else:
+                    log.warning(
+                        "[stream_manager] Session token fetch error (attempt %d/3): %s",
+                        attempt, e,
+                    )
+                token = None
+            else:
+                is_quota = False
+
+            if token:
+                log.info("[stream_manager] Session token acquired (attempt %d)", attempt)
+                return token
+
+            log.warning(
+                "[stream_manager] Session token fetch failed (attempt %d/3)", attempt
+            )
+            if attempt < 3:
+                delay = _SESSION_QUOTA_BACKOFF_S if is_quota else _SESSION_RETRY_DELAY_S
+                log.info(
+                    "[stream_manager] Waiting %.0fs before retry (attempt %d/3)...",
+                    delay, attempt + 1,
+                )
+                await asyncio.sleep(delay)
+
+        log.error("[stream_manager] Could not acquire session token after 3 attempts")
+        return None
+
+    async def _post_spawn_token_refresh(self, workers_snapshot: list) -> None:
+        """
+        STREAM-13: Scheduled immediately after _spawn_workers() as a fire-and-
+        forget Task. Sleeps until after the last worker has woken from its
+        startup_delay, then fetches a fresh session token and pushes it to
+        every worker via w._shared_token.
+
+        Why: the spawn loop is a plain Python for-loop with no awaits — it
+        completes in microseconds. The original FIX-C measured spawn_duration
+        after the loop and found ~0.001s, so its `if spawn_duration > 10s`
+        guard never fired. Meanwhile the last worker's startup_delay_s ≈ 10s
+        means it POSTs to Tradier at T+10s — right at the ~10-15s session TTL
+        boundary. Refreshing the token at T+12s ensures a fresh token is in
+        place before any worker's first reconnect attempt.
+
+        workers_snapshot: the list of StreamWorker objects at spawn time,
+        captured before the task is created so it's stable even if
+        self._workers is later replaced by a respawn.
+        """
+        sleep_s = _SPAWN_WINDOW_S + _TOKEN_REFRESH_GRACE_S  # 12s
+        log.debug(
+            "[stream_manager] STREAM-13: post-spawn token refresh scheduled in %.0fs",
+            sleep_s,
+        )
+        await asyncio.sleep(sleep_s)
+
+        # Check that this spawn generation is still the active one.
+        # If _respawn_workers() fired in the meantime, self._workers will be
+        # a different list and workers_snapshot is stale — skip the push.
+        if workers_snapshot is not self._workers:
+            log.debug(
+                "[stream_manager] STREAM-13: workers respawned before refresh fired — skipping"
+            )
+            return
+
+        fresh_token = await self._fetch_session_token()
+        if fresh_token:
+            self._session_token = fresh_token
+            for w in workers_snapshot:
+                w._shared_token = fresh_token
+            log.info(
+                "[stream_manager] STREAM-13: Post-spawn token refreshed — "
+                "session=%s... pushed to %d workers",
+                fresh_token[:8], len(workers_snapshot),
+            )
+        else:
+            log.error(
+                "[stream_manager] STREAM-13: Post-spawn token refresh failed — "
+                "workers will reconnect with original token (may hit 400/401)"
+            )
+
+    async def _spawn_workers(self):
+        if self._registry is None:
+            return
+        try:
+            from services.stream_worker import StreamWorker
+        except ImportError:
+            log.error("[stream_manager] Could not import StreamWorker")
+            return
+
+        all_symbols = self._registry.all_symbols()
+        if not all_symbols:
+            log.warning("[stream_manager] Registry is empty -- no workers spawned")
+            return
+
+        self._session_token = await self._fetch_session_token()
+        if not self._session_token:
+            log.error("[stream_manager] Aborting spawn -- no session token")
+            return
+
+        chunks = [
+            all_symbols[i:i + _CHUNK_SIZE]
+            for i in range(0, len(all_symbols), _CHUNK_SIZE)
+        ]
+
+        # FIX-A: spread workers proportionally over _SPAWN_WINDOW_S (~10s)
+        # instead of a flat 50ms stagger. With 64 workers the old 50ms stagger
+        # compressed all connections into ~3s, causing thundering-herd 400s.
+        stagger_step = _SPAWN_WINDOW_S / max(len(chunks), 1)
+
+        log.info(
+            "[stream_manager] Spawning %d workers | symbols=%d chunk_size=%d "
+            "session=%s... stagger=%.0fms (spread=%.1fs)",
+            len(chunks), len(all_symbols), _CHUNK_SIZE,
+            self._session_token[:8],
+            stagger_step * 1000,
+            _SPAWN_WINDOW_S,
+        )
+
+        self._workers = []
+        self._tasks   = []
+        self._spawn_at = _time.time()
+        self._total_ticks_at_last_health = 0
+        self._last_health_at = _time.monotonic()
+
+        for idx, chunk in enumerate(chunks):
+            worker = StreamWorker(
+                worker_id            = idx,
+                symbols              = chunk,
+                event_queue          = self._queue,
+                startup_delay_s      = idx * stagger_step,   # FIX-A: proportional
+                shared_session_token = self._session_token,
+            )
+            self._workers.append(worker)
+            task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
+            self._tasks.append(task)
+
+        log.info(
+            "[stream_manager] %d workers spawned -- all streaming in parallel",
+            len(self._workers),
+        )
+
+        # STREAM-13: schedule the post-spawn token refresh as a fire-and-forget
+        # task. It sleeps _SPAWN_WINDOW_S + _TOKEN_REFRESH_GRACE_S (12s) then
+        # pushes a fresh token to all workers so the last worker's first POST
+        # (at T+10s) uses a token that hasn't aged past Tradier's ~10-15s TTL.
+        asyncio.create_task(
+            self._post_spawn_token_refresh(self._workers),
+            name="post-spawn-token-refresh",
+        )
+
+    async def _respawn_workers(self, force_token_refresh: bool = False):
+        """Cancel all current workers and start fresh ones."""
+        if self._registry is None:
+            return
+        try:
+            from services.stream_worker import StreamWorker
+        except ImportError:
+            return
+
+        new_symbols = self._registry.all_symbols()
+        if not new_symbols:
+            log.warning("[stream_manager] _respawn_workers: registry empty -- skipping")
+            return
+
+        old_set = {s for w in self._workers for s in w.symbols}
+        new_set = set(new_symbols)
+        symbols_changed = new_set != old_set
+
+        if not symbols_changed and not force_token_refresh:
+            log.debug(
+                "[stream_manager] _respawn_workers: symbol set unchanged (%d) -- skipping",
+                len(new_set),
+            )
+            return
+
+        log.info(
+            "[stream_manager] _respawn_workers: old_symbols=%d new_symbols=%d "
+            "force_token_refresh=%s -- cancelling %d workers",
+            len(old_set), len(new_set), force_token_refresh, len(self._tasks),
+        )
+
+        # Emit final health snapshot before teardown
+        if self._workers:
+            self._log_health()
+
+        for task in self._tasks:
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*[t for t in self._tasks if t is not None], return_exceptions=True)
+
+        # Always refresh token on respawn
+        self._session_token = await self._fetch_session_token()
+        if not self._session_token:
+            log.error("[stream_manager] _respawn_workers: no session token -- aborting")
+            return
+
+        chunks = [
+            new_symbols[i:i + _CHUNK_SIZE]
+            for i in range(0, len(new_symbols), _CHUNK_SIZE)
+        ]
+
+        # FIX-A: same proportional stagger applied to respawn so 401-triggered
+        # respawns don't cause the same thundering-herd that _spawn_workers had.
+        stagger_step = _SPAWN_WINDOW_S / max(len(chunks), 1)
+
+        self._workers = []
+        self._tasks   = []
+        self._spawn_at = _time.time()
+        self._total_ticks_at_last_health = 0
+        self._last_health_at = _time.monotonic()
+
+        for idx, chunk in enumerate(chunks):
+            worker = StreamWorker(
+                worker_id            = idx,
+                symbols              = chunk,
+                event_queue          = self._queue,
+                startup_delay_s      = idx * stagger_step,   # FIX-A: proportional
+                shared_session_token = self._session_token,
+            )
+            self._workers.append(worker)
+            task = asyncio.create_task(worker.run(), name=f"stream-worker-{idx}")
+            self._tasks.append(task)
+
+        log.info(
+            "[stream_manager] _respawn_workers done: %d workers for %d symbols "
+            "session=%s... stagger=%.0fms (spread=%.1fs)",
+            len(self._workers), len(new_symbols), self._session_token[:8],
+            stagger_step * 1000, _SPAWN_WINDOW_S,
+        )
+        # Note: _respawn_workers() fetches a fresh token immediately before the
+        # spawn loop so the TTL race does not apply — no post-spawn refresh needed.
+
+    async def _consume_queue(self):
+        """
+        STREAM-7: Non-blocking concurrent queue drain.
+
+        Previously awaited _process_fn serially — one tick at a time.
+        With persist_flow_event() at up to 2s latency, drain rate << ingest
+        rate at market open burst, causing QUEUE_FULL at depth=50,000.
+
+        Now: pull items as fast as they arrive and dispatch each as a Task.
+        A Semaphore(_PROCESS_CONCURRENCY=32) caps concurrent executions to
+        prevent unbounded parallelism on shared accumulator / dedup state.
+        The semaphore is acquired inside _run_process() so the drain loop
+        itself never blocks waiting for a slot — if all 32 slots are taken,
+        the semaphore acquire yields to the event loop which will free a slot
+        before the next iteration.
+        """
+        if self._queue is None:
+            return
+        log.info(
+            "[stream_manager] Queue consumer started -- maxsize=%d concurrency=%d",
+            _QUEUE_SIZE, _PROCESS_CONCURRENCY,
+        )
+        processed = 0
+
+        async def _run_process(raw: dict) -> None:
+            async with self._process_sem:
+                try:
+                    if self._process_fn:
+                        await self._process_fn(raw)
+                except Exception as e:
+                    log.error("[stream_manager] process_fn error: %s", e)
+                finally:
+                    self._queue.task_done()
+
+        try:
+            while True:
+                raw = await self._queue.get()
+                processed += 1
+                asyncio.create_task(_run_process(raw), name=f"process-{processed}")
+        except asyncio.CancelledError:
+            log.info(
+                "[stream_manager] Queue consumer stopped -- total_dispatched=%d", processed
+            )
+            raise
