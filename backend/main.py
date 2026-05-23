@@ -576,10 +576,6 @@ async def _chain_refresh_after_build(
             "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
             _CHAIN_REFRESH_STAGGER_S,
         )
-        log.info(
-            "[chain_refresh] SEQ-002-STAGGER: %d s elapsed - starting chain refresh worker",
-            _CHAIN_REFRESH_STAGGER_S,
-        )
 
     await start_chain_refresh_worker(
         get_tracked_symbols=get_tracked_symbols,

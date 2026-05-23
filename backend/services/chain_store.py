@@ -21,8 +21,7 @@ load_chain(snapshot_id, max_age_hours)  -> dict[str, ContractMeta] | None
 get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
     ING-008: Fast in-process lookup from the module-level _vol_oi_cache
     dict keyed by OCC symbol.  Returns (volume, open_interest) or
-    (None, None) on cache miss.  Zero API calls on the hot path.
-    The cache is populated / refreshed by start_chain_refresh_worker().
+    (None, None) on cache miss. The cache is populated / refreshed by start_chain_refresh_worker().
 
 (get_tracked_symbols, fetch_chain_fn)
     ING-008: Background asyncio task that refreshes the intraday chain
@@ -44,7 +43,7 @@ get_contract_vol_oi(occ_symbol) -> tuple[int | None, int | None]
     into early-morning events.
 
 get_epoch() -> int
-    Return the current mutation epoch counter.  Incremented on every
+    Return the current chain_store mutation epoch counter.  Incremented on every
     successful save_chain() call.  Used by assert_epoch_parity() in
     gate_config_store to detect generation skew between stores.
 
@@ -103,7 +102,7 @@ HOTFIX-CHAIN-CONCURRENCY (2026-05-13):
 
   Fix: single _client() call outside _upsert_batch, shared across all
   batches. Added asyncio.Semaphore(_SAVE_CONCURRENCY=10) to cap concurrent
-  run_in_executor threads. Wall time: ~300ms → ~1.5s (still 4x faster
+  run_in_executor threads. Wall time: ~300ms -> ~1.5s (still 4x faster
   than the original sequential 5.8s). Zero impact on streaming hot path —
   save_chain is called only at startup and every 24h; get_contract_vol_oi()
   reads _vol_oi_cache fed by (), a separate path.
@@ -120,7 +119,7 @@ FIX (2026-05-14): HTTP 400 handling in ().
   continue to increment the error counter and log at WARNING.
 
 FIX-FK-SNAPSHOT (2026-05-15):
-  save_chain() was failing with Postgres FK violation 23503 on cold-start
+  save_chain() was failing with Postgres FK violation 2350 la on cold-start
   periodic flushes and final persist. Root cause: options_chain_cache.snapshot_id
   references options_universe_snapshots.id, but a fresh uuid4() snapshot_id
   had no parent row before child upserts fired.
@@ -166,7 +165,7 @@ FIX-CHAIN-FALLBACK (2026-05-19):
   index (idx_chain_cache_built_at). Silent PostgREST 42703 errors caused
   the fallback to always return None, forcing a full Tradier build() on
   every warm restart.
-  Also bumped _DEFAULT_MAX_AGE_HOURS 24 → 48: a chain built at 13:32 on
+  Also bumped _DEFAULT_MAX_AGE_HOURS 24 -> 48: a chain built at 13:32 on
   day N is still valid at 14:54 on day N+1.
 """
 import asyncio
@@ -186,7 +185,7 @@ _TABLE          = "options_chain_cache"
 _SNAPSHOT_TABLE = "options_universe_snapshots"
 _BATCH_SIZE     = 500
 _PAGE_SIZE      = 1000
-_DEFAULT_MAX_AGE_HOURS = 48  # FIX-CHAIN-FALLBACK: 24→48; overnight restarts need the extra window
+_DEFAULT_MAX_AGE_HOURS = 48  # FIX-CHAIN-FALLBACK: 24->48; overnight restarts need the extra window
 
 # ---------------------------------------------------------------------------
 # Save timeout ceiling (seconds) for long-running chain persist operations.
@@ -323,16 +322,17 @@ async def start_chain_refresh_worker(
         _CHAIN_REFRESH_INTERVAL_S,
     )
     try:
-        # ING-008-COLD: immediate initial pull — no 5-min wait before first data.
-        await _run_refresh_cycle(get_tracked_symbols(), fetch_chain_fn, label="initial")
-
-        # CHAIN-READY-001: signal stream workers NOW — after fresh contracts are loaded.
+        # CHAIN-READY-001: signal stream workers NOW — the registry is already built,
+        # so the set of contracts is fresh. Vol/OI enrichment can happen in parallel.
         if on_first_refresh_done is not None and not on_first_refresh_done.is_set():
             on_first_refresh_done.set()
             log.info(
                 "[chain_store] CHAIN-READY-001: on_first_refresh_done set — "
                 "stream workers may now spawn with today's contracts"
             )
+
+        # ING-008-COLD: immediate initial pull
+        await _run_refresh_cycle(get_tracked_symbols(), fetch_chain_fn, label="initial")
 
         cycle = 0
         while True:
@@ -347,6 +347,7 @@ async def start_chain_refresh_worker(
     except asyncio.CancelledError:
         log.info("[chain_store] chain refresh worker cancelled — shutting down cleanly")
         raise
+
 
 def _client() -> Client:
     key = settings.SUPABASE_SERVICE_KEY
