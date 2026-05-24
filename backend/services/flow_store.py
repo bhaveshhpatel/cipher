@@ -504,14 +504,14 @@ def _compute_episode_steamroom_score(
 ) -> int:
     """
     Compute an episode-level Steamroom conviction score as the sum of 5 binary
-    dimensions. Range: 0–5.
+    dimensions. Range: 0-5.
 
     Dimensions (1 point each):
-      Dim 1 — ask-side majority  : ask_side_pct >= 0.5
-      Dim 2 — vol/OI conviction  : vol_oi_signal is True (HIGH)
-      Dim 3 — notional size      : total_premium >= $100k (BLOCK or GOLDEN tier)
-      Dim 4 — near-term expiry   : dte_bucket in ('1-4', '5-60')
-      Dim 5 — accumulation depth : trade_count >= 3 (repeated prints = conviction)
+      Dim 1 - ask-side majority  : ask_side_pct >= 0.5
+      Dim 2 - vol/OI conviction  : vol_oi_signal is True (HIGH)
+      Dim 3 - notional size      : total_premium >= $100k (BLOCK or GOLDEN tier)
+      Dim 4 - near-term expiry   : dte_bucket in ('1-4', '5-60')
+      Dim 5 - accumulation depth : trade_count >= 3 (repeated prints = conviction)
 
     None-safety: all inputs are coerced to their zero-score default if
     None/missing is passed. Score arithmetic never raises.
@@ -604,7 +604,7 @@ def get_episode_stats() -> Dict[str, int]:
 def enqueue_lookback(key) -> None:
     """
     Non-blocking enqueue of a ContractKey for async lookback enrichment.
-    Never raises — overflow is silently counted.
+    Never raises -- overflow is silently counted.
     """
     try:
         _lookback_queue.put_nowait(key)
@@ -612,7 +612,7 @@ def enqueue_lookback(key) -> None:
     except asyncio.QueueFull:
         _lookback_stats["lookback_queue_overflow"] += 1
         log.debug(
-            "[lookback] queue full (%d) — key dropped: %s",
+            "[lookback] queue full (%d) -- key dropped: %s",
             _LOOKBACK_QUEUE_MAX, key,
         )
 
@@ -661,7 +661,7 @@ async def _insert_rows_with_retry(table: str, rows: list[dict]) -> bool:
                 f"[flow_store] insert into {table} failed (attempt {attempt}/{_RETRY_MAX}) "
                 f"-- retrying in {_RETRY_DELAY_S}s"
             )
-            await _async_sleep(_RETRY_DELAY_S)  # patched via services.flow_store._async_sleep
+            await _async_sleep(_RETRY_DELAY_S)
     log.error(
         f"[flow_store] insert into {table} failed after {_RETRY_MAX} attempts "
         f"-- {len(rows)} rows DISCARDED. Check Supabase connectivity."
@@ -688,13 +688,12 @@ async def persist_flow_event(ev_dict):
     if not _is_configured():
         log.warning(
             "[flow_store] persist_flow_event: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY "
-            "not set — event dropped. Set env vars to enable DB persistence."
+            "not set -- event dropped. Set env vars to enable DB persistence."
         )
         return
 
-    # FIX-EV-NAME: normalise OptionsFlowEvent dataclass → dict so .get() works
+    # FIX-EV-NAME: normalise OptionsFlowEvent dataclass -> dict so .get() works
     # regardless of whether caller passes a dataclass/object or a plain dict.
-    # ev_dict is the canonical variable name throughout this function.
     if not isinstance(ev_dict, dict):
         ev_dict = vars(ev_dict)
 
@@ -730,7 +729,167 @@ async def persist_flow_event(ev_dict):
 
     open_interest = _g("open_interest") or None
 
-    # PBE-1: classify_bid_ask() returns Tuple[str, bool] — unpack directly.
+    # PBE-1: classify_bid_ask() returns Tuple[str, bool] -- unpack directly.
     bid_ask_cls, is_ask_side = classify_bid_ask(fill_price, bid, ask)
 
-    vol_oi_signal: Optional[b
+    vol_oi_signal: Optional[bool] = compute_vol_oi_signal(
+        contract_volume_snapshot, contract_oi
+    )
+
+    normalized_premium: Optional[float] = _compute_normalized_premium(premium, underlying_price)
+
+    normalized_oi: Optional[float] = _compute_vol_oi_ratio(open_interest, contract_oi)
+
+    dte_bucket    = _compute_dte_bucket(dte)
+    notional_tier = _compute_notional_tier(premium)
+
+    trade_type = _g("trade_type", "UNKNOWN") or "UNKNOWN"
+    is_agg     = bool(_g("is_aggressive", False))
+    _bac       = bid_ask_cls
+    if _bac == "ASK" and is_agg:
+        execution_mechanic = "AGGRESSIVE_BUY"
+    elif _bac == "BID" and is_agg:
+        execution_mechanic = "AGGRESSIVE_SELL"
+    elif _bac == "ASK":
+        execution_mechanic = "PASSIVE_BUY"
+    elif _bac == "BID":
+        execution_mechanic = "PASSIVE_SELL"
+    else:
+        execution_mechanic = "AMBIGUOUS_LONG"
+
+    sentiment = _g("sentiment", "NEUTRAL") or "NEUTRAL"
+    strong_sentiment = bool(
+        is_ask_side and is_agg and not bool(_g("is_synthetic_quote", False))
+    )
+
+    # SA-2: Resolve episode_id from _episode_in_flight cache.
+    # persist_flow_episode() is always called before persist_flow_event() in
+    # _process_trade(), so the cache will have the id populated.
+    # Direction is read from the event dict (same key _process_trade passes to
+    # persist_flow_episode). A cache miss writes NULL -- column is nullable.
+    _ev_direction   = _g("direction", "UNKNOWN") or "UNKNOWN"
+    _ev_episode_key = _episode_key(
+        ticker,
+        _ev_direction,
+        _g("contract_type") or "CALL",
+        strike or 0,
+        expiry or "",
+    )
+    _in_flight = _episode_in_flight.get(_ev_episode_key)
+    episode_id: Optional[int] = _in_flight["id"] if _in_flight else None
+
+    global _flow_event_buffer
+    row = {
+        "ticker":                   ticker,
+        "contract_type":            _g("contract_type"),
+        "strike":                   strike,
+        "expiry":                   expiry,
+        "dte":                      _g("dte", 0),
+        "fill_price":               fill_price,
+        "bid":                      bid,
+        "ask":                      ask,
+        "size":                     _g("size", 0),
+        "premium":                  premium,
+        "trade_type":               trade_type,
+        "bid_ask_class":            bid_ask_cls,
+        "is_ask_side":              is_ask_side,
+        "is_aggressive":            is_agg,
+        "sentiment":                sentiment,
+        "order_side":               _g("order_side", "UNKNOWN") or "UNKNOWN",
+        "strong_sentiment":         strong_sentiment,
+        "execution_mechanic":       execution_mechanic,
+        "exchange_count":           _g("exchange_count", 1),
+        "fill_count":               _g("fill_count", 1),
+        "open_interest":            _g("open_interest", 0),
+        "iv":                       _g("iv", 0.0),
+        "underlying_price":         underlying_price,
+        "occ_symbol":               occ_symbol,
+        "is_synthetic_quote":       bool(_g("is_synthetic_quote", False)),
+        "quote_source":             "live",
+        "contract_volume_snapshot": contract_volume_snapshot,
+        "contract_oi":              contract_oi,
+        "vol_oi_signal":            vol_oi_signal,
+        "normalized_premium":       normalized_premium,
+        "normalized_oi":            normalized_oi,
+        "dte_bucket":               dte_bucket,
+        "notional_tier":            notional_tier,
+        "episode_id":               episode_id,
+    }
+    _flow_event_buffer.append(row)
+
+    if len(_flow_event_buffer) >= _FLUSH_MAX_ROWS:
+        batch = _flow_event_buffer[:_FLUSH_MAX_ROWS]
+        _flow_event_buffer = _flow_event_buffer[_FLUSH_MAX_ROWS:]
+        ok = await _insert_rows_with_retry("flow_events", batch)
+        if ok:
+            log.info(f"[flow_store] early flush ({_FLUSH_MAX_ROWS} rows) -- buffer hit max")
+
+
+async def upgrade_to_sweep_in_db(occ_symbol: str, fill_price: float, size: int) -> bool:
+    """C-003: Retroactively upgrade flow_events rows to trade_type='SWEEP'."""
+    if not _is_configured():
+        log.debug("[flow_store] upgrade_to_sweep_in_db: not configured, skipping")
+        return False
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+
+    url = (
+        f"{_SUPABASE_URL}/rest/v1/flow_events"
+        f"?occ_symbol=eq.{quote(occ_symbol)}"
+        f"&fill_price=eq.{fill_price}"
+        f"&size=eq.{size}"
+        f"&trade_type=neq.SWEEP"
+        f"&created_at=gte.{quote(cutoff)}"
+    )
+    headers = {
+        "apikey":        _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+    payload = {"trade_type": "SWEEP"}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(url, headers=headers, json=payload)
+        if resp.status_code in (200, 204):
+            log.info(
+                f"[flow_store] sweep upgrade applied: {occ_symbol} "
+                f"fill={fill_price} size={size}"
+            )
+            return True
+        log.warning(
+            f"[flow_store] sweep upgrade failed: {resp.status_code} -- {resp.text[:200]}"
+        )
+        return False
+    except Exception as e:
+        log.error(f"[flow_store] upgrade_to_sweep_in_db exception: {e}")
+        return False
+
+
+async def _lookup_open_episode(
+    ticker: str,
+    direction: str,
+    contract_type: str,
+    strike: float,
+    expiry: str,
+    window_s: int = _EPISODE_MERGE_WINDOW_S,
+) -> Optional[dict]:
+    """
+    ING-009: Query flow_episodes for an open same-session episode.
+
+    REARCH-004: select= extended to include ask_side_count so the DB-lookup
+    PATCH path can recompute ask_side_pct without an additional round-trip.
+    Pre-REARCH rows return NULL for ask_side_count -- callers must COALESCE
+    with 0 before incrementing (PBE-1 NULL contract).
+    """
+    if not _is_configured():
+        return None
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=window_s)
+    ).isoformat()
+
+    get_headers = {
+        "apikey":        _SUPABASE_KEY,
+       

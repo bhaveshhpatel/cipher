@@ -143,19 +143,22 @@ def _check_ordering_invariants(key: str, cast_value: Any) -> str | None:
     """
     Validate ordering invariants for the given key and its proposed new value.
 
-    Reads the current live snapshot for related keys so the check reflects
-    the full config state after the proposed change is applied.
+    Reads the current live snapshot for related keys via the public
+    get_param() API so the check reflects the full config state after the
+    proposed change is applied.  get_param() already handles snapshot
+    fallback to _DEFAULTS internally — this function must NOT reach into
+    _snapshot or _DEFAULTS directly (SA-002: no internal-state reaches
+    across module boundaries).
 
     Returns an error string if an invariant is violated, or None if valid.
     """
-    snap = dict(get_signal_config.__wrapped__()) if hasattr(get_signal_config, "__wrapped__") else {}
-    # Fall back to module-level get_param for snapshot reads — avoids async
-    # call inside a sync validator.
-
     def _current(k: str) -> Any:
         """Read the current snapshot value for key k (before this PATCH)."""
-        from services.signal_config_store import _snapshot, _DEFAULTS
-        return _snapshot.get(k, _DEFAULTS.get(k))
+        # Use the public get_param() API rather than importing _snapshot or
+        # _DEFAULTS directly.  get_param() is synchronous and returns the
+        # currently-cached value with _DEFAULTS fallback — exactly what we
+        # need for an invariant pre-check.  (SA-002)
+        return get_param(k)
 
     # Simulate the snapshot after this proposed update.
     def _effective(k: str) -> Any:
