@@ -43,6 +43,15 @@ log = logging.getLogger("gate_config_store")
 # ---------------------------------------------------------------------------
 # Gate name -> alias resolution
 # ---------------------------------------------------------------------------
+# SA-002 (ADR): This map exists because the accumulator and early ingestion
+# code used the short name "debounce_ms" before the gate was formalised as
+# "signal_debounce_ms" in the gate_configs schema.  The alias is kept here
+# (rather than at call-sites) so there is exactly ONE canonical resolution
+# point for any caller — whether it's reading via store.get() or writing via
+# store.update().  Do NOT add a second lookup path elsewhere.
+#
+# Canonical name       <- Alias(es) accepted by get() and update()
+# signal_debounce_ms   <- debounce_ms
 _ALIAS_MAP: dict[str, str] = {
     "debounce_ms": "signal_debounce_ms",
 }
@@ -124,11 +133,31 @@ _DEFAULTS: dict[str, dict[int, float]] = {
     },
     # signal_min_premium: values match migration 021 seed.
     # T1=75k (whale/institutional only), T2=50k, T3=25k (retail catch-all).
+    #
+    # SA-002 OVERLAP WARNING: this gate is evaluated at INGESTION time
+    # (before an episode is formed) and controls whether a raw flow trade
+    # is even accumulated.  The signal_config_store carries a separate set
+    # of sig.*_premium keys (sig.noteworthy_premium, sig.block_premium,
+    # sig.golden_sweep_premium) which are evaluated at SIGNAL-EMISSION time
+    # after episode close.  These two threshold layers are intentionally
+    # independent — see ADR SA-002 for the full rationale.
+    #
+    # TUNING RISK: if you raise signal_min_premium here WITHOUT also raising
+    # the corresponding sig.*_premium floors in signal_config_store, the
+    # gate-stage will silently drop trades that the signal-stage would have
+    # passed.  Always review BOTH stores together when adjusting premium
+    # thresholds.
     "signal_min_premium": {
         1: 75_000.0,
         2: 50_000.0,
         3: 25_000.0,
     },
+    # exclude_indices: logical label = excluded_symbols_config (SA-002).
+    # This is a boolean-as-float gate: 1.0 = exclude index underlyings
+    # (SPY, QQQ, IWM, etc.) from accumulation; 0.0 = allow them through.
+    # It is NOT a per-symbol exclusion list — per-symbol exclusions are a
+    # future extension requiring a separate DB table.  The gate fires at
+    # ingestion time before the episode accumulator sees the trade.
     "exclude_indices": {
         1: 1.0,
         2: 1.0,
@@ -379,6 +408,13 @@ class GateConfigStore:
         """
         Commit a gate value change to the DB and hot-patch the cache.
 
+        The ``gate_name`` parameter accepts BOTH the canonical DB name AND
+        any alias defined in ``_ALIAS_MAP`` (e.g. ``debounce_ms`` resolves
+        to ``signal_debounce_ms`` transparently).  Alias resolution happens
+        at the top of this method before any validation — callers should NOT
+        pre-resolve aliases themselves, as that would bypass the single
+        authoritative resolution point.  (SA-002)
+
         Returns
         -------
         dict with keys: gate_name, tier, old_value, new_value
@@ -388,6 +424,10 @@ class GateConfigStore:
         ValueError  — unknown gate_name, bad tier, or value out of bounds
         RuntimeError — DB write failed
         """
+        # SA-002: alias resolution is intentionally the FIRST operation so
+        # that all downstream validation and cache writes use the canonical
+        # name.  Both "debounce_ms" and "signal_debounce_ms" are valid inputs;
+        # the DB and cache always store the canonical form.
         gate_name = self._resolve_alias(gate_name)
         if gate_name not in _VALID_GATES:
             raise ValueError(f"Unknown gate: {gate_name!r}")
