@@ -241,6 +241,17 @@ Fix (IS-SWEEP-ATTR 2026-05-19): replace sig_ep.is_sweep with ev.trade_type == "S
     2. bus.publish_all dict     — "is_sweep": sig_ep.is_sweep
     3. signal log line          — sig_ep.is_sweep (same AttributeError risk)
   All three replaced with ev.trade_type == "SWEEP".
+
+Fix (SA-2 2026-05-24): registry.size() calls + _REGISTRY_READY constant names.
+  Four targeted fixes in stream_options_flow() registry-is-not-None branch:
+  1. REGISTRY_READY_TIMEOUT_S -> _REGISTRY_READY_TIMEOUT_S (missing _ prefix
+     caused NameError on first registry-path entry, falling to idle immediately)
+  2. REGISTRY_READY_POLL_S -> _REGISTRY_READY_POLL_S (same root cause)
+  3. registry.size -> registry.size() in STREAM-GATE-002 log format arg
+     (SymbolRegistry.size is a method, not a property — TypeError on log call)
+  4. registry.size -> registry.size() in STREAM-GATE-003 log + stats assignment
+     + LIVE mode log (same TypeError; _stats["active_symbols"] stored a bound
+     method object instead of an int, breaking /health and get_stats() responses)
 """
 import asyncio
 import logging
@@ -721,7 +732,7 @@ async def stream_options_flow(
             chain_ready_event,
             chain_ready_event.is_set() if chain_ready_event is not None else "N/A",
         )
-    
+
         # Gate 1: wait for fresh chain refresh before spawning workers
         if chain_ready_event is not None:
             log.info("[stream] CHAIN-READY-001 waiting for chain refresh timeout=180s...")
@@ -730,40 +741,40 @@ async def stream_options_flow(
                 log.info("[stream] CHAIN-READY-001 fresh contracts confirmed, spawning workers")
             except asyncio.TimeoutError:
                 log.warning("[stream] CHAIN-READY-001 chain_ready_event timed out (180s) spawning with DB-seeded contracts")
-    
+
         log.info(
             "[stream] STREAM-GATE-002: past chain_ready_event. registry.is_ready()=%s, registry.size=%d",
             registry.is_ready(),
-            registry.size,
+            registry.size(),
         )
 
         # Gate 2: wait for registry build to complete
         waited = 0.0
-        while not registry.is_ready() and waited < REGISTRY_READY_TIMEOUT_S:
-            await asyncio.sleep(REGISTRY_READY_POLL_S)
-            waited += REGISTRY_READY_POLL_S
+        while not registry.is_ready() and waited < _REGISTRY_READY_TIMEOUT_S:
+            await asyncio.sleep(_REGISTRY_READY_POLL_S)
+            waited += _REGISTRY_READY_POLL_S
 
         if not registry.is_ready():
             log.error(
                 "[stream] Registry still not ready after %.0fs — stream idle. Use admin panel to start demo engine.",
-                REGISTRY_READY_TIMEOUT_S,
+                _REGISTRY_READY_TIMEOUT_S,
             )
             _stats["mode"] = "idle"
             return
-    
+
         log.info(
             "[stream] STREAM-GATE-003: registry ready. size=%d, waited=%.1fs. About to call manager.run().",
-            registry.size,
+            registry.size(),
             waited,
         )
-        log.info("[stream] Registry ready %d OCC contracts waited=%.1fs starting stream manager", registry.size, waited)
-    
+        log.info("[stream] Registry ready %d OCC contracts waited=%.1fs starting stream manager", registry.size(), waited)
+
         asyncio.create_task(registry.refresh_loop())
-        _stats["active_symbols"] = registry.size
+        _stats["active_symbols"] = registry.size()
         _stats["mode"] = "live"
         log.info(
             "[stream] LIVE mode: subscribing to %d OCC contracts across %d tickers",
-            registry.size,
+            registry.size(),
             len({v.ticker for v in registry.registry.values()}) if hasattr(registry, "registry") else 0,
         )
         manager = StreamManager(registry=registry, process_fn=_process_trade)
@@ -779,7 +790,7 @@ async def stream_options_flow(
         log.info(f"[stream] Building OCC registry for {len(symbols)} tickers...")
         registry = _init_registry(watchlist=symbols)
         try:
-            occ_count, _ = await registry.build()
+            occ_count, _ = await registry.build(
         except Exception as e:
             log.error(
                 f"[stream] OCC registry build failed: {e} — "
